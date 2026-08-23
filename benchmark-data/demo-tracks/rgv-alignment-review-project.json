@@ -1,0 +1,190 @@
+{
+  "schema_version": 3,
+  "locus": {
+    "contig": "chr1",
+    "start": 0,
+    "end": 200000
+  },
+  "panels": [
+    {
+      "id": 1,
+      "locus": {
+        "contig": "chr1",
+        "start": 0,
+        "end": 200000
+      },
+      "vertical_scroll_points": 0.0
+    },
+    {
+      "id": 2,
+      "locus": {
+        "contig": "chr1",
+        "start": 2100000,
+        "end": 2301000
+      },
+      "vertical_scroll_points": 0.0
+    },
+    {
+      "id": 3,
+      "locus": {
+        "contig": "chr2",
+        "start": 0,
+        "end": 2000000
+      },
+      "vertical_scroll_points": 0.0
+    },
+    {
+      "id": 4,
+      "locus": {
+        "contig": "chr2",
+        "start": 2500000,
+        "end": 2550000
+      },
+      "vertical_scroll_points": 0.0
+    }
+  ],
+  "active_panel": 1,
+  "alignment_tracks": [
+    {
+      "id": 1,
+      "name": "Short, RNA, long-read, and specialist alignment truth",
+      "source": {
+        "Local": {
+          "path": "../mixed.bam"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 420.0,
+      "filters": {
+        "alignment_color_mode": "none",
+        "alignment_group_mode": "none",
+        "alignment_group_order": "natural",
+        "alignment_sort_mode": "start",
+        "alignment_sort_order": "natural",
+        "view_as_pairs": false,
+        "minimum_template_length": null,
+        "maximum_template_length": null,
+        "overlapping_mate_policy": "count_once",
+        "minimum_mapping_quality": null,
+        "minimum_base_quality": 0,
+        "minimum_allele_fraction": 0.2,
+        "quality_weighted_alleles": true,
+        "show_reference": true,
+        "show_coverage": true,
+        "show_junctions": true,
+        "minimum_junction_depth": 1,
+        "minimum_junction_flank": 0,
+        "junction_display_mode": "collapsed",
+        "sashimi_scale_mode": "automatic",
+        "sashimi_fixed_scale_maximum": 100,
+        "sashimi_count_mode": "raw",
+        "show_junction_labels": true,
+        "show_reads": true,
+        "coverage_scale_maximum": null,
+        "show_coverage_center_line": true,
+        "alignment_density": 1.0,
+        "inspector_activation": "click",
+        "read_base_display_mode": "mismatches",
+        "shade_read_bases_by_quality": true,
+        "minimum_indel_size": 1,
+        "minimum_event_label_size": 1,
+        "show_modified_bases": true,
+        "show_modification_frequency": true,
+        "minimum_modification_probability": 0,
+        "modified_base_color_mode": "by_type",
+        "hidden_modification_codes": [],
+        "include_secondary": true,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    }
+  ],
+  "reference": null,
+  "genome_name": "RGV synthetic alignment truth",
+  "cytobands": null,
+  "reference_reverse_complement": false,
+  "reference_translation_frames": [],
+  "reference_genetic_code": "Standard",
+  "regions_of_interest": [],
+  "review_items": [
+    {
+      "id": 1,
+      "label": "Paired short reads",
+      "locus": {
+        "contig": "chr1",
+        "start": 0,
+        "end": 200000
+      },
+      "status": "Pending",
+      "notes": "Proper paired templates; use View as pairs, grouping, sorting, mate navigation, and overlap counting.",
+      "assignment": null
+    },
+    {
+      "id": 2,
+      "label": "Deep coverage",
+      "locus": {
+        "contig": "chr1",
+        "start": 900000,
+        "end": 920000
+      },
+      "status": "Pending",
+      "notes": "150,000 records cross the locus; use this to review sampling-independent coverage and responsive navigation.",
+      "assignment": null
+    },
+    {
+      "id": 3,
+      "label": "RNA splice junctions",
+      "locus": {
+        "contig": "chr1",
+        "start": 2100000,
+        "end": 2301000
+      },
+      "status": "Pending",
+      "notes": "10,000 distinct generated junctions with tagged, inferred, and invalid strand evidence.",
+      "assignment": null
+    },
+    {
+      "id": 4,
+      "label": "Structural read pairs",
+      "locus": {
+        "contig": "chr1",
+        "start": 2590000,
+        "end": 2650000
+      },
+      "status": "Pending",
+      "notes": "Long, short, same-strand, outward-facing, and inter-contig pair evidence.",
+      "assignment": null
+    },
+    {
+      "id": 5,
+      "label": "Long and specialist reads",
+      "locus": {
+        "contig": "chr2",
+        "start": 0,
+        "end": 2000000
+      },
+      "status": "Pending",
+      "notes": "Long reads, supplementary chains, modified bases, SMRT kinetics, and SBX evidence.",
+      "assignment": null
+    },
+    {
+      "id": 6,
+      "label": "Pathological long CIGAR",
+      "locus": {
+        "contig": "chr2",
+        "start": 2500000,
+        "end": 2550000
+      },
+      "status": "Pending",
+      "notes": "One generated read with 70,000 CIGAR operations; inspect and navigate it without truncation or a crash.",
+      "assignment": null
+    }
+  ],
+  "sample_metadata": null,
+  "contig_aliases": {},
+  "tracks": [],
+  "maximum_alignments": 50000
+}

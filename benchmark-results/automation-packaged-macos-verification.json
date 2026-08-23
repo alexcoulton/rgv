@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "succeeded": true,
+  "qualification_manifest_sha256": "84e07e4a006437d3ae2382306a920220b79a8293b8a6d200fb0c70fd6e43fd18",
+  "batch_sha256": "6424282930f0292f3ba4ed5f2ff842fc9066a671da6aa0df03a3cf1fff6816c6",
+  "automation_report_sha256": "109ed9992983b9f18d55947da8bb83b08054d968a20bc8912a57fda07bdbb04f",
+  "commands_verified": 19,
+  "artifacts": [
+    {
+      "name": "automation-alignments.tsv",
+      "bytes": 953041,
+      "sha256": "b2cc4d54d0c1de4206bd7f99d8b20a5ab12ed62306db7331328c2ce0f8c442dd",
+      "reviewed": false
+    },
+    {
+      "name": "automation-full-panel.svg",
+      "bytes": 2477790,
+      "sha256": "027ecb709c3432fc93db082ffe00154c797cf976054ab3bf7cfcc6e5e57574df",
+      "reviewed": true
+    },
+    {
+      "name": "automation-junctions.tsv",
+      "bytes": 667,
+      "sha256": "99b1d51b348ac0c9b525271b3047536ec7c987bce5d8fa02732b1ed975264beb",
+      "reviewed": false
+    },
+    {
+      "name": "automation-modifications.tsv",
+      "bytes": 673,
+      "sha256": "b479c7408835eb0126f43a32bbe255e618a7a71ffa96713b08de4429af58dfb3",
+      "reviewed": false
+    },
+    {
+      "name": "automation-pileup.tsv",
+      "bytes": 54828,
+      "sha256": "0722db93b616f39e1650eca5478cd0ef6a4795bd515120089be4956d9ab2c567",
+      "reviewed": false
+    },
+    {
+      "name": "automation-project.json",
+      "bytes": 2798,
+      "sha256": "fc555aca6509a3827c75ea20a2ced7a47774e00008cb9563be68213af5091b3b",
+      "reviewed": false
+    },
+    {
+      "name": "automation-selected-evidence.tsv",
+      "bytes": 895,
+      "sha256": "aec530637f16515932a79bac8fb4a137b2ca4cd203605f7a3c5cd4ae47f0470c",
+      "reviewed": false
+    },
+    {
+      "name": "automation-smoke.svg",
+      "bytes": 562364,
+      "sha256": "ea837d45815dba8ed16e73f3ed65f536c6010a9b9fcb76e534703033ec4d54f9",
+      "reviewed": true
+    },
+    {
+      "name": "automation-track-names.tsv",
+      "bytes": 149,
+      "sha256": "1ec8a72943e07cad01c6524e5b391a1fe52034485f733637e067d24ea3d0d44b",
+      "reviewed": false
+    }
+  ],
+  "telemetry": {
+    "operating_system": "macos",
+    "architecture": "aarch64",
+    "gpu_adapter": "Apple M4",
+    "gpu_backend": "Metal",
+    "surface_width_pixels": 2560,
+    "surface_height_pixels": 1600,
+    "scale_factor": 2.0,
+    "run_elapsed_ms": 656.7721250000001,
+    "startup_to_first_frame_ms": 1677.134958,
+    "startup_to_first_settled_ms": 1816.416625,
+    "presented_frames": 31,
+    "frame_median_ms": 7.186708,
+    "frame_p95_ms": 10.238125,
+    "frame_maximum_ms": 23.137916,
+    "samples_dropped": 0,
+    "prepared_frames": 16,
+    "uploaded_frames": 2,
+    "total_uploaded_bytes": 263904,
+    "peak_uploaded_bytes": 263808,
+    "peak_instances": 5497,
+    "buffer_reallocations": 0,
+    "truncated_frames": 0
+  }
+}

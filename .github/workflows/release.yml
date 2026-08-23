@@ -1,0 +1,182 @@
+name: Signed release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked --release -p rgv-desktop
+      - name: Require signing credentials
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: |
+          test -n "$APPLE_CERTIFICATE_P12"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$APPLE_SIGNING_IDENTITY"
+          test -n "$APPLE_ID"
+          test -n "$APPLE_TEAM_ID"
+          test -n "$APPLE_APP_PASSWORD"
+          test -n "$APPLE_KEYCHAIN_PASSWORD"
+      - name: Build, sign, and notarize disk image
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          RGV_ARCH: ${{ matrix.architecture }}
+        run: |
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/rgv-signing.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/rgv.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/rgv.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/rgv.keychain-db"
+          security import "$RUNNER_TEMP/rgv-signing.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/rgv.keychain-db"
+          security list-keychain -d user -s "$RUNNER_TEMP/rgv.keychain-db"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/rgv.keychain-db"
+          python3 packaging/stage_package.py --platform macos --architecture "$RGV_ARCH" --version "${GITHUB_REF_NAME#v}" --build-number "$GITHUB_RUN_NUMBER" --binary target/release/rgv-desktop --destination dist/stage
+          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" dist/stage/RGV.app
+          codesign --verify --deep --strict --verbose=2 dist/stage/RGV.app
+          cp dist/stage/RGV.app/Contents/Resources/RGV.cdx.json "dist/RGV-macos-$RGV_ARCH.cdx.json"
+          cp dist/stage/RGV.app/Contents/Resources/BUILD-PROVENANCE.json "dist/RGV-macos-$RGV_ARCH.provenance.json"
+          hdiutil create -volname RGV -srcfolder dist/stage/RGV.app -ov -format UDZO "dist/RGV-macos-$RGV_ARCH.dmg"
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "dist/RGV-macos-$RGV_ARCH.dmg"
+          xcrun notarytool submit "dist/RGV-macos-$RGV_ARCH.dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "dist/RGV-macos-$RGV_ARCH.dmg"
+          xcrun stapler validate "dist/RGV-macos-$RGV_ARCH.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rgv-macos-${{ matrix.architecture }}
+          path: |
+            dist/*.dmg
+            dist/*.cdx.json
+            dist/*.provenance.json
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2025
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked --release -p rgv-desktop
+      - name: Require signing credentials
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PFX)) { throw "WINDOWS_CERTIFICATE_PFX is required" }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) { throw "WINDOWS_CERTIFICATE_PASSWORD is required" }
+      - name: Sign executable and build signed MSI
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\rgv-signing.pfx", [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX))
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signTool) { throw "SignTool was not found" }
+          & $signTool.FullName sign /fd SHA256 /tr https://timestamp.digicert.com /td SHA256 /f "$env:RUNNER_TEMP\rgv-signing.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD target\release\rgv-desktop.exe
+          & $signTool.FullName verify /pa /v target\release\rgv-desktop.exe
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          python packaging/stage_package.py --platform windows --architecture x86_64 --version $version --build-number $env:GITHUB_RUN_NUMBER --binary target/release/rgv-desktop.exe --destination dist/stage
+          $packageRoot = "$env:GITHUB_WORKSPACE\dist\stage\RGV-windows-x86_64"
+          dotnet build packaging\windows\RGV.wixproj -c Release -p:RgvVersion=$version -p:RgvBinary="$packageRoot\rgv-desktop.exe" -p:RgvPackageRoot=$packageRoot -p:RgvResources="$packageRoot\licenses" -o dist
+          & $signTool.FullName sign /fd SHA256 /tr https://timestamp.digicert.com /td SHA256 /f "$env:RUNNER_TEMP\rgv-signing.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD dist\RGV-windows-x86_64.msi
+          & $signTool.FullName verify /pa /v dist\RGV-windows-x86_64.msi
+          Copy-Item "$packageRoot\rgv-desktop.exe" dist\RGV-windows-x86_64.exe
+          Copy-Item "$packageRoot\licenses\RGV.cdx.json" dist\RGV-windows-x86_64.cdx.json
+          Copy-Item "$packageRoot\licenses\BUILD-PROVENANCE.json" dist\RGV-windows-x86_64.provenance.json
+          Compress-Archive -Path $packageRoot -DestinationPath dist\RGV-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rgv-windows-x86_64
+          path: dist/RGV-windows-x86_64.*
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install --yes libfontconfig1-dev libxkbcommon-dev libwayland-dev
+      - run: cargo build --locked --release -p rgv-desktop
+      - name: Package tarball
+        run: |
+          python3 packaging/stage_package.py --platform linux --architecture x86_64 --version "${GITHUB_REF_NAME#v}" --build-number "$GITHUB_RUN_NUMBER" --binary target/release/rgv-desktop --destination dist/stage
+          cp dist/stage/RGV-linux-x86_64/share/doc/rgv/RGV.cdx.json dist/RGV-linux-x86_64.cdx.json
+          cp dist/stage/RGV-linux-x86_64/share/doc/rgv/BUILD-PROVENANCE.json dist/RGV-linux-x86_64.provenance.json
+          tar -C dist/stage -czf dist/RGV-linux-x86_64.tar.gz RGV-linux-x86_64
+      - name: Package AppImage with pinned tool
+        env:
+          APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+        run: |
+          mkdir -p dist/RGV.AppDir/usr/bin
+          cp dist/stage/RGV-linux-x86_64/bin/rgv-desktop dist/RGV.AppDir/usr/bin/
+          cp -R dist/stage/RGV-linux-x86_64/share dist/RGV.AppDir/usr/
+          cp packaging/linux/AppRun dist/RGV.AppDir/AppRun
+          cp packaging/linux/rgv.desktop dist/RGV.AppDir/rgv.desktop
+          cp packaging/linux/rgv.svg dist/RGV.AppDir/rgv.svg
+          chmod +x dist/RGV.AppDir/AppRun
+          curl --fail --location https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage --output "$RUNNER_TEMP/appimagetool"
+          echo "$APPIMAGETOOL_SHA256  $RUNNER_TEMP/appimagetool" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 VERSION="${GITHUB_REF_NAME#v}" "$RUNNER_TEMP/appimagetool" --no-appstream dist/RGV.AppDir dist/RGV-linux-x86_64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rgv-linux-x86_64
+          path: |
+            dist/RGV-linux-x86_64.tar.gz
+            dist/RGV-linux-x86_64.AppImage
+            dist/RGV-linux-x86_64.cdx.json
+            dist/RGV-linux-x86_64.provenance.json
+          if-no-files-found: error
+
+  publish:
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum RGV-* > SHA256SUMS
+      - name: Attest release artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/RGV-*
+      - name: Publish immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --verify-tag --generate-notes --title "RGV ${{ github.ref_name }}"

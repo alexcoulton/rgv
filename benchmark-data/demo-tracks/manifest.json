@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "locus": "chrVariants:8501-16000",
+  "project": "rgv-demo-project.json",
+  "files": [
+    {
+      "path": "archive.tdf",
+      "sha256": "790f57cd3df8eebcb42359ffc5c48b203635971e5c52d3a9542e6c64c72bd9ff",
+      "purpose": "multi-channel archived quantitative signal"
+    },
+    {
+      "path": "association.gwas",
+      "sha256": "0c166e7618dcf4d5a999aa0ef992505310656de0905150565d90925d009f3a64",
+      "purpose": "GWAS Manhattan points and identifier search"
+    },
+    {
+      "path": "cohort.seg",
+      "sha256": "0c0e031d39c2a4beb2d087c16d8dc5d65d3389cc4d6e308d1eff8f68848cc99a",
+      "purpose": "multi-sample copy-number matrix"
+    },
+    {
+      "path": "features.bed.gz",
+      "sha256": "1eee435ebc300e20302d71d5a4153c65e8e72aa3d94eddab2a41a62390c01bd3",
+      "purpose": "compressed BED12 annotation"
+    },
+    {
+      "path": "features.bigBed",
+      "sha256": "c21e5964b65f9a5190dd751dc0b5eadabbc4cb5f84e666937917f72b930c3645",
+      "purpose": "generic indexed annotation"
+    },
+    {
+      "path": "genes.bigGenePred",
+      "sha256": "0f38a9a8c1ada0b64f462fbcc31c47bfb8402c046abb417f46cea82c5a0d369b",
+      "purpose": "indexed typed transcript annotation"
+    },
+    {
+      "path": "genes.gtf.gz",
+      "sha256": "57722286feb8a16da5546d3b6523139f8350fcf92dbe9443a3706c48941aad09",
+      "purpose": "compressed gene and CDS annotation"
+    },
+    {
+      "path": "interactions.interact",
+      "sha256": "46684723e538f3f0b5f7c8dbc02114c8322625c11928d910c8e8f20b773dc9fc",
+      "purpose": "directional UCSC interaction"
+    },
+    {
+      "path": "loops.bedpe",
+      "sha256": "f63ccd03cd0e3e941c73dd03f2dc64c734b4db8547cb0de62933fd65cb7906f0",
+      "purpose": "paired-endpoint interaction arcs"
+    },
+    {
+      "path": "mutations.maf",
+      "sha256": "5d52ffa99580cec1f9148111d5ef46052cda9e57c78a5b2149c0b41c72f5f3b1",
+      "purpose": "somatic mutation samples"
+    },
+    {
+      "path": "peaks.bigNarrowPeak",
+      "sha256": "d5db8de7c6f811c55c441a9d1247c34de615c4d6cbb0f7dbdc34b76c9da8b566",
+      "purpose": "indexed typed peak with summit"
+    },
+    {
+      "path": "peaks.narrowPeak",
+      "sha256": "4f7011fb706843d31866aa445b59620374dd3228ba53ff7fe014c801b5970bd9",
+      "purpose": "text peak with summit"
+    },
+    {
+      "path": "regions.broadPeak",
+      "sha256": "00c898c471a997b1d52328ec50ca2a054b2151a03af5e8a15598f262a1506c42",
+      "purpose": "text broad peak without summit"
+    },
+    {
+      "path": "rgv-alignment-review-project.json",
+      "sha256": "6ad4ee9d4b3d1ebe6f581c045fb9348b6be02f1a74f0ee4aa4c75a6402acde47",
+      "purpose": "ready-to-open multi-panel alignment truth project"
+    },
+    {
+      "path": "rgv-demo-project.json",
+      "sha256": "3ea27317b17ea2621fd2e223395b8ab7f33e162e1d5513f8031e0fa42aa812e9",
+      "purpose": "ready-to-open mixed-format RGV project"
+    },
+    {
+      "path": "signal.bedGraph",
+      "sha256": "09db65a9f8aaf8fb7fec4d5028c58a29e64c3d7c4a5a6d0a79e3fb3f86c84732",
+      "purpose": "signed quantitative intervals"
+    },
+    {
+      "path": "signal.bigWig",
+      "sha256": "270e086145a4b477d246d96674510f9349843ab86875ccf866f9b9c7edc692c7",
+      "purpose": "indexed quantitative intervals"
+    },
+    {
+      "path": "signal.wig",
+      "sha256": "08f43c55309d13cb58ba07c5f568ca31a9d168e0a26514963c1d215c5708aa94",
+      "purpose": "variable-step WIG signal"
+    },
+    {
+      "path": "target-alignments.psl",
+      "sha256": "94b9b6a3551efe2df1f98205b80e2561dee997d90adc72473ec7359726d007b6",
+      "purpose": "nucleotide target alignment blocks"
+    },
+    {
+      "path": "transcripts.genePred",
+      "sha256": "e9916cda35cde560825c09d977697dfc7f1b8c746cfca4deb7e26574ab6184c7",
+      "purpose": "text transcript and CDS model"
+    },
+    {
+      "path": "variants.bcf",
+      "sha256": "abbf9fe2f10bea4393c06eadbe8942bf867142ccff5d78d41cf8eced080deda3",
+      "purpose": "typed variants, structural evidence, and genotypes"
+    },
+    {
+      "path": "variants.bcf.csi",
+      "sha256": "6c78a0257cae414f15e7b8cffca8f099592891c23d7d114e7059caf4213c7366",
+      "purpose": "CSI index for the demo BCF"
+    }
+  ]
+}

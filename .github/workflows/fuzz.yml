@@ -1,0 +1,38 @@
+name: Fuzz resilience
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes clang libfontconfig1-dev libxkbcommon-dev libwayland-dev
+      - run: cargo install cargo-fuzz --locked
+      - name: Generate deterministic alignment seed corpus
+        run: cargo run --locked --release -p rgv-alignment-bench -- generate
+      - name: Fuzz parser and normalized-record boundaries
+        run: |
+          cargo fuzz run filter_expression -- -max_total_time=60
+          cargo fuzz run modified_bases -- -max_total_time=60
+          cargo fuzz run session_input -- -max_total_time=60
+          cargo fuzz run text_features -- -max_total_time=60
+          cargo fuzz run alignment_file -- -max_total_time=60
+          cargo fuzz run normalized_record -- -max_total_time=60
+      - name: Retain reproducer inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-reproducers-${{ github.sha }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 30

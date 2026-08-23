@@ -1,0 +1,5 @@
+track type=bedGraph name=RGV_demo_signal
+chrVariants	8500	9300	2.5
+chrVariants	9300	10000	8.0
+chrVariants	10000	11000	-3.5
+chrVariants	11000	12500	5.0

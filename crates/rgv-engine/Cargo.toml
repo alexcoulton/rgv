@@ -1,0 +1,21 @@
+[package]
+name = "rgv-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+crossbeam-channel.workspace = true
+lru.workspace = true
+rgv-core = { version = "0.1.0", path = "../rgv-core" }
+rgv-hts = { version = "0.1.0", path = "../rgv-hts" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

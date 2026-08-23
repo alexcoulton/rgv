@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "datasets": [
+    {
+      "id": "rgv-deterministic-mixed",
+      "categories": ["synthetic"],
+      "alignment": "../benchmark-data/mixed.bam",
+      "alignment_sha256": "b6c505d68495c3ce842f524b830bdc35dbd768faeb2bfd3c7b67edfa19a2e57c",
+      "index": "../benchmark-data/mixed.bam.bai",
+      "index_sha256": "887c7afa17bc387a9875dc917fc21bc887eaaf8824225b03f040afa41832cb65",
+      "reference": null,
+      "reference_sha256": null,
+      "loci": [
+        {
+          "region": "chr1:900001-920000",
+          "expected": {
+            "minimum_records_seen": 150000,
+            "minimum_records_emitted": 40000
+          }
+        },
+        {
+          "region": "chr1:1-200000",
+          "expected": {
+            "minimum_records_seen": 10000,
+            "required": ["paired"]
+          }
+        },
+        {
+          "region": "chr1:2100001-2301000",
+          "expected": {
+            "minimum_records_seen": 9000,
+            "required": ["spliced"],
+            "junctions": {
+              "distinct": 10000,
+              "total_depth": 10000,
+              "xs_tagged": 5000,
+              "alignment_strand_fallback": 2500,
+              "invalid_xs": 2500
+            }
+          }
+        },
+        {
+          "region": "chr1:2590001-2650000",
+          "expected": {
+            "minimum_records_seen": 9,
+            "required": ["paired"]
+          }
+        },
+        {
+          "region": "chr2:1-2000000",
+          "expected": {
+            "minimum_records_seen": 1500,
+            "required": [
+              "supplementary",
+              "long-read",
+              "modified-bases",
+              "smrt-kinetics",
+              "sbx-evidence"
+            ]
+          }
+        },
+        {
+          "region": "chr2:2500001-2550000",
+          "expected": {
+            "minimum_records_seen": 1,
+            "required": ["long-read", "long-cigar"]
+          }
+        }
+      ]
+    },
+    {
+      "id": "rgv-deterministic-variant-and-ultima-truth",
+      "categories": ["synthetic", "ultima"],
+      "alignment": "../benchmark-data/variants.bam",
+      "alignment_sha256": "76338ecbdf7012493971c9d293ef7e914861dfba847ae692e9533e7671fa88e3",
+      "index": "../benchmark-data/variants.bam.bai",
+      "index_sha256": "53591e06ced802b835c2b38b30058b58448e78e3925cc66c768147d82758370c",
+      "reference": "../benchmark-data/variants.fa",
+      "reference_sha256": "e4940a3d5611de386f6dbc12bc36240523fb94440a93c7508682a4316e30aed9",
+      "loci": [
+        {
+          "region": "chrVariants:13991-15120",
+          "expected": {
+            "minimum_records_seen": 3,
+            "minimum_records_emitted": 3,
+            "required": ["ultima-evidence"]
+          }
+        }
+      ]
+    }
+  ]
+}

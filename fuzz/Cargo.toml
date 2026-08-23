@@ -1,0 +1,56 @@
+[package]
+name = "rgv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rgv-core = { version = "0.1.0", path = "../crates/rgv-core" }
+rgv-hts = { version = "0.1.0", path = "../crates/rgv-hts" }
+tempfile = "3.23"
+
+[[bin]]
+name = "filter_expression"
+path = "fuzz_targets/filter_expression.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "modified_bases"
+path = "fuzz_targets/modified_bases.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_input"
+path = "fuzz_targets/session_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_features"
+path = "fuzz_targets/text_features.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "alignment_file"
+path = "fuzz_targets/alignment_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "normalized_record"
+path = "fuzz_targets/normalized_record.rs"
+test = false
+doc = false
+bench = false

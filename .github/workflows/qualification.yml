@@ -1,0 +1,72 @@
+name: Beta qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      corpus_manifest:
+        description: Absolute path to the pinned private real-world corpus manifest
+        required: true
+        type: string
+      igv_samples:
+        description: Absolute path to matched raw IGV timing samples
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: [self-hosted, rgv-benchmark]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify immutable inputs exist
+        env:
+          CORPUS_MANIFEST: ${{ inputs.corpus_manifest }}
+          IGV_SAMPLES: ${{ inputs.igv_samples }}
+        run: |
+          test -f "$CORPUS_MANIFEST"
+          test -f "$IGV_SAMPLES"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --locked
+      - name: Verify cross-platform package staging
+        run: python3 -m unittest discover -s packaging/tests -v
+      - name: Run synthetic semantic corpus
+        run: |
+          cargo run --locked --release -p rgv-alignment-bench -- generate
+          cargo run --locked --release -p rgv-validation-runner -- validation/synthetic-corpus.json --output benchmark-results/validation-synthetic-latest.json
+      - name: Run real-world fixture matrix
+        env:
+          CORPUS_MANIFEST: ${{ inputs.corpus_manifest }}
+        run: cargo run --locked --release -p rgv-validation-runner -- "$CORPUS_MANIFEST" --require-complete-matrix --output benchmark-results/validation-real-world.json
+      - name: Enforce local interaction budgets
+        run: |
+          cargo run --locked --release -p rgv-interaction-bench -- benchmark-data/mixed.bam --locus chr1:900001-920000 --iterations 10 --maximum-median-ms 16 --maximum-p95-ms 33 --maximum-layout-ms 16 --require-rss --output benchmark-results/interaction-latest.json
+          cargo run --locked --release -p rgv-interaction-bench -- benchmark-data/mixed.bam --locus chr1:900001-920000 --panel-locus chr2:1-200000 --track-count 1 --iterations 10 --maximum-median-ms 16 --maximum-p95-ms 33 --maximum-layout-ms 16 --require-rss --output benchmark-results/interaction-1-track-2-panel-latest.json
+          cargo run --locked --release -p rgv-interaction-bench -- benchmark-data/mixed.bam --locus chr1:900001-920000 --panel-locus chr2:1-200000 --track-count 4 --iterations 10 --maximum-median-ms 16 --maximum-p95-ms 33 --maximum-layout-ms 16 --require-rss --output benchmark-results/interaction-4-track-2-panel-latest.json
+          cargo run --locked --release -p rgv-interaction-bench -- benchmark-data/mixed.bam --locus chr1:900001-920000 --panel-locus chr2:1-200000 --track-count 8 --iterations 10 --maximum-median-ms 16 --maximum-p95-ms 33 --maximum-layout-ms 16 --require-rss --output benchmark-results/interaction-8-track-2-panel-latest.json
+      - name: Enforce simulated WAN budgets
+        run: cargo run --locked --release -p rgv-remote-range-bench -- --output benchmark-results/remote-range-latest.json
+      - name: Compile and enforce IGV comparison
+        env:
+          IGV_SAMPLES: ${{ inputs.igv_samples }}
+        run: cargo run --locked --release -p rgv-igv-comparison -- benchmark-results/interaction-latest.json "$IGV_SAMPLES" --output benchmark-results/RGV_VS_IGV.md --require-rgv-faster --require-complete-telemetry
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rgv-beta-qualification-${{ github.sha }}
+          path: |
+            benchmark-results/interaction-latest.json
+            benchmark-results/interaction-1-track-2-panel-latest.json
+            benchmark-results/interaction-4-track-2-panel-latest.json
+            benchmark-results/interaction-8-track-2-panel-latest.json
+            benchmark-results/remote-range-latest.json
+            benchmark-results/validation-synthetic-latest.json
+            benchmark-results/validation-real-world.json
+            benchmark-results/RGV_VS_IGV.md
+          if-no-files-found: error
+          retention-days: 90

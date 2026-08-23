@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "commands": [
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 30000
+    },
+    {
+      "command": "export",
+      "path": "../benchmark-results/alignment-review-workspace-track-names.tsv",
+      "kind": "track_names"
+    },
+    {
+      "command": "snapshot",
+      "path": "../benchmark-results/alignment-review-workspace.svg",
+      "scope": "visible_workspace",
+      "format": "svg"
+    },
+    {
+      "command": "exit"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+/target/
+/fuzz/target/
+.DS_Store
+
+# Local visual references supplied during GUI review.
+/Screenshot*.png
+/igv_layout_gui.png
+/rgv_layout_gui.png
+/rgv_zoom_*.png
+
+# HTSlib may cache this adjacent remote-test index in the crate working directory.
+/crates/rgv-hts/variants.bcf.csi

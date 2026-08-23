@@ -1,0 +1,7 @@
+# RGV 0.1.0 modified-base export v1
+# genome	BAM header
+# locus	chr1:910001-930000
+# coordinates	start is one-based; end is one-based inclusive; internal intervals are zero-based half-open
+# byte_limit	67108864
+track_id	track_name	contig	start	end	canonical_base	modification_code	modification_strand	implicit_mode	haplotype	modified_calls	canonical_observations	forward_modified_calls	reverse_modified_calls	raw_fraction	weighted_fraction	mean_probability	missing_probability_calls
+# track_provenance	1	Mixed short and long reads	eligible_records=154105	tagged_records=0	decoded_calls=0	malformed_records=0	unavailable_records=0	dropped_series=0	all_eligible_records=true

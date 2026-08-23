@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "locus": { "contig": "chr1", "start": 100, "end": 200 },
+  "alignment": { "Local": { "path": "data/reads.bam" } },
+  "reference": { "Local": { "path": "data/reference.fa" } },
+  "tracks": [
+    {
+      "id": 1,
+      "name": "genes",
+      "kind": "GeneModel",
+      "source": { "Local": { "path": "data/genes.gtf" } },
+      "visible": true,
+      "height": 120.0
+    }
+  ],
+  "filters": {
+    "minimum_mapping_quality": 20,
+    "include_secondary": false,
+    "include_supplementary": true,
+    "auxiliary_predicates": []
+  },
+  "maximum_alignments": 1234
+}

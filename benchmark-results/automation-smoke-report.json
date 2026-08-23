@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "succeeded": true,
+  "results": [
+    {
+      "command_index": 0,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Started a new workspace while retaining the active genome",
+      "data": {
+        "panel_id": 1
+      }
+    },
+    {
+      "command_index": 1,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Opened alignment track 1",
+      "data": {
+        "track_id": 1
+      }
+    },
+    {
+      "command_index": 2,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Navigated to 1 ordered loci",
+      "data": {
+        "loci": [
+          "chr1:900001-920000"
+        ]
+      }
+    },
+    {
+      "command_index": 3,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Added panel 2 at chr1:910001-930000",
+      "data": {
+        "locus": "chr1:910001-930000",
+        "panel_id": 2
+      }
+    },
+    {
+      "command_index": 4,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Set option show_junctions",
+      "data": {
+        "key": "show_junctions"
+      }
+    },
+    {
+      "command_index": 5,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Grouped 1 alignment tracks",
+      "data": {
+        "track_ids": [
+          1
+        ]
+      }
+    },
+    {
+      "command_index": 6,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Sorted 1 alignment tracks",
+      "data": {
+        "track_ids": [
+          1
+        ]
+      }
+    },
+    {
+      "command_index": 7,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Workspace reached a deterministic settled state",
+      "data": {
+        "settled": true
+      }
+    },
+    {
+      "command_index": 8,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-alignments.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-alignments.tsv"
+      }
+    },
+    {
+      "command_index": 9,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-pileup.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-pileup.tsv"
+      }
+    },
+    {
+      "command_index": 10,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-modifications.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-modifications.tsv"
+      }
+    },
+    {
+      "command_index": 11,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-junctions.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-junctions.tsv"
+      }
+    },
+    {
+      "command_index": 12,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Updated semantic selection",
+      "data": {
+        "panel_id": 2,
+        "position": 915000,
+        "track_id": 1
+      }
+    },
+    {
+      "command_index": 13,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-selected-evidence.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-selected-evidence.tsv"
+      }
+    },
+    {
+      "command_index": 14,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-full-panel.svg",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-full-panel.svg"
+      }
+    },
+    {
+      "command_index": 15,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-smoke.svg",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-smoke.svg"
+      }
+    },
+    {
+      "command_index": 16,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-track-names.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-track-names.tsv"
+      }
+    },
+    {
+      "command_index": 17,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Saved project to /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-project.json",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-project.json"
+      }
+    },
+    {
+      "command_index": 18,
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exit requested after the automation report is durable",
+      "data": {
+        "exit": true
+      }
+    }
+  ]
+}

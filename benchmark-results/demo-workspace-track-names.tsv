@@ -1,0 +1,25 @@
+# RGV 0.1.0 track-name export
+# genome	RGV mixed-format demo
+# panel_count	1
+track_id	kind	name	sample_key	visible
+1	alignment	Variant and specialist alignment truth		true
+2	feature	Features (gzip BED)		true
+3	genemodel	Genes (gzip GTF)		true
+4	genemodel	Transcripts		true
+5	feature	Narrow peaks		true
+6	feature	Broad peaks		true
+7	feature	PSL target alignments		true
+8	gwas	Association study		true
+9	variant	Variants and genotypes		true
+10	quantitative	Signal BigWig		true
+11	quantitative	archive sample one		true
+21	quantitative	archive sample two		true
+12	quantitative	Signal bedGraph		true
+13	quantitative	Signal WIG		true
+14	interaction	BEDPE loops		true
+15	interaction	UCSC interactions		true
+16	copynumber	Copy number		true
+17	mutation	Somatic mutations		true
+18	feature	Generic BigBed		true
+19	genemodel	Indexed transcripts		true
+20	feature	Indexed peaks		true

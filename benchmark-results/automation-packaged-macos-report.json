@@ -1,0 +1,288 @@
+{
+  "schema_version": 1,
+  "succeeded": true,
+  "results": [
+    {
+      "command_index": 0,
+      "command": "new_workspace",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Started a new workspace while retaining the active genome",
+      "data": {
+        "panel_id": 1
+      },
+      "elapsed_ms": 0.178791
+    },
+    {
+      "command_index": 1,
+      "command": "load_track",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Opened alignment track 1",
+      "data": {
+        "track_id": 1
+      },
+      "elapsed_ms": 352.745416
+    },
+    {
+      "command_index": 2,
+      "command": "goto",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Navigated to 1 ordered loci",
+      "data": {
+        "loci": [
+          "chr1:900001-920000"
+        ]
+      },
+      "elapsed_ms": 0.02325
+    },
+    {
+      "command_index": 3,
+      "command": "add_panel",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Added panel 2 at chr1:910001-930000",
+      "data": {
+        "locus": "chr1:910001-930000",
+        "panel_id": 2
+      },
+      "elapsed_ms": 0.019333
+    },
+    {
+      "command_index": 4,
+      "command": "set_option",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Set option show_junctions",
+      "data": {
+        "key": "show_junctions"
+      },
+      "elapsed_ms": 0.013291
+    },
+    {
+      "command_index": 5,
+      "command": "group",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Grouped 1 alignment tracks",
+      "data": {
+        "track_ids": [
+          1
+        ]
+      },
+      "elapsed_ms": 0.011792
+    },
+    {
+      "command_index": 6,
+      "command": "sort",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Sorted 1 alignment tracks",
+      "data": {
+        "track_ids": [
+          1
+        ]
+      },
+      "elapsed_ms": 0.019833
+    },
+    {
+      "command_index": 7,
+      "command": "wait_until_settled",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Workspace reached a deterministic settled state",
+      "data": {
+        "settled": true
+      },
+      "elapsed_ms": 117.860375
+    },
+    {
+      "command_index": 8,
+      "command": "export",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-alignments.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-alignments.tsv"
+      },
+      "elapsed_ms": 16.436916999999998
+    },
+    {
+      "command_index": 9,
+      "command": "export",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-pileup.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-pileup.tsv"
+      },
+      "elapsed_ms": 6.54725
+    },
+    {
+      "command_index": 10,
+      "command": "export",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-modifications.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-modifications.tsv"
+      },
+      "elapsed_ms": 10.300042000000001
+    },
+    {
+      "command_index": 11,
+      "command": "export",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-junctions.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-junctions.tsv"
+      },
+      "elapsed_ms": 7.053458
+    },
+    {
+      "command_index": 12,
+      "command": "select",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Updated semantic selection",
+      "data": {
+        "panel_id": 2,
+        "position": 915000,
+        "track_id": 1
+      },
+      "elapsed_ms": 0.40975
+    },
+    {
+      "command_index": 13,
+      "command": "export",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-selected-evidence.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-selected-evidence.tsv"
+      },
+      "elapsed_ms": 6.2125
+    },
+    {
+      "command_index": 14,
+      "command": "snapshot",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-full-panel.svg",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-full-panel.svg"
+      },
+      "elapsed_ms": 10.038583000000001
+    },
+    {
+      "command_index": 15,
+      "command": "snapshot",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-smoke.svg",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-smoke.svg"
+      },
+      "elapsed_ms": 6.918457999999999
+    },
+    {
+      "command_index": 16,
+      "command": "export",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-track-names.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-track-names.tsv"
+      },
+      "elapsed_ms": 10.100207999999999
+    },
+    {
+      "command_index": 17,
+      "command": "save",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Saved project to /Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-project.json",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/automation-project.json"
+      },
+      "elapsed_ms": 18.122458
+    },
+    {
+      "command_index": 18,
+      "command": "exit",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exit requested after the automation report is durable",
+      "data": {
+        "exit": true
+      },
+      "elapsed_ms": 0.0014160000000000002
+    }
+  ],
+  "telemetry": {
+    "run_elapsed_ms": 656.7721250000001,
+    "startup_to_first_frame_ms": 1677.1349579999999,
+    "startup_to_first_settled_ms": 1816.416625,
+    "environment": {
+      "application_version": "0.1.0",
+      "operating_system": "macos",
+      "architecture": "aarch64",
+      "gpu_adapter": "Apple M4",
+      "gpu_backend": "Metal",
+      "surface_width_pixels": 2560,
+      "surface_height_pixels": 1600,
+      "scale_factor": 2.0
+    },
+    "frames": {
+      "presented_frames": 31,
+      "samples_ms": [
+        9.96675,
+        2.778833,
+        9.127791,
+        6.603000000000001,
+        2.5102089999999997,
+        1.5375,
+        23.137916,
+        9.582291,
+        5.871042,
+        1.7182499999999998,
+        2.291958,
+        9.345666000000001,
+        7.549792,
+        9.124500000000001,
+        7.186708,
+        9.025834,
+        5.900667,
+        7.237165999999999,
+        7.060875,
+        9.102374999999999,
+        6.397625,
+        10.238125,
+        6.5058750000000005,
+        9.697417,
+        6.0251660000000005,
+        9.388667,
+        6.816792,
+        9.992917,
+        5.988042,
+        9.895,
+        5.308375
+      ],
+      "samples_dropped": 0,
+      "median_ms": 7.186708,
+      "p95_ms": 10.238125,
+      "maximum_ms": 23.137916
+    },
+    "gpu": {
+      "prepared_frames": 16,
+      "uploaded_frames": 2,
+      "total_uploaded_bytes": 263904,
+      "peak_uploaded_bytes": 263808,
+      "peak_instances": 5497,
+      "buffer_reallocations": 0,
+      "truncated_frames": 0
+    }
+  }
+}

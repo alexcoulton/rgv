@@ -1,0 +1,7 @@
+# RGV 0.1.0 junction export v1
+# genome	BAM header
+# locus	chr1:910001-930000
+# coordinates	start is one-based; end is one-based inclusive; internal intervals are zero-based half-open
+# byte_limit	67108864
+track_id	track_name	contig	start	end	depth	minimum_left_flank	minimum_right_flank	maximum_left_flank	maximum_right_flank	positive_depth	negative_depth	unknown_depth	tagged_positive_depth	tagged_negative_depth	fallback_positive_depth	fallback_negative_depth	invalid_strand_depth
+# track_provenance	1	Mixed short and long reads	eligible_records=154105	spliced_records=0	observations_examined=0	observations_retained=0	dropped_distinct=0	all_eligible_records=true

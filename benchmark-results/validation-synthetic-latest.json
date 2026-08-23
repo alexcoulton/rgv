@@ -1,0 +1,219 @@
+{
+  "manifest_schema_version": 1,
+  "categories": [
+    "synthetic",
+    "ultima"
+  ],
+  "datasets": [
+    {
+      "id": "rgv-deterministic-mixed",
+      "categories": [
+        "synthetic"
+      ],
+      "alignment_bytes": 19723042,
+      "open_ms": 0.501209,
+      "loci": [
+        {
+          "region": "chr1:900001-920000",
+          "query_ms": 105.278625,
+          "observed": {
+            "records_seen": 151259,
+            "records_emitted": 40009,
+            "spliced": 0,
+            "secondary": 0,
+            "supplementary": 0,
+            "paired": 314,
+            "long_read": 0,
+            "long_cigar": 0,
+            "modified_bases": 0,
+            "missing_sequence": 0,
+            "missing_quality": 0,
+            "bisulfite_evidence": 0,
+            "smrt_kinetics": 0,
+            "single_cell_tags": 0,
+            "sbx_evidence": 0,
+            "ultima_evidence": 0,
+            "junctions_distinct": 0,
+            "junction_depth": 0,
+            "junction_xs_tagged": 0,
+            "junction_alignment_strand_fallback": 0,
+            "junction_invalid_xs": 0
+          }
+        },
+        {
+          "region": "chr1:1-200000",
+          "query_ms": 16.187459,
+          "observed": {
+            "records_seen": 12438,
+            "records_emitted": 12438,
+            "spliced": 0,
+            "secondary": 0,
+            "supplementary": 0,
+            "paired": 12438,
+            "long_read": 0,
+            "long_cigar": 0,
+            "modified_bases": 0,
+            "missing_sequence": 0,
+            "missing_quality": 0,
+            "bisulfite_evidence": 0,
+            "smrt_kinetics": 0,
+            "single_cell_tags": 0,
+            "sbx_evidence": 0,
+            "ultima_evidence": 0,
+            "junctions_distinct": 0,
+            "junction_depth": 0,
+            "junction_xs_tagged": 0,
+            "junction_alignment_strand_fallback": 0,
+            "junction_invalid_xs": 0
+          }
+        },
+        {
+          "region": "chr1:2100001-2301000",
+          "query_ms": 15.481791999999999,
+          "observed": {
+            "records_seen": 10000,
+            "records_emitted": 10000,
+            "spliced": 10000,
+            "secondary": 0,
+            "supplementary": 0,
+            "paired": 0,
+            "long_read": 0,
+            "long_cigar": 0,
+            "modified_bases": 0,
+            "missing_sequence": 0,
+            "missing_quality": 0,
+            "bisulfite_evidence": 0,
+            "smrt_kinetics": 0,
+            "single_cell_tags": 0,
+            "sbx_evidence": 0,
+            "ultima_evidence": 0,
+            "junctions_distinct": 10000,
+            "junction_depth": 10000,
+            "junction_xs_tagged": 5000,
+            "junction_alignment_strand_fallback": 2500,
+            "junction_invalid_xs": 2500
+          }
+        },
+        {
+          "region": "chr1:2590001-2650000",
+          "query_ms": 0.289917,
+          "observed": {
+            "records_seen": 9,
+            "records_emitted": 9,
+            "spliced": 0,
+            "secondary": 0,
+            "supplementary": 0,
+            "paired": 9,
+            "long_read": 0,
+            "long_cigar": 0,
+            "modified_bases": 0,
+            "missing_sequence": 0,
+            "missing_quality": 0,
+            "bisulfite_evidence": 0,
+            "smrt_kinetics": 0,
+            "single_cell_tags": 0,
+            "sbx_evidence": 0,
+            "ultima_evidence": 0,
+            "junctions_distinct": 0,
+            "junction_depth": 0,
+            "junction_xs_tagged": 0,
+            "junction_alignment_strand_fallback": 0,
+            "junction_invalid_xs": 0
+          }
+        },
+        {
+          "region": "chr2:1-2000000",
+          "query_ms": 50.215625,
+          "observed": {
+            "records_seen": 2000,
+            "records_emitted": 2000,
+            "spliced": 0,
+            "secondary": 0,
+            "supplementary": 500,
+            "paired": 0,
+            "long_read": 1500,
+            "long_cigar": 0,
+            "modified_bases": 1500,
+            "missing_sequence": 0,
+            "missing_quality": 0,
+            "bisulfite_evidence": 0,
+            "smrt_kinetics": 8,
+            "single_cell_tags": 0,
+            "sbx_evidence": 1500,
+            "ultima_evidence": 0,
+            "junctions_distinct": 0,
+            "junction_depth": 0,
+            "junction_xs_tagged": 0,
+            "junction_alignment_strand_fallback": 0,
+            "junction_invalid_xs": 0
+          }
+        },
+        {
+          "region": "chr2:2500001-2550000",
+          "query_ms": 1.504958,
+          "observed": {
+            "records_seen": 1,
+            "records_emitted": 1,
+            "spliced": 0,
+            "secondary": 0,
+            "supplementary": 0,
+            "paired": 0,
+            "long_read": 1,
+            "long_cigar": 1,
+            "modified_bases": 0,
+            "missing_sequence": 0,
+            "missing_quality": 0,
+            "bisulfite_evidence": 0,
+            "smrt_kinetics": 0,
+            "single_cell_tags": 0,
+            "sbx_evidence": 1,
+            "ultima_evidence": 0,
+            "junctions_distinct": 0,
+            "junction_depth": 0,
+            "junction_xs_tagged": 0,
+            "junction_alignment_strand_fallback": 0,
+            "junction_invalid_xs": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "rgv-deterministic-variant-and-ultima-truth",
+      "categories": [
+        "synthetic",
+        "ultima"
+      ],
+      "alignment_bytes": 1086,
+      "open_ms": 0.335291,
+      "loci": [
+        {
+          "region": "chrVariants:13991-15120",
+          "query_ms": 0.256083,
+          "observed": {
+            "records_seen": 3,
+            "records_emitted": 3,
+            "spliced": 0,
+            "secondary": 0,
+            "supplementary": 0,
+            "paired": 0,
+            "long_read": 0,
+            "long_cigar": 0,
+            "modified_bases": 0,
+            "missing_sequence": 0,
+            "missing_quality": 0,
+            "bisulfite_evidence": 3,
+            "smrt_kinetics": 0,
+            "single_cell_tags": 0,
+            "sbx_evidence": 1,
+            "ultima_evidence": 3,
+            "junctions_distinct": 0,
+            "junction_depth": 0,
+            "junction_xs_tagged": 0,
+            "junction_alignment_strand_fallback": 0,
+            "junction_invalid_xs": 0
+          }
+        }
+      ]
+    }
+  ]
+}

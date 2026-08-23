@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "batch": "automation-smoke.json",
+  "reviewed_artifacts": [
+    {
+      "path": "../benchmark-results/automation-smoke.svg",
+      "sha256": "ea837d45815dba8ed16e73f3ed65f536c6010a9b9fcb76e534703033ec4d54f9"
+    },
+    {
+      "path": "../benchmark-results/automation-full-panel.svg",
+      "sha256": "027ecb709c3432fc93db082ffe00154c797cf976054ab3bf7cfcc6e5e57574df"
+    }
+  ],
+  "saved_project": {
+    "path": "../benchmark-results/automation-project.json",
+    "schema_version": 3,
+    "active_panel": 2,
+    "panel_ids": [
+      1,
+      2
+    ],
+    "alignment_tracks": [
+      {
+        "id": 1,
+        "group_mode": "strand",
+        "group_order": "natural",
+        "sort_mode": "base",
+        "sort_order": "natural"
+      }
+    ]
+  },
+  "telemetry": {
+    "operating_system": "macos",
+    "architecture": "aarch64",
+    "gpu_backend": "Metal",
+    "maximum_frame_median_ms": 16.0,
+    "maximum_frame_p95_ms": 33.0,
+    "maximum_dropped_samples": 0,
+    "maximum_truncated_frames": 0
+  }
+}

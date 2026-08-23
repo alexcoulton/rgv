@@ -1,0 +1,4 @@
+CHR	BP	SNP	P	BETA
+chrVariants	9100	rs-demo-1	1e-8	0.42
+chrVariants	10050	rs-demo-2	0	-0.31
+chrVariants	11950	rs-demo-3	0.004	0.12

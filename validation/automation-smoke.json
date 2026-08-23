@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "commands": [
+    {
+      "command": "new_workspace"
+    },
+    {
+      "command": "load_track",
+      "source": {
+        "Local": {
+          "path": "../benchmark-data/mixed.bam"
+        }
+      },
+      "kind": "Alignment",
+      "name": "Mixed short and long reads"
+    },
+    {
+      "command": "goto",
+      "loci": [
+        "chr1:900001-920000"
+      ]
+    },
+    {
+      "command": "add_panel",
+      "locus": "chr1:910001-930000"
+    },
+    {
+      "command": "set_option",
+      "scope": {
+        "scope": "workspace"
+      },
+      "key": "show_junctions",
+      "value": true
+    },
+    {
+      "command": "group",
+      "track_ids": [
+        1
+      ],
+      "mode": "strand"
+    },
+    {
+      "command": "sort",
+      "track_ids": [
+        1
+      ],
+      "mode": "base",
+      "direction": "natural"
+    },
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 30000
+    },
+    {
+      "command": "export",
+      "path": "../benchmark-results/automation-alignments.tsv",
+      "kind": "alignments"
+    },
+    {
+      "command": "export",
+      "path": "../benchmark-results/automation-pileup.tsv",
+      "kind": "pileup"
+    },
+    {
+      "command": "export",
+      "path": "../benchmark-results/automation-modifications.tsv",
+      "kind": "modifications"
+    },
+    {
+      "command": "export",
+      "path": "../benchmark-results/automation-junctions.tsv",
+      "kind": "junctions"
+    },
+    {
+      "command": "select",
+      "selection": {
+        "selection": "position",
+        "panel_id": 2,
+        "track_id": 1,
+        "position": 915000
+      }
+    },
+    {
+      "command": "export",
+      "path": "../benchmark-results/automation-selected-evidence.tsv",
+      "kind": "selected_evidence"
+    },
+    {
+      "command": "snapshot",
+      "path": "../benchmark-results/automation-full-panel.svg",
+      "scope": "full_active_panel",
+      "format": "svg"
+    },
+    {
+      "command": "snapshot",
+      "path": "../benchmark-results/automation-smoke.svg",
+      "scope": "visible_workspace",
+      "format": "svg"
+    },
+    {
+      "command": "export",
+      "path": "../benchmark-results/automation-track-names.tsv",
+      "kind": "track_names"
+    },
+    {
+      "command": "save",
+      "path": "../benchmark-results/automation-project.json"
+    },
+    {
+      "command": "exit"
+    }
+  ]
+}

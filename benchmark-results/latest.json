@@ -1,0 +1,734 @@
+{
+  "input": "benchmark-data/mixed.bam",
+  "input_bytes": 19268750,
+  "iterations": 5,
+  "remote_latency_ms": 2,
+  "measurements": [
+    {
+      "backend": "noodles",
+      "threads": 1,
+      "workload": "sequential-all",
+      "iterations_ms": [
+        117.57508299999999,
+        119.24341700000001,
+        122.847709,
+        130.25916700000002,
+        136.011458
+      ],
+      "median_ms": 122.847709,
+      "records": 282001,
+      "records_per_second": 2295533.244335879,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 282001,
+        "sequence_bases": 59895000,
+        "cigar_ops": 381500,
+        "reference_bases": 67635000,
+        "selected_tag_hits": 569002,
+        "name_hash": 10777149751234788762,
+        "flag_sum": 2876000
+      }
+    },
+    {
+      "backend": "rust-htslib",
+      "threads": 1,
+      "workload": "sequential-all",
+      "iterations_ms": [
+        96.106709,
+        106.34599999999999,
+        106.91187500000001,
+        112.260375,
+        120.788292
+      ],
+      "median_ms": 106.91187500000001,
+      "records": 282001,
+      "records_per_second": 2637695.765788412,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 282001,
+        "sequence_bases": 59895000,
+        "cigar_ops": 381500,
+        "reference_bases": 67635000,
+        "selected_tag_hits": 569002,
+        "name_hash": 10777149751234788762,
+        "flag_sum": 2876000
+      }
+    },
+    {
+      "backend": "rust-htslib-4t",
+      "threads": 4,
+      "workload": "sequential-all",
+      "iterations_ms": [
+        33.038125,
+        35.27975,
+        36.612708,
+        40.0815,
+        41.377959
+      ],
+      "median_ms": 36.612708,
+      "records": 282001,
+      "records_per_second": 7702271.025677751,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 282001,
+        "sequence_bases": 59895000,
+        "cigar_ops": 381500,
+        "reference_bases": 67635000,
+        "selected_tag_hits": 569002,
+        "name_hash": 10777149751234788762,
+        "flag_sum": 2876000
+      }
+    },
+    {
+      "backend": "rsomics-bamio",
+      "threads": 1,
+      "workload": "sequential-all",
+      "iterations_ms": [
+        96.29587500000001,
+        97.665875,
+        98.449959,
+        100.47416700000001,
+        104.95620799999999
+      ],
+      "median_ms": 98.449959,
+      "records": 282001,
+      "records_per_second": 2864409.5219988865,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 282001,
+        "sequence_bases": 59895000,
+        "cigar_ops": 381500,
+        "reference_bases": 67635000,
+        "selected_tag_hits": 569002,
+        "name_hash": 10777149751234788762,
+        "flag_sum": 2876000
+      }
+    },
+    {
+      "backend": "rsomics-bamio-4t",
+      "threads": 4,
+      "workload": "sequential-all",
+      "iterations_ms": [
+        45.080834,
+        56.02975,
+        57.051875,
+        57.62275,
+        62.173
+      ],
+      "median_ms": 57.051875,
+      "records": 282001,
+      "records_per_second": 4942887.503697293,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 282001,
+        "sequence_bases": 59895000,
+        "cigar_ops": 381500,
+        "reference_bases": 67635000,
+        "selected_tag_hits": 569002,
+        "name_hash": 10777149751234788762,
+        "flag_sum": 2876000
+      }
+    },
+    {
+      "backend": "noodles",
+      "threads": 1,
+      "workload": "broad-chr1",
+      "iterations_ms": [
+        81.46829199999999,
+        83.05479100000001,
+        91.453,
+        95.692333,
+        104.713708
+      ],
+      "median_ms": 91.453,
+      "records": 270000,
+      "records_per_second": 2952336.172678862,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 270000,
+        "sequence_bases": 0,
+        "cigar_ops": 0,
+        "reference_bases": 0,
+        "selected_tag_hits": 0,
+        "name_hash": 1797355829060079969,
+        "flag_sum": 1760000
+      }
+    },
+    {
+      "backend": "rust-htslib",
+      "threads": 1,
+      "workload": "broad-chr1",
+      "iterations_ms": [
+        69.82970900000001,
+        72.74075,
+        77.80525,
+        77.885875,
+        80.82050000000001
+      ],
+      "median_ms": 77.80525,
+      "records": 270000,
+      "records_per_second": 3470202.8462089635,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 270000,
+        "sequence_bases": 0,
+        "cigar_ops": 0,
+        "reference_bases": 0,
+        "selected_tag_hits": 0,
+        "name_hash": 1797355829060079969,
+        "flag_sum": 1760000
+      }
+    },
+    {
+      "backend": "rust-htslib-4t",
+      "threads": 4,
+      "workload": "broad-chr1",
+      "iterations_ms": [
+        23.476541,
+        30.872792,
+        30.966207999999998,
+        30.97475,
+        34.699625
+      ],
+      "median_ms": 30.966207999999998,
+      "records": 270000,
+      "records_per_second": 8719181.890142959,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 270000,
+        "sequence_bases": 0,
+        "cigar_ops": 0,
+        "reference_bases": 0,
+        "selected_tag_hits": 0,
+        "name_hash": 1797355829060079969,
+        "flag_sum": 1760000
+      }
+    },
+    {
+      "backend": "rsomics-bamio",
+      "threads": 1,
+      "workload": "broad-chr1",
+      "iterations_ms": [
+        111.878791,
+        116.887042,
+        130.994,
+        131.277167,
+        168.37379199999998
+      ],
+      "median_ms": 130.994,
+      "records": 270000,
+      "records_per_second": 2061163.1067071774,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 270000,
+        "sequence_bases": 0,
+        "cigar_ops": 0,
+        "reference_bases": 0,
+        "selected_tag_hits": 0,
+        "name_hash": 1797355829060079969,
+        "flag_sum": 1760000
+      }
+    },
+    {
+      "backend": "noodles",
+      "threads": 1,
+      "workload": "deep-hotspot",
+      "iterations_ms": [
+        57.978041,
+        63.131667,
+        65.445125,
+        69.58625,
+        71.39975
+      ],
+      "median_ms": 65.445125,
+      "records": 151259,
+      "records_per_second": 2311234.0300366143,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 151259,
+        "sequence_bases": 22688850,
+        "cigar_ops": 151259,
+        "reference_bases": 22688850,
+        "selected_tag_hits": 302518,
+        "name_hash": 8617489000469255033,
+        "flag_sum": 810080
+      }
+    },
+    {
+      "backend": "rust-htslib",
+      "threads": 1,
+      "workload": "deep-hotspot",
+      "iterations_ms": [
+        53.550458,
+        57.458417,
+        57.530417,
+        64.45625000000001,
+        65.98495799999999
+      ],
+      "median_ms": 57.530417,
+      "records": 151259,
+      "records_per_second": 2629200.480156436,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 151259,
+        "sequence_bases": 22688850,
+        "cigar_ops": 151259,
+        "reference_bases": 22688850,
+        "selected_tag_hits": 302518,
+        "name_hash": 8617489000469255033,
+        "flag_sum": 810080
+      }
+    },
+    {
+      "backend": "rust-htslib-4t",
+      "threads": 4,
+      "workload": "deep-hotspot",
+      "iterations_ms": [
+        18.39925,
+        18.774375,
+        19.5215,
+        24.556042,
+        26.193875
+      ],
+      "median_ms": 19.5215,
+      "records": 151259,
+      "records_per_second": 7748328.765719847,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 151259,
+        "sequence_bases": 22688850,
+        "cigar_ops": 151259,
+        "reference_bases": 22688850,
+        "selected_tag_hits": 302518,
+        "name_hash": 8617489000469255033,
+        "flag_sum": 810080
+      }
+    },
+    {
+      "backend": "rsomics-bamio",
+      "threads": 1,
+      "workload": "deep-hotspot",
+      "iterations_ms": [
+        85.76675,
+        86.191209,
+        92.153792,
+        100.649958,
+        107.070167
+      ],
+      "median_ms": 92.153792,
+      "records": 151259,
+      "records_per_second": 1641375.7558668882,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 151259,
+        "sequence_bases": 22688850,
+        "cigar_ops": 151259,
+        "reference_bases": 22688850,
+        "selected_tag_hits": 302518,
+        "name_hash": 8617489000469255033,
+        "flag_sum": 810080
+      }
+    },
+    {
+      "backend": "noodles",
+      "threads": 1,
+      "workload": "spliced",
+      "iterations_ms": [
+        4.496499999999999,
+        5.246542,
+        5.735083,
+        6.2335,
+        7.0267919999999995
+      ],
+      "median_ms": 5.735083,
+      "records": 10000,
+      "records_per_second": 1743653.9279379216,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 10000,
+        "sequence_bases": 1500000,
+        "cigar_ops": 30000,
+        "reference_bases": 11500000,
+        "selected_tag_hits": 20000,
+        "name_hash": 587222713948496909,
+        "flag_sum": 80000
+      }
+    },
+    {
+      "backend": "rust-htslib",
+      "threads": 1,
+      "workload": "spliced",
+      "iterations_ms": [
+        4.01375,
+        5.025042,
+        5.506208,
+        6.511583,
+        6.733125
+      ],
+      "median_ms": 5.506208,
+      "records": 10000,
+      "records_per_second": 1816131.9005747694,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 10000,
+        "sequence_bases": 1500000,
+        "cigar_ops": 30000,
+        "reference_bases": 11500000,
+        "selected_tag_hits": 20000,
+        "name_hash": 587222713948496909,
+        "flag_sum": 80000
+      }
+    },
+    {
+      "backend": "rust-htslib-4t",
+      "threads": 4,
+      "workload": "spliced",
+      "iterations_ms": [
+        2.229917,
+        2.368958,
+        2.4814580000000004,
+        2.795334,
+        3.241041
+      ],
+      "median_ms": 2.4814580000000004,
+      "records": 10000,
+      "records_per_second": 4029888.879844027,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 10000,
+        "sequence_bases": 1500000,
+        "cigar_ops": 30000,
+        "reference_bases": 11500000,
+        "selected_tag_hits": 20000,
+        "name_hash": 587222713948496909,
+        "flag_sum": 80000
+      }
+    },
+    {
+      "backend": "rsomics-bamio",
+      "threads": 1,
+      "workload": "spliced",
+      "iterations_ms": [
+        4.824417,
+        4.874459,
+        4.962709,
+        6.019916,
+        7.39175
+      ],
+      "median_ms": 4.962709,
+      "records": 10000,
+      "records_per_second": 2015028.4854501844,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 10000,
+        "sequence_bases": 1500000,
+        "cigar_ops": 30000,
+        "reference_bases": 11500000,
+        "selected_tag_hits": 20000,
+        "name_hash": 587222713948496909,
+        "flag_sum": 80000
+      }
+    },
+    {
+      "backend": "noodles",
+      "threads": 1,
+      "workload": "long-modified-split",
+      "iterations_ms": [
+        23.634291,
+        26.154375,
+        30.048458,
+        33.247040999999996,
+        34.977000000000004
+      ],
+      "median_ms": 30.048458,
+      "records": 2000,
+      "records_per_second": 66559.15588081093,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 2000,
+        "sequence_bases": 17825000,
+        "cigar_ops": 11500,
+        "reference_bases": 15600000,
+        "selected_tag_hits": 9000,
+        "name_hash": 15096299670468389949,
+        "flag_sum": 1036000
+      }
+    },
+    {
+      "backend": "rust-htslib",
+      "threads": 1,
+      "workload": "long-modified-split",
+      "iterations_ms": [
+        20.746292,
+        23.81325,
+        24.19025,
+        24.560792000000003,
+        25.845375
+      ],
+      "median_ms": 24.19025,
+      "records": 2000,
+      "records_per_second": 82677.93842560536,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 2000,
+        "sequence_bases": 17825000,
+        "cigar_ops": 11500,
+        "reference_bases": 15600000,
+        "selected_tag_hits": 9000,
+        "name_hash": 15096299670468389949,
+        "flag_sum": 1036000
+      }
+    },
+    {
+      "backend": "rust-htslib-4t",
+      "threads": 4,
+      "workload": "long-modified-split",
+      "iterations_ms": [
+        7.600833000000001,
+        8.415542,
+        8.94725,
+        9.665667,
+        10.024666
+      ],
+      "median_ms": 8.94725,
+      "records": 2000,
+      "records_per_second": 223532.37028137138,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 2000,
+        "sequence_bases": 17825000,
+        "cigar_ops": 11500,
+        "reference_bases": 15600000,
+        "selected_tag_hits": 9000,
+        "name_hash": 15096299670468389949,
+        "flag_sum": 1036000
+      }
+    },
+    {
+      "backend": "rsomics-bamio",
+      "threads": 1,
+      "workload": "long-modified-split",
+      "iterations_ms": [
+        24.550833,
+        25.618792000000003,
+        26.5115,
+        30.031792000000003,
+        32.967333
+      ],
+      "median_ms": 26.5115,
+      "records": 2000,
+      "records_per_second": 75438.96045112498,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 2000,
+        "sequence_bases": 17825000,
+        "cigar_ops": 11500,
+        "reference_bases": 15600000,
+        "selected_tag_hits": 9000,
+        "name_hash": 15096299670468389949,
+        "flag_sum": 1036000
+      }
+    },
+    {
+      "backend": "noodles",
+      "threads": 1,
+      "workload": "long-cigar",
+      "iterations_ms": [
+        0.465916,
+        0.5385,
+        0.5436660000000001,
+        0.622417,
+        0.6985830000000001
+      ],
+      "median_ms": 0.5436660000000001,
+      "records": 1,
+      "records_per_second": 1839.3646098891597,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 1,
+        "sequence_bases": 70000,
+        "cigar_ops": 70000,
+        "reference_bases": 35000,
+        "selected_tag_hits": 2,
+        "name_hash": 8387821956199744942,
+        "flag_sum": 0
+      }
+    },
+    {
+      "backend": "rust-htslib",
+      "threads": 1,
+      "workload": "long-cigar",
+      "iterations_ms": [
+        0.427208,
+        0.446458,
+        0.451167,
+        0.480041,
+        0.5865
+      ],
+      "median_ms": 0.451167,
+      "records": 1,
+      "records_per_second": 2216.4741658853595,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 1,
+        "sequence_bases": 70000,
+        "cigar_ops": 70000,
+        "reference_bases": 35000,
+        "selected_tag_hits": 2,
+        "name_hash": 8387821956199744942,
+        "flag_sum": 0
+      }
+    },
+    {
+      "backend": "rust-htslib-4t",
+      "threads": 4,
+      "workload": "long-cigar",
+      "iterations_ms": [
+        0.443042,
+        0.468583,
+        0.477,
+        0.6956249999999999,
+        0.8147500000000001
+      ],
+      "median_ms": 0.477,
+      "records": 1,
+      "records_per_second": 2096.4360587002097,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 1,
+        "sequence_bases": 70000,
+        "cigar_ops": 70000,
+        "reference_bases": 35000,
+        "selected_tag_hits": 2,
+        "name_hash": 8387821956199744942,
+        "flag_sum": 0
+      }
+    },
+    {
+      "backend": "rsomics-bamio",
+      "threads": 1,
+      "workload": "long-cigar",
+      "iterations_ms": [
+        0.7912079999999999,
+        0.8702500000000001,
+        0.87675,
+        0.8805,
+        0.898
+      ],
+      "median_ms": 0.87675,
+      "records": 1,
+      "records_per_second": 1140.575990875392,
+      "remote_requests": null,
+      "remote_bytes": null,
+      "digest": {
+        "records": 1,
+        "sequence_bases": 70000,
+        "cigar_ops": 70000,
+        "reference_bases": 35000,
+        "selected_tag_hits": 2,
+        "name_hash": 8387821956199744942,
+        "flag_sum": 0
+      }
+    },
+    {
+      "backend": "noodles-http",
+      "threads": 1,
+      "workload": "remote-deep-hotspot",
+      "iterations_ms": [
+        184.66987500000002,
+        200.05620800000003,
+        228.550083,
+        240.249416,
+        573.476458
+      ],
+      "median_ms": 228.550083,
+      "records": 151259,
+      "records_per_second": 661819.930295103,
+      "remote_requests": [
+        38,
+        38,
+        38,
+        38,
+        38
+      ],
+      "remote_bytes": [
+        9441305,
+        9441305,
+        9441305,
+        9441305,
+        9441305
+      ],
+      "digest": {
+        "records": 151259,
+        "sequence_bases": 22688850,
+        "cigar_ops": 151259,
+        "reference_bases": 22688850,
+        "selected_tag_hits": 302518,
+        "name_hash": 8617489000469255033,
+        "flag_sum": 810080
+      }
+    },
+    {
+      "backend": "rust-htslib-http",
+      "threads": 1,
+      "workload": "remote-deep-hotspot",
+      "iterations_ms": [
+        54.104709,
+        57.883540999999994,
+        60.447666999999996,
+        61.968666,
+        62.056124999999994
+      ],
+      "median_ms": 60.447666999999996,
+      "records": 151259,
+      "records_per_second": 2502313.2819997836,
+      "remote_requests": [
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "remote_bytes": [
+        35669792,
+        35669792,
+        35669792,
+        35669792,
+        35669792
+      ],
+      "digest": {
+        "records": 151259,
+        "sequence_bases": 22688850,
+        "cigar_ops": 151259,
+        "reference_bases": 22688850,
+        "selected_tag_hits": 302518,
+        "name_hash": 8617489000469255033,
+        "flag_sum": 810080
+      }
+    }
+  ]
+}

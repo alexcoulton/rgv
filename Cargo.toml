@@ -1,0 +1,72 @@
+[workspace]
+members = [
+    "apps/rgv-desktop",
+    "benchmarks/alignment-io",
+    "benchmarks/interaction",
+    "benchmarks/comparison",
+    "benchmarks/remote-range",
+    "validation/runner",
+    "crates/rgv-core",
+    "crates/rgv-engine",
+    "crates/rgv-hts",
+    "crates/rgv-layout",
+    "crates/rgv-render",
+]
+resolver = "2"
+exclude = ["fuzz"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+ab_glyph = "0.2.32"
+anyhow = "1.0"
+bigtools = { version = "0.5.8", default-features = false, features = ["read"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5.16"
+egui = "0.35.0"
+egui-wgpu = "0.35.0"
+egui-winit = { version = "0.35.0", features = ["accesskit"] }
+epaint_default_fonts = "0.35.0"
+flate2 = "1.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+lru = "0.18.2"
+noodles = { version = "0.115.0", features = ["bam", "bgzf", "core", "cram", "csi", "fasta", "sam"] }
+noodles-bgzf = { version = "0.51.0", features = ["libdeflate"] }
+noodles110 = { package = "noodles", version = "=0.110.0", features = ["bam", "core", "sam"] }
+pollster = "0.4.0"
+quick-xml = "0.41"
+rayon = "1.12.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
+rfd = "0.17.2"
+rsomics-bamio = { version = "0.8.4", default-features = false }
+rust-htslib = { version = "1.0.1", default-features = false, features = ["curl", "libdeflate"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+tempfile = "3.23"
+thiserror = "2.0"
+tiny_http = "0.12"
+tokio = { version = "1.34", features = ["rt-multi-thread"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+wgpu = "29.0"
+winit = "0.30.13"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "succeeded": true,
+  "results": [
+    {
+      "command_index": 0,
+      "command": "wait_until_settled",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Workspace reached a deterministic settled state",
+      "data": {
+        "settled": true
+      },
+      "elapsed_ms": 489.211084
+    },
+    {
+      "command_index": 1,
+      "command": "export",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/alignment-review-workspace-track-names.tsv",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/alignment-review-workspace-track-names.tsv"
+      },
+      "elapsed_ms": 4.410167
+    },
+    {
+      "command_index": 2,
+      "command": "snapshot",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exported /Users/alexcoulton/work/external.repos/rgv/benchmark-results/alignment-review-workspace.svg",
+      "data": {
+        "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-results/alignment-review-workspace.svg"
+      },
+      "elapsed_ms": 36.645125
+    },
+    {
+      "command_index": 3,
+      "command": "exit",
+      "status": "succeeded",
+      "error_code": null,
+      "message": "Exit requested after the automation report is durable",
+      "data": {
+        "exit": true
+      },
+      "elapsed_ms": 0.0015
+    }
+  ],
+  "telemetry": {
+    "run_elapsed_ms": 582.323875,
+    "startup_to_first_frame_ms": 1113.3447919999999,
+    "startup_to_first_settled_ms": 1575.83875,
+    "environment": {
+      "application_version": "0.1.0",
+      "operating_system": "macos",
+      "architecture": "aarch64",
+      "gpu_adapter": "Apple M4",
+      "gpu_backend": "Metal",
+      "surface_width_pixels": 2560,
+      "surface_height_pixels": 1600,
+      "scale_factor": 2.0
+    },
+    "frames": {
+      "presented_frames": 6,
+      "samples_ms": [
+        8.093291,
+        9.33025,
+        3.729417,
+        7.352209,
+        2.108375,
+        2.10975
+      ],
+      "samples_dropped": 0,
+      "median_ms": 7.352209,
+      "p95_ms": 9.33025,
+      "maximum_ms": 9.33025
+    },
+    "gpu": {
+      "prepared_frames": 5,
+      "uploaded_frames": 1,
+      "total_uploaded_bytes": 1801056,
+      "peak_uploaded_bytes": 1801056,
+      "peak_instances": 37522,
+      "buffer_reallocations": 1,
+      "truncated_frames": 0
+    }
+  }
+}

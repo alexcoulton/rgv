@@ -1,0 +1,27 @@
+[package]
+name = "rgv-hts"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bigtools.workspace = true
+flate2.workspace = true
+lru.workspace = true
+noodles.workspace = true
+reqwest.workspace = true
+rgv-core = { version = "0.1.0", path = "../rgv-core" }
+rust-htslib.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+bigtools = { workspace = true, features = ["write"] }
+tiny_http.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

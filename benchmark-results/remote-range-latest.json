@@ -1,0 +1,28 @@
+{
+  "latency_ms": 20,
+  "injected_failure": true,
+  "range_elapsed_ms": 99.059208,
+  "total_elapsed_ms": 809.230958,
+  "requests": 3,
+  "retries": 1,
+  "response_bytes": 786433,
+  "cache_hits": 3,
+  "cache_misses": 1,
+  "evictions": 0,
+  "cancellations": 0,
+  "second_read_added_requests": 0,
+  "alignment": {
+    "locus": "chr1:900001-920000",
+    "elapsed_ms": 383.857208,
+    "requests": 10,
+    "retries": 0,
+    "response_bytes": 14684514,
+    "cache_hits": 64,
+    "cache_misses": 8,
+    "evictions": 0,
+    "cancellations": 0,
+    "records_seen": 151259,
+    "records_retained": 40009,
+    "warm_query_added_requests": 0
+  }
+}

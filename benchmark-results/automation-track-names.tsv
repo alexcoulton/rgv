@@ -1,0 +1,5 @@
+# RGV 0.1.0 track-name export
+# genome	BAM header
+# panel_count	2
+track_id	kind	name	sample_key	visible
+1	alignment	Mixed short and long reads		true

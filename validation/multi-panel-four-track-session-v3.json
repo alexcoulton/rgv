@@ -1,0 +1,112 @@
+{
+  "schema_version": 3,
+  "locus": {
+    "contig": "chr2",
+    "start": 0,
+    "end": 200000
+  },
+  "panels": [
+    {
+      "id": 7,
+      "locus": {
+        "contig": "chr1",
+        "start": 900000,
+        "end": 920000
+      }
+    },
+    {
+      "id": 3,
+      "locus": {
+        "contig": "chr2",
+        "start": 0,
+        "end": 200000
+      }
+    }
+  ],
+  "active_panel": 3,
+  "alignment_tracks": [
+    {
+      "id": 1,
+      "name": "Tumour — haplotype",
+      "source": {
+        "Local": {
+          "path": "benchmark-data/mixed.bam"
+        }
+      },
+      "visible": true,
+      "collapsed": false,
+      "height": 300.0,
+      "filters": {
+        "alignment_color_mode": "haplotype",
+        "minimum_mapping_quality": 30,
+        "include_secondary": true,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    },
+    {
+      "id": 2,
+      "name": "Normal — strand",
+      "source": {
+        "Local": {
+          "path": "benchmark-data/mixed.bam"
+        }
+      },
+      "visible": true,
+      "collapsed": false,
+      "height": 240.0,
+      "filters": {
+        "alignment_color_mode": "strand",
+        "minimum_mapping_quality": 10,
+        "include_secondary": false,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    },
+    {
+      "id": 3,
+      "name": "Long-read review",
+      "source": {
+        "Local": {
+          "path": "benchmark-data/mixed.bam"
+        }
+      },
+      "visible": true,
+      "collapsed": false,
+      "height": 420.0,
+      "filters": {
+        "alignment_group_mode": "chimeric",
+        "alignment_sort_mode": "aligned_length",
+        "minimum_mapping_quality": null,
+        "include_secondary": true,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    },
+    {
+      "id": 4,
+      "name": "Expected source failure",
+      "source": {
+        "Local": {
+          "path": "benchmark-data/missing-for-failure-isolation.bam"
+        }
+      },
+      "visible": true,
+      "collapsed": false,
+      "height": 180.0,
+      "filters": {
+        "minimum_mapping_quality": null,
+        "include_secondary": true,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    }
+  ],
+  "reference": null,
+  "tracks": [],
+  "maximum_alignments": 50000
+}

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RGV
+Comment=Fast native genome viewer
+Exec=rgv-desktop
+Icon=rgv
+Terminal=false
+Categories=Science;Biology;

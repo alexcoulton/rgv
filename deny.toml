@@ -1,0 +1,39 @@
+[advisories]
+version = 2
+yanked = "deny"
+# rust-htslib 1.0.1 depends on custom_derive and has no safe replacement path.
+# The advisory is abandonment-only and does not report a vulnerability.
+# winit 0.30.13 reaches ttf-parser through its Linux decoration stack; that
+# advisory is likewise abandonment-only with no safe compatible upgrade.
+ignore = ["RUSTSEC-2025-0058", "RUSTSEC-2026-0192"]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "BSL-1.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Zlib",
+    "bzip2-1.0.6",
+]
+
+[bans]
+# Cross-platform GUI and HTS stacks legitimately carry parallel platform and
+# parser generations. They remain visible in Cargo.lock; deny policy focuses on
+# wildcard requirements and untrusted sources rather than failing on duplicates.
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "igv_version": "replace-with-exact-version",
+  "machine": "replace-with-CPU-RAM-OS-power-mode",
+  "fixture_sha256": "4b567e92eeed85acfec87a740afa39689a15c79cd566e5873cd62910c5bba14a",
+  "locus": "chr1:900001-920000",
+  "viewport_width": 1280,
+  "maximum_alignments": 50000,
+  "startup_to_first_snapshot_ms": [],
+  "navigation_to_snapshot_ms": [],
+  "sampled_rss_mib": null,
+  "rgv_remote_requests": null,
+  "rgv_remote_response_bytes": null,
+  "rgv_remote_wall_ms": null,
+  "rgv_cpu_percent": null,
+  "remote_requests": null,
+  "remote_response_bytes": null,
+  "remote_wall_ms": null,
+  "cpu_percent": null,
+  "commands": ["igv.sh -b matched-benchmark.batch"]
+}

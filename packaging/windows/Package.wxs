@@ -1,0 +1,32 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="RGV"
+      Manufacturer="RGV Project"
+      Version="$(var.RgvVersion)"
+      UpgradeCode="D1861952-B4C5-4E1A-B5A4-64D8031F64EE"
+      Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of RGV is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RGV">
+        <Component Id="RgvExecutable" Guid="B483E788-81B0-46B8-A775-D40703DDA44C">
+          <File Id="RgvDesktop" Source="$(var.RgvBinary)" Name="rgv-desktop.exe" KeyPath="yes" />
+        </Component>
+        <Directory Id="LICENSEFOLDER" Name="licenses">
+          <Component Id="RgvReleaseMetadata" Guid="A9C3A7CA-3F4B-4AE9-A8E6-9622991DF4C5">
+            <File Source="$(var.RgvResources)\LICENSE-MIT" />
+            <File Source="$(var.RgvResources)\LICENSE-APACHE" />
+            <File Source="$(var.RgvResources)\THIRD_PARTY_LICENSES.txt" />
+            <File Source="$(var.RgvResources)\RGV.cdx.json" />
+            <File Source="$(var.RgvResources)\BUILD-PROVENANCE.json" />
+            <File Source="$(var.RgvPackageRoot)\PACKAGE-MANIFEST.sha256" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="Main" Title="RGV" Level="1">
+      <ComponentRef Id="RgvExecutable" />
+      <ComponentRef Id="RgvReleaseMetadata" />
+    </Feature>
+  </Package>
+</Wix>
