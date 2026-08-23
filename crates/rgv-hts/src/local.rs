@@ -756,9 +756,10 @@ mod tests {
                 .modifications
                 .provenance
                 .records_with_modification_tags,
-            1_500
+            1_499
         );
-        assert_eq!(query.pileup.modifications.provenance.decoded_calls, 3_000);
+        assert_eq!(query.pileup.modifications.provenance.malformed_records, 3);
+        assert_eq!(query.pileup.modifications.provenance.decoded_calls, 2_992);
     }
 
     #[test]
@@ -825,7 +826,7 @@ mod tests {
             .filter(|record| record.read_name.starts_with(b"PairSv-"))
             .map(|record| crate::pair_evidence(&record, interval, bounds))
             .collect::<Vec<_>>();
-        assert_eq!(evidence.len(), 9);
+        assert_eq!(evidence.len(), 10);
         assert_eq!(
             evidence
                 .iter()
@@ -863,6 +864,13 @@ mod tests {
             evidence
                 .iter()
                 .filter(|pair| pair.classification == crate::PairClassification::InterContig)
+                .count(),
+            1
+        );
+        assert_eq!(
+            evidence
+                .iter()
+                .filter(|pair| pair.classification == crate::PairClassification::MateUnmapped)
                 .count(),
             1
         );
@@ -977,7 +985,7 @@ mod tests {
         );
         assert_eq!(
             sampled.junctions.provenance.normalization_mapped_records,
-            Some(282_011)
+            Some(282_017)
         );
         assert_eq!(sampled.junctions.provenance.xs_tagged_observations, 5_000);
         assert_eq!(

@@ -14,6 +14,7 @@
       "end_zero_based_exclusive": 40600,
       "expected_facts": [
         "Named records expose concordant, partly discordant, and fully discordant ten-base insertions plus a reverse-strand control.",
+        "A named boundary record carries insertion qualities Q9, Q10, and Q30 around the two classification thresholds.",
         "A named all-tail record has no retained center and a named missing-quality record reports unavailable evidence without hiding healthy reads."
       ]
     }

@@ -16,13 +16,13 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use flate2::{Compression, write::GzEncoder};
 use rgv_core::{
-    AlignmentColorMode, AlignmentGroupMode, BisulfiteContext, GENOME_CONFIGURATION_SCHEMA_VERSION,
-    GenomeAnnotation, GenomeConfiguration, JunctionDisplayMode, PanelId, QuantitativeArithmetic,
-    QuantitativeScaleMode, ReadBaseDisplayMode, ReferenceTranslationFrame, RegionOfInterest,
-    ReviewItem, ReviewStatus, SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode,
-    SessionAlignmentTrack, SessionDocument, SessionLocus, SessionViewPanel, SmrtKineticsMode,
-    TrackConfig, TrackFormat, TrackId, TrackKind, TrackSource, UltimaDisplayOptions,
-    UltimaQualityMode,
+    AlignmentColorMode, AlignmentGroupMode, AlignmentSortMode, BisulfiteContext,
+    GENOME_CONFIGURATION_SCHEMA_VERSION, GenomeAnnotation, GenomeConfiguration,
+    JunctionDisplayMode, PanelId, QuantitativeArithmetic, QuantitativeScaleMode,
+    ReadBaseDisplayMode, ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus,
+    SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode, SessionAlignmentTrack,
+    SessionDocument, SessionLocus, SessionViewPanel, SmrtKineticsMode, TrackConfig, TrackFormat,
+    TrackId, TrackKind, TrackSource, UltimaDisplayOptions, UltimaQualityMode,
 };
 use rgv_validation_runner::{
     CoverageCatalog, CoverageDisposition, CoverageEntry, CoverageSource, DEFAULT_SUITE_ROOT,
@@ -669,6 +669,83 @@ fn write_projects(suite_root: &Path) -> Result<()> {
     core_track.filters.view_as_pairs = true;
     core_track.filters.alignment_group_mode = AlignmentGroupMode::PairOrientation;
     core.alignment_tracks.push(core_track);
+    for (offset, (name, color, group, sort, density, pairs, reads)) in [
+        (
+            "Squished strand grouping",
+            AlignmentColorMode::Strand,
+            AlignmentGroupMode::Strand,
+            AlignmentSortMode::Strand,
+            0.55,
+            false,
+            true,
+        ),
+        (
+            "Packed MAPQ sort",
+            AlignmentColorMode::MappingQuality,
+            AlignmentGroupMode::None,
+            AlignmentSortMode::MappingQuality,
+            0.35,
+            false,
+            true,
+        ),
+        (
+            "Expanded read-group view",
+            AlignmentColorMode::ReadGroup,
+            AlignmentGroupMode::ReadGroup,
+            AlignmentSortMode::ReadGroup,
+            1.25,
+            false,
+            true,
+        ),
+        (
+            "RG tag colour/group/sort",
+            AlignmentColorMode::Tag(*b"RG"),
+            AlignmentGroupMode::Tag(*b"RG"),
+            AlignmentSortMode::Tag(*b"RG"),
+            1.0,
+            false,
+            true,
+        ),
+        (
+            "Paired insert-size view",
+            AlignmentColorMode::TemplateLength,
+            AlignmentGroupMode::UnexpectedPair,
+            AlignmentSortMode::TemplateLength,
+            1.0,
+            true,
+            true,
+        ),
+        (
+            "Haplotype colour/group/sort",
+            AlignmentColorMode::Haplotype,
+            AlignmentGroupMode::Haplotype,
+            AlignmentSortMode::Haplotype,
+            1.0,
+            false,
+            true,
+        ),
+        (
+            "Coverage density only",
+            AlignmentColorMode::None,
+            AlignmentGroupMode::None,
+            AlignmentSortMode::Start,
+            0.35,
+            false,
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut track = alignment_track(u64::try_from(offset)? + 2, name, "../../mixed.bam", color);
+        track.visible = false;
+        track.filters.alignment_group_mode = group;
+        track.filters.alignment_sort_mode = sort;
+        track.filters.alignment_density = density;
+        track.filters.view_as_pairs = pairs;
+        track.filters.show_reads = reads;
+        core.alignment_tracks.push(track);
+    }
     core.review_items = vec![
         review_item(1, "Paired short reads", "chr1", 0, 200_000),
         review_item(2, "Deep coverage", "chr1", 900_000, 920_000),
@@ -1641,13 +1718,35 @@ fn write_sbx_bam(path: &Path) -> Result<()> {
             .push_tag(b"LN", MANUAL_CONTIG_LENGTH),
     );
     let mut records = Vec::new();
-    for (offset, (name, reverse, insertion_low_bases, all_tail, missing_qualities)) in [
-        ("EXPECTED_SBX_CONCORDANT", false, 0_usize, false, false),
-        ("EXPECTED_SBX_PARTIAL", false, 1, false, false),
-        ("EXPECTED_SBX_FULL", false, 10, false, false),
-        ("EXPECTED_SBX_REVERSE", true, 0, false, false),
-        ("EXPECTED_SBX_ALL_TAIL", false, 10, true, false),
-        ("EXPECTED_SBX_MISSING_QUALITIES", false, 0, false, true),
+    for (offset, (name, reverse, insertion_low_bases, all_tail, missing_qualities, boundary)) in [
+        (
+            "EXPECTED_SBX_CONCORDANT",
+            false,
+            0_usize,
+            false,
+            false,
+            false,
+        ),
+        ("EXPECTED_SBX_PARTIAL", false, 1, false, false, false),
+        ("EXPECTED_SBX_FULL", false, 10, false, false, false),
+        ("EXPECTED_SBX_REVERSE", true, 0, false, false, false),
+        ("EXPECTED_SBX_ALL_TAIL", false, 10, true, false, false),
+        (
+            "EXPECTED_SBX_MISSING_QUALITIES",
+            false,
+            0,
+            false,
+            true,
+            false,
+        ),
+        (
+            "EXPECTED_SBX_QUALITY_BOUNDARY",
+            false,
+            0,
+            false,
+            false,
+            true,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -1669,6 +1768,9 @@ fn write_sbx_bam(path: &Path) -> Result<()> {
         }
         if missing_qualities {
             qualities.fill(u8::MAX);
+        }
+        if boundary {
+            qualities[70..73].copy_from_slice(&[9, 10, 30]);
         }
         let mut record = Record::new();
         record.set(name.as_bytes(), Some(&cigar), &sequence, &qualities);
@@ -1866,6 +1968,38 @@ fn write_specialist_bam(path: &Path) -> Result<()> {
     )?;
     missing.push_aux(b"RG", Aux::String("bisulfite"))?;
     records.push(missing);
+    let pair_name = "EXPECTED_BISULFITE_PAIRED_ORIENTATION";
+    let left_start = 1_040_usize;
+    let right_start = 1_120_usize;
+    let mut left = basic_record(
+        pair_name,
+        i64::try_from(left_start)?,
+        &reference[left_start..left_start + 160],
+        false,
+    )?;
+    left.set_flags(0x63);
+    left.set_mtid(0);
+    left.set_mpos(i64::try_from(right_start)?);
+    left.set_insert_size(240);
+    left.push_aux(b"RG", Aux::String("bisulfite"))?;
+    let mut right_sequence = reverse_complement(&reference[right_start..right_start + 160]);
+    for base in &mut right_sequence {
+        if *base == b'C' {
+            *base = b'T';
+        }
+    }
+    let mut right = basic_record(
+        pair_name,
+        i64::try_from(right_start)?,
+        &right_sequence,
+        true,
+    )?;
+    right.set_flags(0x93);
+    right.set_mtid(0);
+    right.set_mpos(i64::try_from(left_start)?);
+    right.set_insert_size(-240);
+    right.push_aux(b"RG", Aux::String("bisulfite"))?;
+    records.extend([left, right]);
     for (offset, (cell, raw_cell, umi, raw_umi)) in [
         ("CELL_A-1", "RAW_CELL_A", "UMI0001", "RAWUMI01"),
         ("CELL_A-1", "RAW_CELL_A", "UMI0001", "RAWUMI01"),
@@ -2224,8 +2358,10 @@ fn write_truth_documents(suite_root: &Path) -> Result<()> {
                 2_590_000,
                 2_650_000,
                 &[
-                    "Long, short, same-strand, outward-facing, and inter-contig templates are present.",
+                    "Long, short, same-strand, outward-facing, inter-contig, and unmapped-mate templates are present.",
+                    "Named sparse controls cover duplicate, QC-fail, MAPQ 0, missing qualities, secondary, RG, and NM evidence.",
                     "Deep coverage and long/supplementary loci are reachable through the review queue.",
+                    "Named long-read controls cover valid multiple-code/strand/probability MM/ML, missing tags, malformed MM, mismatched ML length, and wrong MM type.",
                 ],
             )],
         ),
@@ -2241,7 +2377,10 @@ fn write_truth_documents(suite_root: &Path) -> Result<()> {
                 12_600,
                 &[
                     "A 1,000-base insertion and a 2,000-base deletion start from the shared 9,500 zero-based alignment position.",
-                    "The base-level locus contains controls, SNVs, 1/6-base insertions, and 1/12-base deletions.",
+                    "The 25-record base-level locus contains exact-match controls, SNVs, a three-base MNV, four Ns, Q5 and reverse-strand controls, and a compound event.",
+                    "Named insertions have lengths 1, 2, 3, 6, 10, 100, and 1,000; named deletions have lengths 1, 2, 10, 12, 100, 500, 1,000, and 2,000.",
+                    "Named records exercise M, =, X, I, D, S, H, N, and P CIGAR operations, including adjacent skip/padding/insertion events.",
+                    "At displayed base chrVariants:10290 the bounded pileup bin has depth 7, forward/reverse depth 6/1, and two deletion observations.",
                 ],
             )],
         ),
@@ -2278,7 +2417,7 @@ fn write_truth_documents(suite_root: &Path) -> Result<()> {
                 900,
                 1_200,
                 &[
-                    "Six named records cover forward/reverse converted/protected evidence, a low-quality call, and missing evidence.",
+                    "Eight records cover forward/reverse converted/protected evidence, a low-quality call, missing evidence, and a two-read inward proper-pair orientation control.",
                     "Every CG, CHG, CHH, HCG, GCH, and WCG display mode has both protected and converted observations against the matching reference.",
                 ],
             )],
@@ -2311,6 +2450,7 @@ fn write_truth_documents(suite_root: &Path) -> Result<()> {
                 40_600,
                 &[
                     "Named records expose concordant, partly discordant, and fully discordant ten-base insertions plus a reverse-strand control.",
+                    "A named boundary record carries insertion qualities Q9, Q10, and Q30 around the two classification thresholds.",
                     "A named all-tail record has no retained center and a named missing-quality record reports unavailable evidence without hiding healthy reads.",
                 ],
             )],
@@ -2452,7 +2592,7 @@ fn write_truth_documents(suite_root: &Path) -> Result<()> {
                 900,
                 5_400,
                 &[
-                    "The CRAM returns the same fourteen named records as the source BAM when opened with the matching reference.",
+                    "The CRAM returns the same sixteen records (fifteen names, including one paired template) as the source BAM when opened with the matching reference.",
                     "A reference with a different MD5 is rejected rather than displaying fabricated sequence.",
                 ],
             )],

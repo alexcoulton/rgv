@@ -32,6 +32,7 @@ enum Kind {
     Long,
     Supplementary,
     PairSv,
+    Control,
     LongCigar,
 }
 
@@ -141,12 +142,22 @@ pub fn run(path: &Path) -> Result<()> {
         (7, 0, 2_630_500),
         (8, 0, 2_640_000),
         (9, 1, 2_640_000),
+        (10, 0, 2_645_000),
     ] {
         specs.push(Spec {
             tid,
             pos,
             id,
             kind: Kind::PairSv,
+        });
+    }
+
+    for id in 0..5_u32 {
+        specs.push(Spec {
+            tid: 0,
+            pos: 2_650_000 + i64::from(id) * 500,
+            id,
+            kind: Kind::Control,
         });
     }
 
@@ -320,6 +331,65 @@ fn variant_specs() -> Vec<VariantSpec> {
                 ('=', 99),
             ],
         ),
+        variant_spec("mnv_3bp", 10_200, &[('=', 40), ('X', 3), ('=', 57)]),
+        variant_spec("ambiguous_bases", 10_220, &[('=', 100)]),
+        variant_spec(
+            "low_quality_snv_q5",
+            10_240,
+            &[('=', 49), ('X', 1), ('=', 50)],
+        ),
+        variant_spec(
+            "reverse_strand_snv",
+            10_260,
+            &[('=', 49), ('X', 1), ('=', 50)],
+        ),
+        variant_spec(
+            "small_insertion_2bp",
+            10_300,
+            &[('=', 50), ('I', 2), ('=', 50)],
+        ),
+        variant_spec(
+            "small_insertion_10bp",
+            10_320,
+            &[('=', 50), ('I', 10), ('=', 50)],
+        ),
+        variant_spec(
+            "small_deletion_2bp",
+            10_340,
+            &[('=', 50), ('D', 2), ('=', 50)],
+        ),
+        variant_spec(
+            "small_deletion_10bp",
+            10_360,
+            &[('=', 50), ('D', 10), ('=', 50)],
+        ),
+        variant_spec(
+            "large_deletion_100bp",
+            10_380,
+            &[('=', 50), ('D', 100), ('=', 50)],
+        ),
+        variant_spec(
+            "large_deletion_1000bp",
+            10_400,
+            &[('=', 50), ('D', 1_000), ('=', 50)],
+        ),
+        variant_spec(
+            "mixed_m_soft_hard_clip",
+            10_450,
+            &[('S', 5), ('M', 50), ('X', 1), ('M', 49), ('H', 5)],
+        ),
+        variant_spec(
+            "skip_padding_adjacent_events",
+            10_500,
+            &[
+                ('M', 40),
+                ('N', 25),
+                ('M', 20),
+                ('P', 3),
+                ('I', 2),
+                ('M', 38),
+            ],
+        ),
     ]
 }
 
@@ -331,6 +401,11 @@ fn variant_spec(name: &'static str, position: usize, operations: &[(char, u32)])
             'X' => Cigar::Diff(*length),
             'I' => Cigar::Ins(*length),
             'D' => Cigar::Del(*length),
+            'M' => Cigar::Match(*length),
+            'S' => Cigar::SoftClip(*length),
+            'H' => Cigar::HardClip(*length),
+            'N' => Cigar::RefSkip(*length),
+            'P' => Cigar::Pad(*length),
             _ => unreachable!("the truth-set CIGAR alphabet is fixed"),
         })
         .collect();
@@ -376,7 +451,14 @@ fn make_variant_record(spec: &VariantSpec, reference: &[u8]) -> Result<Record> {
                 reference_position += *length as usize;
                 edit_distance += *length;
             }
-            _ => unreachable!("variant truth records use only =, X, I, and D"),
+            Cigar::SoftClip(length) => {
+                sequence.extend(
+                    (0..*length as usize).map(|offset| b"ACGT"[(inserted_position + offset) % 4]),
+                );
+                inserted_position += *length as usize;
+            }
+            Cigar::RefSkip(length) => reference_position += *length as usize,
+            Cigar::HardClip(_) | Cigar::Pad(_) => {}
         }
     }
     ensure!(
@@ -384,7 +466,28 @@ fn make_variant_record(spec: &VariantSpec, reference: &[u8]) -> Result<Record> {
         "variant record exceeds reference"
     );
 
-    let qualities = vec![40_u8; sequence.len()];
+    if spec.name == "ambiguous_bases" {
+        sequence[48..52].fill(b'N');
+    }
+    let mut qualities = vec![40_u8; sequence.len()];
+    if spec.name == "low_quality_snv_q5" {
+        qualities[49] = 5;
+    }
+    let reverse = spec.name == "reverse_strand_snv";
+    if reverse {
+        sequence = sequence
+            .iter()
+            .rev()
+            .map(|base| match base.to_ascii_uppercase() {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'T' => b'A',
+                other => other,
+            })
+            .collect();
+        qualities.reverse();
+    }
     let mut record = Record::new();
     record.set(
         spec.name.as_bytes(),
@@ -395,7 +498,7 @@ fn make_variant_record(spec: &VariantSpec, reference: &[u8]) -> Result<Record> {
     record.set_tid(0);
     record.set_pos(spec.position as i64);
     record.set_bin(bai_bin(spec.position as u64, reference_position as u64));
-    record.set_flags(0);
+    record.set_flags(if reverse { 0x10 } else { 0 });
     record.set_mapq(60);
     record.push_aux(b"RG", Aux::String("variant-truth"))?;
     record.push_aux(b"EV", Aux::String(spec.name))?;
@@ -582,7 +685,7 @@ fn make_record(spec: Spec) -> Result<Record> {
         format!("{:?}-{:06}", spec.kind, spec.id)
     };
 
-    let (cigar, read_len, flags, mapq) = match spec.kind {
+    let (cigar, read_len, mut flags, mut mapq) = match spec.kind {
         Kind::Short => (
             vec![Cigar::Match(150)],
             150,
@@ -626,6 +729,7 @@ fn make_record(spec: Spec) -> Result<Record> {
             35,
         ),
         Kind::PairSv => (vec![Cigar::Match(150)], 150, pair_sv_fields(spec).0, 55),
+        Kind::Control => (vec![Cigar::Match(150)], 150, 0, 45),
         Kind::LongCigar => {
             let mut cigar = Vec::with_capacity(70_000);
             for i in 0..70_000 {
@@ -640,7 +744,17 @@ fn make_record(spec: Spec) -> Result<Record> {
     };
 
     let sequence = deterministic_sequence(read_len, spec.id ^ ((spec.tid as u32) << 24));
-    let qualities = synthetic_qualities(spec, read_len);
+    let mut qualities = synthetic_qualities(spec, read_len);
+    if matches!(spec.kind, Kind::Deep | Kind::Control) {
+        match spec.id {
+            0 => flags |= 0x400,
+            1 => flags |= 0x200,
+            2 => mapq = 0,
+            3 => qualities.fill(u8::MAX),
+            4 => flags |= 0x100,
+            _ => {}
+        }
+    }
     let reference_end = u64::try_from(spec.pos)? + cigar_reference_len(&cigar);
     record.set(
         qname.as_bytes(),
@@ -679,8 +793,28 @@ fn make_record(spec: Spec) -> Result<Record> {
             _ => record.push_aux(b"XS", Aux::String("?"))?,
         },
         Kind::Long => {
-            record.push_aux(b"MM", Aux::String(LONG_MM_TAG))?;
-            record.push_aux(b"ML", Aux::ArrayU8((&[255_u8, 180][..]).into()))?;
+            match spec.id {
+                1_490 => {}
+                1_491 => {
+                    record.push_aux(b"MM", Aux::String("not-valid"))?;
+                    record.push_aux(b"ML", Aux::ArrayU8((&[255_u8][..]).into()))?;
+                }
+                1_492 => {
+                    record.push_aux(b"MM", Aux::String(LONG_MM_TAG))?;
+                    record.push_aux(b"ML", Aux::ArrayU8((&[255_u8][..]).into()))?;
+                }
+                1_493 => {
+                    record.push_aux(b"MM", Aux::String("C+m,500;C-h,510;"))?;
+                    record.push_aux(b"ML", Aux::ArrayU8((&[255_u8, 64][..]).into()))?;
+                }
+                1_494 => {
+                    record.push_aux(b"MM", Aux::I32(42))?;
+                }
+                _ => {
+                    record.push_aux(b"MM", Aux::String(LONG_MM_TAG))?;
+                    record.push_aux(b"ML", Aux::ArrayU8((&[255_u8, 180][..]).into()))?;
+                }
+            }
             record.push_aux(b"HP", Aux::I32((spec.id % 2 + 1) as i32))?;
             if spec.id < SMRT_TRUTH_RECORDS {
                 add_smrt_truth_tags(&mut record, read_len, spec.id)?;
@@ -760,6 +894,7 @@ fn pair_sv_fields(spec: Spec) -> (u16, i32, i64, i64) {
         7 => (0xa1, 0, 2_630_000, -650),
         8 => (0x41, 1, 2_640_000, 0),
         9 => (0x81, 0, 2_640_000, 0),
+        10 => (0x49, -1, -1, 0),
         _ => unreachable!("pair-SV fixture id is bounded"),
     }
 }
@@ -1147,7 +1282,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(metadata.len(), 16, "{metadata:?}");
+        assert_eq!(metadata.len(), 28, "{metadata:?}");
 
         let mut reader = bam::IndexedReader::from_path(&bam_path).unwrap();
         reader.fetch((VARIANT_CONTIG, 10_008, 10_017)).unwrap();

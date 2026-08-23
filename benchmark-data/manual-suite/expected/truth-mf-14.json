@@ -14,7 +14,7 @@
       "start_zero_based": 900,
       "end_zero_based_exclusive": 5400,
       "expected_facts": [
-        "The CRAM returns the same fourteen named records as the source BAM when opened with the matching reference.",
+        "The CRAM returns the same sixteen records (fifteen names, including one paired template) as the source BAM when opened with the matching reference.",
         "A reference with a different MD5 is rejected rather than displaying fabricated sequence."
       ]
     }

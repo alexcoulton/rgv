@@ -15,7 +15,10 @@
       "end_zero_based_exclusive": 12600,
       "expected_facts": [
         "A 1,000-base insertion and a 2,000-base deletion start from the shared 9,500 zero-based alignment position.",
-        "The base-level locus contains controls, SNVs, 1/6-base insertions, and 1/12-base deletions."
+        "The 25-record base-level locus contains exact-match controls, SNVs, a three-base MNV, four Ns, Q5 and reverse-strand controls, and a compound event.",
+        "Named insertions have lengths 1, 2, 3, 6, 10, 100, and 1,000; named deletions have lengths 1, 2, 10, 12, 100, 500, 1,000, and 2,000.",
+        "Named records exercise M, =, X, I, D, S, H, N, and P CIGAR operations, including adjacent skip/padding/insertion events.",
+        "At displayed base chrVariants:10290 the bounded pileup bin has depth 7, forward/reverse depth 6/1, and two deletion observations."
       ]
     }
   ]

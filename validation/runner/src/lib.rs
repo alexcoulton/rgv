@@ -16,9 +16,11 @@ use rgv_core::{
 };
 use rgv_engine::{TrackEngine, TrackEngineEvent, TrackSnapshotData, TrackSpec, TrackSpecKind};
 use rgv_hts::{
-    AlignmentOpenOptions, AlignmentQuery, AlignmentSource, AuxValue, FastaReference, FeatureFormat,
-    LocalAlignmentSource, LocalVariantSource, QueryDetail, QueryOptions, TextFeatureSource,
-    UltimaQualitySource, VariantType, analyze_ultima_record, smrt_kinetics_series,
+    AlignmentOpenOptions, AlignmentQuery, AlignmentRecord, AlignmentSource, AuxValue,
+    BaseModificationStrand, CigarOpKind, FastaReference, FeatureFormat, LocalAlignmentSource,
+    LocalVariantSource, ModificationCode, PairClassification, PairOrientation, QueryDetail,
+    QueryOptions, SequenceData, TemplateLengthBounds, TextFeatureSource, UltimaQualitySource,
+    VariantType, analyze_ultima_record, decode_modified_bases, pair_evidence, smrt_kinetics_series,
     summarize_bisulfite_record, summarize_sbx_record,
 };
 use serde::{Deserialize, Serialize};
@@ -1078,27 +1080,53 @@ fn query_read_names(query: &AlignmentQuery) -> Result<BTreeSet<String>> {
         .collect()
 }
 
-fn verify_mixed_alignment_truth(root: &Path, manifest: &FixtureManifest) -> Result<()> {
-    let path = fixture_path(root, manifest, "dep-mixed-bam")?;
-    let paired = query_alignment(&path, None, "chr1", 0, 200_000)?;
+fn named_alignment_record(
+    query: &AlignmentQuery,
+    name: &[u8],
+    fixture_locus: &str,
+) -> Result<AlignmentRecord> {
+    (0..query.batch.len())
+        .find_map(|index| {
+            let record = query.materialize_record(index).ok()?;
+            (record.read_name == name).then_some(record)
+        })
+        .with_context(|| format!("{fixture_locus} lost {}", String::from_utf8_lossy(name)))
+}
+
+fn verify_mixed_sparse_controls(path: &Path) -> Result<()> {
+    let query = query_alignment(path, None, "chr1", 2_650_000, 2_652_150)?;
+    let duplicate = named_alignment_record(&query, b"Control-000000", "MF-01 controls")?;
+    let qc_fail = named_alignment_record(&query, b"Control-000001", "MF-01 controls")?;
+    let low_mapq = named_alignment_record(&query, b"Control-000002", "MF-01 controls")?;
+    let missing_quality = named_alignment_record(&query, b"Control-000003", "MF-01 controls")?;
+    let secondary = named_alignment_record(&query, b"Control-000004", "MF-01 controls")?;
     ensure!(
-        paired.pairs.eligible_proper_templates > 0
-            && paired.batch.flags.iter().any(|flags| flags.is_paired()),
-        "MF-01 has no proper paired templates"
+        duplicate.flags.bits() & 0x400 != 0
+            && qc_fail.flags.bits() & 0x200 != 0
+            && low_mapq.mapping_quality == Some(0)
+            && matches!(
+                missing_quality.sequence,
+                SequenceData::Present {
+                    qualities: None,
+                    ..
+                }
+            )
+            && secondary.flags.is_secondary()
+            && duplicate
+                .auxiliary_fields
+                .iter()
+                .any(|field| field.tag == *b"RG")
+            && duplicate
+                .auxiliary_fields
+                .iter()
+                .any(|field| field.tag == *b"NM"),
+        "MF-01 duplicate/QC/MAPQ/quality/secondary/RG/NM controls changed"
     );
-    let deep = query_alignment(&path, None, "chr1", 900_000, 920_000)?;
-    ensure!(
-        deep.stats.records_seen >= 150_000,
-        "MF-01 deep locus saw {} records instead of at least 150,000",
-        deep.stats.records_seen
-    );
-    let rna = query_alignment(&path, None, "chr1", 2_100_000, 2_301_000)?;
-    ensure!(
-        rna.junctions.junctions.len() == 10_000
-            && rna.junctions.provenance.spliced_records == 10_000,
-        "MF-03 does not retain the exact 10,000-junction truth"
-    );
-    let long = query_alignment(&path, None, "chr2", 0, 2_000_000)?;
+    Ok(())
+}
+
+fn verify_mixed_long_truth(path: &Path) -> Result<()> {
+    let long = query_alignment(path, None, "chr2", 0, 2_000_000)?;
     ensure!(
         long.batch
             .flags
@@ -1106,6 +1134,31 @@ fn verify_mixed_alignment_truth(root: &Path, manifest: &FixtureManifest) -> Resu
             .any(|flags| flags.is_supplementary())
             && (0..long.batch.len()).any(|index| long.batch.has_auxiliary_tag(index, *b"MM")),
         "MF-01 long-read locus lacks supplementary or modified-base evidence"
+    );
+    let missing = named_alignment_record(&long, b"Long-001490", "MF-01 long-read locus")?;
+    ensure!(
+        decode_modified_bases(&missing)?.is_empty(),
+        "MF-01 missing-MM record unexpectedly decoded calls"
+    );
+    for name in [b"Long-001491", b"Long-001492", b"Long-001494"] {
+        let record = named_alignment_record(&long, name, "MF-01 long-read locus")?;
+        ensure!(
+            decode_modified_bases(&record).is_err(),
+            "MF-01 malformed modified-base record {} unexpectedly decoded",
+            String::from_utf8_lossy(name)
+        );
+    }
+    let multi = named_alignment_record(&long, b"Long-001493", "MF-01 long-read locus")?;
+    let calls = decode_modified_bases(&multi)?;
+    ensure!(
+        calls.len() == 2
+            && calls[0].strand == BaseModificationStrand::Forward
+            && calls[0].code == ModificationCode::Letter(b'm')
+            && calls[0].probability == Some(255)
+            && calls[1].strand == BaseModificationStrand::Reverse
+            && calls[1].code == ModificationCode::Letter(b'h')
+            && calls[1].probability == Some(64),
+        "MF-01 multi-code/strand/probability modified-base truth changed"
     );
     ensure!(
         (0..long.batch.len()).any(|index| {
@@ -1130,6 +1183,97 @@ fn verify_mixed_alignment_truth(root: &Path, manifest: &FixtureManifest) -> Resu
         }),
         "MF-06 has no decodable SBX insertion evidence"
     );
+    Ok(())
+}
+
+fn verify_mixed_pair_truth(path: &Path) -> Result<()> {
+    let structural = query_alignment(path, None, "chr1", 2_590_000, 2_650_000)?;
+    let pair_truth = (0..structural.batch.len())
+        .map(|index| {
+            let record = structural.materialize_record(index)?;
+            Ok(pair_evidence(
+                &record,
+                structural.interval,
+                TemplateLengthBounds {
+                    minimum: Some(100),
+                    maximum: Some(1_000),
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for orientation in [
+        PairOrientation::Inward,
+        PairOrientation::Outward,
+        PairOrientation::SameStrand,
+    ] {
+        ensure!(
+            pair_truth
+                .iter()
+                .any(|evidence| evidence.orientation == orientation),
+            "MF-01 structural locus lacks {orientation:?} pair evidence"
+        );
+    }
+    for classification in [
+        PairClassification::InterContig,
+        PairClassification::DiscordantOrientation,
+        PairClassification::DiscordantTemplateLengthShort,
+        PairClassification::DiscordantTemplateLengthLong,
+        PairClassification::MateUnmapped,
+    ] {
+        ensure!(
+            pair_truth
+                .iter()
+                .any(|evidence| evidence.classification == classification),
+            "MF-01 structural locus lacks {classification:?} pair evidence"
+        );
+    }
+    Ok(())
+}
+
+fn verify_mixed_alignment_truth(root: &Path, manifest: &FixtureManifest) -> Result<()> {
+    let path = fixture_path(root, manifest, "dep-mixed-bam")?;
+    let paired = query_alignment(&path, None, "chr1", 0, 200_000)?;
+    ensure!(
+        paired.pairs.eligible_proper_templates > 0
+            && paired.batch.flags.iter().any(|flags| flags.is_paired()),
+        "MF-01 has no proper paired templates"
+    );
+    let project = project_document(root, manifest, "mf-01-alignment-core")?;
+    ensure!(
+        project.alignment_tracks.len() == 8
+            && project
+                .alignment_tracks
+                .iter()
+                .filter(|track| track.visible)
+                .count()
+                == 1
+            && project
+                .alignment_tracks
+                .iter()
+                .any(|track| !track.filters.show_reads)
+            && project
+                .alignment_tracks
+                .iter()
+                .map(|track| track.filters.alignment_density.to_bits())
+                .collect::<BTreeSet<_>>()
+                .len()
+                >= 3,
+        "MF-01 lost its eight focused pair/group/sort/density track configurations"
+    );
+    let deep = query_alignment(&path, None, "chr1", 900_000, 920_000)?;
+    ensure!(
+        deep.stats.records_seen >= 150_000,
+        "MF-01 deep locus saw {} records instead of at least 150,000",
+        deep.stats.records_seen
+    );
+    verify_mixed_sparse_controls(&path)?;
+    let rna = query_alignment(&path, None, "chr1", 2_100_000, 2_301_000)?;
+    ensure!(
+        rna.junctions.junctions.len() == 10_000
+            && rna.junctions.provenance.spliced_records == 10_000,
+        "MF-03 does not retain the exact 10,000-junction truth"
+    );
+    verify_mixed_long_truth(&path)?;
     let pathological = query_alignment(&path, None, "chr2", 2_500_000, 2_550_000)?;
     ensure!(
         (0..pathological.batch.len()).any(|index| pathological
@@ -1138,6 +1282,7 @@ fn verify_mixed_alignment_truth(root: &Path, manifest: &FixtureManifest) -> Resu
             .is_some_and(|cigar| cigar.len() >= 70_000)),
         "MF-01 lacks the 70,000-operation CIGAR"
     );
+    verify_mixed_pair_truth(&path)?;
     Ok(())
 }
 
@@ -1224,14 +1369,109 @@ fn verify_event_and_ultima_truth(root: &Path, manifest: &FixtureManifest) -> Res
     for expected in [
         "long_insertion_1000bp",
         "long_deletion_2000bp",
+        "reference_control_a",
+        "reference_control_b",
         "small_insertion_1bp",
+        "small_insertion_2bp",
         "small_insertion_6bp",
+        "small_insertion_10bp",
+        "large_insertion_100bp",
         "small_deletion_1bp",
+        "small_deletion_2bp",
+        "small_deletion_10bp",
         "small_deletion_12bp",
+        "large_deletion_100bp",
+        "large_deletion_500bp",
+        "large_deletion_1000bp",
         "snv_single",
+        "snv_cluster_3",
+        "mnv_3bp",
+        "ambiguous_bases",
+        "low_quality_snv_q5",
+        "reverse_strand_snv",
+        "compound_snv_ins_del",
+        "mixed_m_soft_hard_clip",
+        "skip_padding_adjacent_events",
     ] {
         ensure!(names.contains(expected), "MF-02 is missing {expected}");
     }
+    ensure!(
+        events.batch.len() == 25,
+        "MF-02 has {} event records instead of 25",
+        events.batch.len()
+    );
+    let mut cigar_lengths: Vec<(CigarOpKind, BTreeSet<u32>)> = Vec::new();
+    let mut special_records = BTreeMap::new();
+    for index in 0..events.batch.len() {
+        let record = events.materialize_record(index)?;
+        for operation in &record.cigar {
+            if let Some((_, lengths)) = cigar_lengths
+                .iter_mut()
+                .find(|(kind, _)| *kind == operation.kind)
+            {
+                lengths.insert(operation.len);
+            } else {
+                cigar_lengths.push((operation.kind, BTreeSet::from([operation.len])));
+            }
+        }
+        special_records.insert(
+            String::from_utf8_lossy(&record.read_name).into_owned(),
+            record,
+        );
+    }
+    for (kind, expected) in [
+        (CigarOpKind::Insertion, &[1, 2, 3, 6, 10, 100, 1_000][..]),
+        (
+            CigarOpKind::Deletion,
+            &[1, 2, 10, 12, 100, 500, 1_000, 2_000][..],
+        ),
+        (CigarOpKind::Match, &[20, 38, 40, 49, 50][..]),
+        (CigarOpKind::SequenceMismatch, &[1, 3][..]),
+        (CigarOpKind::SoftClip, &[5][..]),
+        (CigarOpKind::HardClip, &[5][..]),
+        (CigarOpKind::ReferenceSkip, &[25][..]),
+        (CigarOpKind::Padding, &[3][..]),
+    ] {
+        let observed = cigar_lengths
+            .iter()
+            .find_map(|(observed_kind, lengths)| (*observed_kind == kind).then_some(lengths))
+            .with_context(|| format!("MF-02 lacks {kind:?}"))?;
+        ensure!(
+            expected.iter().all(|length| observed.contains(length)),
+            "MF-02 {kind:?} lengths changed: {observed:?}"
+        );
+    }
+    let ambiguous = special_records
+        .get("ambiguous_bases")
+        .context("MF-02 lacks ambiguous base control")?;
+    ensure!(
+        matches!(&ambiguous.sequence, SequenceData::Present { bases, .. } if bases[48..52] == [b'N'; 4]),
+        "MF-02 ambiguous base control lost its four Ns"
+    );
+    let low_quality = special_records
+        .get("low_quality_snv_q5")
+        .context("MF-02 lacks low-quality SNV control")?;
+    ensure!(
+        matches!(&low_quality.sequence, SequenceData::Present { qualities: Some(qualities), .. } if qualities[49] == 5),
+        "MF-02 low-quality SNV no longer has Q5 at its mismatch"
+    );
+    ensure!(
+        special_records
+            .get("reverse_strand_snv")
+            .is_some_and(|record| record.flags.is_reverse()),
+        "MF-02 reverse-strand control is no longer reverse"
+    );
+    let (_, pileup) = events
+        .pileup
+        .bin_at(events.interval, 10_289)
+        .context("MF-02 lacks the exact pileup bin at chrVariants:10290")?;
+    ensure!(
+        pileup.depth == 7
+            && pileup.forward_depth == 6
+            && pileup.reverse_depth == 1
+            && pileup.alleles.deletion == 2,
+        "MF-02 chrVariants:10290 pileup changed: {pileup:?}"
+    );
     ensure!(
         events.pileup.provenance.rendered_records > 0 && events.reference.is_some(),
         "MF-02 did not produce pileup and reference truth"
@@ -1328,9 +1568,10 @@ fn verify_specialist_alignment_truth(root: &Path, manifest: &FixtureManifest) ->
     let bisulfite = query_alignment(&bam, Some(&fasta), "chrManual", 900, 1_200)?;
     let bisulfite_names = query_read_names(&bisulfite)?;
     ensure!(
-        bisulfite_names.len() == 6,
-        "MF-04 has {} records instead of 6",
-        bisulfite_names.len()
+        bisulfite.batch.len() == 8 && bisulfite_names.len() == 7,
+        "MF-04 has {} records/{} names instead of 8/7",
+        bisulfite.batch.len(),
+        bisulfite_names.len(),
     );
     for expected in [
         "EXPECTED_CG_PROTECTED_FORWARD",
@@ -1339,12 +1580,29 @@ fn verify_specialist_alignment_truth(root: &Path, manifest: &FixtureManifest) ->
         "EXPECTED_CG_CONVERTED_REVERSE",
         "EXPECTED_BISULFITE_LOW_QUALITY",
         "EXPECTED_BISULFITE_MISSING_EVIDENCE",
+        "EXPECTED_BISULFITE_PAIRED_ORIENTATION",
     ] {
         ensure!(
             bisulfite_names.contains(expected),
             "MF-04 is missing {expected}"
         );
     }
+    let paired_bisulfite = (0..bisulfite.batch.len())
+        .filter_map(|index| {
+            let record = bisulfite.materialize_record(index).ok()?;
+            (record.read_name == b"EXPECTED_BISULFITE_PAIRED_ORIENTATION").then(|| {
+                pair_evidence(&record, bisulfite.interval, TemplateLengthBounds::default())
+            })
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        paired_bisulfite.len() == 2
+            && paired_bisulfite.iter().all(|evidence| {
+                evidence.orientation == PairOrientation::Inward
+                    && evidence.classification == PairClassification::Proper
+            }),
+        "MF-04 paired orientation control is not an inward proper pair"
+    );
     let reference = bisulfite
         .reference
         .as_ref()
@@ -1427,8 +1685,8 @@ fn verify_specialist_alignment_truth(root: &Path, manifest: &FixtureManifest) ->
     let sbx_path = fixture_path(root, manifest, "manual-sbx-bam")?;
     let sbx = query_alignment(&sbx_path, Some(&fasta), "chrManual", 39_900, 40_600)?;
     ensure!(
-        sbx.batch.len() == 6,
-        "MF-06 has {} records instead of 6",
+        sbx.batch.len() == 7,
+        "MF-06 has {} records instead of 7",
         sbx.batch.len()
     );
     let mut observed_sbx = BTreeMap::new();
@@ -1464,6 +1722,12 @@ fn verify_specialist_alignment_truth(root: &Path, manifest: &FixtureManifest) ->
                 "MF-06 named tail bounds changed for {name}: {summary:?}"
             );
         }
+        if name == "EXPECTED_SBX_QUALITY_BOUNDARY" {
+            ensure!(
+                matches!(&record.sequence, SequenceData::Present { qualities: Some(qualities), .. } if qualities[70..73] == [9, 10, 30]),
+                "MF-06 quality-boundary record lost Q9/Q10/Q30 insertion bases"
+            );
+        }
         observed_sbx.insert(name, state.to_owned());
     }
     ensure!(
@@ -1480,6 +1744,10 @@ fn verify_specialist_alignment_truth(root: &Path, manifest: &FixtureManifest) ->
                     "missing".to_owned()
                 ),
                 ("EXPECTED_SBX_PARTIAL".to_owned(), "partial".to_owned()),
+                (
+                    "EXPECTED_SBX_QUALITY_BOUNDARY".to_owned(),
+                    "partial".to_owned()
+                ),
                 ("EXPECTED_SBX_REVERSE".to_owned(), "concordant".to_owned()),
             ]),
         "MF-06 named insertion-state truth changed: {observed_sbx:?}"
@@ -1886,8 +2154,8 @@ fn verify_relocation_truth(root: &Path, manifest: &FixtureManifest) -> Result<()
     };
     let query = query_alignment(&bam, Some(&reference), "chrManual", 900, 5_400)?;
     ensure!(
-        query.batch.len() == 14,
-        "MF-12 relocated project returned {} records instead of 14",
+        query.batch.len() == 16,
+        "MF-12 relocated project returned {} records instead of 16",
         query.batch.len()
     );
     Ok(())
