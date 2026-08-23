@@ -10,18 +10,31 @@ mod panel;
 mod sample_metadata;
 mod session;
 mod settings;
+mod source;
 mod track;
 mod viewport;
 
 pub use automation::{
-    AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationCommand, AutomationCommandResult,
+    AUTOMATION_SCHEMA_VERSION, AutomationAlignmentHit, AutomationAlignmentRelationship,
+    AutomationAlignmentSearchResult, AutomationAlignmentSelector, AutomationAlignmentState,
+    AutomationAlignmentTrackSnapshot, AutomationBatch, AutomationCommand, AutomationCommandResult,
     AutomationCommandStatus, AutomationEnvironmentTelemetry, AutomationError, AutomationErrorCode,
-    AutomationExportKind, AutomationFrameTelemetry, AutomationGpuTelemetry, AutomationOptionScope,
-    AutomationRunReport, AutomationRunTelemetry, AutomationSelection, AutomationSnapshotFormat,
-    AutomationSnapshotScope, MAXIMUM_AUTOMATION_COMMANDS, MAXIMUM_AUTOMATION_LOCI,
-    MAXIMUM_AUTOMATION_OPTION_BYTES, MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS,
+    AutomationEvidenceField, AutomationExportKind, AutomationFrameTelemetry,
+    AutomationGenomeSnapshot, AutomationGpuTelemetry, AutomationHistoryEntrySnapshot,
+    AutomationHistoryNavigation, AutomationNavigationDestination,
+    AutomationNavigationHistorySnapshot, AutomationOptionScope, AutomationPanelSnapshot,
+    AutomationRenderLaneSnapshot, AutomationRenderOmissionReason, AutomationReviewItemSnapshot,
+    AutomationReviewNavigation, AutomationReviewQueueSnapshot, AutomationRunReport,
+    AutomationRunTelemetry, AutomationSelection, AutomationSelectionGranularity,
+    AutomationSelectionKind, AutomationSelectionSnapshot, AutomationSetting,
+    AutomationSnapshotFormat, AutomationSnapshotScope, AutomationTrackLifecycle,
+    AutomationTrackSnapshot, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
+    AutomationWorkspaceSnapshot, MAXIMUM_AUTOMATION_ALIGNMENT_RESULTS, MAXIMUM_AUTOMATION_COMMANDS,
+    MAXIMUM_AUTOMATION_EVIDENCE_FIELDS, MAXIMUM_AUTOMATION_HISTORY_ENTRIES,
+    MAXIMUM_AUTOMATION_LOCI, MAXIMUM_AUTOMATION_OPTION_BYTES,
+    MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS, MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS,
     MAXIMUM_AUTOMATION_STRING_BYTES, MAXIMUM_AUTOMATION_TRACK_SELECTION,
-    MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS,
+    MINIMUM_AUTOMATION_SCHEMA_VERSION, MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS,
 };
 pub use coordinates::{
     Contig, ContigAliasError, ContigAliases, ContigId, GenomicInterval, IntervalError,
@@ -58,6 +71,10 @@ pub use settings::{
     MAXIMUM_AUTOSAVE_RETENTION, MAXIMUM_CACHE_BUDGET_MIB, MAXIMUM_INTERFACE_SCALE_PERCENT,
     MINIMUM_AUTOSAVE_INTERVAL_SECONDS, MINIMUM_AUTOSAVE_RETENTION, MINIMUM_CACHE_BUDGET_MIB,
     MINIMUM_INTERFACE_SCALE_PERCENT, SETTINGS_SCHEMA_VERSION, SettingsError,
+};
+pub use source::{
+    ClassifiedGenomicSource, GenomicSourceFormat, classify_genomic_source,
+    default_genomic_source_label,
 };
 pub use track::{
     CopyNumberSortLocus, CopyNumberSortMode, CopyNumberTrackSettings, CopyNumberValueMode,

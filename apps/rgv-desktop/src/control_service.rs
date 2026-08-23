@@ -31,8 +31,22 @@ pub(crate) struct ControlService {
     worker: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ControlStatusMetadata {
+    pub(crate) application_instance_id: String,
+    pub(crate) renderer_backend: String,
+    pub(crate) surface_width_pixels: u32,
+    pub(crate) surface_height_pixels: u32,
+    pub(crate) scale_factor: f64,
+}
+
 impl ControlService {
-    pub(crate) fn start(port: u16, root: PathBuf, secret: String) -> Result<Self, String> {
+    pub(crate) fn start(
+        port: u16,
+        root: PathBuf,
+        secret: String,
+        status: ControlStatusMetadata,
+    ) -> Result<Self, String> {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
             .map_err(|error| format!("could not bind the loopback control service: {error}"))?;
         let address = listener
@@ -49,7 +63,14 @@ impl ControlService {
         let worker = std::thread::Builder::new()
             .name("rgv-local-control".to_owned())
             .spawn(move || {
-                control_server_loop(&server, &request_sender, &root, &secret, &worker_stop);
+                control_server_loop(
+                    &server,
+                    &request_sender,
+                    &root,
+                    &secret,
+                    &status,
+                    &worker_stop,
+                );
             })
             .map_err(|error| format!("could not start the control-service worker: {error}"))?;
         Ok(Self {
@@ -126,12 +147,13 @@ fn control_server_loop(
     request_sender: &SyncSender<ControlRequest>,
     root: &Path,
     secret: &str,
+    status: &ControlStatusMetadata,
     stop: &AtomicBool,
 ) {
     while !stop.load(Ordering::Acquire) {
         match server.recv_timeout(Duration::from_millis(100)) {
             Ok(Some(request)) => {
-                handle_control_request(request, request_sender, root, secret, stop);
+                handle_control_request(request, request_sender, root, secret, status, stop);
             }
             Ok(None) => {}
             Err(error) => {
@@ -147,6 +169,7 @@ fn handle_control_request(
     request_sender: &SyncSender<ControlRequest>,
     root: &Path,
     secret: &str,
+    status: &ControlStatusMetadata,
     stop: &AtomicBool,
 ) {
     if request
@@ -167,8 +190,28 @@ fn handle_control_request(
             200,
             &serde_json::json!({
                 "schema_version": AUTOMATION_SCHEMA_VERSION,
+                "control_schema_version": AUTOMATION_SCHEMA_VERSION,
+                "application_version": env!("CARGO_PKG_VERSION"),
+                "application_instance_id": status.application_instance_id,
+                "process_id": std::process::id(),
+                "window_count": 1,
+                "active_window_ordinal": 1,
+                "renderer_backend": status.renderer_backend,
+                "surface_width_pixels": status.surface_width_pixels,
+                "surface_height_pixels": status.surface_height_pixels,
+                "scale_factor": status.scale_factor,
                 "service": "rgv-local-control",
-                "authentication": "bearer"
+                "authentication": "bearer",
+                "capabilities": [
+                    "workspace_state",
+                    "selection_state",
+                    "relative_viewport"
+                    ,"typed_configuration"
+                    ,"review_queue"
+                    ,"navigation_history"
+                    ,"alignment_discovery"
+                    ,"workspace_open"
+                ]
             })
             .to_string(),
         );
@@ -382,6 +425,16 @@ mod tests {
         AutomationCommand, AutomationCommandResult, AutomationCommandStatus, AutomationRunTelemetry,
     };
 
+    fn test_status() -> ControlStatusMetadata {
+        ControlStatusMetadata {
+            application_instance_id: "test-instance".to_owned(),
+            renderer_backend: "test".to_owned(),
+            surface_width_pixels: 800,
+            surface_height_pixels: 600,
+            scale_factor: 1.0,
+        }
+    }
+
     use super::*;
 
     const TEST_SECRET: &str = "0123456789abcdef0123456789abcdef";
@@ -406,10 +459,38 @@ mod tests {
     }
 
     #[test]
+    fn public_status_advertises_non_sensitive_control_capabilities() {
+        let root = tempfile::tempdir().unwrap();
+        let mut service = ControlService::start(
+            0,
+            root.path().to_owned(),
+            TEST_SECRET.to_owned(),
+            test_status(),
+        )
+        .unwrap();
+        let response = send_request(
+            service.address(),
+            "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("workspace_state"));
+        assert!(response.contains("selection_state"));
+        assert!(response.contains("relative_viewport"));
+        assert!(!response.contains(TEST_SECRET));
+        assert!(!response.contains(root.path().to_string_lossy().as_ref()));
+        service.shutdown();
+    }
+
+    #[test]
     fn authenticated_loopback_batch_returns_the_structured_executor_report() {
         let root = tempfile::tempdir().unwrap();
-        let mut service =
-            ControlService::start(0, root.path().to_owned(), TEST_SECRET.to_owned()).unwrap();
+        let mut service = ControlService::start(
+            0,
+            root.path().to_owned(),
+            TEST_SECRET.to_owned(),
+            test_status(),
+        )
+        .unwrap();
         assert!(service.address().ip().is_loopback());
         let body = serde_json::json!({
             "schema_version": AUTOMATION_SCHEMA_VERSION,
@@ -454,8 +535,13 @@ mod tests {
     #[test]
     fn missing_secret_is_rejected_without_reaching_the_window() {
         let root = tempfile::tempdir().unwrap();
-        let mut service =
-            ControlService::start(0, root.path().to_owned(), TEST_SECRET.to_owned()).unwrap();
+        let mut service = ControlService::start(
+            0,
+            root.path().to_owned(),
+            TEST_SECRET.to_owned(),
+            test_status(),
+        )
+        .unwrap();
         let body = r#"{"schema_version":1,"commands":[{"command":"exit"}]}"#;
         let response = batch_request(service.address(), "wrong", body);
         assert!(response.starts_with("HTTP/1.1 401"));

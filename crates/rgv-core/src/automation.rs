@@ -4,16 +4,22 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, PanelId, TrackId, TrackKind,
-    TrackSource,
+    AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
+    DetailLevel, ModifiedBaseColorMode, OverlappingMatePolicy, PanelId, ReadBaseDisplayMode,
+    ReviewStatus, TrackId, TrackKind, TrackSource,
 };
 
-pub const AUTOMATION_SCHEMA_VERSION: u32 = 1;
+pub const AUTOMATION_SCHEMA_VERSION: u32 = 2;
+pub const MINIMUM_AUTOMATION_SCHEMA_VERSION: u32 = 1;
 pub const MAXIMUM_AUTOMATION_COMMANDS: usize = 10_000;
 pub const MAXIMUM_AUTOMATION_STRING_BYTES: usize = 16_384;
 pub const MAXIMUM_AUTOMATION_OPTION_BYTES: usize = 64 * 1024;
 pub const MAXIMUM_AUTOMATION_LOCI: usize = 16;
 pub const MAXIMUM_AUTOMATION_TRACK_SELECTION: usize = 1_024;
+pub const MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS: usize = 1_024;
+pub const MAXIMUM_AUTOMATION_EVIDENCE_FIELDS: usize = 128;
+pub const MAXIMUM_AUTOMATION_ALIGNMENT_RESULTS: usize = 128;
+pub const MAXIMUM_AUTOMATION_HISTORY_ENTRIES: usize = 256;
 pub const MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS: u64 = 100;
 pub const MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS: u64 = 600_000;
 
@@ -70,8 +76,10 @@ impl AutomationBatch {
         Ok(())
     }
 
-    fn validate(&self) -> Result<(), AutomationError> {
-        if self.schema_version != AUTOMATION_SCHEMA_VERSION {
+    pub fn validate(&self) -> Result<(), AutomationError> {
+        if !(MINIMUM_AUTOMATION_SCHEMA_VERSION..=AUTOMATION_SCHEMA_VERSION)
+            .contains(&self.schema_version)
+        {
             return Err(AutomationError::UnsupportedVersion(self.schema_version));
         }
         if self.commands.is_empty() || self.commands.len() > MAXIMUM_AUTOMATION_COMMANDS {
@@ -89,7 +97,23 @@ impl AutomationBatch {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum AutomationCommand {
+    DescribeWorkspace,
+    DescribeSelection,
+    ClearSelection,
+    RefreshSelection,
+    DescribeReviewQueue,
+    DescribeNavigationHistory {
+        panel_id: PanelId,
+    },
     NewWorkspace,
+    OpenWorkspace {
+        path: String,
+        confirm_replace: bool,
+        #[serde(default)]
+        unsaved_changes: AutomationUnsavedChangesPolicy,
+        #[serde(default = "default_settle_timeout_millis")]
+        timeout_millis: u64,
+    },
     SetGenome {
         source: TrackSource,
         #[serde(default)]
@@ -108,6 +132,10 @@ pub enum AutomationCommand {
     Goto {
         loci: Vec<String>,
     },
+    ChangeViewport {
+        panel_id: PanelId,
+        operation: AutomationViewportOperation,
+    },
     AddPanel {
         locus: String,
     },
@@ -119,9 +147,14 @@ pub enum AutomationCommand {
         key: String,
         value: serde_json::Value,
     },
+    Configure {
+        setting: AutomationSetting,
+    },
     Group {
         track_ids: Vec<TrackId>,
         mode: AlignmentGroupMode,
+        #[serde(default)]
+        direction: AlignmentOrderDirection,
         #[serde(default)]
         tag: Option<String>,
     },
@@ -139,6 +172,31 @@ pub enum AutomationCommand {
     },
     Select {
         selection: AutomationSelection,
+    },
+    FindAlignments {
+        panel_id: PanelId,
+        track_id: TrackId,
+        selector: AutomationAlignmentSelector,
+        #[serde(default = "default_alignment_result_limit")]
+        maximum_results: usize,
+    },
+    SelectAlignment {
+        handle: String,
+    },
+    DescribeRelatedAlignments,
+    NavigateRelatedAlignment {
+        relationship: AutomationAlignmentRelationship,
+        #[serde(default)]
+        segment_index: Option<usize>,
+        #[serde(default)]
+        destination: AutomationNavigationDestination,
+    },
+    NavigateReviewItem {
+        action: AutomationReviewNavigation,
+    },
+    NavigateHistory {
+        panel_id: PanelId,
+        action: AutomationHistoryNavigation,
     },
     WaitUntilSettled {
         #[serde(default = "default_settle_timeout_millis")]
@@ -164,18 +222,33 @@ pub enum AutomationCommand {
 impl AutomationCommand {
     pub const fn name(&self) -> &'static str {
         match self {
+            Self::DescribeWorkspace => "describe_workspace",
+            Self::DescribeSelection => "describe_selection",
+            Self::ClearSelection => "clear_selection",
+            Self::RefreshSelection => "refresh_selection",
+            Self::DescribeReviewQueue => "describe_review_queue",
+            Self::DescribeNavigationHistory { .. } => "describe_navigation_history",
             Self::NewWorkspace => "new_workspace",
+            Self::OpenWorkspace { .. } => "open_workspace",
             Self::SetGenome { .. } => "set_genome",
             Self::LoadTrack { .. } => "load_track",
             Self::RemoveTrack { .. } => "remove_track",
             Self::Goto { .. } => "goto",
+            Self::ChangeViewport { .. } => "change_viewport",
             Self::AddPanel { .. } => "add_panel",
             Self::ClosePanel { .. } => "close_panel",
             Self::SetOption { .. } => "set_option",
+            Self::Configure { .. } => "configure",
             Self::Group { .. } => "group",
             Self::Sort { .. } => "sort",
             Self::Filter { .. } => "filter",
             Self::Select { .. } => "select",
+            Self::FindAlignments { .. } => "find_alignments",
+            Self::SelectAlignment { .. } => "select_alignment",
+            Self::DescribeRelatedAlignments => "describe_related_alignments",
+            Self::NavigateRelatedAlignment { .. } => "navigate_related_alignment",
+            Self::NavigateReviewItem { .. } => "navigate_review_item",
+            Self::NavigateHistory { .. } => "navigate_history",
             Self::WaitUntilSettled { .. } => "wait_until_settled",
             Self::Snapshot { .. } => "snapshot",
             Self::Export { .. } => "export",
@@ -184,9 +257,27 @@ impl AutomationCommand {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<(), String> {
         match self {
-            Self::NewWorkspace | Self::Exit => Ok(()),
+            Self::DescribeWorkspace
+            | Self::DescribeSelection
+            | Self::ClearSelection
+            | Self::RefreshSelection
+            | Self::DescribeReviewQueue
+            | Self::DescribeRelatedAlignments
+            | Self::NewWorkspace
+            | Self::Exit => Ok(()),
+            Self::DescribeNavigationHistory { panel_id }
+            | Self::NavigateHistory { panel_id, .. } => validate_panel_id(*panel_id),
+            Self::OpenWorkspace {
+                path,
+                timeout_millis,
+                ..
+            } => {
+                validate_string(path, "workspace path")?;
+                validate_settle_timeout(*timeout_millis)
+            }
             Self::SetGenome { source, name } | Self::LoadTrack { source, name, .. } => {
                 validate_source(source)?;
                 validate_optional_string(name.as_deref(), "name")
@@ -204,6 +295,15 @@ impl AutomationCommand {
                 Ok(())
             }
             Self::AddPanel { locus } => validate_string(locus, "locus"),
+            Self::ChangeViewport {
+                panel_id,
+                operation,
+            } => {
+                if panel_id.get() == 0 {
+                    return Err("panel_id must be positive".to_owned());
+                }
+                operation.validate()
+            }
             Self::ClosePanel { panel_id } => {
                 if panel_id.get() == 0 {
                     Err("panel_id must be positive".to_owned())
@@ -222,6 +322,7 @@ impl AutomationCommand {
                 }
                 Ok(())
             }
+            Self::Configure { setting } => setting.validate(),
             Self::Group { track_ids, tag, .. } | Self::Sort { track_ids, tag, .. } => {
                 validate_track_selection(track_ids)?;
                 validate_optional_sam_tag(tag.as_deref())
@@ -231,21 +332,49 @@ impl AutomationCommand {
                 expression,
             } => {
                 validate_track_selection(track_ids)?;
-                validate_string(expression, "filter expression")
-            }
-            Self::Select { selection } => selection.validate(),
-            Self::WaitUntilSettled { timeout_millis } => {
-                if (MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS
-                    ..=MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS)
-                    .contains(timeout_millis)
-                {
+                if expression.len() <= MAXIMUM_AUTOMATION_STRING_BYTES {
                     Ok(())
                 } else {
                     Err(format!(
-                        "timeout_millis must be between {MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS} and {MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS}"
+                        "filter expression must be no more than {MAXIMUM_AUTOMATION_STRING_BYTES} bytes"
                     ))
                 }
             }
+            Self::Select { selection } => selection.validate(),
+            Self::FindAlignments {
+                panel_id,
+                track_id,
+                selector,
+                maximum_results,
+            } => {
+                validate_panel_id(*panel_id)?;
+                validate_track_id(*track_id)?;
+                selector.validate()?;
+                if !(1..=MAXIMUM_AUTOMATION_ALIGNMENT_RESULTS).contains(maximum_results) {
+                    return Err(format!(
+                        "maximum_results must be between 1 and {MAXIMUM_AUTOMATION_ALIGNMENT_RESULTS}"
+                    ));
+                }
+                Ok(())
+            }
+            Self::SelectAlignment { handle } => validate_string(handle, "alignment handle"),
+            Self::NavigateRelatedAlignment {
+                relationship,
+                segment_index,
+                ..
+            } => match relationship {
+                AutomationAlignmentRelationship::Mate if segment_index.is_some() => {
+                    Err("segment_index is only valid for supplementary_segment".to_owned())
+                }
+                AutomationAlignmentRelationship::SupplementarySegment
+                    if segment_index.is_none() =>
+                {
+                    Err("segment_index is required for supplementary_segment".to_owned())
+                }
+                _ => Ok(()),
+            },
+            Self::NavigateReviewItem { action } => action.validate(),
+            Self::WaitUntilSettled { timeout_millis } => validate_settle_timeout(*timeout_millis),
             Self::Snapshot { path, .. } | Self::Export { path, .. } | Self::Save { path } => {
                 validate_string(path, "output path")
             }
@@ -257,6 +386,10 @@ impl AutomationCommand {
             Self::SetGenome { source, .. } | Self::LoadTrack { source, .. } => {
                 *source = source.redacted_for_persistence();
             }
+            Self::FindAlignments {
+                selector: AutomationAlignmentSelector::ExactReadName { read_name },
+                ..
+            } => "[redacted]".clone_into(read_name),
             _ => {}
         }
     }
@@ -273,7 +406,10 @@ impl AutomationCommand {
                     }
                 }
             }
-            Self::Snapshot { path, .. } | Self::Export { path, .. } | Self::Save { path } => {
+            Self::OpenWorkspace { path, .. }
+            | Self::Snapshot { path, .. }
+            | Self::Export { path, .. }
+            | Self::Save { path } => {
                 let output = PathBuf::from(&*path);
                 if output.is_relative() {
                     *path = normalize_automation_path(&root.join(output))
@@ -308,13 +444,546 @@ impl AutomationCommand {
                     resolve(path)?;
                 }
             }
-            Self::Snapshot { path, .. } | Self::Export { path, .. } | Self::Save { path } => {
+            Self::OpenWorkspace { path, .. }
+            | Self::Snapshot { path, .. }
+            | Self::Export { path, .. }
+            | Self::Save { path } => {
                 resolve(path)?;
             }
             _ => {}
         }
         Ok(())
     }
+}
+
+/// A deterministic mutation of one existing panel's genomic camera.
+///
+/// Zoom factors are expressed in user-facing magnification: values greater
+/// than one zoom in and values below one zoom out.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum AutomationViewportOperation {
+    PanBases {
+        delta: i64,
+    },
+    PanFraction {
+        fraction: f64,
+    },
+    Zoom {
+        factor: f64,
+        #[serde(default)]
+        anchor_position: Option<u64>,
+    },
+    FitInterval {
+        start: u64,
+        end: u64,
+    },
+}
+
+impl AutomationViewportOperation {
+    fn validate(self) -> Result<(), String> {
+        match self {
+            Self::PanBases { delta } if delta != 0 => Ok(()),
+            Self::PanBases { .. } => Err("pan delta must not be zero".to_owned()),
+            Self::PanFraction { fraction }
+                if fraction.is_finite()
+                    && fraction != 0.0
+                    && (-100.0..=100.0).contains(&fraction) =>
+            {
+                Ok(())
+            }
+            Self::PanFraction { .. } => {
+                Err("pan fraction must be finite, non-zero, and between -100 and 100".to_owned())
+            }
+            Self::Zoom { factor, .. } if factor.is_finite() && (0.01..=100.0).contains(&factor) => {
+                Ok(())
+            }
+            Self::Zoom { .. } => {
+                Err("zoom factor must be finite and between 0.01 and 100".to_owned())
+            }
+            Self::FitInterval { start, end } if start < end => Ok(()),
+            Self::FitInterval { .. } => {
+                Err("fit interval must have a start smaller than its end".to_owned())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationUnsavedChangesPolicy {
+    #[default]
+    Reject,
+    SaveThenOpen,
+    Discard,
+}
+
+/// Typed configuration accepted by automation schema v2. Each variant owns
+/// its valid scope, preventing key/scope mismatches at the protocol boundary.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "setting", rename_all = "snake_case")]
+pub enum AutomationSetting {
+    ShowReference {
+        value: bool,
+    },
+    ShowCoverage {
+        value: bool,
+    },
+    ShowReads {
+        value: bool,
+    },
+    ShowJunctions {
+        value: bool,
+    },
+    ViewAsPairs {
+        value: bool,
+    },
+    OverlappingMatePolicy {
+        value: OverlappingMatePolicy,
+    },
+    AlignmentColorMode {
+        track_ids: Vec<TrackId>,
+        value: AlignmentColorMode,
+    },
+    AlignmentDensity {
+        value: f32,
+    },
+    ReadBaseDisplayMode {
+        value: ReadBaseDisplayMode,
+    },
+    ShadeReadBasesByQuality {
+        value: bool,
+    },
+    ShowModifiedBases {
+        value: bool,
+    },
+    ModifiedBaseColorMode {
+        value: ModifiedBaseColorMode,
+    },
+    TrackHeight {
+        track_id: TrackId,
+        value: f32,
+    },
+    TrackCollapsed {
+        track_id: TrackId,
+        value: bool,
+    },
+    TrackVisible {
+        track_id: TrackId,
+        value: bool,
+    },
+    VerticalScrollPoints {
+        panel_id: PanelId,
+        value: f32,
+    },
+}
+
+impl AutomationSetting {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::AlignmentColorMode { track_ids, value } => {
+                validate_track_selection(track_ids)?;
+                if let AlignmentColorMode::Tag(tag) = value {
+                    validate_sam_tag_bytes(*tag)?;
+                }
+                Ok(())
+            }
+            Self::AlignmentDensity { value }
+                if value.is_finite() && (0.25..=4.0).contains(value) =>
+            {
+                Ok(())
+            }
+            Self::AlignmentDensity { .. } => {
+                Err("alignment density must be finite and between 0.25 and 4".to_owned())
+            }
+            Self::TrackHeight { track_id, value } => {
+                validate_track_id(*track_id)?;
+                if value.is_finite() && (40.0..=1_200.0).contains(value) {
+                    Ok(())
+                } else {
+                    Err("track height must be finite and between 40 and 1200".to_owned())
+                }
+            }
+            Self::TrackCollapsed { track_id, .. } | Self::TrackVisible { track_id, .. } => {
+                validate_track_id(*track_id)
+            }
+            Self::VerticalScrollPoints { panel_id, value } => {
+                validate_panel_id(*panel_id)?;
+                if value.is_finite() && *value >= 0.0 {
+                    Ok(())
+                } else {
+                    Err("vertical scroll must be finite and non-negative".to_owned())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "selector", rename_all = "snake_case")]
+pub enum AutomationAlignmentSelector {
+    ExactReadName {
+        read_name: String,
+    },
+    Position {
+        position: u64,
+    },
+    Interval {
+        start: u64,
+        end: u64,
+    },
+    Semantic {
+        #[serde(default)]
+        alignment_state: Option<AutomationAlignmentState>,
+        #[serde(default)]
+        pair_class: Option<String>,
+        #[serde(default)]
+        has_mapped_mate: Option<bool>,
+        #[serde(default)]
+        has_supplementary_chain: Option<bool>,
+        #[serde(default)]
+        has_modified_bases: Option<bool>,
+    },
+}
+
+impl AutomationAlignmentSelector {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::ExactReadName { read_name } => validate_string(read_name, "read name"),
+            Self::Interval { start, end } if start >= end => {
+                Err("alignment interval start must be smaller than end".to_owned())
+            }
+            Self::Semantic { pair_class, .. } => {
+                validate_optional_string(pair_class.as_deref(), "pair class")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationAlignmentState {
+    Primary,
+    Secondary,
+    Supplementary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationAlignmentRelationship {
+    Mate,
+    SupplementarySegment,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationNavigationDestination {
+    #[default]
+    CurrentPanel,
+    NewPanel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AutomationReviewNavigation {
+    Item { review_item_id: u64 },
+    NextPending,
+}
+
+impl AutomationReviewNavigation {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Item { review_item_id: 0 } => Err("review_item_id must be positive".to_owned()),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AutomationHistoryNavigation {
+    Back,
+    Forward,
+    Index { index: usize },
+}
+
+fn default_alignment_result_limit() -> usize {
+    25
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationWorkspaceSnapshot {
+    pub application_version: String,
+    pub schema_version: u32,
+    #[serde(default)]
+    pub application_instance_id: String,
+    #[serde(default)]
+    pub workspace_revision: u64,
+    pub genome: AutomationGenomeSnapshot,
+    pub settled: bool,
+    pub active_panel_id: PanelId,
+    pub panels: Vec<AutomationPanelSnapshot>,
+    pub tracks: Vec<AutomationTrackSnapshot>,
+    #[serde(default)]
+    pub selection: Option<AutomationSelectionSnapshot>,
+    #[serde(default)]
+    pub status: Vec<String>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationGenomeSnapshot {
+    pub name: String,
+    pub reference_configured: bool,
+    pub reference_ready: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPanelSnapshot {
+    pub id: PanelId,
+    pub locus: String,
+    pub contig: String,
+    pub start: u64,
+    pub end: u64,
+    pub detail_level: DetailLevel,
+    pub vertical_scroll_points: f32,
+    #[serde(default)]
+    pub maximum_vertical_scroll_points: f32,
+    #[serde(default)]
+    pub render_generation: u64,
+    #[serde(default)]
+    pub settled: bool,
+    #[serde(default)]
+    pub render_lanes: Vec<AutomationRenderLaneSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationRenderLaneSnapshot {
+    pub lane: String,
+    pub configured: bool,
+    pub rendered: bool,
+    #[serde(default)]
+    pub omission_reason: Option<AutomationRenderOmissionReason>,
+    #[serde(default)]
+    pub queried_items: usize,
+    #[serde(default)]
+    pub rendered_items: usize,
+    #[serde(default)]
+    pub sampled_items: usize,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationRenderOmissionReason {
+    OverviewDetailThreshold,
+    Disabled,
+    NoReference,
+    NoData,
+    Loading,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationTrackSnapshot {
+    pub id: TrackId,
+    pub name: String,
+    pub kind: TrackKind,
+    pub visible: bool,
+    pub collapsed: bool,
+    pub height: f32,
+    pub lifecycle: AutomationTrackLifecycle,
+    #[serde(default)]
+    pub failure: Option<String>,
+    #[serde(default)]
+    pub alignment: Option<AutomationAlignmentTrackSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationTrackLifecycle {
+    Opening,
+    Ready,
+    Failed,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationAlignmentTrackSnapshot {
+    pub group_mode: AlignmentGroupMode,
+    pub group_order: AlignmentOrderDirection,
+    pub sort_mode: AlignmentSortMode,
+    pub sort_order: AlignmentOrderDirection,
+    pub filter_expression: String,
+    #[serde(default)]
+    pub view_as_pairs: bool,
+    #[serde(default)]
+    pub overlapping_mate_policy: OverlappingMatePolicy,
+    #[serde(default)]
+    pub color_mode: AlignmentColorMode,
+    #[serde(default = "default_alignment_density")]
+    pub alignment_density: f32,
+    #[serde(default)]
+    pub read_base_display_mode: ReadBaseDisplayMode,
+    #[serde(default)]
+    pub shade_read_bases_by_quality: bool,
+    #[serde(default)]
+    pub show_modified_bases: bool,
+    #[serde(default)]
+    pub modified_base_color_mode: ModifiedBaseColorMode,
+    #[serde(default)]
+    pub show_reference: bool,
+    #[serde(default)]
+    pub show_coverage: bool,
+    #[serde(default)]
+    pub show_reads: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationSelectionSnapshot {
+    #[serde(default)]
+    pub selection_id: String,
+    #[serde(default)]
+    pub evidence_revision: u64,
+    #[serde(default)]
+    pub workspace_revision_at_selection: u64,
+    pub panel_id: PanelId,
+    #[serde(default)]
+    pub track_id: Option<TrackId>,
+    pub kind: AutomationSelectionKind,
+    #[serde(default)]
+    pub granularity: Option<AutomationSelectionGranularity>,
+    #[serde(default)]
+    pub anchor_position: Option<u64>,
+    #[serde(default)]
+    pub evidence_start: Option<u64>,
+    #[serde(default)]
+    pub evidence_end: Option<u64>,
+    #[serde(default)]
+    pub position: Option<u64>,
+    #[serde(default)]
+    pub start: Option<u64>,
+    #[serde(default)]
+    pub end: Option<u64>,
+    #[serde(default)]
+    pub fields: Vec<AutomationEvidenceField>,
+    #[serde(default)]
+    pub provenance: Vec<AutomationEvidenceField>,
+    #[serde(default)]
+    pub visible_in_active_view: bool,
+    #[serde(default)]
+    pub stale: bool,
+    #[serde(default)]
+    pub stale_reason: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationSelectionGranularity {
+    #[default]
+    ExactBase,
+    VisibleBin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationSelectionKind {
+    Panel,
+    Track,
+    Position,
+    Read,
+    ReadEvent,
+    Pileup,
+    Modification,
+    Junction,
+    Feature,
+    Variant,
+    Gwas,
+    Quantitative,
+    CopyNumber,
+    Mutation,
+    Interaction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationEvidenceField {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationReviewQueueSnapshot {
+    pub application_instance_id: String,
+    pub workspace_revision: u64,
+    pub items: Vec<AutomationReviewItemSnapshot>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationReviewItemSnapshot {
+    pub id: u64,
+    pub label: String,
+    pub locus: String,
+    pub contig: String,
+    pub start: u64,
+    pub end: u64,
+    pub status: ReviewStatus,
+    pub current: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationNavigationHistorySnapshot {
+    pub application_instance_id: String,
+    pub workspace_revision: u64,
+    pub panel_id: PanelId,
+    pub entries: Vec<AutomationHistoryEntrySnapshot>,
+    pub cursor: usize,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationHistoryEntrySnapshot {
+    pub index: usize,
+    pub locus: String,
+    pub contig: String,
+    pub start: u64,
+    pub end: u64,
+    pub current: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationAlignmentHit {
+    pub handle: String,
+    pub panel_id: PanelId,
+    pub track_id: TrackId,
+    pub start: u64,
+    pub end: u64,
+    pub flags: u16,
+    #[serde(default)]
+    pub mapping_quality: Option<u8>,
+    pub pair_class: String,
+    pub mapped_mate_available: bool,
+    pub supplementary_segment_count: usize,
+    pub modification_code_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationAlignmentSearchResult {
+    pub application_instance_id: String,
+    pub workspace_revision: u64,
+    pub query_generation: u64,
+    pub hits: Vec<AutomationAlignmentHit>,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 fn normalize_automation_path(path: &Path) -> PathBuf {
@@ -363,6 +1032,8 @@ pub enum AutomationSelection {
         panel_id: PanelId,
         track_id: TrackId,
         position: u64,
+        #[serde(default)]
+        granularity: AutomationSelectionGranularity,
     },
 }
 
@@ -382,6 +1053,10 @@ impl AutomationSelection {
             }
         }
     }
+}
+
+fn default_alignment_density() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -424,6 +1099,18 @@ pub enum AutomationErrorCode {
     UnsupportedCommand,
     ResourceNotFound,
     InvalidState,
+    InvalidSettingScope,
+    SettingOutOfRange,
+    EffectiveStateUnavailable,
+    NoSelection,
+    SelectionStale,
+    StaleHandle,
+    AmbiguousAlignmentMatch,
+    RelatedAlignmentUnavailable,
+    ReviewItemNotFound,
+    HistoryBoundary,
+    UnsavedChanges,
+    WorkspaceReplacementNotConfirmed,
     Timeout,
     Io,
     Internal,
@@ -541,6 +1228,26 @@ fn default_settle_timeout_millis() -> u64 {
     30_000
 }
 
+fn validate_settle_timeout(timeout_millis: u64) -> Result<(), String> {
+    if (MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS..=MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS)
+        .contains(&timeout_millis)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "timeout_millis must be between {MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS} and {MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS}"
+        ))
+    }
+}
+
+fn validate_panel_id(panel_id: PanelId) -> Result<(), String> {
+    if panel_id.get() == 0 {
+        Err("panel_id must be positive".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_source(source: &TrackSource) -> Result<(), String> {
     match source {
         TrackSource::Local { path } => validate_string(path, "local source path"),
@@ -574,6 +1281,14 @@ fn validate_optional_sam_tag(tag: Option<&str>) -> Result<(), String> {
     };
     let bytes = tag.as_bytes();
     if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1].is_ascii_alphanumeric() {
+        Ok(())
+    } else {
+        Err("tag must be a valid two-character SAM tag".to_owned())
+    }
+}
+
+fn validate_sam_tag_bytes(tag: [u8; 2]) -> Result<(), String> {
+    if tag[0].is_ascii_alphabetic() && tag[1].is_ascii_alphanumeric() {
         Ok(())
     } else {
         Err("tag must be a valid two-character SAM tag".to_owned())
@@ -619,6 +1334,8 @@ mod tests {
         let batch = AutomationBatch {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             commands: vec![
+                AutomationCommand::DescribeWorkspace,
+                AutomationCommand::DescribeSelection,
                 AutomationCommand::NewWorkspace,
                 AutomationCommand::LoadTrack {
                     source: TrackSource::Local {
@@ -629,6 +1346,13 @@ mod tests {
                 },
                 AutomationCommand::Goto {
                     loci: vec!["chr1:101-200".to_owned(), "chr2:301-400".to_owned()],
+                },
+                AutomationCommand::ChangeViewport {
+                    panel_id: PanelId::new(1),
+                    operation: AutomationViewportOperation::Zoom {
+                        factor: 2.0,
+                        anchor_position: Some(150),
+                    },
                 },
                 AutomationCommand::WaitUntilSettled {
                     timeout_millis: 30_000,
@@ -654,15 +1378,166 @@ mod tests {
                 .map(AutomationCommand::name)
                 .collect::<Vec<_>>(),
             [
+                "describe_workspace",
+                "describe_selection",
                 "new_workspace",
                 "load_track",
                 "goto",
+                "change_viewport",
                 "wait_until_settled",
                 "snapshot",
                 "save",
                 "exit",
             ]
         );
+    }
+
+    #[test]
+    fn viewport_operations_reject_ambiguous_or_unbounded_values() {
+        for operation in [
+            AutomationViewportOperation::PanBases { delta: 0 },
+            AutomationViewportOperation::PanFraction { fraction: f64::NAN },
+            AutomationViewportOperation::PanFraction { fraction: 101.0 },
+            AutomationViewportOperation::Zoom {
+                factor: 0.0,
+                anchor_position: None,
+            },
+            AutomationViewportOperation::Zoom {
+                factor: f64::INFINITY,
+                anchor_position: None,
+            },
+            AutomationViewportOperation::FitInterval { start: 10, end: 10 },
+        ] {
+            let batch = AutomationBatch {
+                schema_version: AUTOMATION_SCHEMA_VERSION,
+                commands: vec![AutomationCommand::ChangeViewport {
+                    panel_id: PanelId::new(1),
+                    operation,
+                }],
+            };
+            assert!(matches!(
+                batch.to_json(),
+                Err(AutomationError::InvalidCommand { index: 0, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn version_one_batches_remain_readable_and_receive_exact_base_defaults() {
+        let batch = AutomationBatch::from_json(
+            r#"{
+                "schema_version": 1,
+                "commands": [{
+                    "command": "select",
+                    "selection": {
+                        "selection": "position",
+                        "panel_id": 1,
+                        "track_id": 2,
+                        "position": 149
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            batch.commands.as_slice(),
+            [AutomationCommand::Select {
+                selection: AutomationSelection::Position {
+                    granularity: AutomationSelectionGranularity::ExactBase,
+                    ..
+                }
+            }]
+        ));
+    }
+
+    #[test]
+    fn sensitive_alignment_selectors_are_redacted_from_persisted_batches() {
+        let batch = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::FindAlignments {
+                panel_id: PanelId::new(1),
+                track_id: TrackId::new(2),
+                selector: AutomationAlignmentSelector::ExactReadName {
+                    read_name: "private-read-name".to_owned(),
+                },
+                maximum_results: 1,
+            }],
+        };
+        let json = batch.to_json().unwrap();
+        assert!(!json.contains("private-read-name"));
+        assert!(json.contains("[redacted]"));
+    }
+
+    #[test]
+    fn typed_workspace_and_selection_snapshots_round_trip() {
+        let selection = AutomationSelectionSnapshot {
+            selection_id: "selection-fixture".to_owned(),
+            evidence_revision: 3,
+            workspace_revision_at_selection: 7,
+            panel_id: PanelId::new(1),
+            track_id: Some(TrackId::new(7)),
+            kind: AutomationSelectionKind::Pileup,
+            granularity: Some(AutomationSelectionGranularity::ExactBase),
+            anchor_position: Some(149),
+            evidence_start: Some(149),
+            evidence_end: Some(150),
+            position: Some(149),
+            start: Some(149),
+            end: Some(150),
+            fields: vec![AutomationEvidenceField {
+                key: "A".to_owned(),
+                value: "12".to_owned(),
+            }],
+            provenance: Vec::new(),
+            visible_in_active_view: true,
+            stale: false,
+            stale_reason: None,
+            truncated: false,
+        };
+        let workspace = AutomationWorkspaceSnapshot {
+            application_version: "0.1.0".to_owned(),
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            application_instance_id: "application-fixture".to_owned(),
+            workspace_revision: 7,
+            genome: AutomationGenomeSnapshot {
+                name: "fixture".to_owned(),
+                reference_configured: true,
+                reference_ready: true,
+            },
+            settled: true,
+            active_panel_id: PanelId::new(1),
+            panels: vec![AutomationPanelSnapshot {
+                id: PanelId::new(1),
+                locus: "chr1:101-200".to_owned(),
+                contig: "chr1".to_owned(),
+                start: 100,
+                end: 200,
+                detail_level: DetailLevel::Reads,
+                vertical_scroll_points: 0.0,
+                maximum_vertical_scroll_points: 0.0,
+                render_generation: 1,
+                settled: true,
+                render_lanes: Vec::new(),
+            }],
+            tracks: Vec::new(),
+            selection: Some(selection.clone()),
+            status: Vec::new(),
+            truncated: false,
+        };
+
+        let workspace_json = serde_json::to_string(&workspace).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AutomationWorkspaceSnapshot>(&workspace_json).unwrap(),
+            workspace
+        );
+        let selection_json = serde_json::to_string(&selection).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AutomationSelectionSnapshot>(&selection_json).unwrap(),
+            selection
+        );
+        assert!(!workspace_json.contains("source"));
+        assert!(!workspace_json.contains("path"));
+        assert!(!workspace_json.contains("sequence"));
     }
 
     #[test]
@@ -697,6 +1572,23 @@ mod tests {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             commands: vec![AutomationCommand::WaitUntilSettled {
                 timeout_millis: MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS + 1,
+            }],
+        };
+        assert!(matches!(
+            invalid.to_json(),
+            Err(AutomationError::InvalidCommand { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn typed_alignment_color_tags_enforce_sam_tag_syntax() {
+        let invalid = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::Configure {
+                setting: AutomationSetting::AlignmentColorMode {
+                    track_ids: vec![TrackId::new(1)],
+                    value: AlignmentColorMode::Tag(*b"1!"),
+                },
             }],
         };
         assert!(matches!(

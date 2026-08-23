@@ -38,21 +38,27 @@ class PackagingTests(unittest.TestCase):
             directory = Path(raw_directory)
             binary = directory / "rgv-desktop"
             binary.write_bytes(b"test executable")
+            mcp_binary = directory / "rgv-mcp"
+            mcp_binary.write_bytes(b"test mcp executable")
             destination = directory / "dist"
             destination.mkdir()
-            root = stage_package.stage_macos(binary, destination, "0.1.0", "42")
+            root = stage_package.stage_macos(
+                binary, destination, "0.1.0", "42", mcp_binary
+            )
             stage_package.write_manifest(root)
             stage_package.verify_manifest(root)
 
             plist = plistlib.loads((root / "Contents" / "Info.plist").read_bytes())
             self.assertEqual(plist["CFBundleShortVersionString"], "0.1.0")
             self.assertEqual(plist["CFBundleVersion"], "42")
+            self.assertTrue((root / "Contents" / "MacOS" / "rgv-mcp").is_file())
             resources = root / "Contents" / "Resources"
             release_metadata.check(resources)
             sbom = json.loads((resources / release_metadata.SBOM_NAME).read_text())
             serialized = json.dumps(sbom)
             self.assertNotIn(str(Path.home()), serialized)
             self.assertTrue(any(item["name"] == "rgv-desktop" for item in sbom["components"]))
+            self.assertTrue(any(item["name"] == "rgv-mcp" for item in sbom["components"]))
 
     def test_manifest_detects_package_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
@@ -69,21 +75,27 @@ class PackagingTests(unittest.TestCase):
             directory = Path(raw_directory)
             binary = directory / "rgv-desktop"
             binary.write_bytes(b"test executable")
-            linux_root = stage_package.stage_linux(binary, directory / "linux", "x86_64", "0.1.0")
+            mcp_binary = directory / "rgv-mcp"
+            mcp_binary.write_bytes(b"test mcp executable")
+            linux_root = stage_package.stage_linux(
+                binary, directory / "linux", "x86_64", "0.1.0", mcp_binary
+            )
             stage_package.write_manifest(linux_root)
             stage_package.verify_manifest(linux_root)
             self.assertTrue((linux_root / "bin" / "rgv-desktop").is_file())
+            self.assertTrue((linux_root / "bin" / "rgv-mcp").is_file())
             linux_resources = linux_root / "share" / "doc" / "rgv"
             release_metadata.check(linux_resources)
             desktop = (linux_root / "share" / "applications" / "rgv.desktop").read_text()
             self.assertEqual(next(line for line in desktop.splitlines() if line.startswith("Exec=")), "Exec=rgv-desktop")
 
             windows_root = stage_package.stage_windows(
-                binary, directory / "windows", "x86_64", "0.1.0"
+                binary, directory / "windows", "x86_64", "0.1.0", mcp_binary
             )
             stage_package.write_manifest(windows_root)
             stage_package.verify_manifest(windows_root)
             self.assertTrue((windows_root / "rgv-desktop.exe").is_file())
+            self.assertTrue((windows_root / "rgv-mcp.exe").is_file())
             release_metadata.check(windows_root / "licenses")
 
 

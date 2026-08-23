@@ -1,4 +1,9 @@
-use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, Ui, pos2};
+use std::sync::Arc;
+
+use egui::{
+    Align2, Color32, FontId, Galley, Rect, Sense, Stroke, Ui, pos2,
+    text::{LayoutJob, TextFormat, TextWrapping},
+};
 use rgv_core::{TrackId, TrackKind};
 use rgv_layout::TextPrimitive;
 
@@ -54,6 +59,58 @@ pub enum TrackUiAction {
 #[derive(Default)]
 pub struct TrackGutterResult {
     pub actions: Vec<TrackUiAction>,
+}
+
+const GUTTER_TEXT_GAP: f32 = 6.0;
+const MAX_GUTTER_LABEL_FRACTION: f32 = 0.55;
+
+fn gutter_row_widths(label_width: f32, detail_width: f32, available_width: f32) -> (f32, f32) {
+    let available_width = available_width.max(0.0);
+    if detail_width <= f32::EPSILON {
+        return (label_width.min(available_width), 0.0);
+    }
+    if label_width + GUTTER_TEXT_GAP + detail_width <= available_width {
+        return (label_width, detail_width);
+    }
+    let text_width = (available_width - GUTTER_TEXT_GAP).max(0.0);
+    let label_width = label_width.min(text_width * MAX_GUTTER_LABEL_FRACTION);
+    (label_width, (text_width - label_width).max(0.0))
+}
+
+fn layout_elided_text(
+    painter: &egui::Painter,
+    text: &str,
+    font_id: FontId,
+    color: Color32,
+    maximum_width: f32,
+) -> Arc<Galley> {
+    let mut job = LayoutJob {
+        wrap: TextWrapping::truncate_at_width(maximum_width.max(0.0)),
+        ..LayoutJob::default()
+    };
+    job.append(text, 0.0, TextFormat::simple(font_id, color));
+    painter.layout_job(job)
+}
+
+fn paint_elided_text(
+    painter: &egui::Painter,
+    text: &str,
+    font_id: FontId,
+    color: Color32,
+    maximum_width: f32,
+    anchor: egui::Pos2,
+    right_aligned: bool,
+) {
+    if maximum_width <= f32::EPSILON {
+        return;
+    }
+    let galley = layout_elided_text(painter, text, font_id, color, maximum_width);
+    let left = if right_aligned {
+        anchor.x - galley.size().x
+    } else {
+        anchor.x
+    };
+    painter.galley(pos2(left, anchor.y - galley.size().y * 0.5), galley, color);
 }
 
 pub fn track_drop_index(
@@ -367,6 +424,14 @@ pub fn paint_track_viewport_chrome(
             tooltip.push('\n');
             tooltip.push_str(source);
         }
+        for subtrack in &frame.subtracks {
+            tooltip.push('\n');
+            tooltip.push_str(&subtrack.label);
+            if let Some(detail) = &subtrack.detail {
+                tooltip.push_str(": ");
+                tooltip.push_str(detail);
+            }
+        }
         response.clone().on_hover_text(tooltip);
         response.context_menu(|ui| {
             if ui.button("Track settings…").clicked() {
@@ -427,12 +492,14 @@ pub fn paint_track_viewport_chrome(
             FontId::proportional(10.0),
             text_color,
         );
-        label_painter.text(
-            pos2(label_rect.left() + 18.0, label_rect.top() + 11.0),
-            Align2::LEFT_CENTER,
+        paint_elided_text(
+            &label_painter,
             &frame.name,
             FontId::proportional(11.0),
             text_color,
+            (label_rect.width() - 25.0).max(0.0),
+            pos2(label_rect.left() + 18.0, label_rect.top() + 11.0),
+            false,
         );
         for subtrack in &frame.subtracks {
             let (subtrack_top, subtrack_bottom) =
@@ -443,20 +510,41 @@ pub fn paint_track_viewport_chrome(
                 continue;
             }
             let y = (subtrack_top + 9.0).min(subtrack_bottom - 2.0);
-            label_painter.text(
-                pos2(label_rect.left() + 18.0, y),
-                Align2::LEFT_CENTER,
+            let label_font = FontId::proportional(10.0);
+            let detail_font = FontId::proportional(9.0);
+            let label_color = Color32::from_gray(75);
+            let detail_color = Color32::from_gray(105);
+            let label_width = label_painter
+                .layout_no_wrap(subtrack.label.clone(), label_font.clone(), label_color)
+                .size()
+                .x;
+            let detail_width = subtrack.detail.as_ref().map_or(0.0, |detail| {
+                label_painter
+                    .layout_no_wrap(detail.clone(), detail_font.clone(), detail_color)
+                    .size()
+                    .x
+            });
+            let available_width = (label_rect.width() - 25.0).max(0.0);
+            let (label_width, detail_width) =
+                gutter_row_widths(label_width, detail_width, available_width);
+            paint_elided_text(
+                &label_painter,
                 &subtrack.label,
-                FontId::proportional(10.0),
-                Color32::from_gray(75),
+                label_font,
+                label_color,
+                label_width,
+                pos2(label_rect.left() + 18.0, y),
+                false,
             );
             if let Some(detail) = &subtrack.detail {
-                label_painter.text(
-                    pos2(label_rect.right() - 7.0, y),
-                    Align2::RIGHT_CENTER,
+                paint_elided_text(
+                    &label_painter,
                     detail,
-                    FontId::proportional(9.0),
-                    Color32::from_gray(105),
+                    detail_font,
+                    detail_color,
+                    detail_width,
+                    pos2(label_rect.right() - 7.0, y),
+                    true,
                 );
             }
         }
@@ -600,6 +688,37 @@ mod tests {
             (actual - expected).abs() < 1.0e-3,
             "expected {expected}, got {actual}"
         );
+    }
+
+    #[test]
+    fn gutter_row_widths_keep_label_and_detail_apart() {
+        let available_width = 143.0;
+        let (label_width, detail_width) = gutter_row_widths(62.0, 240.0, available_width);
+
+        assert_close(label_width, 62.0);
+        assert_close(
+            label_width + GUTTER_TEXT_GAP + detail_width,
+            available_width,
+        );
+        assert!(detail_width > 0.0);
+    }
+
+    #[test]
+    fn gutter_text_is_elided_to_one_bounded_row() {
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let galley = layout_elided_text(
+                ui.painter(),
+                "2 types · 5 tagged reads · 0 malformed · 0 unavailable",
+                FontId::proportional(9.0),
+                Color32::from_gray(105),
+                70.0,
+            );
+
+            assert!(galley.elided);
+            assert_eq!(galley.rows.len(), 1);
+            assert!(galley.size().x <= 70.0);
+        });
     }
 
     #[test]

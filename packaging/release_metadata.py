@@ -70,11 +70,16 @@ def cargo_metadata() -> dict:
     return json.loads(raw)
 
 
-def reachable_package_ids(metadata: dict, root_name: str = "rgv-desktop") -> set[str]:
+def reachable_package_ids(metadata: dict, root_names=("rgv-desktop",)) -> set[str]:
+    if isinstance(root_names, str):
+        root_names = (root_names,)
     packages = metadata["packages"]
-    roots = [package["id"] for package in packages if package["name"] == root_name]
-    if len(roots) != 1:
-        raise ValueError(f"expected exactly one {root_name} package, found {len(roots)}")
+    roots = []
+    for root_name in root_names:
+        matching = [package["id"] for package in packages if package["name"] == root_name]
+        if len(matching) != 1:
+            raise ValueError(f"expected exactly one {root_name} package, found {len(matching)}")
+        roots.extend(matching)
     nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
     pending = roots[:]
     reachable: set[str] = set()
@@ -128,8 +133,13 @@ def package_purl(package: dict) -> str:
     return f"pkg:cargo/{name}@{version}?{qualifier}"
 
 
-def build_sbom(metadata: dict, version: str, timestamp: str) -> tuple[dict, list[dict]]:
-    reachable = reachable_package_ids(metadata)
+def build_sbom(
+    metadata: dict,
+    version: str,
+    timestamp: str,
+    root_names=("rgv-desktop",),
+) -> tuple[dict, list[dict]]:
+    reachable = reachable_package_ids(metadata, root_names)
     packages = [package for package in metadata["packages"] if package["id"] in reachable]
     packages.sort(key=lambda package: (package["name"], package["version"], package["id"]))
     checksum_by_package = lock_checksums()
@@ -137,7 +147,7 @@ def build_sbom(metadata: dict, version: str, timestamp: str) -> tuple[dict, list
     components = []
     for package in packages:
         component = {
-            "type": "application" if package["name"] == "rgv-desktop" else "library",
+            "type": "application" if package["name"] in root_names else "library",
             "bom-ref": refs[package["id"]],
             "name": package["name"],
             "version": package["version"],
@@ -245,7 +255,7 @@ def build_notices(packages: list[dict]) -> str:
         "==================================",
         "",
         "This inventory and deduplicated license-text bundle are generated from the locked",
-        "dependency graph and the exact Cargo source distributions used to build rgv-desktop.",
+        "dependency graph and the exact Cargo source distributions used to build the packaged RGV binaries.",
         "",
     ]
     for package in packages:
@@ -286,19 +296,29 @@ def build_timestamp() -> str:
     return instant.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def generate(binary: Path, target: str, version: str, output: Path) -> None:
+def generate(
+    binary: Path,
+    target: str,
+    version: str,
+    output: Path,
+    additional_binaries=(),
+) -> None:
     binary = binary.resolve(strict=True)
+    additional_binaries = tuple(path.resolve(strict=True) for path in additional_binaries)
+    root_names = ("rgv-desktop",) + tuple(path.stem for path in additional_binaries)
+    if any(name != "rgv-mcp" for name in root_names[1:]):
+        raise ValueError("only the rgv-mcp companion binary is supported")
     output.mkdir(parents=True, exist_ok=True)
     timestamp = build_timestamp()
     metadata = cargo_metadata()
     workspace_versions = {
-        package["version"] for package in metadata["packages"] if package["name"] == "rgv-desktop"
+        package["version"] for package in metadata["packages"] if package["name"] in root_names
     }
     if workspace_versions != {version}:
         raise ValueError(
-            f"package version {version} does not match rgv-desktop metadata {sorted(workspace_versions)}"
+            f"package version {version} does not match packaged RGV metadata {sorted(workspace_versions)}"
         )
-    sbom, packages = build_sbom(metadata, version, timestamp)
+    sbom, packages = build_sbom(metadata, version, timestamp, root_names)
     sbom_path = output / SBOM_NAME
     sbom_path.write_text(json.dumps(sbom, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / NOTICES_NAME).write_text(build_notices(packages), encoding="utf-8")
@@ -316,11 +336,14 @@ def generate(binary: Path, target: str, version: str, output: Path) -> None:
             "rustc": command_output(["rustc", "--version", "--verbose"]),
             "cargo": command_output(["cargo", "--version", "--verbose"]),
         },
-        "staged_input_binary": {
-            "name": binary.name,
-            "bytes": binary.stat().st_size,
-            "sha256": sha256(binary),
-        },
+        "staged_input_binaries": [
+            {
+                "name": path.name,
+                "bytes": path.stat().st_size,
+                "sha256": sha256(path),
+            }
+            for path in (binary,) + additional_binaries
+        ],
         "sbom": {"name": SBOM_NAME, "sha256": sha256(sbom_path)},
         "dependency_components": len(packages),
     }
@@ -349,6 +372,7 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     generate_parser = subparsers.add_parser("generate")
     generate_parser.add_argument("--binary", type=Path, required=True)
+    generate_parser.add_argument("--additional-binary", type=Path, action="append", default=[])
     generate_parser.add_argument("--target", required=True)
     generate_parser.add_argument("--version", required=True)
     generate_parser.add_argument("--output", type=Path, required=True)
@@ -356,7 +380,13 @@ def main() -> int:
     check_parser.add_argument("--directory", type=Path, required=True)
     arguments = parser.parse_args()
     if arguments.command == "generate":
-        generate(arguments.binary, arguments.target, arguments.version, arguments.output)
+        generate(
+            arguments.binary,
+            arguments.target,
+            arguments.version,
+            arguments.output,
+            additional_binaries=arguments.additional_binary,
+        )
     else:
         check(arguments.directory)
     return 0

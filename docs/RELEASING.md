@@ -1,6 +1,7 @@
 # Releasing RGV
 
-RGV targets macOS, Linux, and Windows from the same locked Rust workspace. A release candidate must
+RGV targets macOS, Linux, and Windows from the same locked Rust workspace. Releases that advertise
+agent control must build and package both `rgv-desktop` and `rgv-mcp` from the same lockfile. A release candidate must
 pass formatting, strict Clippy, workspace tests, dependency policy checks, the interaction budget,
 and the fixture-matrix audit before packaging.
 
@@ -20,7 +21,8 @@ For example, an unsigned macOS staging check is:
 ```sh
 python3 packaging/stage_package.py \
   --platform macos --architecture arm64 --version 0.1.0 --build-number 1 \
-  --binary target/release/rgv-desktop --destination /tmp/rgv-package-stage
+  --binary target/release/rgv-desktop --mcp-binary target/release/rgv-mcp \
+  --destination /tmp/rgv-package-stage
 ```
 
 ## Artifacts
@@ -62,10 +64,15 @@ check setting. Session-schema compatibility is independent of application update
 ## Release checklist
 
 1. Lock the release version and supported session schema in the changelog.
-2. Run `cargo deny check`, `cargo test --workspace`, and strict Clippy on all target platforms.
+2. Run `cargo deny check`, `cargo test --workspace`, and strict Clippy on all target platforms;
+   build `rgv-desktop` and `rgv-mcp` together when MCP is included.
 3. Regenerate the alignment and interaction reports on the named benchmark machine.
 4. Run the documented RGV-versus-IGV protocol and archive raw samples and fixture hashes.
-5. Exercise BAM, CRAM, remote, corrupt-input, and mixed-track smoke sessions.
+5. Exercise BAM, CRAM, remote, corrupt-input, and mixed-track smoke sessions. For MCP-enabled
+   packages, attach through stdio, inspect state, traverse review/history, exercise typed settings
+   and opaque alignment selection, prove retained evidence/export stability, save/open in-process,
+   capture by the MCP-reported PID, and verify that both binaries report a compatible control
+   schema and application instance.
 6. Build, sign, notarize where applicable, and install each artifact on a clean machine.
 7. Verify that diagnostics remain opt-in and URLs/credentials are redacted.
 8. Publish artifacts and checksums together, then test session migration from the previous release.

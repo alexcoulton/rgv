@@ -12,6 +12,9 @@
         <Component Id="RgvExecutable" Guid="B483E788-81B0-46B8-A775-D40703DDA44C">
           <File Id="RgvDesktop" Source="$(var.RgvBinary)" Name="rgv-desktop.exe" KeyPath="yes" />
         </Component>
+        <Component Id="RgvMcpExecutable" Guid="79746E42-E263-46E7-B81A-380D48FAAF4C">
+          <File Id="RgvMcp" Source="$(var.RgvMcpBinary)" Name="rgv-mcp.exe" KeyPath="yes" />
+        </Component>
         <Directory Id="LICENSEFOLDER" Name="licenses">
           <Component Id="RgvReleaseMetadata" Guid="A9C3A7CA-3F4B-4AE9-A8E6-9622991DF4C5">
             <File Source="$(var.RgvResources)\LICENSE-MIT" />
@@ -26,6 +29,7 @@
     </StandardDirectory>
     <Feature Id="Main" Title="RGV" Level="1">
       <ComponentRef Id="RgvExecutable" />
+      <ComponentRef Id="RgvMcpExecutable" />
       <ComponentRef Id="RgvReleaseMetadata" />
     </Feature>
   </Package>

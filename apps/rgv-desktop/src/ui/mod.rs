@@ -1,10 +1,19 @@
+pub(crate) mod alignment_settings;
 mod diagnostics;
+mod frame;
+pub(crate) mod gestures;
+pub(crate) mod inspectors;
+pub(crate) mod interaction;
 mod menu;
 mod navigation;
+pub(crate) mod shell;
 mod status;
+pub(crate) mod system_dialogs;
+pub(crate) mod track_settings;
 mod tracks;
+pub(crate) mod workspace_dialogs;
 
-pub use diagnostics::{DiagnosticsSnapshot, show_diagnostics, toggled_diagnostics};
+pub use diagnostics::{show_diagnostics, toggled_diagnostics};
 pub use menu::{SEARCHABLE_COMMANDS, UiCommand, command_matches};
 pub use navigation::{GENOME_CONTEXT_HEIGHT, OverviewInteraction, paint_genome_context};
 pub use status::status_bar;

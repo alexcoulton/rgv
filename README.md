@@ -59,7 +59,8 @@ The current native prototype supports:
 The current execution roadmap is in [RGV_IGV_PARITY_ROADMAP.md](RGV_IGV_PARITY_ROADMAP.md).
 See [the user guide](docs/USER_GUIDE.md), [format support matrix](docs/FORMAT_SUPPORT.md),
 [session compatibility policy](docs/SESSION_COMPATIBILITY.md), [portable genome configuration](docs/GENOME_CONFIGURATION.md), and
-[validation guide](docs/VALIDATION.md) for operational details. The complete deterministic manual
+[validation guide](docs/VALIDATION.md) for operational details. To attach an agent to a visible,
+explicitly controlled window, see [the MCP setup and tool guide](docs/MCP.md). The complete deterministic manual
 fixture index is [validation/manual-suite/README.md](validation/manual-suite/README.md).
 
 ## Run the desktop viewer

@@ -8,6 +8,10 @@ BigWig, TDF, bedGraph, WIG, generic BigBed, BEDPE/interact, and SEG/CBS copy-num
 Cancer Mutation Annotation Format (`.maf`, `.maf.txt`, and `.maf.gz`) files are also supported; UCSC Multiple
 Alignment Format happens to share the `.maf` suffix but is not yet supported.
 
+For agent-driven testing of the visible desktop window, use the separate opt-in `rgv-mcp` adapter.
+Its protected-secret setup, host configuration, complete tool contract, coordinate rules, privacy
+bounds, and troubleshooting are documented in [Controlling RGV from an MCP agent](MCP.md).
+
 ## Opening data
 
 Use **File → Open BAM/CRAM** for an alignment source, **Genomes → Open FASTA** for an indexed

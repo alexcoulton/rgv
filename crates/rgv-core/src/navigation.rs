@@ -70,6 +70,21 @@ impl NavigationHistory {
         self.entries.len()
     }
 
+    /// Returns a read-only view of retained entries without moving the cursor.
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = &GenomicInterval> {
+        self.entries.iter()
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn select(&mut self, index: usize) -> Option<GenomicInterval> {
+        let interval = self.entries.get(index).copied()?;
+        self.cursor = index;
+        Some(interval)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -107,5 +122,18 @@ mod tests {
         assert_eq!(history.back(), Some(interval(20)));
         assert_eq!(history.back(), Some(interval(10)));
         assert!(!history.can_go_back());
+    }
+
+    #[test]
+    fn observation_does_not_move_the_cursor() {
+        let mut history = NavigationHistory::new(interval(0));
+        history.visit(interval(10));
+        history.visit(interval(20));
+        assert_eq!(history.back(), Some(interval(10)));
+        let before = history.current();
+        assert_eq!(history.entries().copied().collect::<Vec<_>>().len(), 3);
+        assert_eq!(history.cursor(), 1);
+        assert_eq!(history.current(), before);
+        assert_eq!(history.select(2), Some(interval(20)));
     }
 }

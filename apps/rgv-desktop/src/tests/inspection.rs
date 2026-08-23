@@ -1,0 +1,783 @@
+use super::super::*;
+
+#[test]
+fn pileup_pointer_maps_canvas_pixels_to_an_exact_query_bin() {
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 104).unwrap();
+    let query = AlignmentQuery {
+        interval,
+        header: Arc::default(),
+        batch: rgv_hts::AlignmentBatch::default(),
+        pileup: rgv_hts::PileupSummary::from_depths([1; 4]),
+        junctions: rgv_hts::JunctionSummary::default(),
+        pairs: rgv_hts::PairSummary::default(),
+        reference: None,
+        stats: QueryStats::default(),
+    };
+    let viewport = Viewport::new(interval, 400.0).unwrap();
+    let canvas = egui::Rect::from_min_max(egui::pos2(50.0, 100.0), egui::pos2(450.0, 300.0));
+    assert_eq!(
+        pileup_position_from_pointer(&query, viewport, canvas, egui::pos2(250.0, 180.0)),
+        Some(102)
+    );
+    assert_eq!(
+        pileup_position_from_pointer(&query, viewport, canvas, egui::pos2(20.0, 180.0)),
+        None
+    );
+}
+
+#[test]
+fn modification_pointer_maps_canvas_pixels_even_when_only_errors_were_aggregated() {
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 104).unwrap();
+    let mut pileup = rgv_hts::PileupSummary::from_depths([1; 4]);
+    pileup.modifications.bin_count = 4;
+    pileup.modifications.provenance.malformed_records = 1;
+    let query = AlignmentQuery {
+        interval,
+        header: Arc::default(),
+        batch: rgv_hts::AlignmentBatch::default(),
+        pileup,
+        junctions: rgv_hts::JunctionSummary::default(),
+        pairs: rgv_hts::PairSummary::default(),
+        reference: None,
+        stats: QueryStats::default(),
+    };
+    let viewport = Viewport::new(interval, 400.0).unwrap();
+    let canvas = egui::Rect::from_min_max(egui::pos2(50.0, 100.0), egui::pos2(450.0, 300.0));
+    assert_eq!(
+        modification_position_from_pointer(&query, viewport, canvas, egui::pos2(250.0, 180.0)),
+        Some(102)
+    );
+    assert_eq!(
+        modification_position_from_pointer(&query, viewport, canvas, egui::pos2(20.0, 180.0)),
+        None
+    );
+}
+
+#[test]
+fn junction_selection_prefers_the_deepest_then_narrowest_visible_event() {
+    let summary = rgv_hts::JunctionSummary {
+        junctions: vec![
+            rgv_hts::JunctionEvidence {
+                start: 100,
+                end: 300,
+                depth: 10,
+                ..rgv_hts::JunctionEvidence::default()
+            },
+            rgv_hts::JunctionEvidence {
+                start: 150,
+                end: 250,
+                depth: 10,
+                ..rgv_hts::JunctionEvidence::default()
+            },
+            rgv_hts::JunctionEvidence {
+                start: 175,
+                end: 225,
+                depth: 9,
+                ..rgv_hts::JunctionEvidence::default()
+            },
+        ],
+        ..rgv_hts::JunctionSummary::default()
+    };
+    assert_eq!(junction_at_position(&summary, 1, 200), Some((150, 250)));
+    assert_eq!(junction_at_position(&summary, 11, 200), None);
+    assert_eq!(junction_at_position(&summary, 1, 300), None);
+}
+
+#[test]
+fn junction_annotation_requires_adjacent_exons_from_the_same_transcript() {
+    let mut configs = TrackCollection::default();
+    configs.push(TrackConfig::new(
+        TrackId::new(7),
+        "Genes".to_owned(),
+        TrackKind::GeneModel,
+        TrackSource::Local {
+            path: "genes.gtf".to_owned(),
+        },
+    ));
+    let exon = |start, end, transcript: &str, gene: &str| rgv_hts::FeatureRecord {
+        contig: "chr1".to_owned(),
+        start,
+        end,
+        name: Some(gene.to_owned()),
+        feature_type: Some("exon".to_owned()),
+        score: None,
+        strand: rgv_hts::Strand::Forward,
+        blocks: Vec::new(),
+        coding_interval: None,
+        peak: None,
+        attributes: vec![
+            ("transcript_id".to_owned(), transcript.to_owned()),
+            ("gene_name".to_owned(), gene.to_owned()),
+        ],
+    };
+    let snapshots = vec![TrackSnapshot {
+        id: TrackId::new(7),
+        name: "Genes".to_owned(),
+        data: TrackSnapshotData::Features(vec![
+            exon(100, 200, "tx1", "GENE1"),
+            exon(300, 400, "tx1", "GENE1"),
+            exon(500, 600, "tx2", "GENE2"),
+        ]),
+    }];
+    let loaded = GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap();
+    let viewport = GenomicInterval::new(ContigId::new(0), 50, 900).unwrap();
+    let context = junction_annotation_context(&configs, &snapshots, Some(loaded), viewport);
+    assert_eq!(
+        context.status(200, 300),
+        JunctionAnnotationStatus::Annotated
+    );
+    assert_eq!(context.labels(200, 300), &["GENE1"]);
+    assert_eq!(context.status(400, 500), JunctionAnnotationStatus::Novel);
+
+    let incomplete = junction_annotation_context(&configs, &snapshots, Some(viewport), viewport);
+    assert_eq!(
+        incomplete.status(400, 500),
+        JunctionAnnotationStatus::Unknown
+    );
+}
+
+#[test]
+fn rna_exports_preserve_filters_annotation_scaling_and_bounds() {
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 400).unwrap();
+    let query = Arc::new(AlignmentQuery {
+        interval,
+        header: Arc::default(),
+        batch: rgv_hts::AlignmentBatch::default(),
+        pileup: rgv_hts::PileupSummary::default(),
+        junctions: rgv_hts::JunctionSummary {
+            junctions: vec![rgv_hts::JunctionEvidence {
+                start: 200,
+                end: 300,
+                depth: 10,
+                minimum_left_flank: 12,
+                minimum_right_flank: 14,
+                positive_depth: 10,
+                tagged_positive_depth: 10,
+                ..rgv_hts::JunctionEvidence::default()
+            }],
+            provenance: rgv_hts::JunctionProvenance {
+                eligible_records: 20,
+                spliced_records: 10,
+                supporting_spliced_records: 10,
+                junction_observations_examined: 10,
+                junction_observations_retained: 10,
+                minimum_flank: 8,
+                normalization_mapped_records: Some(1_000_000),
+                all_eligible_records: true,
+                ..rgv_hts::JunctionProvenance::default()
+            },
+        },
+        pairs: rgv_hts::PairSummary::default(),
+        reference: None,
+        stats: QueryStats::default(),
+    });
+    let filters = SessionFilters {
+        minimum_junction_depth: 5,
+        minimum_junction_flank: 8,
+        junction_display_mode: JunctionDisplayMode::Expanded,
+        sashimi_scale_mode: SashimiScaleMode::Shared,
+        sashimi_count_mode: SashimiCountMode::CountsPerMillion,
+        ..SessionFilters::default()
+    };
+    let track = SashimiExportTrack {
+        id: TrackId::new(1),
+        name: "RNA sample".to_owned(),
+        query,
+        filters,
+    };
+    let annotations = JunctionAnnotationContext {
+        lookup: JunctionAnnotationLookup::new([(200, 300)], 1, true),
+        labels: BTreeMap::from([((200, 300), vec!["GENE1".to_owned()])]),
+        source_records_truncated: false,
+    };
+    let bed = junction_bed_export(&track, "chr1", interval, &annotations);
+    assert!(bed.contains("# filters\tminimum_depth=5\tminimum_flank=8"));
+    assert!(bed.contains("chr1\t200\t300\tjunction_201_300"));
+    assert!(bed.contains("\tannotated\tGENE1\n"));
+    assert!(bed.len() <= MAX_RNA_EXPORT_BYTES);
+
+    let bundle = SashimiExportBundle {
+        tracks: vec![
+            track.clone(),
+            SashimiExportTrack {
+                id: TrackId::new(2),
+                name: "RNA sample 2".to_owned(),
+                ..track
+            },
+        ],
+        omitted_tracks: 2,
+        viewport: Viewport::new(interval, 800.0).unwrap(),
+        contig_name: "chr&1".to_owned(),
+        annotations,
+    };
+    assert_eq!(
+        sashimi_export_shared_maximum(&bundle, SashimiCountMode::CountsPerMillion),
+        Some(10.0)
+    );
+    let (display, width, height) = sashimi_export_display(&bundle);
+    assert_eq!(width, 800);
+    assert!(height > 300);
+    assert!(!display.rectangles.is_empty());
+    let svg = sashimi_svg_export(&display, width, height, &bundle);
+    assert!(svg.contains("locus chr&amp;1:101-400"));
+    assert!(svg.contains("RNA sample"));
+    assert!(svg.ends_with("</svg>\n"));
+    assert!(svg.len() <= MAX_RNA_EXPORT_BYTES);
+}
+
+#[test]
+fn variant_picking_distance_and_genotype_formatting_preserve_half_open_phasing() {
+    assert_eq!(genomic_distance_to_interval(99, 100, 110), 1);
+    assert_eq!(genomic_distance_to_interval(100, 100, 110), 0);
+    assert_eq!(genomic_distance_to_interval(109, 100, 110), 0);
+    assert_eq!(genomic_distance_to_interval(110, 100, 110), 1);
+    let genotype = rgv_hts::VariantGenotype {
+        sample_index: 0,
+        alleles: vec![
+            rgv_hts::VariantGenotypeAllele {
+                index: Some(0),
+                phased: false,
+            },
+            rgv_hts::VariantGenotypeAllele {
+                index: Some(1),
+                phased: true,
+            },
+            rgv_hts::VariantGenotypeAllele {
+                index: None,
+                phased: false,
+            },
+        ],
+        fields: Vec::new(),
+    };
+    assert_eq!(format_genotype(&genotype), "GT=0|1/.");
+    assert_eq!(
+        bounded_variant_allele(&vec![b'A'; VARIANT_ALLELE_PREVIEW_BASES + 7]),
+        format!("{}… (+7 bases)", "A".repeat(VARIANT_ALLELE_PREVIEW_BASES))
+    );
+}
+
+#[test]
+fn variant_predicate_drafts_are_typed_and_genotype_groups_are_stable() {
+    assert_eq!(
+        build_variant_predicate(
+            VariantFieldScope::Info,
+            "AF",
+            VariantPredicateOperator::GreaterOrEqual,
+            "0.2",
+            VariantMissingValueRule::Exclude,
+        )
+        .unwrap(),
+        VariantFieldPredicate {
+            scope: VariantFieldScope::Info,
+            key: "AF".to_owned(),
+            comparison: VariantFieldComparison::GreaterOrEqual(0.2),
+            missing: VariantMissingValueRule::Exclude,
+        }
+    );
+    assert!(
+        build_variant_predicate(
+            VariantFieldScope::Format,
+            "DP",
+            VariantPredicateOperator::GreaterThan,
+            "not-a-number",
+            VariantMissingValueRule::Include,
+        )
+        .is_err()
+    );
+    let genotype = rgv_hts::VariantGenotype {
+        sample_index: 0,
+        alleles: vec![
+            rgv_hts::VariantGenotypeAllele {
+                index: Some(1),
+                phased: false,
+            },
+            rgv_hts::VariantGenotypeAllele {
+                index: Some(1),
+                phased: true,
+            },
+        ],
+        fields: Vec::new(),
+    };
+    assert_eq!(variant_genotype_group_rank(&genotype), 2);
+    assert_eq!(variant_genotype_group_label(&genotype), "Hom-alt");
+}
+
+#[test]
+fn variant_alignment_summary_is_observational_and_allele_specific_when_exact() {
+    let mut record = rgv_hts::VariantRecord {
+        contig: "chr1".to_owned(),
+        start: 100,
+        end: 101,
+        id: None,
+        reference: b"A".to_vec(),
+        alternates: vec![b"T".to_vec()],
+        quality: None,
+        filters: Vec::new(),
+        info: Vec::new(),
+        genotypes: Vec::new(),
+        variant_types: vec![rgv_hts::VariantType::Snv],
+        breakends: Vec::new(),
+    };
+    let bin = rgv_hts::PileupBin {
+        alleles: rgv_hts::AlleleSupport {
+            a: 8,
+            t: 3,
+            deletion: 2,
+            insertion: 1,
+            ..rgv_hts::AlleleSupport::default()
+        },
+        ..rgv_hts::PileupBin::default()
+    };
+    assert_eq!(
+        variant_allele_evidence_summary(&record, 1, bin),
+        "ALT T: 3 of 11 base observations"
+    );
+    record.reference = b"AT".to_vec();
+    record.alternates = vec![b"A".to_vec()];
+    record.variant_types = vec![rgv_hts::VariantType::Deletion];
+    assert_eq!(
+        variant_allele_evidence_summary(&record, 1, bin),
+        "2 deletion observations"
+    );
+    let inspector = VariantInspectorSnapshot {
+        track_name: "calls\tcohort".to_owned(),
+        query: Arc::new(rgv_hts::VariantQuery {
+            header: rgv_hts::VariantHeader {
+                samples: vec!["sample-1".to_owned()],
+                ..rgv_hts::VariantHeader::default()
+            },
+            records: vec![record.clone()],
+            provenance: rgv_hts::VariantQueryProvenance::default(),
+        }),
+        record_index: 0,
+        settings: VariantTrackSettings::default(),
+    };
+    let variant_tsv = variant_genotype_export_tsv(&inspector);
+    assert!(variant_tsv.contains("# RGV selected variant and genotype export v1"));
+    assert!(variant_tsv.contains("calls cohort"));
+    assert!(variant_tsv.len() <= MAX_VARIANT_EXPORT_BYTES);
+    let evidence = VariantAlignmentEvidence {
+        track_id: TrackId::new(1),
+        track_name: "reads".to_owned(),
+        position: 100,
+        bin_start: 100,
+        bin_end: 101,
+        depth: 11,
+        forward_depth: 6,
+        reverse_depth: 5,
+        allele_summary: "2 deletion observations".to_owned(),
+        modification_series: 0,
+        modification_calls: 0,
+        pair_templates_sampled: 20,
+        retained_records: 11,
+        retained_records_sampled: false,
+        complete_pileup: true,
+    };
+    let evidence_tsv = variant_evidence_export_tsv(&inspector, &[evidence]);
+    assert!(evidence_tsv.contains("not an RGV variant call"));
+    assert!(evidence_tsv.contains("reads\t101\t101\t11"));
+    assert_eq!(
+        variant_export_file_name(&inspector.query.records[0], "evidence"),
+        "rgv-chr1-101-evidence.tsv"
+    );
+}
+
+#[test]
+fn read_event_selection_and_preview_follow_cigar_coordinates() {
+    let mut bases = vec![b'A'; 5];
+    bases.extend(std::iter::repeat_n(b'C', 1_000));
+    bases.extend(std::iter::repeat_n(b'G', 5));
+    bases.extend_from_slice(b"TTTT");
+    let record = AlignmentRecord {
+        contig: ContigId::new(0),
+        start: 100,
+        end: 610,
+        flags: rgv_hts::AlignmentFlags::from_bits(0),
+        mapping_quality: Some(60),
+        mate_contig: None,
+        mate_start: None,
+        template_length: 0,
+        read_name: b"event-read".to_vec(),
+        cigar: vec![
+            rgv_hts::CigarOp {
+                kind: CigarOpKind::SequenceMatch,
+                len: 5,
+            },
+            rgv_hts::CigarOp {
+                kind: CigarOpKind::Insertion,
+                len: 1_000,
+            },
+            rgv_hts::CigarOp {
+                kind: CigarOpKind::SequenceMatch,
+                len: 5,
+            },
+            rgv_hts::CigarOp {
+                kind: CigarOpKind::Deletion,
+                len: 500,
+            },
+            rgv_hts::CigarOp {
+                kind: CigarOpKind::SoftClip,
+                len: 4,
+            },
+        ],
+        sequence: SequenceData::Present {
+            qualities: Some(vec![40; bases.len()]),
+            bases,
+        },
+        auxiliary_fields: Vec::new(),
+    };
+
+    assert_eq!(find_read_event(&record, 105.1, 0.5), Some(1));
+    assert_eq!(find_read_event(&record, 200.0, 0.5), Some(3));
+    assert_eq!(find_read_event(&record, 610.0, 0.5), Some(4));
+    let insertion = read_event_details(&record, 1, "chr1").unwrap();
+    assert_eq!(
+        insertion.copy_sequence.as_deref().map(str::len),
+        Some(1_000)
+    );
+    assert!(
+        insertion
+            .fields
+            .iter()
+            .any(|(label, value)| { label == "Sequence preview" && value.contains("+880 bases") })
+    );
+    let deletion = read_event_details(&record, 3, "chr1").unwrap();
+    assert!(deletion.copy_sequence.is_none());
+    assert!(
+        deletion
+            .fields
+            .contains(&("Event locus".to_owned(), "chr1:111-610".to_owned()))
+    );
+    let clip = read_event_details(&record, 4, "chr1").unwrap();
+    assert_eq!(clip.copy_sequence.as_deref(), Some("TTTT"));
+    assert_eq!(
+        oriented_event_sequence(b"AACG", Some(&[10, 20, 30, 40]), 0..2, true),
+        (b"CG".to_vec(), Some(vec![40, 30]))
+    );
+}
+
+#[test]
+fn inspector_sequence_and_tag_copy_actions_are_bounded_and_oriented() {
+    let forward = bounded_oriented_sequence_copy(b"AACG", false);
+    assert_eq!(forward.text, "AACG");
+    assert_eq!((forward.copied_bases, forward.total_bases), (4, 4));
+
+    let reverse = bounded_oriented_sequence_copy(b"AACG", true);
+    assert_eq!(reverse.text, "CGTT");
+    assert_eq!((reverse.copied_bases, reverse.total_bases), (4, 4));
+
+    let long_sequence = vec![b'A'; SEQUENCE_COPY_BASES + 17];
+    let bounded = bounded_sequence_copy(&long_sequence);
+    assert_eq!(bounded.text.len(), SEQUENCE_COPY_BASES);
+    assert_eq!(bounded.copied_bases, SEQUENCE_COPY_BASES);
+    assert_eq!(bounded.total_bases, SEQUENCE_COPY_BASES + 17);
+    assert!(sequence_copy_hover(Some(&bounded), "read").contains("use export"));
+
+    let tags = vec![
+        ("AA".to_owned(), "A".repeat(600_000)),
+        ("BB".to_owned(), "B".repeat(600_000)),
+    ];
+    let copied = auxiliary_tags_text(&tags);
+    assert!(copied.starts_with("AA:"));
+    assert!(copied.ends_with("1 tags omitted at the clipboard limit"));
+    assert!(copied.len() < AUXILIARY_TAGS_COPY_BYTES);
+
+    let unicode = "é".repeat(AUXILIARY_VALUE_DISPLAY_BYTES);
+    let preview = bounded_auxiliary_value(&unicode);
+    assert!(preview.is_char_boundary(preview.len()));
+    assert!(preview.contains("bytes)"));
+    let mut editor = "é".repeat(1_000);
+    truncate_string_to_bytes(&mut editor, 1_024);
+    assert_eq!(editor.len(), 1_024);
+    assert!(editor.is_char_boundary(editor.len()));
+}
+
+#[test]
+fn selected_chain_includes_current_and_declared_segments_with_error_provenance() {
+    let record = AlignmentRecord {
+        contig: ContigId::new(0),
+        start: 100,
+        end: 200,
+        flags: rgv_hts::AlignmentFlags::from_bits(0),
+        mapping_quality: Some(60),
+        mate_contig: None,
+        mate_start: None,
+        template_length: 0,
+        read_name: b"split-read".to_vec(),
+        cigar: vec![rgv_hts::CigarOp {
+            kind: CigarOpKind::Match,
+            len: 100,
+        }],
+        sequence: SequenceData::NotLoaded,
+        auxiliary_fields: vec![
+            rgv_hts::AuxField {
+                tag: *b"NM",
+                value: AuxValue::Unsigned(2),
+            },
+            rgv_hts::AuxField {
+                tag: *b"SA",
+                value: AuxValue::String("chr2,501,-,25S75M,40,3;broken;".to_owned()),
+            },
+        ],
+    };
+    let chain = selected_supplementary_chain(&record, "chr1").unwrap();
+    assert_eq!(chain.read_name, b"split-read");
+    assert_eq!(chain.segments.len(), 2);
+    assert_eq!(chain.segments[0].reference_name, "chr1");
+    assert_eq!(chain.segments[0].edit_distance, 2);
+    assert_eq!(chain.segments[1].reference_name, "chr2");
+    assert_eq!((chain.segments[1].start, chain.segments[1].end), (500, 575));
+    assert!(chain.segments[1].reverse);
+    assert_eq!(chain.malformed_entries, 1);
+
+    let diagram = supplementary_chain_diagram(&chain);
+    assert_eq!(diagram.read_length, 100);
+    assert_eq!(diagram.alignment_order, vec![0, 1]);
+    assert_eq!(diagram.read_order, vec![1, 0]);
+    assert_eq!(
+        diagram.segments[1],
+        ChainDiagramSegment {
+            segment_index: 1,
+            read_start: 0,
+            read_end: 75,
+            read_length: 100,
+        }
+    );
+    assert_eq!(
+        segment_read_coordinates(
+            &[
+                rgv_hts::CigarOp {
+                    kind: CigarOpKind::HardClip,
+                    len: 10,
+                },
+                rgv_hts::CigarOp {
+                    kind: CigarOpKind::SoftClip,
+                    len: 10,
+                },
+                rgv_hts::CigarOp {
+                    kind: CigarOpKind::Match,
+                    len: 80,
+                },
+            ],
+            false,
+        ),
+        (20, 100, 100)
+    );
+}
+
+#[test]
+fn supplementary_chain_segments_expose_complete_accessibility_names() {
+    let chain = SelectedSupplementaryChain {
+        read_name: b"split-read".to_vec(),
+        segments: vec![SupplementarySegment {
+            reference_name: "chr2".to_owned(),
+            start: 500,
+            end: 575,
+            reverse: true,
+            cigar: vec![rgv_hts::CigarOp {
+                kind: CigarOpKind::Match,
+                len: 75,
+            }],
+            mapping_quality: Some(40),
+            edit_distance: 3,
+        }],
+        active_segment: 0,
+        malformed_entries: 0,
+        truncated: false,
+        invalid_tag_type: false,
+    };
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let output = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(700.0, 180.0),
+            )),
+            ..egui::RawInput::default()
+        },
+        |ui| {
+            let _ = paint_supplementary_chain_diagram(ui, &chain);
+        },
+    );
+    let update = output.platform_output.accesskit_update.unwrap();
+    assert!(update.nodes.iter().any(|(_, node)| {
+        node.role() == egui::accesskit::Role::Button
+            && node.label().is_some_and(|label| {
+                label.contains("Supplementary alignment segment 1")
+                    && label.contains("chr2")
+                    && label.contains("strand −")
+            })
+            && node.toggled() == Some(egui::accesskit::Toggled::True)
+    }));
+}
+
+#[test]
+fn accessibility_preferences_apply_scale_contrast_and_reduced_motion() {
+    let context = egui::Context::default();
+    let settings = DesktopSettings {
+        interface_scale_percent: 150,
+        high_contrast: true,
+        reduced_motion: true,
+        ..DesktopSettings::default()
+    };
+
+    apply_accessibility_preferences(&context, &settings);
+    let _ = context.run_ui(egui::RawInput::default(), |_| {});
+
+    assert!((context.zoom_factor() - 1.5).abs() < f32::EPSILON);
+    let style = context.style_of(egui::Theme::Light);
+    assert_eq!(
+        style.visuals.override_text_color,
+        Some(egui::Color32::BLACK)
+    );
+    assert_eq!(
+        style.visuals.selection.bg_fill,
+        egui::Color32::from_rgb(0, 64, 160)
+    );
+    assert!(style.animation_time.abs() < f32::EPSILON);
+}
+
+#[test]
+fn supplementary_flag_alone_still_creates_an_explicit_single_segment_chain() {
+    let record = AlignmentRecord {
+        contig: ContigId::new(0),
+        start: 100,
+        end: 200,
+        flags: rgv_hts::AlignmentFlags::from_bits(0x800),
+        mapping_quality: Some(60),
+        mate_contig: None,
+        mate_start: None,
+        template_length: 0,
+        read_name: b"orphan-supplementary".to_vec(),
+        cigar: vec![rgv_hts::CigarOp {
+            kind: CigarOpKind::Match,
+            len: 100,
+        }],
+        sequence: SequenceData::NotLoaded,
+        auxiliary_fields: Vec::new(),
+    };
+    let chain = selected_supplementary_chain(&record, "chr1").unwrap();
+    assert_eq!(chain.segments.len(), 1);
+    assert!(!chain.invalid_tag_type);
+}
+
+#[test]
+fn run_marker_detects_unclean_exit_and_clears_on_finish() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = directory.path().join("settings.json");
+    let first = RunMarker::start(&settings);
+    assert!(!first.previous_unclean_exit());
+    drop(first);
+
+    let mut recovered = RunMarker::start(&settings);
+    assert!(recovered.previous_unclean_exit());
+    recovered.finish();
+    assert!(!directory.path().join("rgv-running.marker").exists());
+}
+
+#[test]
+fn autosave_names_are_stable_and_retention_is_scoped_per_project() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = directory.path().join("settings.json");
+    let first_project = directory.path().join("tumour review.json");
+    let second_project = directory.path().join("normal.json");
+    let first_prefix = autosave_group_prefix(Some(&first_project));
+    let second_prefix = autosave_group_prefix(Some(&second_project));
+    assert!(first_prefix.starts_with("tumour_review-"));
+    assert_ne!(first_prefix, second_prefix);
+
+    let autosaves = autosave_directory(&settings);
+    std::fs::create_dir(&autosaves).unwrap();
+    for millisecond in 1..=4 {
+        let (path, prefix) = autosave_snapshot_path(
+            &settings,
+            Some(&first_project),
+            UNIX_EPOCH + Duration::from_millis(millisecond),
+        );
+        assert_eq!(prefix, first_prefix);
+        std::fs::write(path, b"snapshot").unwrap();
+    }
+    let (other, _) = autosave_snapshot_path(
+        &settings,
+        Some(&second_project),
+        UNIX_EPOCH + Duration::from_millis(1),
+    );
+    std::fs::write(&other, b"other").unwrap();
+
+    prune_autosaves(&autosaves, &first_prefix, 2).unwrap();
+    let candidates = discover_recovery_candidates(&settings);
+    assert_eq!(candidates.len(), 3);
+    assert!(candidates.contains(&other));
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&first_prefix)
+            })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn custom_style_tags_follow_sam_tag_syntax() {
+    assert_eq!(parse_style_tag("NM"), Some(*b"NM"));
+    assert_eq!(parse_style_tag("X1"), Some(*b"X1"));
+    assert_eq!(parse_style_tag("1X"), None);
+    assert_eq!(parse_style_tag("ABC"), None);
+    assert_ne!(
+        alignment_color_mode_fingerprint(AlignmentColorMode::Tag(*b"NM")),
+        alignment_color_mode_fingerprint(AlignmentColorMode::Tag(*b"HP"))
+    );
+    let smrt_modes = [
+        SmrtKineticsMode::SubreadIpd,
+        SmrtKineticsMode::SubreadPulseWidth,
+        SmrtKineticsMode::CcsForwardIpd,
+        SmrtKineticsMode::CcsForwardPulseWidth,
+        SmrtKineticsMode::CcsReverseIpd,
+        SmrtKineticsMode::CcsReversePulseWidth,
+    ];
+    let fingerprints = smrt_modes
+        .map(|mode| alignment_color_mode_fingerprint(AlignmentColorMode::SmrtKinetics(mode)));
+    assert_eq!(
+        fingerprints
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        6
+    );
+    let sbx_default = SbxDisplayOptions::default();
+    assert_ne!(
+        alignment_color_mode_fingerprint(AlignmentColorMode::Sbx(sbx_default)),
+        alignment_color_mode_fingerprint(AlignmentColorMode::Sbx(SbxDisplayOptions {
+            simplex_tail_mode: SbxSimplexTailMode::Hide,
+            ..sbx_default
+        }))
+    );
+    let ultima_default = UltimaDisplayOptions::default();
+    assert_ne!(
+        alignment_color_mode_fingerprint(AlignmentColorMode::Ultima(ultima_default)),
+        alignment_color_mode_fingerprint(AlignmentColorMode::Ultima(UltimaDisplayOptions {
+            quality_mode: UltimaQualityMode::Minimum,
+            ..ultima_default
+        }))
+    );
+    assert_ne!(
+        alignment_color_mode_fingerprint(AlignmentColorMode::Ultima(ultima_default)),
+        alignment_color_mode_fingerprint(AlignmentColorMode::Ultima(UltimaDisplayOptions {
+            maximum_homopolymer_length_override: Some(12),
+            ..ultima_default
+        }))
+    );
+    assert_ne!(
+        alignment_color_mode_fingerprint(AlignmentColorMode::Sbx(sbx_default)),
+        alignment_color_mode_fingerprint(AlignmentColorMode::Sbx(SbxDisplayOptions {
+            discordant_quality_maximum: 11,
+            ..sbx_default
+        }))
+    );
+}

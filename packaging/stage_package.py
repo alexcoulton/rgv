@@ -10,6 +10,7 @@ import plistlib
 import shutil
 import stat
 import sys
+from typing import Optional
 
 import release_metadata
 
@@ -31,11 +32,19 @@ def require_empty(destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
 
 
-def stage_macos(binary: Path, destination: Path, version: str, build_number: str) -> Path:
+def stage_macos(
+    binary: Path,
+    destination: Path,
+    version: str,
+    build_number: str,
+    mcp_binary: Optional[Path] = None,
+) -> Path:
     root = destination / "RGV.app"
     executable = root / "Contents" / "MacOS" / "rgv-desktop"
     resources = root / "Contents" / "Resources"
     copy(binary, executable, executable=True)
+    if mcp_binary is not None:
+        copy(mcp_binary, root / "Contents" / "MacOS" / "rgv-mcp", executable=True)
     plist = plistlib.loads((ROOT / "packaging/macos/Info.plist").read_bytes())
     plist["CFBundleShortVersionString"] = version
     plist["CFBundleVersion"] = build_number
@@ -44,13 +53,21 @@ def stage_macos(binary: Path, destination: Path, version: str, build_number: str
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_bytes(plistlib.dumps(plist, sort_keys=True))
     copy(ROOT / "packaging/linux/rgv.svg", resources / "rgv.svg")
-    stage_common(binary, resources, "macos", version)
+    stage_common(binary, resources, "macos", version, mcp_binary)
     return root
 
 
-def stage_linux(binary: Path, destination: Path, architecture: str, version: str) -> Path:
+def stage_linux(
+    binary: Path,
+    destination: Path,
+    architecture: str,
+    version: str,
+    mcp_binary: Optional[Path] = None,
+) -> Path:
     root = destination / f"RGV-linux-{architecture}"
     copy(binary, root / "bin" / "rgv-desktop", executable=True)
+    if mcp_binary is not None:
+        copy(mcp_binary, root / "bin" / "rgv-mcp", executable=True)
     copy(
         ROOT / "packaging/linux/rgv.desktop",
         root / "share" / "applications" / "rgv.desktop",
@@ -59,23 +76,49 @@ def stage_linux(binary: Path, destination: Path, architecture: str, version: str
         ROOT / "packaging/linux/rgv.svg",
         root / "share" / "icons" / "hicolor" / "scalable" / "apps" / "rgv.svg",
     )
-    stage_common(binary, root / "share" / "doc" / "rgv", f"linux-{architecture}", version)
+    stage_common(
+        binary,
+        root / "share" / "doc" / "rgv",
+        f"linux-{architecture}",
+        version,
+        mcp_binary,
+    )
     return root
 
 
-def stage_windows(binary: Path, destination: Path, architecture: str, version: str) -> Path:
+def stage_windows(
+    binary: Path,
+    destination: Path,
+    architecture: str,
+    version: str,
+    mcp_binary: Optional[Path] = None,
+) -> Path:
     root = destination / f"RGV-windows-{architecture}"
     copy(binary, root / "rgv-desktop.exe", executable=True)
-    stage_common(binary, root / "licenses", f"windows-{architecture}", version)
+    if mcp_binary is not None:
+        copy(mcp_binary, root / "rgv-mcp.exe", executable=True)
+    stage_common(binary, root / "licenses", f"windows-{architecture}", version, mcp_binary)
     return root
 
 
-def stage_common(binary: Path, resources: Path, target: str, version: str) -> None:
+def stage_common(
+    binary: Path,
+    resources: Path,
+    target: str,
+    version: str,
+    mcp_binary: Optional[Path] = None,
+) -> None:
     resources.mkdir(parents=True, exist_ok=True)
     copy(ROOT / "LICENSE-MIT", resources / "LICENSE-MIT")
     copy(ROOT / "LICENSE-APACHE", resources / "LICENSE-APACHE")
     copy(ROOT / "README.md", resources / "README.md")
-    release_metadata.generate(binary, target, version, resources)
+    release_metadata.generate(
+        binary,
+        target,
+        version,
+        resources,
+        additional_binaries=() if mcp_binary is None else (mcp_binary,),
+    )
     release_metadata.check(resources)
 
 
@@ -145,16 +188,36 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--build-number", default="1")
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--mcp-binary", type=Path)
     parser.add_argument("--destination", type=Path, required=True)
     arguments = parser.parse_args()
     binary = arguments.binary.resolve(strict=True)
+    mcp_binary = arguments.mcp_binary.resolve(strict=True) if arguments.mcp_binary else None
     require_empty(arguments.destination)
     if arguments.platform == "macos":
-        root = stage_macos(binary, arguments.destination, arguments.version, arguments.build_number)
+        root = stage_macos(
+            binary,
+            arguments.destination,
+            arguments.version,
+            arguments.build_number,
+            mcp_binary,
+        )
     elif arguments.platform == "linux":
-        root = stage_linux(binary, arguments.destination, arguments.architecture, arguments.version)
+        root = stage_linux(
+            binary,
+            arguments.destination,
+            arguments.architecture,
+            arguments.version,
+            mcp_binary,
+        )
     else:
-        root = stage_windows(binary, arguments.destination, arguments.architecture, arguments.version)
+        root = stage_windows(
+            binary,
+            arguments.destination,
+            arguments.architecture,
+            arguments.version,
+            mcp_binary,
+        )
     write_manifest(root)
     verify_manifest(root)
     print(root)

@@ -1,0 +1,235 @@
+# Controlling RGV from an MCP agent
+
+`rgv-mcp` is a local stdio MCP server for inspecting and manipulating one visible RGV desktop
+window. Agent operations use the same automation executor as RGV's direct control API: navigation,
+zoom, track changes, selection, and configuration are immediately visible in the attached window.
+The MCP process never embeds the renderer and cannot enable desktop control by itself.
+
+The initial implementation uses MCP through `rmcp` 3.1.4 and supports the protocol versions
+negotiated by that SDK. It deliberately provides stdio transport only.
+
+## Build and start
+
+Build both binaries from a locked checkout:
+
+```sh
+cargo build --release --locked -p rgv-desktop -p rgv-mcp
+```
+
+Choose a directory that contains every local input and output the agent may access. Create a
+random bearer secret in a file readable only by your account. On Unix-like systems:
+
+```sh
+mkdir -p /path/to/review-workspace
+openssl rand -hex 32 > /path/to/rgv-control.secret
+chmod 600 /path/to/rgv-control.secret
+```
+
+Start the viewer explicitly:
+
+```sh
+target/release/rgv-desktop \
+  --control-port 60151 \
+  --control-secret-file /path/to/rgv-control.secret \
+  --control-root /path/to/review-workspace
+```
+
+RGV binds this service to loopback. Without all three control options, agent control remains off.
+The MCP server can start before the viewer and reports `unavailable` until the window appears.
+
+## Configure a stdio MCP host
+
+Configure the host to launch the packaged `rgv-mcp` executable directly. A host using the common
+`mcpServers` JSON form can use:
+
+```json
+{
+  "mcpServers": {
+    "rgv": {
+      "command": "/absolute/path/to/rgv-mcp",
+      "args": [
+        "--control-url", "http://127.0.0.1:60151",
+        "--control-secret-file", "/path/to/rgv-control.secret",
+        "--control-root", "/path/to/review-workspace"
+      ]
+    }
+  }
+}
+```
+
+The host sees the secret-file path but never receives the secret as a tool argument or result.
+Do not put the secret value in JSON, an environment variable, or a command-line option. The
+equivalent non-secret environment variables are `RGV_MCP_CONTROL_URL`,
+`RGV_MCP_CONTROL_SECRET_FILE`, and `RGV_MCP_CONTROL_ROOT`. The optional temporary-artifact
+subdirectory is selected with `--artifact-directory`; it must be relative to the control root.
+
+The implementation's in-process MCP client test performs a real initialize handshake, lists the
+complete tool contract, and calls `rgv_status` and `rgv_get_workspace`. Use those two tools first
+when qualifying a new host.
+
+### First supported host: Codex CLI
+
+Codex accepts a stdio server command after `--`. Register the packaged adapter with:
+
+```sh
+codex mcp add rgv -- \
+  /absolute/path/to/rgv-mcp \
+  --control-url http://127.0.0.1:60151 \
+  --control-secret-file /path/to/rgv-control.secret \
+  --control-root /path/to/review-workspace
+codex mcp get rgv
+```
+
+Restart or begin a fresh Codex session after changing the MCP configuration, then ask it to call
+`rgv_status` and `rgv_get_workspace`. Remove the registration with `codex mcp remove rgv`.
+See the [official Codex MCP documentation](https://developers.openai.com/codex/mcp/) for current
+host configuration details. This example passes only the protected file's path; it does not use
+`--env` to expose the secret value.
+
+## Coordinates and waiting
+
+- Locus strings such as `chr1:1,000,001-1,100,000` are conventional one-based, inclusive display
+  coordinates.
+- Numeric `position`, `start`, and `end` fields are zero-based; intervals are half-open.
+- A zoom factor greater than `1` zooms in. A factor below `1` zooms out. The accepted range is
+  `0.01..=100`.
+- Pans and zooms clamp to contig bounds and return the exact resulting interval in the automation
+  report.
+- Query-triggering tools wait for generation-based settlement by default. Set
+  `wait_until_settled` to `false` only when testing intermediate state. Settlement timeouts use
+  milliseconds and inherit RGV's validated upper bound.
+- Panel and track IDs are positive stable identities. Inspect the workspace after changes rather
+  than inferring an ID from display order.
+- Every workspace observation carries an unpredictable per-process `application_instance_id` and
+  monotonic `workspace_revision`. Status also reports the local PID used for PID-targeted capture.
+- A selected evidence object is immutable. `selection_id`, `evidence_revision`, fields, exact
+  half-open evidence interval, and selected-evidence export do not change after pan or zoom.
+  `rgv_refresh_selection` is the only operation that replaces that evidence explicitly.
+- Position selection defaults to `exact_base`; choose `visible_bin` only when the current rendered
+  bin is itself the evidence under review. `anchor_position` and the evidence interval are
+  intentionally separate.
+
+## Tools
+
+| Tool | Effect |
+|---|---|
+| `rgv_status` | Reports reachability, versions, compatibility, and non-sensitive capabilities. |
+| `rgv_get_workspace` | Returns bounded genome, ordered panel, track, readiness, and selection state. |
+| `rgv_get_selection` | Returns bounded structured evidence for the semantic selection. |
+| `rgv_clear_selection` | Clears all selection state and closes the inspector. |
+| `rgv_refresh_selection` | Explicitly creates a new immutable evidence revision. |
+| `rgv_get_review_queue` | Lists review items without notes or assignments. |
+| `rgv_navigate_review_item` | Navigates by item ID or to the next pending item. |
+| `rgv_get_navigation_history` | Observes history without moving its cursor. |
+| `rgv_navigate_history` | Moves backward, forward, or to a bounded history index. |
+| `rgv_find_alignments` | Finds records and returns opaque generation-scoped handles. |
+| `rgv_select_alignment` | Selects one opaque alignment handle. |
+| `rgv_get_related_alignments` | Describes mate and supplementary-chain availability. |
+| `rgv_navigate_related_alignment` | Opens a mate or chain segment. |
+| `rgv_navigate` | Replaces the visible panel arrangement with exact locus strings. |
+| `rgv_change_viewport` | Pans by bases/fraction, zooms around an optional anchor, or fits an interval. |
+| `rgv_load_track` | Loads a typed local path or HTTP/S remote source and returns the command report. |
+| `rgv_remove_track` | Destructively removes one stable track ID. |
+| `rgv_configure` | Applies a valid-by-construction typed setting and returns effective state. |
+| `rgv_group_alignments` | Applies a typed grouping mode and group order to stable alignment track IDs. |
+| `rgv_sort_alignments` | Applies a typed sort mode and direction. |
+| `rgv_filter_alignments` | Applies RGV's validated alignment-filter expression. |
+| `rgv_select` | Selects a panel, track, or zero-based genomic position. |
+| `rgv_capture_view` | Waits if requested and returns a bounded PNG as MCP image content. |
+| `rgv_export` | Writes a structured export under the root and inlines only small UTF-8 results. |
+| `rgv_save_workspace` | Saves an RGV project under the root. |
+| `rgv_open_workspace` | Explicitly replaces the window with a root-confined saved project. |
+| `rgv_execute_batch` | Advanced ordered escape hatch, limited to 100 validated commands. |
+
+`rgv_execute_batch` always rejects `exit`. It rejects `new_workspace` unless
+`allow_destructive` is true. Focused tools should be preferred because their generated schemas,
+annotations, defaults, and result interpretation are more precise.
+
+Typed configuration reports `requested`, `effective`, `changed`, and `clamped`. Group, sort, and
+filter reports additionally expose `no_op`; an empty filter expression is the explicit operation
+for clearing an alignment filter. This makes an applied clamp or idempotent call distinguishable
+from a mutation that changed the viewer.
+
+## Bounds and privacy
+
+- Control responses are capped at 80 MiB.
+- Workspace snapshots contain at most 16 panels and 1,024 tracks; selection snapshots contain at
+  most 128 fields, with explicit truncation flags.
+- Captured PNG files are capped at 64 MiB and removed after being read.
+- Text exports are inlined only through 256 KiB; larger results remain root-relative artifacts.
+- Workspace and selection inspection omit source paths, credentials, signed URLs, read names,
+  read sequences, and arbitrary alignment tags.
+- Exact read names may be supplied as sensitive `rgv_find_alignments` input. They are matched only
+  in the desktop process, redacted if a batch is serialized, never echoed in results, and replaced
+  by random opaque handles that expire when the backing query changes.
+- Tool reports recursively redact path-, URL-, and source-named fields. The control secret is never
+  logged or returned.
+- Local reads and writes stay under `--control-root`. Absolute/traversing artifact arguments and
+  symbolic-link escapes are rejected.
+- stdout is reserved for MCP protocol frames. Diagnostics go to stderr.
+
+No telemetry or genomic content is sent outside the local `rgv-mcp` and `rgv-desktop` processes.
+
+## Errors and recovery
+
+Tool failures contain structured `error.code` and `error.message` fields. Stable adapter codes
+include `unavailable`, `unauthorized`, `unsupported_version`, `invalid_input`, `invalid_batch`,
+`forbidden_command`, `destructive_confirmation_required`, `invalid_response`,
+`response_too_large`, `state_reobservation_failed`, and `artifact_error`. Viewer failures preserve the lower-case shared error
+codes, including `invalid_setting_scope`, `setting_out_of_range`, `effective_state_unavailable`,
+`no_selection`, `selection_stale`, `stale_handle`, `ambiguous_alignment_match`,
+`related_alignment_unavailable`, `review_item_not_found`, `history_boundary`, `unsaved_changes`,
+and `workspace_replacement_not_confirmed`.
+Selection, setting, history, review, relationship, and persistence failures additionally preserve
+`no_selection`, `selection_stale`, `stale_handle`, `setting_out_of_range`,
+`effective_state_unavailable`, `review_item_not_found`, `history_boundary`,
+`related_alignment_unavailable`, `unsaved_changes`, and
+`workspace_replacement_not_confirmed`.
+
+- `unavailable`: start RGV with matching control options, then retry; the MCP server need not be
+  restarted.
+- `unauthorized`: verify that both processes read the same protected secret file.
+- `unsupported_version`: rebuild both binaries from the same release.
+- `invalid_state` or `resource_not_found`: call `rgv_get_workspace`, correct the ID/resource, and
+  retry.
+- `timeout`: inspect workspace state before retrying. Cancellation or timeout does not roll back a
+  mutation already accepted by the viewer.
+- `state_reobservation_failed`: the adapter detected an interrupted mutation but could not inspect
+  the resulting workspace; restore connectivity before retrying.
+- `artifact_error`: verify root permissions and ensure no path component is a symbolic link.
+
+Calls are serialized in the adapter and again in the viewer. After a cancelled call, observe the
+workspace before issuing another mutation because the first operation may still have completed.
+
+## Native release qualification
+
+Start the release viewer with the fixture explicitly named; do not rely on a project left open by a
+previous run:
+
+```sh
+target/release/rgv-desktop \
+  --session benchmark-data/manual-suite/projects/mf-01-alignment-core.rgv.json \
+  --control-port 60151 \
+  --control-secret-file /path/to/rgv-control.secret \
+  --control-root /path/to/review-workspace
+```
+
+Then exercise the actual stdio protocol and rendered window with:
+
+```sh
+python3 validation/rgv_mcp_qualification.py \
+  --mcp-binary target/release/rgv-mcp \
+  --control-url http://127.0.0.1:60151 \
+  --secret-file /path/to/rgv-control.secret \
+  --control-root /path/to/review-workspace \
+  --locus chr1:2590001-2650000 \
+  --evidence-position 2600000
+```
+
+The harness performs MCP initialization and tool discovery, observes state, navigates, zooms,
+pans, traverses the review queue, exercises typed settings, optionally finds/selects alignments,
+proves selected evidence remains stable across viewport changes, captures PID-targeted macOS
+screenshots when requested, saves and opens the project in-process, and writes a path-free
+structured report under the control root. Run it twice from clean launches and retain each uniquely
+named screenshot. Visual correctness still comes from inspecting those images, not from structured
+renderer metadata.
