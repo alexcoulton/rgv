@@ -1,0 +1,3217 @@
+{
+  "schema_version": 3,
+  "locus": {
+    "contig": "chrVariants",
+    "start": 8500,
+    "end": 16000
+  },
+  "panels": [
+    {
+      "id": 1,
+      "locus": {
+        "contig": "chrVariants",
+        "start": 8500,
+        "end": 16000
+      },
+      "vertical_scroll_points": 0.0
+    }
+  ],
+  "active_panel": 1,
+  "alignment_tracks": [
+    {
+      "id": 1,
+      "name": "Variant and specialist alignment truth",
+      "source": {
+        "Local": {
+          "path": "../../variants.bam"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 360.0,
+      "filters": {
+        "alignment_color_mode": "none",
+        "alignment_group_mode": "none",
+        "alignment_group_order": "natural",
+        "alignment_sort_mode": "start",
+        "alignment_sort_order": "natural",
+        "view_as_pairs": false,
+        "minimum_template_length": null,
+        "maximum_template_length": null,
+        "overlapping_mate_policy": "count_once",
+        "minimum_mapping_quality": null,
+        "minimum_base_quality": 0,
+        "minimum_allele_fraction": 0.2,
+        "quality_weighted_alleles": true,
+        "show_reference": true,
+        "show_coverage": true,
+        "show_junctions": true,
+        "minimum_junction_depth": 1,
+        "minimum_junction_flank": 0,
+        "junction_display_mode": "collapsed",
+        "sashimi_scale_mode": "automatic",
+        "sashimi_fixed_scale_maximum": 100,
+        "sashimi_count_mode": "raw",
+        "show_junction_labels": true,
+        "show_reads": true,
+        "coverage_scale_maximum": null,
+        "show_coverage_center_line": true,
+        "alignment_density": 1.0,
+        "inspector_activation": "click",
+        "read_base_display_mode": "mismatches",
+        "shade_read_bases_by_quality": true,
+        "minimum_indel_size": 1,
+        "minimum_event_label_size": 1,
+        "show_modified_bases": true,
+        "show_modification_frequency": true,
+        "minimum_modification_probability": 0,
+        "modified_base_color_mode": "by_type",
+        "hidden_modification_codes": [],
+        "include_secondary": true,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    }
+  ],
+  "reference": {
+    "Local": {
+      "path": "../../variants.fa"
+    }
+  },
+  "genome_name": "RGV complete mixed-format manual fixture",
+  "cytobands": null,
+  "reference_reverse_complement": false,
+  "reference_translation_frames": [],
+  "reference_genetic_code": "Standard",
+  "regions_of_interest": [],
+  "review_items": [],
+  "sample_metadata": null,
+  "contig_aliases": {},
+  "tracks": [
+    {
+      "id": 2,
+      "name": "Features (gzip BED)",
+      "kind": "Feature",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/features.bed.gz"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 3,
+      "name": "Genes (gzip GTF)",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/genes.gtf.gz"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 4,
+      "name": "Transcripts",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/transcripts.genePred"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 5,
+      "name": "Narrow peaks",
+      "kind": "Feature",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/peaks.narrowPeak"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 6,
+      "name": "Broad peaks",
+      "kind": "Feature",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/regions.broadPeak"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 7,
+      "name": "PSL target alignments",
+      "kind": "Feature",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/target-alignments.psl"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 8,
+      "name": "Association study",
+      "kind": "Gwas",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/association.gwas"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 200.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 9,
+      "name": "Variants and genotypes",
+      "kind": "Variant",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/variants.bcf"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 10,
+      "name": "Signal BigWig",
+      "kind": "Quantitative",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/signal.bigWig"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "shared",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": 1,
+        "scale_group": 1
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 11,
+      "name": "Archived TDF",
+      "kind": "Quantitative",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/archive.tdf"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "shared",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": 1,
+        "scale_group": 1
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 12,
+      "name": "Arithmetic signal difference",
+      "kind": "Quantitative",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/signal.bedGraph"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "subtract",
+        "operand_track": 11,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 13,
+      "name": "Signal WIG",
+      "kind": "Quantitative",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/signal.wig"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 14,
+      "name": "BEDPE loops",
+      "kind": "Interaction",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/loops.bedpe"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 15,
+      "name": "UCSC interactions",
+      "kind": "Interaction",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/interactions.interact"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 16,
+      "name": "Copy number",
+      "kind": "CopyNumber",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/cohort.seg"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.5,
+        "fixed_maximum": 1.5,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "heatmap",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          220,
+          50,
+          47,
+          230
+        ],
+        "negative_color": [
+          38,
+          100,
+          210,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 17,
+      "name": "Somatic mutations",
+      "kind": "Mutation",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/mutations.maf"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 18,
+      "name": "Generic BigBed",
+      "kind": "Feature",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/features.bigBed"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 19,
+      "name": "Indexed transcripts",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/genes.bigGenePred"
+        }
+      },
+      "format": "big_gene_pred",
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 20,
+      "name": "Indexed peaks",
+      "kind": "Feature",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/peaks.bigNarrowPeak"
+        }
+      },
+      "format": "big_narrow_peak",
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 21,
+      "name": "Plain BED annotations",
+      "kind": "Feature",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/default-annotations.bed"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 22,
+      "name": "Plain GFF3 gene models",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/annotations.gff3"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 23,
+      "name": "Compressed GFF3 gene models",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/annotations.gff3.gz"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 24,
+      "name": "Plain GTF transcripts",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/annotations.gtf"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 25,
+      "name": "refFlat transcripts",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/transcripts.refFlat"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 26,
+      "name": "Fixed-step WIG",
+      "kind": "Quantitative",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/signal-fixed.wig"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 27,
+      "name": "CBS copy number",
+      "kind": "CopyNumber",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/cohort.cbs"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.5,
+        "fixed_maximum": 1.5,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "heatmap",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          220,
+          50,
+          47,
+          230
+        ],
+        "negative_color": [
+          38,
+          100,
+          210,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 28,
+      "name": "PLINK linear association",
+      "kind": "Gwas",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/association.linear"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 200.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 29,
+      "name": "PLINK logistic association",
+      "kind": "Gwas",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/association.logistic"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 200.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 30,
+      "name": "PLINK association",
+      "kind": "Gwas",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/association.assoc"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 200.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 31,
+      "name": "PLINK quantitative association",
+      "kind": "Gwas",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/association.qassoc"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 200.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    }
+  ],
+  "maximum_alignments": 50000
+}

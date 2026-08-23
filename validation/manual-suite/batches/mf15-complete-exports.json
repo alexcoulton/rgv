@@ -1,0 +1,120 @@
+{
+  "commands": [
+    {
+      "command": "new_workspace"
+    },
+    {
+      "command": "load_track",
+      "kind": "Alignment",
+      "name": "Automation alignments",
+      "source": {
+        "Local": {
+          "path": "../../../benchmark-data/mixed.bam"
+        }
+      }
+    },
+    {
+      "command": "goto",
+      "loci": [
+        "chr1:100001-120000"
+      ]
+    },
+    {
+      "command": "add_panel",
+      "locus": "chr1:110001-130000"
+    },
+    {
+      "command": "set_option",
+      "key": "show_junctions",
+      "scope": {
+        "scope": "workspace"
+      },
+      "value": true
+    },
+    {
+      "command": "group",
+      "mode": "strand",
+      "track_ids": [
+        1
+      ]
+    },
+    {
+      "command": "sort",
+      "direction": "natural",
+      "mode": "mapping_quality",
+      "track_ids": [
+        1
+      ]
+    },
+    {
+      "command": "filter",
+      "expression": "NM>=0",
+      "track_ids": [
+        1
+      ]
+    },
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 30000
+    },
+    {
+      "command": "select",
+      "selection": {
+        "panel_id": 1,
+        "position": 115000,
+        "selection": "position",
+        "track_id": 1
+      }
+    },
+    {
+      "command": "export",
+      "kind": "alignments",
+      "path": "../../../benchmark-results/manual-suite/alignments.tsv"
+    },
+    {
+      "command": "export",
+      "kind": "pileup",
+      "path": "../../../benchmark-results/manual-suite/pileup.tsv"
+    },
+    {
+      "command": "export",
+      "kind": "selected_evidence",
+      "path": "../../../benchmark-results/manual-suite/selected-evidence.tsv"
+    },
+    {
+      "command": "export",
+      "kind": "modifications",
+      "path": "../../../benchmark-results/manual-suite/modifications.tsv"
+    },
+    {
+      "command": "export",
+      "kind": "junctions",
+      "path": "../../../benchmark-results/manual-suite/junctions.tsv"
+    },
+    {
+      "command": "export",
+      "kind": "track_names",
+      "path": "../../../benchmark-results/manual-suite/track-names.tsv"
+    },
+    {
+      "command": "snapshot",
+      "format": "png",
+      "path": "../../../benchmark-results/manual-suite/workspace.png",
+      "scope": "visible_workspace"
+    },
+    {
+      "command": "snapshot",
+      "format": "svg",
+      "path": "../../../benchmark-results/manual-suite/full-panel.svg",
+      "scope": "full_active_panel"
+    },
+    {
+      "command": "save",
+      "path": "../../../benchmark-results/manual-suite/automation-project.rgv.json"
+    },
+    {
+      "command": "exit"
+    }
+  ],
+  "schema_version": 1
+}

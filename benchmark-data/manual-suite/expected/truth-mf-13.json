@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-13",
+  "fixture_ids": [
+    "manual-igv-import",
+    "manual-igv-expected",
+    "manual-recovery-autosave",
+    "manual-recovery-state",
+    "failure-changed-source",
+    "manual-changed-source-state"
+  ],
+  "assembly": "mixed-synthetic",
+  "loci": [
+    {
+      "id": "session-recovery",
+      "displayed_locus": "chr1:900001-920000",
+      "contig": "chr1",
+      "start_zero_based": 900000,
+      "end_zero_based_exclusive": 920000,
+      "expected_facts": [
+        "The IGV import report exactly classifies imported, approximated, and ignored items.",
+        "A controlled unclean runtime state exposes exactly one valid autosave and an explicit recover-or-continue choice.",
+        "The changed-source fingerprint differs deliberately, while the partial workspace names exactly one missing BAM.",
+        "Native versions 1, 2, and 3 reopen and the deliberately future schema is rejected."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-12",
+  "fixture_ids": [
+    "dep-mixed-bam"
+  ],
+  "assembly": "mixed-synthetic",
+  "loci": [
+    {
+      "id": "workspace-deep",
+      "displayed_locus": "chr1:900001-920000",
+      "contig": "chr1",
+      "start_zero_based": 900000,
+      "end_zero_based_exclusive": 920000,
+      "expected_facts": [
+        "Four stable alignment tracks reopen in two ordered panels; separate eight-track and one-failure workspaces retain distinct identities.",
+        "The self-contained reference/BAM project reopens and queries after relocation to a different directory."
+      ]
+    }
+  ]
+}

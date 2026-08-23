@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-06",
+  "fixture_ids": [
+    "manual-sbx-bam"
+  ],
+  "assembly": "manual-synthetic",
+  "loci": [
+    {
+      "id": "sbx",
+      "displayed_locus": "chrManual:39901-40600",
+      "contig": "chrManual",
+      "start_zero_based": 39900,
+      "end_zero_based_exclusive": 40600,
+      "expected_facts": [
+        "Named records expose concordant, partly discordant, and fully discordant ten-base insertions plus a reverse-strand control.",
+        "A named all-tail record has no retained center and a named missing-quality record reports unavailable evidence without hiding healthy reads."
+      ]
+    }
+  ]
+}

@@ -910,10 +910,13 @@ ordinary user demand can promote any of them into a later feature phase.
 
 **Qualification: ready for the user's broad manual pass.** The 23 August 2026 post-freeze desktop
 access/persistence audit found and corrected opening gaps for remote sources and advertised
-compressed annotations, then passed the complete 503-test correctness gate, strict Clippy, release
-build, and pinned semantic corpus. A controlled backend matrix, headless baselines, and an unsigned
-macOS package check were completed early and remain valid evidence; they are not a reason to delay
-the user's pass or tune acceptable load times.
+compressed annotations. The subsequent complete manual fixture suite now maps every advertised
+feature and format to 17 focused projects, 15 scenario cards, three automation batches, exact
+semantic truth, deliberate failures, relocation, and a controlled loopback lab. Its strict catalog
+has 59 rows and no unresolved planned disposition; deterministic/tamper qualification, the full
+workspace tests, strict Clippy, release validation binaries, remote protocol/production-BAM checks,
+runtime project materialisation, and two native Metal export batches pass. Manual card results,
+representative real data, external WAN, and the platform/release matrix remain pending by design.
 
 The concise evidence/gap audit is maintained in
 `benchmark-results/PHASE9_QUALIFICATION_STATUS.md`.
@@ -1174,8 +1177,8 @@ Work in this order. Each numbered item must be independently testable and review
     `docs/DESKTOP_FEATURE_ACCESS.md`; custom index URLs are bounded to HTTP/S remote sources and
     have credentials removed from persisted projects. Formatting, all 505 active tests, strict
     all-feature Clippy, the release desktop build, and the pinned semantic corpus passed.
-16. **Ready:** launch the broad manual product pass from the verified mixed-format and
-    alignment-review projects and the release build instructions in
+16. **Ready:** launch the broad manual product pass from the complete focused index in
+    `validation/manual-suite/README.md` and the broader release-build guidance in
     `validation/MANUAL_QUALIFICATION.md`. Fix concrete findings
     before longer soak, platform/signing, or matched-IGV qualification. Retain existing benchmark
     evidence and do not tune roughly 500 ms loads without a demonstrated usability problem or

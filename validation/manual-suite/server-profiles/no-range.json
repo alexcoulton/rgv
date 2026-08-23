@@ -1,0 +1,7 @@
+{
+  "expected_behavior": "Range is deliberately ignored and Accept-Ranges is omitted",
+  "external_network_required": false,
+  "profile": "no-range",
+  "representative_status": 200,
+  "schema_version": 1
+}

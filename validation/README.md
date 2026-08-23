@@ -15,6 +15,36 @@ cargo run --release -p rgv-validation-runner -- \
   --output benchmark-results/validation-synthetic-latest.json
 ```
 
+## Complete manual fixture suite
+
+The focused suite under `benchmark-data/manual-suite` is the preferred starting point for broad
+desktop testing. It maps every advertised desktop capability and supported format to a named
+project or operational scenario, with exact truth and deliberate failures:
+
+```sh
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- generate
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixture-check -- \
+  verify --require-complete
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- qualify
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- list
+```
+
+The generated index is [`manual-suite/README.md`](manual-suite/README.md). `qualify` performs two
+disposable generations and proves identical declared hashes, tamper/stale/missing rejection,
+portable relocation, exact production-reader semantics, and the size budget. The deliberate CRAM
+wrong-reference test prints an htslib MD5 mismatch while the verifier succeeds.
+
+For the controlled remote matrix, build the validation binaries together and run:
+
+```sh
+cargo build --release -p rgv-validation-runner --bins
+target/release/rgv-fixture-server-check --suite benchmark-data/manual-suite
+```
+
+Fixture-ready means the data and workflows are ready for a person to test. It does not mean the
+manual cards, representative real-data matrix, platform checks, or release qualification have
+passed.
+
 The checked-in synthetic manifest also pins `variants.bam`, its BAI, and the matching FASTA. Its
 `chrVariants:13991-15120` truth locus requires all three Ultima records to survive indexed file
 decoding with usable flow-indel evidence: directional `tp` insertion Q40, read-group-`mc` deletion

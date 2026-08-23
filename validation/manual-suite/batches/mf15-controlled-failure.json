@@ -1,0 +1,31 @@
+{
+  "commands": [
+    {
+      "command": "new_workspace"
+    },
+    {
+      "command": "load_track",
+      "kind": "Alignment",
+      "name": "EXPECTED missing source",
+      "source": {
+        "Local": {
+          "path": "../../../benchmark-data/manual-suite/failures/does-not-exist.bam"
+        }
+      }
+    },
+    {
+      "command": "goto",
+      "loci": [
+        "chr1:900001-920000"
+      ]
+    },
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 100
+    },
+    {
+      "command": "exit"
+    }
+  ],
+  "schema_version": 1
+}

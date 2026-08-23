@@ -1,0 +1,29 @@
+{
+  "alignment_track_count": 1,
+  "approximated": [
+    "IGV panel placement was flattened into RGV's ordered track stack",
+    "Session.genome identifier was retained as an assembly label; RGV did not infer a reference file"
+  ],
+  "ignored": [
+    "Panel.name is not preserved after panel flattening",
+    "Resource.index is not persisted by the RGV project model",
+    "Track configuration did not match a Resource and was ignored",
+    "Track.color has no exact RGV project equivalent",
+    "Track.displayMode has no exact RGV project equivalent"
+  ],
+  "imported": [
+    "3 Resource.path entries -> RGV data sources",
+    "Session.locus -> active RGV locus",
+    "Session.version accepted as IGV compatibility metadata",
+    "Track.height -> RGV track height",
+    "Track.name -> RGV track name"
+  ],
+  "locus": {
+    "contig": "chrVariants",
+    "end": 12600,
+    "start": 9400
+  },
+  "omitted_notice_count": 0,
+  "schema_version": 1,
+  "track_count": 1
+}

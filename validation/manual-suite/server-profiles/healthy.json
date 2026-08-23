@@ -1,0 +1,7 @@
+{
+  "expected_behavior": "HEAD and bounded GET byte ranges succeed with stable validators",
+  "external_network_required": false,
+  "profile": "healthy",
+  "representative_status": 206,
+  "schema_version": 1
+}

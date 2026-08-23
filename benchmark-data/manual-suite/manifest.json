@@ -1,0 +1,3087 @@
+{
+  "schema_version": 1,
+  "generator": "rgv-manual-fixtures/1",
+  "corpus_size_budget_bytes": 52428800,
+  "artifacts": [
+    {
+      "id": "coverage-catalog",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/coverage-catalog.json",
+      "media_type": "application/vnd.rgv.coverage+json",
+      "bytes": 40719,
+      "sha256": "5b65d4282686a12c279d32ceb1c050451999e1d6140605f0274fbcead825cdce",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "failure-changed-source",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/failures/changed-source.bed",
+      "media_type": "text/vnd.rgv.bed",
+      "bytes": 47,
+      "sha256": "f07bbcc3bdfb40ce91f8fd93542e3befa60967cb478fa5c644fe16fe4b96ba63",
+      "validity": "intentionally_invalid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-13"
+      ],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "failure-invalid-session",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/failures/invalid-session.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 66,
+      "sha256": "517a67baa4e247ab883686ef60913b653f43bd594ef3badc70359968545485e3",
+      "validity": "intentionally_invalid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "failure-truncated-bed",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/failures/truncated.bed",
+      "media_type": "text/vnd.rgv.bed",
+      "bytes": 17,
+      "sha256": "3ece0f4f921e8964dad93347b2fe5726a2721ce24e85642b51e797f5941c01d7",
+      "validity": "intentionally_invalid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "failure-wrong-reference-fai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/failures/wrong-reference.fa.fai",
+      "media_type": "application/vnd.rgv.fai",
+      "bytes": 26,
+      "sha256": "302b0486740ed27285f8c74a18dde7f553d9a49a1888213fbe1d0bb2a88d793a",
+      "validity": "intentionally_invalid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "failure-wrong-reference-fasta",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/failures/wrong-reference.fa",
+      "media_type": "application/vnd.rgv.fasta",
+      "bytes": 101261,
+      "sha256": "0c2502f5f87b208185caed91e77b1a46bb28b27732c5a76077946f750bce5cbc",
+      "validity": "intentionally_invalid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-association-assoc",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/association.assoc",
+      "media_type": "text/vnd.rgv.gwas",
+      "bytes": 108,
+      "sha256": "3da48e69d2176a2e4f23ce7535591be45a22106483a4c6f036802e22d7b5988b",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-association-linear",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/association.linear",
+      "media_type": "text/vnd.rgv.gwas",
+      "bytes": 108,
+      "sha256": "3da48e69d2176a2e4f23ce7535591be45a22106483a4c6f036802e22d7b5988b",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-association-logistic",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/association.logistic",
+      "media_type": "text/vnd.rgv.gwas",
+      "bytes": 108,
+      "sha256": "3da48e69d2176a2e4f23ce7535591be45a22106483a4c6f036802e22d7b5988b",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-association-qassoc",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/association.qassoc",
+      "media_type": "text/vnd.rgv.gwas",
+      "bytes": 108,
+      "sha256": "3da48e69d2176a2e4f23ce7535591be45a22106483a4c6f036802e22d7b5988b",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-batch-mf15-complete-exports.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/batches/mf15-complete-exports.json",
+      "media_type": "application/vnd.rgv.automation-batch+json",
+      "bytes": 2586,
+      "sha256": "80afe151cbc82fba57c8638f4efed416a8f691068e10b79546d1e8a2be588482",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-15"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-batch-mf15-controlled-failure.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/batches/mf15-controlled-failure.json",
+      "media_type": "application/vnd.rgv.automation-batch+json",
+      "bytes": 552,
+      "sha256": "7bf10c85584ae29e7e1f3592f9d611d19e866d6213cc8bdd03f5181a13442cc3",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-15"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-batch-mf15-variant-track-exports.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/batches/mf15-variant-track-exports.json",
+      "media_type": "application/vnd.rgv.automation-batch+json",
+      "bytes": 2092,
+      "sha256": "cb63ffaa2a5f5553cf056345cfcd2512e24a052ad3348623ef6dfdb71a2a6f63",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-15"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-cbs",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/cohort.cbs",
+      "media_type": "text/vnd.rgv.cbs",
+      "bytes": 123,
+      "sha256": "c48dbeb2c87740bff7d46010aa69d9cc2892b042e056f25e587b035f42e1bbd7",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-changed-source-state",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/changed-source-state.json",
+      "media_type": "application/vnd.rgv.source-state+json",
+      "bytes": 222,
+      "sha256": "fb1ab2b08bdaa24ac88c0eb7def82a5da7305d153eedf7cf63d2194595cc3851",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-13"
+      ],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-cohort-bcf",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/variants/cohort.bcf",
+      "media_type": "application/vnd.rgv.bcf",
+      "bytes": 1624,
+      "sha256": "859e4172b576088675d6e58d928bc575ba8c4a6020f7a89f35c81e91c35c474c",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-09"
+      ],
+      "project_ids": [
+        "mf-09-cohort-variants"
+      ],
+      "scenario_ids": [
+        "scenario-mf-09"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-cohort-csi",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/variants/cohort.bcf.csi",
+      "media_type": "application/vnd.rgv.csi",
+      "bytes": 93,
+      "sha256": "daa7d52e5445734ff9b7c15bc267471175b05f7d35a760ca9e2671db0bd2e3f7",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-cohort-tbi",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/variants/cohort.vcf.gz.tbi",
+      "media_type": "application/vnd.rgv.tabix",
+      "bytes": 118,
+      "sha256": "5e865a8e433d9b34627676a3a4cfc239185d5c5ad4e8c60e88cc1270321cae21",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-cohort-vcf",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/variants/cohort.vcf.gz",
+      "media_type": "application/vnd.rgv.vcf+bgzip",
+      "bytes": 2801,
+      "sha256": "e102a28b79c4e55a510e41cafdad776d75f7fea1a96245e76cab601ef99659d9",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-09"
+      ],
+      "project_ids": [
+        "mf-09-cohort-variants"
+      ],
+      "scenario_ids": [
+        "scenario-mf-09"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-cytobands",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/cytobands.txt",
+      "media_type": "text/tab-separated-values",
+      "bytes": 130,
+      "sha256": "6ecdfbd8d6879bc3fcd4562640108bfa2ec883c45f92943c92828f0b1a9cc6ce",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-default-annotations",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/default-annotations.bed",
+      "media_type": "text/vnd.rgv.bed",
+      "bytes": 109,
+      "sha256": "f3a53fa78ceaa30898623bd4b5d069cf45d7d4185ab2949db478127a020e8839",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-fixed-wig",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/signal-fixed.wig",
+      "media_type": "text/vnd.rgv.wig",
+      "bytes": 74,
+      "sha256": "ec590465dc75a9bc1e7f5d81ff33142d5dd083cbaa735e6045bb5ca7eb203d2b",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-genome-config",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/genomes/manual.rgvgenome",
+      "media_type": "application/vnd.rgv.genome+json",
+      "bytes": 514,
+      "sha256": "f38ecb5ed11c11bddb345ef9875a4ea93415ca8d45e986bb65f5387c9e378e79",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-11"
+      ],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-gff3",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/annotations.gff3",
+      "media_type": "text/vnd.rgv.gff3",
+      "bytes": 282,
+      "sha256": "fe11b30cfbe76994e6f17c9b91cbe1d4e18fb055f04ae67ddc0d350f21d7b99d",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-gff3-gzip",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/annotations.gff3.gz",
+      "media_type": "application/vnd.rgv.gff3+gzip",
+      "bytes": 123,
+      "sha256": "7286a9aca867dddeca0c27e4e647c19450f656b4b51f0a5669dfaad99ed9f0b8",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-gtf",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/annotations.gtf",
+      "media_type": "text/vnd.rgv.gtf",
+      "bytes": 442,
+      "sha256": "8a0a4ec9670a8bcf7917e9fa6298e79adcd72588de9edaa2ac509e05a6333ba2",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-igv-expected",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/igv-import-report.json",
+      "media_type": "application/vnd.rgv.igv-import-report+json",
+      "bytes": 962,
+      "sha256": "3a5affa00df067fd5f269486f675a95636e4b843173cfdf7aaee3c8f6fdf74c2",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-13"
+      ],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-igv-import",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/imports/representative-igv-session.xml",
+      "media_type": "application/vnd.igv.session+xml",
+      "bytes": 535,
+      "sha256": "64c655e57321320c8a92a042396c772e691858c6c6d31519ce18acc1ca4a1998",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-13"
+      ],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-recovery-autosave",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/recovery/autosaves/manual-00000000000000000001.autosave.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 10122,
+      "sha256": "827f95c98976988be951c93bf88debf335ee487f0c360b6ad11c8ca1126c8a9a",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-13"
+      ],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-recovery-state",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/recovery/runtime-state.json",
+      "media_type": "application/vnd.rgv.recovery-state+json",
+      "bytes": 232,
+      "sha256": "d8d94a0e58bbe53c20c55ece37f53a4a58c5fb958df5065c4d5064e3ecc9c9c2",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-13"
+      ],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-ref-flat",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/transcripts.refFlat",
+      "media_type": "text/vnd.rgv.ref-flat",
+      "bytes": 105,
+      "sha256": "54a58912bc5a91271772398fcab94770904c6e05e6fa85275c9e98cf71a7c6bc",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-reference-crai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/reference-dependent.cram.crai",
+      "media_type": "application/vnd.rgv.crai",
+      "bytes": 46,
+      "sha256": "6243e3e4456b08da77c0ffdb2f1a897c857fdd350966dc536b8049e59f45fe57",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-reference-cram",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/reference-dependent.cram",
+      "media_type": "application/vnd.rgv.cram",
+      "bytes": 1467,
+      "sha256": "6b8aba0a4e18f02dec578339acc363bc821127d49b54655fe8f0df9308791472",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-reference-fai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/references/manual.fa.fai",
+      "media_type": "application/vnd.rgv.fai",
+      "bytes": 26,
+      "sha256": "302b0486740ed27285f8c74a18dde7f553d9a49a1888213fbe1d0bb2a88d793a",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-reference-fasta",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/references/manual.fa",
+      "media_type": "application/vnd.rgv.fasta",
+      "bytes": 101261,
+      "sha256": "9fec194495a7394e1b540cd09af9cadb2aa0996cf9b240204eee1e78acdda8cf",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-04",
+        "truth-mf-05",
+        "truth-mf-06",
+        "truth-mf-08"
+      ],
+      "project_ids": [
+        "mf-04-bisulfite",
+        "mf-05-smrt-kinetics",
+        "mf-06-sbx",
+        "mf-08-single-cell"
+      ],
+      "scenario_ids": [
+        "scenario-mf-04",
+        "scenario-mf-05",
+        "scenario-mf-06",
+        "scenario-mf-08"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-relocation-bai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/relocation/source/data/specialist.bam.bai",
+      "media_type": "application/vnd.rgv.bai",
+      "bytes": 96,
+      "sha256": "c0c7d344ce5571f110fc9de8e9aa19088ec661229debe8ccd7b2cf0fee1bcef7",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-relocation-bam",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/relocation/source/data/specialist.bam",
+      "media_type": "application/vnd.rgv.bam",
+      "bytes": 795,
+      "sha256": "e34672ba59fa9c8b2e3d0a9d18e1307033ced1c8f0f1001c941d462fb1ab8d48",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "project_ids": [
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-relocation-fai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/relocation/source/data/manual.fa.fai",
+      "media_type": "application/vnd.rgv.fai",
+      "bytes": 26,
+      "sha256": "302b0486740ed27285f8c74a18dde7f553d9a49a1888213fbe1d0bb2a88d793a",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-relocation-fasta",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/relocation/source/data/manual.fa",
+      "media_type": "application/vnd.rgv.fasta",
+      "bytes": 101261,
+      "sha256": "9fec194495a7394e1b540cd09af9cadb2aa0996cf9b240204eee1e78acdda8cf",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "project_ids": [
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-relocation-project",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/relocation/source/relocatable.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 2673,
+      "sha256": "b3af9c0e1b3c3a90470f5db404b0716453648a68429a7aacd255a35a8679a0db",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "project_ids": [
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-review-import",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/imports/review-items.tsv",
+      "media_type": "text/vnd.rgv.review-items",
+      "bytes": 513,
+      "sha256": "117b033f8cc0f68d561203be5390550205fc82f7bdac13bc04e05f41d3d8371d",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-11"
+      ],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-rna-a-bai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/rna-sample-a.bam.bai",
+      "media_type": "application/vnd.rgv.bai",
+      "bytes": 104,
+      "sha256": "05199e43bf2c051e72b26b17825d53ef3a29c24915d7b7b95761fcf875bfc671",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-rna-a-bam",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/rna-sample-a.bam",
+      "media_type": "application/vnd.rgv.bam",
+      "bytes": 451,
+      "sha256": "b85a2386e90d0e7ab2954c5805a44af756aa373805c0b6d1320edfe053abf657",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-03"
+      ],
+      "project_ids": [
+        "mf-03-rna-sashimi"
+      ],
+      "scenario_ids": [
+        "scenario-mf-03"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-rna-annotation",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/tracks/rna-transcripts.gff3",
+      "media_type": "text/vnd.rgv.gff3",
+      "bytes": 471,
+      "sha256": "686bbe882368d8d04a8718c21231af521301e0d6ec9becd6000efb4412cbfbdb",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-03"
+      ],
+      "project_ids": [
+        "mf-03-rna-sashimi"
+      ],
+      "scenario_ids": [
+        "scenario-mf-03"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-rna-b-bai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/rna-sample-b.bam.bai",
+      "media_type": "application/vnd.rgv.bai",
+      "bytes": 104,
+      "sha256": "0d8f1c96233a6c0cb0ec50bf6d71124c34ae13d98d66290eb3b7c5f4ac187c72",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-rna-b-bam",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/rna-sample-b.bam",
+      "media_type": "application/vnd.rgv.bam",
+      "bytes": 510,
+      "sha256": "f370642a05476548fe563bf345d26c8ae47115dee0a0243a0c0b830c845d8564",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-03"
+      ],
+      "project_ids": [
+        "mf-03-rna-sashimi"
+      ],
+      "scenario_ids": [
+        "scenario-mf-03"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-roi-import",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/imports/regions.bed",
+      "media_type": "text/vnd.rgv.regions",
+      "bytes": 277,
+      "sha256": "81426ad5534ce0a6851ed39c931d4ef3668dcba45d3900e5109d68544d1ab74c",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-11"
+      ],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-sample-metadata",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/metadata/samples.tsv",
+      "media_type": "text/tab-separated-values",
+      "bytes": 336,
+      "sha256": "aa459e7d644508e053c0991d5c104c3de8ace3abb8d22e94dae630a4ee336904",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-08",
+        "truth-mf-09"
+      ],
+      "project_ids": [
+        "mf-08-single-cell",
+        "mf-09-cohort-variants",
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-08",
+        "scenario-mf-09",
+        "scenario-mf-12"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-sbx-bai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/sbx-evidence.bam.bai",
+      "media_type": "application/vnd.rgv.bai",
+      "bytes": 112,
+      "sha256": "877f51f3cd573471db3346c38c69861e436c4cc19429e3fc08fd13337cd4f1c9",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-sbx-bam",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/sbx-evidence.bam",
+      "media_type": "application/vnd.rgv.bam",
+      "bytes": 389,
+      "sha256": "b0de7d6d58bcbe4411fe5c4f7ca04919a737abef5deb026fda24b39b039ae6f3",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [
+        "truth-mf-06"
+      ],
+      "project_ids": [
+        "mf-06-sbx"
+      ],
+      "scenario_ids": [
+        "scenario-mf-06"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-smrt-bai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/smrt-evidence.bam.bai",
+      "media_type": "application/vnd.rgv.bai",
+      "bytes": 104,
+      "sha256": "60b08f9c2a2298f6d8a639a021fd1ad88e34d11d96c5aa0443ac9560db3362e3",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-smrt-bam",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/smrt-evidence.bam",
+      "media_type": "application/vnd.rgv.bam",
+      "bytes": 729,
+      "sha256": "3e960aac0d63f9fbc910af013793292214cc7226409e9f2e130ea61763b9cff8",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-05"
+      ],
+      "project_ids": [
+        "mf-05-smrt-kinetics"
+      ],
+      "scenario_ids": [
+        "scenario-mf-05"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-specialist-bai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/specialist.bam.bai",
+      "media_type": "application/vnd.rgv.bai",
+      "bytes": 96,
+      "sha256": "c0c7d344ce5571f110fc9de8e9aa19088ec661229debe8ccd7b2cf0fee1bcef7",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-specialist-bam",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/specialist.bam",
+      "media_type": "application/vnd.rgv.bam",
+      "bytes": 795,
+      "sha256": "e34672ba59fa9c8b2e3d0a9d18e1307033ced1c8f0f1001c941d462fb1ab8d48",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-04",
+        "truth-mf-05",
+        "truth-mf-06",
+        "truth-mf-08"
+      ],
+      "project_ids": [
+        "mf-04-bisulfite",
+        "mf-05-smrt-kinetics",
+        "mf-06-sbx",
+        "mf-08-single-cell"
+      ],
+      "scenario_ids": [
+        "scenario-mf-04",
+        "scenario-mf-05",
+        "scenario-mf-06",
+        "scenario-mf-08"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-specialist-csi",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/specialist.bam.csi",
+      "media_type": "application/vnd.rgv.csi",
+      "bytes": 94,
+      "sha256": "0d484bc2e976f8be587e58a1587f8b48bbd2f2874f5bcc39819c80c3058cd26d",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-suite-index",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/README.md",
+      "media_type": "text/markdown",
+      "bytes": 3072,
+      "sha256": "f92e0b6901d2b83b98b5b9d992cc7966a642c2296957d672ccdd6b6fdf01de87",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-01",
+        "scenario-mf-02",
+        "scenario-mf-03",
+        "scenario-mf-04",
+        "scenario-mf-05",
+        "scenario-mf-06",
+        "scenario-mf-07",
+        "scenario-mf-08",
+        "scenario-mf-09",
+        "scenario-mf-10",
+        "scenario-mf-11",
+        "scenario-mf-12",
+        "scenario-mf-13",
+        "scenario-mf-14",
+        "scenario-mf-15"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-ultima-bai",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/ultima-evidence.bam.bai",
+      "media_type": "application/vnd.rgv.bai",
+      "bytes": 120,
+      "sha256": "f8cdfcd86dbf931372eecb7da8d52b274a43e08d1f9c00cccda1006efd25644e",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "manual-ultima-bam",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/data/alignments/ultima-evidence.bam",
+      "media_type": "application/vnd.rgv.bam",
+      "bytes": 469,
+      "sha256": "9e444281ff69e1185b18062aa7c34f0444ff9b2336b4edb7b10f24d38383c03e",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-07"
+      ],
+      "project_ids": [
+        "mf-07-ultima"
+      ],
+      "scenario_ids": [
+        "scenario-mf-07"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-01-alignment-core",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-01-alignment-core.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 4100,
+      "sha256": "d2d3700d4fc3c5fb81e66a34e779559553d2f824e70a9291ff0ed348fb9e2231",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "dep-mixed-bam",
+        "dep-mixed-bai"
+      ],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-01"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-02-alignment-events",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-02-alignment-events.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 2673,
+      "sha256": "942063f51246799f72ef38a4d62d4b5f9859af0dc4e48cca553affa63805a31e",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "dep-variants-bam",
+        "dep-variants-fasta"
+      ],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-02"
+      ],
+      "project_ids": [
+        "mf-02-alignment-events"
+      ],
+      "scenario_ids": [
+        "scenario-mf-02"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-03-rna-sashimi",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-03-rna-sashimi.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 7180,
+      "sha256": "d47ba49fb4688a3cdc3b64f3f04351b6372b20170c7092b90f9adc55d026d870",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "manual-rna-a-bam",
+        "manual-rna-b-bam",
+        "manual-reference-fasta",
+        "manual-rna-annotation"
+      ],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-03"
+      ],
+      "project_ids": [
+        "mf-03-rna-sashimi"
+      ],
+      "scenario_ids": [
+        "scenario-mf-03"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-04-bisulfite",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-04-bisulfite.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 12534,
+      "sha256": "2e450c18793bb1b04168b3468104a3acae821f44b25f66ea07167e169a17e240",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "manual-specialist-bam",
+        "manual-reference-fasta"
+      ],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-04"
+      ],
+      "project_ids": [
+        "mf-04-bisulfite"
+      ],
+      "scenario_ids": [
+        "scenario-mf-04"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-05-smrt-kinetics",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-05-smrt-kinetics.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 12615,
+      "sha256": "385cb04929293413e05a8d93a03ad03de13475f0dc5eac215814e57c66113007",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "manual-smrt-bam",
+        "manual-reference-fasta"
+      ],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-05"
+      ],
+      "project_ids": [
+        "mf-05-smrt-kinetics"
+      ],
+      "scenario_ids": [
+        "scenario-mf-05"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-06-sbx",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-06-sbx.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 7020,
+      "sha256": "4d1b2e2f3ead46d43abc8844e536a62cafeb97697d173ce2e1b9c94cf1734484",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "manual-sbx-bam",
+        "manual-reference-fasta"
+      ],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [
+        "truth-mf-06"
+      ],
+      "project_ids": [
+        "mf-06-sbx"
+      ],
+      "scenario_ids": [
+        "scenario-mf-06"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-07-ultima",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-07-ultima.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 4897,
+      "sha256": "70e83246cf4836226a1288ee24df31e86d154f50d252585f059a76690969e090",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "manual-ultima-bam",
+        "manual-reference-fasta"
+      ],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-07"
+      ],
+      "project_ids": [
+        "mf-07-ultima"
+      ],
+      "scenario_ids": [
+        "scenario-mf-07"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-08-single-cell",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-08-single-cell.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 4476,
+      "sha256": "95edf928ac7f3b8ce2f90f72ee30b0ada75d4802543267f89ee99206a171c14f",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "manual-specialist-bam",
+        "manual-reference-fasta"
+      ],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-08"
+      ],
+      "project_ids": [
+        "mf-08-single-cell"
+      ],
+      "scenario_ids": [
+        "scenario-mf-08"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-09-cohort-variants",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-09-cohort-variants.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 7428,
+      "sha256": "17a2d1ceb0e2e40927c89244d7e1a85e7e6a23888b51f2bb81b1606e8d83e33f",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "manual-cohort-vcf",
+        "manual-cohort-bcf",
+        "manual-sample-metadata"
+      ],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-09"
+      ],
+      "project_ids": [
+        "mf-09-cohort-variants"
+      ],
+      "scenario_ids": [
+        "scenario-mf-09"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-10-mixed-tracks",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-10-mixed-tracks.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 77976,
+      "sha256": "0bcb5b6a224d4500fa7ba968a1e758a7012c68be5d911dad787bcd6f8e34a0fe",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "dep-demo-project"
+      ],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-11-genome-review",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-11-genome-review.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 4570,
+      "sha256": "3c129d5b3d96cde11bd7aca64e1c821c1574a3a2f5f292257cb6fd05b9f08631",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "manual-genome-config",
+        "dep-variants-fasta"
+      ],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-11"
+      ],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-12-eight-track",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-12-eight-track.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 17806,
+      "sha256": "ec894617e112fec1bbf34d68c806498fdc34e9d4d7f292d6a38e2adf0793fc10",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "dep-mixed-bam",
+        "manual-sample-metadata"
+      ],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "project_ids": [
+        "mf-12-eight-track"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-12-failure-isolation",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-12-failure-isolation.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 10167,
+      "sha256": "b4c6541ae986ce75aae41dcb92749f7c1f966080afeda084b5266227a442c2e6",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "dep-mixed-bam",
+        "manual-sample-metadata"
+      ],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "project_ids": [
+        "mf-12-failure-isolation"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-12-four-track",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-12-four-track.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 10110,
+      "sha256": "8d30ff45e0b251938381d3c2aa937f09db206c504247da454e7e329876624f32",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "dep-mixed-bam",
+        "manual-sample-metadata"
+      ],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "project_ids": [
+        "mf-12-four-track"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-12-workspaces",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-12-workspaces.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 10110,
+      "sha256": "8d30ff45e0b251938381d3c2aa937f09db206c504247da454e7e329876624f32",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "dep-mixed-bam",
+        "manual-sample-metadata"
+      ],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "project_ids": [
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-13-recovery",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-13-recovery.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 10110,
+      "sha256": "8d30ff45e0b251938381d3c2aa937f09db206c504247da454e7e329876624f32",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "manual-recovery-autosave",
+        "manual-recovery-state",
+        "manual-igv-import",
+        "manual-igv-expected"
+      ],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-13"
+      ],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "project-artifact-mf-14-reference-cram",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/projects/mf-14-reference-cram.rgv.json",
+      "media_type": "application/vnd.rgv.session+json",
+      "bytes": 2710,
+      "sha256": "1b7b345fe8a7d11d453a15d24ef6c2294f26f8967f4a9a705f0a688e392199bd",
+      "validity": "valid",
+      "source_fixture_ids": [
+        "manual-reference-cram",
+        "manual-reference-fasta"
+      ],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-14"
+      ],
+      "project_ids": [
+        "mf-14-reference-cram"
+      ],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-01",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-01.md",
+      "media_type": "text/markdown",
+      "bytes": 1557,
+      "sha256": "8059cc95b81e26bf522559e106ff465d2f861b55bf3cf18322336a16b217dd0f",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-01-alignment-core"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-02",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-02.md",
+      "media_type": "text/markdown",
+      "bytes": 1578,
+      "sha256": "a52407b1edc4d0946a3720bf7c1eddb2ad975cb380cda797df92c2a7e58ffad5",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-02-alignment-events"
+      ],
+      "scenario_ids": [
+        "scenario-mf-02"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-03",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-03.md",
+      "media_type": "text/markdown",
+      "bytes": 1482,
+      "sha256": "21ee1008f07175ea550b4414baf77721e7a5425046224c5e13cbfdc322786b11",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-03-rna-sashimi"
+      ],
+      "scenario_ids": [
+        "scenario-mf-03"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-04",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-04.md",
+      "media_type": "text/markdown",
+      "bytes": 1352,
+      "sha256": "cc6ad021b3304d656b3af29b753824c22d52842a0efcde0140e2588b03f8dc60",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-04-bisulfite"
+      ],
+      "scenario_ids": [
+        "scenario-mf-04"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-05",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-05.md",
+      "media_type": "text/markdown",
+      "bytes": 1365,
+      "sha256": "861eb1640c6557817958040fe18ab186cd8c47bab485d7184e38df71d3628fad",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-05-smrt-kinetics"
+      ],
+      "scenario_ids": [
+        "scenario-mf-05"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-06",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-06.md",
+      "media_type": "text/markdown",
+      "bytes": 1270,
+      "sha256": "37c9b0bdd78cdee695170002e26aeacfefb0e41333103cb162bb55af6374bb58",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-06-sbx"
+      ],
+      "scenario_ids": [
+        "scenario-mf-06"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-07",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-07.md",
+      "media_type": "text/markdown",
+      "bytes": 1418,
+      "sha256": "2138fb38c8afec3f9d8bef849df8c93f393a79465f3cc27fe2cd32386ed159b3",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-07-ultima"
+      ],
+      "scenario_ids": [
+        "scenario-mf-07"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-08",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-08.md",
+      "media_type": "text/markdown",
+      "bytes": 1349,
+      "sha256": "571cf7b4dce4b3c26761b40f0bc8dd8ac66f417e0c1e25acbd2f1e0f24253c80",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-08-single-cell"
+      ],
+      "scenario_ids": [
+        "scenario-mf-08"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-09",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-09.md",
+      "media_type": "text/markdown",
+      "bytes": 1486,
+      "sha256": "b885c6ba8691cc513123567fa18ccf4e717bff59f82a14c0f5bf8177df54018d",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-09-cohort-variants"
+      ],
+      "scenario_ids": [
+        "scenario-mf-09"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-10",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-10.md",
+      "media_type": "text/markdown",
+      "bytes": 1395,
+      "sha256": "484a123339bee47f1946b6f83fda2ba11d2d2b332713b442604171ea5d5c718f",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-11",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-11.md",
+      "media_type": "text/markdown",
+      "bytes": 1455,
+      "sha256": "8c9b2c123dd78b78a2f1732ad7d9a8d586594cbbf527863df4c29ae81e6ff301",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-12",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-12.md",
+      "media_type": "text/markdown",
+      "bytes": 1409,
+      "sha256": "4c1ec3e8332470c9589c3f3bc33fcb744fc3ad26ccb6c7078d7f3a99700709f6",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-13",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-13.md",
+      "media_type": "text/markdown",
+      "bytes": 1545,
+      "sha256": "a6b99e6f39a44c452e276ce59104e4bb86e70fd07b3141ce897c293314f5cf99",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-14",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-14.md",
+      "media_type": "text/markdown",
+      "bytes": 1596,
+      "sha256": "43a9846a8d9fca37ad6e156187bac34e31c026402b71929a598a815c761f1be9",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "scenario-card-scenario-mf-15",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/scenarios/scenario-mf-15.md",
+      "media_type": "text/markdown",
+      "bytes": 1566,
+      "sha256": "8c2cab2057b92c2e245fe077773627f67db27431ea06a6ef7317e4486f35018e",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-15"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-auth-required.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/auth-required.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 207,
+      "sha256": "8a4e9e6dc968ca21513175e091b4c80829670d9a07b26b277496b73ed18cffdc",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-changed-etag.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/changed-etag.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 202,
+      "sha256": "c9a4aeb15e9530c211ad7f3de7aca999d2ebda07abafbd2b1053f507f9b232e4",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-corrupt.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/corrupt.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 201,
+      "sha256": "38dee7ed6aeac45f357d7e0d0b723eb5329d78ba4c56cdd3adc6d2b7d2074e2e",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-fail-first-n.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/fail-first-n.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 215,
+      "sha256": "4feb643a1c91075e18a7db26f6580b6eb2c9083dcf8372918f1ff2f9d405209f",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-healthy.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/healthy.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 210,
+      "sha256": "2dca942e88fd902fa534eb6b0dcdf630d66f3a689352e5eadfeb5340f22fc676",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-invalid-content-type.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/invalid-content-type.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 232,
+      "sha256": "81b81f32255b61a8e71446806ec5171da9ed856d29138d46b97d1b678f449b08",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-no-range.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/no-range.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 206,
+      "sha256": "d281c3068c444b0b99351a8fc46e14a90b16d5003bbbf9d9040526bb3116979d",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-outage.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/outage.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 197,
+      "sha256": "f870356655f7b39f50b8e4624f7468cc35b92b1b855db0176f4479f6c232fa00",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-redirect.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/redirect.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 210,
+      "sha256": "350f1926d21c11454d46f9243d717d44fbcb255d7c973e05223a2332bc596ff6",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-remote-source-map.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/remote-source-map.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 677,
+      "sha256": "65dce59d13f79ea40e6d90db868539b6a1575edc07637a96b8679a79f09231f7",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-short-body.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/short-body.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 203,
+      "sha256": "3a08a6a418be329b93babab5adbcc314bcb11ab63b2bf34e6b37db300188a9e4",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "server-profile-slow.json",
+      "generator_schema_version": 1,
+      "path": "validation/manual-suite/server-profiles/slow.json",
+      "media_type": "application/vnd.rgv.fixture-server-profile+json",
+      "bytes": 200,
+      "sha256": "c95575c818ed92689390e1e36fb116e70d7ca7d987ea26232441bf1855e3d9a6",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-01",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-01.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 557,
+      "sha256": "580fbc4439f3fd421cdbfcc1a09984dd0b7a9b4c9cf596fdb4f66afc11598e79",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-01"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-02",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-02.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 625,
+      "sha256": "1eba09d77c38a1b09e48142fcc2298bd58e77c8b737fd5f50d428e3ae40f846a",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-02"
+      ],
+      "project_ids": [
+        "mf-02-alignment-events"
+      ],
+      "scenario_ids": [
+        "scenario-mf-02"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-03",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-03.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 954,
+      "sha256": "54060df9085783a65147e0342a3e129c7376b9d9f941c6e95beb928146ba05db",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-03"
+      ],
+      "project_ids": [
+        "mf-03-rna-sashimi"
+      ],
+      "scenario_ids": [
+        "scenario-mf-03"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-04",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-04.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 662,
+      "sha256": "188caa4d72c06d89447416545e80c8680b140638d053c9f3a12bba596312ffe2",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-04"
+      ],
+      "project_ids": [
+        "mf-04-bisulfite"
+      ],
+      "scenario_ids": [
+        "scenario-mf-04"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-05",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-05.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 643,
+      "sha256": "8c6756eec0d3840ea640122c3f1c7f26c8f00f03036c0beea751cdd4dc3fdfb6",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-05"
+      ],
+      "project_ids": [
+        "mf-05-smrt-kinetics"
+      ],
+      "scenario_ids": [
+        "scenario-mf-05"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-06",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-06.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 649,
+      "sha256": "945f57ee1c0e745b4314df3b9e401434c4cb4594a3ffa3ea0565dc0af171a43d",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": null,
+      "contigs": {},
+      "truth_ids": [
+        "truth-mf-06"
+      ],
+      "project_ids": [
+        "mf-06-sbx"
+      ],
+      "scenario_ids": [
+        "scenario-mf-06"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-07",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-07.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 780,
+      "sha256": "3826bf1780331802a9728001484dc24b274b1a786caf663518e87676f8daf14c",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-07"
+      ],
+      "project_ids": [
+        "mf-07-ultima"
+      ],
+      "scenario_ids": [
+        "scenario-mf-07"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-08",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-08.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 636,
+      "sha256": "05d7d65ce60af5a0436e06d3442bbf89500ba4ed5dda5487dcc69c10187191c2",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-08"
+      ],
+      "project_ids": [
+        "mf-08-single-cell"
+      ],
+      "scenario_ids": [
+        "scenario-mf-08"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-09",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-09.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 815,
+      "sha256": "097e554ddf319c7d58834281e59e7753e9484663453f17222911380bea6c7718",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-09"
+      ],
+      "project_ids": [
+        "mf-09-cohort-variants"
+      ],
+      "scenario_ids": [
+        "scenario-mf-09"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-10",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-10.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 526,
+      "sha256": "e210ac5d62d1872222838b64d0c1b87475dfb089d3cd186bc9265857286aeafc",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-11",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-11.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 847,
+      "sha256": "96eea777b2f9e7db7ce4709b535270015a959a3290fe8c17f51cab17ce2a8b4d",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "variants-synthetic",
+      "contigs": {
+        "chrVariants": 20000
+      },
+      "truth_ids": [
+        "truth-mf-11"
+      ],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-12",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-12.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 626,
+      "sha256": "20a0db09ecf1b19ff95702f507cf061b78b7ed8c9b163f673338fe221662f3fc",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "project_ids": [
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-13",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-13.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 961,
+      "sha256": "3ea47f7b0fba3e553444fcb1fe53f2eefd3c90dfedbe96c64b2e56f0008fdf89",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "mixed-synthetic",
+      "contigs": {
+        "chr1": 3000000,
+        "chr2": 3000000
+      },
+      "truth_ids": [
+        "truth-mf-13"
+      ],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    },
+    {
+      "id": "truth-document-mf-14",
+      "generator_schema_version": 1,
+      "path": "benchmark-data/manual-suite/expected/truth-mf-14.json",
+      "media_type": "application/vnd.rgv.truth+json",
+      "bytes": 633,
+      "sha256": "f6b679e5fd62aff5225b076f6f63189b099c2d1afcce672c33b1795366e410d8",
+      "validity": "valid",
+      "source_fixture_ids": [],
+      "assembly": "manual-synthetic",
+      "contigs": {
+        "chrManual": 100000
+      },
+      "truth_ids": [
+        "truth-mf-14"
+      ],
+      "project_ids": [
+        "mf-14-reference-cram"
+      ],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "privacy": "deterministic-synthetic-no-personal-data",
+      "redistributable": true
+    }
+  ],
+  "dependencies": [
+    {
+      "id": "dep-automation-batch",
+      "path": "validation/automation-smoke.json",
+      "bytes": 2375,
+      "sha256": "6424282930f0292f3ba4ed5f2ff842fc9066a671da6aa0df03a3cf1fff6816c6",
+      "purpose": "structured automation and export smoke"
+    },
+    {
+      "id": "dep-demo-archive.tdf",
+      "path": "benchmark-data/demo-tracks/archive.tdf",
+      "bytes": 245,
+      "sha256": "790f57cd3df8eebcb42359ffc5c48b203635971e5c52d3a9542e6c64c72bd9ff",
+      "purpose": "existing mixed-format source archive.tdf"
+    },
+    {
+      "id": "dep-demo-association.gwas",
+      "path": "benchmark-data/demo-tracks/association.gwas",
+      "bytes": 130,
+      "sha256": "0c166e7618dcf4d5a999aa0ef992505310656de0905150565d90925d009f3a64",
+      "purpose": "existing mixed-format source association.gwas"
+    },
+    {
+      "id": "dep-demo-bcf",
+      "path": "benchmark-data/demo-tracks/variants.bcf",
+      "bytes": 588,
+      "sha256": "abbf9fe2f10bea4393c06eadbe8942bf867142ccff5d78d41cf8eced080deda3",
+      "purpose": "typed variants and genotypes"
+    },
+    {
+      "id": "dep-demo-bcf-csi",
+      "path": "benchmark-data/demo-tracks/variants.bcf.csi",
+      "bytes": 92,
+      "sha256": "6c78a0257cae414f15e7b8cffca8f099592891c23d7d114e7059caf4213c7366",
+      "purpose": "CSI for typed variants"
+    },
+    {
+      "id": "dep-demo-cohort.seg",
+      "path": "benchmark-data/demo-tracks/cohort.seg",
+      "bytes": 171,
+      "sha256": "0c0e031d39c2a4beb2d087c16d8dc5d65d3389cc4d6e308d1eff8f68848cc99a",
+      "purpose": "existing mixed-format source cohort.seg"
+    },
+    {
+      "id": "dep-demo-features.bed.gz",
+      "path": "benchmark-data/demo-tracks/features.bed.gz",
+      "bytes": 150,
+      "sha256": "1eee435ebc300e20302d71d5a4153c65e8e72aa3d94eddab2a41a62390c01bd3",
+      "purpose": "existing mixed-format source features.bed.gz"
+    },
+    {
+      "id": "dep-demo-features.bigBed",
+      "path": "benchmark-data/demo-tracks/features.bigBed",
+      "bytes": 890,
+      "sha256": "c21e5964b65f9a5190dd751dc0b5eadabbc4cb5f84e666937917f72b930c3645",
+      "purpose": "existing mixed-format source features.bigBed"
+    },
+    {
+      "id": "dep-demo-genes.bigGenePred",
+      "path": "benchmark-data/demo-tracks/genes.bigGenePred",
+      "bytes": 1193,
+      "sha256": "0f38a9a8c1ada0b64f462fbcc31c47bfb8402c046abb417f46cea82c5a0d369b",
+      "purpose": "existing mixed-format source genes.bigGenePred"
+    },
+    {
+      "id": "dep-demo-genes.gtf.gz",
+      "path": "benchmark-data/demo-tracks/genes.gtf.gz",
+      "bytes": 150,
+      "sha256": "57722286feb8a16da5546d3b6523139f8350fcf92dbe9443a3706c48941aad09",
+      "purpose": "existing mixed-format source genes.gtf.gz"
+    },
+    {
+      "id": "dep-demo-interactions.interact",
+      "path": "benchmark-data/demo-tracks/interactions.interact",
+      "bytes": 130,
+      "sha256": "46684723e538f3f0b5f7c8dbc02114c8322625c11928d910c8e8f20b773dc9fc",
+      "purpose": "existing mixed-format source interactions.interact"
+    },
+    {
+      "id": "dep-demo-loops.bedpe",
+      "path": "benchmark-data/demo-tracks/loops.bedpe",
+      "bytes": 123,
+      "sha256": "f63ccd03cd0e3e941c73dd03f2dc64c734b4db8547cb0de62933fd65cb7906f0",
+      "purpose": "existing mixed-format source loops.bedpe"
+    },
+    {
+      "id": "dep-demo-manifest.json",
+      "path": "benchmark-data/demo-tracks/manifest.json",
+      "bytes": 4153,
+      "sha256": "bd5087975c91656dde6c800f61ec5beafb6f0f056fde735b9508c9d329fe0936",
+      "purpose": "existing mixed-format source manifest.json"
+    },
+    {
+      "id": "dep-demo-mutations.maf",
+      "path": "benchmark-data/demo-tracks/mutations.maf",
+      "bytes": 302,
+      "sha256": "5d52ffa99580cec1f9148111d5ef46052cda9e57c78a5b2149c0b41c72f5f3b1",
+      "purpose": "existing mixed-format source mutations.maf"
+    },
+    {
+      "id": "dep-demo-peaks.bigNarrowPeak",
+      "path": "benchmark-data/demo-tracks/peaks.bigNarrowPeak",
+      "bytes": 734,
+      "sha256": "d5db8de7c6f811c55c441a9d1247c34de615c4d6cbb0f7dbdc34b76c9da8b566",
+      "purpose": "existing mixed-format source peaks.bigNarrowPeak"
+    },
+    {
+      "id": "dep-demo-peaks.narrowPeak",
+      "path": "benchmark-data/demo-tracks/peaks.narrowPeak",
+      "bytes": 62,
+      "sha256": "4f7011fb706843d31866aa445b59620374dd3228ba53ff7fe014c801b5970bd9",
+      "purpose": "existing mixed-format source peaks.narrowPeak"
+    },
+    {
+      "id": "dep-demo-project",
+      "path": "benchmark-data/demo-tracks/rgv-demo-project.json",
+      "bytes": 49996,
+      "sha256": "3ea27317b17ea2621fd2e223395b8ab7f33e162e1d5513f8031e0fa42aa812e9",
+      "purpose": "existing verified mixed-format workspace"
+    },
+    {
+      "id": "dep-demo-regions.broadPeak",
+      "path": "benchmark-data/demo-tracks/regions.broadPeak",
+      "bytes": 56,
+      "sha256": "00c898c471a997b1d52328ec50ca2a054b2151a03af5e8a15598f262a1506c42",
+      "purpose": "existing mixed-format source regions.broadPeak"
+    },
+    {
+      "id": "dep-demo-rgv-alignment-review-project.json",
+      "path": "benchmark-data/demo-tracks/rgv-alignment-review-project.json",
+      "bytes": 5079,
+      "sha256": "6ad4ee9d4b3d1ebe6f581c045fb9348b6be02f1a74f0ee4aa4c75a6402acde47",
+      "purpose": "existing mixed-format source rgv-alignment-review-project.json"
+    },
+    {
+      "id": "dep-demo-signal.bedGraph",
+      "path": "benchmark-data/demo-tracks/signal.bedGraph",
+      "bytes": 151,
+      "sha256": "09db65a9f8aaf8fb7fec4d5028c58a29e64c3d7c4a5a6d0a79e3fb3f86c84732",
+      "purpose": "existing mixed-format source signal.bedGraph"
+    },
+    {
+      "id": "dep-demo-signal.bigWig",
+      "path": "benchmark-data/demo-tracks/signal.bigWig",
+      "bytes": 544,
+      "sha256": "270e086145a4b477d246d96674510f9349843ab86875ccf866f9b9c7edc692c7",
+      "purpose": "existing mixed-format source signal.bigWig"
+    },
+    {
+      "id": "dep-demo-signal.wig",
+      "path": "benchmark-data/demo-tracks/signal.wig",
+      "bytes": 115,
+      "sha256": "08f43c55309d13cb58ba07c5f568ca31a9d168e0a26514963c1d215c5708aa94",
+      "purpose": "existing mixed-format source signal.wig"
+    },
+    {
+      "id": "dep-demo-target-alignments.psl",
+      "path": "benchmark-data/demo-tracks/target-alignments.psl",
+      "bytes": 95,
+      "sha256": "94b9b6a3551efe2df1f98205b80e2561dee997d90adc72473ec7359726d007b6",
+      "purpose": "existing mixed-format source target-alignments.psl"
+    },
+    {
+      "id": "dep-demo-transcripts.genePred",
+      "path": "benchmark-data/demo-tracks/transcripts.genePred",
+      "bytes": 87,
+      "sha256": "e9916cda35cde560825c09d977697dfc7f1b8c746cfca4deb7e26574ab6184c7",
+      "purpose": "existing mixed-format source transcripts.genePred"
+    },
+    {
+      "id": "dep-mixed-bai",
+      "path": "benchmark-data/mixed.bam.bai",
+      "bytes": 4448,
+      "sha256": "887c7afa17bc387a9875dc917fc21bc887eaaf8824225b03f040afa41832cb65",
+      "purpose": "BAI for the mixed alignment corpus"
+    },
+    {
+      "id": "dep-mixed-bam",
+      "path": "benchmark-data/mixed.bam",
+      "bytes": 19723042,
+      "sha256": "b6c505d68495c3ce842f524b830bdc35dbd768faeb2bfd3c7b67edfa19a2e57c",
+      "purpose": "mixed short/long/RNA/specialist alignment corpus"
+    },
+    {
+      "id": "dep-session-future",
+      "path": "validation/future-session-v99.json",
+      "bytes": 209,
+      "sha256": "b78dd9362319bc0622701f0f0182cfb69e3e26142149c3897087c5c0c3fd8342",
+      "purpose": "unsupported future-schema rejection"
+    },
+    {
+      "id": "dep-session-v1",
+      "path": "validation/session-v1.json",
+      "bytes": 587,
+      "sha256": "55f620cd907b74936a71f63812c0984f3c9a62eac47be3c795527e7663bb2d77",
+      "purpose": "native schema-v1 migration"
+    },
+    {
+      "id": "dep-session-v2",
+      "path": "validation/four-track-session-v2.json",
+      "bytes": 2202,
+      "sha256": "42b47b0585670253d02c6500aba125377aef9b093bf0d009f9f668e7385caa8e",
+      "purpose": "native schema-v2 multi-track migration"
+    },
+    {
+      "id": "dep-session-v3",
+      "path": "validation/multi-panel-four-track-session-v3.json",
+      "bytes": 2483,
+      "sha256": "a243f1ecd447f4e69dc15e6ef6122e67b078ae9a68a7bd086508e0e52cea3e76",
+      "purpose": "native schema-v3 multi-panel session"
+    },
+    {
+      "id": "dep-variants-bai",
+      "path": "benchmark-data/variants.bam.bai",
+      "bytes": 96,
+      "sha256": "53591e06ced802b835c2b38b30058b58448e78e3925cc66c768147d82758370c",
+      "purpose": "BAI for exact base/indel truth"
+    },
+    {
+      "id": "dep-variants-bam",
+      "path": "benchmark-data/variants.bam",
+      "bytes": 1086,
+      "sha256": "76338ecbdf7012493971c9d293ef7e914861dfba847ae692e9533e7671fa88e3",
+      "purpose": "exact base/indel/Ultima alignment truth"
+    },
+    {
+      "id": "dep-variants-fai",
+      "path": "benchmark-data/variants.fa.fai",
+      "bytes": 27,
+      "sha256": "b738ccc55212efcd2d35469d1a1ec5043527eab652435adb7593f104e99de2bc",
+      "purpose": "FAI for exact-event reference"
+    },
+    {
+      "id": "dep-variants-fasta",
+      "path": "benchmark-data/variants.fa",
+      "bytes": 20263,
+      "sha256": "e4940a3d5611de386f6dbc12bc36240523fb94440a93c7508682a4316e30aed9",
+      "purpose": "matching exact-event reference"
+    },
+    {
+      "id": "dep-workspace-batch",
+      "path": "validation/demo-workspace-smoke.json",
+      "bytes": 459,
+      "sha256": "753fc7f4ebe3d3c507760eb10d591bef2253dfd9290bd8554fd4ca3cfed71bd6",
+      "purpose": "mixed-workspace settled-state smoke"
+    }
+  ],
+  "projects": [
+    {
+      "id": "mf-01-alignment-core",
+      "title": "Core alignments and navigation",
+      "path": "benchmark-data/manual-suite/projects/mf-01-alignment-core.rgv.json",
+      "purpose": "paired, deep, structural, long-read, modification, grouping, sorting, and navigation review",
+      "initial_locus": "chr1:2590001-2650000",
+      "scenario_id": "scenario-mf-01",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-02-alignment-events",
+      "title": "Alignment events and reference bases",
+      "path": "benchmark-data/manual-suite/projects/mf-02-alignment-events.rgv.json",
+      "purpose": "exact base, coverage, CIGAR, small-indel, and large-indel truth",
+      "initial_locus": "chrVariants:9401-12600",
+      "scenario_id": "scenario-mf-02",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-03-rna-sashimi",
+      "title": "RNA and Sashimi",
+      "path": "benchmark-data/manual-suite/projects/mf-03-rna-sashimi.rgv.json",
+      "purpose": "spliced-read, strand-evidence, junction-count, scale, and export review",
+      "initial_locus": "chr1:2100001-2301000",
+      "scenario_id": "scenario-mf-03",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-04-bisulfite",
+      "title": "Bisulfite contexts",
+      "path": "benchmark-data/manual-suite/projects/mf-04-bisulfite.rgv.json",
+      "purpose": "forward/reverse converted and protected cytosines in preselected contexts",
+      "initial_locus": "chrManual:901-1200",
+      "scenario_id": "scenario-mf-04",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-05-smrt-kinetics",
+      "title": "PacBio SMRT kinetics",
+      "path": "benchmark-data/manual-suite/projects/mf-05-smrt-kinetics.rgv.json",
+      "purpose": "subread and CCS kinetics with the physical evidence mode preselected",
+      "initial_locus": "chr2:1-2000000",
+      "scenario_id": "scenario-mf-05",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-06-sbx",
+      "title": "SBX insertion and tail evidence",
+      "path": "benchmark-data/manual-suite/projects/mf-06-sbx.rgv.json",
+      "purpose": "concordant/discordant insertions and simplex tail presentation",
+      "initial_locus": "chr2:1-2000000",
+      "scenario_id": "scenario-mf-06",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-07-ultima",
+      "title": "Ultima flow-indel evidence",
+      "path": "benchmark-data/manual-suite/projects/mf-07-ultima.rgv.json",
+      "purpose": "directional and minimum Ultima evidence with a matching reference",
+      "initial_locus": "chrManual:49901-50600",
+      "scenario_id": "scenario-mf-07",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-08-single-cell",
+      "title": "Tagged single-cell alignments",
+      "path": "benchmark-data/manual-suite/projects/mf-08-single-cell.rgv.json",
+      "purpose": "RG/CB/CR/UB/UR grouping, sorting, filtering, metadata, and persistence",
+      "initial_locus": "chrManual:4901-5400",
+      "scenario_id": "scenario-mf-08",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-09-cohort-variants",
+      "title": "Cohort variants and genotypes",
+      "path": "benchmark-data/manual-suite/projects/mf-09-cohort-variants.rgv.json",
+      "purpose": "typed SNV/MNV/indel/SV/BND evidence, genotypes, samples, filters, and export",
+      "initial_locus": "chrVariants:14901-18100",
+      "scenario_id": "scenario-mf-09",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-10-mixed-tracks",
+      "title": "Mixed auxiliary tracks",
+      "path": "benchmark-data/manual-suite/projects/mf-10-mixed-tracks.rgv.json",
+      "purpose": "all supported auxiliary formats, typed settings, overlays, arithmetic, and interaction",
+      "initial_locus": "chrVariants:8501-16000",
+      "scenario_id": "scenario-mf-10",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-11-genome-review",
+      "title": "Genome, search, translation, ROI, and review",
+      "path": "benchmark-data/manual-suite/projects/mf-11-genome-review.rgv.json",
+      "purpose": "portable genome semantics, aliases, six-frame translation, ROI, and review workflow",
+      "initial_locus": "chrVariants:8501-12500",
+      "scenario_id": "scenario-mf-11",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-12-workspaces",
+      "title": "Multi-track and multi-panel workspace",
+      "path": "benchmark-data/manual-suite/projects/mf-12-workspaces.rgv.json",
+      "purpose": "track identity, bulk actions, linked/independent panels, failure isolation, and relocation",
+      "initial_locus": "chr1:900001-920000",
+      "scenario_id": "scenario-mf-12",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-14-reference-cram",
+      "title": "Reference-dependent CRAM",
+      "path": "benchmark-data/manual-suite/projects/mf-14-reference-cram.rgv.json",
+      "purpose": "local CRAM decoding with matching and deliberately wrong reference behavior",
+      "initial_locus": "chrManual:901-5400",
+      "scenario_id": "scenario-mf-14",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-12-four-track",
+      "title": "Four-track alignment workspace",
+      "path": "benchmark-data/manual-suite/projects/mf-12-four-track.rgv.json",
+      "purpose": "compact multi-sample identity, bulk-operation, and persistence review",
+      "initial_locus": "chr1:900001-920000",
+      "scenario_id": "scenario-mf-12",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-12-eight-track",
+      "title": "Eight-track alignment workspace",
+      "path": "benchmark-data/manual-suite/projects/mf-12-eight-track.rgv.json",
+      "purpose": "larger multi-sample scrolling, ordering, metadata, and persistence review",
+      "initial_locus": "chr1:900001-920000",
+      "scenario_id": "scenario-mf-12",
+      "expected_unresolved_source_basenames": []
+    },
+    {
+      "id": "mf-12-failure-isolation",
+      "title": "Workspace source failure isolation",
+      "path": "benchmark-data/manual-suite/projects/mf-12-failure-isolation.rgv.json",
+      "purpose": "one deliberately missing alignment source alongside healthy tracks and panels",
+      "initial_locus": "chr1:900001-920000",
+      "scenario_id": "scenario-mf-12",
+      "expected_unresolved_source_basenames": [
+        "does-not-exist.bam"
+      ]
+    },
+    {
+      "id": "mf-13-recovery",
+      "title": "Sessions, imports, and recovery",
+      "path": "benchmark-data/manual-suite/projects/mf-13-recovery.rgv.json",
+      "purpose": "native/IGV compatibility, autosave discovery, partial workspace, and recovery review",
+      "initial_locus": "chr1:900001-920000",
+      "scenario_id": "scenario-mf-13",
+      "expected_unresolved_source_basenames": []
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-03",
+  "fixture_ids": [
+    "manual-rna-a-bam",
+    "manual-rna-b-bam",
+    "manual-rna-annotation"
+  ],
+  "assembly": "manual-synthetic",
+  "loci": [
+    {
+      "id": "rna-junctions",
+      "displayed_locus": "chrManual:19901-21100",
+      "contig": "chrManual",
+      "start_zero_based": 19900,
+      "end_zero_based_exclusive": 21100,
+      "expected_facts": [
+        "Sample A contains five observations of the shared 20040-20140 junction and three of the annotated A-specific 20250-20370 junction.",
+        "Sample B contains four observations of the shared junction, two of the unannotated B-specific 20435-20635 junction, and alternative donor and acceptor events.",
+        "Both samples contain a two-junction multi-exon read and an unspliced retained-intron record.",
+        "Tagged positive, tagged negative, inferred missing, and invalid XS strand evidence are all present."
+      ]
+    }
+  ]
+}

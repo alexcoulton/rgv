@@ -1,0 +1,8 @@
+##gff-version 3
+chrManual	RGV	gene	19951	20750	.	+	.	ID=RNA_GENE;Name=RNA fixture gene
+chrManual	RGV	mRNA	19951	20750	.	+	.	ID=RNA_SHARED_TX;Parent=RNA_GENE
+chrManual	RGV	exon	19951	20040	.	+	.	Parent=RNA_SHARED_TX
+chrManual	RGV	exon	20141	20250	.	+	.	Parent=RNA_SHARED_TX
+chrManual	RGV	mRNA	20201	20500	.	+	.	ID=RNA_A_SPECIFIC_TX;Parent=RNA_GENE
+chrManual	RGV	exon	20201	20250	.	+	.	Parent=RNA_A_SPECIFIC_TX
+chrManual	RGV	exon	20371	20500	.	+	.	Parent=RNA_A_SPECIFIC_TX

@@ -1,0 +1,9 @@
+{
+  "autosave_candidates": [
+    "autosaves/manual-00000000000000000001.autosave.json"
+  ],
+  "autosave_enabled": true,
+  "clean_shutdown": false,
+  "expected_choice": "recover-or-continue-without-recovery",
+  "schema_version": 1
+}

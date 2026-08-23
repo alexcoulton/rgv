@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-11",
+  "fixture_ids": [
+    "manual-genome-config",
+    "dep-variants-fasta"
+  ],
+  "assembly": "variants-synthetic",
+  "loci": [
+    {
+      "id": "genome-review",
+      "displayed_locus": "chrVariants:8501-12500",
+      "contig": "chrVariants",
+      "start_zero_based": 8500,
+      "end_zero_based_exclusive": 12500,
+      "expected_facts": [
+        "Alias variants resolves to chrVariants.",
+        "All six translation frames, two ROIs, and two review items restore.",
+        "The chrVariants:8501-8560 reference is exact ACGT repetition, yielding stable forward/reverse codons including ACG, CGT, GTA, and TAC.",
+        "EXPECTED_SEARCH_FEATURE resolves exactly to chrVariants:8501-9200, and the import files contain valid coloured boundary ROIs and versioned review rows."
+      ]
+    }
+  ]
+}

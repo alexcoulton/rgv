@@ -1,0 +1,211 @@
+{
+  "schema_version": 3,
+  "locus": {
+    "contig": "chrVariants",
+    "start": 8500,
+    "end": 12500
+  },
+  "panels": [
+    {
+      "id": 1,
+      "locus": {
+        "contig": "chrVariants",
+        "start": 8500,
+        "end": 12500
+      },
+      "vertical_scroll_points": 0.0
+    }
+  ],
+  "active_panel": 1,
+  "alignment_tracks": [],
+  "reference": {
+    "Local": {
+      "path": "../../variants.fa"
+    }
+  },
+  "genome_name": "RGV portable genome review",
+  "cytobands": {
+    "Local": {
+      "path": "../data/tracks/cytobands.txt"
+    }
+  },
+  "reference_reverse_complement": true,
+  "reference_translation_frames": [
+    "Forward1",
+    "Forward2",
+    "Forward3",
+    "Reverse1",
+    "Reverse2",
+    "Reverse3"
+  ],
+  "reference_genetic_code": "Standard",
+  "regions_of_interest": [
+    {
+      "id": 1,
+      "name": "large indels",
+      "locus": {
+        "contig": "chrVariants",
+        "start": 9400,
+        "end": 12600
+      },
+      "color": [
+        42,
+        112,
+        190,
+        180
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Ultima evidence",
+      "locus": {
+        "contig": "chrVariants",
+        "start": 13990,
+        "end": 15120
+      },
+      "color": [
+        130,
+        70,
+        170,
+        180
+      ]
+    }
+  ],
+  "review_items": [
+    {
+      "id": 1,
+      "label": "Inspect translation and aliases",
+      "locus": {
+        "contig": "chrVariants",
+        "start": 8500,
+        "end": 9200
+      },
+      "status": "Pending",
+      "notes": "Expected manual fixture truth for Inspect translation and aliases.",
+      "assignment": null
+    },
+    {
+      "id": 2,
+      "label": "Inspect large indels",
+      "locus": {
+        "contig": "chrVariants",
+        "start": 9400,
+        "end": 12600
+      },
+      "status": "Pending",
+      "notes": "Expected manual fixture truth for Inspect large indels.",
+      "assignment": null
+    }
+  ],
+  "sample_metadata": null,
+  "contig_aliases": {
+    "variants": "chrVariants"
+  },
+  "tracks": [
+    {
+      "id": 1,
+      "name": "Default transcript annotation",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "../../demo-tracks/transcripts.genePred"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    }
+  ],
+  "maximum_alignments": 50000
+}

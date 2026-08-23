@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-05",
+  "fixture_ids": [
+    "manual-smrt-bam"
+  ],
+  "assembly": "manual-synthetic",
+  "loci": [
+    {
+      "id": "smrt",
+      "displayed_locus": "chrManual:29901-30600",
+      "contig": "chrManual",
+      "start_zero_based": 29900,
+      "end_zero_based_exclusive": 30600,
+      "expected_facts": [
+        "Forward and reverse records expose exact 100-value ip, pw, fi, ri, fp, and rp arrays in all six preconfigured modes.",
+        "Named controls expose missing tags, a three-value ip array, a string ip value, and a negative signed ip value without breaking valid reads."
+      ]
+    }
+  ]
+}

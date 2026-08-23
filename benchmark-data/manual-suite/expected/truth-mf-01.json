@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-01",
+  "fixture_ids": [
+    "dep-mixed-bam"
+  ],
+  "assembly": "mixed-synthetic",
+  "loci": [
+    {
+      "id": "structural-pairs",
+      "displayed_locus": "chr1:2590001-2650000",
+      "contig": "chr1",
+      "start_zero_based": 2590000,
+      "end_zero_based_exclusive": 2650000,
+      "expected_facts": [
+        "Long, short, same-strand, outward-facing, and inter-contig templates are present.",
+        "Deep coverage and long/supplementary loci are reachable through the review queue."
+      ]
+    }
+  ]
+}

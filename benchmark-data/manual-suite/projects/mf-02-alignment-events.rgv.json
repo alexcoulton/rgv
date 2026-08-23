@@ -1,0 +1,94 @@
+{
+  "schema_version": 3,
+  "locus": {
+    "contig": "chrVariants",
+    "start": 9400,
+    "end": 12600
+  },
+  "panels": [
+    {
+      "id": 1,
+      "locus": {
+        "contig": "chrVariants",
+        "start": 9400,
+        "end": 12600
+      },
+      "vertical_scroll_points": 0.0
+    }
+  ],
+  "active_panel": 1,
+  "alignment_tracks": [
+    {
+      "id": 1,
+      "name": "Exact bases and small/large indels",
+      "source": {
+        "Local": {
+          "path": "../../variants.bam"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 420.0,
+      "filters": {
+        "alignment_color_mode": "strand",
+        "alignment_group_mode": "none",
+        "alignment_group_order": "natural",
+        "alignment_sort_mode": "start",
+        "alignment_sort_order": "natural",
+        "view_as_pairs": false,
+        "minimum_template_length": null,
+        "maximum_template_length": null,
+        "overlapping_mate_policy": "count_once",
+        "minimum_mapping_quality": null,
+        "minimum_base_quality": 0,
+        "minimum_allele_fraction": 0.2,
+        "quality_weighted_alleles": true,
+        "show_reference": true,
+        "show_coverage": true,
+        "show_junctions": true,
+        "minimum_junction_depth": 1,
+        "minimum_junction_flank": 0,
+        "junction_display_mode": "collapsed",
+        "sashimi_scale_mode": "automatic",
+        "sashimi_fixed_scale_maximum": 100,
+        "sashimi_count_mode": "raw",
+        "show_junction_labels": true,
+        "show_reads": true,
+        "coverage_scale_maximum": null,
+        "show_coverage_center_line": true,
+        "alignment_density": 1.0,
+        "inspector_activation": "click",
+        "read_base_display_mode": "all",
+        "shade_read_bases_by_quality": true,
+        "minimum_indel_size": 1,
+        "minimum_event_label_size": 1,
+        "show_modified_bases": true,
+        "show_modification_frequency": true,
+        "minimum_modification_probability": 0,
+        "modified_base_color_mode": "by_type",
+        "hidden_modification_codes": [],
+        "include_secondary": true,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    }
+  ],
+  "reference": {
+    "Local": {
+      "path": "../../variants.fa"
+    }
+  },
+  "genome_name": "RGV exact alignment event truth",
+  "cytobands": null,
+  "reference_reverse_complement": false,
+  "reference_translation_frames": [],
+  "reference_genetic_code": "Standard",
+  "regions_of_interest": [],
+  "review_items": [],
+  "sample_metadata": null,
+  "contig_aliases": {},
+  "tracks": [],
+  "maximum_alignments": 50000
+}

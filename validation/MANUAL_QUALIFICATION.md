@@ -10,8 +10,24 @@ use.
 
 ## 0. Start here
 
-Build once. The handoff has two complementary checked-in projects: one for the supported auxiliary
-track families and one for alignment behavior.
+Generate and strictly verify the complete focused fixture suite first:
+
+```sh
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- generate
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixture-check -- \
+  verify --require-complete
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- list
+```
+
+The copyable project commands and the short/full scenario indexes are in
+[`manual-suite/README.md`](manual-suite/README.md). Begin with MF-01, MF-02, MF-03, MF-09, MF-10,
+MF-12, and one MF-14 outage/recovery profile. The remaining cards cover each specialist mode,
+genome/review workflows, recovery/import, exports, automation, and accessibility. Each card starts
+as `manual result not run`; fixture readiness is not a manual pass result.
+
+`cargo run` builds changed binaries automatically, so a separate build is optional. Release mode
+is still the default for visual testing. The older two broad handoff projects below remain useful
+complements: one combines supported auxiliary tracks and one stresses alignment behavior.
 
 First open the mixed-format project:
 

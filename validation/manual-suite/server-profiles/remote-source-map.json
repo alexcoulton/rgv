@@ -1,0 +1,26 @@
+{
+  "bam": {
+    "index": "dep-mixed-bai",
+    "source": "dep-mixed-bam"
+  },
+  "big_gene_pred": "dep-demo-genes.bigGenePred",
+  "big_narrow_peak": "dep-demo-peaks.bigNarrowPeak",
+  "bigbed": "dep-demo-features.bigBed",
+  "bigwig": "dep-demo-signal.bigWig",
+  "cram": {
+    "index": "manual-reference-crai",
+    "reference": "manual-reference-fasta",
+    "reference_index": "manual-reference-fai",
+    "source": "manual-reference-cram"
+  },
+  "reference": {
+    "index": "dep-variants-fai",
+    "source": "dep-variants-fasta"
+  },
+  "schema_version": 1,
+  "tdf": "dep-demo-archive.tdf",
+  "variants": {
+    "index": "manual-cohort-csi",
+    "source": "manual-cohort-bcf"
+  }
+}

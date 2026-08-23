@@ -1,0 +1,7 @@
+{
+  "expected_behavior": "the validator changes after the first data request",
+  "external_network_required": false,
+  "profile": "changed-etag",
+  "representative_status": 206,
+  "schema_version": 1
+}

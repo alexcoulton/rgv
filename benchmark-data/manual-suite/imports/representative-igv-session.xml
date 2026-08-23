@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Session genome="manual" locus="chrVariants:9401-12600" version="8">
+<Resources>
+<Resource path="../../variants.bam" index="../../variants.bam.bai"/>
+<Resource path="../../variants.fa"/>
+<Resource path="../../demo-tracks/features.bed.gz"/>
+</Resources>
+<Panel name="DataPanel"><Track id="../../variants.bam" name="Imported alignment" color="0,0,150" height="320" displayMode="EXPANDED"/></Panel>
+<Panel name="IgnoredPanel"><Track id="unsupported.hic" name="Unsupported Hi-C"/></Panel>
+</Session>

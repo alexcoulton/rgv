@@ -1,0 +1,255 @@
+{
+  "schema_version": 3,
+  "locus": {
+    "contig": "chrManual",
+    "start": 19900,
+    "end": 21100
+  },
+  "panels": [
+    {
+      "id": 1,
+      "locus": {
+        "contig": "chrManual",
+        "start": 19900,
+        "end": 21100
+      },
+      "vertical_scroll_points": 0.0
+    }
+  ],
+  "active_panel": 1,
+  "alignment_tracks": [
+    {
+      "id": 1,
+      "name": "RNA sample A: shared and A-specific junctions",
+      "source": {
+        "Local": {
+          "path": "../data/alignments/rna-sample-a.bam"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 420.0,
+      "filters": {
+        "alignment_color_mode": "strand",
+        "alignment_group_mode": "none",
+        "alignment_group_order": "natural",
+        "alignment_sort_mode": "start",
+        "alignment_sort_order": "natural",
+        "view_as_pairs": false,
+        "minimum_template_length": null,
+        "maximum_template_length": null,
+        "overlapping_mate_policy": "count_once",
+        "minimum_mapping_quality": null,
+        "minimum_base_quality": 0,
+        "minimum_allele_fraction": 0.2,
+        "quality_weighted_alleles": true,
+        "show_reference": true,
+        "show_coverage": true,
+        "show_junctions": true,
+        "minimum_junction_depth": 1,
+        "minimum_junction_flank": 0,
+        "junction_display_mode": "expanded",
+        "sashimi_scale_mode": "fixed",
+        "sashimi_fixed_scale_maximum": 100,
+        "sashimi_count_mode": "raw",
+        "show_junction_labels": true,
+        "show_reads": true,
+        "coverage_scale_maximum": null,
+        "show_coverage_center_line": true,
+        "alignment_density": 1.0,
+        "inspector_activation": "click",
+        "read_base_display_mode": "mismatches",
+        "shade_read_bases_by_quality": true,
+        "minimum_indel_size": 1,
+        "minimum_event_label_size": 1,
+        "show_modified_bases": true,
+        "show_modification_frequency": true,
+        "minimum_modification_probability": 0,
+        "modified_base_color_mode": "by_type",
+        "hidden_modification_codes": [],
+        "include_secondary": true,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    },
+    {
+      "id": 2,
+      "name": "RNA sample B: shared and B-specific junctions",
+      "source": {
+        "Local": {
+          "path": "../data/alignments/rna-sample-b.bam"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 420.0,
+      "filters": {
+        "alignment_color_mode": "strand",
+        "alignment_group_mode": "none",
+        "alignment_group_order": "natural",
+        "alignment_sort_mode": "start",
+        "alignment_sort_order": "natural",
+        "view_as_pairs": false,
+        "minimum_template_length": null,
+        "maximum_template_length": null,
+        "overlapping_mate_policy": "count_once",
+        "minimum_mapping_quality": null,
+        "minimum_base_quality": 0,
+        "minimum_allele_fraction": 0.2,
+        "quality_weighted_alleles": true,
+        "show_reference": true,
+        "show_coverage": true,
+        "show_junctions": true,
+        "minimum_junction_depth": 1,
+        "minimum_junction_flank": 0,
+        "junction_display_mode": "collapsed",
+        "sashimi_scale_mode": "automatic",
+        "sashimi_fixed_scale_maximum": 100,
+        "sashimi_count_mode": "raw",
+        "show_junction_labels": true,
+        "show_reads": true,
+        "coverage_scale_maximum": null,
+        "show_coverage_center_line": true,
+        "alignment_density": 1.0,
+        "inspector_activation": "click",
+        "read_base_display_mode": "mismatches",
+        "shade_read_bases_by_quality": true,
+        "minimum_indel_size": 1,
+        "minimum_event_label_size": 1,
+        "show_modified_bases": true,
+        "show_modification_frequency": true,
+        "minimum_modification_probability": 0,
+        "modified_base_color_mode": "by_type",
+        "hidden_modification_codes": [],
+        "include_secondary": true,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    }
+  ],
+  "reference": {
+    "Local": {
+      "path": "../data/references/manual.fa"
+    }
+  },
+  "genome_name": "RGV two-sample RNA junction truth",
+  "cytobands": null,
+  "reference_reverse_complement": false,
+  "reference_translation_frames": [],
+  "reference_genetic_code": "Standard",
+  "regions_of_interest": [],
+  "review_items": [],
+  "sample_metadata": null,
+  "contig_aliases": {},
+  "tracks": [
+    {
+      "id": 3,
+      "name": "Annotated RNA transcripts",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/rna-transcripts.gff3"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    }
+  ],
+  "maximum_alignments": 50000
+}

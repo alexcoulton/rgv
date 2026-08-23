@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-08",
+  "fixture_ids": [
+    "manual-specialist-bam",
+    "manual-sample-metadata"
+  ],
+  "assembly": "manual-synthetic",
+  "loci": [
+    {
+      "id": "single-cell",
+      "displayed_locus": "chrManual:4901-5400",
+      "contig": "chrManual",
+      "start_zero_based": 4900,
+      "end_zero_based_exclusive": 5400,
+      "expected_facts": [
+        "CELL_A-1, CELL_B-1, and CELL_C-1 records have corrected/raw cell and UMI tags.",
+        "One named record deliberately lacks cell and UMI tags.",
+        "One named record deliberately carries a numeric malformed CB tag."
+      ]
+    }
+  ]
+}

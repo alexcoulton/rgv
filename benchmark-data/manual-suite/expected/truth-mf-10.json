@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-10",
+  "fixture_ids": [
+    "dep-demo-project"
+  ],
+  "assembly": "variants-synthetic",
+  "loci": [
+    {
+      "id": "mixed-tracks",
+      "displayed_locus": "chrVariants:8501-16000",
+      "contig": "chrVariants",
+      "start_zero_based": 8500,
+      "end_zero_based_exclusive": 16000,
+      "expected_facts": [
+        "All 19 declared auxiliary sources return non-empty production-engine evidence.",
+        "The TDF exposes two independent named channels."
+      ]
+    }
+  ]
+}

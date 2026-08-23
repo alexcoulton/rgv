@@ -1,0 +1,6 @@
+{
+  "expected_behavior": "report-changed-and-keep-healthy-sources",
+  "path": "../failures/changed-source.bed",
+  "saved_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "schema_version": 1
+}

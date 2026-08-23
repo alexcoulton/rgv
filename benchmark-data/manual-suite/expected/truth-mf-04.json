@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-04",
+  "fixture_ids": [
+    "manual-specialist-bam",
+    "manual-reference-fasta"
+  ],
+  "assembly": "manual-synthetic",
+  "loci": [
+    {
+      "id": "bisulfite",
+      "displayed_locus": "chrManual:901-1200",
+      "contig": "chrManual",
+      "start_zero_based": 900,
+      "end_zero_based_exclusive": 1200,
+      "expected_facts": [
+        "Six named records cover forward/reverse converted/protected evidence, a low-quality call, and missing evidence.",
+        "Every CG, CHG, CHH, HCG, GCH, and WCG display mode has both protected and converted observations against the matching reference."
+      ]
+    }
+  ]
+}

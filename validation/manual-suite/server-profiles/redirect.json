@@ -1,0 +1,7 @@
+{
+  "expected_behavior": "the first request redirects while preserving signed query keys",
+  "external_network_required": false,
+  "profile": "redirect",
+  "representative_status": 307,
+  "schema_version": 1
+}

@@ -1,0 +1,1462 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "sha256": "f147b5a16d3afd04d8582cdd7b95cd8db12f99e2f03aea47c454d8235363dcb7"
+    },
+    {
+      "path": "docs/FORMAT_SUPPORT.md",
+      "sha256": "63729befcfedea8518fad66801711e4f4835e456352537315b73e36d6d10bfb5"
+    }
+  ],
+  "entries": [
+    {
+      "id": "coverage-001",
+      "capability": "Accessibility preferences and keyboard operation",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Accessibility preferences and keyboard operation",
+      "disposition": "operational-ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-15"
+      ],
+      "batch_ids": [
+        "manual-batch-mf15-complete-exports.json",
+        "manual-batch-mf15-variant-track-exports.json",
+        "manual-batch-mf15-controlled-failure.json",
+        "dep-automation-batch"
+      ],
+      "truth_ids": [],
+      "real_data_follow_up": "Repeat accessibility checks on each supported desktop platform."
+    },
+    {
+      "id": "coverage-002",
+      "capability": "Arithmetic, shared scales, overlays",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Arithmetic, shared scales, overlays",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-003",
+      "capability": "Autosave and recovery",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Autosave and recovery",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-13-recovery"
+      ],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-13"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-004",
+      "capability": "BED/GFF/GTF/genePred/refFlat/peaks/PSL/BigBed",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "BED/GFF/GTF/genePred/refFlat/peaks/PSL/BigBed",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-005",
+      "capability": "BEDPE/interact",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "BEDPE/interact",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-006",
+      "capability": "Base display, quality shading, indel/label thresholds, modified-base visibility and legend",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Base display, quality shading, indel/label thresholds, modified-base visibility and legend",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-01-alignment-core",
+        "project-artifact-mf-02-alignment-events"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core",
+        "mf-02-alignment-events"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01",
+        "scenario-mf-02"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-01",
+        "truth-mf-02"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-007",
+      "capability": "BigWig/TDF/bedGraph/WIG",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "BigWig/TDF/bedGraph/WIG",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-008",
+      "capability": "Bisulfite contexts, PacBio kinetics, SBX, and Ultima evidence",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Bisulfite contexts, PacBio kinetics, SBX, and Ultima evidence",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-04-bisulfite",
+        "project-artifact-mf-05-smrt-kinetics",
+        "project-artifact-mf-06-sbx",
+        "project-artifact-mf-07-ultima"
+      ],
+      "project_ids": [
+        "mf-04-bisulfite",
+        "mf-05-smrt-kinetics",
+        "mf-06-sbx",
+        "mf-07-ultima"
+      ],
+      "scenario_ids": [
+        "scenario-mf-04",
+        "scenario-mf-05",
+        "scenario-mf-06",
+        "scenario-mf-07"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-04",
+        "truth-mf-05",
+        "truth-mf-06",
+        "truth-mf-07"
+      ],
+      "real_data_follow_up": "Repeat specialist evidence checks with representative private real-world data."
+    },
+    {
+      "id": "coverage-009",
+      "capability": "CRAM plus remote reference",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "CRAM plus remote reference",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-14-reference-cram"
+      ],
+      "project_ids": [
+        "mf-14-reference-cram"
+      ],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-14"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-010",
+      "capability": "Consensus, reference, read, CIGAR, tags, and event sequence copy",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Consensus, reference, read, CIGAR, tags, and event sequence copy",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-01-alignment-core",
+        "project-artifact-mf-02-alignment-events"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core",
+        "mf-02-alignment-events"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01",
+        "scenario-mf-02"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-01",
+        "truth-mf-02"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-011",
+      "capability": "Coordinate, annotation-name, and variant-ID search",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Coordinate, annotation-name, and variant-ID search",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-09-cohort-variants",
+        "project-artifact-mf-10-mixed-tracks",
+        "project-artifact-mf-11-genome-review"
+      ],
+      "project_ids": [
+        "mf-09-cohort-variants",
+        "mf-10-mixed-tracks",
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-09",
+        "scenario-mf-10",
+        "scenario-mf-11"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-09",
+        "truth-mf-10",
+        "truth-mf-11"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-012",
+      "capability": "Expanded/squished/collapsed and continuous vertical density",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Expanded/squished/collapsed and continuous vertical density",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-01-alignment-core"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-01"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-013",
+      "capability": "GWAS association summary",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "GWAS association summary",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-014",
+      "capability": "Grouping, sorting, direction, pairing, template bounds, and tag expressions",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Grouping, sorting, direction, pairing, template bounds, and tag expressions",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-01-alignment-core",
+        "project-artifact-mf-08-single-cell"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core",
+        "mf-08-single-cell"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01",
+        "scenario-mf-08"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-01",
+        "truth-mf-08"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-015",
+      "capability": "Local BAM/CRAM",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Local BAM/CRAM",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-01-alignment-core",
+        "project-artifact-mf-14-reference-cram"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core",
+        "mf-14-reference-cram"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01",
+        "scenario-mf-14"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-01",
+        "truth-mf-14"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-016",
+      "capability": "Local FASTA",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Local FASTA",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-11-genome-review"
+      ],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-11"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-017",
+      "capability": "Local auxiliary track",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Local auxiliary track",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-018",
+      "capability": "Mate and supplementary-chain navigation",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Mate and supplementary-chain navigation",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-01-alignment-core"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-01"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-019",
+      "capability": "Multi-channel TDF",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Multi-channel TDF",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-020",
+      "capability": "Multiple loci",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Multiple loci",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-11-genome-review",
+        "project-artifact-mf-12-workspaces"
+      ],
+      "project_ids": [
+        "mf-11-genome-review",
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11",
+        "scenario-mf-12"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-11",
+        "truth-mf-12"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-021",
+      "capability": "Native or IGV project",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Native or IGV project",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-13-recovery"
+      ],
+      "project_ids": [
+        "mf-13-recovery"
+      ],
+      "scenario_ids": [
+        "scenario-mf-13"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-13"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-022",
+      "capability": "PNG and semantic evidence exports",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "PNG and semantic evidence exports",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-023",
+      "capability": "Portable genome",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Portable genome",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-11-genome-review"
+      ],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-11"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-024",
+      "capability": "Previous/next annotation or loaded evidence",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Previous/next annotation or loaded evidence",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-09-cohort-variants",
+        "project-artifact-mf-10-mixed-tracks",
+        "project-artifact-mf-11-genome-review"
+      ],
+      "project_ids": [
+        "mf-09-cohort-variants",
+        "mf-10-mixed-tracks",
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-09",
+        "scenario-mf-10",
+        "scenario-mf-11"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-09",
+        "truth-mf-10",
+        "truth-mf-11"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-025",
+      "capability": "RNA and Sashimi",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "RNA and Sashimi",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-03-rna-sashimi"
+      ],
+      "project_ids": [
+        "mf-03-rna-sashimi"
+      ],
+      "scenario_ids": [
+        "scenario-mf-03"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-03"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-026",
+      "capability": "Read, CIGAR event, pileup, modification, and junction inspection",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Read, CIGAR event, pileup, modification, and junction inspection",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-01-alignment-core",
+        "project-artifact-mf-02-alignment-events",
+        "project-artifact-mf-03-rna-sashimi"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core",
+        "mf-02-alignment-events",
+        "mf-03-rna-sashimi"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01",
+        "scenario-mf-02",
+        "scenario-mf-03"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-01",
+        "truth-mf-02",
+        "truth-mf-03"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-027",
+      "capability": "Reference, coverage, junction/Sashimi, and read subtracks",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Reference, coverage, junction/Sashimi, and read subtracks",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-01-alignment-core",
+        "project-artifact-mf-03-rna-sashimi"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core",
+        "mf-03-rna-sashimi"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01",
+        "scenario-mf-03"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-01",
+        "truth-mf-03"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-028",
+      "capability": "Regions of interest",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Regions of interest",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-11-genome-review"
+      ],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-11"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-029",
+      "capability": "Remote BAM/CRAM",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Remote BAM/CRAM",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-14-reference-cram"
+      ],
+      "project_ids": [
+        "mf-14-reference-cram"
+      ],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-14"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-030",
+      "capability": "Remote FASTA",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Remote FASTA",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-14-reference-cram"
+      ],
+      "project_ids": [
+        "mf-14-reference-cram"
+      ],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-14"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-031",
+      "capability": "Remote indexed auxiliary track",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Remote indexed auxiliary track",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-14-reference-cram"
+      ],
+      "project_ids": [
+        "mf-14-reference-cram"
+      ],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-14"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-032",
+      "capability": "Reverse reference and six-frame translation",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Reverse reference and six-frame translation",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-11-genome-review"
+      ],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-11"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-033",
+      "capability": "Review queue",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Review queue",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-11-genome-review"
+      ],
+      "project_ids": [
+        "mf-11-genome-review"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-11"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-034",
+      "capability": "SEG/CBS copy number and MAF mutations",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "SEG/CBS copy number and MAF mutations",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-035",
+      "capability": "Sample metadata and bulk track actions",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Sample metadata and bulk track actions",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-08-single-cell",
+        "project-artifact-mf-09-cohort-variants",
+        "project-artifact-mf-12-workspaces"
+      ],
+      "project_ids": [
+        "mf-08-single-cell",
+        "mf-09-cohort-variants",
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-08",
+        "scenario-mf-09",
+        "scenario-mf-12"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-08",
+        "truth-mf-09",
+        "truth-mf-12"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-036",
+      "capability": "Save/save-as and portable relocation",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Save/save-as and portable relocation",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-12-workspaces"
+      ],
+      "project_ids": [
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-037",
+      "capability": "Several alignment samples",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Several alignment samples",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-12-workspaces"
+      ],
+      "project_ids": [
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-038",
+      "capability": "Track visibility, collapse, order, height, appearance, and removal",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Track visibility, collapse, order, height, appearance, and removal",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-12-workspaces"
+      ],
+      "project_ids": [
+        "mf-12-workspaces"
+      ],
+      "scenario_ids": [
+        "scenario-mf-12"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-12"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-039",
+      "capability": "VCF/BCF and genotypes",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "VCF/BCF and genotypes",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-09-cohort-variants"
+      ],
+      "project_ids": [
+        "mf-09-cohort-variants"
+      ],
+      "scenario_ids": [
+        "scenario-mf-09"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-09"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-040",
+      "capability": "Additional annotation",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Additional annotation",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-041",
+      "capability": "Alignments",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Alignments",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-01-alignment-core",
+        "project-artifact-mf-03-rna-sashimi",
+        "project-artifact-mf-04-bisulfite",
+        "project-artifact-mf-05-smrt-kinetics",
+        "project-artifact-mf-06-sbx",
+        "project-artifact-mf-07-ultima",
+        "project-artifact-mf-08-single-cell",
+        "project-artifact-mf-14-reference-cram"
+      ],
+      "project_ids": [
+        "mf-01-alignment-core",
+        "mf-03-rna-sashimi",
+        "mf-04-bisulfite",
+        "mf-05-smrt-kinetics",
+        "mf-06-sbx",
+        "mf-07-ultima",
+        "mf-08-single-cell",
+        "mf-14-reference-cram"
+      ],
+      "scenario_ids": [
+        "scenario-mf-01",
+        "scenario-mf-03",
+        "scenario-mf-04",
+        "scenario-mf-05",
+        "scenario-mf-06",
+        "scenario-mf-07",
+        "scenario-mf-08",
+        "scenario-mf-14"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-01",
+        "truth-mf-03",
+        "truth-mf-04",
+        "truth-mf-05",
+        "truth-mf-06",
+        "truth-mf-07",
+        "truth-mf-08",
+        "truth-mf-14"
+      ],
+      "real_data_follow_up": "Repeat specialist evidence checks with representative private real-world data."
+    },
+    {
+      "id": "coverage-042",
+      "capability": "Archived quantitative",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Archived quantitative",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-043",
+      "capability": "Association summary",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Association summary",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-044",
+      "capability": "Copy number",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Copy number",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-045",
+      "capability": "General annotation",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "General annotation",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-046",
+      "capability": "Indexed annotation",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Indexed annotation",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-047",
+      "capability": "Indexed peaks",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Indexed peaks",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-048",
+      "capability": "Indexed transcripts",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Indexed transcripts",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-049",
+      "capability": "Interactions",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Interactions",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-050",
+      "capability": "Peaks",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Peaks",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-051",
+      "capability": "Quantitative",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Quantitative",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-052",
+      "capability": "Reference",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Reference",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-11-genome-review",
+        "project-artifact-mf-14-reference-cram"
+      ],
+      "project_ids": [
+        "mf-11-genome-review",
+        "mf-14-reference-cram"
+      ],
+      "scenario_ids": [
+        "scenario-mf-11",
+        "scenario-mf-14"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-11",
+        "truth-mf-14"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-053",
+      "capability": "Somatic mutations",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Somatic mutations",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-054",
+      "capability": "Transcript annotation",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Transcript annotation",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-10-mixed-tracks"
+      ],
+      "project_ids": [
+        "mf-10-mixed-tracks"
+      ],
+      "scenario_ids": [
+        "scenario-mf-10"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-10"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-055",
+      "capability": "Variants",
+      "source_path": "docs/FORMAT_SUPPORT.md",
+      "source_claim": "Variants",
+      "disposition": "ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [
+        "project-artifact-mf-09-cohort-variants"
+      ],
+      "project_ids": [
+        "mf-09-cohort-variants"
+      ],
+      "scenario_ids": [
+        "scenario-mf-09"
+      ],
+      "batch_ids": [],
+      "truth_ids": [
+        "truth-mf-09"
+      ],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-056",
+      "capability": "Deterministic batch automation",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Deterministic batch automation",
+      "disposition": "operational-ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-15"
+      ],
+      "batch_ids": [
+        "manual-batch-mf15-complete-exports.json",
+        "manual-batch-mf15-variant-track-exports.json",
+        "manual-batch-mf15-controlled-failure.json",
+        "dep-automation-batch"
+      ],
+      "truth_ids": [],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-057",
+      "capability": "Authenticated local external control",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Authenticated local external control",
+      "disposition": "operational-ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-15"
+      ],
+      "batch_ids": [
+        "manual-batch-mf15-complete-exports.json",
+        "manual-batch-mf15-variant-track-exports.json",
+        "manual-batch-mf15-controlled-failure.json",
+        "dep-automation-batch"
+      ],
+      "truth_ids": [],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-058",
+      "capability": "Structured evidence and snapshot exports",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Structured evidence and snapshot exports",
+      "disposition": "operational-ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-15"
+      ],
+      "batch_ids": [
+        "manual-batch-mf15-complete-exports.json",
+        "manual-batch-mf15-variant-track-exports.json",
+        "manual-batch-mf15-controlled-failure.json",
+        "dep-automation-batch"
+      ],
+      "truth_ids": [],
+      "real_data_follow_up": null
+    },
+    {
+      "id": "coverage-059",
+      "capability": "Bearer authentication without persistence",
+      "source_path": "docs/DESKTOP_FEATURE_ACCESS.md",
+      "source_claim": "Bearer authentication without persistence",
+      "disposition": "operational-ready",
+      "preflight_status": "passed",
+      "manual_qualification_status": "not-run",
+      "fixture_ids": [],
+      "project_ids": [],
+      "scenario_ids": [
+        "scenario-mf-14"
+      ],
+      "batch_ids": [],
+      "truth_ids": [],
+      "real_data_follow_up": null
+    }
+  ]
+}

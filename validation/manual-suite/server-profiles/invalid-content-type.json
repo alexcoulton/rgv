@@ -1,0 +1,7 @@
+{
+  "expected_behavior": "the bytes are valid but the response declares an incompatible media type",
+  "external_network_required": false,
+  "profile": "invalid-content-type",
+  "representative_status": 206,
+  "schema_version": 1
+}

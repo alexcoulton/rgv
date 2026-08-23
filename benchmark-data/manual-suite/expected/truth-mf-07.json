@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-07",
+  "fixture_ids": [
+    "manual-ultima-bam",
+    "manual-reference-fasta"
+  ],
+  "assembly": "manual-synthetic",
+  "loci": [
+    {
+      "id": "ultima",
+      "displayed_locus": "chrManual:49901-50600",
+      "contig": "chrManual",
+      "start_zero_based": 49900,
+      "end_zero_based_exclusive": 50600,
+      "expected_facts": [
+        "Forward Q40 and reverse Q0 insertion records expose exact signed tp direction arrays in directional and minimum modes.",
+        "A read-group mc=1 homopolymer deletion resolves to Q0 and a single-base non-homopolymer deletion resolves from t0 to Q35.",
+        "Named missing, wrong-length, and wrong-type tp controls remain local errors without hiding the valid reads."
+      ]
+    }
+  ]
+}

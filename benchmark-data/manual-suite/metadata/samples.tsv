@@ -1,0 +1,9 @@
+sample	condition	batch	family_id	father	mother	affected
+tumour	case	B	FAM1	normal-father	normal-mother	yes
+normal	control	A	FAM1	0	0	no
+normal-father	control	A	FAM1	0	0	no
+normal-mother	control	A	FAM1	0	0	no
+child	case	C	PED1	father	mother	yes
+father	control	C	PED1	0	0	no
+mother	control	C	PED1	0	0	no
+single-cell	case	SC	.	0	0	unknown

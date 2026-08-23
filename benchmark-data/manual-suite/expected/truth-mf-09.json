@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-09",
+  "fixture_ids": [
+    "manual-cohort-vcf",
+    "manual-cohort-bcf"
+  ],
+  "assembly": "variants-synthetic",
+  "loci": [
+    {
+      "id": "cohort-variants",
+      "displayed_locus": "chrVariants:14901-18100",
+      "contig": "chrVariants",
+      "start_zero_based": 14900,
+      "end_zero_based_exclusive": 18100,
+      "expected_facts": [
+        "The VCF and BCF contain SNV, MNV, multi-allelic, insertion, deletion, inversion, symbolic deletion, and breakend records.",
+        "All 128 samples retain phased, unphased, haploid, polyploid, missing, and partial no-call GT states plus DP, AD, GQ, and PL fields.",
+        "The final sample on EXPECTED_BREAKEND has one out-of-range allele index as a readable malformed-genotype boundary case."
+      ]
+    }
+  ]
+}

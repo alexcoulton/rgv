@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "truth-mf-02",
+  "fixture_ids": [
+    "dep-variants-bam",
+    "dep-variants-fasta"
+  ],
+  "assembly": "variants-synthetic",
+  "loci": [
+    {
+      "id": "large-indels",
+      "displayed_locus": "chrVariants:9401-12600",
+      "contig": "chrVariants",
+      "start_zero_based": 9400,
+      "end_zero_based_exclusive": 12600,
+      "expected_facts": [
+        "A 1,000-base insertion and a 2,000-base deletion start from the shared 9,500 zero-based alignment position.",
+        "The base-level locus contains controls, SNVs, 1/6-base insertions, and 1/12-base deletions."
+      ]
+    }
+  ]
+}

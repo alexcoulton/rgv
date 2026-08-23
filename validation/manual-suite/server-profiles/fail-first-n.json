@@ -1,0 +1,7 @@
+{
+  "expected_behavior": "the first configured number of data requests fail, then recover",
+  "external_network_required": false,
+  "profile": "fail-first-n",
+  "representative_status": 503,
+  "schema_version": 1
+}

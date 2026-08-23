@@ -1,0 +1,6 @@
+#RGV-review-queue-v1
+contig	start	end	status	label_json	assignment_json	notes_json
+chrVariants	0	1	pending	"Review contig start"	"tester-a"	"Boundary coordinate must remain zero-based internally."
+chrVariants	9400	12600	in_progress	"Review large indels"	null	"Expected 1000 bp insertion and 2000 bp deletion"
+chrManual	49900	50600	pending	"Review Ultima"	"tester-b"	"Expected tp, mc, t0, missing, and malformed evidence"
+chrVariants	19999	20000	complete	"Review contig end"	null	"Last valid base of chrVariants."

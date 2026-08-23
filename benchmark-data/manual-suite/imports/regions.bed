@@ -1,0 +1,5 @@
+track name="RGV manual regions" itemRgb=On
+chrVariants	0	1	contig-start	0	.	0	1	45,92,175
+chrVariants	9400	12600	large-indels	0	.	9400	12600	220,80,60
+chrManual	49900	50600	ultima-evidence	0	.	49900	50600	126,87,194
+chrVariants	19999	20000	contig-end	0	.	19999	20000	40,150,90

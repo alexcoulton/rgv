@@ -1,0 +1,7 @@
+{
+  "expected_behavior": "requests without the runtime bearer token are rejected",
+  "external_network_required": false,
+  "profile": "auth-required",
+  "representative_status": 401,
+  "schema_version": 1
+}

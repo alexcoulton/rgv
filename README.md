@@ -59,7 +59,8 @@ The current native prototype supports:
 The current execution roadmap is in [RGV_IGV_PARITY_ROADMAP.md](RGV_IGV_PARITY_ROADMAP.md).
 See [the user guide](docs/USER_GUIDE.md), [format support matrix](docs/FORMAT_SUPPORT.md),
 [session compatibility policy](docs/SESSION_COMPATIBILITY.md), [portable genome configuration](docs/GENOME_CONFIGURATION.md), and
-[validation guide](docs/VALIDATION.md) for operational details.
+[validation guide](docs/VALIDATION.md) for operational details. The complete deterministic manual
+fixture index is [validation/manual-suite/README.md](validation/manual-suite/README.md).
 
 ## Run the desktop viewer
 
@@ -160,6 +161,22 @@ decoded-alignment cache. `Ctrl/Cmd+K` opens command search, `Ctrl/Cmd+D` toggles
 `Ctrl/Cmd+,` opens settings.
 
 ### Ready-made manual-review workspaces
+
+Generate, mechanically qualify, and list the complete focused manual suite with:
+
+```sh
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- generate
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixture-check -- \
+  verify --require-complete
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- qualify
+cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- list
+```
+
+This supplies 17 ready-to-open projects for MF-01 through MF-14, 15 plain-language scenario cards,
+three MF-15 automation batches, exact truth, deliberate failures, portable relocation, and an
+ephemeral loopback remote-source lab. `cargo run` builds changed binaries automatically; a separate
+`cargo build` is optional. Fixture readiness does not mean that the manual cards or real-data and
+platform qualification have passed.
 
 After building the release executable, open the deterministic manual-test project directly:
 

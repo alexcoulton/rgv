@@ -1,0 +1,346 @@
+{
+  "schema_version": 3,
+  "locus": {
+    "contig": "chrVariants",
+    "start": 14900,
+    "end": 18100
+  },
+  "panels": [
+    {
+      "id": 1,
+      "locus": {
+        "contig": "chrVariants",
+        "start": 14900,
+        "end": 18100
+      },
+      "vertical_scroll_points": 0.0
+    }
+  ],
+  "active_panel": 1,
+  "alignment_tracks": [],
+  "reference": {
+    "Local": {
+      "path": "../../variants.fa"
+    }
+  },
+  "genome_name": "RGV cohort variant truth",
+  "cytobands": null,
+  "reference_reverse_complement": false,
+  "reference_translation_frames": [],
+  "reference_genetic_code": "Standard",
+  "regions_of_interest": [],
+  "review_items": [],
+  "sample_metadata": {
+    "key_column": "sample",
+    "columns": [
+      "condition",
+      "batch",
+      "family_id",
+      "father",
+      "mother",
+      "affected"
+    ],
+    "rows": [
+      {
+        "sample_key": "tumour",
+        "values": [
+          "case",
+          "B",
+          "FAM1",
+          "normal-father",
+          "normal-mother",
+          "yes"
+        ]
+      },
+      {
+        "sample_key": "normal",
+        "values": [
+          "control",
+          "A",
+          "FAM1",
+          "0",
+          "0",
+          "no"
+        ]
+      },
+      {
+        "sample_key": "normal-father",
+        "values": [
+          "control",
+          "A",
+          "FAM1",
+          "0",
+          "0",
+          "no"
+        ]
+      },
+      {
+        "sample_key": "normal-mother",
+        "values": [
+          "control",
+          "A",
+          "FAM1",
+          "0",
+          "0",
+          "no"
+        ]
+      },
+      {
+        "sample_key": "child",
+        "values": [
+          "case",
+          "C",
+          "PED1",
+          "father",
+          "mother",
+          "yes"
+        ]
+      },
+      {
+        "sample_key": "father",
+        "values": [
+          "control",
+          "C",
+          "PED1",
+          "0",
+          "0",
+          "no"
+        ]
+      },
+      {
+        "sample_key": "mother",
+        "values": [
+          "control",
+          "C",
+          "PED1",
+          "0",
+          "0",
+          "no"
+        ]
+      },
+      {
+        "sample_key": "single-cell",
+        "values": [
+          "case",
+          "SC",
+          ".",
+          "0",
+          "0",
+          "unknown"
+        ]
+      }
+    ]
+  },
+  "contig_aliases": {},
+  "tracks": [
+    {
+      "id": 1,
+      "name": "Cohort VCF and 128-sample genotypes",
+      "kind": "Variant",
+      "source": {
+        "Local": {
+          "path": "../data/variants/cohort.vcf.gz"
+        }
+      },
+      "sample_key": "child",
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    },
+    {
+      "id": 2,
+      "name": "Equivalent cohort BCF",
+      "kind": "Variant",
+      "source": {
+        "Local": {
+          "path": "../data/variants/cohort.bcf"
+        }
+      },
+      "sample_key": null,
+      "visible": true,
+      "collapsed": false,
+      "height": 120.0,
+      "variant": {
+        "minimum_quality": null,
+        "quality_missing": "exclude",
+        "pass_only": false,
+        "allowed_filters": [],
+        "variant_types": [],
+        "minimum_allele_frequency": null,
+        "maximum_allele_frequency": null,
+        "allele_frequency_missing": "exclude",
+        "genotype": "any",
+        "field_predicates": [],
+        "sample_subset_enabled": false,
+        "sample_subset": [],
+        "genotype_grouping": "sample_order",
+        "color_mode": "type"
+      },
+      "mutation": {
+        "color_mode": "classification",
+        "row_height": 16.0,
+        "show_sample_names": true,
+        "show_gene_labels": true
+      },
+      "gwas": {
+        "color_mode": "chromosome",
+        "point_size": 3.0,
+        "maximum_score": 25.0,
+        "uniform_color": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_one": [
+          45,
+          92,
+          175,
+          230
+        ],
+        "alternating_color_two": [
+          124,
+          156,
+          204,
+          230
+        ]
+      },
+      "quantitative": {
+        "scale_mode": "automatic",
+        "fixed_minimum": -1.0,
+        "fixed_maximum": 1.0,
+        "baseline": 0.0,
+        "scale_transform": "linear",
+        "display_mode": "bar",
+        "window_function": "mean",
+        "missing_mode": "gap",
+        "positive_color": [
+          37,
+          156,
+          197,
+          230
+        ],
+        "negative_color": [
+          218,
+          75,
+          99,
+          230
+        ],
+        "opacity": 1.0,
+        "arithmetic": "none",
+        "operand_track": null,
+        "show_range_labels": true,
+        "overlay_group": null,
+        "scale_group": null
+      },
+      "copy_number": {
+        "value_mode": "automatic",
+        "sort_mode": "file_order",
+        "sort_locus": null,
+        "row_height": 14.0,
+        "show_sample_names": true,
+        "show_values": true
+      },
+      "interaction": {
+        "display_mode": "arcs",
+        "minimum_score": null,
+        "fixed_maximum_score": null,
+        "show_labels": true
+      },
+      "feature": {
+        "display_mode": "expanded"
+      }
+    }
+  ],
+  "maximum_alignments": 50000
+}

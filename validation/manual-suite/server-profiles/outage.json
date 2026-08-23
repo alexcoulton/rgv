@@ -1,0 +1,7 @@
+{
+  "expected_behavior": "all data requests fail until the profile is changed",
+  "external_network_required": false,
+  "profile": "outage",
+  "representative_status": 503,
+  "schema_version": 1
+}

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "name": "RGV portable manual genome",
+  "reference": {
+    "Local": {
+      "path": "../../variants.fa"
+    }
+  },
+  "cytobands": {
+    "Local": {
+      "path": "../data/tracks/cytobands.txt"
+    }
+  },
+  "contig_aliases": {
+    "variants": "chrVariants"
+  },
+  "default_annotations": [
+    {
+      "name": "Manual search annotations",
+      "kind": "Feature",
+      "source": {
+        "Local": {
+          "path": "../data/tracks/default-annotations.bed"
+        }
+      }
+    }
+  ]
+}

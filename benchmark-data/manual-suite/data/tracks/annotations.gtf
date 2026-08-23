@@ -1,0 +1,4 @@
+chrVariants	RGV	gene	14501	17500	.	+	.	gene_id "EXPECTED_GTF_GENE"; gene_name "Expected GTF gene";
+chrVariants	RGV	transcript	14501	17500	.	+	.	gene_id "EXPECTED_GTF_GENE"; transcript_id "EXPECTED_GTF_TX";
+chrVariants	RGV	exon	14501	15000	.	+	.	gene_id "EXPECTED_GTF_GENE"; transcript_id "EXPECTED_GTF_TX"; exon_number "1";
+chrVariants	RGV	exon	17001	17500	.	+	.	gene_id "EXPECTED_GTF_GENE"; transcript_id "EXPECTED_GTF_TX"; exon_number "2";

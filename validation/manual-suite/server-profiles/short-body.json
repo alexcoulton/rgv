@@ -1,0 +1,7 @@
+{
+  "expected_behavior": "the response body is shorter than its requested range",
+  "external_network_required": false,
+  "profile": "short-body",
+  "representative_status": 206,
+  "schema_version": 1
+}

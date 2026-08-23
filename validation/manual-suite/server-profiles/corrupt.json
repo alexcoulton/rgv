@@ -1,0 +1,7 @@
+{
+  "expected_behavior": "one deterministic byte in the response body is changed",
+  "external_network_required": false,
+  "profile": "corrupt",
+  "representative_status": 206,
+  "schema_version": 1
+}

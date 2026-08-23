@@ -1,0 +1,90 @@
+{
+  "commands": [
+    {
+      "command": "new_workspace"
+    },
+    {
+      "command": "set_genome",
+      "name": "Manual variants genome",
+      "source": {
+        "Local": {
+          "path": "../../../benchmark-data/variants.fa"
+        }
+      }
+    },
+    {
+      "command": "goto",
+      "loci": [
+        "chrVariants:14901-18100"
+      ]
+    },
+    {
+      "command": "load_track",
+      "kind": "Variant",
+      "name": "Automation variants",
+      "source": {
+        "Local": {
+          "path": "../../../benchmark-data/manual-suite/data/variants/cohort.bcf"
+        }
+      }
+    },
+    {
+      "command": "load_track",
+      "kind": "Quantitative",
+      "name": "Automation signal",
+      "source": {
+        "Local": {
+          "path": "../../../benchmark-data/demo-tracks/signal.bedGraph"
+        }
+      }
+    },
+    {
+      "command": "load_track",
+      "kind": "Feature",
+      "name": "Automation regions",
+      "source": {
+        "Local": {
+          "path": "../../../benchmark-data/manual-suite/data/tracks/default-annotations.bed"
+        }
+      }
+    },
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 30000
+    },
+    {
+      "command": "export",
+      "kind": "variants",
+      "path": "../../../benchmark-results/manual-suite/variants.tsv"
+    },
+    {
+      "command": "export",
+      "kind": "quantitative",
+      "path": "../../../benchmark-results/manual-suite/quantitative.tsv"
+    },
+    {
+      "command": "export",
+      "kind": "regions",
+      "path": "../../../benchmark-results/manual-suite/regions.tsv"
+    },
+    {
+      "command": "export",
+      "kind": "track_names",
+      "path": "../../../benchmark-results/manual-suite/variant-track-names.tsv"
+    },
+    {
+      "command": "snapshot",
+      "format": "svg",
+      "path": "../../../benchmark-results/manual-suite/variant-workspace.svg",
+      "scope": "visible_workspace"
+    },
+    {
+      "command": "save",
+      "path": "../../../benchmark-results/manual-suite/variant-project.rgv.json"
+    },
+    {
+      "command": "exit"
+    }
+  ],
+  "schema_version": 1
+}

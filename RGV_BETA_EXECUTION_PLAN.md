@@ -21,22 +21,27 @@ make the application impractical to use. A roughly 500 ms load is acceptable at 
 ## Current position
 
 The code audit recorded Phases 0–8 of the detailed roadmap as implemented. The project is not at
-Phase 0. It is at the final boundary between major-feature implementation and the user's broad
-manual pass.
+Phase 0. The complete manual fixture suite is now mechanically ready, so the project is at the
+start of the user's broad manual pass.
 
 Before handoff, one implementation check remained: prove that every major capability is reachable
 through the native desktop UI and not merely present in a library, command-line flag, automation
 command, saved project, or test fixture. Any gap found by this audit is implementation work and is
 fixed before manual testing begins.
 
-The access audit has already corrected two real gaps:
+The access and fixture audits corrected real gaps, including:
 
 - remote BAM/CRAM, FASTA, VCF/BCF, BigWig, TDF, BigBed, bigGenePred, and bigNarrowPeak now have a
   desktop **Open URL** workflow with custom alignment/reference indexes and optional CRAM reference
   input;
 - `.bed.gz`, `.gff3.gz`, and `.gtf.gz` files now work through **Add track** and drag-and-drop as
   documented, and signed URLs retain correct format inference without exposing their query in
-  track names or status text.
+  track names or status text;
+- the focused Ultima fixture covers valid forward/reverse `tp`, `mc`, and `t0` evidence plus
+  missing, wrong-length, and wrong-type controls;
+- cohort VCF and BCF contain identical 128-sample truth, including a readable malformed-genotype
+  boundary; and
+- ROI/review imports use the exact versioned desktop syntax rather than an ad-hoc table.
 
 ## Stage 1 — finish the major-feature boundary
 
@@ -79,6 +84,15 @@ queue expose the paired, deep, RNA, structural-pair, long/supplementary/modified
 exported their track inventories and visible-workspace SVGs, and exited successfully; the
 mixed-format project also expanded both TDF channels.
 
+The subsequent complete fixture suite adds 17 focused projects, 15 scenario cards, three export
+batches, 116 declared artifacts, 35 reused dependencies, 34 production semantic checks, and 59
+feature/format catalog rows with no unresolved planned row. Disposable double generation proves a
+stable declared tree hash, mutation/stale/missing rejection, relocation, source reopening, and the
+50 MiB budget. The loopback lab passes range, conditional, authentication, redirect, retry,
+validator, corruption, truncation, outage, slow-response, recovery, and clean-shutdown cases. Two
+native Metal automation batches produced every declared alignment/variant/track export plus PNG and
+SVG evidence. This is fixture readiness, not a recorded human pass.
+
 Do not add broad performance tuning, platform matrices, signing, long soaks, or matched IGV
 benchmarking to this stage.
 
@@ -91,9 +105,10 @@ The pass covers visual meaning and readability, navigation feel, short and long 
 RNA, quantitative and annotation tracks, multi-track/multi-locus work, sessions, recovery, and
 exports.
 
-`validation/MANUAL_QUALIFICATION.md` is the checklist, but it is guidance rather than a demand for
-the user to reproduce every automated test. Findings should describe the data, locus, action,
-expected result, and observed result, with screenshots where helpful.
+`validation/manual-suite/README.md` is the focused fixture index and
+`validation/MANUAL_QUALIFICATION.md` is the broader checklist. They are guidance rather than a
+demand for the user to reproduce every automated test. Findings should describe the fixture/data,
+locus, action, expected result, and observed result, with screenshots where helpful.
 
 The initial priority order is:
 
@@ -142,5 +157,8 @@ real problem.
 3. **Done:** pass the complete Stage 1 correctness gate with 505 active tests.
 4. **Done:** provide the verified mixed-format and alignment-review projects, release-build launch
    instructions, and focused alignment loci.
-5. **Next:** record and fix concrete Stage 2 manual findings before beginning release
+5. **Done:** generate and mechanically qualify the complete MF-01–MF-15 manual fixture suite,
+   including focused biological truth, invalid inputs, portable projects, automation batches, and
+   the controlled loopback lab.
+6. **Next:** record and fix concrete Stage 2 manual findings before beginning release
    qualification.
