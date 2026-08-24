@@ -587,11 +587,49 @@ pub fn paint_track_viewport_chrome(
                 (label_rect.top() + 22.0).min(label_rect.bottom()),
             ),
         );
+        let eye_rect = Rect::from_center_size(
+            pos2(header_rect.left() + 11.0, header_rect.center().y),
+            egui::vec2(16.0, 16.0),
+        );
         let response = ui.interact(
-            header_rect,
+            Rect::from_min_max(
+                pos2(header_rect.left() + 22.0, header_rect.top()),
+                header_rect.max,
+            ),
             egui::Id::new(("track-label", frame.key)),
             Sense::click_and_drag(),
         );
+        let eye = ui.interact(
+            eye_rect,
+            egui::Id::new(("track-collapse", frame.key)),
+            Sense::click(),
+        );
+        eye.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Checkbox,
+                true,
+                !frame.collapsed,
+                format!(
+                    "{} track {}",
+                    frame.name,
+                    if frame.collapsed {
+                        "collapsed"
+                    } else {
+                        "expanded"
+                    }
+                ),
+            )
+        });
+        if eye.clicked() {
+            result
+                .actions
+                .push(TrackUiAction::ToggleCollapsed(frame.key));
+        }
+        eye.clone().on_hover_text(if frame.collapsed {
+            format!("Expand {} track", frame.name)
+        } else {
+            format!("Collapse {} track", frame.name)
+        });
         if response.clicked() {
             result.actions.push(TrackUiAction::Select(frame.key));
         }
@@ -705,8 +743,7 @@ pub fn paint_track_viewport_chrome(
                     .push(TrackUiAction::ToggleVisibility(frame.key));
                 ui.close();
             }
-            if !matches!(frame.key, TrackFrameKey::Reference)
-                && frame.visible
+            if frame.visible
                 && ui
                     .button(if frame.collapsed {
                         "Expand track"
@@ -738,20 +775,34 @@ pub fn paint_track_viewport_chrome(
             Color32::from_gray(145)
         };
         let label_painter = painter.with_clip_rect(label_rect.shrink2(egui::vec2(3.0, 1.0)));
-        label_painter.text(
-            pos2(label_rect.left() + 6.0, label_rect.top() + 11.0),
-            Align2::LEFT_CENTER,
-            if frame.collapsed { "+" } else { "−" },
-            FontId::proportional(10.0),
-            text_color,
-        );
+        let eye_color = if eye.hovered() {
+            Color32::from_rgb(45, 92, 175)
+        } else {
+            Color32::from_gray(105)
+        };
+        label_painter.add(egui::epaint::Shape::ellipse_stroke(
+            eye_rect.center(),
+            egui::vec2(5.0, 3.2),
+            Stroke::new(1.0, eye_color),
+        ));
+        if frame.collapsed {
+            label_painter.line_segment(
+                [
+                    eye_rect.left_top() + egui::vec2(2.5, 2.5),
+                    eye_rect.right_bottom() - egui::vec2(2.5, 2.5),
+                ],
+                Stroke::new(1.4, eye_color),
+            );
+        } else {
+            label_painter.circle_filled(eye_rect.center(), 1.6, eye_color);
+        }
         paint_elided_text(
             &label_painter,
             &frame.name,
             FontId::proportional(11.0),
             text_color,
-            (label_rect.width() - 25.0).max(0.0),
-            pos2(label_rect.left() + 18.0, label_rect.top() + 11.0),
+            (label_rect.width() - 31.0).max(0.0),
+            pos2(label_rect.left() + 22.0, label_rect.top() + 11.0),
             false,
         );
         for subtrack in &frame.subtracks {
@@ -1274,6 +1325,82 @@ mod tests {
                     .label()
                     .is_some_and(|label| label.starts_with("Resize track-7 track"))
         }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::CheckBox
+                && node
+                    .label()
+                    .is_some_and(|label| label == "track-7 track expanded")
+                && node.toggled() == Some(egui::accesskit::Toggled::True)
+        }));
+    }
+
+    #[test]
+    fn clicking_a_track_eye_requests_collapse() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let frames = [frame(7, 20.0)];
+        let pointer = pos2(11.0, 31.0);
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &frames,
+                0.0,
+                None,
+                &[],
+            )
+        };
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                actions = render(ui).actions;
+            },
+        );
+
+        assert_eq!(
+            actions,
+            vec![TrackUiAction::ToggleCollapsed(TrackFrameKey::Auxiliary(
+                TrackId::new(7),
+            ))]
+        );
     }
 
     #[test]

@@ -528,7 +528,9 @@ pub(super) fn parse_big_gene_pred_record(
     let gene_name = fields[14];
     let gene_name2 = fields[15];
     let gene_type = fields[16];
-    let display_name = [gene_name, name2, transcript_name]
+    // bigGenePred's geneName is commonly a stable database identifier, while
+    // geneName2 is the human-readable gene symbol intended for display.
+    let display_name = [gene_name2, gene_name, name2, transcript_name]
         .into_iter()
         .find(|value| !value.is_empty() && *value != ".")
         .unwrap_or(transcript_name);

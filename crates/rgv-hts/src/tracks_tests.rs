@@ -521,7 +521,7 @@ fn big_gene_pred_preserves_binary_schema_transcript_semantics() {
         )
         .unwrap();
 
-    assert_eq!(record.name.as_deref(), Some("GENE1"));
+    assert_eq!(record.name.as_deref(), Some("GENE1-alt"));
     assert_eq!(record.blocks, [(100, 120), (160, 190), (200, 220)]);
     assert_eq!(record.coding_interval, Some((120, 200)));
     assert_eq!(record.strand, Strand::Forward);
@@ -535,6 +535,23 @@ fn big_gene_pred_preserves_binary_schema_transcript_semantics() {
         Some("protein_coding")
     );
     assert!(feature_search_terms(&record).contains(&"tx1-alt".to_owned()));
+}
+
+#[test]
+fn big_gene_pred_prefers_the_human_readable_gene_symbol() {
+    let record = parse_big_gene_pred_record(
+        "chr1",
+        100,
+        220,
+        "ENST000001	900	+	120	200	0	3	20,30,20,	0,60,100,	ENST000001	cmpl	cmpl	0,1,2,	coding	ENSG000001	GENE1	protein_coding",
+    )
+    .unwrap();
+
+    assert_eq!(record.name.as_deref(), Some("GENE1"));
+    assert_eq!(
+        attribute_value(&record.attributes, &["gene_name"]).as_deref(),
+        Some("ENSG000001")
+    );
 }
 
 #[test]
@@ -719,11 +736,11 @@ fn generated_bigbed_truth_queries_typed_models_and_supports_bounded_search() {
         BigBedSource::open_with_format(&gene_path, BigBedFeatureFormat::BigGenePred).unwrap();
     let queried = genes.query("chr1", 110, 210).unwrap();
     assert_eq!(queried.len(), 1);
-    assert_eq!(queried[0].name.as_deref(), Some("GENE1"));
+    assert_eq!(queried[0].name.as_deref(), Some("GENE1-alt"));
     assert_eq!(queried[0].blocks, [(100, 120), (160, 190), (200, 220)]);
     let search = genes.search("tx1-alt", 10).unwrap();
     assert_eq!(search.hits.len(), 1);
-    assert_eq!(search.hits[0].record.name.as_deref(), Some("GENE1"));
+    assert_eq!(search.hits[0].record.name.as_deref(), Some("GENE1-alt"));
     assert!(!search.scan_truncated);
     assert_eq!(
         genes
@@ -732,7 +749,7 @@ fn generated_bigbed_truth_queries_typed_models_and_supports_bounded_search() {
             .unwrap()
             .name
             .as_deref(),
-        Some("GENE1")
+        Some("GENE1-alt")
     );
     assert_eq!(
         genes
@@ -741,7 +758,7 @@ fn generated_bigbed_truth_queries_typed_models_and_supports_bounded_search() {
             .unwrap()
             .name
             .as_deref(),
-        Some("GENE1")
+        Some("GENE1-alt")
     );
 
     let mut peaks =

@@ -132,17 +132,23 @@ impl Viewer {
                 && !track.collapsed
                 && matches!(track.kind, TrackKind::CopyNumber | TrackKind::Mutation)
         });
-        if self.primary_alignment_filters().show_reference && self.reference_engine.is_some() {
+        if self.reference_engine.is_some() {
             let frame_top = top;
+            let reference_expanded = self.primary_alignment_filters().show_reference;
             let sequence_top = frame_top + 25.0;
             let translation_top = sequence_top + 23.0;
-            let bottom = frame_top + 49.0 + self.reference_translation_frames.len() as f32 * 20.0;
-            if let Some(reference) = self
-                .panels
-                .active()
-                .reference_slice
-                .as_deref()
-                .filter(|slice| retained_data_overlaps(slice.interval, viewport_interval))
+            let bottom = if reference_expanded {
+                frame_top + 49.0 + self.reference_translation_frames.len() as f32 * 20.0
+            } else {
+                frame_top + 26.0
+            };
+            if reference_expanded
+                && let Some(reference) = self
+                    .panels
+                    .active()
+                    .reference_slice
+                    .as_deref()
+                    .filter(|slice| retained_data_overlaps(slice.interval, viewport_interval))
             {
                 let reference_display = layout_reference_slice_oriented(
                     reference,
@@ -171,32 +177,35 @@ impl Viewer {
                     pinned_display.texts.extend(translation.texts);
                 }
             }
-            let reference_is_zoomed_out =
-                self.panels.active().viewport.detail_level() != DetailLevel::Bases;
-            let mut subtracks = vec![TrackSubtrack {
-                label: if self.reference_reverse_complement {
-                    "Bases · reverse strand".to_owned()
-                } else {
-                    "Bases · forward".to_owned()
-                },
-                detail: reference_is_zoomed_out.then(|| "zoom in to see sequence".to_owned()),
-                top: sequence_top,
-                bottom: sequence_top + 20.0,
-                collapsed: false,
-            }];
-            subtracks.extend(
-                self.reference_translation_frames
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(index, frame)| TrackSubtrack {
-                        label: format!("Translation {}", frame.label()),
-                        detail: Some(format!("{:?}", self.reference_genetic_code)),
-                        top: translation_top + index as f32 * 20.0,
-                        bottom: translation_top + (index + 1) as f32 * 20.0,
-                        collapsed: false,
-                    }),
-            );
+            let mut subtracks = Vec::new();
+            if reference_expanded {
+                let reference_is_zoomed_out =
+                    self.panels.active().viewport.detail_level() != DetailLevel::Bases;
+                subtracks.push(TrackSubtrack {
+                    label: if self.reference_reverse_complement {
+                        "Bases · reverse strand".to_owned()
+                    } else {
+                        "Bases · forward".to_owned()
+                    },
+                    detail: reference_is_zoomed_out.then(|| "zoom in to see sequence".to_owned()),
+                    top: sequence_top,
+                    bottom: sequence_top + 20.0,
+                    collapsed: false,
+                });
+                subtracks.extend(
+                    self.reference_translation_frames
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(index, frame)| TrackSubtrack {
+                            label: format!("Translation {}", frame.label()),
+                            detail: Some(format!("{:?}", self.reference_genetic_code)),
+                            top: translation_top + index as f32 * 20.0,
+                            bottom: translation_top + (index + 1) as f32 * 20.0,
+                            collapsed: false,
+                        }),
+                );
+            }
             let frame = TrackFrame {
                 key: TrackFrameKey::Reference,
                 name: "Reference sequence".to_owned(),
@@ -208,7 +217,7 @@ impl Viewer {
                 top: frame_top,
                 bottom,
                 visible: true,
-                collapsed: false,
+                collapsed: !reference_expanded,
                 frozen_bottom: Some(bottom),
                 subtracks,
             };
@@ -251,6 +260,7 @@ impl Viewer {
                 let options = TrackLayoutOptions {
                     top: frame_top,
                     height,
+                    maximum_rows: ((height / 20.0).floor() as usize).clamp(1, 12),
                     selected_record: self
                         .panels
                         .active()

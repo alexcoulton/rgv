@@ -81,8 +81,10 @@ impl Viewer {
                         *collapsed = !*collapsed;
                     }
                 }
-                TrackUiAction::ToggleCollapsed(TrackFrameKey::Reference)
-                | TrackUiAction::Remove(TrackFrameKey::Reference) => {}
+                TrackUiAction::ToggleCollapsed(TrackFrameKey::Reference) => {
+                    *draft.show_reference = !*draft.show_reference;
+                }
+                TrackUiAction::Remove(TrackFrameKey::Reference) => {}
                 TrackUiAction::ToggleAlignmentSubtrack(track_id, subtrack) => outcome
                     .alignment_subtracks_to_toggle
                     .push((track_id, subtrack)),

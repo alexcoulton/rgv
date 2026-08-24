@@ -53,6 +53,74 @@ fn gene_models_render_utrs_thinner_than_coding_exons() {
 }
 
 #[test]
+fn gene_models_render_bounded_gene_labels_when_rows_have_room() {
+    let feature = FeatureRecord {
+        contig: "chr1".to_owned(),
+        start: 110,
+        end: 190,
+        name: Some("GENE1".to_owned()),
+        feature_type: Some("transcript".to_owned()),
+        score: None,
+        strand: Strand::Forward,
+        blocks: vec![(110, 140), (160, 190)],
+        coding_interval: Some((125, 175)),
+        peak: None,
+        attributes: Vec::new(),
+    };
+    let (display, _) = layout_features(
+        &[feature],
+        viewport(),
+        TrackLayoutOptions {
+            height: 48.0,
+            maximum_rows: 2,
+            ..TrackLayoutOptions::default()
+        },
+    );
+    assert_eq!(display.texts.len(), 1);
+    assert_eq!(display.texts[0].text, "GENE1");
+}
+
+#[test]
+fn gene_model_labels_do_not_overlap_at_overview_scale() {
+    let gene = |start, end, name: &str| FeatureRecord {
+        contig: "chr1".to_owned(),
+        start,
+        end,
+        name: Some(name.to_owned()),
+        feature_type: Some("transcript".to_owned()),
+        score: None,
+        strand: Strand::Forward,
+        blocks: vec![(start, end)],
+        coding_interval: None,
+        peak: None,
+        attributes: Vec::new(),
+    };
+    let features = [
+        gene(110, 111, "GENE_ONE"),
+        gene(112, 113, "GENE_TWO"),
+        gene(180, 181, "GENE_THREE"),
+    ];
+    let (display, _) = layout_features(
+        &features,
+        viewport(),
+        TrackLayoutOptions {
+            height: 24.0,
+            maximum_rows: 1,
+            ..TrackLayoutOptions::default()
+        },
+    );
+
+    assert_eq!(
+        display
+            .texts
+            .iter()
+            .map(|text| text.text.as_str())
+            .collect::<Vec<_>>(),
+        ["GENE_ONE", "GENE_THREE"]
+    );
+}
+
+#[test]
 fn narrow_peaks_render_the_called_summit() {
     let feature = FeatureRecord {
         contig: "chr1".to_owned(),

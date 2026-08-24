@@ -723,10 +723,12 @@ impl TrackConfig {
             sample_key: None,
             visible: true,
             collapsed: false,
-            height: if kind == TrackKind::Gwas {
-                200.0
-            } else {
-                120.0
+            height: match kind {
+                TrackKind::Gwas => 200.0,
+                // Gene models are compact context lanes. A tall generic feature
+                // default wastes most of the viewport for sparse MANE tracks.
+                TrackKind::GeneModel => 48.0,
+                _ => 120.0,
             },
             variant: VariantTrackSettings::default(),
             mutation: MutationTrackSettings::default(),
@@ -843,6 +845,19 @@ mod tests {
                 TrackId::new(1)
             ]
         );
+    }
+
+    #[test]
+    fn gene_models_use_a_compact_default_height() {
+        let track = TrackConfig::new(
+            TrackId::new(1),
+            "MANE Select".to_owned(),
+            TrackKind::GeneModel,
+            TrackSource::Local {
+                path: "mane.bb".to_owned(),
+            },
+        );
+        assert_eq!(track.height, 48.0);
     }
 
     #[test]

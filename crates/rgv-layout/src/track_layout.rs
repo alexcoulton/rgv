@@ -19,6 +19,7 @@ pub const MAX_QUANTITATIVE_WINDOWS: usize = 4_096;
 pub const MAX_RAW_QUANTITATIVE_RECORDS: usize = 16_384;
 pub const MAX_RENDERED_INTERACTIONS: usize = 2_048;
 pub const MAX_INTERACTION_LABELS: usize = 512;
+pub const MAX_FEATURE_LABELS: usize = 512;
 pub const MAX_RENDERED_COPY_NUMBER_SEGMENTS: usize = 32_768;
 pub const MAX_COPY_NUMBER_VALUE_LABELS: usize = 2_048;
 pub const COPY_NUMBER_HEADER_HEIGHT: f32 = 24.0;
@@ -170,9 +171,11 @@ pub fn layout_features(
         FeatureDisplayMode::Expanded => options.maximum_rows.max(1),
     };
     let mut row_ends = vec![0_u64; row_count];
+    let mut label_intervals = vec![Vec::<(f32, f32)>::new(); row_count];
     let row_height = options.height / row_ends.len() as f32;
     let mut rendered = 0;
     let mut hidden = 0;
+    let mut labels = 0;
     for (index, feature) in features.iter().enumerate() {
         if feature.end <= viewport.interval().start() || feature.start >= viewport.interval().end()
         {
@@ -188,7 +191,13 @@ pub fn layout_features(
             row
         };
         row_ends[row] = row_ends[row].max(feature.end);
-        let y = options.top + row as f32 * row_height + 2.0;
+        let row_top = options.top + row as f32 * row_height;
+        let label = (feature.feature_type.as_deref() == Some("transcript"))
+            .then_some(feature.name.as_deref())
+            .flatten()
+            .filter(|name| !name.is_empty() && row_height >= 16.0);
+        let label_band = if label.is_some() { 10.0 } else { 0.0 };
+        let y = row_top + label_band + 2.0;
         let object_id = options
             .object_id_base
             .saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
@@ -197,10 +206,36 @@ pub fn layout_features(
             feature,
             viewport,
             y,
-            row_height - 4.0,
+            (row_height - label_band - 4.0).max(2.0),
             object_id,
             options.selected_record == Some(index),
         );
+        if let Some(label) = label.filter(|_| labels < MAX_FEATURE_LABELS) {
+            let text = label.chars().take(32).collect::<String>();
+            let text_width = text.chars().count() as f32 * 9.0 * 0.62;
+            let half_width = text_width * 0.5;
+            let (x, width) = clipped_geometry(feature.start, feature.end, viewport);
+            let viewport_width = viewport.pixel_width() as f32;
+            if text_width + 4.0 <= viewport_width {
+                let center =
+                    (x + width * 0.5).clamp(half_width + 2.0, viewport_width - half_width - 2.0);
+                let interval = (center - half_width, center + half_width);
+                let has_collision = label_intervals[row]
+                    .iter()
+                    .any(|occupied| interval.0 < occupied.1 + 6.0 && interval.1 + 6.0 > occupied.0);
+                if !has_collision {
+                    display.texts.push(TextPrimitive {
+                        x: center,
+                        y: row_top + 5.5,
+                        text,
+                        font_size: 9.0,
+                        color: Rgba::new(0.16, 0.18, 0.22, 0.96),
+                    });
+                    label_intervals[row].push(interval);
+                    labels = labels.saturating_add(1);
+                }
+            }
+        }
         rendered += 1;
     }
     let primitive_count = display.rectangles.len();
