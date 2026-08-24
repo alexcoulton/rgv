@@ -588,6 +588,7 @@ struct Viewer {
     egui_renderer: egui_wgpu::Renderer,
     panels: PanelWorkspace,
     canvas_geometry: CanvasGeometry,
+    genomic_canvas_layer_id: Option<egui::LayerId>,
     composite_display_list: DisplayList,
     shared_primary_alignment_height: Option<f32>,
     alignment_tracks: Vec<AlignmentTrackController>,

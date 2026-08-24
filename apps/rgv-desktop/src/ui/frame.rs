@@ -458,6 +458,7 @@ impl Viewer {
         let mut overview_interaction = ui::OverviewInteraction::default();
         let mut overview_panel_id = active_panel_id;
         let mut scrollbar_interaction = ui::ScrollbarInteraction::default();
+        let mut genomic_canvas_layer_id = None;
         let mut diagnostics_open = self.diagnostics_open;
         let mut metadata_open = self.open_panel == Some(UiPanel::Metadata);
         let mut regions_open = self.open_panel == Some(UiPanel::Regions);
@@ -1103,6 +1104,7 @@ impl Viewer {
                     egui::Id::new(("genomic-canvas-accessibility", active_panel_id)),
                     egui::Sense::focusable_noninteractive(),
                 );
+                genomic_canvas_layer_id = Some(canvas_accessibility.layer_id);
                 let canvas_label = selection_summary.as_ref().map_or_else(
                     || format!("Genome tracks at {status_locus}; no evidence selected"),
                     |selection| format!("Genome tracks at {status_locus}; {selection}"),
@@ -1993,6 +1995,7 @@ impl Viewer {
             .get(&egui::ViewportId::ROOT)
             .map_or(Duration::MAX, |output| output.repaint_delay);
         self.announced_status.clone_from(&data_status);
+        self.genomic_canvas_layer_id = genomic_canvas_layer_id;
         self.command_search = command_search;
         self.diagnostics_open = diagnostics_open;
         self.recovery_open = recovery_open && !dismiss_recovery && recovery_requested.is_none();

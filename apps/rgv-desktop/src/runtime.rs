@@ -97,8 +97,7 @@ impl ApplicationHandler for Application {
                     viewer.begin_vertical_scrollbar_drag();
                 }
                 if state == ElementState::Pressed
-                    && !egui_response.consumed
-                    && viewer.cursor_in_genomic_canvas()
+                    && viewer.cursor_over_unobstructed_genomic_canvas()
                 {
                     if let Some(panel_id) = viewer.panel_at_cursor() {
                         viewer.activate_view_panel(panel_id);
@@ -129,7 +128,11 @@ impl ApplicationHandler for Application {
                             .navigation_history
                             .visit(interval);
                     }
-                    if clicked && !egui_response.consumed {
+                    // `press_cursor` is only recorded for the unobstructed GPU canvas.
+                    // The surrounding egui panel reports ordinary canvas presses as
+                    // consumed, so the native click must finish independently of that
+                    // coarse area-level response.
+                    if clicked {
                         viewer.select_at_cursor();
                     }
                 }

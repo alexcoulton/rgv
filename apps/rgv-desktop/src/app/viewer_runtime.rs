@@ -319,6 +319,7 @@ impl Viewer {
             egui_renderer,
             panels,
             canvas_geometry,
+            genomic_canvas_layer_id: None,
             composite_display_list: DisplayList::default(),
             shared_primary_alignment_height: None,
             alignment_tracks,

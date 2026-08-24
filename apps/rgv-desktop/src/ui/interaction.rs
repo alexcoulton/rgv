@@ -1,5 +1,13 @@
 use super::super::*;
 
+fn pointer_targets_unobstructed_canvas(
+    canvas_contains_pointer: bool,
+    canvas_layer: Option<egui::LayerId>,
+    layer_under_pointer: Option<egui::LayerId>,
+) -> bool {
+    canvas_contains_pointer && canvas_layer.is_some() && canvas_layer == layer_under_pointer
+}
+
 impl Viewer {
     pub(crate) fn cursor_moved(&mut self, position: PhysicalPosition<f64>, consumed: bool) {
         self.cursor = position;
@@ -770,6 +778,22 @@ impl Viewer {
         ))
     }
 
+    pub(crate) fn cursor_over_unobstructed_genomic_canvas(&self) -> bool {
+        if !self.cursor_in_genomic_canvas() {
+            return false;
+        }
+        let scale = self.window.scale_factor();
+        let pointer = egui::pos2(
+            (self.cursor.x / scale) as f32,
+            (self.cursor.y / scale) as f32,
+        );
+        pointer_targets_unobstructed_canvas(
+            true,
+            self.genomic_canvas_layer_id,
+            self.egui_context.layer_id_at(pointer),
+        )
+    }
+
     pub(crate) fn panel_column_rect_at(&self, index: usize) -> egui::Rect {
         let canvas = self.canvas_geometry.genomic;
         let count = self.panels.len().max(1) as f32;
@@ -967,5 +991,61 @@ impl Viewer {
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_canvas_pointer_survives_coarse_egui_area_consumption() {
+        let context = egui::Context::default();
+        let pointer = egui::pos2(50.0, 50.0);
+        let mut canvas_layer = None;
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(200.0, 200.0),
+                )),
+                events: vec![egui::Event::PointerMoved(pointer)],
+                ..egui::RawInput::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    let response = ui.interact(
+                        ui.max_rect(),
+                        egui::Id::new("test-genomic-canvas"),
+                        egui::Sense::focusable_noninteractive(),
+                    );
+                    canvas_layer = Some(response.layer_id);
+                });
+            },
+        );
+
+        assert!(context.egui_wants_pointer_input());
+        assert!(pointer_targets_unobstructed_canvas(
+            true,
+            canvas_layer,
+            context.layer_id_at(pointer),
+        ));
+    }
+
+    #[test]
+    fn native_canvas_pointer_does_not_click_through_an_overlay_layer() {
+        let canvas = egui::LayerId::new(egui::Order::Background, egui::Id::new("canvas"));
+        let overlay = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("dialog"));
+
+        assert!(!pointer_targets_unobstructed_canvas(
+            true,
+            Some(canvas),
+            Some(overlay),
+        ));
+        assert!(!pointer_targets_unobstructed_canvas(
+            false,
+            Some(canvas),
+            Some(canvas),
+        ));
     }
 }
