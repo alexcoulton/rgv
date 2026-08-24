@@ -453,6 +453,7 @@ fn ultima_deletion_uses_read_group_maximum_homopolymer_length() {
             maximum_homopolymer_length: Some(3),
         }],
         read_groups_omitted: 0,
+        ..AlignmentHeaderMetadata::default()
     });
     let viewport =
         Viewport::new(GenomicInterval::new(ContigId::new(0), 0, 8).unwrap(), 160.0).unwrap();
@@ -1838,6 +1839,23 @@ fn fixed_coverage_scale_is_applied_and_clipped_without_changing_reported_depth()
     );
     assert_eq!(maximum, 10);
     assert_eq!(display.rectangles.len(), 1);
+    assert!((display.rectangles[0].height - 15.0).abs() < 0.01);
+
+    display.rectangles.clear();
+    let square_root_options = AlignmentLayoutOptions {
+        coverage_scale_transform: CoverageScaleTransform::SquareRoot,
+        ..options
+    };
+    let maximum = add_coverage(
+        &mut display,
+        &pileup,
+        None,
+        interval,
+        viewport,
+        100.0,
+        &square_root_options,
+    );
+    assert_eq!(maximum, 10);
     assert!((display.rectangles[0].height - 30.0).abs() < 0.01);
 
     display.rectangles.clear();
@@ -2387,6 +2405,54 @@ fn regional_spans_reuse_rows_after_preceding_alignments_end() {
             .filter(|rectangle| rectangle.object_id != 0)
             .all(|rectangle| rectangle.width >= 1.0)
     );
+}
+
+#[test]
+fn regional_insertions_are_prominent_pickable_and_collision_bounded() {
+    let contig = ContigId::new(0);
+    let interval = GenomicInterval::new(contig, 0, 1_000).unwrap();
+    let viewport = Viewport::new(interval, 50.0).unwrap();
+    assert_eq!(viewport.detail_level(), DetailLevel::Regional);
+    let mut record = row_test_record(b"regional-insertions", 100, 200);
+    record.cigar = vec![
+        CigarOp {
+            kind: CigarOpKind::Match,
+            len: 10,
+        },
+        CigarOp {
+            kind: CigarOpKind::Insertion,
+            len: 5,
+        },
+        CigarOp {
+            kind: CigarOpKind::Match,
+            len: 1,
+        },
+        CigarOp {
+            kind: CigarOpKind::Insertion,
+            len: 7,
+        },
+        CigarOp {
+            kind: CigarOpKind::Match,
+            len: 89,
+        },
+    ];
+    let query = row_test_query(&[record]);
+
+    let layout = layout_alignment_query(&query, viewport, AlignmentLayoutOptions::default());
+
+    assert_eq!(layout.stats.regional_insertions_rendered, 1);
+    assert_eq!(layout.stats.regional_insertions_collapsed, 1);
+    assert_eq!(layout.stats.regional_insertions_omitted, 0);
+    assert!(
+        layout
+            .display_list
+            .texts
+            .iter()
+            .any(|text| text.text == "I")
+    );
+    assert!(layout.display_list.rectangles.iter().any(|rectangle| {
+        rectangle.object_id & READ_DETAIL_OBJECT_BIT != 0 && rectangle.width >= 3.0
+    }));
 }
 
 #[test]

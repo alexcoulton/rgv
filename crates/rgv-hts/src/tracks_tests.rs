@@ -538,6 +538,33 @@ fn big_gene_pred_preserves_binary_schema_transcript_semantics() {
 }
 
 #[test]
+fn big_gene_pred_accepts_and_preserves_extension_columns() {
+    let record = parse_big_gene_pred_record(
+        "chr1",
+        100,
+        220,
+        "tx1\t900\t+\t120\t200\t8,81,156\t3\t20,30,20,\t0,60,100,\ttx1-alt\tcmpl\tincmpl\t0,1,2,\tcoding\tGENE1\tGENE1-alt\tprotein_coding\tMANE Select\tNM_001",
+    )
+    .unwrap();
+
+    assert!(
+        record
+            .attributes
+            .contains(&("extension_field_1".to_owned(), "MANE Select".to_owned()))
+    );
+    assert!(
+        record
+            .attributes
+            .contains(&("extension_field_2".to_owned(), "NM_001".to_owned()))
+    );
+    assert!(
+        record
+            .attributes
+            .contains(&("item_rgb".to_owned(), "8,81,156".to_owned()))
+    );
+}
+
+#[test]
 fn big_gene_pred_rejects_malformed_blocks_frames_status_and_bounds() {
     let parse =
         |rest: &str| parse_big_gene_pred_record("chr1", 100, 220, rest).map(|record| record.blocks);

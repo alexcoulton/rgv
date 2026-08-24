@@ -813,7 +813,7 @@ mod tests {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
         assert_eq!(
-            hash, 6_060_784_535_120_229_735,
+            hash, 4_573_482_968_793_436_903,
             "update only after reviewing the short-, long-, spliced-, supplementary-, paired-, and deep-read fixture"
         );
     }

@@ -9,8 +9,9 @@ use rgv_core::{
     AutomationInteractionTrace, AutomationNavigationDestination, AutomationReviewNavigation,
     AutomationRunReport, AutomationSelection, AutomationSelectionGranularity, AutomationSetting,
     AutomationSnapshotFormat, AutomationSnapshotScope, AutomationUnsavedChangesPolicy,
-    AutomationViewportOperation, AutomationWorkspaceSnapshot, ModifiedBaseColorMode,
-    OverlappingMatePolicy, PanelId, ReadBaseDisplayMode, TrackId, TrackKind, TrackSource,
+    AutomationViewportOperation, AutomationWorkspaceSnapshot, CoverageScaleTransform,
+    ModifiedBaseColorMode, OverlappingMatePolicy, PanelId, ReadBaseDisplayMode, TrackId, TrackKind,
+    TrackSource,
 };
 use rmcp::schemars;
 use rmcp::{
@@ -1487,6 +1488,15 @@ pub enum ToolSetting {
         #[schemars(range(min = 0.25, max = 4.0))]
         value: f32,
     },
+    IncludeSecondary {
+        value: bool,
+    },
+    IncludeSupplementary {
+        value: bool,
+    },
+    CoverageScaleTransform {
+        value: ToolCoverageScaleTransform,
+    },
     ReadBaseDisplayMode {
         value: ToolReadBaseDisplayMode,
     },
@@ -1557,6 +1567,13 @@ impl ToolSetting {
                 }
             }
             Self::AlignmentDensity { value } => AutomationSetting::AlignmentDensity { value },
+            Self::IncludeSecondary { value } => AutomationSetting::IncludeSecondary { value },
+            Self::IncludeSupplementary { value } => {
+                AutomationSetting::IncludeSupplementary { value }
+            }
+            Self::CoverageScaleTransform { value } => AutomationSetting::CoverageScaleTransform {
+                value: value.into_core(),
+            },
             Self::ReadBaseDisplayMode { value } => AutomationSetting::ReadBaseDisplayMode {
                 value: value.into_core(),
             },
@@ -1585,6 +1602,22 @@ impl ToolSetting {
                     value,
                 }
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCoverageScaleTransform {
+    Linear,
+    SquareRoot,
+}
+
+impl ToolCoverageScaleTransform {
+    fn into_core(self) -> CoverageScaleTransform {
+        match self {
+            Self::Linear => CoverageScaleTransform::Linear,
+            Self::SquareRoot => CoverageScaleTransform::SquareRoot,
         }
     }
 }

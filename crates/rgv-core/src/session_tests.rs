@@ -49,6 +49,7 @@ fn json_round_trip_preserves_schema_and_sources() {
     filters.show_junction_labels = false;
     filters.show_reads = false;
     filters.coverage_scale_maximum = Some(500);
+    filters.coverage_scale_transform = CoverageScaleTransform::SquareRoot;
     filters.show_coverage_center_line = false;
     filters.alignment_density = 0.55;
     filters.inspector_activation = InspectorActivation::Hover;
@@ -688,6 +689,12 @@ fn early_version_one_sessions_receive_pileup_defaults() {
     assert!(filters.show_junction_labels);
     assert!(filters.show_reads);
     assert_eq!(filters.coverage_scale_maximum, None);
+    assert_eq!(
+        filters.coverage_scale_transform,
+        CoverageScaleTransform::SquareRoot
+    );
+    assert!(filters.include_secondary);
+    assert!(filters.include_supplementary);
     assert!(filters.show_coverage_center_line);
     assert!((filters.alignment_density - 1.0).abs() < f32::EPSILON);
     assert_eq!(filters.inspector_activation, InspectorActivation::Click);
@@ -706,6 +713,18 @@ fn early_version_one_sessions_receive_pileup_defaults() {
         ModifiedBaseColorMode::ByType
     );
     assert!(filters.hidden_modification_codes.is_empty());
+}
+
+#[test]
+fn new_alignment_filters_use_igv_parity_defaults() {
+    let filters = SessionFilters::default();
+    assert!(!filters.include_secondary);
+    assert!(filters.include_supplementary);
+    assert_eq!(
+        filters.coverage_scale_transform,
+        CoverageScaleTransform::Linear
+    );
+    assert_eq!(filters.minimum_event_label_size, 10);
 }
 
 #[test]

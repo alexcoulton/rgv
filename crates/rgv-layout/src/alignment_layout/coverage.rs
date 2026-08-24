@@ -38,7 +38,11 @@ pub(crate) fn add_coverage(
         let x = viewport.pixel_at_genomic(visible.start()) as f32;
         let right = viewport.pixel_at_genomic(visible.end()) as f32;
         let fraction = (bin.depth as f32 / scale_maximum as f32).min(1.0);
-        let height = (fraction.sqrt() * options.coverage_height).max(1.0);
+        let transformed = match options.coverage_scale_transform {
+            CoverageScaleTransform::Linear => fraction,
+            CoverageScaleTransform::SquareRoot => fraction.sqrt(),
+        };
+        let height = (transformed * options.coverage_height).max(1.0);
         display_list.rectangles.push(RectPrimitive {
             x,
             y: options.coverage_top + options.coverage_height - height,
@@ -521,33 +525,49 @@ pub(crate) fn add_spans(
     viewport: Viewport,
     options: &AlignmentLayoutOptions,
     rows: &AlignmentRowLayout,
-) -> (usize, usize) {
+) -> ReadRenderStats {
+    #[derive(Clone, Copy, Debug)]
+    struct RegionalInsertion {
+        index: usize,
+        row: usize,
+        anchor: u64,
+        length: u32,
+    }
+
     let batch = &query.batch;
-    let mut rendered = 0;
-    let mut hidden = 0;
+    let mut stats = ReadRenderStats::default();
+    let mut insertions = BTreeMap::<(usize, i32), RegionalInsertion>::new();
     for index in 0..batch.len() {
         let (x, width) = clipped_geometry(batch.starts[index], batch.ends[index], viewport);
         if width <= 0.0 {
             continue;
         }
         let Some(row) = rows.rows[index] else {
-            hidden += 1;
+            stats.hidden += 1;
             continue;
         };
         let representative = rows.representative(index);
-        add_read_body(
-            display_list,
-            x,
-            options.reads_top + row as f32 * options.row_height,
-            width.max(1.0),
-            options.read_height,
+        let read_fill = if options.color_mode == AlignmentColorMode::None {
+            // Regional stacks need enough chroma and contrast to remain visibly
+            // occupied at hundreds of bases per pixel. Keep detailed/base mode's
+            // neutral fill, but use the familiar IGV-like purple at this scale.
+            Rgba::new(0.36, 0.05, 0.72, 1.0)
+        } else {
             alignment_color(
                 query,
                 index,
                 options.color_mode,
                 options.pair_length_bounds,
                 0.78,
-            ),
+            )
+        };
+        add_read_body(
+            display_list,
+            x,
+            options.reads_top + row as f32 * options.row_height,
+            width.max(1.0),
+            options.read_height,
+            read_fill,
             u32::try_from(representative + 1).unwrap_or(u32::MAX),
         );
         if options
@@ -567,7 +587,100 @@ pub(crate) fn add_spans(
                 options.read_height,
             );
         }
-        rendered += 1;
+        stats.rendered += 1;
+
+        let Some(cigar) = batch.cigar(index) else {
+            continue;
+        };
+        let mut reference_position = batch.starts[index];
+        for operation in cigar {
+            match operation.kind {
+                CigarOpKind::Match
+                | CigarOpKind::SequenceMatch
+                | CigarOpKind::SequenceMismatch
+                | CigarOpKind::Deletion
+                | CigarOpKind::ReferenceSkip => {
+                    reference_position =
+                        reference_position.saturating_add(u64::from(operation.len));
+                }
+                CigarOpKind::Insertion
+                    if operation.len >= options.minimum_indel_size
+                        && reference_position >= viewport.interval().start()
+                        && reference_position <= viewport.interval().end() =>
+                {
+                    let pixel = viewport.pixel_at_genomic(reference_position) as f32;
+                    let key = (row, pixel.round() as i32);
+                    let candidate = RegionalInsertion {
+                        index,
+                        row,
+                        anchor: reference_position,
+                        length: operation.len,
+                    };
+                    if let Some(previous) = insertions.get_mut(&key) {
+                        stats.regional_insertions_collapsed =
+                            stats.regional_insertions_collapsed.saturating_add(1);
+                        if (candidate.length, Reverse(candidate.index))
+                            > (previous.length, Reverse(previous.index))
+                        {
+                            *previous = candidate;
+                        }
+                    } else if insertions.len() < MAX_RENDERED_REGIONAL_INSERTIONS {
+                        insertions.insert(key, candidate);
+                    } else {
+                        stats.regional_insertions_omitted =
+                            stats.regional_insertions_omitted.saturating_add(1);
+                    }
+                }
+                CigarOpKind::Insertion
+                | CigarOpKind::SoftClip
+                | CigarOpKind::HardClip
+                | CigarOpKind::Padding => {}
+            }
+        }
     }
-    (rendered, hidden)
+
+    for insertion in insertions.into_values() {
+        let x = viewport.pixel_at_genomic(insertion.anchor) as f32;
+        let y = options.reads_top + insertion.row as f32 * options.row_height;
+        let representative = rows.representative(insertion.index);
+        let object_id =
+            read_detail_object_id(u32::try_from(representative + 1).unwrap_or(u32::MAX));
+        let labelled = insertion.length >= options.minimum_event_label_size;
+        // Small ONT insertion errors remain visible as fine pale notches, while
+        // label-sized events use the familiar high-contrast red `I` vocabulary.
+        let color = if labelled {
+            Rgba::new(0.90, 0.03, 0.08, 1.0)
+        } else {
+            Rgba::new(0.94, 0.94, 0.96, 0.92)
+        };
+        display_list.rectangles.push(RectPrimitive {
+            x: x - if labelled { 0.75 } else { 0.375 },
+            y: y - 1.0,
+            width: if labelled { 1.5 } else { 0.75 },
+            height: options.read_height + 2.0,
+            color,
+            object_id,
+        });
+        if labelled {
+            display_list.rectangles.push(RectPrimitive {
+                x: x - 2.0,
+                y: y - 1.0,
+                width: 4.0,
+                height: 1.5,
+                color,
+                object_id,
+            });
+        }
+        if labelled && options.row_height >= 5.0 {
+            display_list.texts.push(TextPrimitive {
+                x,
+                y: y + options.read_height * 0.5,
+                text: "I".to_owned(),
+                font_size: options.row_height.clamp(8.0, 11.0),
+                color,
+            });
+        }
+        stats.regional_insertions_rendered = stats.regional_insertions_rendered.saturating_add(1);
+    }
+    stats
 }

@@ -219,6 +219,7 @@ impl Viewer {
                     dictionary,
                     remote_io_stats,
                 } => {
+                    let reference_contig_count = dictionary.len();
                     self.reference_open_error = None;
                     self.reference_remote_io_stats = remote_io_stats;
                     self.reference_dictionary = Some(dictionary.clone());
@@ -265,12 +266,16 @@ impl Viewer {
                                 Err(_) => {}
                             }
                         }
+                        let default_annotation_count = self.assembly.default_annotation_count;
                         self.assembly = load_assembly(
                             &self.assembly_name,
                             dictionary,
                             self.cytoband_path.as_deref(),
                         );
+                        self.assembly.default_annotation_count = default_annotation_count;
                     }
+                    self.assembly.reference_contig_count = reference_contig_count;
+                    self.assembly.identity.clone_from(&self.assembly_identity);
                     self.synthetic = false;
                     if !self.has_alignment_engine() {
                         let source = self.reference_source.as_ref().map_or_else(
@@ -482,11 +487,18 @@ impl Viewer {
                             Err(_) => {}
                         }
                     }
+                    let default_annotation_count = self.assembly.default_annotation_count;
                     self.assembly = load_assembly(
                         &self.assembly_name,
                         dictionary.clone(),
                         self.cytoband_path.as_deref(),
                     );
+                    self.assembly.default_annotation_count = default_annotation_count;
+                    self.assembly.reference_contig_count = self
+                        .reference_dictionary
+                        .as_ref()
+                        .map_or(dictionary.len(), ReferenceDictionary::len);
+                    self.assembly.identity.clone_from(&self.assembly_identity);
                     self.request_all_panel_queries();
                 }
                 AlignmentEngineEvent::QueryCompleted {
@@ -496,6 +508,8 @@ impl Viewer {
                     cache_stats,
                     remote_io_stats,
                 } if event_is_current => {
+                    self.suggested_assembly_identity =
+                        rgv_hts::recognize_assembly_from_header(&query.header);
                     let is_active = request.panel_id() == active_panel_id;
                     if let Some(panel) = self.panels.get_mut(request.panel_id()) {
                         let has_pending_selection = panel
@@ -566,6 +580,11 @@ impl Viewer {
             } = &event
                 && self.automation_auxiliary_open_state.contains_key(track_id)
             {
+                tracing::warn!(
+                    track_id = track_id.get(),
+                    error = %message,
+                    "auxiliary track failed to open"
+                );
                 self.automation_auxiliary_open_state.insert(
                     *track_id,
                     AutomationAuxiliaryOpenState::Failed(message.clone()),

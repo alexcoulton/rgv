@@ -9,6 +9,37 @@ use crate::{
 
 pub const GENOME_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
 pub const MAXIMUM_DEFAULT_ANNOTATIONS: usize = 256;
+pub const MAXIMUM_GENOME_ASSET_PROVENANCE: usize = 256;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssemblyIdentityConfidence {
+    #[default]
+    Unknown,
+    Explicit,
+    Fingerprint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GenomeAssemblyIdentity {
+    pub stable_id: String,
+    pub display_name: String,
+    pub confidence: AssemblyIdentityConfidence,
+    pub provenance: String,
+    #[serde(default)]
+    pub matched_fingerprints: usize,
+    #[serde(default)]
+    pub expected_primary_contigs: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GenomeAssetProvenance {
+    pub role: String,
+    pub source: String,
+    pub version: String,
+    pub sha256: String,
+    pub license: String,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum GeneticCode {
@@ -72,6 +103,8 @@ pub struct GenomeAnnotation {
 pub struct GenomeConfiguration {
     pub schema_version: u32,
     pub name: String,
+    #[serde(default)]
+    pub assembly_identity: Option<GenomeAssemblyIdentity>,
     pub reference: TrackSource,
     #[serde(default)]
     pub cytobands: Option<TrackSource>,
@@ -79,6 +112,8 @@ pub struct GenomeConfiguration {
     pub contig_aliases: ContigAliases,
     #[serde(default)]
     pub default_annotations: Vec<GenomeAnnotation>,
+    #[serde(default)]
+    pub asset_provenance: Vec<GenomeAssetProvenance>,
 }
 
 impl GenomeConfiguration {
@@ -100,6 +135,16 @@ impl GenomeConfiguration {
         if self.name.trim().is_empty() || self.name.len() > 256 {
             return Err(GenomeConfigurationError::InvalidName);
         }
+        if self.assembly_identity.as_ref().is_some_and(|identity| {
+            identity.stable_id.trim().is_empty()
+                || identity.stable_id.len() > 256
+                || identity.display_name.trim().is_empty()
+                || identity.display_name.len() > 256
+                || identity.provenance.trim().is_empty()
+                || identity.provenance.len() > 4_096
+        }) {
+            return Err(GenomeConfigurationError::InvalidIdentity);
+        }
         if self.contig_aliases.len() > crate::MAXIMUM_CONTIG_ALIASES
             || self
                 .contig_aliases
@@ -116,6 +161,21 @@ impl GenomeConfiguration {
             })
         {
             return Err(GenomeConfigurationError::InvalidAnnotations);
+        }
+        if self.asset_provenance.len() > MAXIMUM_GENOME_ASSET_PROVENANCE
+            || self.asset_provenance.iter().any(|asset| {
+                asset.role.trim().is_empty()
+                    || asset.role.len() > 256
+                    || asset.source.trim().is_empty()
+                    || asset.source.len() > 4_096
+                    || asset.version.len() > 256
+                    || asset.sha256.len() != 64
+                    || !asset.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || asset.license.trim().is_empty()
+                    || asset.license.len() > 4_096
+            })
+        {
+            return Err(GenomeConfigurationError::InvalidAssetProvenance);
         }
         Ok(())
     }
@@ -155,12 +215,16 @@ pub enum GenomeConfigurationError {
     UnsupportedVersion(u32),
     #[error("genome configuration name is invalid")]
     InvalidName,
+    #[error("genome configuration assembly identity is invalid")]
+    InvalidIdentity,
     #[error("genome configuration contig aliases are invalid")]
     InvalidAliases,
     #[error(
         "genome configuration default annotations are invalid or exceed {MAXIMUM_DEFAULT_ANNOTATIONS} entries"
     )]
     InvalidAnnotations,
+    #[error("genome configuration asset provenance is invalid")]
+    InvalidAssetProvenance,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -185,17 +249,46 @@ pub struct Cytoband {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GenomeAssembly {
     pub name: String,
+    pub identity: Option<GenomeAssemblyIdentity>,
+    /// Number of contigs with configured reference sequence. This can be
+    /// smaller than the alignment dictionary used for navigation.
+    pub reference_contig_count: usize,
+    pub default_annotation_count: usize,
     pub dictionary: ReferenceDictionary,
     pub cytobands: Vec<Cytoband>,
 }
 
 impl GenomeAssembly {
     pub fn from_dictionary(name: impl Into<String>, dictionary: ReferenceDictionary) -> Self {
+        let reference_contig_count = dictionary.len();
         Self {
             name: name.into(),
+            identity: None,
+            reference_contig_count,
+            default_annotation_count: 0,
             dictionary,
             cytobands: Vec::new(),
         }
+    }
+
+    pub fn context_label(&self) -> String {
+        let Some(identity) = &self.identity else {
+            return self.name.clone();
+        };
+        if identity.expected_primary_contigs > 0
+            && self.reference_contig_count < identity.expected_primary_contigs
+        {
+            format!(
+                "{} · {}-contig subset",
+                identity.display_name, self.reference_contig_count
+            )
+        } else {
+            identity.display_name.clone()
+        }
+    }
+
+    pub fn has_cytobands(&self) -> bool {
+        !self.cytobands.is_empty()
     }
 
     pub fn cytobands_for(&self, contig: ContigId) -> impl Iterator<Item = &Cytoband> {
@@ -216,7 +309,13 @@ pub fn parse_ucsc_cytobands(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let fields = line.split_whitespace().collect::<Vec<_>>();
+        // UCSC represents unnamed bands as an empty fourth TSV column. Preserve
+        // that column instead of collapsing it with `split_whitespace`.
+        let fields = if line.contains('\t') {
+            line.split('\t').collect::<Vec<_>>()
+        } else {
+            line.split_whitespace().collect::<Vec<_>>()
+        };
         if fields.len() < 5 {
             return Err(CytobandParseError::FieldCount { line: line_number });
         }
@@ -301,12 +400,13 @@ mod tests {
     fn parses_ucsc_cytobands_and_ignores_unknown_contigs() {
         let dictionary = ReferenceDictionary::from_contigs([("chr1".to_owned(), 1_000)]);
         let bands = parse_ucsc_cytobands(
-            "chr1\t0\t400\tp11\tgneg\nchr1\t400\t500\tp12\tacen\nchrUn\t0\t5\tx\tgneg",
+            "chr1\t0\t400\tp11\tgneg\nchr1\t400\t500\tp12\tacen\nchr1\t500\t600\t\tgneg\nchrUn\t0\t5\tx\tgneg",
             &dictionary,
         )
         .unwrap();
-        assert_eq!(bands.len(), 2);
+        assert_eq!(bands.len(), 3);
         assert_eq!(bands[1].stain, CytobandStain::Centromere);
+        assert!(bands[2].name.is_empty());
     }
 
     #[test]
@@ -314,6 +414,7 @@ mod tests {
         let configuration = GenomeConfiguration {
             schema_version: GENOME_CONFIGURATION_SCHEMA_VERSION,
             name: "test".to_owned(),
+            assembly_identity: None,
             reference: TrackSource::Local {
                 path: "reference/genome.fa".to_owned(),
             },
@@ -328,6 +429,7 @@ mod tests {
                     path: "annotations/genes.gtf.gz".to_owned(),
                 },
             }],
+            asset_provenance: Vec::new(),
         };
         configuration.validate().unwrap();
         let directory = tempfile::tempdir().unwrap();

@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ContigAliases, GeneticCode, PanelId, ReferenceTranslationFrame, SampleMetadataError,
-    SampleMetadataTable, TrackConfig, TrackFormat, TrackId, TrackKind, TrackSource,
-    classify_genomic_source,
+    ContigAliases, GeneticCode, GenomeAssemblyIdentity, PanelId, ReferenceTranslationFrame,
+    SampleMetadataError, SampleMetadataTable, TrackConfig, TrackFormat, TrackId, TrackKind,
+    TrackSource, classify_genomic_source,
 };
 
 pub const SESSION_SCHEMA_VERSION: u32 = 3;
@@ -452,6 +452,11 @@ pub struct SessionFilters {
     pub show_reads: bool,
     #[serde(default)]
     pub coverage_scale_maximum: Option<u32>,
+    /// The legacy renderer used square-root heights. Missing fields deserialize
+    /// to that transform so old projects retain their appearance, while newly
+    /// constructed filters use the linear default below.
+    #[serde(default = "legacy_coverage_scale_transform")]
+    pub coverage_scale_transform: CoverageScaleTransform,
     #[serde(default = "default_true")]
     pub show_coverage_center_line: bool,
     #[serde(default = "default_alignment_density")]
@@ -509,23 +514,36 @@ impl Default for SessionFilters {
             show_junction_labels: true,
             show_reads: true,
             coverage_scale_maximum: None,
+            coverage_scale_transform: CoverageScaleTransform::Linear,
             show_coverage_center_line: true,
             alignment_density: default_alignment_density(),
             inspector_activation: InspectorActivation::default(),
             read_base_display_mode: ReadBaseDisplayMode::default(),
             shade_read_bases_by_quality: true,
             minimum_indel_size: 1,
-            minimum_event_label_size: 1,
+            minimum_event_label_size: 10,
             show_modified_bases: true,
             show_modification_frequency: true,
             minimum_modification_probability: 0,
             modified_base_color_mode: ModifiedBaseColorMode::ByType,
             hidden_modification_codes: Vec::new(),
-            include_secondary: true,
+            include_secondary: false,
             include_supplementary: true,
             auxiliary_predicates: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageScaleTransform {
+    #[default]
+    Linear,
+    SquareRoot,
+}
+
+const fn legacy_coverage_scale_transform() -> CoverageScaleTransform {
+    CoverageScaleTransform::SquareRoot
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -580,6 +598,8 @@ pub struct SessionDocument {
     pub remote_reference_index_url: Option<String>,
     #[serde(default)]
     pub genome_name: Option<String>,
+    #[serde(default)]
+    pub assembly_identity: Option<GenomeAssemblyIdentity>,
     #[serde(default)]
     pub cytobands: Option<TrackSource>,
     #[serde(default)]
@@ -640,6 +660,7 @@ impl MultiTrackSessionDocument {
             reference: self.reference,
             remote_reference_index_url: None,
             genome_name: None,
+            assembly_identity: None,
             cytobands: None,
             reference_reverse_complement: false,
             reference_translation_frames: Vec::new(),
@@ -674,6 +695,7 @@ impl LegacySessionDocument {
             reference: self.reference,
             remote_reference_index_url: None,
             genome_name: None,
+            assembly_identity: None,
             cytobands: None,
             reference_reverse_complement: false,
             reference_translation_frames: Vec::new(),
@@ -700,6 +722,7 @@ impl SessionDocument {
             reference: None,
             remote_reference_index_url: None,
             genome_name: None,
+            assembly_identity: None,
             cytobands: None,
             reference_reverse_complement: false,
             reference_translation_frames: Vec::new(),

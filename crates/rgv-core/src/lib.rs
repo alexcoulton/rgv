@@ -43,9 +43,11 @@ pub use coordinates::{
 };
 pub use generation::{GenerationClock, ViewportGeneration};
 pub use genome::{
-    Cytoband, CytobandParseError, CytobandStain, GENOME_CONFIGURATION_SCHEMA_VERSION, GeneticCode,
-    GenomeAnnotation, GenomeAssembly, GenomeConfiguration, GenomeConfigurationError,
-    MAXIMUM_DEFAULT_ANNOTATIONS, ReferenceTranslationFrame, parse_ucsc_cytobands,
+    AssemblyIdentityConfidence, Cytoband, CytobandParseError, CytobandStain,
+    GENOME_CONFIGURATION_SCHEMA_VERSION, GeneticCode, GenomeAnnotation, GenomeAssembly,
+    GenomeAssemblyIdentity, GenomeAssetProvenance, GenomeConfiguration, GenomeConfigurationError,
+    MAXIMUM_DEFAULT_ANNOTATIONS, MAXIMUM_GENOME_ASSET_PROVENANCE, ReferenceTranslationFrame,
+    parse_ucsc_cytobands,
 };
 pub use lod::{DetailLevel, RenderBudget};
 pub use navigation::NavigationHistory;
@@ -57,14 +59,14 @@ pub use sample_metadata::{
 };
 pub use session::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
-    BisulfiteContext, IgvImportReport, IgvSessionImport, InspectorActivation, JunctionDisplayMode,
-    MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_CONTIG_ALIASES, MAXIMUM_REGIONS_OF_INTEREST,
-    MAXIMUM_REVIEW_ITEMS, MAXIMUM_REVIEW_NOTE_BYTES, MAXIMUM_VIEW_PANELS, ModifiedBaseColorMode,
-    OverlappingMatePolicy, ReadBaseDisplayMode, RegionOfInterest, ReviewItem, ReviewStatus,
-    SESSION_SCHEMA_VERSION, SashimiCountMode, SashimiScaleMode, SbxDisplayOptions,
-    SbxSimplexTailMode, SessionAlignmentTrack, SessionDocument, SessionError, SessionFilters,
-    SessionLocus, SessionViewPanel, SmrtKineticsMode, UltimaDisplayOptions, UltimaQualityMode,
-    UnresolvedSessionSource,
+    BisulfiteContext, CoverageScaleTransform, IgvImportReport, IgvSessionImport,
+    InspectorActivation, JunctionDisplayMode, MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_CONTIG_ALIASES,
+    MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS, MAXIMUM_REVIEW_NOTE_BYTES,
+    MAXIMUM_VIEW_PANELS, ModifiedBaseColorMode, OverlappingMatePolicy, ReadBaseDisplayMode,
+    RegionOfInterest, ReviewItem, ReviewStatus, SESSION_SCHEMA_VERSION, SashimiCountMode,
+    SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode, SessionAlignmentTrack,
+    SessionDocument, SessionError, SessionFilters, SessionLocus, SessionViewPanel,
+    SmrtKineticsMode, UltimaDisplayOptions, UltimaQualityMode, UnresolvedSessionSource,
 };
 pub use settings::{
     DEFAULT_AUTOSAVE_INTERVAL_SECONDS, DEFAULT_AUTOSAVE_RETENTION, DEFAULT_CACHE_BUDGET_MIB,

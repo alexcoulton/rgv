@@ -807,6 +807,7 @@ impl Viewer {
                 });
                 session.reference = self.reference_source.clone();
                 session.genome_name = Some(self.assembly_name.clone());
+                session.assembly_identity = self.assembly_identity.clone();
                 session.cytobands = self.cytoband_path.as_deref().map(track_source);
                 match self.apply_session(&session) {
                     Ok(()) => {
@@ -1464,6 +1465,34 @@ impl Viewer {
                                 .saturating_sub(query.stats.records_emitted)
                         }),
                         truncated: query.is_some_and(|query| query.stats.truncated),
+                        filtered_secondary_items: query
+                            .map_or(0, |query| query.stats.records_filtered_secondary),
+                        filtered_supplementary_items: query
+                            .map_or(0, |query| query.stats.records_filtered_supplementary),
+                        filtered_user_items: query
+                            .map_or(0, |query| query.stats.records_filtered_user),
+                        filtered_duplicate_items: query
+                            .map_or(0, |query| query.stats.records_filtered_duplicate),
+                        filtered_qc_failed_items: query
+                            .map_or(0, |query| query.stats.records_filtered_qc_failed),
+                        regional_insertions_rendered: layout_stats
+                            .map_or(0, |stats| stats.regional_insertions_rendered),
+                        regional_insertions_collapsed: layout_stats
+                            .map_or(0, |stats| stats.regional_insertions_collapsed),
+                        regional_insertions_omitted: layout_stats
+                            .map_or(0, |stats| stats.regional_insertions_omitted),
+                        raw_maximum_coverage: layout_stats
+                            .map_or(0, |stats| stats.maximum_coverage),
+                        coverage_exact_complete: query
+                            .is_some_and(|query| query.pileup.provenance.exact_depth_complete),
+                        depth_segments_omitted: query
+                            .map_or(0, |query| query.pileup.provenance.depth_segments_omitted),
+                        packed_row_count: layout_stats.map_or(0, |stats| stats.packed_row_count),
+                        visible_occupied_rows: layout_stats
+                            .map_or(0, |stats| stats.visible_occupied_rows),
+                        visible_row_span: layout_stats.map_or(0, |stats| stats.visible_row_span),
+                        natural_stack_height: layout_stats
+                            .map_or(0, |stats| stats.natural_stack_height),
                     }
                 })
                 .collect();
@@ -1474,6 +1503,8 @@ impl Viewer {
                     start: interval.start(),
                     end: interval.end(),
                     detail_level: panel.viewport.detail_level(),
+                    pixel_width: panel.viewport.pixel_width(),
+                    bases_per_pixel: panel.viewport.bases_per_pixel(),
                     vertical_scroll_points: panel.vertical_scroll_points,
                     maximum_vertical_scroll_points: maximum_scroll,
                     render_generation: panel.generation_clock.current().get(),
@@ -1524,7 +1555,10 @@ impl Viewer {
                         modified_base_color_mode: track.config.filters.modified_base_color_mode,
                         show_reference: track.config.filters.show_reference,
                         show_coverage: track.config.filters.show_coverage,
+                        coverage_scale_transform: track.config.filters.coverage_scale_transform,
                         show_reads: track.config.filters.show_reads,
+                        include_secondary: track.config.filters.include_secondary,
+                        include_supplementary: track.config.filters.include_supplementary,
                     }),
                 }
             })
@@ -1565,9 +1599,27 @@ impl Viewer {
             workspace_revision: self.workspace_revision,
             genome: AutomationGenomeSnapshot {
                 name: self.assembly_name.clone(),
+                context_label: self.assembly.context_label(),
+                assembly_identity: self.assembly_identity.clone(),
+                suggested_assembly_identity: self.suggested_assembly_identity.clone(),
                 reference_configured: self.reference_engine.is_some(),
                 reference_ready: self.reference_engine.is_some()
                     && self.reference_dictionary.is_some(),
+                reference_contig_count: self.assembly.reference_contig_count,
+                navigation_contig_count: self.assembly.dictionary.len(),
+                reference_is_subset: self.assembly_identity.as_ref().is_some_and(|identity| {
+                    identity.expected_primary_contigs > 0
+                        && self.assembly.reference_contig_count < identity.expected_primary_contigs
+                }),
+                cytobands_loaded: self.assembly.has_cytobands(),
+                default_annotation_count: self.assembly.default_annotation_count,
+                gene_model_track_count: self
+                    .tracks
+                    .tracks()
+                    .iter()
+                    .filter(|track| track.kind == TrackKind::GeneModel)
+                    .count(),
+                contig_alias_count: self.contig_aliases.len(),
             },
             settled: self.automation_data_is_settled(),
             active_panel_id: self.panels.active().id,
@@ -2036,6 +2088,22 @@ impl Viewer {
                         self.primary_filter_editor_mut().minimum_mapq =
                             requested.unwrap_or_default();
                     }
+                    "include_secondary" => {
+                        let requested = automation_bool(value, key)?;
+                        query_changed =
+                            requested != self.primary_active_filters().include_secondary;
+                        self.primary_alignment_filters_mut().include_secondary = requested;
+                        self.primary_active_filters_mut().include_secondary = requested;
+                        self.primary_filter_editor_mut().include_secondary = requested;
+                    }
+                    "include_supplementary" => {
+                        let requested = automation_bool(value, key)?;
+                        query_changed =
+                            requested != self.primary_active_filters().include_supplementary;
+                        self.primary_alignment_filters_mut().include_supplementary = requested;
+                        self.primary_active_filters_mut().include_supplementary = requested;
+                        self.primary_filter_editor_mut().include_supplementary = requested;
+                    }
                     "minimum_base_quality" => {
                         self.primary_alignment_filters_mut().minimum_base_quality =
                             automation_u8(automation_u64(value, key)?, key)?;
@@ -2062,6 +2130,15 @@ impl Viewer {
                             .transpose()?;
                         anyhow::ensure!(maximum != Some(0), "{key} must be positive or null");
                         self.primary_alignment_filters_mut().coverage_scale_maximum = maximum;
+                    }
+                    "coverage_scale_transform" => {
+                        let requested = automation_name(value, key)?;
+                        self.primary_alignment_filters_mut()
+                            .coverage_scale_transform = match requested.as_str() {
+                            "linear" => CoverageScaleTransform::Linear,
+                            "square_root" => CoverageScaleTransform::SquareRoot,
+                            _ => anyhow::bail!("{key} must be linear or square_root"),
+                        };
                     }
                     "minimum_indel_size" => {
                         let minimum = automation_u32(automation_u64(value, key)?, key)?;
@@ -2215,6 +2292,21 @@ impl Viewer {
             AutomationSetting::AlignmentDensity { value } => self.apply_automation_option(
                 &AutomationOptionScope::Workspace,
                 "vertical_density",
+                &serde_json::json!(value),
+            )?,
+            AutomationSetting::IncludeSecondary { value } => self.apply_automation_option(
+                &AutomationOptionScope::Workspace,
+                "include_secondary",
+                &serde_json::json!(value),
+            )?,
+            AutomationSetting::IncludeSupplementary { value } => self.apply_automation_option(
+                &AutomationOptionScope::Workspace,
+                "include_supplementary",
+                &serde_json::json!(value),
+            )?,
+            AutomationSetting::CoverageScaleTransform { value } => self.apply_automation_option(
+                &AutomationOptionScope::Workspace,
+                "coverage_scale_transform",
                 &serde_json::json!(value),
             )?,
             AutomationSetting::ReadBaseDisplayMode { value } => {

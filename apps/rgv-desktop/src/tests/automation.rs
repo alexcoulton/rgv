@@ -307,6 +307,7 @@ fn automation_structured_exports_preserve_active_interval_semantics() {
                 records_emitted: 1,
                 truncated: false,
                 cancelled: false,
+                ..QueryStats::default()
             },
         }),
     }];

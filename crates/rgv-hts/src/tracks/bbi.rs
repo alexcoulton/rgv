@@ -126,15 +126,16 @@ fn validate_bigbed_schema<R>(
     reader: &BigBedRead<R>,
     format: BigBedFeatureFormat,
 ) -> Result<(), TrackError> {
-    let expected = match format {
+    let (expected, extended) = match format {
         BigBedFeatureFormat::Bed => return Ok(()),
-        BigBedFeatureFormat::BigGenePred => 20,
-        BigBedFeatureFormat::BigNarrowPeak => 10,
+        BigBedFeatureFormat::BigGenePred => (20, true),
+        BigBedFeatureFormat::BigNarrowPeak => (10, false),
     };
     let actual = reader.info().header.field_count;
-    if actual != expected {
+    if (extended && actual < expected) || (!extended && actual != expected) {
+        let qualifier = if extended { "at least" } else { "exactly" };
         return Err(TrackError::InvalidSchema(format!(
-            "{} requires exactly {expected} BigBed fields, but the file declares {actual}",
+            "{} requires {qualifier} {expected} BigBed fields, but the file declares {actual}",
             bigbed_format_name(format)
         )));
     }
@@ -431,9 +432,9 @@ pub(super) fn parse_big_gene_pred_record(
     rest: &str,
 ) -> Result<FeatureRecord, String> {
     let fields = rest.split('\t').collect::<Vec<_>>();
-    if fields.len() != 17 {
+    if fields.len() < 17 {
         return Err(format!(
-            "bigGenePred requires 17 non-coordinate fields, found {}",
+            "bigGenePred requires at least 17 non-coordinate fields, found {}",
             fields.len()
         ));
     }
@@ -458,9 +459,17 @@ pub(super) fn parse_big_gene_pred_record(
             "bigGenePred thick interval must be contained within the transcript".to_owned(),
         );
     }
-    let item_rgb = fields[5]
-        .parse::<u32>()
-        .map_err(|_| format!("invalid bigGenePred reserved/itemRgb value: {}", fields[5]))?;
+    let item_rgb = fields[5];
+    let numeric_item_rgb = item_rgb.parse::<u32>().is_ok();
+    let channel_item_rgb = {
+        let channels = item_rgb.split(',').collect::<Vec<_>>();
+        channels.len() == 3 && channels.iter().all(|channel| channel.parse::<u8>().is_ok())
+    };
+    if !numeric_item_rgb && !channel_item_rgb {
+        return Err(format!(
+            "invalid bigGenePred reserved/itemRgb value: {item_rgb}"
+        ));
+    }
     let block_count = fields[6]
         .parse::<usize>()
         .map_err(|_| format!("invalid bigGenePred block count: {}", fields[6]))?;
@@ -526,7 +535,7 @@ pub(super) fn parse_big_gene_pred_record(
     let mut attributes = vec![
         ("transcript_id".to_owned(), transcript_name.to_owned()),
         ("source_format".to_owned(), "bigGenePred".to_owned()),
-        ("item_rgb".to_owned(), item_rgb.to_string()),
+        ("item_rgb".to_owned(), item_rgb.to_owned()),
         ("cds_start_status".to_owned(), fields[10].to_owned()),
         ("cds_end_status".to_owned(), fields[11].to_owned()),
         ("exon_frames".to_owned(), fields[12].to_owned()),
@@ -542,6 +551,18 @@ pub(super) fn parse_big_gene_pred_record(
             attributes.push((key.to_owned(), value.to_owned()));
         }
     }
+    attributes.extend(
+        fields[17..]
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| !value.is_empty() && **value != ".")
+            .map(|(index, value)| {
+                (
+                    format!("extension_field_{}", index + 1),
+                    (*value).to_owned(),
+                )
+            }),
+    );
     Ok(FeatureRecord {
         contig: contig.to_owned(),
         start,

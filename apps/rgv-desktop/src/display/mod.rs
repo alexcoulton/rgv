@@ -216,6 +216,75 @@ impl Viewer {
             top = bottom;
             scroll_clip_top = bottom;
         }
+        // Gene models are reference context, so keep them immediately above the
+        // primary alignment instead of placing them below an arbitrarily tall
+        // read stack. This preserves visible gene context while reads scroll.
+        let pinned_gene_configs = self
+            .tracks
+            .tracks()
+            .iter()
+            .filter(|track| track.visible && track.kind == TrackKind::GeneModel)
+            .cloned()
+            .collect::<Vec<_>>();
+        for config in pinned_gene_configs {
+            let frame_top = top;
+            let height = if config.collapsed {
+                26.0
+            } else {
+                (config.height
+                    * auxiliary_track_scale(self.primary_alignment_filters().alignment_density))
+                .clamp(40.0, 1_200.0)
+            };
+            let bottom = frame_top + height;
+            if !config.collapsed
+                && tracks_overlap_viewport
+                && let Some(TrackSnapshot {
+                    data: TrackSnapshotData::Features(records),
+                    ..
+                }) = self
+                    .panels
+                    .active()
+                    .track_snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.id == config.id)
+            {
+                let options = TrackLayoutOptions {
+                    top: frame_top,
+                    height,
+                    selected_record: self
+                        .panels
+                        .active()
+                        .selected_feature
+                        .filter(|selection| selection.track_id == config.id)
+                        .map(|selection| selection.record_index),
+                    object_id_base: 1_000_000_u32.saturating_add(
+                        u32::try_from(config.id.get())
+                            .unwrap_or(u32::MAX)
+                            .saturating_mul(100_000),
+                    ),
+                    feature_display_mode: config.feature.display_mode,
+                    ..TrackLayoutOptions::default()
+                };
+                let gene_display =
+                    layout_features(records, self.panels.active().viewport, options).0;
+                pinned_display.rectangles.extend(gene_display.rectangles);
+                pinned_display.texts.extend(gene_display.texts);
+            }
+            self.panels.active_mut().track_frames.push(TrackFrame {
+                key: TrackFrameKey::Auxiliary(config.id),
+                name: config.name,
+                kind: config.kind,
+                source_label: Some(config.source.redacted_label()),
+                top: frame_top,
+                bottom,
+                visible: true,
+                collapsed: config.collapsed,
+                frozen_bottom: Some(bottom),
+                subtracks: Vec::new(),
+            });
+            top = bottom;
+            scroll_clip_top = bottom;
+        }
         if self.primary_alignment_visible()
             && !self.primary_alignment_collapsed()
             && let Some(query) = self
@@ -258,6 +327,8 @@ impl Viewer {
             options.coverage_height = (48.0 * secondary_scale).clamp(28.0, 84.0);
             options.coverage_scale_maximum =
                 self.primary_alignment_filters().coverage_scale_maximum;
+            options.coverage_scale_transform =
+                self.primary_alignment_filters().coverage_scale_transform;
             if self.primary_alignment_filters().show_coverage {
                 lane_top += options.coverage_height + 6.0;
             } else {
@@ -480,18 +551,12 @@ impl Viewer {
                         ));
                     }
                     if self.primary_alignment_filters().show_coverage {
-                        let scale = self
-                            .primary_alignment_filters()
-                            .coverage_scale_maximum
-                            .map_or_else(
-                                || format!("auto {}×", layout.stats.maximum_coverage),
-                                |maximum| {
-                                    format!(
-                                        "max {}× · fixed {maximum}×",
-                                        layout.stats.maximum_coverage
-                                    )
-                                },
-                            );
+                        let scale = alignment::coverage_scale_detail(
+                            layout.stats.maximum_coverage,
+                            self.primary_alignment_filters().coverage_scale_maximum,
+                            self.primary_alignment_filters().coverage_scale_transform,
+                            query.pileup.provenance.exact_depth_complete,
+                        );
                         subtracks.push(TrackSubtrack {
                             label: "Coverage".to_owned(),
                             detail: Some(scale),
@@ -575,6 +640,11 @@ impl Viewer {
                                 ));
                             }
                         }
+                        read_details.extend(alignment::filtered_read_details(query.stats));
+                        if let Some(detail) = alignment::regional_insertion_detail(layout.stats) {
+                            read_details.push(detail);
+                        }
+                        read_details.push(alignment::row_occupancy_detail(layout.stats));
                         if layout.stats.bisulfite_marks_omitted > 0 {
                             read_details.push(format!(
                                 "{} bisulfite marks omitted at display cap",
@@ -771,7 +841,7 @@ impl Viewer {
             .tracks
             .tracks()
             .iter()
-            .filter(|track| track.visible)
+            .filter(|track| track.visible && track.kind != TrackKind::GeneModel)
             .collect::<Vec<_>>();
         let mut rendered_overlay_groups = BTreeSet::new();
         for config in &visible_configs {

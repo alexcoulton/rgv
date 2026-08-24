@@ -156,6 +156,7 @@ impl Viewer {
         let mut show_reads = settings_filters.show_reads;
         let mut use_fixed_coverage_scale = settings_filters.coverage_scale_maximum.is_some();
         let mut coverage_scale_maximum = settings_filters.coverage_scale_maximum.unwrap_or(100);
+        let mut coverage_scale_transform = settings_filters.coverage_scale_transform;
         let mut show_coverage_center_line = settings_filters.show_coverage_center_line;
         let mut alignment_density = settings_filters.alignment_density;
         let mut inspector_activation = settings_filters.inspector_activation;
@@ -424,6 +425,7 @@ impl Viewer {
         let genomic_texts = self.composite_display_list.texts.clone();
         let selected_track = self.panels.active().selected_track;
         let assembly = self.assembly.clone();
+        let assembly_label = assembly.context_label();
         let contigs = assembly
             .dictionary
             .iter()
@@ -685,7 +687,39 @@ impl Viewer {
                             }
                         });
                         ui.menu_button("Genomes", |ui| {
-                            ui.label(&assembly.name);
+                            ui.label(&assembly_label);
+                            if let Some(identity) = &assembly.identity {
+                                ui.small(format!(
+                                    "{} · {:?} · {} fingerprint matches",
+                                    identity.stable_id,
+                                    identity.confidence,
+                                    identity.matched_fingerprints
+                                ));
+                            } else if let Some(suggestion) = &self.suggested_assembly_identity {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(150, 92, 20),
+                                    format!(
+                                        "Suggested: {} ({} fingerprint matches); load a genome configuration to confirm",
+                                        suggestion.display_name, suggestion.matched_fingerprints
+                                    ),
+                                );
+                            } else {
+                                ui.small("Assembly unidentified");
+                            }
+                            ui.small(format!(
+                                "Reference: {} contigs · cytobands: {} · default annotations: {}",
+                                assembly.reference_contig_count,
+                                if assembly.has_cytobands() { "loaded" } else { "missing" },
+                                assembly.default_annotation_count,
+                            ));
+                            if !assembly.has_cytobands()
+                                || assembly.default_annotation_count == 0
+                            {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(150, 92, 20),
+                                    "Genome context incomplete — open a genome configuration",
+                                );
+                            }
                             if ui.button("Open FASTA…").clicked() {
                                 open_reference_requested = true;
                                 ui.close();
@@ -857,16 +891,16 @@ impl Viewer {
                 .show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
                         let assembly_response = egui::ComboBox::from_id_salt("assembly-selector")
-                            .selected_text(&assembly.name)
+                            .selected_text(&assembly_label)
                             .width(145.0)
                             .show_ui(ui, |ui| {
-                                let _ = ui.selectable_label(true, &assembly.name);
+                                let _ = ui.selectable_label(true, &assembly_label);
                             });
                         assembly_response.response.widget_info(|| {
                             egui::WidgetInfo::labeled(
                                 egui::WidgetType::ComboBox,
                                 true,
-                                format!("Genome assembly; {}", assembly.name),
+                                format!("Genome assembly; {assembly_label}"),
                             )
                         });
                         let contig_response = egui::ComboBox::from_id_salt("contig-selector")
@@ -1616,6 +1650,28 @@ impl Viewer {
                                     .labelled_by(label.id);
                             });
                             ui.checkbox(&mut use_fixed_coverage_scale, "Fixed coverage scale");
+                            ui.horizontal(|ui| {
+                                let label = ui.label("Coverage transform");
+                                egui::ComboBox::from_id_salt("coverage-scale-transform")
+                                    .selected_text(match coverage_scale_transform {
+                                        CoverageScaleTransform::Linear => "Linear",
+                                        CoverageScaleTransform::SquareRoot => "Square root",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut coverage_scale_transform,
+                                            CoverageScaleTransform::Linear,
+                                            "Linear",
+                                        );
+                                        ui.selectable_value(
+                                            &mut coverage_scale_transform,
+                                            CoverageScaleTransform::SquareRoot,
+                                            "Square root",
+                                        );
+                                    })
+                                    .response
+                                    .labelled_by(label.id);
+                            });
                             if use_fixed_coverage_scale {
                                 ui.horizontal(|ui| {
                                     ui.label("Coverage maximum");
@@ -3038,6 +3094,8 @@ impl Viewer {
                 || show_reads != self.primary_alignment_filters().show_reads
                 || requested_coverage_scale
                     != self.primary_alignment_filters().coverage_scale_maximum
+                || coverage_scale_transform
+                    != self.primary_alignment_filters().coverage_scale_transform
                 || show_coverage_center_line
                     != self.primary_alignment_filters().show_coverage_center_line
                 || (alignment_density - self.primary_alignment_filters().alignment_density).abs()
@@ -3086,6 +3144,8 @@ impl Viewer {
             }
             self.primary_alignment_filters_mut().show_reads = show_reads;
             self.primary_alignment_filters_mut().coverage_scale_maximum = requested_coverage_scale;
+            self.primary_alignment_filters_mut()
+                .coverage_scale_transform = coverage_scale_transform;
             self.primary_alignment_filters_mut()
                 .show_coverage_center_line = show_coverage_center_line;
             self.primary_alignment_filters_mut().alignment_density =
@@ -3401,6 +3461,7 @@ impl Viewer {
             filters.show_junction_labels = show_junction_labels;
             filters.show_reads = show_reads;
             filters.coverage_scale_maximum = requested_coverage_scale;
+            filters.coverage_scale_transform = coverage_scale_transform;
             filters.show_coverage_center_line = show_coverage_center_line;
             filters.alignment_density =
                 alignment_density.clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);

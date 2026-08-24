@@ -68,6 +68,13 @@ sort order default to natural ordering; base sorting uses the centre of each pan
 colour, group, or sort tags must be valid two-character SAM tags. These additions do not reinterpret
 an existing field and therefore do not require a schema bump.
 
+Coverage-transform compatibility is deliberately asymmetric: newly created alignment tracks use
+linear coverage heights, while a serialized track that predates the `coverage_scale_transform`
+field loads as `square_root`, preserving its former presentation. The raw coverage metric itself is
+not migrated: it now means exact maximum concurrent aligned-base depth within each display bin.
+Likewise, changing the new-track secondary-alignment default to off does not reinterpret saved
+`include_secondary` values. Optional assembly-identity fields mean unidentified/custom when absent.
+
 Saving always emits version 3. Remote credentials, query parameters, and fragments are redacted for
 every alignment, reference, and auxiliary source. Unknown future schemas are rejected before full
 deserialization and are never overwritten automatically. A session is limited to 64 alignment

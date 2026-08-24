@@ -529,8 +529,31 @@ where
             stats.cancelled = true;
             break;
         }
-        if !eligible(&record, header, options)? {
-            continue;
+        match eligibility(&record, header, options)? {
+            Eligibility::Eligible => {}
+            Eligibility::Secondary => {
+                stats.records_filtered_secondary =
+                    stats.records_filtered_secondary.saturating_add(1);
+                continue;
+            }
+            Eligibility::Supplementary => {
+                stats.records_filtered_supplementary =
+                    stats.records_filtered_supplementary.saturating_add(1);
+                continue;
+            }
+            Eligibility::UserFilter {
+                duplicate,
+                qc_failed,
+            } => {
+                stats.records_filtered_user = stats.records_filtered_user.saturating_add(1);
+                stats.records_filtered_duplicate = stats
+                    .records_filtered_duplicate
+                    .saturating_add(usize::from(duplicate));
+                stats.records_filtered_qc_failed = stats
+                    .records_filtered_qc_failed
+                    .saturating_add(usize::from(qc_failed));
+                continue;
+            }
         }
         stats.records_eligible = stats.records_eligible.saturating_add(1);
         let flags = AlignmentFlags::from_bits(record.flags()?.bits());
@@ -618,6 +641,7 @@ where
         overlapping_mate_policy: overlap_collapser.policy(),
         overlap_collapse_complete: overlap_collapser.complete(),
         collapsed_mate_bases: overlap_collapser.collapsed_mate_bases(),
+        ..PileupProvenance::default()
     });
     if let Some(modifications) = modifications {
         pileup.modifications = modifications.finish(stats.records_eligible, !stats.cancelled);
@@ -918,21 +942,34 @@ fn cancelled_query(
     }
 }
 
-fn eligible(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Eligibility {
+    Eligible,
+    Secondary,
+    Supplementary,
+    UserFilter { duplicate: bool, qc_failed: bool },
+}
+
+fn eligibility(
     record: &dyn sam::alignment::Record,
     _header: &sam::Header,
     options: &QueryOptions,
-) -> Result<bool, AlignmentError> {
+) -> Result<Eligibility, AlignmentError> {
     let flags = record.flags()?.bits();
-    if (!options.include_secondary && flags & 0x100 != 0)
-        || (!options.include_supplementary && flags & 0x800 != 0)
-    {
-        return Ok(false);
+    if !options.include_secondary && flags & 0x100 != 0 {
+        return Ok(Eligibility::Secondary);
     }
+    if !options.include_supplementary && flags & 0x800 != 0 {
+        return Ok(Eligibility::Supplementary);
+    }
+    let filtered = || Eligibility::UserFilter {
+        duplicate: flags & 0x400 != 0,
+        qc_failed: flags & 0x200 != 0,
+    };
     let filter = &options.filter;
     if flags & filter.required_flags != filter.required_flags || flags & filter.excluded_flags != 0
     {
-        return Ok(false);
+        return Ok(filtered());
     }
     let mapping_quality = record
         .mapping_quality()
@@ -941,7 +978,7 @@ fn eligible(
     if let Some(minimum) = filter.minimum_mapping_quality
         && mapping_quality.is_none_or(|value| value < minimum)
     {
-        return Ok(false);
+        return Ok(filtered());
     }
     let data = record.data();
     for predicate in &filter.auxiliary {
@@ -949,16 +986,16 @@ fn eligible(
         let value = data.get(&tag).transpose()?.map(normalize_aux).transpose()?;
         if predicate.comparison == AuxComparison::Exists {
             if value.is_none() {
-                return Ok(false);
+                return Ok(filtered());
             }
         } else if !value
             .as_ref()
             .is_some_and(|value| predicate.matches_value(value))
         {
-            return Ok(false);
+            return Ok(filtered());
         }
     }
-    Ok(true)
+    Ok(Eligibility::Eligible)
 }
 
 fn sampling_score(

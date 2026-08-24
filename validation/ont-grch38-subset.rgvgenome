@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "name": "ONT human variation demo",
+  "assembly_identity": {
+    "stable_id": "GRCh38.no_alt_analysis_set",
+    "display_name": "GRCh38",
+    "confidence": "explicit",
+    "provenance": "Confirmed by the genome configuration and BAM @SQ length/M5 fingerprints for chr6, chr20, and chrM.",
+    "matched_fingerprints": 3,
+    "expected_primary_contigs": 25
+  },
+  "reference": {
+    "Local": {
+      "path": "/Users/alexcoulton/work/external.repos/ont_test/wf-human-variation-demo/demo.fasta"
+    }
+  },
+  "cytobands": {
+    "Local": {
+      "path": "assets/grch38/cytoBandIdeo.txt"
+    }
+  },
+  "contig_aliases": {
+    "6": "chr6",
+    "20": "chr20",
+    "MT": "chrM"
+  },
+  "default_annotations": [
+    {
+      "name": "MANE Select",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "assets/grch38/mane.bb"
+        }
+      }
+    }
+  ],
+  "asset_provenance": [
+    {
+      "role": "partial_reference",
+      "source": "ONT wf-human-variation demo data; GRCh38 no-alt analysis set subset",
+      "version": "local qualification dataset",
+      "sha256": "50c15bd3c4bf5a3ee288db8f48bed59801c5d522bac6ab4188a6c452fc331995",
+      "license": "See the ONT demo dataset README and upstream GRCh38 terms."
+    },
+    {
+      "role": "cytobands",
+      "source": "https://hgdownload.soe.ucsc.edu/goldenPath/hg38/database/cytoBandIdeo.txt.gz",
+      "version": "UCSC hg38 database, modified 2022-10-28",
+      "sha256": "ce1b6033a5243e7c5022660b952d2ec33243e307e909afcaeec1894641a5208f",
+      "license": "UCSC raw table data are freely available for public and commercial use; cite UCSC."
+    },
+    {
+      "role": "gene_model",
+      "source": "https://hgdownload.soe.ucsc.edu/gbdb/hg38/mane/mane.bb",
+      "version": "UCSC hg38 MANE bigGenePred, modified 2025-12-08",
+      "sha256": "304e3e37d34b7e7b3e32cb9aa65bcd2d254473a7048d5a1fb517148abbe0b4bc",
+      "license": "UCSC raw binary data are freely available for public and commercial use; cite UCSC and MANE/NCBI."
+    }
+  ]
+}

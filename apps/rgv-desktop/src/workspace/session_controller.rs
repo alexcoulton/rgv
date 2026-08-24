@@ -226,6 +226,11 @@ impl Viewer {
         if let Some(name) = &session.genome_name {
             self.assembly_name.clone_from(name);
         }
+        self.assembly_identity
+            .clone_from(&session.assembly_identity);
+        self.assembly
+            .identity
+            .clone_from(&session.assembly_identity);
         self.cytoband_path = match &session.cytobands {
             Some(TrackSource::Local { path }) => Some(PathBuf::from(path)),
             Some(TrackSource::Remote { .. }) => {
@@ -236,6 +241,12 @@ impl Viewer {
         self.contig_aliases.clone_from(&session.contig_aliases);
         let (specifications, tracks) = session_track_specs(session);
         self.tracks = tracks;
+        self.automation_auxiliary_open_state.extend(
+            self.tracks
+                .tracks()
+                .iter()
+                .map(|track| (track.id, AutomationAuxiliaryOpenState::Pending)),
+        );
         self.track_engine =
             (!specifications.is_empty()).then(|| TrackEngine::spawn(specifications, 8));
         self.panels = PanelWorkspace::from_session(
@@ -330,6 +341,7 @@ impl Viewer {
             reference: self.reference_source.clone(),
             remote_reference_index_url: self.remote_reference_index_url.clone(),
             genome_name: Some(self.assembly_name.clone()),
+            assembly_identity: self.assembly_identity.clone(),
             cytobands: self.cytoband_path.as_deref().map(track_source),
             reference_reverse_complement: self.reference_reverse_complement,
             reference_translation_frames: self.reference_translation_frames.clone(),

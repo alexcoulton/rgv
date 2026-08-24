@@ -504,6 +504,7 @@ pub(crate) fn copy_compatible_alignment_appearance(
     target.show_junction_labels = source.show_junction_labels;
     target.show_reads = source.show_reads;
     target.coverage_scale_maximum = source.coverage_scale_maximum;
+    target.coverage_scale_transform = source.coverage_scale_transform;
     target.show_coverage_center_line = source.show_coverage_center_line;
     target.alignment_density = source.alignment_density;
     target.inspector_activation = source.inspector_activation;

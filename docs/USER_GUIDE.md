@@ -138,8 +138,10 @@ settings can order genotype rows by pedigree: child first, then father, mother, 
 members. If parent columns are unavailable, RGV states that it is retaining VCF header order.
 
 - The compact navigation toolbar keeps assembly, contig, locus, history, and zoom controls together.
-  The chromosome bar marks the visible span; a cytoband ideogram replaces the fallback bar when
-  `--cytobands` is supplied. Coordinate ruler labels always use one-based display positions.
+  The chromosome row uses a cytoband ideogram when `--cytobands` is supplied and a fallback bar
+  otherwise. A separate coverage/read-density overview rail directly below it retains the blue
+  visible-span handle and horizontal pan/zoom interactions. Coordinate ruler labels always use
+  one-based display positions.
 - The chromosome overview supports Ableton-style direct navigation: drag left/right to pan, drag
   down/up to zoom in/out around the press position, click to recenter, and double-click to show the
   complete contig. Indexed BAM sources contribute a stable, logarithmic whole-contig occupancy
@@ -231,13 +233,19 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   shading can be disabled without changing the underlying base qualities. “Show indels ≥” removes
   smaller insertion/deletion markers while “Label events ≥” independently suppresses text labels;
   reference skips remain visible because hiding them would misrepresent spliced alignment geometry.
+  Regional views retain CIGAR insertions as fixed-pixel marks: short events use fine pale notches,
+  while label-sized events use a prominent red `I` (10 bp or longer for new tracks by default).
+  Compact rows retain the high-contrast red tick. Same-row events landing in one pixel are collapsed
+  deterministically and the gutter reports shown, collapsed, and omitted counts.
 - Reference, coverage, Sashimi, aggregate-modification, and read lanes have independent visibility
   controls. Click the eye beside a lane in the track gutter to hide or show it. A hidden lane
   collapses to a compact labelled row with a closed eye, so it can be restored in the same place;
   the alignment track's submenu under **Tracks** is a second recovery path. Hidden lanes cannot be
-  picked. Coverage can autoscale to
-  the current visible maximum or use a positive fixed maximum; the gutter always reports both the
-  observed maximum and active scale. Expanded, Squished, and Collapsed buttons set useful read-row
+  picked. Coverage can autoscale to the current visible maximum or use a positive fixed maximum.
+  Each bin is the exact maximum concurrent aligned-base depth at a position inside that bin, not
+  the number of reads touching a wide bin. Linear and square-root height transforms are explicit;
+  the gutter reports the raw maximum, transform, fixed scale, and any incomplete event-budget
+  provenance. Expanded, Squished, and Collapsed buttons set useful read-row
   densities, while the right overview remains available for continuous adjustment. Lane visibility,
   fixed scale, and the exact continuous density survive session round trips.
 - Modified-base controls use stable colours per `MM` modification code, a live legend with
@@ -291,7 +299,9 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   grey, while their unavailable classification and any 50,000-mark tail-display truncation are
   disclosed in the track gutter.
 - Filters accept a minimum MAPQ, secondary/supplementary switches, and semicolon-separated tag
-  predicates such as `HP=1;RG=tumour;MM`.
+  predicates such as `HP=1;RG=tumour;MM`. New tracks exclude secondary alignments and include
+  supplementary alignments by default. The gutter, diagnostics, exports, and MCP snapshots report
+  exclusions; saved projects retain their explicit choices.
 
 RGV retains every eligible alignment for ordinary detailed views; it does not apply IGV-style
 per-window read downsampling. The configurable **Read safety cap** is an emergency workspace

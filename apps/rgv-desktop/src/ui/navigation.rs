@@ -6,7 +6,7 @@ use rgv_layout::{
 
 use super::TRACK_GUTTER_WIDTH;
 
-pub const GENOME_CONTEXT_HEIGHT: f32 = 62.0;
+pub const GENOME_CONTEXT_HEIGHT: f32 = 79.0;
 pub const GENOME_OVERVIEW_BINS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -162,9 +162,13 @@ pub fn paint_genome_context(
     let ideogram_rect = Rect::from_min_size(
         pos2(
             content.left() + 8.0,
-            rect.top() + if show_gutter { 5.0 } else { 18.0 },
+            rect.top() + if show_gutter { 4.0 } else { 10.0 },
         ),
         vec2((content.width() - 16.0).max(1.0), 13.0),
+    );
+    let overview_rect = Rect::from_min_size(
+        pos2(ideogram_rect.left(), ideogram_rect.bottom() + 5.0),
+        ideogram_rect.size(),
     );
     let ideogram = layout_ideogram(
         assembly,
@@ -173,23 +177,23 @@ pub fn paint_genome_context(
         viewport.interval(),
         ideogram_rect.width(),
     );
-    let ideogram_response = ui
+    let overview_response = ui
         .interact(
-            ideogram_rect,
-            egui::Id::new(("genome-context-ideogram", id_salt)),
+            overview_rect,
+            egui::Id::new(("genome-context-overview", id_salt)),
             egui::Sense::click_and_drag(),
         )
         .on_hover_cursor(egui::CursorIcon::AllScroll)
         .on_hover_text(
-            "Coverage density is shown inside the rail · drag left/right to pan · drag down/up to zoom in/out · double-click to show all",
+            "Coverage/read density overview · drag left/right to pan · drag down/up to zoom in/out · double-click to show all",
         );
     let visible_interval = viewport.interval();
-    ideogram_response.widget_info(|| {
+    overview_response.widget_info(|| {
         egui::WidgetInfo::slider(
             true,
             visible_interval.start() as f64,
             format!(
-                "Genome overview for {contig_name}; visible bases {} through {}. Arrow left and right pan, arrow down and up zoom in and out, Home shows the full contig",
+                "Coverage overview for {contig_name}; visible bases {} through {}. Arrow left and right pan, arrow down and up zoom in and out, Home shows the full contig",
                 visible_interval.start().saturating_add(1),
                 visible_interval.end()
             ),
@@ -198,7 +202,7 @@ pub fn paint_genome_context(
     let mut keyboard_pan_fraction = None;
     let mut keyboard_zoom_factor = None;
     let mut keyboard_show_all = false;
-    if ideogram_response.has_focus() {
+    if overview_response.has_focus() {
         ui.input_mut(|input| {
             if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
                 keyboard_pan_fraction = Some(-0.1);
@@ -235,13 +239,20 @@ pub fn paint_genome_context(
             );
         }
     }
-    paint_genome_overview_data(painter, ideogram_rect, overview_data);
+    painter.rect_filled(overview_rect, 1.0, Color32::from_gray(238));
+    painter.rect_stroke(
+        overview_rect,
+        1.0,
+        Stroke::new(0.75, Color32::from_gray(130)),
+        StrokeKind::Inside,
+    );
+    paint_genome_overview_data(painter, overview_rect, overview_data);
     let visible = Rect::from_min_size(
         pos2(
-            ideogram_rect.left() + ideogram.visible_x,
-            ideogram_rect.top() - 1.0,
+            overview_rect.left() + ideogram.visible_x,
+            overview_rect.top() - 1.0,
         ),
-        vec2(ideogram.visible_width, ideogram_rect.height() + 2.0),
+        vec2(ideogram.visible_width, overview_rect.height() + 2.0),
     );
     painter.rect_stroke(
         visible,
@@ -249,9 +260,9 @@ pub fn paint_genome_context(
         Stroke::new(2.0, Color32::from_rgb(45, 92, 175)),
         StrokeKind::Outside,
     );
-    if ideogram_response.has_focus() {
+    if overview_response.has_focus() {
         painter.rect_stroke(
-            ideogram_rect.expand(3.0),
+            overview_rect.expand(3.0),
             2.0,
             Stroke::new(2.0, Color32::BLACK),
             StrokeKind::Outside,
@@ -269,7 +280,7 @@ pub fn paint_genome_context(
         Stroke::new(1.0, Color32::from_gray(95)),
     );
     painter.text(
-        pos2(content.center().x, rect.top() + 25.0),
+        pos2(content.center().x, rect.top() + 42.0),
         Align2::CENTER_CENTER,
         &ruler.span_label,
         FontId::proportional(11.0),
@@ -300,8 +311,8 @@ pub fn paint_genome_context(
         Color32::from_gray(105),
     );
 
-    let pointer_position = ideogram_response.interact_pointer_pos();
-    let drag_delta = ideogram_response.drag_delta();
+    let pointer_position = overview_response.interact_pointer_pos();
+    let drag_delta = overview_response.drag_delta();
     let press_point = pointer_position.map(|value| value - drag_delta);
     let handle_hit_rect = visible.expand2(vec2(6.0, 3.0));
     let press_handle_fraction = press_point
@@ -316,29 +327,29 @@ pub fn paint_genome_context(
                 0.5
             }
         });
-    let clicked_on_handle = ideogram_response.clicked()
+    let clicked_on_handle = overview_response.clicked()
         && pointer_position.is_some_and(|pointer| handle_hit_rect.contains(pointer));
     OverviewInteraction {
-        clicked_position: (ideogram_response.clicked()
-            && !ideogram_response.double_clicked()
+        clicked_position: (overview_response.clicked()
+            && !overview_response.double_clicked()
             && !clicked_on_handle)
             .then_some(pointer_position)
             .flatten()
-            .map(|value| ideogram_position_at_pointer(ideogram_rect, value.x, contig_length)),
+            .map(|value| ideogram_position_at_pointer(overview_rect, value.x, contig_length)),
         pointer_position: pointer_position
-            .map(|value| ideogram_position_at_pointer(ideogram_rect, value.x, contig_length)),
+            .map(|value| ideogram_position_at_pointer(overview_rect, value.x, contig_length)),
         pointer_x: pointer_position.map(|value| f64::from(value.x)),
         pointer_y: pointer_position.map(|value| f64::from(value.y)),
         press_position: press_point
-            .map(|value| ideogram_position_at_pointer(ideogram_rect, value.x, contig_length)),
+            .map(|value| ideogram_position_at_pointer(overview_rect, value.x, contig_length)),
         press_x: press_point.map(|value| f64::from(value.x)),
         press_y: press_point.map(|value| f64::from(value.y)),
         press_handle_fraction,
-        pointer_down: ideogram_response.is_pointer_button_down_on(),
-        drag_started: ideogram_response.drag_started(),
-        dragging: ideogram_response.dragged(),
-        drag_stopped: ideogram_response.drag_stopped(),
-        show_all: ideogram_response.double_clicked() || keyboard_show_all,
+        pointer_down: overview_response.is_pointer_button_down_on(),
+        drag_started: overview_response.drag_started(),
+        dragging: overview_response.dragged(),
+        drag_stopped: overview_response.drag_stopped(),
+        show_all: overview_response.double_clicked() || keyboard_show_all,
         keyboard_pan_fraction,
         keyboard_zoom_factor,
     }
@@ -435,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn genome_overview_exposes_a_named_accessibility_slider() {
+    fn coverage_overview_exposes_a_named_accessibility_slider() {
         let dictionary = rgv_core::ReferenceDictionary::from_contigs([("chr1".to_owned(), 10_000)]);
         let assembly = GenomeAssembly::from_dictionary("test", dictionary);
         let interval =
@@ -469,7 +480,7 @@ mod tests {
             node.role() == egui::accesskit::Role::Slider
                 && node
                     .label()
-                    .is_some_and(|label| label.contains("Genome overview for chr1"))
+                    .is_some_and(|label| label.contains("Coverage overview for chr1"))
                 && node.numeric_value() == Some(100.0)
         }));
     }

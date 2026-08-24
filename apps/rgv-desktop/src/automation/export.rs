@@ -248,13 +248,18 @@ pub(crate) fn automation_alignments_export(
         let _ = push_automation_export_line(
             &mut output,
             &format!(
-                "# track_provenance\t{}\t{}\trecords_seen={}\trecords_eligible={}\trecords_retained={}\tretained_truncated={}",
+                "# track_provenance\t{}\t{}\trecords_seen={}\trecords_eligible={}\trecords_retained={}\tretained_truncated={}\tsecondary_filtered={}\tsupplementary_filtered={}\tuser_filtered={}\tduplicate_filtered={}\tqc_failed_filtered={}",
                 track.id.get(),
                 sanitized_tsv_field(&track.name, 4_096),
                 query.stats.records_seen,
                 query.stats.records_eligible,
                 query.batch.len(),
                 query.stats.truncated,
+                query.stats.records_filtered_secondary,
+                query.stats.records_filtered_supplementary,
+                query.stats.records_filtered_user,
+                query.stats.records_filtered_duplicate,
+                query.stats.records_filtered_qc_failed,
             ),
         );
         for index in 0..query.batch.len() {

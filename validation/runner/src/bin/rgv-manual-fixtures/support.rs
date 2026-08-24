@@ -149,6 +149,7 @@ pub(crate) fn write_support_files(suite_root: &Path) -> Result<()> {
     let genome = GenomeConfiguration {
         schema_version: GENOME_CONFIGURATION_SCHEMA_VERSION,
         name: "RGV portable manual genome".to_owned(),
+        assembly_identity: None,
         reference: local_source("../../variants.fa"),
         cytobands: Some(local_source("../data/tracks/cytobands.txt")),
         contig_aliases: BTreeMap::from([("variants".to_owned(), "chrVariants".to_owned())]),
@@ -157,6 +158,7 @@ pub(crate) fn write_support_files(suite_root: &Path) -> Result<()> {
             kind: TrackKind::Feature,
             source: local_source("../data/tracks/default-annotations.bed"),
         }],
+        asset_provenance: Vec::new(),
     };
     write_json(&suite_root.join("genomes/manual.rgvgenome"), &genome)
 }

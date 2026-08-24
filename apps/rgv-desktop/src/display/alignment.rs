@@ -92,6 +92,7 @@ pub(crate) fn secondary_alignment_track_layout(
         coverage_top: lane_top,
         coverage_height: (48.0 * secondary_scale).clamp(28.0, 84.0),
         coverage_scale_maximum: filters.coverage_scale_maximum,
+        coverage_scale_transform: filters.coverage_scale_transform,
         ..AlignmentLayoutOptions::default()
     };
     if options.show_coverage {
@@ -260,9 +261,11 @@ pub(crate) fn secondary_alignment_track_layout(
     if options.show_coverage {
         subtracks.push(TrackSubtrack {
             label: "Coverage".to_owned(),
-            detail: Some(filters.coverage_scale_maximum.map_or_else(
-                || format!("auto {}×", layout.stats.maximum_coverage),
-                |maximum| format!("max {}× · fixed {maximum}×", layout.stats.maximum_coverage),
+            detail: Some(coverage_scale_detail(
+                layout.stats.maximum_coverage,
+                filters.coverage_scale_maximum,
+                filters.coverage_scale_transform,
+                query.pileup.provenance.exact_depth_complete,
             )),
             top: options.coverage_top,
             bottom: options.coverage_top + options.coverage_height,
@@ -327,6 +330,11 @@ pub(crate) fn secondary_alignment_track_layout(
                 query.stats.records_emitted, query.stats.records_eligible
             ));
         }
+        read_details.extend(filtered_read_details(query.stats));
+        if let Some(detail) = regional_insertion_detail(layout.stats) {
+            read_details.push(detail);
+        }
+        read_details.push(row_occupancy_detail(layout.stats));
         if layout.stats.bisulfite_marks_omitted > 0 {
             read_details.push(format!(
                 "{} bisulfite marks omitted at display cap",
@@ -452,6 +460,82 @@ pub(crate) fn overview_read_detail(count: usize, cancelled: bool) -> String {
     }
 }
 
+pub(crate) fn filtered_read_details(stats: rgv_hts::QueryStats) -> Vec<String> {
+    let mut details = Vec::new();
+    if stats.records_filtered_secondary > 0 {
+        details.push(format!(
+            "{} secondary filtered",
+            stats.records_filtered_secondary
+        ));
+    }
+    if stats.records_filtered_supplementary > 0 {
+        details.push(format!(
+            "{} supplementary filtered",
+            stats.records_filtered_supplementary
+        ));
+    }
+    if stats.records_filtered_user > 0 {
+        let mut kinds = Vec::new();
+        if stats.records_filtered_duplicate > 0 {
+            kinds.push(format!("{} duplicate", stats.records_filtered_duplicate));
+        }
+        if stats.records_filtered_qc_failed > 0 {
+            kinds.push(format!("{} QC-failed", stats.records_filtered_qc_failed));
+        }
+        let suffix = if kinds.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", kinds.join(", "))
+        };
+        details.push(format!(
+            "{} user-filtered{}",
+            stats.records_filtered_user, suffix
+        ));
+    }
+    details
+}
+
+pub(crate) fn coverage_scale_detail(
+    raw_maximum: u32,
+    fixed_maximum: Option<u32>,
+    transform: CoverageScaleTransform,
+    exact: bool,
+) -> String {
+    let transform = match transform {
+        CoverageScaleTransform::Linear => "linear",
+        CoverageScaleTransform::SquareRoot => "square root",
+    };
+    let completeness = if exact { "" } else { " · incomplete" };
+    fixed_maximum.map_or_else(
+        || format!("max {raw_maximum}× · {transform}{completeness}"),
+        |maximum| format!("max {raw_maximum}× · {transform} · fixed {maximum}×{completeness}"),
+    )
+}
+
+pub(crate) fn regional_insertion_detail(stats: AlignmentLayoutStats) -> Option<String> {
+    (stats.regional_insertions_rendered > 0
+        || stats.regional_insertions_collapsed > 0
+        || stats.regional_insertions_omitted > 0)
+        .then(|| {
+            format!(
+                "regional insertions: {} shown · {} collapsed · {} omitted",
+                stats.regional_insertions_rendered,
+                stats.regional_insertions_collapsed,
+                stats.regional_insertions_omitted
+            )
+        })
+}
+
+pub(crate) fn row_occupancy_detail(stats: AlignmentLayoutStats) -> String {
+    format!(
+        "stable rows: {}/{} occupied · natural peak {} · query pack {}",
+        stats.visible_occupied_rows,
+        stats.visible_row_span,
+        stats.natural_stack_height,
+        stats.packed_row_count,
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn alignment_layout_key(
     owner: PanelTrackId,
@@ -498,6 +582,7 @@ pub(crate) fn alignment_layout_key(
             .unwrap_or(u64::MAX)
             .to_le_bytes(),
     );
+    layout_bytes.push(options.coverage_scale_transform as u8);
     layout_bytes.extend_from_slice(
         &options
             .pair_length_bounds

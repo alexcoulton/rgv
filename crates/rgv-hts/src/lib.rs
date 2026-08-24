@@ -23,8 +23,9 @@ mod ultima;
 
 pub use alignment::{
     AlignmentBatch, AlignmentFlags, AlignmentHeaderMetadata, AlignmentReadGroup, AlignmentRecord,
-    AuxField, AuxValue, CigarOp, CigarOpKind, MAX_ALIGNMENT_READ_GROUPS, PackedRecordError,
-    SequenceData, SequenceView,
+    AlignmentReferenceSequence, AuxField, AuxValue, CigarOp, CigarOpKind,
+    MAX_ALIGNMENT_READ_GROUPS, PackedRecordError, SequenceData, SequenceView,
+    recognize_assembly_from_header,
 };
 pub use bisulfite::{
     BisulfiteObservation, BisulfiteSummary, bisulfite_context_matches, bisulfite_strand_is_reverse,

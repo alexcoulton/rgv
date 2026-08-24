@@ -52,6 +52,14 @@ impl AlignmentFlags {
     pub const fn is_supplementary(self) -> bool {
         self.0 & 0x800 != 0
     }
+
+    pub const fn is_qc_failed(self) -> bool {
+        self.0 & 0x200 != 0
+    }
+
+    pub const fn is_duplicate(self) -> bool {
+        self.0 & 0x400 != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +138,16 @@ impl AlignmentReadGroup {
 pub struct AlignmentHeaderMetadata {
     pub read_groups: Vec<AlignmentReadGroup>,
     pub read_groups_omitted: usize,
+    pub reference_sequences: Vec<AlignmentReferenceSequence>,
+    pub reference_sequences_omitted: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlignmentReferenceSequence {
+    pub name: String,
+    pub length: u64,
+    pub md5: Option<String>,
+    pub uri: Option<String>,
 }
 
 impl AlignmentHeaderMetadata {
@@ -143,6 +161,51 @@ impl AlignmentHeaderMetadata {
 pub(crate) fn alignment_header_metadata_from_sam(bytes: &[u8]) -> AlignmentHeaderMetadata {
     let mut metadata = AlignmentHeaderMetadata::default();
     for line in bytes.split(|byte| *byte == b'\n') {
+        if line.starts_with(b"@SQ\t") {
+            let mut name = None;
+            let mut length = None;
+            let mut md5 = None;
+            let mut uri = None;
+            for field in line.split(|byte| *byte == b'\t').skip(1) {
+                let Some(separator) = field.iter().position(|byte| *byte == b':') else {
+                    continue;
+                };
+                let (tag, value) = (&field[..separator], &field[separator + 1..]);
+                match tag {
+                    b"SN" if !value.is_empty() && value.len() <= 256 => {
+                        name = std::str::from_utf8(value).ok().map(ToOwned::to_owned);
+                    }
+                    b"LN" => {
+                        length = std::str::from_utf8(value)
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok());
+                    }
+                    b"M5" if value.len() == 32 => {
+                        md5 = std::str::from_utf8(value).ok().map(ToOwned::to_owned);
+                    }
+                    b"UR" if value.len() <= 4_096 => {
+                        uri = std::str::from_utf8(value).ok().map(ToOwned::to_owned);
+                    }
+                    _ => {}
+                }
+            }
+            if let (Some(name), Some(length)) = (name, length) {
+                if metadata.reference_sequences.len() < 16_384 {
+                    metadata
+                        .reference_sequences
+                        .push(AlignmentReferenceSequence {
+                            name,
+                            length,
+                            md5,
+                            uri,
+                        });
+                } else {
+                    metadata.reference_sequences_omitted =
+                        metadata.reference_sequences_omitted.saturating_add(1);
+                }
+            }
+            continue;
+        }
         if !line.starts_with(b"@RG\t") {
             continue;
         }
@@ -186,6 +249,40 @@ pub(crate) fn alignment_header_metadata_from_sam(bytes: &[u8]) -> AlignmentHeade
         }
     }
     metadata
+}
+
+pub fn recognize_assembly_from_header(
+    metadata: &AlignmentHeaderMetadata,
+) -> Option<rgv_core::GenomeAssemblyIdentity> {
+    const GRCH38: [(&str, u64, &str); 3] = [
+        ("chr6", 170_805_979, "5691468a67c7e7a7b5f2a3a683792c29"),
+        ("chr20", 64_444_167, "b18e6c531b0bd70e949a7fc20859cb01"),
+        ("chrM", 16_569, "c68f52674c9fb33aef52dcf399755519"),
+    ];
+    let mut matched = 0;
+    for (name, expected_length, expected_md5) in GRCH38 {
+        let sequence = metadata
+            .reference_sequences
+            .iter()
+            .find(|sequence| sequence.name == name)?;
+        if sequence.length != expected_length
+            || !sequence
+                .md5
+                .as_deref()
+                .is_some_and(|md5| md5.eq_ignore_ascii_case(expected_md5))
+        {
+            return None;
+        }
+        matched += 1;
+    }
+    Some(rgv_core::GenomeAssemblyIdentity {
+        stable_id: "GRCh38.no_alt_analysis_set".to_owned(),
+        display_name: "GRCh38".to_owned(),
+        confidence: rgv_core::AssemblyIdentityConfidence::Fingerprint,
+        provenance: "BAM @SQ length and M5 agreement for chr6, chr20, and chrM; UR used only as supporting context".to_owned(),
+        matched_fingerprints: matched,
+        expected_primary_contigs: 25,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -940,5 +1037,30 @@ mod tests {
             assert_eq!(batch.materialize_record(index).unwrap(), *record);
         }
         assert!(batch.materialize_record(expected.len()).is_err());
+    }
+
+    #[test]
+    fn grch38_recognition_requires_length_and_md5_fingerprints() {
+        let header = b"@SQ\tSN:chr6\tLN:170805979\tM5:5691468a67c7e7a7b5f2a3a683792c29\n@SQ\tSN:chr20\tLN:64444167\tM5:b18e6c531b0bd70e949a7fc20859cb01\n@SQ\tSN:chrM\tLN:16569\tM5:c68f52674c9fb33aef52dcf399755519\n";
+        let metadata = alignment_header_metadata_from_sam(header);
+        let identity = recognize_assembly_from_header(&metadata).unwrap();
+        assert_eq!(identity.stable_id, "GRCh38.no_alt_analysis_set");
+        assert_eq!(identity.matched_fingerprints, 3);
+
+        let mismatched = header
+            .windows(1)
+            .enumerate()
+            .map(|(index, byte)| {
+                if index == header.len() - 2 {
+                    b'0'
+                } else {
+                    byte[0]
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            recognize_assembly_from_header(&alignment_header_metadata_from_sam(&mismatched))
+                .is_none()
+        );
     }
 }

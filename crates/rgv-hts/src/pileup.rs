@@ -96,7 +96,7 @@ impl QualityWeightedAlleleSupport {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PileupBin {
-    /// Eligible reads with an aligned base overlapping this bin.
+    /// Maximum concurrent eligible aligned-base depth at any position in this bin.
     pub depth: u32,
     pub forward_depth: u32,
     pub reverse_depth: u32,
@@ -134,7 +134,17 @@ pub struct PileupProvenance {
     pub overlapping_mate_policy: OverlappingMatePolicy,
     pub overlap_collapse_complete: bool,
     pub collapsed_mate_bases: u64,
+    /// True when every eligible aligned segment was included in the exact
+    /// interval sweep used to calculate per-bin maximum depth.
+    pub exact_depth_complete: bool,
+    /// Aligned segments omitted because the bounded event budget was exhausted.
+    pub depth_segments_omitted: u64,
 }
+
+/// Each retained aligned segment consumes two sweep events. The bound keeps a
+/// malformed or adversarial CIGAR from turning a viewport query into unbounded
+/// memory growth; incomplete results are explicitly reported in provenance.
+pub const MAX_PILEUP_DEPTH_EVENTS: usize = 2_000_000;
 
 pub(crate) const MAX_PENDING_PAIR_OVERLAPS: usize = 100_000;
 
@@ -393,25 +403,30 @@ pub(crate) struct PileupBuilder {
     interval: GenomicInterval,
     bins: Vec<PileupBin>,
     minimum_base_quality: u8,
-    depth_difference: Vec<i64>,
-    forward_difference: Vec<i64>,
-    reverse_difference: Vec<i64>,
-    mapping_quality_sum_difference: Vec<i128>,
-    mapping_quality_count_difference: Vec<i64>,
+    depth_events: Vec<DepthEvent>,
+    depth_events_complete: bool,
+    depth_segments_omitted: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DepthEvent {
+    position: u64,
+    depth: i64,
+    forward: i64,
+    reverse: i64,
+    mapping_quality_sum: i64,
+    mapping_quality_count: i64,
 }
 
 impl PileupBuilder {
     pub(crate) fn new(interval: GenomicInterval, bins: usize, minimum_base_quality: u8) -> Self {
-        let difference_len = bins.saturating_add(1);
         Self {
             interval,
             bins: vec![PileupBin::default(); bins],
             minimum_base_quality,
-            depth_difference: vec![0; difference_len],
-            forward_difference: vec![0; difference_len],
-            reverse_difference: vec![0; difference_len],
-            mapping_quality_sum_difference: vec![0; difference_len],
-            mapping_quality_count_difference: vec![0; difference_len],
+            depth_events: Vec::new(),
+            depth_events_complete: true,
+            depth_segments_omitted: 0,
         }
     }
 
@@ -421,42 +436,61 @@ impl PileupBuilder {
         reverse: bool,
         mapping_quality: Option<u8>,
     ) {
-        let mut covered_until = 0_usize;
+        let mut merged: Option<(u64, u64)> = None;
         for (start, end) in segments {
-            let Some((first, last)) = self.bin_range(start, end) else {
-                continue;
-            };
-            let first = first.max(covered_until);
-            if first >= last {
+            let start = start.max(self.interval.start());
+            let end = end.min(self.interval.end());
+            if start >= end {
                 continue;
             }
-            self.add_aligned_bin_range(first, last, reverse, mapping_quality);
-            covered_until = last;
+            if let Some((merged_start, merged_end)) = merged {
+                if start <= merged_end {
+                    merged = Some((merged_start, merged_end.max(end)));
+                } else {
+                    self.add_aligned_segment(merged_start, merged_end, reverse, mapping_quality);
+                    merged = Some((start, end));
+                }
+            } else {
+                merged = Some((start, end));
+            }
+        }
+        if let Some((start, end)) = merged {
+            self.add_aligned_segment(start, end, reverse, mapping_quality);
         }
     }
 
-    fn add_aligned_bin_range(
+    fn add_aligned_segment(
         &mut self,
-        first: usize,
-        last: usize,
+        start: u64,
+        end: u64,
         reverse: bool,
         mapping_quality: Option<u8>,
     ) {
-        add_difference(&mut self.depth_difference, first, last, 1);
-        if reverse {
-            add_difference(&mut self.reverse_difference, first, last, 1);
-        } else {
-            add_difference(&mut self.forward_difference, first, last, 1);
+        if self.depth_events.len().saturating_add(2) > MAX_PILEUP_DEPTH_EVENTS {
+            self.depth_events_complete = false;
+            self.depth_segments_omitted = self.depth_segments_omitted.saturating_add(1);
+            return;
         }
-        if let Some(mapping_quality) = mapping_quality {
-            add_difference(
-                &mut self.mapping_quality_sum_difference,
-                first,
-                last,
-                i128::from(mapping_quality),
-            );
-            add_difference(&mut self.mapping_quality_count_difference, first, last, 1);
-        }
+        let forward = i64::from(!reverse);
+        let reverse = i64::from(reverse);
+        let mapping_quality_sum = mapping_quality.map_or(0, i64::from);
+        let mapping_quality_count = i64::from(mapping_quality.is_some());
+        self.depth_events.push(DepthEvent {
+            position: start,
+            depth: 1,
+            forward,
+            reverse,
+            mapping_quality_sum,
+            mapping_quality_count,
+        });
+        self.depth_events.push(DepthEvent {
+            position: end,
+            depth: -1,
+            forward: -forward,
+            reverse: -reverse,
+            mapping_quality_sum: -mapping_quality_sum,
+            mapping_quality_count: -mapping_quality_count,
+        });
     }
 
     pub(crate) fn add_base(&mut self, position: u64, base: u8, quality: Option<u8>, reverse: bool) {
@@ -516,27 +550,53 @@ impl PileupBuilder {
         }
     }
 
-    pub(crate) fn finish(mut self, provenance: PileupProvenance) -> PileupSummary {
+    pub(crate) fn finish(mut self, mut provenance: PileupProvenance) -> PileupSummary {
         let mut depth = 0_i64;
         let mut forward = 0_i64;
         let mut reverse = 0_i64;
-        let mut mapping_quality_sum = 0_i128;
+        let mut mapping_quality_sum = 0_i64;
         let mut mapping_quality_count = 0_i64;
-        for index in 0..self.bins.len() {
-            depth = depth.saturating_add(self.depth_difference[index]);
-            forward = forward.saturating_add(self.forward_difference[index]);
-            reverse = reverse.saturating_add(self.reverse_difference[index]);
-            mapping_quality_sum =
-                mapping_quality_sum.saturating_add(self.mapping_quality_sum_difference[index]);
-            mapping_quality_count =
-                mapping_quality_count.saturating_add(self.mapping_quality_count_difference[index]);
-            let bin = &mut self.bins[index];
-            bin.depth = nonnegative_u32(depth);
-            bin.forward_depth = nonnegative_u32(forward);
-            bin.reverse_depth = nonnegative_u32(reverse);
-            bin.mapping_quality_sum = u64::try_from(mapping_quality_sum.max(0)).unwrap_or(u64::MAX);
-            bin.mapping_quality_observations = nonnegative_u32(mapping_quality_count);
+        self.depth_events
+            .sort_unstable_by_key(|event| event.position);
+        let mut cursor = 0;
+        while cursor < self.depth_events.len() {
+            let position = self.depth_events[cursor].position;
+            while cursor < self.depth_events.len() && self.depth_events[cursor].position == position
+            {
+                let event = self.depth_events[cursor];
+                depth = depth.saturating_add(event.depth);
+                forward = forward.saturating_add(event.forward);
+                reverse = reverse.saturating_add(event.reverse);
+                mapping_quality_sum = mapping_quality_sum.saturating_add(event.mapping_quality_sum);
+                mapping_quality_count =
+                    mapping_quality_count.saturating_add(event.mapping_quality_count);
+                cursor += 1;
+            }
+            let next_position = self
+                .depth_events
+                .get(cursor)
+                .map_or(self.interval.end(), |event| event.position)
+                .min(self.interval.end());
+            if depth <= 0 || position >= next_position {
+                continue;
+            }
+            if let Some((first, last)) = self.bin_range(position, next_position) {
+                let candidate_depth = nonnegative_u32(depth);
+                for bin in &mut self.bins[first..last] {
+                    if candidate_depth > bin.depth {
+                        bin.depth = candidate_depth;
+                        bin.forward_depth = nonnegative_u32(forward);
+                        bin.reverse_depth = nonnegative_u32(reverse);
+                        bin.mapping_quality_sum =
+                            u64::try_from(mapping_quality_sum.max(0)).unwrap_or(u64::MAX);
+                        bin.mapping_quality_observations = nonnegative_u32(mapping_quality_count);
+                    }
+                }
+            }
         }
+        provenance.exact_depth_complete =
+            self.depth_events_complete && provenance.all_eligible_records;
+        provenance.depth_segments_omitted = self.depth_segments_omitted;
         PileupSummary {
             bins: self.bins,
             minimum_base_quality: self.minimum_base_quality,
@@ -576,14 +636,6 @@ impl PileupBuilder {
             .clamp(first + 1, self.bins.len());
         Some((first, last))
     }
-}
-
-fn add_difference<T>(difference: &mut [T], first: usize, last: usize, value: T)
-where
-    T: Copy + std::ops::AddAssign + std::ops::SubAssign,
-{
-    difference[first] += value;
-    difference[last] -= value;
 }
 
 fn nonnegative_u32(value: i64) -> u32 {
@@ -700,6 +752,24 @@ mod tests {
         assert_eq!(summary.bins[1].mapping_quality_observations, 1);
         assert_eq!(summary.bins[0].alleles.base_observations(), 2);
         assert_eq!(summary.bins[1].alleles.base_observations(), 2);
+    }
+
+    #[test]
+    fn aggregated_bin_reports_maximum_concurrent_depth_not_touching_reads() {
+        let mut builder = PileupBuilder::new(interval(), 1, 0);
+        builder.add_aligned_record([(100, 101)], false, Some(60));
+        builder.add_aligned_record([(103, 104)], true, Some(20));
+        let summary = builder.finish(PileupProvenance {
+            all_eligible_records: true,
+            ..PileupProvenance::default()
+        });
+
+        assert_eq!(summary.bins[0].depth, 1);
+        assert_eq!(summary.bins[0].forward_depth, 1);
+        assert_eq!(summary.bins[0].reverse_depth, 0);
+        assert_eq!(summary.bins[0].mapping_quality_sum, 60);
+        assert_eq!(summary.bins[0].mapping_quality_observations, 1);
+        assert!(summary.provenance.exact_depth_complete);
     }
 
     #[test]

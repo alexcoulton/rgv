@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use crate::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
-    DetailLevel, ModifiedBaseColorMode, OverlappingMatePolicy, PanelId, ReadBaseDisplayMode,
-    ReviewStatus, TrackId, TrackKind, TrackSource,
+    CoverageScaleTransform, DetailLevel, ModifiedBaseColorMode, OverlappingMatePolicy, PanelId,
+    ReadBaseDisplayMode, ReviewStatus, TrackId, TrackKind, TrackSource,
 };
 
 pub const AUTOMATION_SCHEMA_VERSION: u32 = 2;
@@ -557,6 +557,15 @@ pub enum AutomationSetting {
     AlignmentDensity {
         value: f32,
     },
+    IncludeSecondary {
+        value: bool,
+    },
+    IncludeSupplementary {
+        value: bool,
+    },
+    CoverageScaleTransform {
+        value: CoverageScaleTransform,
+    },
     ReadBaseDisplayMode {
         value: ReadBaseDisplayMode,
     },
@@ -755,8 +764,28 @@ pub struct AutomationWorkspaceSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationGenomeSnapshot {
     pub name: String,
+    #[serde(default)]
+    pub context_label: String,
+    #[serde(default)]
+    pub assembly_identity: Option<crate::GenomeAssemblyIdentity>,
+    #[serde(default)]
+    pub suggested_assembly_identity: Option<crate::GenomeAssemblyIdentity>,
     pub reference_configured: bool,
     pub reference_ready: bool,
+    #[serde(default)]
+    pub reference_contig_count: usize,
+    #[serde(default)]
+    pub navigation_contig_count: usize,
+    #[serde(default)]
+    pub reference_is_subset: bool,
+    #[serde(default)]
+    pub cytobands_loaded: bool,
+    #[serde(default)]
+    pub default_annotation_count: usize,
+    #[serde(default)]
+    pub gene_model_track_count: usize,
+    #[serde(default)]
+    pub contig_alias_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -767,6 +796,10 @@ pub struct AutomationPanelSnapshot {
     pub start: u64,
     pub end: u64,
     pub detail_level: DetailLevel,
+    #[serde(default)]
+    pub pixel_width: f64,
+    #[serde(default)]
+    pub bases_per_pixel: f64,
     pub vertical_scroll_points: f32,
     #[serde(default)]
     pub maximum_vertical_scroll_points: f32,
@@ -793,6 +826,36 @@ pub struct AutomationRenderLaneSnapshot {
     pub sampled_items: usize,
     #[serde(default)]
     pub truncated: bool,
+    #[serde(default)]
+    pub filtered_secondary_items: usize,
+    #[serde(default)]
+    pub filtered_supplementary_items: usize,
+    #[serde(default)]
+    pub filtered_user_items: usize,
+    #[serde(default)]
+    pub filtered_duplicate_items: usize,
+    #[serde(default)]
+    pub filtered_qc_failed_items: usize,
+    #[serde(default)]
+    pub regional_insertions_rendered: usize,
+    #[serde(default)]
+    pub regional_insertions_collapsed: usize,
+    #[serde(default)]
+    pub regional_insertions_omitted: usize,
+    #[serde(default)]
+    pub raw_maximum_coverage: u32,
+    #[serde(default)]
+    pub coverage_exact_complete: bool,
+    #[serde(default)]
+    pub depth_segments_omitted: u64,
+    #[serde(default)]
+    pub packed_row_count: usize,
+    #[serde(default)]
+    pub visible_occupied_rows: usize,
+    #[serde(default)]
+    pub visible_row_span: usize,
+    #[serde(default)]
+    pub natural_stack_height: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -857,7 +920,13 @@ pub struct AutomationAlignmentTrackSnapshot {
     #[serde(default)]
     pub show_coverage: bool,
     #[serde(default)]
+    pub coverage_scale_transform: CoverageScaleTransform,
+    #[serde(default)]
     pub show_reads: bool,
+    #[serde(default)]
+    pub include_secondary: bool,
+    #[serde(default)]
+    pub include_supplementary: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -1612,6 +1681,16 @@ mod tests {
                 name: "fixture".to_owned(),
                 reference_configured: true,
                 reference_ready: true,
+                context_label: "fixture".to_owned(),
+                assembly_identity: None,
+                suggested_assembly_identity: None,
+                reference_contig_count: 1,
+                navigation_contig_count: 1,
+                reference_is_subset: false,
+                cytobands_loaded: false,
+                default_annotation_count: 0,
+                gene_model_track_count: 0,
+                contig_alias_count: 0,
             },
             settled: true,
             active_panel_id: PanelId::new(1),
@@ -1622,6 +1701,8 @@ mod tests {
                 start: 100,
                 end: 200,
                 detail_level: DetailLevel::Reads,
+                pixel_width: 1_000.0,
+                bases_per_pixel: 0.1,
                 vertical_scroll_points: 0.0,
                 maximum_vertical_scroll_points: 0.0,
                 render_generation: 1,

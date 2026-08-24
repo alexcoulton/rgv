@@ -5,8 +5,8 @@ use std::{
 
 pub use rgv_core::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
-    BisulfiteContext, SbxDisplayOptions, SbxSimplexTailMode, SmrtKineticsMode,
-    UltimaDisplayOptions, UltimaQualityMode,
+    BisulfiteContext, CoverageScaleTransform, SbxDisplayOptions, SbxSimplexTailMode,
+    SmrtKineticsMode, UltimaDisplayOptions, UltimaQualityMode,
 };
 use rgv_core::{
     DetailLevel, GeneticCode, ModifiedBaseColorMode, ReadBaseDisplayMode,
@@ -33,6 +33,7 @@ pub const MAX_RENDERED_BISULFITE_MARKS: usize = 50_000;
 pub const MAX_RENDERED_SMRT_KINETICS_MARKS: usize = 50_000;
 pub const MAX_RENDERED_SBX_TAIL_MARKS: usize = 50_000;
 pub const MAX_RENDERED_ULTIMA_QUALITY_MARKS: usize = 50_000;
+pub const MAX_RENDERED_REGIONAL_INSERTIONS: usize = 50_000;
 const MAX_EXPANDED_JUNCTION_ROWS: usize = 12;
 pub const MAX_ANNOTATED_JUNCTIONS: usize = 100_000;
 
@@ -128,6 +129,7 @@ pub struct AlignmentLayoutOptions {
     pub show_junctions: bool,
     pub show_reads: bool,
     pub coverage_scale_maximum: Option<u32>,
+    pub coverage_scale_transform: CoverageScaleTransform,
     pub show_coverage_center_line: bool,
     pub junction_top: f32,
     pub junction_height: f32,
@@ -183,6 +185,7 @@ impl Default for AlignmentLayoutOptions {
             show_junctions: true,
             show_reads: true,
             coverage_scale_maximum: None,
+            coverage_scale_transform: CoverageScaleTransform::Linear,
             show_coverage_center_line: false,
             junction_top: 158.0,
             junction_height: 40.0,
@@ -237,6 +240,19 @@ pub struct AlignmentLayoutStats {
     pub ultima_unavailable_records: usize,
     pub ultima_malformed_records: usize,
     pub ultima_unavailable_events: usize,
+    pub regional_insertions_rendered: usize,
+    pub regional_insertions_collapsed: usize,
+    pub regional_insertions_omitted: usize,
+    /// Query-wide stable packing height, including rows that can be empty in
+    /// the current horizontal slice.
+    pub packed_row_count: usize,
+    /// Distinct stable rows occupied by an alignment overlapping the viewport.
+    pub visible_occupied_rows: usize,
+    /// First-to-last occupied stable-row span in the viewport.
+    pub visible_row_span: usize,
+    /// Maximum number of alignment spans concurrent in the viewport before
+    /// grouping/sorting constraints are applied.
+    pub natural_stack_height: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -304,6 +320,9 @@ struct ReadRenderStats {
     ultima_unavailable_records: usize,
     ultima_malformed_records: usize,
     ultima_unavailable_events: usize,
+    regional_insertions_rendered: usize,
+    regional_insertions_collapsed: usize,
+    regional_insertions_omitted: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -557,12 +576,7 @@ pub fn layout_alignment_query_with_rows_and_annotations(
     ) {
         add_reads(&mut display_list, query, viewport, &options, rows)
     } else if viewport.detail_level() == DetailLevel::Regional {
-        let (rendered, hidden) = add_spans(&mut display_list, query, viewport, &options, rows);
-        ReadRenderStats {
-            rendered,
-            hidden,
-            ..ReadRenderStats::default()
-        }
+        add_spans(&mut display_list, query, viewport, &options, rows)
     } else {
         add_overview_reads_placeholder(&mut display_list, query, viewport, &options);
         ReadRenderStats {
@@ -571,6 +585,31 @@ pub fn layout_alignment_query_with_rows_and_annotations(
         }
     };
     let primitive_count = display_list.rectangles.len();
+    let packed_row_count = rows
+        .rows
+        .iter()
+        .flatten()
+        .copied()
+        .max()
+        .map_or(0, |row| row.saturating_add(1));
+    let visible_rows = query
+        .batch
+        .starts
+        .iter()
+        .zip(&query.batch.ends)
+        .zip(&rows.rows)
+        .filter_map(|((&start, &end), row)| {
+            (start < viewport.interval().end() && end > viewport.interval().start())
+                .then_some(*row)
+                .flatten()
+        })
+        .collect::<BTreeSet<_>>();
+    let visible_row_span = visible_rows
+        .first()
+        .zip(visible_rows.last())
+        .map_or(0, |(first, last)| {
+            last.saturating_sub(*first).saturating_add(1)
+        });
     AlignmentLayout {
         display_list,
         pinned_rectangle_count,
@@ -597,8 +636,35 @@ pub fn layout_alignment_query_with_rows_and_annotations(
             ultima_unavailable_records: read_stats.ultima_unavailable_records,
             ultima_malformed_records: read_stats.ultima_malformed_records,
             ultima_unavailable_events: read_stats.ultima_unavailable_events,
+            regional_insertions_rendered: read_stats.regional_insertions_rendered,
+            regional_insertions_collapsed: read_stats.regional_insertions_collapsed,
+            regional_insertions_omitted: read_stats.regional_insertions_omitted,
+            packed_row_count,
+            visible_occupied_rows: visible_rows.len(),
+            visible_row_span,
+            natural_stack_height: natural_stack_height(query, viewport.interval()),
         },
     }
+}
+
+fn natural_stack_height(query: &AlignmentQuery, interval: rgv_core::GenomicInterval) -> usize {
+    let mut events = BTreeMap::<u64, i64>::new();
+    for (&start, &end) in query.batch.starts.iter().zip(&query.batch.ends) {
+        let start = start.max(interval.start());
+        let end = end.min(interval.end());
+        if start >= end {
+            continue;
+        }
+        *events.entry(start).or_default() += 1;
+        *events.entry(end).or_default() -= 1;
+    }
+    let mut depth = 0_i64;
+    let mut maximum = 0_i64;
+    for delta in events.into_values() {
+        depth = depth.saturating_add(delta);
+        maximum = maximum.max(depth);
+    }
+    usize::try_from(maximum.max(0)).unwrap_or(usize::MAX)
 }
 
 fn add_overview_reads_placeholder(

@@ -101,11 +101,27 @@ impl Viewer {
             initial_contig_name.clone(),
             initial_contig_length,
         )]);
-        let assembly = load_assembly(
+        let assembly_identity = options
+            .loaded_genome
+            .as_ref()
+            .and_then(|genome| genome.assembly_identity.clone())
+            .or_else(|| {
+                options
+                    .loaded_session
+                    .as_ref()
+                    .and_then(|session| session.assembly_identity.clone())
+            });
+        let configured_annotation_count = options
+            .loaded_genome
+            .as_ref()
+            .map_or(0, |genome| genome.default_annotations.len());
+        let mut assembly = load_assembly(
             &options.genome_name,
             initial_dictionary,
             options.cytobands.as_deref(),
         );
+        assembly.identity.clone_from(&assembly_identity);
+        assembly.default_annotation_count = configured_annotation_count;
         let mut panel = ViewPanelController::new(
             INITIAL_PANEL_ID,
             viewport,
@@ -134,6 +150,11 @@ impl Viewer {
         let panel_ids = panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         let track_engine =
             (!track_specifications.is_empty()).then(|| TrackEngine::spawn(track_specifications, 8));
+        let automation_auxiliary_open_state = tracks
+            .tracks()
+            .iter()
+            .map(|track| (track.id, AutomationAuxiliaryOpenState::Pending))
+            .collect();
         let alignment_source = options.bam.as_ref().map(|path| track_source(path));
         let mut alignment_track_configs = options
             .loaded_session
@@ -336,7 +357,7 @@ impl Viewer {
             reference_engine,
             reference_open_error: None,
             track_engine,
-            automation_auxiliary_open_state: HashMap::new(),
+            automation_auxiliary_open_state,
             tracks,
             reference_source,
             remote_reference_index_url,
@@ -344,6 +365,8 @@ impl Viewer {
             reference_dictionary: None,
             contig_aliases,
             assembly,
+            assembly_identity,
+            suggested_assembly_identity: None,
             assembly_name: options.genome_name,
             cytoband_path: options.cytobands,
             data_status,

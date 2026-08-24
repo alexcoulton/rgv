@@ -331,6 +331,12 @@ impl Viewer {
             .collect::<Result<Vec<_>>>()?;
 
         self.assembly_name.clone_from(&configuration.name);
+        self.assembly_identity
+            .clone_from(&configuration.assembly_identity);
+        self.assembly
+            .identity
+            .clone_from(&configuration.assembly_identity);
+        self.assembly.default_annotation_count = configuration.default_annotations.len();
         self.contig_aliases
             .clone_from(&configuration.contig_aliases);
         self.cytoband_path = cytoband_path;

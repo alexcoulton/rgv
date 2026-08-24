@@ -1,5 +1,26 @@
 # Corpus validation
 
+## Real ONT / IGV parity
+
+The state-matched parity gate uses the existing ONT demo BAM, never a generated BAM fixture. Build
+the release desktop and MCP binaries, open IGV Desktop with its command port enabled, then run:
+
+```sh
+cargo build --release -p rgv-desktop -p rgv-mcp
+python3 validation/ont_igv_parity_qualification.py
+```
+
+The script verifies the pinned BAM/BAI/FASTA/FAI hashes, launches an authenticated loopback-only
+RGV control endpoint with a mode-0600 ephemeral secret, loads the GRCh38 subset genome bundle,
+navigates both viewers to `chr6:1-630038`, and captures IGV through one activate-and-screenshot
+AppleScript command. It asserts 1,755 primary-plus-supplementary records and exact depth 167 by
+default, then 3,469 records and exact depth 603 with secondary alignments enabled. Its report also
+records bases per pixel, filter/exclusion provenance, Regional insertion counts, assembly subset
+identity, cytobands, gene-track readiness, image hashes, and native window bounds.
+
+`--skip-igv` runs the structured RGV half for headless diagnosis, but it does not satisfy the final
+visual parity gate.
+
 `rgv-validation-runner` hashes every alignment, index, and optional reference before opening it
 through the production HTS path. Each named locus declares minimum record counts and semantic
 features that must survive normalization. Reports contain timings and counts, never read names,

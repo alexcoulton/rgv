@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "recent_alignments": [
+    {
+      "Local": {
+        "path": "/Users/alexcoulton/work/external.repos/ont_test/wf-human-variation-demo/demo.bam"
+      }
+    }
+  ],
+  "recent_sessions": [
+    "/Users/alexcoulton/work/external.repos/rgv/validation/ont-igv-parity-output/restored.rgv.json"
+  ],
+  "recent_loci": [
+    "chr6:1-630038"
+  ],
+  "cache_budget_mib": 512,
+  "diagnostics_opt_in": false,
+  "autosave_enabled": false,
+  "autosave_interval_seconds": 120,
+  "autosave_retention": 5,
+  "interface_scale_percent": 100,
+  "high_contrast": false,
+  "reduced_motion": false
+}

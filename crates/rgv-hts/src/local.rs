@@ -63,7 +63,7 @@ impl Default for QueryOptions {
             overlapping_mate_policy: OverlappingMatePolicy::default(),
             minimum_base_quality: 0,
             minimum_junction_flank: 0,
-            include_secondary: true,
+            include_secondary: false,
             include_supplementary: true,
             include_reference: false,
             filter: AlignmentFilter::default(),
@@ -130,6 +130,18 @@ impl Default for AlignmentOpenOptions {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryStats {
     pub records_seen: usize,
+    /// Secondary records excluded by the dedicated visibility option.
+    pub records_filtered_secondary: usize,
+    /// Supplementary records excluded by the dedicated visibility option.
+    pub records_filtered_supplementary: usize,
+    /// Records rejected by the user-configured flag, quality, or tag filter.
+    pub records_filtered_user: usize,
+    /// User-filtered records carrying the duplicate flag. This is a subset of
+    /// `records_filtered_user` and is therefore not additive with it.
+    pub records_filtered_duplicate: usize,
+    /// User-filtered records carrying the QC-failed flag. This is a subset of
+    /// `records_filtered_user` and is therefore not additive with it.
+    pub records_filtered_qc_failed: usize,
     /// Records that passed flags and user filters in the backing query interval.
     pub records_eligible: usize,
     /// Records loaded for individual layout/inspection, equal to `records_eligible`
@@ -335,12 +347,18 @@ impl AlignmentSource for LocalAlignmentSource {
                 break;
             }
             let flags = AlignmentFlags::from_bits(record.flags());
-            if (!options.include_secondary && flags.is_secondary())
-                || (!options.include_supplementary && flags.is_supplementary())
-            {
+            if !options.include_secondary && flags.is_secondary() {
+                stats.records_filtered_secondary += 1;
+                continue;
+            }
+            if !options.include_supplementary && flags.is_supplementary() {
+                stats.records_filtered_supplementary += 1;
                 continue;
             }
             if !options.filter.matches(&record)? {
+                stats.records_filtered_user += 1;
+                stats.records_filtered_duplicate += usize::from(flags.is_duplicate());
+                stats.records_filtered_qc_failed += usize::from(flags.is_qc_failed());
                 continue;
             }
             stats.records_eligible += 1;
@@ -413,6 +431,7 @@ impl AlignmentSource for LocalAlignmentSource {
             overlapping_mate_policy: overlap_collapser.policy(),
             overlap_collapse_complete: overlap_collapser.complete(),
             collapsed_mate_bases: overlap_collapser.collapsed_mate_bases(),
+            ..PileupProvenance::default()
         });
         if let Some(modifications) = modifications {
             pileup.modifications = modifications.finish(stats.records_eligible, !stats.cancelled);
