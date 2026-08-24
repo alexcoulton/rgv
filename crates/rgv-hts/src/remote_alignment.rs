@@ -37,7 +37,7 @@ use crate::{
         OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, oriented_observation,
     },
     read_remote_object_bounded, remote_url_with_extension,
-    sampling::{RECORDS_PER_WINDOW, WINDOW_BASES, WindowedSampler},
+    sampling::BoundedSampler,
 };
 
 type NoodlesReader = bam::io::IndexedReader<noodles::bgzf::io::Reader<HttpRangeReader>>;
@@ -502,7 +502,7 @@ where
     );
     let mut pairs = crate::pair::PairSummaryBuilder::new();
     let mut overlap_collapser = OverlapCollapser::new(options.overlapping_mate_policy);
-    let mut samples = WindowedSampler::new(options.max_records.get(), RECORDS_PER_WINDOW);
+    let mut samples = BoundedSampler::new(options.max_records.get());
     let mut stats = QueryStats::default();
     for result in records {
         let record = result?;
@@ -568,14 +568,8 @@ where
             None
         };
         let score = sampling_score(&record, header)?;
-        let start = record
-            .alignment_start()
-            .transpose()?
-            .map_or(0, |position| position.get().saturating_sub(1));
-        let window = start as u64 / WINDOW_BASES;
-        if samples.would_retain(window, score, stats.records_seen) {
+        if samples.would_retain(score, stats.records_seen) {
             samples.insert(
-                window,
                 score,
                 stats.records_seen,
                 match normalized_for_modifications {

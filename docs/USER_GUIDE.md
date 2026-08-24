@@ -181,7 +181,9 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   Tracks keep one source and settings identity while projecting independently into every panel.
   Corresponding tracks below the primary alignment stay vertically aligned across columns; a panel
   with fewer retained read rows reserves blank space rather than pulling later tracks upward.
-- Click a read to open its SAM-field and auxiliary-tag inspector. **Copy details**, **Copy CIGAR**,
+- Click a read to open its SAM fields and auxiliary tags in the docked **Properties** panel.
+  The panel can be resized, collapsed to the right edge, reopened from **View**, and automatically
+  reopens for a new selection. **Copy details**, **Copy CIGAR**,
   **Copy read sequence**, and **Copy tags** copy the selected evidence without reconstructing it
   from the display. Every auxiliary tag also has an individual copy action. Read sequence is copied
   in reference-forward display orientation, so a reverse-strand read is reverse complemented. Read,
@@ -226,8 +228,11 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   shading can be disabled without changing the underlying base qualities. “Show indels ≥” removes
   smaller insertion/deletion markers while “Label events ≥” independently suppresses text labels;
   reference skips remain visible because hiding them would misrepresent spliced alignment geometry.
-- Reference, coverage, aggregate-modification, and read lanes have independent visibility controls.
-  Hidden lanes leave no blank vertical reservation and cannot be picked. Coverage can autoscale to
+- Reference, coverage, Sashimi, aggregate-modification, and read lanes have independent visibility
+  controls. Click the eye beside a lane in the track gutter to hide or show it. A hidden lane
+  collapses to a compact labelled row with a closed eye, so it can be restored in the same place;
+  the alignment track's submenu under **Tracks** is a second recovery path. Hidden lanes cannot be
+  picked. Coverage can autoscale to
   the current visible maximum or use a positive fixed maximum; the gutter always reports both the
   observed maximum and active scale. Expanded, Squished, and Collapsed buttons set useful read-row
   densities, while the right overview remains available for continuous adjustment. Lane visibility,
@@ -285,9 +290,11 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
 - Filters accept a minimum MAPQ, secondary/supplementary switches, and semicolon-separated tag
   predicates such as `HP=1;RG=tumour;MM`.
 
-At deep loci, coverage uses all eligible reads while individual alignments are sampled
-deterministically. The status line says when the cap is active. Raising the cap increases memory,
-layout work, and GPU primitives.
+RGV retains every eligible alignment for ordinary detailed views; it does not apply IGV-style
+per-window read downsampling. The configurable **Read safety cap** is an emergency workspace
+resource bound. If a query exceeds it, the gutter reports the exact loaded/eligible counts and the
+retained set is deterministic. Raising the safety cap increases memory, layout work, and GPU
+primitives. Coverage always uses every eligible read, including beyond that safety bound.
 
 RGV currently computes coverage from the explicitly loaded alignment source. It does not discover
 or substitute a precomputed coverage file by filename convention; support for such a source will
@@ -363,7 +370,7 @@ inspector also reports orientation, read order, whether the mate is visible, out
 on another chromosome, unmapped, or unavailable, and a stable non-identifying template hash.
 
 Expected template-length bounds are inferred from eligible, proper, primary first-of-template
-records before visible-read sampling. Inference uses a deterministic sample capped at 4,096
+records before retained-record safety limiting. Inference uses a deterministic sample capped at 4,096
 templates, requires at least 100 templates, reports its sample size and median, and uses a robust
 three-IQR envelope. Track settings can override the inferred minimum and maximum; those explicit
 bounds are validated, session-persisted, and used by pair classification, colour, grouping, and
@@ -409,8 +416,8 @@ Click the lane to inspect every modification series in that bin, including canon
 modification code and strand, optional `HP`, raw and probability-weighted fractions, alignment
 strand counts, missing `ML` calls, and evidence provenance. The inspector reports malformed tags,
 unavailable sequences, incomplete queries, and the bounded 32-series cap. Its details are copyable.
-The aggregate is calculated from every eligible record before individual reads are sampled, so
-lowering the visible-read cap does not change its counts. The per-read probability threshold does
+The aggregate is calculated from every eligible record before the retained-record safety bound, so
+lowering the read safety cap does not change its counts. The per-read probability threshold does
 not rewrite the aggregate; the inspector exposes both raw and probability-weighted evidence.
 Insertions and deletions are reported separately and are not incorporated into this consensus.
 

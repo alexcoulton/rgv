@@ -7,6 +7,35 @@
 
 use super::super::*;
 
+fn alignment_subtrack_visible(filters: &SessionFilters, subtrack: AlignmentSubtrack) -> bool {
+    match subtrack {
+        AlignmentSubtrack::Reference => filters.show_reference,
+        AlignmentSubtrack::Coverage => filters.show_coverage,
+        AlignmentSubtrack::Sashimi => filters.show_junctions,
+        AlignmentSubtrack::Modifications => filters.show_modification_frequency,
+        AlignmentSubtrack::Reads => filters.show_reads,
+    }
+}
+
+fn alignment_subtrack_menu(
+    ui: &mut egui::Ui,
+    track_id: TrackId,
+    filters: &SessionFilters,
+    include_reference: bool,
+    actions: &mut Vec<TrackUiAction>,
+) {
+    ui.label("Subtracks");
+    for subtrack in AlignmentSubtrack::ALL {
+        if subtrack == AlignmentSubtrack::Reference && !include_reference {
+            continue;
+        }
+        let mut visible = alignment_subtrack_visible(filters, subtrack);
+        if ui.checkbox(&mut visible, subtrack.label()).changed() {
+            actions.push(TrackUiAction::ToggleAlignmentSubtrack(track_id, subtrack));
+        }
+    }
+}
+
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(super) fn render_shell_frame(
@@ -185,6 +214,16 @@ impl Viewer {
                         track.config.height,
                     )
                 }
+            })
+            .collect::<Vec<_>>();
+        let alignment_subtrack_controls = self
+            .alignment_tracks
+            .iter()
+            .map(|track| {
+                (
+                    track.config.id,
+                    self.alignment_filters_for_track(track.config.id),
+                )
             })
             .collect::<Vec<_>>();
         let mut track_controls = self
@@ -549,6 +588,23 @@ impl Viewer {
             .or(junction_inspector.as_ref())
             .and_then(|snapshot| snapshot.fields.first())
             .map(|(_, value)| format!("Selected: {value}"));
+        let properties_expanded_id = egui::Id::new("properties-panel-expanded");
+        let properties_revision_id = egui::Id::new("properties-panel-evidence-revision");
+        let mut properties_expanded = self
+            .egui_context
+            .data(|data| data.get_temp::<bool>(properties_expanded_id))
+            .unwrap_or(true);
+        let previous_evidence_revision = self
+            .egui_context
+            .data(|data| data.get_temp::<u64>(properties_revision_id));
+        if previous_evidence_revision
+            .is_some_and(|revision| revision != self.next_evidence_revision)
+        {
+            properties_expanded = true;
+        }
+        self.egui_context.data_mut(|data| {
+            data.insert_temp(properties_revision_id, self.next_evidence_revision);
+        });
         let full_output = self.egui_context.run_ui(raw_input, |ui| {
             egui::Panel::top("application-menu")
                 .exact_size(MENU_HEIGHT)
@@ -628,6 +684,7 @@ impl Viewer {
                         ui.menu_button("View", |ui| {
                             ui.checkbox(&mut diagnostics_open, "Diagnostics");
                             ui.checkbox(&mut metadata_open, "Sample metadata");
+                            ui.checkbox(&mut properties_expanded, "Properties panel");
                             if ui.button("Settings…  ⌘,").clicked() {
                                 settings_requested = true;
                                 ui.close();
@@ -645,18 +702,45 @@ impl Viewer {
                             }
                             ui.separator();
                             if self.alignment_tracks.is_empty() && self.synthetic {
-                                ui.checkbox(&mut alignment_visible, self.alignment_track_name());
-                                if ui.button("Alignment settings…").clicked() {
-                                    track_settings_panel = Some(TrackFrameKey::Alignment(
-                                        self.primary_alignment_track_id(),
-                                    ));
-                                    ui.close();
-                                }
+                                let id = self.primary_alignment_track_id();
+                                let filters = self.live_session_filters();
+                                ui.menu_button(self.alignment_track_name(), |ui| {
+                                    ui.checkbox(&mut alignment_visible, "Show track");
+                                    ui.separator();
+                                    alignment_subtrack_menu(
+                                        ui,
+                                        id,
+                                        &filters,
+                                        true,
+                                        &mut track_ui_actions,
+                                    );
+                                    ui.separator();
+                                    if ui.button("Alignment settings…").clicked() {
+                                        track_settings_panel =
+                                            Some(TrackFrameKey::Alignment(id));
+                                        ui.close();
+                                    }
+                                });
                             }
                             for (id, name, visible, _, _) in &mut alignment_track_controls {
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(visible, name.as_str());
-                                    if ui.small_button("Settings…").clicked() {
+                                let filters = alignment_subtrack_controls
+                                    .iter()
+                                    .find(|(candidate, _)| candidate == id)
+                                    .map(|(_, filters)| filters)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                ui.menu_button(name.as_str(), |ui| {
+                                    ui.checkbox(visible, "Show track");
+                                    ui.separator();
+                                    alignment_subtrack_menu(
+                                        ui,
+                                        *id,
+                                        &filters,
+                                        *id == primary_alignment_id,
+                                        &mut track_ui_actions,
+                                    );
+                                    ui.separator();
+                                    if ui.button("Alignment settings…").clicked() {
                                         track_settings_panel =
                                             Some(TrackFrameKey::Alignment(*id));
                                         ui.close();
@@ -1086,6 +1170,88 @@ impl Viewer {
                         }
                     }
                 });
+            if properties_expanded {
+                egui::Panel::right("properties-panel")
+                    .default_size(340.0)
+                    .size_range(280.0..=520.0)
+                    .resizable(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("Properties");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .button("›")
+                                        .on_hover_text("Collapse Properties panel")
+                                        .clicked()
+                                    {
+                                        properties_expanded = false;
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_salt("properties-panel-scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let inspector_actions = ui::inspectors::show_properties(
+                                    self,
+                                    ui,
+                                    variant_sample_search.clone(),
+                                );
+                                clear_selection |= inspector_actions.clear_selection;
+                                selected_to_top_requested |=
+                                    inspector_actions.selected_to_top_requested;
+                                chain_navigation_requested =
+                                    inspector_actions.chain_navigation_requested;
+                                mate_panel_requested |= inspector_actions.mate_panel_requested;
+                                chain_panel_requested = inspector_actions.chain_panel_requested;
+                                chain_all_panels_requested |=
+                                    inspector_actions.chain_all_panels_requested;
+                                variant_partner_requested =
+                                    inspector_actions.variant_partner_requested;
+                                variant_endpoint_requested =
+                                    inspector_actions.variant_endpoint_requested;
+                                interaction_endpoint_requested =
+                                    inspector_actions.interaction_endpoint_requested;
+                                variant_pileup_requested =
+                                    inspector_actions.variant_pileup_requested;
+                                variant_modification_requested =
+                                    inspector_actions.variant_modification_requested;
+                                variant_genotypes_export_requested |=
+                                    inspector_actions.variant_genotypes_export_requested;
+                                variant_evidence_export_requested |=
+                                    inspector_actions.variant_evidence_export_requested;
+                                junction_bed_export_requested |=
+                                    inspector_actions.junction_bed_export_requested;
+                                sashimi_png_export_requested |=
+                                    inspector_actions.sashimi_png_export_requested;
+                                sashimi_svg_export_requested |=
+                                    inspector_actions.sashimi_svg_export_requested;
+                                add_selected_feature_to_review |=
+                                    inspector_actions.add_selected_feature_to_review;
+                                review_open |= inspector_actions.review_open;
+                                variant_sample_search = inspector_actions.variant_sample_search;
+                            });
+                    });
+            } else {
+                egui::Panel::right("properties-panel-collapsed")
+                    .exact_size(30.0)
+                    .resizable(false)
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            if ui
+                                .button("‹")
+                                .on_hover_text("Expand Properties panel")
+                                .clicked()
+                            {
+                                properties_expanded = true;
+                            }
+                        });
+                    });
+            }
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 let geometry = CanvasGeometry::from_viewport(ui.max_rect());
                 new_canvas_geometry = geometry;
@@ -1658,7 +1824,7 @@ impl Viewer {
                                 );
                             });
                             ui.horizontal(|ui| {
-                                ui.label("Read sample cap");
+                                ui.label("Read safety cap");
                                 ui.add(
                                     egui::Slider::new(&mut primitive_limit, 1_000..=250_000)
                                         .logarithmic(true),
@@ -1912,30 +2078,6 @@ impl Viewer {
             metadata_bulk_remove_requested = workspace_dialogs.metadata_bulk_remove_requested;
             metadata_track_rows = workspace_dialogs.metadata_track_rows;
             ui::show_diagnostics(ui.ctx(), &mut diagnostics_open, &diagnostics);
-            let inspector_actions = ui::inspectors::show_inspector_windows(
-                self,
-                ui,
-                variant_sample_search.clone(),
-            );
-            clear_selection |= inspector_actions.clear_selection;
-            selected_to_top_requested |= inspector_actions.selected_to_top_requested;
-            chain_navigation_requested = inspector_actions.chain_navigation_requested;
-            mate_panel_requested |= inspector_actions.mate_panel_requested;
-            chain_panel_requested = inspector_actions.chain_panel_requested;
-            chain_all_panels_requested |= inspector_actions.chain_all_panels_requested;
-            variant_partner_requested = inspector_actions.variant_partner_requested;
-            variant_endpoint_requested = inspector_actions.variant_endpoint_requested;
-            interaction_endpoint_requested = inspector_actions.interaction_endpoint_requested;
-            variant_pileup_requested = inspector_actions.variant_pileup_requested;
-            variant_modification_requested = inspector_actions.variant_modification_requested;
-            variant_genotypes_export_requested |= inspector_actions.variant_genotypes_export_requested;
-            variant_evidence_export_requested |= inspector_actions.variant_evidence_export_requested;
-            junction_bed_export_requested |= inspector_actions.junction_bed_export_requested;
-            sashimi_png_export_requested |= inspector_actions.sashimi_png_export_requested;
-            sashimi_svg_export_requested |= inspector_actions.sashimi_svg_export_requested;
-            add_selected_feature_to_review |= inspector_actions.add_selected_feature_to_review;
-            review_open |= inspector_actions.review_open;
-            variant_sample_search = inspector_actions.variant_sample_search;
             let mut system_dialogs = ui::system_dialogs::SystemDialogDraft {
                 command_palette_open,
                 command_search: command_search.clone(),
@@ -1989,6 +2131,9 @@ impl Viewer {
             recovery_open = system_dialogs.recovery_open;
             recovery_requested = system_dialogs.recovery_requested;
             dismiss_recovery = system_dialogs.dismiss_recovery;
+        });
+        self.egui_context.data_mut(|data| {
+            data.insert_temp(properties_expanded_id, properties_expanded);
         });
         let repaint_delay = full_output
             .viewport_output
@@ -2111,6 +2256,7 @@ impl Viewer {
         export_png_requested |= track_effects.export_requested;
         let alignment_track_to_remove = track_effects.alignment_to_remove;
         let alignment_track_move = track_effects.alignment_move;
+        let alignment_subtracks_to_toggle = track_effects.alignment_subtracks_to_toggle;
         track_move = track_effects.auxiliary_move.or(track_move);
         let mut alignment_configuration_changed = false;
         let mut alignment_query_membership_changed = Vec::new();
@@ -3281,6 +3427,9 @@ impl Viewer {
                 self.apply_bulk_alignment_appearance(settings_alignment_id, &bulk_alignment_ids)
         {
             self.data_status = error.to_string();
+        }
+        for (track_id, subtrack) in alignment_subtracks_to_toggle {
+            self.toggle_alignment_subtrack(track_id, subtrack);
         }
         self.metadata_bulk_height = metadata_bulk_height;
         self.metadata_remove_armed = metadata_remove_armed && !metadata_selection_changed;

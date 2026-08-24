@@ -56,6 +56,7 @@ pub(crate) fn quantitative_overlay_subtracks(
                 .map(|group| format!("overlay {group}")),
             top: top + 22.0 + index as f32 * 14.0,
             bottom: top + 36.0 + index as f32 * 14.0,
+            collapsed: false,
         })
         .collect::<Vec<_>>();
     if truncated {
@@ -66,6 +67,7 @@ pub(crate) fn quantitative_overlay_subtracks(
             detail: Some("Open the Tracks menu to inspect every overlay member".to_owned()),
             top: top + 22.0 + index as f32 * 14.0,
             bottom: top + 36.0 + index as f32 * 14.0,
+            collapsed: false,
         });
     }
     subtracks

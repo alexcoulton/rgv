@@ -104,7 +104,7 @@ pub(crate) fn fill_lone_alignment_track(
     }
     let frame = &mut frames[0];
     frame.bottom = viewport_bottom;
-    if let Some(reads) = frame.subtracks.last_mut() {
+    if let Some(reads) = frame.subtracks.last_mut().filter(|reads| !reads.collapsed) {
         reads.bottom = viewport_bottom;
     }
     viewport_bottom

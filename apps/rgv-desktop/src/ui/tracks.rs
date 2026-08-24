@@ -17,12 +17,50 @@ pub enum TrackFrameKey {
     Auxiliary(TrackId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AlignmentSubtrack {
+    Reference,
+    Coverage,
+    Sashimi,
+    Modifications,
+    Reads,
+}
+
+impl AlignmentSubtrack {
+    pub const ALL: [Self; 5] = [
+        Self::Reference,
+        Self::Coverage,
+        Self::Sashimi,
+        Self::Modifications,
+        Self::Reads,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Reference => "Reference",
+            Self::Coverage => "Coverage",
+            Self::Sashimi => "Sashimi",
+            Self::Modifications => "Modifications",
+            Self::Reads => "Reads",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|subtrack| subtrack.label() == label)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrackSubtrack {
     pub label: String,
     pub detail: Option<String>,
     pub top: f32,
     pub bottom: f32,
+    /// A compact placeholder for a hidden alignment lane. The gutter keeps
+    /// its label and closed-eye control so visibility can be restored in place.
+    pub collapsed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +85,7 @@ pub enum TrackUiAction {
     OpenSettings(TrackFrameKey),
     ToggleVisibility(TrackFrameKey),
     ToggleCollapsed(TrackFrameKey),
+    ToggleAlignmentSubtrack(TrackId, AlignmentSubtrack),
     Export(TrackFrameKey),
     Remove(TrackFrameKey),
     ReorderDropped(TrackId, f32),
@@ -541,8 +580,15 @@ pub fn paint_track_viewport_chrome(
         if selected == Some(frame.key) || selected_as_part_of_group {
             painter.rect_filled(label_rect, 0.0, Color32::from_rgb(229, 238, 252));
         }
+        let header_rect = Rect::from_min_max(
+            label_rect.left_top(),
+            pos2(
+                label_rect.right(),
+                (label_rect.top() + 22.0).min(label_rect.bottom()),
+            ),
+        );
         let response = ui.interact(
-            label_rect,
+            header_rect,
             egui::Id::new(("track-label", frame.key)),
             Sense::click_and_drag(),
         );
@@ -620,7 +666,7 @@ pub fn paint_track_viewport_chrome(
         });
         if response.has_focus() {
             painter.rect_stroke(
-                label_rect.shrink(1.0),
+                header_rect.shrink(1.0),
                 1.0,
                 Stroke::new(2.0, Color32::BLACK),
                 egui::StrokeKind::Inside,
@@ -717,10 +763,111 @@ pub fn paint_track_viewport_chrome(
                 continue;
             }
             let y = (subtrack_top + 9.0).min(subtrack_bottom - 2.0);
+            let alignment_subtrack = match frame.key {
+                TrackFrameKey::Alignment(_) => AlignmentSubtrack::from_label(&subtrack.label),
+                TrackFrameKey::Reference | TrackFrameKey::Auxiliary(_) => None,
+            };
+            if let (TrackFrameKey::Alignment(track_id), Some(alignment_subtrack)) =
+                (frame.key, alignment_subtrack)
+            {
+                if subtrack.collapsed {
+                    painter.rect_filled(
+                        Rect::from_min_max(
+                            pos2(geometry.gutter.left(), subtrack_top),
+                            pos2(geometry.gutter.right(), subtrack_bottom),
+                        ),
+                        0.0,
+                        Color32::from_gray(242),
+                    );
+                    painter.line_segment(
+                        [
+                            pos2(geometry.gutter.left(), subtrack_bottom),
+                            pos2(geometry.gutter.right(), subtrack_bottom),
+                        ],
+                        Stroke::new(1.0, Color32::from_gray(218)),
+                    );
+                }
+                let eye_rect = Rect::from_center_size(
+                    pos2(label_rect.left() + 11.0, y),
+                    egui::vec2(16.0, 16.0),
+                );
+                let eye = ui.interact(
+                    eye_rect,
+                    egui::Id::new((
+                        "alignment-subtrack-visibility",
+                        track_id,
+                        alignment_subtrack,
+                    )),
+                    Sense::click(),
+                );
+                eye.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Checkbox,
+                        true,
+                        !subtrack.collapsed,
+                        format!(
+                            "{} subtrack {}",
+                            alignment_subtrack.label(),
+                            if subtrack.collapsed {
+                                "hidden"
+                            } else {
+                                "visible"
+                            }
+                        ),
+                    )
+                });
+                if eye.clicked() {
+                    result.actions.push(TrackUiAction::ToggleAlignmentSubtrack(
+                        track_id,
+                        alignment_subtrack,
+                    ));
+                }
+                let visibility_action = if subtrack.collapsed { "Show" } else { "Hide" };
+                eye.clone().on_hover_text(format!(
+                    "{visibility_action} {} subtrack",
+                    alignment_subtrack.label()
+                ));
+                eye.context_menu(|ui| {
+                    if ui
+                        .button(format!(
+                            "{visibility_action} {}",
+                            alignment_subtrack.label()
+                        ))
+                        .clicked()
+                    {
+                        result.actions.push(TrackUiAction::ToggleAlignmentSubtrack(
+                            track_id,
+                            alignment_subtrack,
+                        ));
+                        ui.close();
+                    }
+                });
+                let eye_color = if eye.hovered() {
+                    Color32::from_rgb(45, 92, 175)
+                } else {
+                    Color32::from_gray(115)
+                };
+                label_painter.add(egui::epaint::Shape::ellipse_stroke(
+                    eye_rect.center(),
+                    egui::vec2(5.0, 3.2),
+                    Stroke::new(1.0, eye_color),
+                ));
+                if subtrack.collapsed {
+                    label_painter.line_segment(
+                        [
+                            eye_rect.left_top() + egui::vec2(2.5, 2.5),
+                            eye_rect.right_bottom() - egui::vec2(2.5, 2.5),
+                        ],
+                        Stroke::new(1.4, eye_color),
+                    );
+                } else {
+                    label_painter.circle_filled(eye_rect.center(), 1.6, eye_color);
+                }
+            }
             let label_font = FontId::proportional(10.0);
             let detail_font = FontId::proportional(9.0);
-            let label_color = Color32::from_gray(75);
-            let detail_color = Color32::from_gray(105);
+            let label_color = Color32::from_gray(if subtrack.collapsed { 115 } else { 75 });
+            let detail_color = Color32::from_gray(if subtrack.collapsed { 135 } else { 105 });
             let label_width = label_painter
                 .layout_no_wrap(subtrack.label.clone(), label_font.clone(), label_color)
                 .size()
@@ -731,7 +878,7 @@ pub fn paint_track_viewport_chrome(
                     .size()
                     .x
             });
-            let available_width = (label_rect.width() - 25.0).max(0.0);
+            let available_width = (label_rect.width() - 29.0).max(0.0);
             let (label_width, detail_width) =
                 gutter_row_widths(label_width, detail_width, available_width);
             paint_elided_text(
@@ -740,7 +887,7 @@ pub fn paint_track_viewport_chrome(
                 label_font,
                 label_color,
                 label_width,
-                pos2(label_rect.left() + 18.0, y),
+                pos2(label_rect.left() + 22.0, y),
                 false,
             );
             if let Some(detail) = &subtrack.detail {
@@ -874,6 +1021,17 @@ pub fn paint_genomic_text(ui: &Ui, clip_rect: Rect, texts: &[TextPrimitive]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alignment_subtrack_labels_round_trip_to_gutter_actions() {
+        for subtrack in AlignmentSubtrack::ALL {
+            assert_eq!(
+                AlignmentSubtrack::from_label(subtrack.label()),
+                Some(subtrack)
+            );
+        }
+        assert_eq!(AlignmentSubtrack::from_label("Genes"), None);
+    }
 
     fn frame(id: u64, top: f32) -> TrackFrame {
         TrackFrame {
@@ -1119,6 +1277,140 @@ mod tests {
     }
 
     #[test]
+    fn hidden_alignment_subtrack_keeps_a_collapsed_closed_eye_row() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 500.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let track_id = TrackId::new(9);
+                let geometry = CanvasGeometry::from_viewport(ui.max_rect());
+                let frames = [TrackFrame {
+                    key: TrackFrameKey::Alignment(track_id),
+                    name: "reads.bam".to_owned(),
+                    kind: TrackKind::Alignment,
+                    source_label: None,
+                    top: 20.0,
+                    bottom: 300.0,
+                    visible: true,
+                    collapsed: false,
+                    frozen_bottom: None,
+                    subtracks: vec![TrackSubtrack {
+                        label: "Coverage".to_owned(),
+                        detail: None,
+                        top: 42.0,
+                        bottom: 62.0,
+                        collapsed: true,
+                    }],
+                }];
+                let _ = paint_track_viewport_chrome(ui, geometry, &frames, 0.0, None, &[]);
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::CheckBox
+                && node
+                    .label()
+                    .is_some_and(|label| label == "Coverage subtrack hidden")
+                && node.toggled() == Some(egui::accesskit::Toggled::False)
+        }));
+    }
+
+    #[test]
+    fn clicking_closed_eye_on_collapsed_subtrack_requests_reenable() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let track_id = TrackId::new(9);
+        let frames = [TrackFrame {
+            key: TrackFrameKey::Alignment(track_id),
+            name: "reads.bam".to_owned(),
+            kind: TrackKind::Alignment,
+            source_label: None,
+            top: 20.0,
+            bottom: 300.0,
+            visible: true,
+            collapsed: false,
+            frozen_bottom: None,
+            subtracks: vec![TrackSubtrack {
+                label: "Coverage".to_owned(),
+                detail: None,
+                top: 42.0,
+                bottom: 62.0,
+                collapsed: true,
+            }],
+        }];
+        let pointer = pos2(11.0, 51.0);
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &frames,
+                0.0,
+                None,
+                &[],
+            )
+        };
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                actions = render(ui).actions;
+            },
+        );
+
+        assert_eq!(
+            actions,
+            vec![TrackUiAction::ToggleAlignmentSubtrack(
+                track_id,
+                AlignmentSubtrack::Coverage,
+            )]
+        );
+    }
+
+    #[test]
     fn resize_clamps_to_track_height_constraints() {
         assert_close(resized_track_height(120.0, 30.0), 150.0);
         assert_close(resized_track_height(120.0, -500.0), 40.0);
@@ -1143,12 +1435,14 @@ mod tests {
                     detail: None,
                     top: 125.0,
                     bottom: 165.0,
+                    collapsed: false,
                 },
                 TrackSubtrack {
                     label: "Reads".to_owned(),
                     detail: None,
                     top: 260.0,
                     bottom: 800.0,
+                    collapsed: false,
                 },
             ],
         };

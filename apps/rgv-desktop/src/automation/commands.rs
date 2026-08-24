@@ -1415,6 +1415,12 @@ impl Viewer {
                     .first()
                     .and_then(|track| track.projection(panel.id))
                     .and_then(|projection| projection.current_query.as_deref());
+                let layout_stats = self
+                    .alignment_tracks
+                    .first()
+                    .and_then(|track| track.projection(panel.id))
+                    .and_then(|projection| projection.cached_layout.as_ref())
+                    .map(|(_, layout)| layout.stats);
                 let reads_rendered = filters.show_reads
                     && panel.viewport.detail_level() != DetailLevel::Overview
                     && query.is_some();
@@ -1446,7 +1452,11 @@ impl Viewer {
                         rendered,
                         omission_reason,
                         queried_items: query.map_or(0, |query| query.stats.records_eligible),
-                        rendered_items: query.map_or(0, |query| query.stats.records_emitted),
+                        rendered_items: if lane == "reads" {
+                            layout_stats.map_or(0, |stats| stats.rendered_alignments)
+                        } else {
+                            query.map_or(0, |query| query.stats.records_emitted)
+                        },
                         sampled_items: query.map_or(0, |query| {
                             query
                                 .stats

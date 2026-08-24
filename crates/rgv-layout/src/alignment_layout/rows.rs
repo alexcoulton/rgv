@@ -19,7 +19,16 @@ pub fn assign_alignment_rows(
     let ordered_groups = ordered_group_entries(&groups, options.group_order);
     let group_count = groups.len().max(1);
     let max_rows = options.max_rows.max(1);
-    let rows_per_group = (max_rows / group_count).max(1);
+    // When the caller provides enough capacity for every retained alignment,
+    // grouping must not manufacture a smaller per-group display cap. A group
+    // can consume as many rows as it needs and later groups use the remaining
+    // global capacity. Preserve the equal-share policy only for explicitly
+    // capacity-limited layouts such as fixed-height secondary tracks.
+    let rows_per_group = if max_rows >= query.batch.len() {
+        max_rows
+    } else {
+        (max_rows / group_count).max(1)
+    };
     let identities = alignment_row_identities(query, &pairs);
     let mut rows = vec![None; query.batch.len()];
     let mut group_starts = BTreeMap::new();

@@ -152,12 +152,41 @@ fn a_lone_alignment_track_fills_unused_canvas_height() {
             detail: None,
             top: 200.0,
             bottom: 300.0,
+            collapsed: false,
         }],
     }];
     let content_bottom = fill_lone_alignment_track(&mut frames, 300.0, 900.0);
     assert!((content_bottom - 900.0).abs() < f32::EPSILON);
     assert!((frames[0].bottom - 900.0).abs() < f32::EPSILON);
     assert!((frames[0].subtracks[0].bottom - 900.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn a_collapsed_alignment_lane_stays_compact_when_its_frame_fills_the_canvas() {
+    let mut frames = vec![TrackFrame {
+        key: TrackFrameKey::Alignment(TrackId::new(1)),
+        name: "variants.bam".to_owned(),
+        kind: TrackKind::Alignment,
+        source_label: None,
+        top: 100.0,
+        bottom: 142.0,
+        visible: true,
+        collapsed: false,
+        frozen_bottom: Some(142.0),
+        subtracks: vec![TrackSubtrack {
+            label: "Reads".to_owned(),
+            detail: None,
+            top: 122.0,
+            bottom: 142.0,
+            collapsed: true,
+        }],
+    }];
+
+    let content_bottom = fill_lone_alignment_track(&mut frames, 142.0, 900.0);
+
+    assert!((content_bottom - 900.0).abs() < f32::EPSILON);
+    assert!((frames[0].bottom - 900.0).abs() < f32::EPSILON);
+    assert!((frames[0].subtracks[0].bottom - 142.0).abs() < f32::EPSILON);
 }
 
 #[test]
@@ -273,6 +302,7 @@ fn alignment_lane_picking_distinguishes_frozen_and_scrolled_tracks() {
                 detail: None,
                 top: 125.0,
                 bottom: 175.0,
+                collapsed: false,
             }],
         },
         TrackFrame {
@@ -290,6 +320,7 @@ fn alignment_lane_picking_distinguishes_frozen_and_scrolled_tracks() {
                 detail: None,
                 top: 525.0,
                 bottom: 575.0,
+                collapsed: false,
             }],
         },
     ];
@@ -301,6 +332,33 @@ fn alignment_lane_picking_distinguishes_frozen_and_scrolled_tracks() {
     assert_eq!(
         alignment_lane_at_screen_y(&frames, "Coverage", 200.0, 350.0),
         Some(TrackId::new(11))
+    );
+}
+
+#[test]
+fn collapsed_alignment_lanes_are_not_pickable() {
+    let frames = vec![TrackFrame {
+        key: TrackFrameKey::Alignment(TrackId::new(10)),
+        name: "Tumour".to_owned(),
+        kind: TrackKind::Alignment,
+        source_label: None,
+        top: 100.0,
+        bottom: 180.0,
+        visible: true,
+        collapsed: false,
+        frozen_bottom: Some(180.0),
+        subtracks: vec![TrackSubtrack {
+            label: "Coverage".to_owned(),
+            detail: None,
+            top: 122.0,
+            bottom: 142.0,
+            collapsed: true,
+        }],
+    }];
+
+    assert_eq!(
+        alignment_lane_at_screen_y(&frames, "Coverage", 130.0, 0.0),
+        None
     );
 }
 

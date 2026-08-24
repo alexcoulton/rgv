@@ -32,7 +32,7 @@ pub(crate) fn alignment_lane_at_screen_y(
             return None;
         };
         frame.subtracks.iter().find_map(|subtrack| {
-            if subtrack.label != label {
+            if subtrack.label != label || subtrack.collapsed {
                 return None;
             }
             let y = if frame

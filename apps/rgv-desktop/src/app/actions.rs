@@ -21,6 +21,7 @@ pub(crate) struct TrackActionOutcome {
     pub alignment_to_remove: Option<TrackId>,
     pub alignment_move: Option<(TrackId, usize)>,
     pub auxiliary_move: Option<(TrackId, usize)>,
+    pub alignment_subtracks_to_toggle: Vec<(TrackId, AlignmentSubtrack)>,
 }
 
 impl Viewer {
@@ -82,6 +83,9 @@ impl Viewer {
                 }
                 TrackUiAction::ToggleCollapsed(TrackFrameKey::Reference)
                 | TrackUiAction::Remove(TrackFrameKey::Reference) => {}
+                TrackUiAction::ToggleAlignmentSubtrack(track_id, subtrack) => outcome
+                    .alignment_subtracks_to_toggle
+                    .push((track_id, subtrack)),
                 TrackUiAction::Export(_) => outcome.export_requested = true,
                 TrackUiAction::Remove(TrackFrameKey::Auxiliary(id)) => {
                     match self.remove_auxiliary_tracks(&[id]) {
@@ -219,5 +223,74 @@ impl Viewer {
             }
         }
         outcome
+    }
+
+    pub(crate) fn toggle_alignment_subtrack(
+        &mut self,
+        track_id: TrackId,
+        subtrack: AlignmentSubtrack,
+    ) {
+        let primary_id = self.primary_alignment_track_id();
+        let filters = if track_id == primary_id {
+            Some(self.primary_alignment_filters_mut())
+        } else {
+            self.alignment_tracks
+                .iter_mut()
+                .find(|track| track.config.id == track_id)
+                .map(|track| &mut track.config.filters)
+        };
+        let Some(filters) = filters else {
+            return;
+        };
+        let visible = match subtrack {
+            AlignmentSubtrack::Reference => {
+                filters.show_reference = !filters.show_reference;
+                filters.show_reference
+            }
+            AlignmentSubtrack::Coverage => {
+                filters.show_coverage = !filters.show_coverage;
+                filters.show_coverage
+            }
+            AlignmentSubtrack::Sashimi => {
+                filters.show_junctions = !filters.show_junctions;
+                filters.show_junctions
+            }
+            AlignmentSubtrack::Modifications => {
+                filters.show_modification_frequency = !filters.show_modification_frequency;
+                filters.show_modification_frequency
+            }
+            AlignmentSubtrack::Reads => {
+                filters.show_reads = !filters.show_reads;
+                filters.show_reads
+            }
+        };
+
+        if !visible && self.panels.active().selected_alignment_track == Some(track_id) {
+            match subtrack {
+                AlignmentSubtrack::Coverage => {
+                    self.panels.active_mut().selected_pileup_position = None;
+                }
+                AlignmentSubtrack::Sashimi => {
+                    self.panels.active_mut().selected_junction = None;
+                }
+                AlignmentSubtrack::Modifications => {
+                    self.panels.active_mut().selected_modification_position = None;
+                }
+                AlignmentSubtrack::Reads => {
+                    self.panels.active_mut().selected_record = None;
+                    self.panels.active_mut().selected_read_event = None;
+                    self.panels.active_mut().selected_chain = None;
+                }
+                AlignmentSubtrack::Reference => {}
+            }
+        }
+
+        let query_changed = subtrack == AlignmentSubtrack::Modifications;
+        self.invalidate_automation_alignment_layouts(Some(&[track_id]), query_changed);
+        if query_changed {
+            self.request_all_alignment_queries();
+        }
+        self.rebuild_all_panel_displays();
+        self.display_dirty = true;
     }
 }

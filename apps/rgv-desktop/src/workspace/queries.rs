@@ -511,7 +511,7 @@ impl Viewer {
                     let cache_label = if cache_hit { "cache hit · " } else { "" };
                     self.data_status = if query.stats.truncated {
                         format!(
-                            "{cache_label}showing a deterministic sample of {} / {} alignments",
+                            "{cache_label}safety cap loaded {} / {} alignments",
                             query.stats.records_emitted, query.stats.records_eligible
                         )
                     } else {

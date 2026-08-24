@@ -106,8 +106,9 @@ use runtime::*;
 use sha2::{Digest as _, Sha256};
 use sources::*;
 use ui::{
-    CanvasGeometry, GENOME_CONTEXT_HEIGHT, MENU_HEIGHT, NAVIGATION_HEIGHT, SEARCHABLE_COMMANDS,
-    STATUS_HEIGHT, TrackFrame, TrackFrameKey, TrackSubtrack, TrackUiAction, UiCommand,
+    AlignmentSubtrack, CanvasGeometry, GENOME_CONTEXT_HEIGHT, MENU_HEIGHT, NAVIGATION_HEIGHT,
+    SEARCHABLE_COMMANDS, STATUS_HEIGHT, TrackFrame, TrackFrameKey, TrackSubtrack, TrackUiAction,
+    UiCommand,
 };
 use ui::{alignment_settings::*, gestures::*, track_settings::*};
 use winit::{

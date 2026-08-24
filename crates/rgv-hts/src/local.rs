@@ -23,7 +23,7 @@ use crate::{
     pileup::{
         OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, oriented_observation,
     },
-    sampling::{RECORDS_PER_WINDOW, WINDOW_BASES, WindowedSampler},
+    sampling::BoundedSampler,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -129,8 +129,12 @@ impl Default for AlignmentOpenOptions {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryStats {
     pub records_seen: usize,
+    /// Records that passed flags and user filters in the backing query interval.
     pub records_eligible: usize,
+    /// Records loaded for individual layout/inspection, equal to `records_eligible`
+    /// unless the explicit query safety bound was exceeded.
     pub records_emitted: usize,
+    /// The explicit query safety bound omitted otherwise eligible records.
     pub truncated: bool,
     pub cancelled: bool,
 }
@@ -286,7 +290,7 @@ impl AlignmentSource for LocalAlignmentSource {
         self.reader.fetch((tid, start, end))?;
 
         let mut stats = QueryStats::default();
-        let mut samples = WindowedSampler::new(options.max_records.get(), RECORDS_PER_WINDOW);
+        let mut samples = BoundedSampler::new(options.max_records.get());
         let mut pileup = PileupBuilder::new(
             interval,
             options.coverage_bins.get(),
@@ -361,10 +365,8 @@ impl AlignmentSource for LocalAlignmentSource {
             };
 
             let score = sampling_score(&record);
-            let window = u64::try_from(record.pos()).unwrap_or_default() / WINDOW_BASES;
-            if samples.would_retain(window, score, stats.records_seen) {
+            if samples.would_retain(score, stats.records_seen) {
                 samples.insert(
-                    window,
                     score,
                     stats.records_seen,
                     match normalized_for_modifications {

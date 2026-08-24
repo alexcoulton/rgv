@@ -961,6 +961,31 @@ fn sparse_alignment_groups_are_packed_without_reserved_empty_rows() {
 }
 
 #[test]
+fn grouping_does_not_hide_a_dense_group_when_capacity_covers_the_batch() {
+    let mut records = (0..6)
+        .map(|index| row_test_record(format!("forward-{index}").as_bytes(), 10, 30))
+        .collect::<Vec<_>>();
+    let mut reverse = row_test_record(b"reverse", 10, 30);
+    reverse.flags = AlignmentFlags::from_bits(0x10);
+    records.push(reverse);
+    let query = row_test_query(&records);
+    let rows = assign_alignment_rows(
+        &query,
+        AlignmentLayoutOptions {
+            group_mode: AlignmentGroupMode::Strand,
+            max_rows: records.len(),
+            ..AlignmentLayoutOptions::default()
+        },
+        None,
+    );
+
+    assert_eq!(
+        rows.rows.iter().filter(|row| row.is_some()).count(),
+        records.len()
+    );
+}
+
+#[test]
 fn history_preserves_local_rows_while_compacting_following_groups() {
     let leading = row_test_record(b"leading", 10, 40);
     let retained = row_test_record(b"retained", 20, 50);

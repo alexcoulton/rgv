@@ -4,6 +4,18 @@ pub(crate) mod hit_test;
 
 use super::*;
 
+pub(super) const COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT: f32 = 20.0;
+
+pub(super) fn collapsed_alignment_subtrack(label: &str, top: f32) -> TrackSubtrack {
+    TrackSubtrack {
+        label: label.to_owned(),
+        detail: None,
+        top,
+        bottom: top + COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT,
+        collapsed: true,
+    }
+}
+
 impl Viewer {
     pub(crate) fn ensure_alignment_rows(&mut self) {
         let panel_id = self.panels.active().id;
@@ -12,7 +24,7 @@ impl Viewer {
         let Some(query) = self.alignment_query_for_track(primary_id).cloned() else {
             return;
         };
-        let max_rows = self.primary_alignment_limit().clamp(90, 4_096);
+        let max_rows = query.batch.len().max(1);
         let pair_length_bounds = self.effective_template_length_bounds(&query);
         let sort_position =
             alignment_sort_position(filters.alignment_sort_mode, self.panels.active().viewport);
@@ -170,6 +182,7 @@ impl Viewer {
                 detail: reference_is_zoomed_out.then(|| "zoom in to see sequence".to_owned()),
                 top: sequence_top,
                 bottom: sequence_top + 20.0,
+                collapsed: false,
             }];
             subtracks.extend(
                 self.reference_translation_frames
@@ -181,6 +194,7 @@ impl Viewer {
                         detail: Some(format!("{:?}", self.reference_genetic_code)),
                         top: translation_top + index as f32 * 20.0,
                         bottom: translation_top + (index + 1) as f32 * 20.0,
+                        collapsed: false,
                     }),
             );
             let frame = TrackFrame {
@@ -212,13 +226,17 @@ impl Viewer {
             let mut options = AlignmentLayoutOptions::default();
             let density = self.primary_alignment_filters().alignment_density;
             let secondary_scale = density.sqrt();
+            let modification_frequency_supported =
+                self.panels.active().viewport.detail_level() != DetailLevel::Overview;
             let show_modification_frequency =
                 self.primary_alignment_filters().show_modification_frequency
-                    && self.panels.active().viewport.detail_level() != DetailLevel::Overview;
-            let show_junctions = self.primary_alignment_filters().show_junctions
-                && !query.junctions.junctions.is_empty();
+                    && modification_frequency_supported;
+            let junctions_available = !query.junctions.junctions.is_empty();
+            let show_junctions =
+                self.primary_alignment_filters().show_junctions && junctions_available;
+            let embedded_reference_supported = self.reference_engine.is_none();
             let embedded_reference =
-                self.primary_alignment_filters().show_reference && self.reference_engine.is_none();
+                self.primary_alignment_filters().show_reference && embedded_reference_supported;
             let reference_height = (28.0 * secondary_scale).clamp(20.0, 52.0);
             let frame_top = top;
             let content_top = frame_top + 22.0;
@@ -230,6 +248,10 @@ impl Viewer {
                 // contents appear at base detail, but later lanes must not move
                 // when a horizontal gesture crosses an LOD boundary.
                 lane_top += reference_height;
+            } else if embedded_reference_supported
+                && !self.primary_alignment_filters().show_reference
+            {
+                lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
             }
             options.show_coverage = self.primary_alignment_filters().show_coverage;
             options.coverage_top = lane_top;
@@ -238,6 +260,8 @@ impl Viewer {
                 self.primary_alignment_filters().coverage_scale_maximum;
             if self.primary_alignment_filters().show_coverage {
                 lane_top += options.coverage_height + 6.0;
+            } else {
+                lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
             }
             options.show_junctions = show_junctions;
             options.junction_top = lane_top;
@@ -276,12 +300,16 @@ impl Viewer {
             };
             if show_junctions {
                 lane_top += options.junction_height + 6.0;
+            } else if junctions_available {
+                lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
             }
             options.show_modification_frequency = show_modification_frequency;
             options.modification_top = lane_top;
             options.modification_height = (26.0 * secondary_scale).clamp(20.0, 40.0);
             if show_modification_frequency {
                 lane_top += options.modification_height + 8.0;
+            } else if modification_frequency_supported {
+                lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
             }
             options.show_reads = self.primary_alignment_filters().show_reads;
             options.reads_top = lane_top
@@ -290,6 +318,14 @@ impl Viewer {
                 } else {
                     0.0
                 };
+            if !options.show_reads {
+                lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
+            }
+            let frozen_bottom = if options.show_reads {
+                options.reads_top
+            } else {
+                lane_top
+            };
             options.row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
             options.read_height = (5.0 * density).clamp(1.5, (options.row_height - 1.0).max(1.5));
             options.color_mode = self.primary_alignment_filters().alignment_color_mode;
@@ -354,7 +390,10 @@ impl Viewer {
             {
                 *slot = Some(code);
             }
-            options.max_rows = (self.primary_alignment_limit()).clamp(90, 4_096);
+            // The query safety cap already bounds retained records. The
+            // scrollable primary track must give every retained record a row
+            // opportunity instead of imposing a second display-only cap.
+            options.max_rows = query.batch.len().max(1);
             let key = alignment_layout_key(
                 PanelTrackId::new(self.panels.active().id, primary_alignment_id),
                 self.primary_alignment_source(),
@@ -389,22 +428,12 @@ impl Viewer {
                 layout
             };
             extend_alignment_layers(&mut pinned_display, &mut display, &layout);
-            scroll_clip_top = options.reads_top;
+            scroll_clip_top = frozen_bottom;
             if let Some(track) = self.alignment_tracks.first_mut() {
                 track.projection_mut(self.panels.active().id).cached_layout =
                     Some((key, Arc::clone(&layout)));
             }
-            let pinned_bottom = if show_modification_frequency {
-                options.modification_top + options.modification_height
-            } else if show_junctions {
-                options.junction_top + options.junction_height
-            } else if self.primary_alignment_filters().show_coverage {
-                options.coverage_top + options.coverage_height
-            } else if embedded_reference {
-                options.reference_top + reference_height
-            } else {
-                content_top
-            };
+            let pinned_bottom = frozen_bottom;
             let natural_bottom = if self.primary_alignment_filters().show_reads {
                 layout
                     .display_list
@@ -431,16 +460,24 @@ impl Viewer {
                 bottom,
                 visible: true,
                 collapsed: false,
-                frozen_bottom: Some(options.reads_top),
+                frozen_bottom: Some(frozen_bottom),
                 subtracks: {
-                    let mut subtracks = Vec::with_capacity(4);
+                    let mut subtracks = Vec::with_capacity(5);
                     if embedded_reference {
                         subtracks.push(TrackSubtrack {
                             label: "Reference".to_owned(),
                             detail: None,
                             top: options.reference_top,
                             bottom: options.reference_top + reference_height,
+                            collapsed: false,
                         });
+                    } else if embedded_reference_supported
+                        && !self.primary_alignment_filters().show_reference
+                    {
+                        subtracks.push(collapsed_alignment_subtrack(
+                            "Reference",
+                            options.reference_top,
+                        ));
                     }
                     if self.primary_alignment_filters().show_coverage {
                         let scale = self
@@ -460,7 +497,13 @@ impl Viewer {
                             detail: Some(scale),
                             top: options.coverage_top,
                             bottom: options.coverage_top + options.coverage_height,
+                            collapsed: false,
                         });
+                    } else {
+                        subtracks.push(collapsed_alignment_subtrack(
+                            "Coverage",
+                            options.coverage_top,
+                        ));
                     }
                     if show_junctions {
                         subtracks.push(TrackSubtrack {
@@ -474,7 +517,13 @@ impl Viewer {
                             )),
                             top: options.junction_top,
                             bottom: options.junction_top + options.junction_height,
+                            collapsed: false,
                         });
+                    } else if junctions_available {
+                        subtracks.push(collapsed_alignment_subtrack(
+                            "Sashimi",
+                            options.junction_top,
+                        ));
                     }
                     if show_modification_frequency {
                         subtracks.push(TrackSubtrack {
@@ -497,7 +546,13 @@ impl Viewer {
                             )),
                             top: options.modification_top,
                             bottom: options.modification_top + options.modification_height,
+                            collapsed: false,
                         });
+                    } else if modification_frequency_supported {
+                        subtracks.push(collapsed_alignment_subtrack(
+                            "Modifications",
+                            options.modification_top,
+                        ));
                     }
                     if self.primary_alignment_filters().show_reads {
                         let mut read_details = Vec::new();
@@ -508,11 +563,17 @@ impl Viewer {
                                 query.stats.records_eligible,
                                 query.stats.cancelled,
                             ));
-                        } else if query.stats.truncated {
+                        } else {
                             read_details.push(format!(
-                                "sampled {}/{}",
-                                query.stats.records_emitted, query.stats.records_eligible
+                                "{} visible · {} loaded",
+                                layout.stats.rendered_alignments, query.stats.records_emitted,
                             ));
+                            if query.stats.truncated {
+                                read_details.push(format!(
+                                    "safety cap: {}/{} loaded",
+                                    query.stats.records_emitted, query.stats.records_eligible
+                                ));
+                            }
                         }
                         if layout.stats.bisulfite_marks_omitted > 0 {
                             read_details.push(format!(
@@ -610,7 +671,10 @@ impl Viewer {
                             detail: (!read_details.is_empty()).then(|| read_details.join(" · ")),
                             top: options.reads_top,
                             bottom,
+                            collapsed: false,
                         });
+                    } else {
+                        subtracks.push(collapsed_alignment_subtrack("Reads", options.reads_top));
                     }
                     subtracks
                 },
@@ -875,6 +939,7 @@ impl Viewer {
                                     }),
                                     top: top + 19.0,
                                     bottom: (top + 39.0).min(bottom),
+                                    collapsed: false,
                                 });
                             }
                             layout_gwas(
@@ -953,6 +1018,7 @@ impl Viewer {
                                                 .map(|value| format!("{value:.3}")),
                                             top: row.top,
                                             bottom: row.bottom,
+                                            collapsed: false,
                                         }
                                     })
                                 }));
@@ -978,6 +1044,7 @@ impl Viewer {
                                             detail: Some("MAF tumour sample".to_owned()),
                                             top: row.top,
                                             bottom: row.bottom,
+                                            collapsed: false,
                                         }
                                     })
                                 }));
@@ -1314,12 +1381,14 @@ impl Viewer {
                                 detail: None,
                                 top: top + 30.0,
                                 bottom: top + 90.0,
+                                collapsed: false,
                             },
                             TrackSubtrack {
                                 label: "Reads".to_owned(),
                                 detail: None,
                                 top: top + 100.0,
                                 bottom,
+                                collapsed: false,
                             },
                         ]
                     },

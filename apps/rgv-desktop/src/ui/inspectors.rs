@@ -28,8 +28,51 @@ fn read_inspector_max_height(content_height: f32) -> f32 {
     (content_height * 0.45).clamp(260.0, 520.0)
 }
 
+/// Builder-compatible adapter used while the inspector UI is docked. Keeping
+/// the old window sizing calls as no-ops lets every inspector retain its full
+/// contents and actions without allowing it to float over the genomic canvas.
+struct PropertySection<'a> {
+    ui: &'a mut egui::Ui,
+    title: &'static str,
+}
+
+impl<'a> PropertySection<'a> {
+    fn new(ui: &'a mut egui::Ui, title: &'static str) -> Self {
+        Self { ui, title }
+    }
+
+    fn default_pos<T>(self, _position: T) -> Self {
+        self
+    }
+
+    fn default_size<T>(self, _size: T) -> Self {
+        self
+    }
+
+    fn max_size<T>(self, _size: T) -> Self {
+        self
+    }
+
+    fn default_width(self, _width: f32) -> Self {
+        self
+    }
+
+    fn resizable(self, _resizable: bool) -> Self {
+        self
+    }
+
+    fn show<R>(self, _context: &egui::Context, add_contents: impl FnOnce(&mut egui::Ui) -> R) {
+        egui::Frame::group(self.ui.style()).show(self.ui, |ui| {
+            egui::CollapsingHeader::new(self.title)
+                .default_open(true)
+                .show(ui, add_contents);
+        });
+        self.ui.add_space(6.0);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-pub(crate) fn show_inspector_windows(
+pub(crate) fn show_properties(
     viewer: &Viewer,
     ui: &mut egui::Ui,
     mut variant_sample_search: String,
@@ -75,10 +118,29 @@ pub(crate) fn show_inspector_windows(
     let mut add_selected_feature_to_review = false;
     let mut review_open = false;
 
+    let has_inspector = inspector.is_some()
+        || chain_inspector.is_some()
+        || pileup_inspector.is_some()
+        || modification_inspector.is_some()
+        || junction_inspector.is_some()
+        || feature_inspector.is_some()
+        || variant_inspector.is_some()
+        || gwas_inspector.is_some()
+        || quantitative_inspector.is_some()
+        || copy_number_inspector.is_some()
+        || mutation_inspector.is_some()
+        || interaction_inspector.is_some();
+    if !has_inspector {
+        ui.vertical_centered(|ui| {
+            ui.add_space(20.0);
+            ui.weak("Select a read, pileup, junction, or feature to inspect it here.");
+        });
+    }
+
     if let Some(inspector) = &inspector {
         let context = ui.ctx().clone();
         let inspector_max_height = read_inspector_max_height(context.content_rect().height());
-        egui::Window::new("Read inspector")
+        PropertySection::new(ui, "Read")
             .default_pos([24.0, 210.0])
             .default_size([520.0, 360.0])
             .max_size([720.0, inspector_max_height])
@@ -206,12 +268,12 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(chain) = &chain_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("Supplementary alignment chain")
+        PropertySection::new(ui, "Supplementary alignments")
                     .default_pos([470.0, 210.0])
                     .default_width(620.0)
                     .resizable(true)
                     .show(&context, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.strong("Read");
                             ui.monospace(String::from_utf8_lossy(&chain.read_name));
                         });
@@ -266,7 +328,7 @@ pub(crate) fn show_inspector_windows(
                             }
                         });
                         ui.separator();
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             let count = chain.segments.len();
                             if ui.add_enabled(count > 1, egui::Button::new("Previous segment")).clicked() {
                                 chain_navigation_requested = Some(
@@ -306,18 +368,18 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(inspector) = &pileup_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("Pileup inspector")
+        PropertySection::new(ui, "Pileup")
             .default_pos([24.0, 210.0])
             .default_width(460.0)
             .resizable(true)
             .show(&context, |ui| {
                 for (label, value) in &inspector.fields {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.strong(label);
                         ui.monospace(value);
                     });
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy details").clicked() {
                         ui.ctx().copy_text(inspector_fields_text(&inspector.fields));
                     }
@@ -360,7 +422,7 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(inspector) = &modification_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("Modification-frequency inspector")
+        PropertySection::new(ui, "Modification frequency")
             .default_pos([24.0, 210.0])
             .default_width(620.0)
             .resizable(true)
@@ -371,7 +433,7 @@ pub(crate) fn show_inspector_windows(
                         ui.monospace(value);
                     });
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy details").clicked() {
                         ui.ctx().copy_text(inspector_fields_text(&inspector.fields));
                     }
@@ -383,7 +445,7 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(inspector) = &junction_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("Junction inspector")
+        PropertySection::new(ui, "Junction")
             .default_pos([24.0, 210.0])
             .default_width(520.0)
             .resizable(true)
@@ -394,7 +456,7 @@ pub(crate) fn show_inspector_windows(
                         ui.monospace(value);
                     });
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy details").clicked() {
                         ui.ctx().copy_text(inspector_fields_text(&inspector.fields));
                     }
@@ -415,7 +477,7 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(inspector) = &feature_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("Feature inspector")
+        PropertySection::new(ui, "Feature")
             .default_pos([24.0, 210.0])
             .default_width(560.0)
             .resizable(true)
@@ -431,7 +493,7 @@ pub(crate) fn show_inspector_windows(
                             });
                         }
                     });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy details").clicked() {
                         ui.ctx().copy_text(inspector_fields_text(&fields));
                     }
@@ -447,7 +509,7 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(inspector) = &quantitative_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("Quantitative inspector")
+        PropertySection::new(ui, "Quantitative value")
             .default_pos([24.0, 210.0])
             .default_width(500.0)
             .resizable(true)
@@ -459,7 +521,7 @@ pub(crate) fn show_inspector_windows(
                         ui.monospace(value);
                     });
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy details").clicked() {
                         ui.ctx().copy_text(inspector_fields_text(&fields));
                     }
@@ -471,7 +533,7 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(inspector) = &gwas_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("GWAS association inspector")
+        PropertySection::new(ui, "GWAS association")
             .default_pos([24.0, 210.0])
             .default_width(560.0)
             .resizable(true)
@@ -487,7 +549,7 @@ pub(crate) fn show_inspector_windows(
                             });
                         }
                     });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy details").clicked() {
                         ui.ctx().copy_text(inspector_fields_text(&fields));
                     }
@@ -499,7 +561,7 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(inspector) = &copy_number_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("Copy-number inspector")
+        PropertySection::new(ui, "Copy number")
             .default_pos([24.0, 210.0])
             .default_width(540.0)
             .resizable(true)
@@ -511,7 +573,7 @@ pub(crate) fn show_inspector_windows(
                         ui.monospace(value);
                     });
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy details").clicked() {
                         ui.ctx().copy_text(inspector_fields_text(&fields));
                     }
@@ -523,7 +585,7 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(inspector) = &mutation_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("Mutation inspector")
+        PropertySection::new(ui, "Mutation")
             .default_pos([24.0, 210.0])
             .default_width(620.0)
             .resizable(true)
@@ -539,7 +601,7 @@ pub(crate) fn show_inspector_windows(
                             });
                         }
                     });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy details").clicked() {
                         ui.ctx().copy_text(inspector_fields_text(&fields));
                     }
@@ -551,7 +613,7 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(inspector) = &interaction_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("Interaction inspector")
+        PropertySection::new(ui, "Interaction")
             .default_pos([24.0, 210.0])
             .default_width(560.0)
             .resizable(true)
@@ -600,7 +662,7 @@ pub(crate) fn show_inspector_windows(
     }
     if let Some(inspector) = &variant_inspector {
         let context = ui.ctx().clone();
-        egui::Window::new("Variant inspector")
+        PropertySection::new(ui, "Variant")
                     .default_pos([24.0, 210.0])
                     .default_width(680.0)
                     .resizable(true)
@@ -635,7 +697,7 @@ pub(crate) fn show_inspector_windows(
                                 format!("Breakend partners ({})", record.breakends.len()),
                                 |ui| {
                                     for partner in &record.breakends {
-                                        ui.horizontal(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.monospace(format!(
                                                 "ALT {} → {}:{}",
                                                 partner.alternate_index + 1,
@@ -692,7 +754,7 @@ pub(crate) fn show_inspector_windows(
                                             "Read context: {} retained records{} · template-length model sampled {} proper pairs{}",
                                             evidence.retained_records,
                                             if evidence.retained_records_sampled {
-                                                " (display sampled)"
+                                                " (display safety-limited)"
                                             } else {
                                                 ""
                                             },
@@ -747,7 +809,7 @@ pub(crate) fn show_inspector_windows(
                             },
                         );
                         ui.separator();
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.strong(format!(
                                 "Genotypes ({} loaded / {} selected / {} in file)",
                                 record.genotypes.len(),
@@ -832,7 +894,7 @@ pub(crate) fn show_inspector_windows(
                                         .samples
                                         .get(genotype.sample_index)
                                         .map_or("?", String::as_str);
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         let group = variant_genotype_group_label(genotype);
                                         ui.colored_label(
                                             variant_genotype_color(genotype),
@@ -885,7 +947,7 @@ pub(crate) fn show_inspector_windows(
                                 ),
                             );
                         }
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("Copy details").clicked() {
                                 ui.ctx().copy_text(variant_details_text(&fields, record));
                             }
@@ -933,7 +995,7 @@ pub(crate) fn show_inspector_windows(
 
 #[cfg(test)]
 mod tests {
-    use super::read_inspector_max_height;
+    use super::{PropertySection, read_inspector_max_height};
 
     #[test]
     fn read_inspector_is_bounded_at_supported_window_heights() {
@@ -942,5 +1004,17 @@ mod tests {
             assert!(inspector <= height * 0.45 + f32::EPSILON);
             assert!(inspector <= 520.0);
         }
+    }
+
+    #[test]
+    fn property_section_renders_inside_its_parent_ui() {
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            let child_context = ui.ctx().clone();
+            PropertySection::new(ui, "Read").show(&child_context, |ui| {
+                ui.label("read-name");
+            });
+        });
+        assert!(output.shapes.len() > 1);
     }
 }

@@ -17,7 +17,7 @@ pub(crate) fn secondary_alignment_track_layout(
     let lifecycle = track.lifecycle.clone();
     let active_filters = track.active_filters.clone();
     let frame_height = config.height.clamp(40.0, 1_200.0);
-    let frame_bottom = if config.collapsed {
+    let mut frame_bottom = if config.collapsed {
         frame_top + 26.0
     } else {
         frame_top + frame_height
@@ -74,6 +74,7 @@ pub(crate) fn secondary_alignment_track_layout(
                     detail: None,
                     top: frame_top + 22.0,
                     bottom: frame_bottom,
+                    collapsed: false,
                 }],
             },
         );
@@ -95,8 +96,11 @@ pub(crate) fn secondary_alignment_track_layout(
     };
     if options.show_coverage {
         lane_top += options.coverage_height + 6.0;
+    } else {
+        lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
     }
-    let show_junctions = filters.show_junctions && !query.junctions.junctions.is_empty();
+    let junctions_available = !query.junctions.junctions.is_empty();
+    let show_junctions = filters.show_junctions && junctions_available;
     options.show_junctions = show_junctions;
     options.junction_top = lane_top;
     options.junction_height = match filters.junction_display_mode {
@@ -118,19 +122,32 @@ pub(crate) fn secondary_alignment_track_layout(
     };
     if show_junctions {
         lane_top += options.junction_height + 6.0;
+    } else if junctions_available {
+        lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
     }
+    let modification_frequency_supported = viewport.detail_level() != DetailLevel::Overview;
     let show_modification_frequency =
-        filters.show_modification_frequency && viewport.detail_level() != DetailLevel::Overview;
+        filters.show_modification_frequency && modification_frequency_supported;
     options.show_modification_frequency = show_modification_frequency;
     options.modification_top = lane_top;
     options.modification_height = (26.0 * secondary_scale).clamp(20.0, 40.0);
     if show_modification_frequency {
         lane_top += options.modification_height + 8.0;
+    } else if modification_frequency_supported {
+        lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
     }
     options.show_reads = filters.show_reads;
     options.reads_top = lane_top + if filters.show_reads { 1.0 } else { 0.0 };
+    if !options.show_reads {
+        lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
+    }
     options.row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
     options.read_height = (5.0 * density).clamp(1.5, (options.row_height - 1.0).max(1.5));
+    frame_bottom = frame_bottom.max(if options.show_reads {
+        options.reads_top + options.row_height + 6.0
+    } else {
+        lane_top + 6.0
+    });
     options.color_mode = filters.alignment_color_mode;
     options.group_mode = filters.alignment_group_mode;
     options.group_order = filters.alignment_group_order;
@@ -249,7 +266,13 @@ pub(crate) fn secondary_alignment_track_layout(
             )),
             top: options.coverage_top,
             bottom: options.coverage_top + options.coverage_height,
+            collapsed: false,
         });
+    } else {
+        subtracks.push(collapsed_alignment_subtrack(
+            "Coverage",
+            options.coverage_top,
+        ));
     }
     if show_junctions {
         subtracks.push(TrackSubtrack {
@@ -263,7 +286,13 @@ pub(crate) fn secondary_alignment_track_layout(
             )),
             top: options.junction_top,
             bottom: options.junction_top + options.junction_height,
+            collapsed: false,
         });
+    } else if junctions_available {
+        subtracks.push(collapsed_alignment_subtrack(
+            "Sashimi",
+            options.junction_top,
+        ));
     }
     if show_modification_frequency {
         subtracks.push(TrackSubtrack {
@@ -271,7 +300,13 @@ pub(crate) fn secondary_alignment_track_layout(
             detail: Some(format!("{} types", query.pileup.modifications.series.len())),
             top: options.modification_top,
             bottom: options.modification_top + options.modification_height,
+            collapsed: false,
         });
+    } else if modification_frequency_supported {
+        subtracks.push(collapsed_alignment_subtrack(
+            "Modifications",
+            options.modification_top,
+        ));
     }
     if options.show_reads {
         let overview = viewport.detail_level() == DetailLevel::Overview;
@@ -282,18 +317,13 @@ pub(crate) fn secondary_alignment_track_layout(
             )]
         } else {
             vec![format!(
-                "{} read{} rendered",
-                layout.stats.rendered_alignments,
-                if layout.stats.rendered_alignments == 1 {
-                    ""
-                } else {
-                    "s"
-                }
+                "{} visible · {} loaded",
+                layout.stats.rendered_alignments, query.stats.records_emitted,
             )]
         };
         if query.stats.truncated && !overview {
             read_details.push(format!(
-                "sampled {}/{}",
+                "safety cap: {}/{} loaded",
                 query.stats.records_emitted, query.stats.records_eligible
             ));
         }
@@ -386,7 +416,10 @@ pub(crate) fn secondary_alignment_track_layout(
             detail: (!read_details.is_empty()).then(|| read_details.join(" · ")),
             top: options.reads_top,
             bottom: frame_bottom,
+            collapsed: false,
         });
+    } else {
+        subtracks.push(collapsed_alignment_subtrack("Reads", options.reads_top));
     }
     (
         Some(layout),
