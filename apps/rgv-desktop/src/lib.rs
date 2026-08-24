@@ -84,9 +84,10 @@ use rgv_hts::{
     CigarOpKind, FastaOpenOptions, HttpRangeConfig, ModificationCode, QUALITY_WEIGHT_SCALE,
     QueryDetail, QueryOptions, QueryStats, ReferenceSlice, RemoteAuthentication, RemoteIoStats,
     SequenceData, SupplementarySegment, TemplateLengthBounds, UltimaEventUnavailable,
-    UltimaIndelKind, UltimaQualitySource, analyze_ultima_record, bisulfite_strand_is_reverse,
-    decode_modified_bases, decode_supplementary_chain, pair_evidence, smrt_kinetics_series,
-    summarize_bisulfite_record, summarize_sbx_record,
+    UltimaIndelKind, UltimaQualitySource, UltimaTagOrientation,
+    analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse, decode_modified_bases,
+    decode_supplementary_chain, pair_evidence, smrt_kinetics_series, summarize_bisulfite_record,
+    summarize_sbx_record,
 };
 use rgv_layout::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentLayout, AlignmentLayoutOptions,

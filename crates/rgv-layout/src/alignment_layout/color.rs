@@ -36,28 +36,17 @@ pub(crate) fn bisulfite_observation(
     )
 }
 
-pub(crate) fn oriented_base(
-    flags: AlignmentFlags,
+pub(crate) fn aligned_base(
     bases: &[u8],
     qualities: Option<&[u8]>,
     aligned_position: usize,
 ) -> Option<(u8, Option<u8>)> {
-    if flags.is_reverse() {
-        let index = bases
-            .len()
-            .checked_sub(aligned_position.saturating_add(1))?;
-        Some((
-            complement(*bases.get(index)?),
-            qualities.and_then(|values| values.get(index)).copied(),
-        ))
-    } else {
-        Some((
-            *bases.get(aligned_position)?,
-            qualities
-                .and_then(|values| values.get(aligned_position))
-                .copied(),
-        ))
-    }
+    Some((
+        *bases.get(aligned_position)?,
+        qualities
+            .and_then(|values| values.get(aligned_position))
+            .copied(),
+    ))
 }
 
 pub(crate) fn visible_positions(

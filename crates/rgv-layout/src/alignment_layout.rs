@@ -18,10 +18,11 @@ use rgv_hts::{
     ImplicitModificationMode, JunctionEvidence, JunctionSummary, ModificationBin, ModificationCode,
     ModificationSummary, PairClassification, PairOrientation, PileupBin, PileupSummary,
     ReferenceSlice, SbxInsertionState, SbxTailBounds, SequenceView, SmrtKineticsSeries,
-    TemplateLengthBounds, UltimaEvidenceError, UltimaRecordAnalysis, analyze_ultima_record,
+    TemplateLengthBounds, UltimaEvidenceError, UltimaRecordAnalysis, UltimaTagOrientation,
+    aligned_position_for_sequencer_position, analyze_ultima_record_with_tag_orientation,
     bisulfite_strand_is_reverse, classify_bisulfite_observation, classify_sbx_insertion,
     decode_modified_bases_parts, decode_smrt_kinetics, pair_evidence_at, sbx_tail_bounds,
-    smrt_kinetics_tag,
+    sequencer_base_matches, smrt_kinetics_tag,
 };
 
 use crate::{DisplayList, RectPrimitive, Rgba, TextPrimitive, read_detail_object_id};
@@ -429,14 +430,17 @@ impl AlignmentRowLayout {
         self.rows.is_empty()
     }
 
-    fn compatible_with(&self, options: &AlignmentLayoutOptions) -> bool {
+    fn compatible_with(&self, options: &AlignmentLayoutOptions, record_count: usize) -> bool {
+        let next_max_rows = options.max_rows.max(1);
+        let capacity_is_compatible = self.max_rows == next_max_rows
+            || (self.max_rows >= self.rows.len().max(1) && next_max_rows >= record_count.max(1));
         self.group_mode == options.group_mode
             && self.group_order == options.group_order
             && self.sort_mode == options.sort_mode
             && self.sort_order == options.sort_order
             && self.sort_position == effective_sort_position(options)
             && self.promoted_read_name_hash == options.promoted_read_name_hash
-            && self.max_rows == options.max_rows.max(1)
+            && capacity_is_compatible
             && self.view_as_pairs == options.view_as_pairs
     }
 
@@ -752,8 +756,8 @@ mod color;
 pub use color::ultima_quality_color;
 use color::{
     add_base_glyph, add_event_label, add_marker, add_read_body, add_ultima_deletion_quality_mark,
-    add_ultima_insertion_quality_mark, alignment_color, base_color, bisulfite_observation,
-    clipped_geometry, complement, fill_label_color, insertion_event_color, oriented_base,
+    add_ultima_insertion_quality_mark, aligned_base, alignment_color, base_color,
+    bisulfite_observation, clipped_geometry, complement, fill_label_color, insertion_event_color,
     palette_color, read_base_label_color, record_tag_label, reference_base_label_color,
     smrt_kinetics_color, visible_positions, with_alpha,
 };

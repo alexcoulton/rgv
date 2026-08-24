@@ -31,8 +31,10 @@ impl SmrtKineticsSeries<'_> {
         self.len() == 0
     }
 
-    /// Returns the kinetic value for a CIGAR-oriented read offset. BAM stores reverse-aligned
-    /// sequence in reverse-complement orientation, so per-base arrays use the same reverse index.
+    /// Returns the kinetic value for a CIGAR-oriented read offset.
+    ///
+    /// PacBio aligners reverse-complement `SEQ` for a reverse alignment but deliberately leave
+    /// the native-orientation kinetics tags unchanged, so these arrays require the reverse index.
     pub fn value_at_aligned_read_position(
         self,
         flags: AlignmentFlags,

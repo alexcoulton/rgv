@@ -90,19 +90,20 @@ pub(crate) fn add_reads(
         };
         let ultima_analysis = match options.color_mode {
             AlignmentColorMode::Ultima(ultima_options) => {
+                let read_group = query.read_group(index);
                 let maximum_homopolymer_length = ultima_options
                     .maximum_homopolymer_length_override
-                    .or_else(|| {
-                        query
-                            .read_group(index)
-                            .and_then(|group| group.maximum_homopolymer_length)
-                    });
+                    .or_else(|| read_group.and_then(|group| group.maximum_homopolymer_length));
+                let tag_orientation = read_group
+                    .and_then(|group| group.ultima_tag_orientation)
+                    .unwrap_or(UltimaTagOrientation::Reference);
                 if let Ok(record) = query.materialize_record(index) {
-                    match analyze_ultima_record(
+                    match analyze_ultima_record_with_tag_orientation(
                         &record,
                         query.reference.as_ref(),
                         ultima_options.quality_mode,
                         maximum_homopolymer_length,
+                        tag_orientation,
                     ) {
                         Ok(analysis) => {
                             stats.ultima_unavailable_events = stats

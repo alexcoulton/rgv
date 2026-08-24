@@ -191,8 +191,9 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   reopens for a new selection. **Copy details**, **Copy CIGAR**,
   **Copy read sequence**, and **Copy tags** copy the selected evidence without reconstructing it
   from the display. Every auxiliary tag also has an individual copy action. Read sequence is copied
-  in reference-forward display orientation, so a reverse-strand read is reverse complemented. Read,
-  consensus, event, and reference clipboard sequences are capped at one million bases; the hover
+  in the reference-facing alignment order stored by SAM/BAM; flag `0x10` means `SEQ` has already
+  been reverse-complemented and `QUAL` reversed. Read, consensus, event, and reference clipboard
+  sequences are capped at one million bases; the hover
   text reports the copied and complete lengths when the cap applies. Very large tag values and the
   combined tag clipboard payload are also bounded and visibly report omitted content.
 - Selecting a read with an `SA` tag, or an explicitly supplementary record, also opens a bounded

@@ -41,10 +41,7 @@ impl Viewer {
                     bases.len(),
                     qualities.as_ref().map_or("missing", |_| "present")
                 ),
-                Some(bounded_oriented_sequence_copy(
-                    bases,
-                    record.flags.is_reverse(),
-                )),
+                Some(bounded_aligned_sequence_copy(bases)),
             ),
         };
         let modified_bases = decode_modified_bases(&record).map_or_else(
@@ -79,8 +76,16 @@ impl Viewer {
         };
         let track_name = self.alignment_track_name_for_id(track_id);
         let cigar = format_cigar(&record.cigar);
+        let segment_role = if record.flags.is_supplementary() {
+            "Supplementary"
+        } else if record.flags.is_secondary() {
+            "Secondary"
+        } else {
+            "Primary"
+        };
         let mut fields = vec![
             ("Track".to_owned(), track_name),
+            ("Alignment segment".to_owned(), segment_role.to_owned()),
             (
                 "Read".to_owned(),
                 String::from_utf8_lossy(&record.read_name).into_owned(),
@@ -131,11 +136,7 @@ impl Viewer {
             ("Sequence".to_owned(), sequence),
             (
                 "Sequence copy orientation".to_owned(),
-                if record.flags.is_reverse() {
-                    "reference-forward (reverse complemented)".to_owned()
-                } else {
-                    "reference-forward".to_owned()
-                },
+                "reference-facing SAM/BAM alignment order".to_owned(),
             ),
             ("Modified-base calls".to_owned(), modified_bases),
         ];
@@ -254,11 +255,23 @@ impl Viewer {
                     |maximum| format!("{maximum} bases ({maximum_source})"),
                 ),
             ));
-            match analyze_ultima_record(
+            let tag_orientation = read_group
+                .and_then(|group| group.ultima_tag_orientation)
+                .unwrap_or(UltimaTagOrientation::Reference);
+            fields.push((
+                "Ultima tp/t0 orientation".to_owned(),
+                match read_group.and_then(|group| group.ultima_tag_orientation) {
+                    Some(UltimaTagOrientation::Reference) => "reference (read-group tp)".to_owned(),
+                    Some(UltimaTagOrientation::Synthesis) => "synthesis (read-group tp)".to_owned(),
+                    None => "reference (assumed; read-group tp missing)".to_owned(),
+                },
+            ));
+            match analyze_ultima_record_with_tag_orientation(
                 &record,
                 query.reference.as_ref(),
                 options.quality_mode,
                 maximum_homopolymer_length,
+                tag_orientation,
             ) {
                 Ok(analysis) => {
                     fields.push((

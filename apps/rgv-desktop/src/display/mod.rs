@@ -24,7 +24,14 @@ impl Viewer {
         let Some(query) = self.alignment_query_for_track(primary_id).cloned() else {
             return;
         };
-        let max_rows = query.batch.len().max(1);
+        let minimum_rows = query.batch.len().max(1);
+        let max_rows = self
+            .alignment_tracks
+            .first()
+            .and_then(|track| track.projection(panel_id))
+            .and_then(|projection| projection.alignment_rows.as_ref())
+            .filter(|cached| cached.max_rows >= cached.query.batch.len().max(1))
+            .map_or(minimum_rows, |cached| cached.max_rows.max(minimum_rows));
         let pair_length_bounds = self.effective_template_length_bounds(&query);
         let sort_position =
             alignment_sort_position(filters.alignment_sort_mode, self.panels.active().viewport);
@@ -76,7 +83,6 @@ impl Viewer {
                     && cached.sort_order == filters.alignment_sort_order
                     && cached.sort_position == sort_position
                     && cached.promoted_read_name_hash == promoted_read_name_hash
-                    && cached.max_rows == max_rows
                     && cached.view_as_pairs == filters.view_as_pairs
                     && cached.pair_length_bounds == pair_length_bounds)
                     .then_some(cached.layout.as_ref())

@@ -1,5 +1,46 @@
 use super::super::*;
 
+fn alignment_query_supports_gesture_detail(
+    query: &AlignmentQuery,
+    interval: GenomicInterval,
+    detail: DetailLevel,
+    reference_available: bool,
+) -> bool {
+    if !query.interval.contains_interval(interval) {
+        return false;
+    }
+    if matches!(detail, DetailLevel::Reads | DetailLevel::Bases)
+        && (0..query.batch.len()).any(|index| {
+            matches!(
+                query.batch.sequence(index),
+                None | Some(rgv_hts::SequenceView::NotLoaded)
+            )
+        })
+    {
+        return false;
+    }
+    detail != DetailLevel::Bases
+        || !reference_available
+        || query
+            .reference
+            .as_ref()
+            .is_some_and(|reference| reference.interval.contains_interval(interval))
+}
+
+fn read_selection_for_query_refresh(
+    selected_track: Option<TrackId>,
+    selected_record: Option<usize>,
+    query_track: TrackId,
+    query: &AlignmentQuery,
+) -> Option<(TrackId, Vec<u8>)> {
+    let track_id = selected_track.filter(|selected| *selected == query_track)?;
+    let read_name = query
+        .batch
+        .read_name(selected_record?)
+        .filter(|name| !name.is_empty())?;
+    Some((track_id, read_name.to_vec()))
+}
+
 fn pointer_targets_unobstructed_canvas(
     canvas_contains_pointer: bool,
     canvas_layer: Option<egui::LayerId>,
@@ -206,12 +247,9 @@ impl Viewer {
                 || self.reference_dictionary.is_some()
                 || self.track_engine.is_some())
         {
+            self.retain_active_read_selection_for_query_refresh();
             self.panels.active().generation_clock.advance();
             self.advance_alignment_generations(self.panels.active().id);
-            self.panels.active_mut().selected_record = None;
-            self.panels.active_mut().selected_alignment_track = None;
-            self.panels.active_mut().selected_read_event = None;
-            self.panels.active_mut().pending_read_selection = None;
             let interval = self.panels.active().viewport.interval();
             let alignment_covers_viewport = !self.has_alignment_engine()
                 || self
@@ -253,10 +291,17 @@ impl Viewer {
             return;
         }
         let interval = self.panels.active().viewport.interval();
+        let detail = self.panels.active().viewport.detail_level();
+        let reference_available = self.reference_engine.is_some();
         let alignment_needs_refinement = self.has_alignment_engine()
-            && !self
-                .primary_alignment_query()
-                .is_some_and(|query| query.interval.contains_interval(interval));
+            && !self.primary_alignment_query().is_some_and(|query| {
+                alignment_query_supports_gesture_detail(
+                    query,
+                    interval,
+                    detail,
+                    reference_available,
+                )
+            });
         let tracks_need_refinement = self.track_engine.is_some()
             && !self
                 .panels
@@ -284,6 +329,9 @@ impl Viewer {
             return;
         }
         self.panels.active_mut().last_gesture_query_at = Some(now);
+        if alignment_needs_refinement {
+            self.retain_active_read_selection_for_query_refresh();
+        }
         self.panels.active().generation_clock.advance();
         self.advance_alignment_generations(self.panels.active().id);
         if alignment_needs_refinement {
@@ -295,6 +343,36 @@ impl Viewer {
         if tracks_need_refinement {
             self.request_track_query();
         }
+    }
+
+    /// Preserve a read selection across an alignment query refresh.
+    ///
+    /// Alignment object IDs are query-local record indexes. Keeping the index
+    /// alone would either drop the highlight or select an unrelated record
+    /// when a zoom changes the loaded query. The read name is stable across
+    /// detail levels, so query completion can atomically rebind the selection
+    /// to its new record index.
+    fn retain_active_read_selection_for_query_refresh(&mut self) {
+        let Some(track_id) = self.panels.active().selected_alignment_track else {
+            return;
+        };
+        if self.panels.active().selected_record.is_none() {
+            // A selection that is temporarily outside the loaded interval is
+            // already represented by pending_read_selection. Leave it intact
+            // so a later query can bind it again.
+            return;
+        }
+        let Some(pending) = self.alignment_query_for_track(track_id).and_then(|query| {
+            read_selection_for_query_refresh(
+                self.panels.active().selected_alignment_track,
+                self.panels.active().selected_record,
+                track_id,
+                query,
+            )
+        }) else {
+            return;
+        };
+        self.panels.active_mut().pending_read_selection = Some(pending);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -997,6 +1075,91 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gesture_query(interval: GenomicInterval) -> AlignmentQuery {
+        AlignmentQuery {
+            interval,
+            header: Arc::default(),
+            batch: rgv_hts::AlignmentBatch::default(),
+            pileup: rgv_hts::PileupSummary::default(),
+            junctions: rgv_hts::JunctionSummary::default(),
+            pairs: rgv_hts::PairSummary::default(),
+            reference: None,
+            stats: QueryStats::default(),
+        }
+    }
+
+    #[test]
+    fn selected_read_identity_survives_query_refresh_boundaries() {
+        let interval = GenomicInterval::new(ContigId::new(0), 100, 110).unwrap();
+        let mut query = gesture_query(interval);
+        query
+            .batch
+            .push(&AlignmentRecord {
+                contig: ContigId::new(0),
+                start: 101,
+                end: 106,
+                flags: rgv_hts::AlignmentFlags::from_bits(0),
+                mapping_quality: Some(42),
+                mate_contig: None,
+                mate_start: None,
+                template_length: 0,
+                read_name: b"selected-read".to_vec(),
+                cigar: vec![rgv_hts::CigarOp {
+                    kind: rgv_hts::CigarOpKind::Match,
+                    len: 5,
+                }],
+                sequence: rgv_hts::SequenceData::NotLoaded,
+                auxiliary_fields: Vec::new(),
+            })
+            .unwrap();
+        let track_id = TrackId::new(7);
+
+        assert_eq!(
+            read_selection_for_query_refresh(Some(track_id), Some(0), track_id, &query),
+            Some((track_id, b"selected-read".to_vec()))
+        );
+        assert_eq!(
+            read_selection_for_query_refresh(Some(track_id), Some(1), track_id, &query),
+            None
+        );
+        assert_eq!(
+            read_selection_for_query_refresh(Some(TrackId::new(8)), Some(0), track_id, &query),
+            None
+        );
+    }
+
+    #[test]
+    fn gesture_query_refines_immediately_when_crossing_base_detail() {
+        let contig = ContigId::new(0);
+        let loaded = GenomicInterval::new(contig, 100, 300).unwrap();
+        let visible = GenomicInterval::new(contig, 150, 200).unwrap();
+        let mut query = gesture_query(loaded);
+
+        assert!(alignment_query_supports_gesture_detail(
+            &query,
+            visible,
+            DetailLevel::Reads,
+            true,
+        ));
+        assert!(!alignment_query_supports_gesture_detail(
+            &query,
+            visible,
+            DetailLevel::Bases,
+            true,
+        ));
+
+        query.reference = Some(ReferenceSlice {
+            interval: loaded,
+            bases: vec![b'A'; loaded.len() as usize],
+        });
+        assert!(alignment_query_supports_gesture_detail(
+            &query,
+            visible,
+            DetailLevel::Bases,
+            true,
+        ));
+    }
 
     #[test]
     fn native_canvas_pointer_survives_coarse_egui_area_consumption() {

@@ -24,7 +24,7 @@ mod ultima;
 pub use alignment::{
     AlignmentBatch, AlignmentFlags, AlignmentHeaderMetadata, AlignmentReadGroup, AlignmentRecord,
     AlignmentReferenceSequence, AuxField, AuxValue, CigarOp, CigarOpKind,
-    MAX_ALIGNMENT_READ_GROUPS, PackedRecordError, SequenceData, SequenceView,
+    MAX_ALIGNMENT_READ_GROUPS, PackedRecordError, SequenceData, SequenceView, UltimaTagOrientation,
     recognize_assembly_from_header,
 };
 pub use bisulfite::{
@@ -47,7 +47,8 @@ pub use modification_summary::{
 };
 pub use modified_bases::{
     BaseModificationStrand, ImplicitModificationMode, ModificationCode, ModifiedBaseCall,
-    ModifiedBaseError, decode_modified_bases, decode_modified_bases_parts,
+    ModifiedBaseError, aligned_position_for_sequencer_position, decode_modified_bases,
+    decode_modified_bases_parts, sequencer_base_matches,
 };
 pub use pair::{
     MAX_TEMPLATE_LENGTH_SAMPLES, MIN_TEMPLATE_LENGTH_SAMPLES, MateVisibility, PairClassification,
@@ -110,5 +111,5 @@ pub use tracks::{
 pub use ultima::{
     MAX_ULTIMA_VALUES_PER_RECORD, UltimaEventUnavailable, UltimaEvidenceError, UltimaIndelEvidence,
     UltimaIndelKind, UltimaQualitySource, UltimaRecordAnalysis, UltimaSummary,
-    analyze_ultima_record,
+    analyze_ultima_record, analyze_ultima_record_with_tag_orientation,
 };

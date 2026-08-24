@@ -652,34 +652,17 @@ fn quality_weight(quality: u8) -> u64 {
     })[usize::from(quality)]
 }
 
-pub(crate) fn oriented_observation(
+pub(crate) fn aligned_observation(
     bases: &[u8],
     qualities: &[u8],
     read_position: usize,
-    reverse: bool,
 ) -> Option<(u8, Option<u8>)> {
-    let index = if reverse {
-        bases.len().checked_sub(read_position.saturating_add(1))?
-    } else {
-        read_position
-    };
-    let base = *bases.get(index)?;
-    let base = if reverse { complement(base) } else { base };
+    let base = *bases.get(read_position)?;
     let quality = qualities
-        .get(index)
+        .get(read_position)
         .copied()
         .filter(|quality| *quality != u8::MAX);
     Some((base, quality))
-}
-
-const fn complement(base: u8) -> u8 {
-    match base.to_ascii_uppercase() {
-        b'A' => b'T',
-        b'C' => b'G',
-        b'G' => b'C',
-        b'T' | b'U' => b'A',
-        other => other,
-    }
 }
 
 #[cfg(test)]
@@ -798,14 +781,14 @@ mod tests {
     }
 
     #[test]
-    fn reverse_observations_match_read_render_orientation() {
+    fn reverse_observations_use_sam_alignment_order_without_a_second_reverse_complement() {
         assert_eq!(
-            oriented_observation(b"AACG", &[10, 20, 30, 40], 0, true),
-            Some((b'C', Some(40)))
+            aligned_observation(b"AACG", &[10, 20, 30, 40], 0),
+            Some((b'A', Some(10)))
         );
         assert_eq!(
-            oriented_observation(b"AACG", &[10, 20, 30, 40], 3, true),
-            Some((b'T', Some(10)))
+            aligned_observation(b"AACG", &[10, 20, 30, 40], 3),
+            Some((b'G', Some(40)))
         );
     }
 }

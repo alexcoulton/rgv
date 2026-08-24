@@ -516,10 +516,10 @@ impl Viewer {
                             .pending_read_selection
                             .as_ref()
                             .is_some_and(|(pending_track, _)| *pending_track == track_id);
+                        panel.selected_record = None;
+                        panel.selected_read_event = None;
                         if !has_pending_selection {
-                            panel.selected_record = None;
                             panel.selected_alignment_track = None;
-                            panel.selected_read_event = None;
                         }
                     }
                     self.resolve_pending_read_selection(request.panel_id(), track_id, &query);

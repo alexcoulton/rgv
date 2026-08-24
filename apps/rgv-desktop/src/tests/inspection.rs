@@ -482,8 +482,8 @@ fn read_event_selection_and_preview_follow_cigar_coordinates() {
     let clip = read_event_details(&record, 4, "chr1").unwrap();
     assert_eq!(clip.copy_sequence.as_deref(), Some("TTTT"));
     assert_eq!(
-        oriented_event_sequence(b"AACG", Some(&[10, 20, 30, 40]), 0..2, true),
-        (b"CG".to_vec(), Some(vec![40, 30]))
+        aligned_event_sequence(b"AACG", Some(&[10, 20, 30, 40]), 0..2),
+        (b"AA".to_vec(), Some(vec![10, 20]))
     );
 }
 
@@ -496,6 +496,9 @@ fn inspector_sequence_and_tag_copy_actions_are_bounded_and_oriented() {
     let reverse = bounded_oriented_sequence_copy(b"AACG", true);
     assert_eq!(reverse.text, "CGTT");
     assert_eq!((reverse.copied_bases, reverse.total_bases), (4, 4));
+
+    let aligned = bounded_aligned_sequence_copy(b"AACG");
+    assert_eq!(aligned.text, "AACG");
 
     let long_sequence = vec![b'A'; SEQUENCE_COPY_BASES + 17];
     let bounded = bounded_sequence_copy(&long_sequence);

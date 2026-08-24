@@ -204,6 +204,13 @@ impl Viewer {
         let Some(index) = (0..query.batch.len())
             .find(|index| query.batch.read_name(*index) == Some(read_name.as_slice()))
         else {
+            // The selected read may be outside this query's interval. Its old
+            // numeric index is unsafe against the new batch, but retain the
+            // stable pending identity so it can reappear after navigation.
+            if let Some(panel) = self.panels.get_mut(panel_id) {
+                panel.selected_record = None;
+                panel.selected_read_event = None;
+            }
             return;
         };
         let contig_name = self

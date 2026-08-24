@@ -60,7 +60,7 @@ pub enum SbxEvidenceError {
 }
 
 pub fn sbx_tail_bounds(
-    flags: AlignmentFlags,
+    _flags: AlignmentFlags,
     bases: &[u8],
     qualities: &[u8],
     tail_quality_maximum: u8,
@@ -68,14 +68,14 @@ pub fn sbx_tail_bounds(
     validate_lengths(bases, qualities)?;
     let mut retained_start = 0_usize;
     while retained_start < bases.len()
-        && oriented_quality(flags, qualities, retained_start)
+        && aligned_quality(qualities, retained_start)
             .is_some_and(|quality| quality <= tail_quality_maximum)
     {
         retained_start += 1;
     }
     let mut retained_end = bases.len();
     while retained_end > retained_start
-        && oriented_quality(flags, qualities, retained_end - 1)
+        && aligned_quality(qualities, retained_end - 1)
             .is_some_and(|quality| quality <= tail_quality_maximum)
     {
         retained_end -= 1;
@@ -90,7 +90,7 @@ pub fn sbx_tail_bounds(
 }
 
 pub fn classify_sbx_insertion(
-    flags: AlignmentFlags,
+    _flags: AlignmentFlags,
     bases: &[u8],
     qualities: &[u8],
     insertion_start: usize,
@@ -113,7 +113,7 @@ pub fn classify_sbx_insertion(
         });
     }
     let insertion_qualities = (insertion_start..insertion_end)
-        .filter_map(|position| oriented_quality(flags, qualities, position));
+        .filter_map(|position| aligned_quality(qualities, position));
     if insertion_qualities
         .clone()
         .all(|quality| quality <= discordant_quality_maximum)
@@ -124,13 +124,12 @@ pub fn classify_sbx_insertion(
         .clone()
         .any(|quality| quality <= discordant_quality_maximum)
         || insertion_start.checked_sub(1).is_some_and(|position| {
-            oriented_quality(flags, qualities, position)
+            aligned_quality(qualities, position)
                 .is_some_and(|quality| quality <= discordant_quality_maximum)
         })
-        || oriented_quality(flags, qualities, insertion_end)
+        || aligned_quality(qualities, insertion_end)
             .is_some_and(|quality| quality <= discordant_quality_maximum)
         || homopolymer_has_discordant_base(
-            flags,
             bases,
             qualities,
             insertion_start,
@@ -207,31 +206,30 @@ pub fn summarize_sbx_record(
 }
 
 fn homopolymer_has_discordant_base(
-    flags: AlignmentFlags,
     bases: &[u8],
     qualities: &[u8],
     insertion_start: usize,
     insertion_end: usize,
     threshold: u8,
 ) -> bool {
-    let Some(base) = oriented_base(flags, bases, insertion_start) else {
+    let Some(base) = aligned_base(bases, insertion_start) else {
         return false;
     };
     if (insertion_start + 1..insertion_end)
-        .any(|position| oriented_base(flags, bases, position) != Some(base))
+        .any(|position| aligned_base(bases, position) != Some(base))
     {
         return false;
     }
     let mut left = insertion_start;
-    while left > 0 && oriented_base(flags, bases, left - 1) == Some(base) {
+    while left > 0 && aligned_base(bases, left - 1) == Some(base) {
         left -= 1;
     }
     let mut right = insertion_end;
-    while right < bases.len() && oriented_base(flags, bases, right) == Some(base) {
+    while right < bases.len() && aligned_base(bases, right) == Some(base) {
         right += 1;
     }
     (left..right).any(|position| {
-        oriented_quality(flags, qualities, position).is_some_and(|quality| quality <= threshold)
+        aligned_quality(qualities, position).is_some_and(|quality| quality <= threshold)
     })
 }
 
@@ -246,38 +244,15 @@ fn validate_lengths(bases: &[u8], qualities: &[u8]) -> Result<(), SbxEvidenceErr
     }
 }
 
-fn oriented_base(flags: AlignmentFlags, bases: &[u8], position: usize) -> Option<u8> {
-    let index = oriented_index(flags, bases.len(), position)?;
-    let base = *bases.get(index)?;
-    Some(if flags.is_reverse() {
-        complement(base)
-    } else {
-        base.to_ascii_uppercase()
-    })
-}
-
-fn oriented_quality(flags: AlignmentFlags, qualities: &[u8], position: usize) -> Option<u8> {
-    qualities
-        .get(oriented_index(flags, qualities.len(), position)?)
+fn aligned_base(bases: &[u8], position: usize) -> Option<u8> {
+    bases
+        .get(position)
         .copied()
+        .map(|base| base.to_ascii_uppercase())
 }
 
-fn oriented_index(flags: AlignmentFlags, length: usize, position: usize) -> Option<usize> {
-    if flags.is_reverse() {
-        length.checked_sub(position.checked_add(1)?)
-    } else {
-        (position < length).then_some(position)
-    }
-}
-
-const fn complement(base: u8) -> u8 {
-    match base.to_ascii_uppercase() {
-        b'A' => b'T',
-        b'C' => b'G',
-        b'G' => b'C',
-        b'T' | b'U' => b'A',
-        other => other,
-    }
+fn aligned_quality(qualities: &[u8], position: usize) -> Option<u8> {
+    qualities.get(position).copied()
 }
 
 #[cfg(test)]
@@ -288,7 +263,7 @@ mod tests {
     use crate::{CigarOp, CigarOpKind};
 
     #[test]
-    fn tail_detection_uses_reference_forward_quality_orientation() {
+    fn tail_detection_uses_sam_alignment_quality_order() {
         let forward = sbx_tail_bounds(
             AlignmentFlags::from_bits(0),
             b"ACGTAC",
@@ -306,8 +281,8 @@ mod tests {
             30,
         )
         .unwrap();
-        assert_eq!((reverse.left_tail_bases, reverse.right_tail_bases), (1, 2));
-        assert_eq!((reverse.retained_start, reverse.retained_end), (1, 4));
+        assert_eq!((reverse.left_tail_bases, reverse.right_tail_bases), (2, 1));
+        assert_eq!((reverse.retained_start, reverse.retained_end), (2, 5));
     }
 
     #[test]

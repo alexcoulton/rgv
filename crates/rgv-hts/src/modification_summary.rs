@@ -4,7 +4,8 @@ use rgv_core::GenomicInterval;
 
 use crate::{
     AlignmentFlags, AlignmentRecord, AuxValue, CigarOp, CigarOpKind, ImplicitModificationMode,
-    ModificationCode, SequenceData, decode_modified_bases,
+    ModificationCode, SequenceData, aligned_position_for_sequencer_position, decode_modified_bases,
+    sequencer_base_matches,
 };
 
 /// Hard bound on independently rendered modification/canonical/strand/haplotype series.
@@ -192,16 +193,21 @@ impl ModificationSummaryBuilder {
             let Some(series_index) = self.series_index(key) else {
                 continue;
             };
-            for (stored_position, base) in bases.iter().copied().enumerate() {
-                if base.to_ascii_uppercase() != key.canonical_base {
+            for sequencer_position in 0..bases.len() {
+                if !sequencer_base_matches(
+                    bases,
+                    record.flags,
+                    sequencer_position,
+                    key.canonical_base,
+                ) {
                     continue;
                 }
-                let Some(position) = reference_position_for_stored_position(
+                let Some(position) = reference_position_for_sequencer_position(
                     record.start,
                     &record.cigar,
                     bases.len(),
                     record.flags,
-                    stored_position,
+                    sequencer_position,
                 ) else {
                     continue;
                 };
@@ -224,12 +230,12 @@ impl ModificationSummaryBuilder {
             let Some(series_index) = self.series_index(key) else {
                 continue;
             };
-            let Some(position) = reference_position_for_stored_position(
+            let Some(position) = reference_position_for_sequencer_position(
                 record.start,
                 &record.cigar,
                 bases.len(),
                 record.flags,
-                call.read_position,
+                call.sequencer_position,
             ) else {
                 continue;
             };
@@ -317,18 +323,15 @@ fn record_haplotype(record: &AlignmentRecord) -> Option<i32> {
     }
 }
 
-fn reference_position_for_stored_position(
+fn reference_position_for_sequencer_position(
     alignment_start: u64,
     cigar: &[CigarOp],
     sequence_length: usize,
     flags: AlignmentFlags,
-    stored_position: usize,
+    sequencer_position: usize,
 ) -> Option<u64> {
-    let aligned_position = if flags.is_reverse() {
-        sequence_length.checked_sub(stored_position.saturating_add(1))?
-    } else {
-        stored_position
-    };
+    let aligned_position =
+        aligned_position_for_sequencer_position(sequence_length, flags, sequencer_position)?;
     let mut reference_position = alignment_start;
     let mut read_position = 0_usize;
     for operation in cigar {
@@ -396,7 +399,12 @@ mod tests {
                 len: 4,
             }],
             sequence: SequenceData::Present {
-                bases: b"ACCC".to_vec(),
+                bases: if flags & 0x10 == 0 {
+                    b"ACCC".to_vec()
+                } else {
+                    // Original ACCC in reference-facing reverse-complement order.
+                    b"GGGT".to_vec()
+                },
                 qualities: None,
             },
             auxiliary_fields,
@@ -441,13 +449,17 @@ mod tests {
     }
 
     #[test]
-    fn reverse_alignment_maps_stored_calls_to_reverse_reference_positions() {
+    fn reverse_alignment_maps_sequencer_oriented_calls_to_reference_positions() {
         let interval = GenomicInterval::new(ContigId::new(0), 100, 104).unwrap();
         let mut builder = ModificationSummaryBuilder::new(interval, 4);
         builder.add_record(&record("C+m,0;", Some(vec![255]), 0x10));
         let summary = builder.finish(1, true);
         assert_eq!(summary.series[0].bins[2].modified_calls, 1);
         assert_eq!(summary.series[0].bins[2].reverse_modified_calls, 1);
+        assert_eq!(summary.series[0].bins[0].canonical_observations, 1);
+        assert_eq!(summary.series[0].bins[1].canonical_observations, 1);
+        assert_eq!(summary.series[0].bins[2].canonical_observations, 1);
+        assert_eq!(summary.series[0].bins[3].canonical_observations, 0);
     }
 
     #[test]

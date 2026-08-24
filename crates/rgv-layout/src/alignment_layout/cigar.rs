@@ -464,12 +464,14 @@ pub(crate) fn add_modified_base_calls(
         .ok()
         .flatten()
         .or_else(|| batch.auxiliary_field(index, *b"Ml").ok().flatten());
-    let Ok(calls) =
-        decode_modified_bases_parts(bases, &mm.value, ml.as_ref().map(|field| &field.value))
-    else {
+    let Ok(calls) = decode_modified_bases_parts(
+        bases,
+        batch.flags[index],
+        &mm.value,
+        ml.as_ref().map(|field| &field.value),
+    ) else {
         return;
     };
-    let sequence_length = bases.len();
     for call in &calls {
         if *budget == 0 {
             break;
@@ -482,14 +484,12 @@ pub(crate) fn add_modified_base_calls(
         {
             continue;
         }
-        let aligned_position = if batch.flags[index].is_reverse() {
-            let Some(position) = sequence_length.checked_sub(call.read_position.saturating_add(1))
-            else {
-                continue;
-            };
-            position
-        } else {
-            call.read_position
+        let Some(aligned_position) = aligned_position_for_sequencer_position(
+            bases.len(),
+            batch.flags[index],
+            call.sequencer_position,
+        ) else {
+            continue;
         };
         if sbx_hides_read_position(sbx_state, aligned_position) {
             continue;
@@ -573,33 +573,29 @@ pub(crate) fn add_unmodified_base_calls(
             .iter_mut()
             .find(|(base, code, _)| *base == call.canonical_base && *code == call.code)
         {
-            positions.insert(call.read_position);
+            positions.insert(call.sequencer_position);
         } else {
             groups.push((
                 call.canonical_base,
                 call.code,
-                BTreeSet::from([call.read_position]),
+                BTreeSet::from([call.sequencer_position]),
             ));
         }
     }
     for (canonical_base, _, called_positions) in groups {
-        for (read_position, base) in bases.iter().copied().enumerate() {
+        for sequencer_position in 0..bases.len() {
             if *budget == 0 {
                 return;
             }
-            if base.to_ascii_uppercase() != canonical_base
-                || called_positions.contains(&read_position)
+            if !sequencer_base_matches(bases, flags, sequencer_position, canonical_base)
+                || called_positions.contains(&sequencer_position)
             {
                 continue;
             }
-            let aligned_position = if flags.is_reverse() {
-                let Some(position) = bases.len().checked_sub(read_position.saturating_add(1))
-                else {
-                    continue;
-                };
-                position
-            } else {
-                read_position
+            let Some(aligned_position) =
+                aligned_position_for_sequencer_position(bases.len(), flags, sequencer_position)
+            else {
+                continue;
             };
             if sbx_hides_read_position(sbx_state, aligned_position) {
                 continue;

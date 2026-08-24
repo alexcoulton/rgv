@@ -1,7 +1,10 @@
 use rgv_core::UltimaQualityMode;
 use thiserror::Error;
 
-use crate::{AlignmentFlags, AlignmentRecord, AuxValue, CigarOpKind, ReferenceSlice, SequenceData};
+use crate::{
+    AlignmentFlags, AlignmentRecord, AuxValue, CigarOpKind, ReferenceSlice, SequenceData,
+    UltimaTagOrientation,
+};
 
 pub const MAX_ULTIMA_VALUES_PER_RECORD: usize = 10_000_000;
 const SYMMETRIC_QUALITY_ADJUSTMENT: f32 = 3.010_300_2;
@@ -101,6 +104,22 @@ pub fn analyze_ultima_record(
     quality_mode: UltimaQualityMode,
     maximum_homopolymer_length: Option<u16>,
 ) -> Result<UltimaRecordAnalysis, UltimaEvidenceError> {
+    analyze_ultima_record_with_tag_orientation(
+        record,
+        reference,
+        quality_mode,
+        maximum_homopolymer_length,
+        UltimaTagOrientation::Reference,
+    )
+}
+
+pub fn analyze_ultima_record_with_tag_orientation(
+    record: &AlignmentRecord,
+    reference: Option<&ReferenceSlice>,
+    quality_mode: UltimaQualityMode,
+    maximum_homopolymer_length: Option<u16>,
+    tag_orientation: UltimaTagOrientation,
+) -> Result<UltimaRecordAnalysis, UltimaEvidenceError> {
     let SequenceData::Present {
         bases,
         qualities: Some(qualities),
@@ -169,6 +188,7 @@ pub fn analyze_ultima_record(
 
     let input = UltimaInput {
         flags: record.flags,
+        tag_orientation,
         bases,
         qualities,
         tp,
@@ -222,6 +242,7 @@ pub fn analyze_ultima_record(
 
 struct UltimaInput<'a> {
     flags: AlignmentFlags,
+    tag_orientation: UltimaTagOrientation,
     bases: &'a [u8],
     qualities: &'a [u8],
     tp: &'a [i64],
@@ -269,21 +290,21 @@ fn insertion_evidence(
         return event;
     };
     let (Some(first), Some(last), Some(previous), Some(next)) = (
-        oriented_base(input, read_start),
+        aligned_base(input, read_start),
         read_end
             .checked_sub(1)
-            .and_then(|position| oriented_base(input, position)),
+            .and_then(|position| aligned_base(input, position)),
         read_start
             .checked_sub(1)
-            .and_then(|position| oriented_base(input, position)),
-        oriented_base(input, read_end),
+            .and_then(|position| aligned_base(input, position)),
+        aligned_base(input, read_end),
     ) else {
         return event;
     };
     let backwards_hmer = first == previous;
     let forward_hmer = last == next;
     let insertion_is_homopolymer =
-        (read_start..read_end).all(|position| oriented_base(input, position) == Some(first));
+        (read_start..read_end).all(|position| aligned_base(input, position) == Some(first));
     let (hmer, direction) = if !backwards_hmer && !forward_hmer && length == 1 {
         (
             Hmer {
@@ -346,8 +367,8 @@ fn deletion_evidence(
     let (Some(previous), Some(next)) = (
         read_start
             .checked_sub(1)
-            .and_then(|position| oriented_base(input, position)),
-        oriented_base(input, read_start),
+            .and_then(|position| aligned_base(input, position)),
+        aligned_base(input, read_start),
     ) else {
         return event;
     };
@@ -412,14 +433,14 @@ fn deletion_evidence(
         event.unavailable = Some(UltimaEventUnavailable::NonHomopolymer);
         return event;
     }
-    let Some(t0) = input.t0 else {
+    if input.t0.is_none() {
         event.unavailable = Some(UltimaEventUnavailable::T0Unavailable);
         return event;
-    };
+    }
     let before = read_start
         .checked_sub(1)
-        .and_then(|position| oriented_t0(input.flags, t0, position));
-    let after = oriented_t0(input.flags, t0, read_start);
+        .and_then(|position| aligned_t0(input, position));
+    let after = aligned_t0(input, read_start);
     let quality = match (before, after) {
         (Some(before), Some(after)) => Some(before.max(after)),
         (Some(value), None) | (None, Some(value)) => Some(value),
@@ -442,14 +463,14 @@ fn quality_from_hmer(
 ) -> (f32, UltimaQualitySource) {
     if input.quality_mode == UltimaQualityMode::Minimum {
         let quality = (hmer.start..=hmer.end)
-            .filter_map(|position| oriented_quality(input, position))
+            .filter_map(|position| aligned_quality(input, position))
             .min()
             .unwrap_or_default();
         return (f32::from(quality), UltimaQualitySource::MinimumHomopolymer);
     }
     if let Some((position, quality)) = (hmer.start..=hmer.end).find_map(|position| {
-        (oriented_tp(input, position) == Some(i64::from(direction)))
-            .then(|| oriented_quality(input, position).map(|quality| (position, quality)))
+        (aligned_tp(input, position) == Some(i64::from(direction)))
+            .then(|| aligned_quality(input, position).map(|quality| (position, quality)))
             .flatten()
     }) {
         let central = position.saturating_sub(hmer.start) == hmer.end.saturating_sub(position);
@@ -483,13 +504,13 @@ fn find_hmer(
         base,
     };
     if walk_backwards {
-        while hmer.start > 0 && oriented_base(input, hmer.start - 1) == Some(base) {
+        while hmer.start > 0 && aligned_base(input, hmer.start - 1) == Some(base) {
             hmer.start -= 1;
             hmer.backwards_size += 1;
         }
     }
     if walk_forward {
-        while hmer.end + 1 < input.bases.len() && oriented_base(input, hmer.end + 1) == Some(base) {
+        while hmer.end + 1 < input.bases.len() && aligned_base(input, hmer.end + 1) == Some(base) {
             hmer.end += 1;
             hmer.forward_size += 1;
         }
@@ -555,55 +576,37 @@ fn summarize(events: &[UltimaIndelEvidence]) -> UltimaSummary {
     summary
 }
 
-fn oriented_base(input: &UltimaInput<'_>, position: usize) -> Option<u8> {
-    let index = oriented_index(input.flags, input.bases.len(), position)?;
-    let base = *input.bases.get(index)?;
-    Some(if input.flags.is_reverse() {
-        complement(base)
-    } else {
-        base.to_ascii_uppercase()
-    })
-}
-
-fn oriented_quality(input: &UltimaInput<'_>, position: usize) -> Option<u8> {
+fn aligned_base(input: &UltimaInput<'_>, position: usize) -> Option<u8> {
     input
-        .qualities
-        .get(oriented_index(
-            input.flags,
-            input.qualities.len(),
-            position,
-        )?)
+        .bases
+        .get(position)
         .copied()
+        .map(|base| base.to_ascii_uppercase())
 }
 
-fn oriented_tp(input: &UltimaInput<'_>, position: usize) -> Option<i64> {
+fn aligned_quality(input: &UltimaInput<'_>, position: usize) -> Option<u8> {
+    input.qualities.get(position).copied()
+}
+
+fn aligned_tp(input: &UltimaInput<'_>, position: usize) -> Option<i64> {
     input
         .tp
-        .get(oriented_index(input.flags, input.tp.len(), position)?)
+        .get(tag_index(input, input.tp.len(), position)?)
         .copied()
 }
 
-fn oriented_t0(flags: AlignmentFlags, t0: &[u8], position: usize) -> Option<u8> {
-    t0.get(oriented_index(flags, t0.len(), position)?)
+fn aligned_t0(input: &UltimaInput<'_>, position: usize) -> Option<u8> {
+    let t0 = input.t0?;
+    t0.get(tag_index(input, t0.len(), position)?)
         .copied()
         .map(|value| value - 33)
 }
 
-fn oriented_index(flags: AlignmentFlags, length: usize, position: usize) -> Option<usize> {
-    if flags.is_reverse() {
-        length.checked_sub(position.checked_add(1)?)
+fn tag_index(input: &UltimaInput<'_>, length: usize, aligned_position: usize) -> Option<usize> {
+    if input.tag_orientation == UltimaTagOrientation::Synthesis && input.flags.is_reverse() {
+        length.checked_sub(aligned_position.checked_add(1)?)
     } else {
-        (position < length).then_some(position)
-    }
-}
-
-const fn complement(base: u8) -> u8 {
-    match base.to_ascii_uppercase() {
-        b'A' => b'T',
-        b'C' => b'G',
-        b'G' => b'C',
-        b'T' | b'U' => b'A',
-        other => other,
+        (aligned_position < length).then_some(aligned_position)
     }
 }
 
@@ -612,7 +615,7 @@ mod tests {
     use rgv_core::{ContigId, GenomicInterval};
 
     use super::*;
-    use crate::{AuxField, CigarOp};
+    use crate::{AlignmentFlags, AuxField, CigarOp};
 
     fn record(cigar: &[(CigarOpKind, u32)], bases: &[u8], qualities: &[u8]) -> AlignmentRecord {
         AlignmentRecord {
@@ -699,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_alignment_orients_sequence_quality_and_tp_together() {
+    fn reverse_alignment_uses_sam_aligned_sequence_quality_and_tp_order() {
         let mut forward = record(
             &[
                 (CigarOpKind::Match, 3),
@@ -714,24 +717,49 @@ mod tests {
             .unwrap()
             .events[0];
 
-        let SequenceData::Present {
-            bases,
-            qualities: Some(qualities),
-        } = &mut forward.sequence
-        else {
-            unreachable!();
-        };
-        *bases = bases.iter().rev().copied().map(complement).collect();
-        qualities.reverse();
-        let AuxValue::SignedArray(tp) = &mut forward.auxiliary_fields[0].value else {
-            unreachable!();
-        };
-        tp.reverse();
         forward.flags = AlignmentFlags::from_bits(0x10);
         let reverse = analyze_ultima_record(&forward, None, UltimaQualityMode::Directional, None)
             .unwrap()
             .events[0];
         assert_eq!(reverse, expected);
+    }
+
+    #[test]
+    fn reverse_alignment_reorients_synthesis_oriented_tp_tags_only() {
+        let mut reference_oriented = record(
+            &[
+                (CigarOpKind::Match, 3),
+                (CigarOpKind::Insertion, 2),
+                (CigarOpKind::Match, 3),
+            ],
+            b"ACGAAATC",
+            &[30, 30, 30, 30, 40, 30, 30, 30],
+        );
+        reference_oriented.flags = AlignmentFlags::from_bits(0x10);
+        add_tp(&mut reference_oriented, &[0, 0, 0, 0, -2, 0, 0, 0]);
+        let expected = analyze_ultima_record_with_tag_orientation(
+            &reference_oriented,
+            None,
+            UltimaQualityMode::Directional,
+            None,
+            UltimaTagOrientation::Reference,
+        )
+        .unwrap();
+
+        let mut synthesis_oriented = reference_oriented.clone();
+        let AuxValue::SignedArray(tp) = &mut synthesis_oriented.auxiliary_fields[0].value else {
+            unreachable!();
+        };
+        tp.reverse();
+        let observed = analyze_ultima_record_with_tag_orientation(
+            &synthesis_oriented,
+            None,
+            UltimaQualityMode::Directional,
+            None,
+            UltimaTagOrientation::Synthesis,
+        )
+        .unwrap();
+        assert_eq!(observed, expected);
     }
 
     #[test]
@@ -808,6 +836,34 @@ mod tests {
         .events[0];
         assert_eq!(event.direction, None);
         assert_eq!(event.quality, Some(30.0));
+
+        single.flags = AlignmentFlags::from_bits(0x10);
+        let expected = analyze_ultima_record_with_tag_orientation(
+            &single,
+            Some(&reference),
+            UltimaQualityMode::Directional,
+            None,
+            UltimaTagOrientation::Reference,
+        )
+        .unwrap();
+        let mut synthesis_oriented = single.clone();
+        let AuxValue::SignedArray(tp) = &mut synthesis_oriented.auxiliary_fields[0].value else {
+            unreachable!();
+        };
+        tp.reverse();
+        let AuxValue::String(t0) = &mut synthesis_oriented.auxiliary_fields[1].value else {
+            unreachable!();
+        };
+        *t0 = t0.chars().rev().collect();
+        let observed = analyze_ultima_record_with_tag_orientation(
+            &synthesis_oriented,
+            Some(&reference),
+            UltimaQualityMode::Directional,
+            None,
+            UltimaTagOrientation::Synthesis,
+        )
+        .unwrap();
+        assert_eq!(observed, expected);
         assert_eq!(event.quality_source, Some(UltimaQualitySource::T0));
     }
 

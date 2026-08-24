@@ -32,7 +32,8 @@ pub fn assign_alignment_rows(
     let identities = alignment_row_identities(query, &pairs);
     let mut rows = vec![None; query.batch.len()];
     let mut group_starts = BTreeMap::new();
-    let compatible_previous = previous.filter(|layout| layout.compatible_with(&options));
+    let compatible_previous =
+        previous.filter(|layout| layout.compatible_with(&options, query.batch.len()));
 
     if let Some(previous) = compatible_previous {
         assign_rows_with_history(
@@ -628,7 +629,7 @@ pub(crate) fn alignment_base_sort_key(
                         let SequenceView::Present { bases, qualities } = sequence else {
                             return None;
                         };
-                        oriented_base(query.batch.flags[index], bases, qualities, aligned_position)
+                        aligned_base(bases, qualities, aligned_position)
                             .map(|(base, _)| base.to_ascii_uppercase())
                     });
                     return base.map_or((6, 0), |base| match base {

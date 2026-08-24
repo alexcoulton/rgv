@@ -225,12 +225,8 @@ pub(crate) fn read_event_details(
         ));
         match &record.sequence {
             SequenceData::Present { bases, qualities } => {
-                let (sequence, event_qualities) = oriented_event_sequence(
-                    bases,
-                    qualities.as_deref(),
-                    range,
-                    record.flags.is_reverse(),
-                );
+                let (sequence, event_qualities) =
+                    aligned_event_sequence(bases, qualities.as_deref(), range);
                 fields.push((
                     "Sequence preview".to_owned(),
                     bounded_sequence_preview(&sequence),
@@ -325,6 +321,15 @@ pub(crate) fn bounded_oriented_sequence_copy(
     }
 }
 
+pub(crate) fn bounded_aligned_sequence_copy(sequence: &[u8]) -> BoundedSequenceCopy {
+    let copied_bases = sequence.len().min(SEQUENCE_COPY_BASES);
+    BoundedSequenceCopy {
+        text: String::from_utf8_lossy(&sequence[..copied_bases]).into_owned(),
+        copied_bases,
+        total_bases: sequence.len(),
+    }
+}
+
 pub(crate) fn sequence_copy_hover(sequence: Option<&BoundedSequenceCopy>, kind: &str) -> String {
     sequence.map_or_else(String::new, |sequence| {
         if sequence.copied_bases == sequence.total_bases {
@@ -375,29 +380,20 @@ pub(crate) fn auxiliary_tags_text(tags: &[(String, String)]) -> String {
     text
 }
 
-pub(crate) fn oriented_event_sequence(
+pub(crate) fn aligned_event_sequence(
     bases: &[u8],
     qualities: Option<&[u8]>,
     range: std::ops::Range<usize>,
-    reverse: bool,
 ) -> (Vec<u8>, Option<Vec<u8>>) {
     let mut event_bases = Vec::with_capacity(range.len());
     let mut event_qualities = qualities.map(|_| Vec::with_capacity(range.len()));
     for read_position in range {
-        let index = if reverse {
-            bases.len().checked_sub(read_position.saturating_add(1))
-        } else {
-            Some(read_position)
-        };
-        let Some(index) = index else {
+        let Some(base) = bases.get(read_position).copied() else {
             continue;
         };
-        let Some(base) = bases.get(index).copied() else {
-            continue;
-        };
-        event_bases.push(if reverse { complement_base(base) } else { base });
+        event_bases.push(base);
         if let (Some(source), Some(output)) = (qualities, &mut event_qualities)
-            && let Some(quality) = source.get(index)
+            && let Some(quality) = source.get(read_position)
         {
             output.push(*quality);
         }

@@ -25,12 +25,9 @@ pub(crate) fn add_bisulfite_marks(
         if !viewport.interval().contains(position) {
             continue;
         }
-        let Some((base, quality)) = oriented_base(
-            query.batch.flags[index],
-            bases,
-            qualities,
-            read_start.saturating_add(offset),
-        ) else {
+        let Some((base, quality)) =
+            aligned_base(bases, qualities, read_start.saturating_add(offset))
+        else {
             continue;
         };
         let Some(observation) = bisulfite_observation(query, index, context, position, base) else {
@@ -322,12 +319,7 @@ pub(crate) fn add_aligned_bases(
         if sbx_hides_read_position(sbx_state, aligned_read_position) {
             continue;
         }
-        let Some((base, quality)) = oriented_base(
-            query.batch.flags[index],
-            bases,
-            qualities,
-            aligned_read_position,
-        ) else {
+        let Some((base, quality)) = aligned_base(bases, qualities, aligned_read_position) else {
             continue;
         };
         let reference_base = query

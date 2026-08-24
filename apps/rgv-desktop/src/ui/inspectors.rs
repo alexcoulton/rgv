@@ -165,7 +165,7 @@ pub(crate) fn show_properties(
     if let Some(inspector) = &inspector {
         let context = ui.ctx().clone();
         let inspector_max_height = read_inspector_max_height(context.content_rect().height());
-        PropertySection::new(ui, "Read")
+        PropertySection::new(ui, "Active alignment segment")
             .default_pos([24.0, 210.0])
             .default_size([520.0, 360.0])
             .max_size([720.0, inspector_max_height])

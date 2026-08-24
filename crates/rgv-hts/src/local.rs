@@ -22,7 +22,7 @@ use crate::{
         JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
     },
     pileup::{
-        OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, oriented_observation,
+        OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, aligned_observation,
     },
     sampling::BoundedSampler,
 };
@@ -524,7 +524,7 @@ fn add_record_pileup(
                         }
                         let sequence_index = read_position.saturating_add(offset);
                         let Some((base, quality)) =
-                            oriented_observation(&sequence, qualities, sequence_index, reverse)
+                            aligned_observation(&sequence, qualities, sequence_index)
                         else {
                             continue;
                         };

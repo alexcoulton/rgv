@@ -53,10 +53,6 @@ fn row_test_query(records: &[AlignmentRecord]) -> AlignmentQuery {
     }
 }
 
-fn reverse_complement(bases: &[u8]) -> Vec<u8> {
-    bases.iter().rev().copied().map(complement).collect()
-}
-
 #[test]
 fn bisulfite_contexts_match_both_reference_strands_exactly() {
     let interval = GenomicInterval::new(ContigId::new(0), 0, 20).unwrap();
@@ -131,7 +127,7 @@ fn bisulfite_observations_distinguish_protected_and_converted_on_both_strands() 
     let mut reverse_display = reference_bases.to_vec();
     reverse_display[5] = b'A';
     reverse.sequence = SequenceData::Present {
-        bases: reverse_complement(&reverse_display),
+        bases: reverse_display,
         qualities: None,
     };
     let mut query = row_test_query(&[forward, reverse]);
@@ -451,6 +447,7 @@ fn ultima_deletion_uses_read_group_maximum_homopolymer_length() {
             id: b"ultima".to_vec(),
             platform: Some("ULTIMA".to_owned()),
             maximum_homopolymer_length: Some(3),
+            ultima_tag_orientation: Some(rgv_hts::UltimaTagOrientation::Reference),
         }],
         read_groups_omitted: 0,
         ..AlignmentHeaderMetadata::default()
@@ -1055,7 +1052,7 @@ fn selected_read_promotion_precedes_configured_sort_without_changing_identity() 
 }
 
 #[test]
-fn base_sort_uses_oriented_bases_and_explicit_gap_states() {
+fn base_sort_uses_sam_alignment_order_and_explicit_gap_states() {
     let mut adenine = row_test_record(b"adenine", 10, 20);
     adenine.sequence = SequenceData::Present {
         bases: b"AAAAAAAAAA".to_vec(),
@@ -1064,8 +1061,8 @@ fn base_sort_uses_oriented_bases_and_explicit_gap_states() {
     let mut reverse_cytosine = row_test_record(b"reverse-cytosine", 10, 20);
     reverse_cytosine.flags = AlignmentFlags::from_bits(0x10);
     reverse_cytosine.sequence = SequenceData::Present {
-        // Reverse-orientation display complements stored G to C.
-        bases: b"GGGGGGGGGG".to_vec(),
+        // SAM/BAM SEQ is already reference-facing when flag 0x10 is set.
+        bases: b"CCCCCCCCCC".to_vec(),
         qualities: None,
     };
     let mut deletion = row_test_record(b"deletion", 10, 20);
@@ -1370,6 +1367,52 @@ fn refined_query_preserves_rows_for_shared_read_identities() {
     let carried_rows = assign_alignment_rows(&refined_query, options, Some(&broad_rows));
     assert_eq!(scratch_rows.rows, vec![Some(0)]);
     assert_eq!(carried_rows.rows, vec![Some(1)]);
+}
+
+#[test]
+fn uncapped_query_refresh_preserves_rows_when_loaded_read_count_changes() {
+    let broad_query = row_test_query(&[
+        row_test_record(b"leading", 0, 70),
+        row_test_record(b"selected", 50, 110),
+    ]);
+    let broad_rows = assign_alignment_rows(
+        &broad_query,
+        AlignmentLayoutOptions {
+            max_rows: broad_query.batch.len(),
+            ..AlignmentLayoutOptions::default()
+        },
+        None,
+    );
+    assert_eq!(broad_rows.rows, vec![Some(0), Some(1)]);
+
+    let refined_query = row_test_query(&[
+        row_test_record(b"selected", 50, 110),
+        row_test_record(b"new", 120, 150),
+        row_test_record(b"new-overlap", 120, 160),
+    ]);
+    let refined_rows = assign_alignment_rows(
+        &refined_query,
+        AlignmentLayoutOptions {
+            max_rows: refined_query.batch.len(),
+            ..AlignmentLayoutOptions::default()
+        },
+        Some(&broad_rows),
+    );
+
+    assert_eq!(refined_rows.rows[0], Some(1));
+
+    let narrowed_query = row_test_query(&[row_test_record(b"new-overlap", 120, 160)]);
+    let narrowed_rows = assign_alignment_rows(
+        &narrowed_query,
+        AlignmentLayoutOptions {
+            // The desktop retains the largest uncapped capacity observed for
+            // the row-history chain, even when the next query has fewer reads.
+            max_rows: refined_query.batch.len(),
+            ..AlignmentLayoutOptions::default()
+        },
+        Some(&refined_rows),
+    );
+    assert_eq!(narrowed_rows.rows[0], refined_rows.rows[2]);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1766,7 +1809,7 @@ fn exact_match_fill_is_stable_across_the_base_detail_boundary() {
 }
 
 #[test]
-fn reverse_strand_bases_are_reverse_complemented_with_quality() {
+fn reverse_strand_bases_are_already_in_sam_alignment_order() {
     let record = AlignmentRecord {
         contig: ContigId::new(0),
         start: 0,
@@ -1777,7 +1820,10 @@ fn reverse_strand_bases_are_reverse_complemented_with_quality() {
         mate_start: None,
         template_length: 0,
         read_name: Vec::new(),
-        cigar: Vec::new(),
+        cigar: vec![CigarOp {
+            kind: CigarOpKind::Match,
+            len: 4,
+        }],
         sequence: SequenceData::Present {
             bases: b"AACG".to_vec(),
             qualities: Some(vec![10, 20, 30, 40]),
@@ -1788,13 +1834,59 @@ fn reverse_strand_bases_are_reverse_complemented_with_quality() {
         unreachable!();
     };
     assert_eq!(
-        oriented_base(record.flags, bases, qualities.as_deref(), 0),
-        Some((b'C', Some(40)))
+        aligned_base(bases, qualities.as_deref(), 0),
+        Some((b'A', Some(10)))
     );
     assert_eq!(
-        oriented_base(record.flags, bases, qualities.as_deref(), 3),
-        Some((b'T', Some(10)))
+        aligned_base(bases, qualities.as_deref(), 3),
+        Some((b'G', Some(40)))
     );
+
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 4).unwrap();
+    let viewport = Viewport::new(interval, 40.0).unwrap();
+    let mut batch = AlignmentBatch::default();
+    batch.push(&record).unwrap();
+    let query = AlignmentQuery {
+        interval,
+        header: Arc::default(),
+        batch,
+        pileup: PileupSummary::default(),
+        junctions: rgv_hts::JunctionSummary::default(),
+        pairs: rgv_hts::PairSummary::default(),
+        reference: Some(ReferenceSlice {
+            interval,
+            bases: b"AACG".to_vec(),
+        }),
+        stats: QueryStats::default(),
+    };
+    let mut display = DisplayList::default();
+    let mut bisulfite_budget = BisulfiteRenderBudget::new(MAX_RENDERED_BISULFITE_MARKS);
+    let mut smrt_kinetics_budget = SmrtKineticsRenderBudget::new(MAX_RENDERED_SMRT_KINETICS_MARKS);
+    let mut sbx_budget = SbxRenderBudget::new(MAX_RENDERED_SBX_TAIL_MARKS);
+    add_aligned_bases(
+        &mut display,
+        &query,
+        0,
+        CigarOpKind::Match,
+        0,
+        0,
+        4,
+        viewport,
+        20.0,
+        5.0,
+        1,
+        AlignmentColorMode::None,
+        TemplateLengthBounds::default(),
+        ReadBaseDisplayMode::Mismatches,
+        true,
+        &mut bisulfite_budget,
+        None,
+        &mut smrt_kinetics_budget,
+        None,
+        &mut sbx_budget,
+    );
+    assert_eq!(display.rectangles.len(), 2);
+    assert!(display.texts.is_empty());
 }
 
 #[test]
@@ -2579,6 +2671,15 @@ fn maps_read_positions_through_insertions_and_deletions() {
 }
 
 fn modified_base_query(mm: &str, probabilities: Option<Vec<u64>>) -> (AlignmentQuery, Viewport) {
+    modified_base_query_with_alignment(mm, probabilities, AlignmentFlags::from_bits(0), b"ACCC")
+}
+
+fn modified_base_query_with_alignment(
+    mm: &str,
+    probabilities: Option<Vec<u64>>,
+    flags: AlignmentFlags,
+    bases: &[u8],
+) -> (AlignmentQuery, Viewport) {
     let mut auxiliary_fields = vec![AuxField {
         tag: *b"MM",
         value: AuxValue::String(mm.to_owned()),
@@ -2593,7 +2694,7 @@ fn modified_base_query(mm: &str, probabilities: Option<Vec<u64>>) -> (AlignmentQ
         contig: ContigId::new(0),
         start: 100,
         end: 104,
-        flags: AlignmentFlags::from_bits(0),
+        flags,
         mapping_quality: Some(60),
         mate_contig: None,
         mate_start: None,
@@ -2604,8 +2705,8 @@ fn modified_base_query(mm: &str, probabilities: Option<Vec<u64>>) -> (AlignmentQ
             len: 4,
         }],
         sequence: SequenceData::Present {
-            bases: b"ACCC".to_vec(),
-            qualities: Some(vec![40; 4]),
+            bases: bases.to_vec(),
+            qualities: Some(vec![40; bases.len()]),
         },
         auxiliary_fields,
     };
@@ -2660,6 +2761,22 @@ fn modified_base_calls_use_stable_type_colour_and_probability_alpha() {
         modification_code_color(ModificationCode::Chebi(76792)),
         modification_code_color(ModificationCode::Chebi(76792))
     );
+}
+
+#[test]
+fn reverse_modified_base_calls_decode_in_sequencer_orientation_before_cigar_mapping() {
+    let (query, viewport) = modified_base_query_with_alignment(
+        "C+m,0;",
+        Some(vec![255]),
+        AlignmentFlags::from_bits(0x10),
+        // Original ACCG, stored as reference-facing reverse complement CGGT.
+        b"CGGT",
+    );
+    let layout = layout_alignment_query(&query, viewport, AlignmentLayoutOptions::default());
+    let overlays = modification_overlays(&layout);
+    assert_eq!(overlays.len(), 1);
+    // Original position 1 becomes aligned position 2 on a reverse alignment.
+    assert!((400.0..600.0).contains(&overlays[0].x));
 }
 
 #[test]

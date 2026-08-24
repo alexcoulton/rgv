@@ -98,8 +98,7 @@ pub fn summarize_bisulfite_record(
             CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
                 for offset in 0..length {
                     let position = reference_position.saturating_add(offset as u64);
-                    let Some(base) =
-                        oriented_base(record.flags, bases, read_position.saturating_add(offset))
+                    let Some(base) = aligned_base(bases, read_position.saturating_add(offset))
                     else {
                         continue;
                     };
@@ -154,15 +153,8 @@ fn strand_reference_base(
     Some(if reverse { complement(base) } else { base })
 }
 
-fn oriented_base(flags: AlignmentFlags, bases: &[u8], aligned_position: usize) -> Option<u8> {
-    if flags.is_reverse() {
-        let index = bases
-            .len()
-            .checked_sub(aligned_position.saturating_add(1))?;
-        Some(complement(*bases.get(index)?))
-    } else {
-        bases.get(aligned_position).copied()
-    }
+fn aligned_base(bases: &[u8], aligned_position: usize) -> Option<u8> {
+    bases.get(aligned_position).copied()
 }
 
 const fn complement(base: u8) -> u8 {

@@ -85,6 +85,9 @@ pub struct CigarOp {
 pub enum SequenceData {
     NotLoaded,
     Missing,
+    /// Bases and qualities in SAM/BAM alignment order. For an alignment with
+    /// flag 0x10, SAM/BAM has already reverse-complemented SEQ and reversed
+    /// QUAL, so CIGAR query positions index these arrays directly.
     Present {
         bases: Vec<u8>,
         qualities: Option<Vec<u8>>,
@@ -95,6 +98,8 @@ pub enum SequenceData {
 pub enum SequenceView<'a> {
     NotLoaded,
     Missing,
+    /// Borrowed sequence in the same SAM/BAM alignment order as
+    /// [`SequenceData::Present`].
     Present {
         bases: &'a [u8],
         qualities: Option<&'a [u8]>,
@@ -118,11 +123,18 @@ pub enum AuxValue {
 pub const MAX_ALIGNMENT_READ_GROUPS: usize = 16_384;
 pub const MAX_ALIGNMENT_READ_GROUP_ID_BYTES: usize = 1_024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UltimaTagOrientation {
+    Reference,
+    Synthesis,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AlignmentReadGroup {
     pub id: Vec<u8>,
     pub platform: Option<String>,
     pub maximum_homopolymer_length: Option<u16>,
+    pub ultima_tag_orientation: Option<UltimaTagOrientation>,
 }
 
 impl AlignmentReadGroup {
@@ -131,6 +143,7 @@ impl AlignmentReadGroup {
             .as_deref()
             .is_some_and(|platform| platform.eq_ignore_ascii_case("ULTIMA"))
             || self.maximum_homopolymer_length.is_some()
+            || self.ultima_tag_orientation.is_some()
     }
 }
 
@@ -212,6 +225,7 @@ pub(crate) fn alignment_header_metadata_from_sam(bytes: &[u8]) -> AlignmentHeade
         let mut id = None;
         let mut platform = None;
         let mut maximum_homopolymer_length = None;
+        let mut ultima_tag_orientation = None;
         for field in line.split(|byte| *byte == b'\t').skip(1) {
             let Some(separator) = field.iter().position(|byte| *byte == b':') else {
                 continue;
@@ -230,6 +244,13 @@ pub(crate) fn alignment_header_metadata_from_sam(bytes: &[u8]) -> AlignmentHeade
                         .and_then(|value| value.parse::<u16>().ok())
                         .filter(|value| *value > 0);
                 }
+                b"tp" => {
+                    ultima_tag_orientation = match value {
+                        b"reference" => Some(UltimaTagOrientation::Reference),
+                        b"synthesis" => Some(UltimaTagOrientation::Synthesis),
+                        _ => None,
+                    };
+                }
                 _ => {}
             }
         }
@@ -245,6 +266,7 @@ pub(crate) fn alignment_header_metadata_from_sam(bytes: &[u8]) -> AlignmentHeade
                 id,
                 platform,
                 maximum_homopolymer_length,
+                ultima_tag_orientation,
             });
         }
     }
@@ -798,13 +820,17 @@ mod tests {
     #[test]
     fn alignment_header_preserves_bounded_ultima_read_group_metadata() {
         let metadata = alignment_header_metadata_from_sam(
-            b"@HD\tVN:1.6\n@RG\tID:ultima-a\tSM:sample\tPL:ULTIMA\tmc:12\n@RG\tID:other\tPL:ILLUMINA\n",
+            b"@HD\tVN:1.6\n@RG\tID:ultima-a\tSM:sample\tPL:ULTIMA\tmc:12\ttp:synthesis\n@RG\tID:other\tPL:ILLUMINA\n",
         );
         assert_eq!(metadata.read_groups.len(), 2);
         assert_eq!(metadata.read_groups_omitted, 0);
         let ultima = metadata.read_group(b"ultima-a").unwrap();
         assert_eq!(ultima.platform.as_deref(), Some("ULTIMA"));
         assert_eq!(ultima.maximum_homopolymer_length, Some(12));
+        assert_eq!(
+            ultima.ultima_tag_orientation,
+            Some(UltimaTagOrientation::Synthesis)
+        );
         assert!(ultima.is_ultima());
         assert!(!metadata.read_group(b"other").unwrap().is_ultima());
     }

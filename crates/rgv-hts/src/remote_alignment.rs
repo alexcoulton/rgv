@@ -34,7 +34,7 @@ use crate::{
         JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
     },
     pileup::{
-        OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, oriented_observation,
+        OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, aligned_observation,
     },
     read_remote_object_bounded, remote_url_with_extension,
     sampling::BoundedSampler,
@@ -54,6 +54,8 @@ fn alignment_header_metadata_from_noodles(header: &sam::Header) -> AlignmentHead
     let mut metadata = AlignmentHeaderMetadata::default();
     let maximum_homopolymer_tag =
         Other::<tag::Standard>::try_from(*b"mc").expect("mc is a valid SAM header tag");
+    let ultima_orientation_tag =
+        Other::<tag::Standard>::try_from(*b"tp").expect("tp is a valid SAM header tag");
     for (id, read_group) in header.read_groups() {
         let id: &[u8] = id.as_ref();
         if id.is_empty() || id.len() > crate::alignment::MAX_ALIGNMENT_READ_GROUP_ID_BYTES {
@@ -74,10 +76,22 @@ fn alignment_header_metadata_from_noodles(header: &sam::Header) -> AlignmentHead
             .and_then(|value| std::str::from_utf8(value.as_ref()).ok())
             .and_then(|value| value.parse::<u16>().ok())
             .filter(|value| *value > 0);
+        let ultima_tag_orientation = read_group
+            .other_fields()
+            .get(&ultima_orientation_tag)
+            .and_then(|value| {
+                let value: &[u8] = value.as_ref();
+                match value {
+                    b"reference" => Some(crate::UltimaTagOrientation::Reference),
+                    b"synthesis" => Some(crate::UltimaTagOrientation::Synthesis),
+                    _ => None,
+                }
+            });
         metadata.read_groups.push(AlignmentReadGroup {
             id: id.to_vec(),
             platform,
             maximum_homopolymer_length,
+            ultima_tag_orientation,
         });
     }
     metadata
@@ -1077,7 +1091,7 @@ fn add_pileup(
                         }
                         let sequence_index = read_position.saturating_add(offset);
                         let Some((base, quality)) =
-                            oriented_observation(sequence, qualities, sequence_index, reverse)
+                            aligned_observation(sequence, qualities, sequence_index)
                         else {
                             continue;
                         };

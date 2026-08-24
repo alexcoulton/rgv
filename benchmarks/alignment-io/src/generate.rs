@@ -990,7 +990,7 @@ mod tests {
             assert!(
                 calls
                     .iter()
-                    .all(|call| (1_000..5_000).contains(&call.read_position))
+                    .all(|call| (1_000..5_000).contains(&call.sequencer_position))
             );
         }
     }

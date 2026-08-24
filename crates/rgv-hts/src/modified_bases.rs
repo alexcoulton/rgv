@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{AlignmentRecord, AuxField, AuxValue, SequenceData};
+use crate::{AlignmentFlags, AlignmentRecord, AuxField, AuxValue, SequenceData};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum BaseModificationStrand {
@@ -26,11 +26,16 @@ pub struct ModifiedBaseCall {
     pub strand: BaseModificationStrand,
     pub code: ModificationCode,
     pub implicit_mode: ImplicitModificationMode,
-    pub read_position: usize,
+    /// Zero-based position in the original sequence reported by the sequencer.
+    ///
+    /// Unlike `SEQ`, SAM `MM`/`ML` coordinates are not reoriented when flag
+    /// `0x10` is set. Use [`aligned_position_for_sequencer_position`] before
+    /// mapping this position through a CIGAR.
+    pub sequencer_position: usize,
     pub probability: Option<u8>,
 }
 
-/// Decode SAM `MM`/`ML` tags into calls located on the stored read sequence.
+/// Decode SAM `MM`/`ML` tags in their original sequencer orientation.
 pub fn decode_modified_bases(
     record: &AlignmentRecord,
 ) -> Result<Vec<ModifiedBaseCall>, ModifiedBaseError> {
@@ -47,12 +52,13 @@ pub fn decode_modified_bases(
         SequenceData::Missing => return Err(ModifiedBaseError::MissingSequence),
         SequenceData::NotLoaded => return Err(ModifiedBaseError::SequenceNotLoaded),
     };
-    decode_modified_bases_parts(sequence, &mm.value, ml)
+    decode_modified_bases_parts(sequence, record.flags, &mm.value, ml)
 }
 
 /// Decode modified bases from packed-record components without materializing an alignment.
 pub fn decode_modified_bases_parts(
     sequence: &[u8],
+    flags: AlignmentFlags,
     mm: &AuxValue,
     ml: Option<&AuxValue>,
 ) -> Result<Vec<ModifiedBaseCall>, ModifiedBaseError> {
@@ -76,7 +82,7 @@ pub fn decode_modified_bases_parts(
                     .map_err(|_| ModifiedBaseError::InvalidDelta(delta.to_owned()))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let positions = locate_calls(sequence, group.canonical_base, &deltas)?;
+        let positions = locate_calls(sequence, flags, group.canonical_base, &deltas)?;
         for position in positions {
             for code in &group.codes {
                 let probability = probabilities.get(probability_index).copied();
@@ -86,7 +92,7 @@ pub fn decode_modified_bases_parts(
                     strand: group.strand,
                     code: *code,
                     implicit_mode: group.implicit_mode,
-                    read_position: position,
+                    sequencer_position: position,
                     probability,
                 });
             }
@@ -162,6 +168,7 @@ fn parse_group_header(header: &str) -> Result<ModificationGroup, ModifiedBaseErr
 
 fn locate_calls(
     sequence: &[u8],
+    flags: AlignmentFlags,
     canonical_base: u8,
     deltas: &[usize],
 ) -> Result<Vec<usize>, ModifiedBaseError> {
@@ -170,12 +177,12 @@ fn locate_calls(
     for delta in deltas {
         let mut remaining = *delta;
         let position = loop {
-            let Some(base) = sequence.get(cursor) else {
+            if cursor >= sequence.len() {
                 return Err(ModifiedBaseError::DeltaBeyondSequence);
-            };
+            }
             let position = cursor;
             cursor += 1;
-            if base.to_ascii_uppercase() != canonical_base {
+            if !sequencer_base_matches(sequence, flags, position, canonical_base) {
                 continue;
             }
             if remaining == 0 {
@@ -186,6 +193,66 @@ fn locate_calls(
         result.push(position);
     }
     Ok(result)
+}
+
+/// Convert a coordinate in the original sequencer orientation to the position
+/// used by the aligned `SEQ`, `QUAL`, and CIGAR fields.
+pub fn aligned_position_for_sequencer_position(
+    sequence_length: usize,
+    flags: AlignmentFlags,
+    sequencer_position: usize,
+) -> Option<usize> {
+    if sequencer_position >= sequence_length {
+        return None;
+    }
+    if flags.is_reverse() {
+        sequence_length.checked_sub(sequencer_position.checked_add(1)?)
+    } else {
+        Some(sequencer_position)
+    }
+}
+
+/// Whether an aligned SAM/BAM `SEQ` base represents the requested canonical
+/// base at an original-sequencer coordinate used by an `MM` tag.
+///
+/// The `N` canonical code matches every sequenced base, as required by the SAM
+/// optional-fields specification.
+pub fn sequencer_base_matches(
+    sequence: &[u8],
+    flags: AlignmentFlags,
+    sequencer_position: usize,
+    canonical_base: u8,
+) -> bool {
+    let Some(aligned_position) =
+        aligned_position_for_sequencer_position(sequence.len(), flags, sequencer_position)
+    else {
+        return false;
+    };
+    let Some(aligned_base) = sequence.get(aligned_position).copied() else {
+        return false;
+    };
+    let canonical_base = canonical_base.to_ascii_uppercase();
+    if canonical_base == b'N' {
+        return true;
+    }
+    let sequencer_base = if flags.is_reverse() {
+        complement(aligned_base)
+    } else {
+        aligned_base.to_ascii_uppercase()
+    };
+    sequencer_base == canonical_base
+        || (canonical_base == b'U' && sequencer_base == b'T')
+        || (canonical_base == b'T' && sequencer_base == b'U')
+}
+
+const fn complement(base: u8) -> u8 {
+    match base.to_ascii_uppercase() {
+        b'A' => b'T',
+        b'C' => b'G',
+        b'G' => b'C',
+        b'T' | b'U' => b'A',
+        other => other,
+    }
 }
 
 fn find_tag(fields: &[AuxField], tag: [u8; 2]) -> Option<&AuxField> {
@@ -272,8 +339,8 @@ mod tests {
     fn decodes_delta_positions_and_probabilities() {
         let calls = decode_modified_bases(&record("C+m,0,2;", vec![240, 128])).unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].read_position, 1);
-        assert_eq!(calls[1].read_position, 5);
+        assert_eq!(calls[0].sequencer_position, 1);
+        assert_eq!(calls[1].sequencer_position, 5);
         assert_eq!(calls[0].probability, Some(240));
         assert_eq!(calls[1].probability, Some(128));
     }
@@ -282,7 +349,7 @@ mod tests {
     fn expands_multi_code_groups_in_ml_order() {
         let calls = decode_modified_bases(&record("C+mh?,1;", vec![10, 20])).unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].read_position, 2);
+        assert_eq!(calls[0].sequencer_position, 2);
         assert_eq!(calls[0].code, ModificationCode::Letter(b'm'));
         assert_eq!(calls[1].code, ModificationCode::Letter(b'h'));
         assert_eq!(calls[1].implicit_mode, ImplicitModificationMode::Unknown);
@@ -296,5 +363,28 @@ mod tests {
             error,
             ModifiedBaseError::ProbabilityCountMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn reverse_alignment_decodes_mm_against_original_sequencer_orientation() {
+        let mut reverse = record("C+m,0;", vec![255]);
+        reverse.flags = AlignmentFlags::from_bits(0x10);
+        // Original ACCG, stored as reference-facing reverse complement CGGT.
+        reverse.sequence = SequenceData::Present {
+            bases: b"CGGT".to_vec(),
+            qualities: None,
+        };
+        let calls = decode_modified_bases(&reverse).unwrap();
+        assert_eq!(calls[0].sequencer_position, 1);
+        assert_eq!(
+            aligned_position_for_sequencer_position(4, reverse.flags, 1),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn canonical_n_counts_every_sequencer_base() {
+        let calls = decode_modified_bases(&record("N+n,2;", vec![200])).unwrap();
+        assert_eq!(calls[0].sequencer_position, 2);
     }
 }

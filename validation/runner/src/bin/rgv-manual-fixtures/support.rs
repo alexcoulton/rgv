@@ -578,7 +578,8 @@ pub(crate) fn write_ultima_bam(path: &Path) -> Result<()> {
             .push_tag(b"ID", "ultima")
             .push_tag(b"SM", "ultima")
             .push_tag(b"PL", "ULTIMA")
-            .push_tag(b"mc", 1),
+            .push_tag(b"mc", 1)
+            .push_tag(b"tp", "reference"),
     );
 
     let cases = [
