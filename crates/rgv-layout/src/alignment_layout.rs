@@ -753,9 +753,9 @@ pub use color::ultima_quality_color;
 use color::{
     add_base_glyph, add_event_label, add_marker, add_read_body, add_ultima_deletion_quality_mark,
     add_ultima_insertion_quality_mark, alignment_color, base_color, bisulfite_observation,
-    clipped_geometry, complement, fill_label_color, oriented_base, palette_color,
-    read_base_label_color, record_tag_label, reference_base_label_color, smrt_kinetics_color,
-    visible_positions, with_alpha,
+    clipped_geometry, complement, fill_label_color, insertion_event_color, oriented_base,
+    palette_color, read_base_label_color, record_tag_label, reference_base_label_color,
+    smrt_kinetics_color, visible_positions, with_alpha,
 };
 
 #[cfg(test)]

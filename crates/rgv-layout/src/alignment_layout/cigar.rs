@@ -272,7 +272,7 @@ pub(crate) fn add_cigar(
                     .map(|(start, end)| end.saturating_sub(start))
                     .unwrap_or_default();
                 let insertion_color =
-                    visible_range.map_or(Rgba::new(0.86, 0.32, 0.82, 0.96), |(start, end)| {
+                    visible_range.map_or(insertion_event_color(0.96), |(start, end)| {
                         sbx_insertion_color(
                             query,
                             index,

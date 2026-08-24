@@ -5,6 +5,157 @@ pub(crate) struct ReadEventDetails {
     pub(crate) copy_sequence: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubstitutionCountSource {
+    Nm,
+    Md,
+    ExplicitCigar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AlignmentEditSummary {
+    pub(crate) substitutions: Option<u64>,
+    pub(crate) substitution_source: Option<SubstitutionCountSource>,
+    pub(crate) insertion_bases: u64,
+    pub(crate) insertion_events: u64,
+    pub(crate) deletion_bases: u64,
+    pub(crate) deletion_events: u64,
+    pub(crate) edit_distance: Option<u64>,
+}
+
+pub(crate) fn alignment_edit_summary(record: &AlignmentRecord) -> AlignmentEditSummary {
+    let mut insertion_bases = 0_u64;
+    let mut insertion_events = 0_u64;
+    let mut deletion_bases = 0_u64;
+    let mut deletion_events = 0_u64;
+    let mut explicit_substitutions = 0_u64;
+    let mut has_explicit_substitutions = false;
+    for operation in &record.cigar {
+        match operation.kind {
+            CigarOpKind::Insertion => {
+                insertion_bases = insertion_bases.saturating_add(u64::from(operation.len));
+                insertion_events = insertion_events.saturating_add(1);
+            }
+            CigarOpKind::Deletion => {
+                deletion_bases = deletion_bases.saturating_add(u64::from(operation.len));
+                deletion_events = deletion_events.saturating_add(1);
+            }
+            CigarOpKind::SequenceMismatch => {
+                explicit_substitutions =
+                    explicit_substitutions.saturating_add(u64::from(operation.len));
+                has_explicit_substitutions = true;
+            }
+            CigarOpKind::Match
+            | CigarOpKind::SequenceMatch
+            | CigarOpKind::ReferenceSkip
+            | CigarOpKind::SoftClip
+            | CigarOpKind::HardClip
+            | CigarOpKind::Padding => {}
+        }
+    }
+
+    let edit_distance = record
+        .auxiliary_fields
+        .iter()
+        .find(|field| field.tag == *b"NM")
+        .and_then(|field| match field.value {
+            AuxValue::Signed(value) => u64::try_from(value).ok(),
+            AuxValue::Unsigned(value) => Some(value),
+            _ => None,
+        });
+    let md_substitutions = record
+        .auxiliary_fields
+        .iter()
+        .find(|field| field.tag == *b"MD")
+        .and_then(|field| match &field.value {
+            AuxValue::String(value) => md_substitution_count(value),
+            _ => None,
+        });
+    let indel_bases = insertion_bases.saturating_add(deletion_bases);
+    let (substitutions, substitution_source) = if let Some(substitutions) =
+        edit_distance.and_then(|distance| distance.checked_sub(indel_bases))
+    {
+        (Some(substitutions), Some(SubstitutionCountSource::Nm))
+    } else if let Some(substitutions) = md_substitutions {
+        (Some(substitutions), Some(SubstitutionCountSource::Md))
+    } else if has_explicit_substitutions {
+        (
+            Some(explicit_substitutions),
+            Some(SubstitutionCountSource::ExplicitCigar),
+        )
+    } else {
+        (None, None)
+    };
+
+    AlignmentEditSummary {
+        substitutions,
+        substitution_source,
+        insertion_bases,
+        insertion_events,
+        deletion_bases,
+        deletion_events,
+        edit_distance,
+    }
+}
+
+fn md_substitution_count(md: &str) -> Option<u64> {
+    if md.is_empty() {
+        return None;
+    }
+    let mut substitutions = 0_u64;
+    let mut deletion = false;
+    for byte in md.bytes() {
+        match byte {
+            b'0'..=b'9' => deletion = false,
+            b'^' if !deletion => deletion = true,
+            b'A'..=b'Z' | b'a'..=b'z' => {
+                if !deletion {
+                    substitutions = substitutions.saturating_add(1);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(substitutions)
+}
+
+pub(crate) fn alignment_edit_fields(record: &AlignmentRecord) -> Vec<(String, String)> {
+    let summary = alignment_edit_summary(record);
+    let substitutions = match (summary.substitutions, summary.substitution_source) {
+        (Some(count), Some(SubstitutionCountSource::Nm)) => {
+            format!("{count} (derived from NM minus inserted and deleted bases)")
+        }
+        (Some(count), Some(SubstitutionCountSource::Md)) => format!("{count} (from MD)"),
+        (Some(count), Some(SubstitutionCountSource::ExplicitCigar)) => {
+            format!("{count} (from explicit CIGAR X operations)")
+        }
+        _ => "unavailable — requires NM, MD, explicit CIGAR X, or reference comparison".to_owned(),
+    };
+    vec![
+        ("Base substitutions".to_owned(), substitutions),
+        (
+            "Insertions".to_owned(),
+            format!(
+                "{} bases across {} events",
+                summary.insertion_bases, summary.insertion_events
+            ),
+        ),
+        (
+            "Deletions".to_owned(),
+            format!(
+                "{} bases across {} events",
+                summary.deletion_bases, summary.deletion_events
+            ),
+        ),
+        (
+            "Edit distance (NM)".to_owned(),
+            summary
+                .edit_distance
+                .map_or_else(|| "missing".to_owned(), |value| value.to_string()),
+        ),
+    ]
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn read_event_details(
     record: &AlignmentRecord,

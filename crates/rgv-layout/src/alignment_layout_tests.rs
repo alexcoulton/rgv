@@ -1452,7 +1452,7 @@ fn layout_distinguishes_cigar_operations() {
             .display_list
             .texts
             .iter()
-            .any(|text| text.text == "I3")
+            .any(|text| text.text == "I3" && text.color == insertion_event_color(1.0))
     );
     assert!(
         layout
@@ -1485,11 +1485,13 @@ fn layout_distinguishes_cigar_operations() {
             .iter()
             .any(|text| text.text == "N5")
     );
-    assert!(!filtered.display_list.rectangles.iter().any(|primitive| {
-        (primitive.color.red - 0.86).abs() < 0.01
-            && (primitive.color.green - 0.32).abs() < 0.01
-            && (primitive.color.blue - 0.82).abs() < 0.01
-    }));
+    assert!(
+        !filtered
+            .display_list
+            .rectangles
+            .iter()
+            .any(|primitive| { primitive.color == insertion_event_color(0.96) })
+    );
 }
 
 #[test]
@@ -2448,7 +2450,7 @@ fn regional_insertions_are_prominent_pickable_and_collision_bounded() {
             .display_list
             .texts
             .iter()
-            .any(|text| text.text == "I")
+            .any(|text| text.text == "I" && text.color == insertion_event_color(1.0))
     );
     assert!(layout.display_list.rectangles.iter().any(|rectangle| {
         rectangle.object_id & READ_DETAIL_OBJECT_BIT != 0 && rectangle.width >= 3.0
@@ -2456,10 +2458,9 @@ fn regional_insertions_are_prominent_pickable_and_collision_bounded() {
 }
 
 #[test]
-fn default_reads_have_a_neutral_outline_and_pale_fill() {
+fn default_reads_have_a_neutral_outline_and_pale_fill_at_every_read_stack_lod() {
     let contig = ContigId::new(0);
     let interval = GenomicInterval::new(contig, 0, 1_000).unwrap();
-    let viewport = Viewport::new(interval, 1_000.0).unwrap();
     let mut batch = AlignmentBatch::default();
     batch
         .push(&AlignmentRecord {
@@ -2494,18 +2495,26 @@ fn default_reads_have_a_neutral_outline_and_pale_fill() {
         color_mode: AlignmentColorMode::None,
         ..AlignmentLayoutOptions::default()
     };
-    let layout = layout_alignment_query(&query, viewport, options);
-    let body = layout
-        .display_list
-        .rectangles
-        .iter()
-        .filter(|primitive| primitive.object_id == 1)
-        .collect::<Vec<_>>();
-    assert_eq!(body.len(), 2);
-    assert!(body[0].color.red < 0.7);
-    assert!(body[1].color.red > 0.8);
-    assert!(body[1].width < body[0].width);
-    assert!(body[1].height < body[0].height);
+    for (pixel_width, expected_detail) in
+        [(1_000.0, DetailLevel::Reads), (50.0, DetailLevel::Regional)]
+    {
+        let viewport = Viewport::new(interval, pixel_width).unwrap();
+        assert_eq!(viewport.detail_level(), expected_detail);
+        let layout = layout_alignment_query(&query, viewport, options);
+        let body = layout
+            .display_list
+            .rectangles
+            .iter()
+            .filter(|primitive| primitive.object_id == 1)
+            .collect::<Vec<_>>();
+        assert_eq!(body.len(), 2);
+        assert!(body[0].color.red < 0.7);
+        assert!(body[1].color.red > 0.8);
+        assert!((body[1].color.red - body[1].color.green).abs() < f32::EPSILON);
+        assert!((body[1].color.green - body[1].color.blue).abs() < f32::EPSILON);
+        assert!(body[1].width < body[0].width);
+        assert!(body[1].height < body[0].height);
+    }
 }
 
 #[test]

@@ -1,6 +1,10 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+pub(crate) fn insertion_event_color(alpha: f32) -> Rgba {
+    Rgba::new(0.10, 0.42, 0.88, alpha)
+}
+
 pub(crate) fn smrt_kinetics_color(value: u64) -> Rgba {
     let value = value.min(6_000) as f32;
     if value <= 100.0 {

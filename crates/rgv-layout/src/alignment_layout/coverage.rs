@@ -547,20 +547,13 @@ pub(crate) fn add_spans(
             continue;
         };
         let representative = rows.representative(index);
-        let read_fill = if options.color_mode == AlignmentColorMode::None {
-            // Regional stacks need enough chroma and contrast to remain visibly
-            // occupied at hundreds of bases per pixel. Keep detailed/base mode's
-            // neutral fill, but use the familiar IGV-like purple at this scale.
-            Rgba::new(0.36, 0.05, 0.72, 1.0)
-        } else {
-            alignment_color(
-                query,
-                index,
-                options.color_mode,
-                options.pair_length_bounds,
-                0.78,
-            )
-        };
+        let read_fill = alignment_color(
+            query,
+            index,
+            options.color_mode,
+            options.pair_length_bounds,
+            0.78,
+        );
         add_read_body(
             display_list,
             x,
@@ -646,13 +639,7 @@ pub(crate) fn add_spans(
         let object_id =
             read_detail_object_id(u32::try_from(representative + 1).unwrap_or(u32::MAX));
         let labelled = insertion.length >= options.minimum_event_label_size;
-        // Small ONT insertion errors remain visible as fine pale notches, while
-        // label-sized events use the familiar high-contrast red `I` vocabulary.
-        let color = if labelled {
-            Rgba::new(0.90, 0.03, 0.08, 1.0)
-        } else {
-            Rgba::new(0.94, 0.94, 0.96, 0.92)
-        };
+        let color = insertion_event_color(if labelled { 1.0 } else { 0.82 });
         display_list.rectangles.push(RectPrimitive {
             x: x - if labelled { 0.75 } else { 0.375 },
             y: y - 1.0,

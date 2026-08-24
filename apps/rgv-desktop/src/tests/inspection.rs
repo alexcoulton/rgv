@@ -597,6 +597,86 @@ fn selected_chain_includes_current_and_declared_segments_with_error_provenance()
 }
 
 #[test]
+fn alignment_edit_summary_separates_substitutions_and_indels() {
+    let mut record = AlignmentRecord {
+        contig: ContigId::new(0),
+        start: 100,
+        end: 120,
+        flags: rgv_hts::AlignmentFlags::from_bits(0),
+        mapping_quality: Some(60),
+        mate_contig: None,
+        mate_start: None,
+        template_length: 0,
+        read_name: b"edits".to_vec(),
+        cigar: vec![
+            rgv_hts::CigarOp {
+                kind: CigarOpKind::Match,
+                len: 10,
+            },
+            rgv_hts::CigarOp {
+                kind: CigarOpKind::Insertion,
+                len: 2,
+            },
+            rgv_hts::CigarOp {
+                kind: CigarOpKind::Deletion,
+                len: 3,
+            },
+            rgv_hts::CigarOp {
+                kind: CigarOpKind::Insertion,
+                len: 1,
+            },
+        ],
+        sequence: SequenceData::NotLoaded,
+        auxiliary_fields: vec![rgv_hts::AuxField {
+            tag: *b"NM",
+            value: AuxValue::Unsigned(12),
+        }],
+    };
+    let summary = alignment_edit_summary(&record);
+    assert_eq!(summary.substitutions, Some(6));
+    assert_eq!(
+        summary.substitution_source,
+        Some(SubstitutionCountSource::Nm)
+    );
+    assert_eq!((summary.insertion_bases, summary.insertion_events), (3, 2));
+    assert_eq!((summary.deletion_bases, summary.deletion_events), (3, 1));
+    assert_eq!(summary.edit_distance, Some(12));
+
+    record.auxiliary_fields = vec![rgv_hts::AuxField {
+        tag: *b"MD",
+        value: AuxValue::String("10A5^AC3T0G4".to_owned()),
+    }];
+    let summary = alignment_edit_summary(&record);
+    assert_eq!(summary.substitutions, Some(3));
+    assert_eq!(
+        summary.substitution_source,
+        Some(SubstitutionCountSource::Md)
+    );
+
+    record.cigar.push(rgv_hts::CigarOp {
+        kind: CigarOpKind::SequenceMismatch,
+        len: 4,
+    });
+    record.auxiliary_fields.clear();
+    let summary = alignment_edit_summary(&record);
+    assert_eq!(summary.substitutions, Some(4));
+    assert_eq!(
+        summary.substitution_source,
+        Some(SubstitutionCountSource::ExplicitCigar)
+    );
+
+    let fields = alignment_edit_fields(&record);
+    assert!(fields.iter().any(|(label, value)| {
+        label == "Base substitutions" && value == "4 (from explicit CIGAR X operations)"
+    }));
+    assert!(
+        fields
+            .iter()
+            .any(|(label, value)| label == "Insertions" && value == "3 bases across 2 events")
+    );
+}
+
+#[test]
 fn supplementary_chain_segments_expose_complete_accessibility_names() {
     let chain = SelectedSupplementaryChain {
         read_name: b"split-read".to_vec(),

@@ -139,6 +139,7 @@ impl Viewer {
             ),
             ("Modified-base calls".to_owned(), modified_bases),
         ];
+        fields.extend(alignment_edit_fields(&record));
         if let AlignmentColorMode::Bisulfite(context) = selected_filters.alignment_color_mode {
             fields.push((
                 "Bisulfite mode".to_owned(),

@@ -186,10 +186,10 @@ pub(crate) fn sbx_insertion_color(
     insertion_length: usize,
     budget: &mut SbxRenderBudget,
 ) -> Rgba {
-    let concordant = Rgba::new(0.86, 0.32, 0.82, 0.96);
     if !enabled {
-        return concordant;
+        return insertion_event_color(0.96);
     }
+    let concordant = Rgba::new(0.86, 0.32, 0.82, 0.96);
     let Some(state) = state else {
         budget.unavailable_insertions = budget.unavailable_insertions.saturating_add(1);
         return concordant;

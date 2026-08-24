@@ -28,6 +28,31 @@ fn read_inspector_max_height(content_height: f32) -> f32 {
     (content_height * 0.45).clamp(260.0, 520.0)
 }
 
+fn break_long_monospace_runs(value: &str) -> String {
+    const MAXIMUM_UNBROKEN_CHARACTERS: usize = 24;
+    let mut display = String::with_capacity(value.len());
+    let mut unbroken = 0_usize;
+    for character in value.chars() {
+        if character.is_whitespace() {
+            unbroken = 0;
+        } else if unbroken == MAXIMUM_UNBROKEN_CHARACTERS {
+            display.push('\n');
+            unbroken = 0;
+        }
+        display.push(character);
+        if !character.is_whitespace() {
+            unbroken += 1;
+        }
+    }
+    display
+}
+
+fn wrapped_monospace(ui: &mut egui::Ui, value: &str) -> egui::Response {
+    ui.add(
+        egui::Label::new(egui::RichText::new(break_long_monospace_runs(value)).monospace()).wrap(),
+    )
+}
+
 /// Builder-compatible adapter used while the inspector UI is docked. Keeping
 /// the old window sizing calls as no-ops lets every inspector retain its full
 /// contents and actions without allowing it to float over the genomic canvas.
@@ -152,7 +177,7 @@ pub(crate) fn show_properties(
                         for (label, value) in &inspector.fields {
                             ui.horizontal_wrapped(|ui| {
                                 ui.strong(label);
-                                ui.monospace(value);
+                                wrapped_monospace(ui, value);
                             });
                         }
                         ui.collapsing(
@@ -161,7 +186,7 @@ pub(crate) fn show_properties(
                                 for (tag, value) in &inspector.auxiliary {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.monospace(tag);
-                                        ui.monospace(value);
+                                        wrapped_monospace(ui, value);
                                         if ui.small_button("Copy").clicked() {
                                             ui.ctx().copy_text(format!("{tag}:{value}"));
                                         }
@@ -995,7 +1020,9 @@ pub(crate) fn show_properties(
 
 #[cfg(test)]
 mod tests {
-    use super::{PropertySection, read_inspector_max_height};
+    use super::{
+        PropertySection, break_long_monospace_runs, read_inspector_max_height, wrapped_monospace,
+    };
 
     #[test]
     fn read_inspector_is_bounded_at_supported_window_heights() {
@@ -1016,5 +1043,22 @@ mod tests {
             });
         });
         assert!(output.shapes.len() > 1);
+    }
+
+    #[test]
+    fn wrapped_monospace_stays_inside_a_narrow_property_row() {
+        let display = break_long_monospace_runs(&"123M4I".repeat(100));
+        assert!(display.lines().all(|line| line.chars().count() <= 24));
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(180.0);
+            let maximum_x = ui.max_rect().right();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("CIGAR");
+                let response = wrapped_monospace(ui, &"123M4I".repeat(100));
+                assert!(response.rect.right() <= maximum_x + f32::EPSILON);
+                assert!(response.rect.height() > ui.text_style_height(&egui::TextStyle::Monospace));
+            });
+        });
     }
 }
