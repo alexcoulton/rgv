@@ -7,6 +7,64 @@ use rgv_layout::{
 use super::TRACK_GUTTER_WIDTH;
 
 pub const GENOME_CONTEXT_HEIGHT: f32 = 62.0;
+pub const GENOME_OVERVIEW_BINS: usize = 256;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenomeOverviewData {
+    pub bins: Vec<f32>,
+    pub observed: Vec<bool>,
+}
+
+impl Default for GenomeOverviewData {
+    fn default() -> Self {
+        Self {
+            bins: vec![0.0; GENOME_OVERVIEW_BINS],
+            observed: vec![false; GENOME_OVERVIEW_BINS],
+        }
+    }
+}
+
+impl GenomeOverviewData {
+    pub fn add_depths(
+        &mut self,
+        contig_length: u64,
+        interval: rgv_core::GenomicInterval,
+        depths: impl ExactSizeIterator<Item = u32>,
+    ) {
+        if contig_length == 0 || interval.is_empty() || depths.len() == 0 {
+            return;
+        }
+        let observed_start = overview_bin(interval.start(), contig_length, self.bins.len());
+        let observed_end = overview_bin(
+            interval.end().saturating_sub(1),
+            contig_length,
+            self.bins.len(),
+        );
+        for observed in &mut self.observed[observed_start..=observed_end] {
+            *observed = true;
+        }
+        let depth_count = depths.len();
+        for (index, depth) in depths.enumerate() {
+            let numerator = (index as u128 * 2 + 1) * u128::from(interval.len());
+            let denominator = depth_count as u128 * 2;
+            let position = interval
+                .start()
+                .saturating_add(u64::try_from(numerator / denominator).unwrap_or(u64::MAX));
+            let bin = overview_bin(position, contig_length, self.bins.len());
+            self.bins[bin] = self.bins[bin].max(depth as f32);
+        }
+    }
+
+    pub fn normalize_logarithmically(&mut self) {
+        let maximum = self.bins.iter().copied().fold(0.0_f32, f32::max).ln_1p();
+        if maximum <= f32::EPSILON {
+            return;
+        }
+        for bin in &mut self.bins {
+            *bin = bin.ln_1p() / maximum;
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -28,13 +86,14 @@ pub struct OverviewInteraction {
     pub keyboard_zoom_factor: Option<f64>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn paint_genome_context(
     ui: &mut Ui,
     assembly: &GenomeAssembly,
     contig_name: &str,
     contig_length: u64,
     viewport: Viewport,
+    overview_data: &GenomeOverviewData,
     id_salt: u64,
     show_gutter: bool,
 ) -> OverviewInteraction {
@@ -86,7 +145,7 @@ pub fn paint_genome_context(
         )
         .on_hover_cursor(egui::CursorIcon::AllScroll)
         .on_hover_text(
-            "Drag left/right to pan · drag down/up to zoom in/out · double-click to show all",
+            "Coverage density is shown inside the rail · drag left/right to pan · drag down/up to zoom in/out · double-click to show all",
         );
     let visible_interval = viewport.interval();
     ideogram_response.widget_info(|| {
@@ -140,6 +199,7 @@ pub fn paint_genome_context(
             );
         }
     }
+    paint_genome_overview_data(painter, ideogram_rect, overview_data);
     let visible = Rect::from_min_size(
         pos2(
             ideogram_rect.left() + ideogram.visible_x,
@@ -248,6 +308,66 @@ pub fn paint_genome_context(
     }
 }
 
+fn paint_genome_overview_data(painter: &egui::Painter, rect: Rect, overview: &GenomeOverviewData) {
+    if overview.bins.is_empty() || overview.bins.len() != overview.observed.len() {
+        return;
+    }
+    let bin_width = rect.width() / overview.bins.len() as f32;
+    let mut run_start = None;
+    for (index, observed) in overview
+        .observed
+        .iter()
+        .copied()
+        .chain(std::iter::once(false))
+        .enumerate()
+    {
+        if observed && run_start.is_none() {
+            run_start = Some(index);
+        } else if !observed && let Some(start) = run_start.take() {
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(rect.left() + start as f32 * bin_width, rect.top()),
+                    pos2(rect.left() + index as f32 * bin_width, rect.bottom()),
+                ),
+                0.0,
+                Color32::from_rgba_unmultiplied(26, 118, 152, 32),
+            );
+        }
+    }
+    for (index, density) in overview.bins.iter().copied().enumerate() {
+        if density <= f32::EPSILON {
+            continue;
+        }
+        let height = (2.0 + density.clamp(0.0, 1.0) * (rect.height() - 2.0)).min(rect.height());
+        painter.rect_filled(
+            Rect::from_min_max(
+                pos2(
+                    rect.left() + index as f32 * bin_width,
+                    rect.bottom() - height,
+                ),
+                pos2(
+                    rect.left() + (index + 1) as f32 * bin_width + 0.5,
+                    rect.bottom(),
+                ),
+            ),
+            0.0,
+            Color32::from_rgba_unmultiplied(16, 105, 145, 190),
+        );
+    }
+}
+
+fn overview_bin(position: u64, contig_length: u64, bins: usize) -> usize {
+    if bins == 0 || contig_length == 0 {
+        return 0;
+    }
+    usize::try_from(
+        u128::from(position.min(contig_length.saturating_sub(1))) * bins as u128
+            / u128::from(contig_length),
+    )
+    .unwrap_or(usize::MAX)
+    .min(bins - 1)
+}
+
 fn ideogram_position_at_pointer(rect: Rect, pointer_x: f32, contig_length: u64) -> u64 {
     let fraction = ((pointer_x - rect.left()) / rect.width().max(f32::EPSILON)).clamp(0.0, 1.0);
     (f64::from(fraction) * contig_length.saturating_sub(1) as f64).round() as u64
@@ -296,7 +416,16 @@ mod tests {
                 ..egui::RawInput::default()
             },
             |ui| {
-                let _ = paint_genome_context(ui, &assembly, "chr1", 10_000, viewport, 1, true);
+                let _ = paint_genome_context(
+                    ui,
+                    &assembly,
+                    "chr1",
+                    10_000,
+                    viewport,
+                    &GenomeOverviewData::default(),
+                    1,
+                    true,
+                );
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
@@ -307,5 +436,23 @@ mod tests {
                     .is_some_and(|label| label.contains("Genome overview for chr1"))
                 && node.numeric_value() == Some(100.0)
         }));
+    }
+
+    #[test]
+    fn genome_overview_maps_and_normalizes_loaded_coverage() {
+        let interval =
+            rgv_core::GenomicInterval::new(rgv_core::ContigId::new(0), 100, 400).unwrap();
+        let mut overview = GenomeOverviewData {
+            bins: vec![0.0; 10],
+            observed: vec![false; 10],
+        };
+        overview.add_depths(1_000, interval, [0, 10, 100].into_iter());
+        overview.normalize_logarithmically();
+
+        assert!(overview.observed[1..4].iter().all(|observed| *observed));
+        assert_eq!(overview.observed.iter().filter(|value| **value).count(), 3);
+        assert!(overview.bins[1].abs() < f32::EPSILON);
+        assert!(overview.bins[2] > 0.0 && overview.bins[2] < 1.0);
+        assert!((overview.bins[3] - 1.0).abs() < f32::EPSILON);
     }
 }

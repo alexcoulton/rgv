@@ -117,6 +117,7 @@ host configuration details. This example passes only the protected file's path; 
 | `rgv_status` | Reports reachability, versions, compatibility, and non-sensitive capabilities. |
 | `rgv_get_workspace` | Returns bounded genome, ordered panel, track, readiness, and selection state. |
 | `rgv_get_selection` | Returns bounded structured evidence for the semantic selection. |
+| `rgv_get_interaction_trace` | Returns the bounded input-to-present timeline for the most recent physical vertical-scrollbar gesture. |
 | `rgv_clear_selection` | Clears all selection state and closes the inspector. |
 | `rgv_refresh_selection` | Explicitly creates a new immutable evidence revision. |
 | `rgv_get_review_queue` | Lists review items without notes or assignments. |
@@ -151,6 +152,12 @@ Typed configuration reports `requested`, `effective`, `changed`, and `clamped`. 
 filter reports additionally expose `no_op`; an empty filter expression is the explicit operation
 for clearing an alignment filter. This makes an applied clamp or idempotent call distinguishable
 from a mutation that changed the viewer.
+
+`rgv_get_interaction_trace` is observational. Drag the vertical scrollbar in the live window, then
+call the tool to inspect the first 500 ms of the gesture. The trace separates pointer receipt,
+egui handling, display clipping, renderer preparation, CPU/GPU capacity growth, upload volume,
+surface acquisition, queue submission, and presentation. It contains no genomic records or screen
+coordinates.
 
 ## Bounds and privacy
 

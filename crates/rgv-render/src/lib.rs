@@ -72,6 +72,7 @@ pub struct RectangleRenderer {
     instance_capacity: usize,
     instance_count: u32,
     cached_instances: Vec<RectangleInstance>,
+    scratch_instances: Vec<RectangleInstance>,
     last_prepare_stats: PrepareStats,
 }
 
@@ -81,6 +82,7 @@ pub struct PrepareStats {
     pub uploaded_instances: usize,
     pub uploaded_bytes: usize,
     pub buffer_reallocated: bool,
+    pub cpu_capacity_grew: bool,
     pub truncated: bool,
 }
 
@@ -161,6 +163,7 @@ impl RectangleRenderer {
             instance_capacity,
             instance_count: 0,
             cached_instances: Vec::new(),
+            scratch_instances: Vec::new(),
             last_prepare_stats: PrepareStats::default(),
         }
     }
@@ -186,16 +189,28 @@ impl RectangleRenderer {
 
         let maximum_instances =
             MAX_UPLOAD_BYTES_PER_FRAME / std::mem::size_of::<RectangleInstance>();
-        let instances: Vec<_> = display_list
-            .rectangles
-            .iter()
-            .take(maximum_instances)
-            .copied()
-            .map(RectangleInstance::from)
-            .collect();
+        self.scratch_instances.clear();
+        let previous_cpu_capacity = self.scratch_instances.capacity();
+        self.scratch_instances.extend(
+            display_list
+                .rectangles
+                .iter()
+                .take(maximum_instances)
+                .copied()
+                .map(RectangleInstance::from),
+        );
+        let instances = &self.scratch_instances;
+        if self.cached_instances.capacity() < instances.capacity() {
+            self.cached_instances.reserve(
+                instances
+                    .capacity()
+                    .saturating_sub(self.cached_instances.len()),
+            );
+        }
         let mut stats = PrepareStats {
             total_instances: instances.len(),
             truncated: display_list.rectangles.len() > instances.len(),
+            cpu_capacity_grew: instances.capacity() > previous_cpu_capacity,
             ..PrepareStats::default()
         };
         if instances.len() > self.instance_capacity {
@@ -206,7 +221,7 @@ impl RectangleRenderer {
         let dirty = if stats.buffer_reallocated {
             (!instances.is_empty()).then_some(0..instances.len())
         } else {
-            changed_instance_range(&self.cached_instances, &instances)
+            changed_instance_range(&self.cached_instances, instances)
         };
         if let Some(range) = dirty {
             let offset = range.start * std::mem::size_of::<RectangleInstance>();
@@ -220,7 +235,7 @@ impl RectangleRenderer {
             stats.uploaded_bytes = std::mem::size_of_val(changed);
         }
         self.instance_count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
-        self.cached_instances = instances;
+        std::mem::swap(&mut self.cached_instances, &mut self.scratch_instances);
         self.last_prepare_stats = stats;
     }
 

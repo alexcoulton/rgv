@@ -367,6 +367,16 @@ impl Viewer {
         let mut recent_locus_requested = None;
         let mut new_canvas_geometry = self.canvas_geometry;
         let track_frames = self.panels.active().track_frames.clone();
+        let scrollbar_overview = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map(|cache| cache.overview.clone());
+        let vertical_scroll_preview = self
+            .vertical_overview_drag
+            .filter(|drag| drag.density_dragging && drag.panel_id == self.panels.active().id)
+            .map(|drag| drag.virtual_scroll_fraction);
         let genomic_texts = self.composite_display_list.texts.clone();
         let selected_track = self.panels.active().selected_track;
         let assembly = self.assembly.clone();
@@ -409,11 +419,36 @@ impl Viewer {
             .panels
             .iter()
             .map(|panel| {
+                let mut genome_overview = ui::GenomeOverviewData::default();
+                for track in self
+                    .alignment_tracks
+                    .iter()
+                    .filter(|track| track.config.visible)
+                {
+                    let query = track
+                        .projection(panel.id)
+                        .and_then(|projection| projection.current_query.as_ref());
+                    let query_matches_contig = track
+                        .dictionary
+                        .as_ref()
+                        .and_then(|dictionary| dictionary.id_by_name(&panel.contig_name))
+                        .zip(query.map(|query| query.interval.contig()))
+                        .is_some_and(|(expected, actual)| expected == actual);
+                    if query_matches_contig && let Some(query) = query {
+                        genome_overview.add_depths(
+                            panel.contig_length,
+                            query.interval,
+                            query.pileup.bins.iter().map(|bin| bin.depth),
+                        );
+                    }
+                }
+                genome_overview.normalize_logarithmically();
                 (
                     panel.id,
                     panel.contig_name.clone(),
                     panel.contig_length,
                     panel.viewport,
+                    genome_overview,
                 )
             })
             .collect::<Vec<_>>();
@@ -986,6 +1021,7 @@ impl Viewer {
                             &contig_name,
                             self.panels.active().contig_length,
                             self.panels.active().viewport,
+                            &panel_contexts[0].4,
                             active_panel_id.get(),
                             true,
                         );
@@ -998,7 +1034,7 @@ impl Viewer {
                         let content_right = rect.right() - ui::SCROLLBAR_WIDTH;
                         let panel_width =
                             (content_right - content_left) / panel_contexts.len() as f32;
-                        for (index, (id, name, length, viewport)) in
+                        for (index, (id, name, length, viewport, genome_overview)) in
                             panel_contexts.iter().enumerate()
                         {
                             let left = content_left + index as f32 * panel_width;
@@ -1021,6 +1057,7 @@ impl Viewer {
                                             name,
                                             *length,
                                             *viewport,
+                                            genome_overview,
                                             id.get(),
                                             false,
                                         )
@@ -1115,6 +1152,9 @@ impl Viewer {
                     geometry.scrollbar,
                     maximum_vertical_scroll,
                     &mut vertical_scroll_points,
+                    alignment_density,
+                    vertical_scroll_preview,
+                    scrollbar_overview.as_ref(),
                 );
             });
             if let Some(key) = rendered_track_settings_panel {

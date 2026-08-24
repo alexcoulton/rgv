@@ -704,6 +704,21 @@ impl Viewer {
                     Err(error) => automation_failure(AutomationErrorCode::Internal, error),
                 }
             }
+            AutomationCommand::DescribeInteractionTrace => {
+                let trace = self.interaction_trace.snapshot();
+                let message = if trace.is_some() {
+                    "Described the most recent vertical scrollbar interaction"
+                } else {
+                    "No vertical scrollbar interaction has been recorded"
+                };
+                match serde_json::to_value(trace) {
+                    Ok(data) => AutomationExecution::Complete {
+                        message: message.to_owned(),
+                        data,
+                    },
+                    Err(error) => automation_failure(AutomationErrorCode::Internal, error),
+                }
+            }
             AutomationCommand::ClearSelection => {
                 let previous = self.automation_selection_snapshot();
                 self.panels.active_mut().clear_selection();
@@ -3129,6 +3144,7 @@ impl Viewer {
         anyhow::bail!("track {} was not found", track_id.get())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn start_automation_snapshot(
         &mut self,
         command_index: usize,

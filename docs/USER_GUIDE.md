@@ -142,7 +142,9 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   `--cytobands` is supplied. Coordinate ruler labels always use one-based display positions.
 - The chromosome overview supports Ableton-style direct navigation: drag left/right to pan, drag
   down/up to zoom in/out around the press position, click to recenter, and double-click to show the
-  complete contig. Pan and zoom can be combined in one diagonal gesture. Horizontal movement is
+  complete contig. Loaded alignment coverage is drawn logarithmically inside the chromosome rail;
+  a faint band distinguishes the queried span from unqueried portions of the contig. Pan and zoom
+  can be combined in one diagonal gesture. Horizontal movement is
   scale-aware: broad views receive extra pan gain for fast chromosome traversal, and movement
   becomes progressively finer as the gesture zooms into a smaller genomic span. During a drag the
   pointer is hidden and captured, so movement continues after it would otherwise reach a screen
@@ -162,11 +164,14 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   the wheel/trackpad to move through vertically stacked tracks and deep read rows.
 - The right overview is also an Ableton-style two-axis control: drag up/down to scroll and
   left/right to compact/expand track heights and read rows. Diagonal motion combines both actions,
-  density changes retain the row beneath the press position, and vertical movement becomes faster
-  in compact views and finer in expanded views. Read rows can expand to roughly 64 pixels for close
-  inspection; auxiliary tracks use a gentler scale above their normal size so they do not consume
-  the entire canvas. It uses the same captured-pointer behavior and visual language as the
-  chromosome overview. Clicking the rail jumps to that vertical position.
+  density changes retain the row beneath the exact grabbed point, and the thumb contracts around
+  that point from the first horizontal movement even when sparse content still fits without
+  scrolling. In that fitting state the control retains a latent vertical camera position, so
+  up/down motion remains visible and becomes the real scroll offset continuously when expanded
+  content first overflows. Read rows can expand to roughly 64 pixels for close inspection;
+  auxiliary tracks use a gentler scale above their normal size so they do not consume the entire
+  canvas. It uses the same captured-pointer behavior and visual language as the chromosome
+  overview. Clicking the rail jumps to that vertical position.
 - Arrow Left/Right pans by ten percent; `+` and `-` zoom around the centre.
 - Home returns to the initial locus; Alt+Left/Right traverses locus history.
 - `Ctrl/Cmd+L` focuses the locus field and Enter navigates.

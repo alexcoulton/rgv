@@ -211,6 +211,7 @@ fn handle_control_request(
                     ,"navigation_history"
                     ,"alignment_discovery"
                     ,"workspace_open"
+                    ,"interaction_trace"
                 ]
             })
             .to_string(),

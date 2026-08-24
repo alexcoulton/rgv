@@ -101,12 +101,10 @@ impl Viewer {
             return;
         }
         self.panels.active_mut().vertical_scroll_points = next;
-        if self.synthetic {
-            self.display_dirty = true;
-        } else {
-            self.rebuild_genomic_display();
+        if self.synthetic || !self.refresh_active_panel_scroll_display() {
             self.display_dirty = true;
         }
+        self.window.request_redraw();
     }
 
     pub(crate) fn keyboard_input(&mut self, key: &Key) {
@@ -406,6 +404,10 @@ impl Viewer {
         interaction: ui::ScrollbarInteraction,
         requested_scroll: &mut f32,
     ) {
+        if interaction.pointer_down {
+            self.interaction_trace
+                .record_once(InteractionTraceStage::EguiPointerDown);
+        }
         if interaction.keyboard_density_pixels.abs() > f32::EPSILON {
             let anchor_y = self.canvas_geometry.viewport.height() * 0.5;
             let (density, scroll) = vertical_overview_step(
@@ -417,68 +419,139 @@ impl Viewer {
             );
             if (density - self.primary_alignment_filters().alignment_density).abs() > 1.0e-4 {
                 self.primary_alignment_filters_mut().alignment_density = density;
-                self.rebuild_genomic_display();
+                self.display_dirty = true;
             }
             let maximum = (self.panels.active().content_bottom_points
                 - self.canvas_geometry.viewport.bottom())
             .max(0.0);
             *requested_scroll = scroll.clamp(0.0, maximum);
             self.display_dirty = true;
-        }
-        if interaction.drag_started
-            && self.vertical_overview_drag.is_none()
-            && let Some(pointer) = interaction.pointer
-        {
-            let press = pointer - interaction.drag_delta;
-            self.vertical_overview_drag = Some(VerticalOverviewDrag {
-                last_pointer_x: press.x,
-                last_pointer_y: press.y,
-                anchor_y: (press.y - self.canvas_geometry.viewport.top())
-                    .clamp(0.0, self.canvas_geometry.viewport.height()),
-            });
-        }
-        let was_captured = self.overview_capture == Some(OverviewCapture::Vertical);
-        if interaction.dragging
-            && !was_captured
-            && let Some(mut drag) = self.vertical_overview_drag
-            && let Some(pointer) = interaction.pointer
-        {
-            let delta_x = pointer.x - drag.last_pointer_x;
-            let delta_y = pointer.y - drag.last_pointer_y;
-            let (density, scroll) = vertical_overview_step(
-                self.primary_alignment_filters().alignment_density,
-                *requested_scroll,
-                drag.anchor_y,
-                delta_x,
-                delta_y,
-            );
-            if (density - self.primary_alignment_filters().alignment_density).abs() > 1.0e-4 {
-                self.primary_alignment_filters_mut().alignment_density = density;
-                self.rebuild_genomic_display();
-            }
-            let maximum = (self.panels.active().content_bottom_points
-                - self.canvas_geometry.viewport.bottom())
-            .max(0.0);
-            *requested_scroll = scroll.clamp(0.0, maximum);
-            self.display_dirty = true;
-            drag.last_pointer_x = pointer.x;
-            drag.last_pointer_y = pointer.y;
-            self.vertical_overview_drag = Some(drag);
-        }
-        if interaction.drag_started
-            && self.vertical_overview_drag.is_some()
-            && self.overview_capture.is_none()
-        {
-            self.begin_overview_capture(OverviewCapture::Vertical);
-        }
-        if interaction.drag_stopped {
-            self.vertical_overview_drag = None;
         }
     }
 
-    pub(crate) fn begin_overview_capture(&mut self, capture: OverviewCapture) {
+    pub(crate) fn begin_vertical_scrollbar_drag(&mut self) -> bool {
+        if self.vertical_overview_drag.is_some() || !self.cursor_in_vertical_scrollbar() {
+            return false;
+        }
+        let maximum = (self.panels.active().content_bottom_points
+            - self.canvas_geometry.viewport.bottom())
+        .max(0.0);
+        // A fitting track stack has no vertical pan range, but the same control must
+        // remain draggable horizontally so the user can expand it into an overflow.
+        let scale = self.window.scale_factor().max(f64::EPSILON);
+        let pointer = egui::pos2(
+            (self.cursor.x / scale) as f32,
+            (self.cursor.y / scale) as f32,
+        );
+        let geometry = ui::scrollbar_geometry_for_density(
+            self.canvas_geometry.scrollbar,
+            maximum,
+            self.panels.active().vertical_scroll_points,
+            self.primary_alignment_filters().alignment_density,
+        );
+        let thumb_hit = geometry.thumb.contains(pointer);
+        let thumb_grab_fraction = if thumb_hit && geometry.thumb.height() > f32::EPSILON {
+            ((pointer.y - geometry.thumb.top()) / geometry.thumb.height()).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let virtual_scroll_fraction = if maximum <= f32::EPSILON {
+            thumb_grab_fraction
+        } else {
+            (self.panels.active().vertical_scroll_points / maximum).clamp(0.0, 1.0)
+        };
+        self.vertical_overview_drag = Some(VerticalOverviewDrag {
+            panel_id: self.panels.active().id,
+            grab_offset: if thumb_hit {
+                pointer.y - geometry.thumb.top()
+            } else {
+                geometry.thumb.height() * 0.5
+            },
+            press_x: pointer.x,
+            press_y: pointer.y,
+            last_pointer_x: pointer.x,
+            thumb_grab_fraction,
+            virtual_pointer_y: pointer
+                .y
+                .clamp(geometry.track.top(), geometry.track.bottom()),
+            virtual_scroll_fraction,
+            density_dragging: false,
+            pending_motion_x: 0.0,
+            pending_motion_y: 0.0,
+        });
+        self.interaction_trace.begin();
+        if !thumb_hit {
+            self.update_vertical_scrollbar_drag(self.cursor);
+        }
+        true
+    }
+
+    pub(crate) fn update_vertical_scrollbar_drag(
+        &mut self,
+        position: PhysicalPosition<f64>,
+    ) -> bool {
+        let Some(mut drag) = self.vertical_overview_drag else {
+            return false;
+        };
+        let scale = self.window.scale_factor().max(f64::EPSILON);
+        let pointer = egui::pos2((position.x / scale) as f32, (position.y / scale) as f32);
+        let total_x = pointer.x - drag.press_x;
+        let total_y = pointer.y - drag.press_y;
+        if !drag.density_dragging && total_x.abs() >= 1.5 && total_x.abs() > total_y.abs() * 1.25 {
+            drag.density_dragging = true;
+            drag.last_pointer_x = pointer.x;
+            self.vertical_overview_drag = Some(drag);
+            self.interaction_trace
+                .record_once(InteractionTraceStage::DensityIntentDetected);
+            self.apply_vertical_density_delta(total_x, total_y);
+            self.begin_overview_capture(OverviewCapture::VerticalDensity);
+            drag = self
+                .vertical_overview_drag
+                .expect("vertical density drag was initialized above");
+        }
+        if self.overview_capture == Some(OverviewCapture::VerticalDensity) {
+            self.window.request_redraw();
+            return true;
+        }
+        if drag.density_dragging {
+            let delta_x = pointer.x - drag.last_pointer_x;
+            let delta_y = pointer.y - drag.virtual_pointer_y;
+            drag.last_pointer_x = pointer.x;
+            self.vertical_overview_drag = Some(drag);
+            self.apply_vertical_density_delta(delta_x, delta_y);
+            self.window.request_redraw();
+            return true;
+        }
+        let maximum = (self.panels.active().content_bottom_points
+            - self.canvas_geometry.viewport.bottom())
+        .max(0.0);
+        let geometry = ui::scrollbar_geometry_for_density(
+            self.canvas_geometry.scrollbar,
+            maximum,
+            self.panels.active().vertical_scroll_points,
+            self.primary_alignment_filters().alignment_density,
+        );
+        let next = ui::scrollbar_offset_at_grab(geometry, maximum, pointer.y, drag.grab_offset);
+        let change = next - self.panels.active().vertical_scroll_points;
+        self.scroll_tracks_by(change);
+        drag.last_pointer_x = pointer.x;
+        self.vertical_overview_drag = Some(drag);
+        self.window.request_redraw();
+        true
+    }
+
+    pub(crate) fn finish_vertical_scrollbar_drag(&mut self) {
+        if self.vertical_overview_drag.take().is_some() {
+            if self.interaction_trace.is_active() {
+                self.interaction_trace.release();
+            }
+            self.window.request_redraw();
+        }
+    }
+
+    pub(crate) fn begin_overview_capture(&mut self, capture: OverviewCapture) -> bool {
         if self.overview_capture.is_some() {
-            return;
+            return false;
         }
         let grabbed = self
             .window
@@ -490,14 +563,58 @@ impl Viewer {
                 self.overview_capture = Some(capture);
                 self.captured_motion = (0.0, 0.0);
                 self.captured_motion_distance = 0.0;
+                if capture == OverviewCapture::VerticalDensity {
+                    self.interaction_trace
+                        .record_once(InteractionTraceStage::PointerCaptureAcquired);
+                }
+                true
             }
             Err(error) => {
                 tracing::warn!(%error, "pointer capture is unavailable; using bounded overview drag");
+                false
             }
         }
     }
 
     pub(crate) fn capture_mouse_motion(&mut self, delta: (f64, f64)) {
+        if self.overview_capture.is_none()
+            && let Some(mut drag) = self.vertical_overview_drag
+        {
+            let scale = self.window.scale_factor().max(f64::EPSILON);
+            if drag.density_dragging {
+                drag.last_pointer_x += (delta.0 / scale) as f32;
+                self.vertical_overview_drag = Some(drag);
+                self.apply_vertical_density_delta(
+                    (delta.0 / scale) as f32,
+                    (delta.1 / scale) as f32,
+                );
+                self.window.request_redraw();
+                return;
+            }
+            drag.pending_motion_x += delta.0;
+            drag.pending_motion_y += delta.1;
+            let logical_x = drag.pending_motion_x / scale;
+            let logical_y = drag.pending_motion_y / scale;
+            if logical_x.abs() >= 0.5 && logical_x.abs() > logical_y.abs() * 1.25 {
+                drag.density_dragging = true;
+                self.vertical_overview_drag = Some(drag);
+                self.interaction_trace
+                    .record_once(InteractionTraceStage::DensityIntentDetected);
+                if self.begin_overview_capture(OverviewCapture::VerticalDensity) {
+                    self.captured_motion = (drag.pending_motion_x, drag.pending_motion_y);
+                    self.captured_motion_distance =
+                        drag.pending_motion_x.hypot(drag.pending_motion_y);
+                } else {
+                    drag.last_pointer_x += logical_x as f32;
+                    self.vertical_overview_drag = Some(drag);
+                    self.apply_vertical_density_delta(logical_x as f32, logical_y as f32);
+                }
+                self.window.request_redraw();
+            } else {
+                self.vertical_overview_drag = Some(drag);
+            }
+            return;
+        }
         if self.overview_capture.is_none() {
             return;
         }
@@ -534,39 +651,57 @@ impl Viewer {
                     self.viewport_gesture_changed();
                 }
             }
-            OverviewCapture::Vertical => {
-                let Some(drag) = self.vertical_overview_drag else {
-                    return;
-                };
-                let (density, scroll) = vertical_overview_step(
-                    self.primary_alignment_filters().alignment_density,
-                    self.panels.active().vertical_scroll_points,
-                    drag.anchor_y,
-                    delta_x as f32,
-                    delta_y as f32,
-                );
-                let density_changed =
-                    (density - self.primary_alignment_filters().alignment_density).abs() > 1.0e-4;
-                if density_changed {
-                    self.primary_alignment_filters_mut().alignment_density = density;
-                    self.rebuild_genomic_display();
-                }
-                let maximum = (self.panels.active().content_bottom_points
-                    - self.canvas_geometry.viewport.bottom())
-                .max(0.0);
-                let scroll = scroll.clamp(0.0, maximum);
-                let scroll_changed =
-                    (scroll - self.panels.active().vertical_scroll_points).abs() > f32::EPSILON;
-                if scroll_changed {
-                    self.panels.active_mut().vertical_scroll_points = scroll;
-                }
-                if density_changed || scroll_changed {
-                    if !self.synthetic {
-                        self.rebuild_genomic_display();
-                    }
-                    self.display_dirty = true;
-                }
+            OverviewCapture::VerticalDensity => {
+                self.apply_vertical_density_delta(delta_x as f32, delta_y as f32);
             }
+        }
+    }
+
+    fn apply_vertical_density_delta(&mut self, delta_x: f32, delta_y: f32) {
+        let Some(mut drag) = self.vertical_overview_drag else {
+            return;
+        };
+        if drag.panel_id != self.panels.active().id {
+            return;
+        }
+        let previous_density = self.primary_alignment_filters().alignment_density;
+        let density = density_from_horizontal_drag(previous_density, delta_x);
+        let maximum = (self.panels.active().content_bottom_points
+            - self.canvas_geometry.viewport.bottom())
+        .max(0.0);
+        let geometry = ui::scrollbar_geometry_for_density_at_fraction(
+            self.canvas_geometry.scrollbar,
+            maximum,
+            density,
+            drag.virtual_scroll_fraction,
+        );
+        drag.virtual_pointer_y += delta_y;
+        let grab_fraction = drag.thumb_grab_fraction.clamp(0.0, 1.0);
+        let minimum_pointer = geometry.track.top() + grab_fraction * geometry.thumb.height();
+        let maximum_pointer =
+            geometry.track.bottom() - (1.0 - grab_fraction) * geometry.thumb.height();
+        drag.virtual_pointer_y = drag
+            .virtual_pointer_y
+            .clamp(minimum_pointer, maximum_pointer.max(minimum_pointer));
+        let previous_fraction = drag.virtual_scroll_fraction;
+        drag.virtual_scroll_fraction =
+            ui::scrollbar_fraction_at_grab(geometry, drag.virtual_pointer_y, grab_fraction);
+        let next_scroll = drag.virtual_scroll_fraction * maximum;
+        let density_changed = (density - previous_density).abs() > 1.0e-4;
+        let scroll_changed =
+            (next_scroll - self.panels.active().vertical_scroll_points).abs() > f32::EPSILON;
+        self.vertical_overview_drag = Some(drag);
+        self.panels.active_mut().vertical_scroll_points = next_scroll;
+        if density_changed {
+            self.primary_alignment_filters_mut().alignment_density = density;
+            self.display_dirty = true;
+            self.interaction_trace
+                .record_once(InteractionTraceStage::DensityChanged);
+        } else if scroll_changed && (self.synthetic || !self.refresh_active_panel_scroll_display())
+        {
+            self.display_dirty = true;
+        } else if (drag.virtual_scroll_fraction - previous_fraction).abs() > f32::EPSILON {
+            self.window.request_redraw();
         }
     }
 
@@ -592,7 +727,9 @@ impl Viewer {
                     self.viewport_changed();
                 }
             }
-            OverviewCapture::Vertical => self.vertical_overview_drag = None,
+            OverviewCapture::VerticalDensity => {
+                self.display_dirty = true;
+            }
         }
         self.window.request_redraw();
     }
@@ -798,6 +935,14 @@ impl Viewer {
     pub(crate) fn cursor_in_track_viewport(&self) -> bool {
         let scale = self.window.scale_factor();
         self.canvas_geometry.viewport.contains(egui::pos2(
+            (self.cursor.x / scale) as f32,
+            (self.cursor.y / scale) as f32,
+        ))
+    }
+
+    pub(crate) fn cursor_in_vertical_scrollbar(&self) -> bool {
+        let scale = self.window.scale_factor();
+        self.canvas_geometry.scrollbar.contains(egui::pos2(
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
         ))

@@ -15,12 +15,16 @@ pub(crate) mod workspace_dialogs;
 
 pub use diagnostics::{show_diagnostics, toggled_diagnostics};
 pub use menu::{SEARCHABLE_COMMANDS, UiCommand, command_matches};
-pub use navigation::{GENOME_CONTEXT_HEIGHT, OverviewInteraction, paint_genome_context};
+pub use navigation::{
+    GENOME_CONTEXT_HEIGHT, GenomeOverviewData, OverviewInteraction, paint_genome_context,
+};
 pub use status::status_bar;
 pub use tracks::{
-    ScrollbarInteraction, TrackFrame, TrackFrameKey, TrackSubtrack, TrackUiAction,
-    keyboard_reorder_index, paint_genomic_text, paint_track_viewport_chrome,
-    paint_vertical_scrollbar, resized_track_height, track_drop_index,
+    ScrollbarInteraction, ScrollbarOverview, TrackFrame, TrackFrameKey, TrackSubtrack,
+    TrackUiAction, keyboard_reorder_index, paint_genomic_text, paint_track_viewport_chrome,
+    paint_vertical_scrollbar, resized_track_height, scrollbar_fraction_at_grab,
+    scrollbar_geometry_for_density, scrollbar_geometry_for_density_at_fraction,
+    scrollbar_offset_at_grab, scrollbar_overview, track_drop_index,
 };
 
 pub const MENU_HEIGHT: f32 = 24.0;

@@ -127,6 +127,7 @@ fn batch_mutates_viewer(batch: &AutomationBatch) -> bool {
             command,
             AutomationCommand::DescribeWorkspace
                 | AutomationCommand::DescribeSelection
+                | AutomationCommand::DescribeInteractionTrace
                 | AutomationCommand::WaitUntilSettled { .. }
                 | AutomationCommand::Snapshot { .. }
                 | AutomationCommand::Export { .. }

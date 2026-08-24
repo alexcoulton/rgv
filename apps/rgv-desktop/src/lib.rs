@@ -17,6 +17,7 @@ mod automation;
 mod control_service;
 mod display;
 mod inspection;
+mod interaction_trace;
 mod launch;
 mod runtime;
 mod sources;
@@ -32,6 +33,7 @@ use control_service::{ControlRequest, ControlService, ControlStatusMetadata, rea
 use display::{alignment::*, auxiliary::*, hit_test::*};
 use egui_wgpu::{RendererOptions, ScreenDescriptor};
 use inspection::{auxiliary::*, model::*, read::*, rna::*, variant::*};
+use interaction_trace::{InteractionTraceRecorder, InteractionTraceStage};
 use launch::*;
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,
@@ -365,15 +367,23 @@ struct HorizontalOverviewDrag {
 
 #[derive(Clone, Copy)]
 struct VerticalOverviewDrag {
+    panel_id: PanelId,
+    grab_offset: f32,
+    press_x: f32,
+    press_y: f32,
     last_pointer_x: f32,
-    last_pointer_y: f32,
-    anchor_y: f32,
+    thumb_grab_fraction: f32,
+    virtual_pointer_y: f32,
+    virtual_scroll_fraction: f32,
+    density_dragging: bool,
+    pending_motion_x: f64,
+    pending_motion_y: f64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OverviewCapture {
     Horizontal,
-    Vertical,
+    VerticalDensity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -630,6 +640,7 @@ struct Viewer {
     synthetic: bool,
     workspace_alignment_limit: usize,
     display_dirty: bool,
+    display_upload_pending_metrics: bool,
     dragging: bool,
     drag_origin_interval: Option<GenomicInterval>,
     cursor: PhysicalPosition<f64>,
@@ -642,6 +653,7 @@ struct Viewer {
     open_panel: Option<UiPanel>,
     remote_source_editor: RemoteSourceEditor,
     diagnostics_open: bool,
+    interaction_trace: InteractionTraceRecorder,
     command_search: String,
     annotation_search_generation: u64,
     annotation_navigation_generation: u64,

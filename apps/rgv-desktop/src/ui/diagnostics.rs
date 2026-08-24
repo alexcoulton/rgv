@@ -13,6 +13,7 @@ pub struct DiagnosticsSnapshot {
     pub remote: Option<String>,
     pub layout_cache: String,
     pub gpu_upload: String,
+    pub interaction: Option<String>,
 }
 
 impl Viewer {
@@ -164,6 +165,20 @@ impl Viewer {
                 upload.uploaded_bytes / 1024,
                 if upload.truncated { " · capped" } else { "" }
             ),
+            interaction: self.interaction_trace.snapshot().map(|trace| {
+                let maximum = trace
+                    .events
+                    .iter()
+                    .filter_map(|event| event.duration_ms)
+                    .fold(0.0_f64, f64::max);
+                format!(
+                    "scroll gesture {} · {} events{} · longest phase {:.2} ms",
+                    trace.gesture_id,
+                    trace.events.len(),
+                    if trace.active { " · recording" } else { "" },
+                    maximum,
+                )
+            }),
         }
     }
 }
@@ -202,6 +217,9 @@ pub fn show_diagnostics(context: &Context, open: &mut bool, snapshot: &Diagnosti
             }
             ui.monospace(&snapshot.layout_cache);
             ui.monospace(&snapshot.gpu_upload);
+            if let Some(interaction) = &snapshot.interaction {
+                ui.monospace(interaction);
+            }
         });
 }
 

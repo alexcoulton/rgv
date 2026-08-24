@@ -35,6 +35,7 @@ impl ApplicationHandler for Application {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -73,6 +74,7 @@ impl ApplicationHandler for Application {
                 viewer.resize(viewer.window.inner_size());
             }
             WindowEvent::CursorMoved { position, .. } => {
+                viewer.update_vertical_scrollbar_drag(position);
                 viewer.cursor_moved(position, egui_response.consumed);
             }
             WindowEvent::CursorLeft { .. } => {
@@ -82,12 +84,18 @@ impl ApplicationHandler for Application {
                 }
                 viewer.panels.active_mut().hover_inspector_target = None;
             }
-            WindowEvent::Focused(false) => viewer.finish_overview_capture(),
+            WindowEvent::Focused(false) => {
+                viewer.finish_overview_capture();
+                viewer.finish_vertical_scrollbar_drag();
+            }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
             } => {
+                if state == ElementState::Pressed {
+                    viewer.begin_vertical_scrollbar_drag();
+                }
                 if state == ElementState::Pressed
                     && !egui_response.consumed
                     && viewer.cursor_in_genomic_canvas()
@@ -100,6 +108,7 @@ impl ApplicationHandler for Application {
                     viewer.press_cursor = Some(viewer.cursor);
                 } else if state == ElementState::Released {
                     viewer.finish_overview_capture();
+                    viewer.finish_vertical_scrollbar_drag();
                     let clicked = viewer.press_cursor.is_some_and(|pressed| {
                         let dx = pressed.x - viewer.cursor.x;
                         let dy = pressed.y - viewer.cursor.y;

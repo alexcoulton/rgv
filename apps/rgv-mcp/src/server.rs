@@ -6,8 +6,8 @@ use rgv_core::{
     AlignmentSortMode, AutomationAlignmentRelationship, AutomationAlignmentReveal,
     AutomationAlignmentSelector, AutomationAlignmentState, AutomationBatch, AutomationCommand,
     AutomationCommandStatus, AutomationExportKind, AutomationHistoryNavigation,
-    AutomationNavigationDestination, AutomationReviewNavigation, AutomationRunReport,
-    AutomationSelection, AutomationSelectionGranularity, AutomationSetting,
+    AutomationInteractionTrace, AutomationNavigationDestination, AutomationReviewNavigation,
+    AutomationRunReport, AutomationSelection, AutomationSelectionGranularity, AutomationSetting,
     AutomationSnapshotFormat, AutomationSnapshotScope, AutomationUnsavedChangesPolicy,
     AutomationViewportOperation, AutomationWorkspaceSnapshot, ModifiedBaseColorMode,
     OverlappingMatePolicy, PanelId, ReadBaseDisplayMode, TrackId, TrackKind, TrackSource,
@@ -201,6 +201,39 @@ impl RgvMcpServer {
                     "The active panel has no semantic selection"
                 },
                 json!({"selection": selection}),
+            ),
+            Err(error) => error,
+        }
+    }
+
+    /// Retrieve the bounded input-to-present timeline for the most recent
+    /// vertical scrollbar gesture. Perform a physical drag first, then call
+    /// this tool; it does not focus or otherwise mutate the RGV window.
+    #[tool(
+        name = "rgv_get_interaction_trace",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn get_interaction_trace(&self) -> CallToolResult {
+        match self
+            .execute_with_data::<Option<AutomationInteractionTrace>>(
+                vec![AutomationCommand::DescribeInteractionTrace],
+                0,
+                "interaction trace",
+            )
+            .await
+        {
+            Ok((trace, _)) => success_result(
+                if trace.is_some() {
+                    "Retrieved the most recent vertical scrollbar interaction trace"
+                } else {
+                    "No vertical scrollbar interaction has been recorded"
+                },
+                json!({"interaction_trace": trace}),
             ),
             Err(error) => error,
         }
@@ -2358,6 +2391,7 @@ mod tests {
                 "rgv_export",
                 "rgv_filter_alignments",
                 "rgv_find_alignments",
+                "rgv_get_interaction_trace",
                 "rgv_get_navigation_history",
                 "rgv_get_related_alignments",
                 "rgv_get_review_queue",

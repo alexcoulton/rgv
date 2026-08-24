@@ -5,9 +5,10 @@ use egui::{
     text::{LayoutJob, TextFormat, TextWrapping},
 };
 use rgv_core::{TrackId, TrackKind};
-use rgv_layout::TextPrimitive;
+use rgv_layout::{DisplayList, TextPrimitive};
 
 use super::CanvasGeometry;
+use crate::{MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TrackFrameKey {
@@ -155,8 +156,91 @@ pub struct ScrollbarGeometry {
     pub thumb: Rect,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarOverviewBin {
+    pub density: f32,
+    pub kind: Option<TrackKind>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScrollbarOverview {
+    pub bins: Vec<ScrollbarOverviewBin>,
+    /// Track boundaries as fractions of the complete vertical content span.
+    pub boundaries: Vec<f32>,
+}
+
+/// Builds a bounded semantic miniature of the vertical content stack. The
+/// model keeps track identity out of the renderer and records only relative
+/// occupancy, so it is safe to expose through ordinary UI diagnostics.
+pub fn scrollbar_overview(
+    frames: &[TrackFrame],
+    display: &DisplayList,
+    content_top: f32,
+    content_bottom: f32,
+    genomic_width: f32,
+    maximum_bins: usize,
+) -> ScrollbarOverview {
+    let span = (content_bottom - content_top).max(0.0);
+    if span <= f32::EPSILON || maximum_bins == 0 {
+        return ScrollbarOverview::default();
+    }
+    let bin_count = maximum_bins.min((span / 4.0).ceil().max(1.0) as usize);
+    let mut activity = vec![0.0_f32; bin_count];
+    let mut bins = vec![
+        ScrollbarOverviewBin {
+            density: 0.0,
+            kind: None,
+        };
+        bin_count
+    ];
+    let bin_height = span / bin_count as f32;
+
+    for (index, bin) in bins.iter_mut().enumerate() {
+        let y = content_top + (index as f32 + 0.5) * bin_height;
+        bin.kind = frames
+            .iter()
+            .find(|frame| frame.visible && y >= frame.top && y < frame.bottom)
+            .map(|frame| frame.kind);
+    }
+    let width = genomic_width.max(1.0);
+    for rectangle in &display.rectangles {
+        let top = rectangle.y.max(content_top);
+        let bottom = (rectangle.y + rectangle.height).min(content_bottom);
+        if bottom <= top || rectangle.color.alpha <= f32::EPSILON {
+            continue;
+        }
+        let first = (((top - content_top) / span) * bin_count as f32)
+            .floor()
+            .clamp(0.0, (bin_count - 1) as f32) as usize;
+        let last = ((((bottom - content_top) / span) * bin_count as f32).ceil() as usize)
+            .saturating_sub(1)
+            .min(bin_count - 1);
+        let horizontal_occupancy = (rectangle.width / width).clamp(0.015, 1.0);
+        for value in &mut activity[first..=last] {
+            *value += horizontal_occupancy;
+        }
+    }
+    let maximum = activity.iter().copied().fold(0.0_f32, f32::max);
+    if maximum > f32::EPSILON {
+        let denominator = maximum.ln_1p();
+        for (bin, value) in bins.iter_mut().zip(activity) {
+            bin.density = (value.ln_1p() / denominator).clamp(0.0, 1.0);
+        }
+    }
+    let mut boundaries = frames
+        .iter()
+        .filter(|frame| frame.visible)
+        .map(|frame| ((frame.top - content_top) / span).clamp(0.0, 1.0))
+        .collect::<Vec<_>>();
+    boundaries.sort_by(f32::total_cmp);
+    boundaries.dedup_by(|left, right| (*left - *right).abs() < 0.002);
+    ScrollbarOverview { bins, boundaries }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ScrollbarInteraction {
+    pub pointer_down: bool,
     pub drag_started: bool,
     pub dragging: bool,
     pub drag_stopped: bool,
@@ -165,19 +249,60 @@ pub struct ScrollbarInteraction {
     pub keyboard_density_pixels: f32,
 }
 
+#[cfg(test)]
 pub fn scrollbar_geometry(rect: Rect, maximum: f32, offset: f32) -> ScrollbarGeometry {
-    let track = rect.shrink2(egui::vec2(6.0, 5.0));
-    let maximum = maximum.max(0.0);
-    let viewport_height = rect.height().max(1.0);
-    let content_height = viewport_height + maximum;
-    let thumb_height = (track.height() * viewport_height / content_height)
-        .clamp(32.0_f32.min(track.height()), track.height());
-    let travel = (track.height() - thumb_height).max(0.0);
     let fraction = if maximum <= f32::EPSILON {
         0.0
     } else {
         offset.clamp(0.0, maximum) / maximum
     };
+    scrollbar_geometry_with_visible_fraction(rect, maximum, 1.0, fraction)
+}
+
+pub fn scrollbar_geometry_for_density(
+    rect: Rect,
+    maximum: f32,
+    offset: f32,
+    density: f32,
+) -> ScrollbarGeometry {
+    let fraction = if maximum <= f32::EPSILON {
+        0.0
+    } else {
+        offset.clamp(0.0, maximum) / maximum
+    };
+    scrollbar_geometry_for_density_at_fraction(rect, maximum, density, fraction)
+}
+
+pub fn scrollbar_geometry_for_density_at_fraction(
+    rect: Rect,
+    maximum: f32,
+    density: f32,
+    scroll_fraction: f32,
+) -> ScrollbarGeometry {
+    let density = density.clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);
+    scrollbar_geometry_with_visible_fraction(
+        rect,
+        maximum,
+        (MIN_VERTICAL_DENSITY / density).clamp(0.0, 1.0),
+        scroll_fraction,
+    )
+}
+
+fn scrollbar_geometry_with_visible_fraction(
+    rect: Rect,
+    maximum: f32,
+    scale_visible_fraction: f32,
+    scroll_fraction: f32,
+) -> ScrollbarGeometry {
+    let track = rect.shrink2(egui::vec2(6.0, 5.0));
+    let maximum = maximum.max(0.0);
+    let viewport_height = rect.height().max(1.0);
+    let content_height = viewport_height + maximum;
+    let visible_fraction = (viewport_height / content_height).min(scale_visible_fraction);
+    let thumb_height =
+        (track.height() * visible_fraction).clamp(32.0_f32.min(track.height()), track.height());
+    let travel = (track.height() - thumb_height).max(0.0);
+    let fraction = scroll_fraction.clamp(0.0, 1.0);
     let thumb_top = track.top() + travel * fraction;
     let thumb = Rect::from_min_size(
         pos2(track.left(), thumb_top),
@@ -186,26 +311,53 @@ pub fn scrollbar_geometry(rect: Rect, maximum: f32, offset: f32) -> ScrollbarGeo
     ScrollbarGeometry { track, thumb }
 }
 
+pub fn scrollbar_fraction_at_grab(
+    geometry: ScrollbarGeometry,
+    pointer_y: f32,
+    grab_fraction: f32,
+) -> f32 {
+    let travel = (geometry.track.height() - geometry.thumb.height()).max(0.0);
+    if travel <= f32::EPSILON {
+        return grab_fraction.clamp(0.0, 1.0);
+    }
+    let requested_top = pointer_y - grab_fraction.clamp(0.0, 1.0) * geometry.thumb.height();
+    ((requested_top - geometry.track.top()) / travel).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
 pub fn scrollbar_offset_at_pointer(
     geometry: ScrollbarGeometry,
     maximum: f32,
     pointer_y: f32,
+) -> f32 {
+    scrollbar_offset_at_grab(geometry, maximum, pointer_y, geometry.thumb.height() * 0.5)
+}
+
+pub fn scrollbar_offset_at_grab(
+    geometry: ScrollbarGeometry,
+    maximum: f32,
+    pointer_y: f32,
+    grab_offset: f32,
 ) -> f32 {
     let maximum = maximum.max(0.0);
     let travel = (geometry.track.height() - geometry.thumb.height()).max(0.0);
     if maximum <= f32::EPSILON || travel <= f32::EPSILON {
         return 0.0;
     }
-    let requested_top = pointer_y - geometry.thumb.height() * 0.5;
+    let requested_top = pointer_y - grab_offset.clamp(0.0, geometry.thumb.height());
     let fraction = ((requested_top - geometry.track.top()) / travel).clamp(0.0, 1.0);
     fraction * maximum
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn paint_vertical_scrollbar(
     ui: &mut Ui,
     rect: Rect,
     maximum: f32,
     offset: &mut f32,
+    density: f32,
+    preview_scroll_fraction: Option<f32>,
+    overview: Option<&ScrollbarOverview>,
 ) -> ScrollbarInteraction {
     let maximum = maximum.max(0.0);
     *offset = offset.clamp(0.0, maximum);
@@ -251,30 +403,63 @@ pub fn paint_vertical_scrollbar(
         });
         *offset = offset.clamp(0.0, maximum);
     }
-    let initial_geometry = scrollbar_geometry(rect, maximum, *offset);
-    if response.clicked()
-        && let Some(pointer) = response.interact_pointer_pos()
-    {
-        *offset = scrollbar_offset_at_pointer(initial_geometry, maximum, pointer.y);
-    }
-
-    let geometry = scrollbar_geometry(rect, maximum, *offset);
+    let pointer_down = response.is_pointer_button_down_on() || response.dragged();
+    let geometry = preview_scroll_fraction.map_or_else(
+        || scrollbar_geometry_for_density(rect, maximum, *offset, density),
+        |fraction| scrollbar_geometry_for_density_at_fraction(rect, maximum, density, fraction),
+    );
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, Color32::from_gray(250));
     painter.rect_filled(geometry.track, 0.0, Color32::WHITE);
+    if let Some(overview) = overview.filter(|overview| !overview.bins.is_empty()) {
+        let bin_height = geometry.track.height() / overview.bins.len() as f32;
+        for (index, bin) in overview.bins.iter().enumerate() {
+            let top = geometry.track.top() + index as f32 * bin_height;
+            let bottom = if index + 1 == overview.bins.len() {
+                geometry.track.bottom()
+            } else {
+                top + bin_height + 0.5
+            };
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(geometry.track.left(), top),
+                    pos2(geometry.track.right(), bottom),
+                ),
+                0.0,
+                scrollbar_overview_color(bin.kind, bin.density),
+            );
+        }
+        for boundary in &overview.boundaries {
+            let y = egui::lerp(geometry.track.y_range(), boundary.clamp(0.0, 1.0));
+            painter.line_segment(
+                [
+                    pos2(geometry.track.left(), y),
+                    pos2(geometry.track.right(), y),
+                ],
+                Stroke::new(0.75, Color32::from_gray(72)),
+            );
+        }
+    }
     painter.rect_stroke(
         geometry.track,
         0.0,
         Stroke::new(0.75, Color32::from_gray(95)),
         egui::StrokeKind::Inside,
     );
-    if response.hovered() || response.dragged() {
-        painter.rect_filled(
-            geometry.thumb,
-            1.0,
-            Color32::from_rgba_unmultiplied(45, 92, 175, 24),
-        );
-    }
+    painter.rect_filled(
+        geometry.thumb,
+        1.0,
+        Color32::from_rgba_unmultiplied(
+            45,
+            92,
+            175,
+            if response.hovered() || response.dragged() {
+                52
+            } else {
+                30
+            },
+        ),
+    );
     painter.rect_stroke(
         geometry.thumb,
         1.0,
@@ -290,6 +475,10 @@ pub fn paint_vertical_scrollbar(
         );
     }
     ScrollbarInteraction {
+        // `dragged` deliberately has a movement/hold threshold when a
+        // response also senses clicks. Report the press separately so exact
+        // thumb mapping and interaction tracing start on the first frame.
+        pointer_down,
         drag_started: response.drag_started(),
         dragging: response.dragged(),
         drag_stopped: response.drag_stopped(),
@@ -297,6 +486,24 @@ pub fn paint_vertical_scrollbar(
         pointer: response.interact_pointer_pos(),
         keyboard_density_pixels,
     }
+}
+
+fn scrollbar_overview_color(kind: Option<TrackKind>, density: f32) -> Color32 {
+    let [red, green, blue] = match kind {
+        Some(TrackKind::Alignment) => [45_u8, 92, 175],
+        Some(TrackKind::Reference | TrackKind::GeneModel | TrackKind::Feature) => [60, 126, 92],
+        Some(TrackKind::Variant | TrackKind::Mutation | TrackKind::Gwas) => [174, 76, 72],
+        Some(TrackKind::Quantitative | TrackKind::CopyNumber) => [112, 82, 160],
+        Some(TrackKind::Interaction) => [176, 112, 46],
+        None => [110, 116, 124],
+    };
+    let strength = 0.16 + density.clamp(0.0, 1.0) * 0.72;
+    let blend = |channel: u8| {
+        (255.0 + (f32::from(channel) - 255.0) * strength)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(blend(red), blend(green), blend(blue))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -738,6 +945,47 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_overview_preserves_empty_and_dense_content_regions() {
+        let frames = [TrackFrame {
+            key: TrackFrameKey::Alignment(TrackId::new(1)),
+            name: "reads".to_owned(),
+            kind: TrackKind::Alignment,
+            source_label: None,
+            top: 100.0,
+            bottom: 500.0,
+            visible: true,
+            collapsed: false,
+            frozen_bottom: None,
+            subtracks: Vec::new(),
+        }];
+        let display = DisplayList {
+            rectangles: (0..24)
+                .map(|index| rgv_layout::RectPrimitive {
+                    x: 0.0,
+                    y: 300.0 + index as f32,
+                    width: 80.0,
+                    height: 3.0,
+                    color: rgv_layout::Rgba::new(0.2, 0.4, 0.8, 1.0),
+                    object_id: index,
+                })
+                .collect(),
+            texts: Vec::new(),
+        };
+
+        let overview = scrollbar_overview(&frames, &display, 100.0, 500.0, 100.0, 40);
+        assert_eq!(overview.bins.len(), 40);
+        assert!(overview.bins[..15].iter().all(|bin| bin.density == 0.0));
+        assert!(overview.bins[20..25].iter().any(|bin| bin.density > 0.5));
+        assert!(
+            overview
+                .bins
+                .iter()
+                .all(|bin| bin.kind == Some(TrackKind::Alignment))
+        );
+        assert_eq!(overview.boundaries, vec![0.0]);
+    }
+
+    #[test]
     fn custom_vertical_overview_exposes_a_named_accessibility_slider() {
         let context = egui::Context::default();
         context.enable_accesskit();
@@ -756,6 +1004,9 @@ mod tests {
                     Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(22.0, 400.0)),
                     1_000.0,
                     &mut offset,
+                    1.0,
+                    None,
+                    None,
                 );
             },
         );
@@ -767,6 +1018,63 @@ mod tests {
                     .is_some_and(|label| label.starts_with("Track overview"))
                 && node.numeric_value() == Some(25.0)
         }));
+    }
+
+    #[test]
+    fn vertical_overview_reports_press_before_egui_drag_threshold() {
+        let context = egui::Context::default();
+        let pointer = egui::pos2(20.0, 100.0);
+        let mut interaction = ScrollbarInteraction::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 500.0));
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let mut offset = 250.0;
+                let _ = paint_vertical_scrollbar(
+                    ui,
+                    Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(22.0, 400.0)),
+                    1_000.0,
+                    &mut offset,
+                    1.0,
+                    None,
+                    None,
+                );
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let mut offset = 250.0;
+                interaction = paint_vertical_scrollbar(
+                    ui,
+                    Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(22.0, 400.0)),
+                    1_000.0,
+                    &mut offset,
+                    1.0,
+                    None,
+                    None,
+                );
+            },
+        );
+
+        assert!(interaction.pointer_down);
+        assert!(!interaction.drag_started);
+        assert!(!interaction.dragging);
     }
 
     #[test]
@@ -882,5 +1190,47 @@ mod tests {
             scrollbar_offset_at_pointer(middle, 3_000.0, middle.track.bottom()),
             3_000.0,
         );
+    }
+
+    #[test]
+    fn exact_scrollbar_drag_preserves_the_pointer_position_inside_the_thumb() {
+        let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(22.0, 600.0));
+        let geometry = scrollbar_geometry(rect, 1_759.0, 500.0);
+        let grab_offset = 9.0;
+        let pointer_y = geometry.track.top()
+            + (geometry.track.height() - geometry.thumb.height()) * 0.75
+            + grab_offset;
+
+        assert_close(
+            scrollbar_offset_at_grab(geometry, 1_759.0, pointer_y, grab_offset),
+            1_319.25,
+        );
+    }
+
+    #[test]
+    fn density_aware_thumb_responds_before_content_overflows() {
+        let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(22.0, 600.0));
+        let compact = scrollbar_geometry_for_density(rect, 0.0, 0.0, MIN_VERTICAL_DENSITY);
+        let first_expansion = scrollbar_geometry_for_density(
+            rect,
+            0.0,
+            0.0,
+            MIN_VERTICAL_DENSITY * (2.0_f32 * 0.012).exp(),
+        );
+
+        assert_close(compact.thumb.height(), compact.track.height());
+        assert!(first_expansion.thumb.height() < compact.thumb.height());
+    }
+
+    #[test]
+    fn density_thumb_can_shrink_around_a_grabbed_point_before_overflow() {
+        let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(22.0, 600.0));
+        let compact = scrollbar_geometry_for_density(rect, 0.0, 0.0, MIN_VERTICAL_DENSITY);
+        let grabbed_y = compact.track.center().y;
+        let expanded =
+            scrollbar_geometry_for_density_at_fraction(rect, 0.0, MIN_VERTICAL_DENSITY * 2.0, 0.5);
+
+        assert_close(expanded.thumb.center().y, grabbed_y);
+        assert_close(scrollbar_fraction_at_grab(expanded, grabbed_y, 0.5), 0.5);
     }
 }

@@ -121,12 +121,49 @@ impl DisplayList {
     /// Applies a vertical canvas offset and clips primitives to the visible
     /// genomic canvas. This happens after cached layout construction.
     pub fn scroll_and_clip_vertical(&mut self, offset: f32, top: f32, bottom: f32) {
-        self.rectangles = self
+        *self = self.scrolled_and_clipped_vertical(offset, top, bottom);
+    }
+
+    /// Returns only the primitives visible after applying a vertical canvas
+    /// offset. Unlike cloning and then clipping, this allocates and copies only
+    /// the visible result, which keeps interactive scrolling bounded by the
+    /// viewport rather than the complete laid-out stack.
+    #[must_use]
+    pub fn scrolled_and_clipped_vertical(&self, offset: f32, top: f32, bottom: f32) -> Self {
+        let mut output = Self::default();
+        self.write_scrolled_and_clipped_vertical(offset, top, bottom, &mut output);
+        output
+    }
+
+    /// Reuses an existing display list's allocations while producing a new
+    /// vertically clipped view. This is the hot path for native scrollbar
+    /// gestures, where allocating equivalent vectors on every frame causes a
+    /// visible cold-start hitch.
+    pub fn write_scrolled_and_clipped_vertical(
+        &self,
+        offset: f32,
+        top: f32,
+        bottom: f32,
+        output: &mut Self,
+    ) {
+        output.rectangles.clear();
+        output.texts.clear();
+        self.append_scrolled_and_clipped_vertical(offset, top, bottom, output);
+    }
+
+    pub fn append_scrolled_and_clipped_vertical(
+        &self,
+        offset: f32,
+        top: f32,
+        bottom: f32,
+        output: &mut Self,
+    ) {
+        let offset = offset.max(0.0);
+        output
             .rectangles
-            .iter()
-            .filter_map(|rectangle| {
+            .extend(self.rectangles.iter().filter_map(|rectangle| {
                 let mut rectangle = *rectangle;
-                rectangle.y -= offset.max(0.0);
+                rectangle.y -= offset;
                 let rectangle_bottom = rectangle.y + rectangle.height;
                 if rectangle_bottom <= top || rectangle.y >= bottom {
                     return None;
@@ -139,51 +176,36 @@ impl DisplayList {
                     rectangle.height = bottom - rectangle.y;
                 }
                 (rectangle.height > 0.0).then_some(rectangle)
-            })
-            .collect();
-        self.texts = self
-            .texts
-            .iter()
-            .filter_map(|text| {
-                let mut text = text.clone();
-                text.y -= offset.max(0.0);
-                (text.y >= top && text.y < bottom).then_some(text)
-            })
-            .collect();
+            }));
+        output.texts.extend(self.texts.iter().filter_map(|text| {
+            let mut text = text.clone();
+            text.y -= offset;
+            (text.y >= top && text.y < bottom).then_some(text)
+        }));
     }
 
     /// Translates content-local horizontal coordinates into the application
     /// canvas and clips primitives to the genomic viewport.
     pub fn translate_and_clip_horizontal(&mut self, offset: f32, left: f32, right: f32) {
-        self.rectangles = self
-            .rectangles
-            .iter()
-            .filter_map(|rectangle| {
-                let mut rectangle = *rectangle;
-                rectangle.x += offset;
-                let rectangle_right = rectangle.x + rectangle.width;
-                if rectangle_right <= left || rectangle.x >= right {
-                    return None;
-                }
-                if rectangle.x < left {
-                    rectangle.width -= left - rectangle.x;
-                    rectangle.x = left;
-                }
-                if rectangle.x + rectangle.width > right {
-                    rectangle.width = right - rectangle.x;
-                }
-                (rectangle.width > 0.0).then_some(rectangle)
-            })
-            .collect();
-        self.texts = self
-            .texts
-            .iter()
-            .filter_map(|text| {
-                let mut text = text.clone();
-                text.x += offset;
-                (text.x >= left - 128.0 && text.x <= right + 128.0).then_some(text)
-            })
-            .collect();
+        self.rectangles.retain_mut(|rectangle| {
+            rectangle.x += offset;
+            let rectangle_right = rectangle.x + rectangle.width;
+            if rectangle_right <= left || rectangle.x >= right {
+                return false;
+            }
+            if rectangle.x < left {
+                rectangle.width -= left - rectangle.x;
+                rectangle.x = left;
+            }
+            if rectangle.x + rectangle.width > right {
+                rectangle.width = right - rectangle.x;
+            }
+            rectangle.width > 0.0
+        });
+        self.texts.retain_mut(|text| {
+            text.x += offset;
+            text.x >= left - 128.0 && text.x <= right + 128.0
+        });
     }
 }
 
@@ -242,7 +264,11 @@ mod tests {
                 color: Rgba::new(0.5, 0.2, 0.8, 1.0),
             }],
         };
+        let original = display.clone();
+        let derived = display.scrolled_and_clipped_vertical(50.0, 80.0, 180.0);
         display.scroll_and_clip_vertical(50.0, 80.0, 180.0);
+        assert_eq!(display, derived);
+        assert_eq!(original.rectangles.len(), 2);
         assert_eq!(display.rectangles.len(), 1);
         assert!((display.rectangles[0].y - 150.0).abs() < f32::EPSILON);
         assert!((display.rectangles[0].height - 30.0).abs() < f32::EPSILON);

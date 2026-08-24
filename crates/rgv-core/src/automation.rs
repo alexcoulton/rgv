@@ -99,6 +99,7 @@ impl AutomationBatch {
 pub enum AutomationCommand {
     DescribeWorkspace,
     DescribeSelection,
+    DescribeInteractionTrace,
     ClearSelection,
     RefreshSelection,
     DescribeReviewQueue,
@@ -230,6 +231,7 @@ impl AutomationCommand {
         match self {
             Self::DescribeWorkspace => "describe_workspace",
             Self::DescribeSelection => "describe_selection",
+            Self::DescribeInteractionTrace => "describe_interaction_trace",
             Self::ClearSelection => "clear_selection",
             Self::RefreshSelection => "refresh_selection",
             Self::DescribeReviewQueue => "describe_review_queue",
@@ -268,6 +270,7 @@ impl AutomationCommand {
         match self {
             Self::DescribeWorkspace
             | Self::DescribeSelection
+            | Self::DescribeInteractionTrace
             | Self::ClearSelection
             | Self::RefreshSelection
             | Self::DescribeReviewQueue
@@ -1224,6 +1227,40 @@ pub struct AutomationGpuTelemetry {
     pub buffer_reallocations: u64,
     #[serde(default)]
     pub truncated_frames: u64,
+}
+
+/// A bounded, privacy-preserving timeline for the most recent vertical
+/// scrollbar gesture. Events contain rendering metrics, never genomic data or
+/// pointer positions in screen coordinates.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationInteractionTrace {
+    pub gesture_id: u64,
+    pub active: bool,
+    pub complete: bool,
+    pub events: Vec<AutomationInteractionTraceEvent>,
+    #[serde(default)]
+    pub events_dropped: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationInteractionTraceEvent {
+    pub index: usize,
+    pub elapsed_ms: f64,
+    pub stage: String,
+    #[serde(default)]
+    pub duration_ms: Option<f64>,
+    #[serde(default)]
+    pub primitive_count: Option<usize>,
+    #[serde(default)]
+    pub secondary_count: Option<usize>,
+    #[serde(default)]
+    pub uploaded_bytes: Option<usize>,
+    #[serde(default)]
+    pub buffer_reallocated: Option<bool>,
+    #[serde(default)]
+    pub cpu_capacity_grew: Option<bool>,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

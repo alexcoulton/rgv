@@ -115,6 +115,11 @@ impl Viewer {
             .active()
             .track_snapshot_interval
             .is_some_and(|loaded| retained_data_overlaps(loaded, viewport_interval));
+        let supports_fast_scroll = !self.tracks.tracks().iter().any(|track| {
+            track.visible
+                && !track.collapsed
+                && matches!(track.kind, TrackKind::CopyNumber | TrackKind::Mutation)
+        });
         if self.primary_alignment_filters().show_reference && self.reference_engine.is_some() {
             let frame_top = top;
             let sequence_top = frame_top + 25.0;
@@ -1023,9 +1028,119 @@ impl Viewer {
             top,
             self.canvas_geometry.viewport.bottom(),
         );
-        self.apply_canvas_scroll(&mut display, &mut pinned_display, top, scroll_clip_top);
+        let content_bottom = display
+            .rectangles
+            .iter()
+            .map(|rectangle| rectangle.y + rectangle.height)
+            .fold(top, f32::max)
+            .max(self.canvas_geometry.viewport.bottom());
+        let overview = ui::scrollbar_overview(
+            &self.panels.active().track_frames,
+            &display,
+            self.canvas_geometry.viewport.top(),
+            content_bottom,
+            self.canvas_geometry.genomic.width(),
+            128,
+        );
+        self.panels.active_mut().scroll_display_cache = Some(PanelScrollDisplayCache {
+            scrollable: display,
+            pinned: pinned_display,
+            overview,
+            content_bottom,
+            scroll_clip_top,
+            supports_fast_scroll,
+        });
+        let rebuilt = self.rebuild_active_panel_from_scroll_cache();
+        debug_assert!(rebuilt);
+    }
+
+    fn rebuild_active_panel_from_scroll_cache(&mut self) -> bool {
+        let trace_started = self.interaction_trace.is_active().then(Instant::now);
+        if trace_started.is_some() {
+            self.interaction_trace
+                .record(InteractionTraceStage::ScrollDisplayStarted);
+        }
+        let Some((content_bottom, scroll_clip_top)) = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map(|cache| (cache.content_bottom, cache.scroll_clip_top))
+        else {
+            return false;
+        };
+        let maximum_scroll = (content_bottom - self.canvas_geometry.viewport.bottom()).max(0.0);
+        let active_panel_id = self.panels.active().id;
+        let density_drag_fraction = self
+            .vertical_overview_drag
+            .filter(|drag| drag.density_dragging && drag.panel_id == active_panel_id)
+            .map(|drag| drag.virtual_scroll_fraction);
+        let panel = self.panels.active_mut();
+        panel.content_bottom_points = content_bottom;
+        panel.vertical_scroll_points = density_drag_fraction.map_or_else(
+            || panel.vertical_scroll_points.clamp(0.0, maximum_scroll),
+            |fraction| fraction.clamp(0.0, 1.0) * maximum_scroll,
+        );
+        let scroll = self.panels.active().vertical_scroll_points;
+        let mut display = std::mem::take(&mut self.panels.active_mut().display_list);
+        let rectangle_capacity = display.rectangles.capacity();
+        let text_capacity = display.texts.capacity();
+        {
+            let cache = self
+                .panels
+                .active()
+                .scroll_display_cache
+                .as_ref()
+                .expect("scroll display cache was observed above");
+            cache.scrollable.write_scrolled_and_clipped_vertical(
+                scroll,
+                scroll_clip_top,
+                self.canvas_geometry.viewport.bottom(),
+                &mut display,
+            );
+            cache.pinned.append_scrolled_and_clipped_vertical(
+                0.0,
+                self.canvas_geometry.viewport.top(),
+                scroll_clip_top,
+                &mut display,
+            );
+        }
+        let panel_rect = self.active_panel_rect();
+        display.translate_and_clip_horizontal(
+            panel_rect.left(),
+            panel_rect.left(),
+            panel_rect.right(),
+        );
         self.add_region_overlays(&mut display);
+        let capacity_grew = display.rectangles.capacity() > rectangle_capacity
+            || display.texts.capacity() > text_capacity;
+        if let Some(started) = trace_started {
+            self.interaction_trace.record_scroll_display(
+                started.elapsed(),
+                display.rectangles.len(),
+                display.texts.len(),
+                capacity_grew,
+            );
+        }
         self.panels.active_mut().display_list = display;
+        true
+    }
+
+    pub(crate) fn refresh_active_panel_scroll_display(&mut self) -> bool {
+        if self.display_dirty
+            || !self
+                .panels
+                .active()
+                .scroll_display_cache
+                .as_ref()
+                .is_some_and(|cache| cache.supports_fast_scroll)
+            || !self.rebuild_active_panel_from_scroll_cache()
+        {
+            return false;
+        }
+        self.composite_display_list = composite_panel_display_lists(&self.panels);
+        self.prepare_rectangle_renderer();
+        true
     }
 
     pub(crate) fn alignment_track_name(&self) -> String {
@@ -1086,6 +1201,11 @@ impl Viewer {
         scroll_clip_top: f32,
     ) {
         let panel_rect = self.active_panel_rect();
+        let active_panel_id = self.panels.active().id;
+        let density_drag_fraction = self
+            .vertical_overview_drag
+            .filter(|drag| drag.density_dragging && drag.panel_id == active_panel_id)
+            .map(|drag| drag.virtual_scroll_fraction);
         self.panels.active_mut().content_bottom_points = display
             .rectangles
             .iter()
@@ -1095,11 +1215,11 @@ impl Viewer {
         let maximum_scroll = (self.panels.active().content_bottom_points
             - self.canvas_geometry.viewport.bottom())
         .max(0.0);
-        self.panels.active_mut().vertical_scroll_points = self
-            .panels
-            .active()
-            .vertical_scroll_points
-            .clamp(0.0, maximum_scroll);
+        let current_scroll = self.panels.active().vertical_scroll_points;
+        self.panels.active_mut().vertical_scroll_points = density_drag_fraction.map_or_else(
+            || current_scroll.clamp(0.0, maximum_scroll),
+            |fraction| fraction.clamp(0.0, 1.0) * maximum_scroll,
+        );
         display.scroll_and_clip_vertical(
             self.panels.active().vertical_scroll_points,
             scroll_clip_top,
@@ -1218,6 +1338,16 @@ impl Viewer {
         } else {
             self.rebuild_all_panel_displays();
         }
+        self.prepare_rectangle_renderer();
+        self.display_dirty = false;
+    }
+
+    fn prepare_rectangle_renderer(&mut self) {
+        let trace_started = self.interaction_trace.is_active().then(Instant::now);
+        if trace_started.is_some() {
+            self.interaction_trace
+                .record(InteractionTraceStage::RendererPrepareStarted);
+        }
         let logical_height = self.surface_config.height as f32 / self.window.scale_factor() as f32;
         let logical_width = self.surface_config.width as f32 / self.window.scale_factor() as f32;
         self.rectangle_renderer.prepare(
@@ -1236,6 +1366,16 @@ impl Viewer {
                 .filter(|(track_id, _)| *track_id == self.primary_alignment_track_id())
                 .and_then(|(_, index)| u32::try_from(index + 1).ok()),
         );
-        self.display_dirty = false;
+        if let Some(started) = trace_started {
+            let stats = self.rectangle_renderer.last_prepare_stats();
+            self.interaction_trace.record_renderer_prepare(
+                started.elapsed(),
+                stats.total_instances,
+                stats.uploaded_bytes,
+                stats.buffer_reallocated,
+                stats.cpu_capacity_grew,
+            );
+        }
+        self.display_upload_pending_metrics = true;
     }
 }

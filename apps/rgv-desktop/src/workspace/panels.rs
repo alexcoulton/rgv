@@ -1,10 +1,20 @@
 use super::super::*;
+use crate::ui::ScrollbarOverview;
 
 #[derive(Default)]
 pub(crate) struct PendingQueries {
     pub(crate) alignment: bool,
     pub(crate) reference: bool,
     pub(crate) tracks: bool,
+}
+
+pub(crate) struct PanelScrollDisplayCache {
+    pub(crate) scrollable: DisplayList,
+    pub(crate) pinned: DisplayList,
+    pub(crate) overview: ScrollbarOverview,
+    pub(crate) content_bottom: f32,
+    pub(crate) scroll_clip_top: f32,
+    pub(crate) supports_fast_scroll: bool,
 }
 
 /// Runtime state owned by one genomic view panel.
@@ -41,6 +51,7 @@ pub(crate) struct ViewPanelController {
     pub(crate) hovered_record: Option<(TrackId, usize)>,
     pub(crate) hover_inspector_target: Option<HoverInspectorTarget>,
     pub(crate) display_list: DisplayList,
+    pub(crate) scroll_display_cache: Option<PanelScrollDisplayCache>,
     pub(crate) reference_slice: Option<Arc<ReferenceSlice>>,
     pub(crate) reference_settled_generation: Option<u64>,
     pub(crate) pending_queries: PendingQueries,
@@ -315,6 +326,7 @@ impl ViewPanelController {
             hovered_record: None,
             hover_inspector_target: None,
             display_list: DisplayList::default(),
+            scroll_display_cache: None,
             reference_slice: None,
             reference_settled_generation: None,
             pending_queries: PendingQueries::default(),

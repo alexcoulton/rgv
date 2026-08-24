@@ -400,6 +400,7 @@ impl Viewer {
             synthetic,
             workspace_alignment_limit,
             display_dirty: true,
+            display_upload_pending_metrics: false,
             dragging: false,
             drag_origin_interval: None,
             cursor: PhysicalPosition::new(0.0, 0.0),
@@ -412,6 +413,7 @@ impl Viewer {
             open_panel: initial_open_panel,
             remote_source_editor: RemoteSourceEditor::default(),
             diagnostics_open: false,
+            interaction_trace: InteractionTraceRecorder::default(),
             command_search: String::new(),
             annotation_search_generation: 0,
             annotation_navigation_generation: 0,
@@ -472,11 +474,18 @@ impl Viewer {
         frame_started: Instant,
         repaint_delay: Duration,
     ) {
+        let tessellation_started = Instant::now();
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
         let paint_jobs = self
             .egui_context
             .tessellate(full_output.shapes, full_output.pixels_per_point);
+        if self.interaction_trace.is_active() {
+            self.interaction_trace.record_phase(
+                InteractionTraceStage::EguiTessellationFinished,
+                tessellation_started.elapsed(),
+            );
+        }
         let screen_descriptor = ScreenDescriptor {
             size_in_pixels: [self.surface_config.width, self.surface_config.height],
             pixels_per_point: full_output.pixels_per_point,
@@ -503,6 +512,7 @@ impl Viewer {
                 view_formats: &[],
             })
         });
+        let surface_started = Instant::now();
         let mut surface_frame = None;
         let view = if let Some(texture) = capture_texture.as_ref() {
             texture.create_view(&wgpu::TextureViewDescriptor::default())
@@ -531,11 +541,18 @@ impl Viewer {
             surface_frame = Some(frame);
             view
         };
+        if self.interaction_trace.is_active() {
+            self.interaction_trace.record_phase(
+                InteractionTraceStage::SurfaceAcquired,
+                surface_started.elapsed(),
+            );
+        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("RGV frame encoder"),
             });
+        let egui_buffers_started = Instant::now();
         let callback_commands = self.egui_renderer.update_buffers(
             &self.device,
             &self.queue,
@@ -543,6 +560,12 @@ impl Viewer {
             &paint_jobs,
             &screen_descriptor,
         );
+        if self.interaction_trace.is_active() {
+            self.interaction_trace.record_phase(
+                InteractionTraceStage::EguiBuffersFinished,
+                egui_buffers_started.elapsed(),
+            );
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("RGV genomic canvas"),
@@ -625,10 +648,24 @@ impl Viewer {
             (buffer, padded_bytes_per_row)
         });
 
+        let queue_started = Instant::now();
         self.queue
             .submit(callback_commands.into_iter().chain([encoder.finish()]));
+        if self.interaction_trace.is_active() {
+            self.interaction_trace.record_phase(
+                InteractionTraceStage::QueueSubmitted,
+                queue_started.elapsed(),
+            );
+        }
         if let Some(frame) = surface_frame {
+            let present_started = Instant::now();
             frame.present();
+            if self.interaction_trace.is_active() {
+                self.interaction_trace.record_phase(
+                    InteractionTraceStage::PresentCalled,
+                    present_started.elapsed(),
+                );
+            }
         }
         if let (Some(task), Some((buffer, padded_bytes_per_row))) = (capture_task, capture_readback)
         {
@@ -636,6 +673,8 @@ impl Viewer {
             self.complete_native_window_capture(task, pixels);
         }
         let frame_ms = frame_started.elapsed().as_secs_f64() * 1_000.0;
+        self.interaction_trace
+            .frame_finished(frame_started.elapsed());
         self.smoothed_frame_ms = self.smoothed_frame_ms * 0.9 + frame_ms * 0.1;
         if let Some(runner) = self.automation.as_mut().filter(|runner| !runner.finished) {
             runner.record_frame(
