@@ -3,6 +3,7 @@
 mod alignment;
 mod bisulfite;
 mod filter;
+mod index_overview;
 mod junction;
 mod local;
 mod modification_summary;
@@ -30,6 +31,7 @@ pub use bisulfite::{
     classify_bisulfite_observation, summarize_bisulfite_record,
 };
 pub use filter::{AlignmentFilter, AuxComparison, AuxPredicate, FilterParseError, FilterValue};
+pub use index_overview::{ALIGNMENT_INDEX_OVERVIEW_BINS, AlignmentIndexOverview};
 pub use junction::{
     JunctionEvidence, JunctionProvenance, JunctionStrand, JunctionSummary, MAX_JUNCTIONS,
     MAX_JUNCTIONS_PER_RECORD,

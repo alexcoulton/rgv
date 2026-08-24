@@ -63,6 +63,34 @@ pub(crate) fn collect_modification_codes(query: &AlignmentQuery) -> Vec<Modifica
     codes.into_iter().collect()
 }
 
+impl Viewer {
+    pub(crate) fn available_modification_codes(
+        &mut self,
+        track_id: TrackId,
+    ) -> Vec<ModificationCode> {
+        let panel_id = self.panels.active().id;
+        let Some(query) = self.alignment_query_for_track(track_id).cloned() else {
+            self.modification_code_cache = None;
+            return Vec::new();
+        };
+        if let Some(cache) = &self.modification_code_cache
+            && cache.panel_id == panel_id
+            && cache.track_id == track_id
+            && Arc::ptr_eq(&cache.query, &query)
+        {
+            return cache.codes.clone();
+        }
+        let codes = collect_modification_codes(&query);
+        self.modification_code_cache = Some(CachedModificationCodes {
+            panel_id,
+            track_id,
+            query,
+            codes: codes.clone(),
+        });
+        codes
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn alignment_style_controls(
     ui: &mut egui::Ui,

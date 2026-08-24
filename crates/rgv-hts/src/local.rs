@@ -17,6 +17,7 @@ use crate::{
     PairSummary, PileupProvenance, PileupSummary, ReferenceSlice, RemoteError, SequenceData,
     alignment::BatchOverflow,
     alignment::alignment_header_metadata_from_sam,
+    index_overview::load_local_alignment_index_overview,
     junction::{
         JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
     },
@@ -184,6 +185,10 @@ impl AlignmentQuery {
 pub trait AlignmentSource {
     fn reference_dictionary(&self) -> &ReferenceDictionary;
 
+    fn index_overview(&self) -> Option<&crate::AlignmentIndexOverview> {
+        None
+    }
+
     fn query(
         &mut self,
         interval: GenomicInterval,
@@ -197,6 +202,7 @@ pub struct LocalAlignmentSource {
     dictionary: ReferenceDictionary,
     header: Arc<AlignmentHeaderMetadata>,
     normalization_mapped_records: Option<u64>,
+    index_overview: Option<crate::AlignmentIndexOverview>,
 }
 
 impl LocalAlignmentSource {
@@ -254,11 +260,14 @@ impl LocalAlignmentSource {
                     (String::from_utf8_lossy(name).into_owned(), length)
                 },
             ));
+        let index_overview =
+            load_local_alignment_index_overview(path, options.index_path.as_deref(), &dictionary);
         Ok(Self {
             reader,
             dictionary,
             header: metadata,
             normalization_mapped_records,
+            index_overview,
         })
     }
 }
@@ -270,6 +279,10 @@ fn is_remote_url(value: &str) -> bool {
 impl AlignmentSource for LocalAlignmentSource {
     fn reference_dictionary(&self) -> &ReferenceDictionary {
         &self.dictionary
+    }
+
+    fn index_overview(&self) -> Option<&crate::AlignmentIndexOverview> {
+        self.index_overview.as_ref()
     }
 
     #[allow(clippy::too_many_lines)]

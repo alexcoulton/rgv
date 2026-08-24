@@ -589,7 +589,7 @@ fn wait_for_open(engine: &AlignmentEngine) -> Result<ReferenceDictionary> {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         match engine.receive_timeout(Duration::from_millis(100))? {
-            Some(AlignmentEngineEvent::Opened { dictionary }) => return Ok(dictionary),
+            Some(AlignmentEngineEvent::Opened { dictionary, .. }) => return Ok(dictionary),
             Some(AlignmentEngineEvent::Error { message, .. }) => anyhow::bail!(message),
             Some(_) | None => {}
         }

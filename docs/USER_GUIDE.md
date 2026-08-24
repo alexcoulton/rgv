@@ -142,9 +142,12 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   `--cytobands` is supplied. Coordinate ruler labels always use one-based display positions.
 - The chromosome overview supports Ableton-style direct navigation: drag left/right to pan, drag
   down/up to zoom in/out around the press position, click to recenter, and double-click to show the
-  complete contig. Loaded alignment coverage is drawn logarithmically inside the chromosome rail;
-  a faint band distinguishes the queried span from unqueried portions of the contig. Pan and zoom
-  can be combined in one diagonal gesture. Horizontal movement is
+  complete contig. Indexed BAM sources contribute a stable, logarithmic whole-contig occupancy
+  preview derived from BAI/CSI metadata, so zooming into a small query does not erase the rest of
+  the navigation map. This preview estimates alignment density without scanning every record;
+  sources without a spatial index summary fall back to loaded alignment coverage, where a faint
+  band distinguishes the queried span from unqueried portions of the contig. Pan and zoom can be
+  combined in one diagonal gesture. Horizontal movement is
   scale-aware: broad views receive extra pan gain for fast chromosome traversal, and movement
   becomes progressively finer as the gesture zooms into a smaller genomic span. During a drag the
   pointer is hidden and captured, so movement continues after it would otherwise reach a screen

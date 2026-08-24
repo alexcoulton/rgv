@@ -50,6 +50,10 @@ impl ApplicationHandler for Application {
         }
 
         let egui_response = viewer.egui_state.on_window_event(&viewer.window, &event);
+        // egui-winit reports `repaint: true` for `RedrawRequested`. Honouring
+        // that response after rendering this same event creates an endless
+        // RedrawRequested -> request_redraw feedback loop.
+        let request_egui_redraw = should_request_egui_redraw(&event, egui_response.repaint);
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. }
@@ -154,7 +158,7 @@ impl ApplicationHandler for Application {
             _ => {}
         }
 
-        if egui_response.repaint {
+        if request_egui_redraw {
             viewer.window.request_redraw();
         }
     }
@@ -233,5 +237,34 @@ impl ApplicationHandler for Application {
             }
             viewer.persist_settings();
         }
+    }
+}
+
+const fn should_request_egui_redraw(event: &WindowEvent, repaint: bool) -> bool {
+    repaint && !matches!(event, WindowEvent::RedrawRequested)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redraw_event_does_not_schedule_itself_again() {
+        assert!(!should_request_egui_redraw(
+            &WindowEvent::RedrawRequested,
+            true,
+        ));
+    }
+
+    #[test]
+    fn egui_repaint_requests_from_input_events_are_preserved() {
+        assert!(should_request_egui_redraw(
+            &WindowEvent::Focused(true),
+            true,
+        ));
+        assert!(!should_request_egui_redraw(
+            &WindowEvent::Focused(true),
+            false,
+        ));
     }
 }

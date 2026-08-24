@@ -392,6 +392,7 @@ impl Viewer {
             variant_predicate_operator: VariantPredicateOperator::Exists,
             variant_predicate_value: String::new(),
             variant_predicate_missing: VariantMissingValueRule::Exclude,
+            modification_code_cache: None,
             export_tasks: Vec::new(),
             pending_native_window_capture: None,
             session_save_tasks: Vec::new(),

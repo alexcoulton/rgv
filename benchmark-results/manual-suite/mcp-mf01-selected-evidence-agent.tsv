@@ -1,0 +1,20 @@
+# RGV 0.1.0 selected evidence export v1
+# byte_limit	67108864
+section	key	value
+detail	Track	Paired, structural, long, and modified reads
+detail	Locus	chr1:2599999-2600001
+detail	Reference	unavailable
+detail	Depth	1×
+detail	Strand depth	forward 1 · reverse 0
+detail	Alleles	A 0 · C 0 · G 0 · T 0 · N 0
+detail	Forward alleles	A 0 · C 0 · G 0 · T 0 · N 0
+detail	Reverse alleles	A 0 · C 0 · G 0 · T 0 · N 0
+detail	Indel support	deletion 0 · insertion 0
+detail	Alternate fraction	unavailable
+detail	Quality-weighted	A 0.00 · C 0.00 · G 0.00 · T 0.00 · N 0.00
+detail	Mean base quality	unavailable
+detail	Mean mapping quality	55.0
+detail	Base quality filter	>= 0
+detail	Evidence	all 2 eligible reads · 2 reads rendered
+detail	Allele detail	zoom to base detail to load sequence observations
+detail	Overlapping mates	count once (leftmost primary end) · 0 overlapping bases removed

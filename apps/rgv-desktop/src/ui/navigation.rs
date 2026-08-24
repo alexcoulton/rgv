@@ -25,6 +25,42 @@ impl Default for GenomeOverviewData {
 }
 
 impl GenomeOverviewData {
+    /// Adds a stable whole-contig occupancy estimate. Each source is
+    /// logarithmically normalized before merging so file compression and track
+    /// size do not allow one alignment track to erase the shape of another.
+    pub fn add_index_density(&mut self, densities: &[u64]) {
+        if densities.is_empty() || self.bins.is_empty() {
+            return;
+        }
+        let maximum = densities.iter().copied().max().unwrap_or_default().max(1) as f32;
+        let denominator = maximum.ln_1p();
+        for target in 0..self.bins.len() {
+            let source_start = target * densities.len() / self.bins.len();
+            let source_end = ((target + 1) * densities.len())
+                .div_ceil(self.bins.len())
+                .min(densities.len());
+            let density = densities[source_start..source_end]
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or_default() as f32;
+            self.bins[target] = self.bins[target].max(density.ln_1p() / denominator);
+            self.observed[target] = true;
+        }
+    }
+
+    pub fn merge_max(&mut self, other: &Self) {
+        for ((density, observed), (other_density, other_observed)) in self
+            .bins
+            .iter_mut()
+            .zip(&mut self.observed)
+            .zip(other.bins.iter().zip(&other.observed))
+        {
+            *density = density.max(*other_density);
+            *observed |= *other_observed;
+        }
+    }
+
     pub fn add_depths(
         &mut self,
         contig_length: u64,
@@ -454,5 +490,20 @@ mod tests {
         assert!(overview.bins[1].abs() < f32::EPSILON);
         assert!(overview.bins[2] > 0.0 && overview.bins[2] < 1.0);
         assert!((overview.bins[3] - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn index_density_populates_the_complete_overview_independently_of_viewport() {
+        let mut overview = GenomeOverviewData::default();
+        let mut density = vec![0_u64; GENOME_OVERVIEW_BINS];
+        density[16] = 10;
+        density[192] = 1_000;
+
+        overview.add_index_density(&density);
+
+        assert!(overview.observed.iter().all(|observed| *observed));
+        assert!(overview.bins[16] > 0.0);
+        assert!((overview.bins[192] - 1.0).abs() < f32::EPSILON);
+        assert!(overview.bins[100].abs() < f32::EPSILON);
     }
 }

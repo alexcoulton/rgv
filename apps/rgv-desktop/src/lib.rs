@@ -269,6 +269,13 @@ struct RemoteSourceRequest {
     reference_index_url: Option<String>,
 }
 
+struct CachedModificationCodes {
+    panel_id: PanelId,
+    track_id: TrackId,
+    query: Arc<AlignmentQuery>,
+    codes: Vec<rgv_hts::ModificationCode>,
+}
+
 fn normalized_remote_url(value: &str, label: &str) -> Result<String> {
     let value = value.trim();
     if !(value.starts_with("https://") || value.starts_with("http://")) {
@@ -632,6 +639,7 @@ struct Viewer {
     variant_predicate_operator: VariantPredicateOperator,
     variant_predicate_value: String,
     variant_predicate_missing: VariantMissingValueRule,
+    modification_code_cache: Option<CachedModificationCodes>,
     export_tasks: Vec<ExportTask>,
     pending_native_window_capture: Option<NativeWindowCaptureTask>,
     session_save_tasks: Vec<SessionSaveTask>,

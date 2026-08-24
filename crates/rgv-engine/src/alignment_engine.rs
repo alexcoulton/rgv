@@ -12,8 +12,9 @@ use rgv_core::{
     GenerationClock, GenomicInterval, PanelGeneration, ReferenceDictionary, ViewportGeneration,
 };
 use rgv_hts::{
-    AlignmentError, AlignmentOpenOptions, AlignmentQuery, AlignmentSource, FastaOpenOptions,
-    FastaReference, ProductionAlignmentSource, QueryOptions, RemoteCancellation, RemoteIoStats,
+    AlignmentError, AlignmentIndexOverview, AlignmentOpenOptions, AlignmentQuery, AlignmentSource,
+    FastaOpenOptions, FastaReference, ProductionAlignmentSource, QueryOptions, RemoteCancellation,
+    RemoteIoStats,
 };
 use thiserror::Error;
 
@@ -48,6 +49,7 @@ enum AlignmentEngineRequest {
 pub enum AlignmentEngineEvent {
     Opened {
         dictionary: ReferenceDictionary,
+        index_overview: Option<Arc<AlignmentIndexOverview>>,
     },
     QueryCompleted {
         request: PanelGeneration,
@@ -222,6 +224,7 @@ fn worker_loop(
                 ) {
                     (Ok(opened), Ok(new_reference)) => {
                         let dictionary = opened.reference_dictionary().clone();
+                        let index_overview = opened.index_overview().cloned().map(Arc::new);
                         if let Err(message) = validate_reference_dictionary(
                             &dictionary,
                             new_reference
@@ -237,7 +240,10 @@ fn worker_loop(
                             reference = new_reference;
                             cache.clear();
                             navigation_by_panel.clear();
-                            AlignmentEngineEvent::Opened { dictionary }
+                            AlignmentEngineEvent::Opened {
+                                dictionary,
+                                index_overview,
+                            }
                         }
                     }
                     (Err(error), _) | (_, Err(error)) => AlignmentEngineEvent::Error {

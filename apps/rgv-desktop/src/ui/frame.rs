@@ -111,6 +111,12 @@ impl Viewer {
                 })
             });
         let settings_alignment_id = editing_alignment_id.unwrap_or(primary_alignment_id);
+        let settings_query = self
+            .alignment_query_for_track(settings_alignment_id)
+            .cloned();
+        let available_modification_codes = editing_alignment_id.map_or_else(Vec::new, |track_id| {
+            self.available_modification_codes(track_id)
+        });
         let settings_controller = self
             .alignment_tracks
             .iter()
@@ -130,7 +136,6 @@ impl Viewer {
                 |track| track.filter_editor.clone(),
             )
         };
-        let settings_query = self.alignment_query_for_track(settings_alignment_id);
         let mut minimum_mapq = settings_filter_editor.minimum_mapq;
         let mut minimum_base_quality = settings_filters.minimum_base_quality;
         let mut minimum_allele_fraction = settings_filters.minimum_allele_fraction;
@@ -168,8 +173,6 @@ impl Viewer {
             .iter()
             .filter_map(|value| parse_modification_code(value))
             .collect::<Vec<_>>();
-        let available_modification_codes =
-            settings_query.map_or_else(Vec::new, |query| collect_modification_codes(query));
         let mut include_secondary = settings_filter_editor.include_secondary;
         let mut include_supplementary = settings_filter_editor.include_supplementary;
         let mut filter_expression = settings_filter_editor.expression.clone();
@@ -337,7 +340,9 @@ impl Viewer {
         let mut sort_mode = settings_filters.alignment_sort_mode;
         let mut sort_order = settings_filters.alignment_sort_order;
         let mut view_as_pairs = settings_filters.view_as_pairs;
-        let pair_summary = settings_query.map_or_else(Default::default, |query| query.pairs);
+        let pair_summary = settings_query
+            .as_deref()
+            .map_or_else(Default::default, |query| query.pairs);
         let inferred_pair_bounds = pair_summary.inferred_bounds.unwrap_or_default();
         let mut override_pair_bounds = settings_filters.minimum_template_length.is_some()
             || settings_filters.maximum_template_length.is_some();
@@ -459,11 +464,26 @@ impl Viewer {
             .iter()
             .map(|panel| {
                 let mut genome_overview = ui::GenomeOverviewData::default();
+                let mut query_fallback_overview = ui::GenomeOverviewData::default();
                 for track in self
                     .alignment_tracks
                     .iter()
                     .filter(|track| track.config.visible)
                 {
+                    let index_bins = track
+                        .dictionary
+                        .as_ref()
+                        .and_then(|dictionary| dictionary.id_by_name(&panel.contig_name))
+                        .and_then(|contig| {
+                            track
+                                .index_overview
+                                .as_ref()
+                                .and_then(|overview| overview.contig_bins(contig))
+                        });
+                    if let Some(index_bins) = index_bins {
+                        genome_overview.add_index_density(index_bins);
+                        continue;
+                    }
                     let query = track
                         .projection(panel.id)
                         .and_then(|projection| projection.current_query.as_ref());
@@ -474,14 +494,15 @@ impl Viewer {
                         .zip(query.map(|query| query.interval.contig()))
                         .is_some_and(|(expected, actual)| expected == actual);
                     if query_matches_contig && let Some(query) = query {
-                        genome_overview.add_depths(
+                        query_fallback_overview.add_depths(
                             panel.contig_length,
                             query.interval,
                             query.pileup.bins.iter().map(|bin| bin.depth),
                         );
                     }
                 }
-                genome_overview.normalize_logarithmically();
+                query_fallback_overview.normalize_logarithmically();
+                genome_overview.merge_max(&query_fallback_overview);
                 (
                     panel.id,
                     panel.contig_name.clone(),

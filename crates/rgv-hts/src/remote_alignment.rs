@@ -127,6 +127,14 @@ impl ProductionAlignmentSource {
         }
     }
 
+    pub fn index_overview(&self) -> Option<&crate::AlignmentIndexOverview> {
+        match self {
+            Self::Htslib(source) => source.index_overview(),
+            Self::RemoteBam(source) => source.index_overview.as_ref(),
+            Self::RemoteCram(_) => None,
+        }
+    }
+
     pub fn query_with_cancellation(
         &mut self,
         interval: GenomicInterval,
@@ -178,6 +186,7 @@ pub struct RemoteBamAlignmentSource {
     metadata: Arc<AlignmentHeaderMetadata>,
     index_stats: RemoteIoStats,
     normalization_mapped_records: Option<u64>,
+    index_overview: Option<crate::AlignmentIndexOverview>,
 }
 
 impl RemoteBamAlignmentSource {
@@ -207,6 +216,10 @@ impl RemoteBamAlignmentSource {
                 })
                 .collect::<Vec<_>>(),
         );
+        let index_overview = Some(crate::AlignmentIndexOverview::from_binning_index(
+            reader.index(),
+            &dictionary,
+        ));
         Ok(Self {
             reader,
             header,
@@ -214,6 +227,7 @@ impl RemoteBamAlignmentSource {
             metadata,
             index_stats,
             normalization_mapped_records,
+            index_overview,
         })
     }
 

@@ -1315,7 +1315,7 @@ fn failed_fourth_controller_does_not_block_three_healthy_queries() {
             .receive_timeout(Duration::from_secs(10))
             .unwrap()
         {
-            Some(AlignmentEngineEvent::Opened { dictionary }) => opened.push(dictionary),
+            Some(AlignmentEngineEvent::Opened { dictionary, .. }) => opened.push(dictionary),
             Some(AlignmentEngineEvent::Error { .. }) => failures += 1,
             event => panic!("unexpected controller-open event: {event:?}"),
         }
@@ -1398,7 +1398,7 @@ fn two_alignment_controllers_route_two_panel_queries_independently() {
                 .receive_timeout(Duration::from_secs(10))
                 .unwrap()
             {
-                Some(AlignmentEngineEvent::Opened { dictionary }) => dictionary,
+                Some(AlignmentEngineEvent::Opened { dictionary, .. }) => dictionary,
                 event => panic!("unexpected controller-open event: {event:?}"),
             }
         })

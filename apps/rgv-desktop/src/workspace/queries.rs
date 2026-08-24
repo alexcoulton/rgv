@@ -355,9 +355,13 @@ impl Viewer {
                 .find(|track| track.config.id == track_id)
             {
                 match &event {
-                    AlignmentEngineEvent::Opened { dictionary } => {
+                    AlignmentEngineEvent::Opened {
+                        dictionary,
+                        index_overview,
+                    } => {
                         track.lifecycle = AlignmentTrackLifecycle::Ready;
                         track.dictionary = Some(dictionary.clone());
+                        track.index_overview.clone_from(index_overview);
                         for projection in track.projections.values_mut() {
                             projection.pending_query = track.config.visible;
                         }
@@ -433,7 +437,7 @@ impl Viewer {
                 continue;
             }
             match event {
-                AlignmentEngineEvent::Opened { dictionary } => {
+                AlignmentEngineEvent::Opened { dictionary, .. } => {
                     if let Some(source) = self.primary_alignment_source().cloned() {
                         self.settings.remember_alignment(&source);
                         self.persist_settings();
