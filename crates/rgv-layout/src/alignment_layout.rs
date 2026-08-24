@@ -390,6 +390,7 @@ pub struct AlignmentRowLayout {
     rows: Vec<Option<usize>>,
     identities: Vec<AlignmentRowIdentity>,
     pair_representatives: Vec<usize>,
+    group_starts: BTreeMap<AlignmentGroupKey, usize>,
     group_mode: AlignmentGroupMode,
     group_order: AlignmentOrderDirection,
     sort_mode: AlignmentSortMode,
@@ -563,6 +564,7 @@ pub fn layout_alignment_query_with_rows_and_annotations(
             ..ReadRenderStats::default()
         }
     } else {
+        add_overview_reads_placeholder(&mut display_list, query, viewport, &options);
         ReadRenderStats {
             hidden: query.batch.len(),
             ..ReadRenderStats::default()
@@ -599,11 +601,59 @@ pub fn layout_alignment_query_with_rows_and_annotations(
     }
 }
 
+fn add_overview_reads_placeholder(
+    display_list: &mut DisplayList,
+    query: &AlignmentQuery,
+    viewport: Viewport,
+    options: &AlignmentLayoutOptions,
+) {
+    let top = options.reads_top + 5.0;
+    let width = (viewport.pixel_width() as f32 - 24.0).max(1.0);
+    display_list.rectangles.push(RectPrimitive {
+        x: 12.0,
+        y: top,
+        width,
+        height: 32.0,
+        color: Rgba::new(0.92, 0.94, 0.97, 0.95),
+        object_id: 0,
+    });
+    display_list.rectangles.push(RectPrimitive {
+        x: 12.0,
+        y: top,
+        width: 3.0_f32.min(width),
+        height: 32.0,
+        color: Rgba::new(0.25, 0.45, 0.72, 0.90),
+        object_id: 0,
+    });
+    let count = query.stats.records_eligible;
+    let text = if query.stats.cancelled {
+        if count == 0 {
+            "Alignment query incomplete — zoom in or retry".to_owned()
+        } else {
+            format!("At least {count} alignments found — overview query incomplete")
+        }
+    } else if count == 0 {
+        "No alignments in this region".to_owned()
+    } else {
+        format!(
+            "{count} alignment{} present — zoom in to view individual reads",
+            if count == 1 { "" } else { "s" }
+        )
+    };
+    display_list.texts.push(TextPrimitive {
+        x: viewport.pixel_width() as f32 * 0.5,
+        y: top + 16.0,
+        text,
+        font_size: 12.0,
+        color: Rgba::new(0.25, 0.29, 0.35, 1.0),
+    });
+}
+
 mod rows;
 #[cfg(test)]
-use rows::{AlignmentGroupKey, grouped_indices};
+use rows::grouped_indices;
+use rows::{AlignmentGroupKey, effective_sort_position, first_of_pair_reverse};
 pub use rows::{alignment_read_name_hash, assign_alignment_rows};
-use rows::{effective_sort_position, first_of_pair_reverse};
 mod coverage;
 pub use coverage::junction_count_value;
 use coverage::{

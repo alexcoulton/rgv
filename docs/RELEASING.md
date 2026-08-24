@@ -71,7 +71,7 @@ check setting. Session-schema compatibility is independent of application update
 5. Exercise BAM, CRAM, remote, corrupt-input, and mixed-track smoke sessions. For MCP-enabled
    packages, attach through stdio, inspect state, traverse review/history, exercise typed settings
    and opaque alignment selection, prove retained evidence/export stability, save/open in-process,
-   capture by the MCP-reported PID, and verify that both binaries report a compatible control
+   background native-window capture through the MCP, and verify that both binaries report a compatible control
    schema and application instance.
 6. Build, sign, notarize where applicable, and install each artifact on a clean machine.
 7. Verify that diagnostics remain opt-in and URLs/credentials are redacted.

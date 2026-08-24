@@ -274,8 +274,24 @@ pub(crate) fn secondary_alignment_track_layout(
         });
     }
     if options.show_reads {
-        let mut read_details = Vec::new();
-        if query.stats.truncated {
+        let overview = viewport.detail_level() == DetailLevel::Overview;
+        let mut read_details = if overview {
+            vec![overview_read_detail(
+                query.stats.records_eligible,
+                query.stats.cancelled,
+            )]
+        } else {
+            vec![format!(
+                "{} read{} rendered",
+                layout.stats.rendered_alignments,
+                if layout.stats.rendered_alignments == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )]
+        };
+        if query.stats.truncated && !overview {
             read_details.push(format!(
                 "sampled {}/{}",
                 query.stats.records_emitted, query.stats.records_eligible
@@ -387,6 +403,20 @@ pub(crate) fn secondary_alignment_track_layout(
             subtracks,
         },
     )
+}
+
+pub(crate) fn overview_read_detail(count: usize, cancelled: bool) -> String {
+    if cancelled {
+        if count == 0 {
+            "overview query incomplete".to_owned()
+        } else {
+            format!("{count}+ found · overview incomplete")
+        }
+    } else if count == 0 {
+        "no alignments in region".to_owned()
+    } else {
+        format!("{count} present · hidden at this zoom")
+    }
 }
 
 #[allow(clippy::too_many_lines)]

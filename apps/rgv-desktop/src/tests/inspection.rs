@@ -1,6 +1,37 @@
 use super::super::*;
 
 #[test]
+fn pathological_cigar_is_summarized_without_losing_exact_copy_text() {
+    let cigar = (0..70_000)
+        .map(|index| rgv_hts::CigarOp {
+            kind: if index % 2 == 0 {
+                CigarOpKind::Match
+            } else {
+                CigarOpKind::Insertion
+            },
+            len: 1,
+        })
+        .collect::<Vec<_>>();
+    let exact = format_cigar(&cigar);
+    let summary = inspector_cigar_value(&cigar, &exact);
+    assert!(summary.starts_with("70000 operations"));
+    assert!(summary.contains("70000 bp query span"));
+    assert!(summary.contains("35000 bp reference span"));
+    assert!(summary.len() < 320);
+    assert!(exact.len() > 100_000);
+}
+
+#[test]
+fn ordinary_cigar_remains_inline() {
+    let cigar = vec![rgv_hts::CigarOp {
+        kind: CigarOpKind::Match,
+        len: 100,
+    }];
+    let exact = format_cigar(&cigar);
+    assert_eq!(inspector_cigar_value(&cigar, &exact), "100M");
+}
+
+#[test]
 fn pileup_pointer_maps_canvas_pixels_to_an_exact_query_bin() {
     let interval = GenomicInterval::new(ContigId::new(0), 100, 104).unwrap();
     let query = AlignmentQuery {

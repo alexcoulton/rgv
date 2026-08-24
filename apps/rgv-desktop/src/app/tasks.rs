@@ -7,6 +7,12 @@ pub(crate) struct ExportTask {
     pub(crate) worker: JoinHandle<std::io::Result<()>>,
 }
 
+pub(crate) struct NativeWindowCaptureTask {
+    pub(crate) path: PathBuf,
+    pub(crate) automation_command: usize,
+    pub(crate) automation_data: serde_json::Value,
+}
+
 pub(crate) struct SessionSaveTask {
     pub(crate) path: PathBuf,
     pub(crate) kind: SessionSaveKind,

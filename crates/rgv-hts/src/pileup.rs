@@ -415,16 +415,33 @@ impl PileupBuilder {
         }
     }
 
-    pub(crate) fn add_aligned_segment(
+    pub(crate) fn add_aligned_record(
         &mut self,
-        start: u64,
-        end: u64,
+        segments: impl IntoIterator<Item = (u64, u64)>,
         reverse: bool,
         mapping_quality: Option<u8>,
     ) {
-        let Some((first, last)) = self.bin_range(start, end) else {
-            return;
-        };
+        let mut covered_until = 0_usize;
+        for (start, end) in segments {
+            let Some((first, last)) = self.bin_range(start, end) else {
+                continue;
+            };
+            let first = first.max(covered_until);
+            if first >= last {
+                continue;
+            }
+            self.add_aligned_bin_range(first, last, reverse, mapping_quality);
+            covered_until = last;
+        }
+    }
+
+    fn add_aligned_bin_range(
+        &mut self,
+        first: usize,
+        last: usize,
+        reverse: bool,
+        mapping_quality: Option<u8>,
+    ) {
         add_difference(&mut self.depth_difference, first, last, 1);
         if reverse {
             add_difference(&mut self.reverse_difference, first, last, 1);
@@ -626,8 +643,8 @@ mod tests {
     #[test]
     fn pileup_tracks_alleles_strands_qualities_and_indels() {
         let mut builder = PileupBuilder::new(interval(), 4, 10);
-        builder.add_aligned_segment(100, 104, false, Some(60));
-        builder.add_aligned_segment(101, 103, true, Some(20));
+        builder.add_aligned_record([(100, 104)], false, Some(60));
+        builder.add_aligned_record([(101, 103)], true, Some(20));
         builder.add_base(100, b'A', Some(30), false);
         builder.add_base(101, b'C', Some(9), false);
         builder.add_base(101, b'T', Some(20), true);
@@ -666,13 +683,21 @@ mod tests {
     #[test]
     fn aggregated_bins_count_each_overlapping_read_once_for_depth() {
         let mut builder = PileupBuilder::new(interval(), 2, 0);
-        builder.add_aligned_segment(100, 104, false, None);
+        builder.add_aligned_record(
+            [(100, 101), (101, 102), (102, 103), (103, 104)],
+            false,
+            Some(60),
+        );
         for (offset, base) in b"ACGT".iter().copied().enumerate() {
             builder.add_base(100 + offset as u64, base, Some(30), false);
         }
         let summary = builder.finish(PileupProvenance::default());
         assert_eq!(summary.bins[0].depth, 1);
         assert_eq!(summary.bins[1].depth, 1);
+        assert_eq!(summary.bins[0].mapping_quality_sum, 60);
+        assert_eq!(summary.bins[0].mapping_quality_observations, 1);
+        assert_eq!(summary.bins[1].mapping_quality_sum, 60);
+        assert_eq!(summary.bins[1].mapping_quality_observations, 1);
         assert_eq!(summary.bins[0].alleles.base_observations(), 2);
         assert_eq!(summary.bins[1].alleles.base_observations(), 2);
     }

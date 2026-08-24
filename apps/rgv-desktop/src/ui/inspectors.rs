@@ -24,6 +24,10 @@ pub(crate) struct InspectorUiActions {
     pub(crate) variant_sample_search: String,
 }
 
+fn read_inspector_max_height(content_height: f32) -> f32 {
+    (content_height * 0.45).clamp(260.0, 520.0)
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn show_inspector_windows(
     viewer: &Viewer,
@@ -73,31 +77,53 @@ pub(crate) fn show_inspector_windows(
 
     if let Some(inspector) = &inspector {
         let context = ui.ctx().clone();
+        let inspector_max_height = read_inspector_max_height(context.content_rect().height());
         egui::Window::new("Read inspector")
             .default_pos([24.0, 210.0])
-            .default_width(420.0)
+            .default_size([520.0, 360.0])
+            .max_size([720.0, inspector_max_height])
             .resizable(true)
             .show(&context, |ui| {
-                for (label, value) in &inspector.fields {
-                    ui.horizontal(|ui| {
-                        ui.strong(label);
-                        ui.monospace(value);
-                    });
-                }
-                ui.collapsing(
-                    format!("Auxiliary tags ({})", inspector.auxiliary.len()),
-                    |ui| {
-                        for (tag, value) in &inspector.auxiliary {
-                            ui.horizontal(|ui| {
-                                ui.monospace(tag);
+                egui::ScrollArea::vertical()
+                    .max_height((inspector_max_height - 105.0).max(140.0))
+                    .show(ui, |ui| {
+                        for (label, value) in &inspector.fields {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(label);
                                 ui.monospace(value);
-                                if ui.small_button("Copy").clicked() {
-                                    ui.ctx().copy_text(format!("{tag}:{value}"));
-                                }
                             });
                         }
-                    },
-                );
+                        ui.collapsing(
+                            format!("Auxiliary tags ({})", inspector.auxiliary.len()),
+                            |ui| {
+                                for (tag, value) in &inspector.auxiliary {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.monospace(tag);
+                                        ui.monospace(value);
+                                        if ui.small_button("Copy").clicked() {
+                                            ui.ctx().copy_text(format!("{tag}:{value}"));
+                                        }
+                                    });
+                                }
+                            },
+                        );
+                        if let Some(cigar) = &inspector.cigar
+                            && cigar.len() > 256
+                        {
+                            ui.collapsing(
+                                format!("Exact CIGAR ({} characters)", cigar.len()),
+                                |ui| {
+                                    egui::ScrollArea::horizontal().max_width(660.0).show(
+                                        ui,
+                                        |ui| {
+                                            ui.monospace(cigar);
+                                        },
+                                    );
+                                },
+                            );
+                        }
+                    });
+                ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Copy details").clicked() {
                         ui.ctx().copy_text(inspector_fields_text(&inspector.fields));
@@ -902,5 +928,19 @@ pub(crate) fn show_inspector_windows(
         add_selected_feature_to_review,
         review_open,
         variant_sample_search,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_inspector_max_height;
+
+    #[test]
+    fn read_inspector_is_bounded_at_supported_window_heights() {
+        for height in [600.0_f32, 800.0, 1_080.0, 1_600.0] {
+            let inspector = read_inspector_max_height(height);
+            assert!(inspector <= height * 0.45 + f32::EPSILON);
+            assert!(inspector <= 520.0);
+        }
     }
 }

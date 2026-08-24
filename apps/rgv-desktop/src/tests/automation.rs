@@ -51,6 +51,7 @@ fn retained_evidence_is_immutable_when_the_viewport_changes() {
         evidence_revision: 11,
         workspace_revision_at_selection: 20,
         panel_id: PanelId::new(1),
+        contig: "chr1".to_owned(),
         track_id: Some(TrackId::new(2)),
         kind: AutomationSelectionKind::Pileup,
         granularity: Some(AutomationSelectionGranularity::VisibleBin),
@@ -72,9 +73,10 @@ fn retained_evidence_is_immutable_when_the_viewport_changes() {
         stale: false,
         stale_reason: None,
         truncated: false,
+        presentation_truncated: false,
     };
     let moved = GenomicInterval::new(ContigId::new(0), 2_600_100, 2_600_200).unwrap();
-    let observed = observed_retained_selection(&retained, moved);
+    let observed = observed_retained_selection(&retained, moved, "chr1");
     assert!(!observed.visible_in_active_view);
     assert_eq!(observed.selection_id, retained.selection_id);
     assert_eq!(observed.evidence_revision, retained.evidence_revision);
@@ -82,6 +84,36 @@ fn retained_evidence_is_immutable_when_the_viewport_changes() {
     assert_eq!(observed.evidence_end, retained.evidence_end);
     assert_eq!(observed.fields, retained.fields);
     assert_eq!(observed.provenance, retained.provenance);
+}
+
+#[test]
+fn retained_evidence_is_not_visible_on_a_different_contig() {
+    let retained = AutomationSelectionSnapshot {
+        selection_id: "cross-contig-selection".to_owned(),
+        evidence_revision: 1,
+        workspace_revision_at_selection: 2,
+        panel_id: PanelId::new(1),
+        contig: "chr1".to_owned(),
+        track_id: Some(TrackId::new(2)),
+        kind: AutomationSelectionKind::Read,
+        granularity: None,
+        anchor_position: Some(10),
+        evidence_start: Some(10),
+        evidence_end: Some(20),
+        position: Some(10),
+        start: Some(10),
+        end: Some(20),
+        fields: Vec::new(),
+        provenance: Vec::new(),
+        visible_in_active_view: true,
+        stale: false,
+        stale_reason: None,
+        truncated: false,
+        presentation_truncated: false,
+    };
+    let viewport = GenomicInterval::new(ContigId::new(1), 0, 100).unwrap();
+    let observed = observed_retained_selection(&retained, viewport, "chr2");
+    assert!(!observed.visible_in_active_view);
 }
 
 #[test]

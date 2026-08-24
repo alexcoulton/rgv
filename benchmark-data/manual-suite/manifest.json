@@ -1310,8 +1310,8 @@
       "generator_schema_version": 1,
       "path": "benchmark-data/manual-suite/projects/mf-01-alignment-core.rgv.json",
       "media_type": "application/vnd.rgv.session+json",
-      "bytes": 17719,
-      "sha256": "6f7549eec6d3d48b0d2642f368cec30b815bb926ecf6b8bd758dfee347cf0c66",
+      "bytes": 17717,
+      "sha256": "235133bccd8cd0175f8836966c884ad8ebba08e6882556d82b913d32d2ac7be4",
       "validity": "valid",
       "source_fixture_ids": [
         "dep-mixed-bam",

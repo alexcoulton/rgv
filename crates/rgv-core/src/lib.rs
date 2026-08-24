@@ -16,12 +16,12 @@ mod viewport;
 
 pub use automation::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentHit, AutomationAlignmentRelationship,
-    AutomationAlignmentSearchResult, AutomationAlignmentSelector, AutomationAlignmentState,
-    AutomationAlignmentTrackSnapshot, AutomationBatch, AutomationCommand, AutomationCommandResult,
-    AutomationCommandStatus, AutomationEnvironmentTelemetry, AutomationError, AutomationErrorCode,
-    AutomationEvidenceField, AutomationExportKind, AutomationFrameTelemetry,
-    AutomationGenomeSnapshot, AutomationGpuTelemetry, AutomationHistoryEntrySnapshot,
-    AutomationHistoryNavigation, AutomationNavigationDestination,
+    AutomationAlignmentReveal, AutomationAlignmentSearchResult, AutomationAlignmentSelector,
+    AutomationAlignmentState, AutomationAlignmentTrackSnapshot, AutomationBatch, AutomationCommand,
+    AutomationCommandResult, AutomationCommandStatus, AutomationEnvironmentTelemetry,
+    AutomationError, AutomationErrorCode, AutomationEvidenceField, AutomationExportKind,
+    AutomationFrameTelemetry, AutomationGenomeSnapshot, AutomationGpuTelemetry,
+    AutomationHistoryEntrySnapshot, AutomationHistoryNavigation, AutomationNavigationDestination,
     AutomationNavigationHistorySnapshot, AutomationOptionScope, AutomationPanelSnapshot,
     AutomationRenderLaneSnapshot, AutomationRenderOmissionReason, AutomationReviewItemSnapshot,
     AutomationReviewNavigation, AutomationReviewQueueSnapshot, AutomationRunReport,

@@ -182,6 +182,10 @@ pub enum AutomationCommand {
     },
     SelectAlignment {
         handle: String,
+        #[serde(default)]
+        reveal: AutomationAlignmentReveal,
+        #[serde(default)]
+        expected_workspace_revision: Option<u64>,
     },
     DescribeRelatedAlignments,
     NavigateRelatedAlignment {
@@ -190,6 +194,8 @@ pub enum AutomationCommand {
         segment_index: Option<usize>,
         #[serde(default)]
         destination: AutomationNavigationDestination,
+        #[serde(default)]
+        expected_workspace_revision: Option<u64>,
     },
     NavigateReviewItem {
         action: AutomationReviewNavigation,
@@ -357,7 +363,7 @@ impl AutomationCommand {
                 }
                 Ok(())
             }
-            Self::SelectAlignment { handle } => validate_string(handle, "alignment handle"),
+            Self::SelectAlignment { handle, .. } => validate_string(handle, "alignment handle"),
             Self::NavigateRelatedAlignment {
                 relationship,
                 segment_index,
@@ -670,6 +676,15 @@ pub enum AutomationAlignmentState {
     Supplementary,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationAlignmentReveal {
+    #[default]
+    None,
+    Center,
+    Fit,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationAlignmentRelationship {
@@ -842,6 +857,7 @@ pub struct AutomationAlignmentTrackSnapshot {
     pub show_reads: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationSelectionSnapshot {
     #[serde(default)]
@@ -851,6 +867,10 @@ pub struct AutomationSelectionSnapshot {
     #[serde(default)]
     pub workspace_revision_at_selection: u64,
     pub panel_id: PanelId,
+    /// Contig containing the retained evidence. This remains independent of
+    /// the active viewport so visibility stays correct after navigation.
+    #[serde(default)]
+    pub contig: String,
     #[serde(default)]
     pub track_id: Option<TrackId>,
     pub kind: AutomationSelectionKind,
@@ -880,6 +900,10 @@ pub struct AutomationSelectionSnapshot {
     pub stale_reason: Option<String>,
     #[serde(default)]
     pub truncated: bool,
+    /// Large human-readable fields were summarized in the structured
+    /// snapshot; exact values remain available through explicit export.
+    #[serde(default)]
+    pub presentation_truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -965,6 +989,7 @@ pub struct AutomationAlignmentHit {
     pub handle: String,
     pub panel_id: PanelId,
     pub track_id: TrackId,
+    pub contig: String,
     pub start: u64,
     pub end: u64,
     pub flags: u16,
@@ -974,6 +999,9 @@ pub struct AutomationAlignmentHit {
     pub mapped_mate_available: bool,
     pub supplementary_segment_count: usize,
     pub modification_code_count: usize,
+    /// `present`, `absent`, `malformed`, or `unavailable`.
+    #[serde(default)]
+    pub modification_evidence_status: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -981,6 +1009,9 @@ pub struct AutomationAlignmentSearchResult {
     pub application_instance_id: String,
     pub workspace_revision: u64,
     pub query_generation: u64,
+    pub query_contig: String,
+    pub query_start: u64,
+    pub query_end: u64,
     pub hits: Vec<AutomationAlignmentHit>,
     #[serde(default)]
     pub truncated: bool,
@@ -1066,6 +1097,7 @@ pub enum AutomationSnapshotScope {
     VisibleWorkspace,
     ActivePanel,
     FullActivePanel,
+    NativeWindow,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1111,6 +1143,7 @@ pub enum AutomationErrorCode {
     HistoryBoundary,
     UnsavedChanges,
     WorkspaceReplacementNotConfirmed,
+    WorkspaceRevisionConflict,
     Timeout,
     Io,
     Internal,
@@ -1393,6 +1426,21 @@ mod tests {
     }
 
     #[test]
+    fn native_window_snapshot_scope_round_trips() {
+        let batch = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::Snapshot {
+                path: "captures/window.png".to_owned(),
+                scope: AutomationSnapshotScope::NativeWindow,
+                format: AutomationSnapshotFormat::Png,
+            }],
+        };
+        let json = batch.to_json().unwrap();
+        assert!(json.contains("native_window"));
+        assert_eq!(AutomationBatch::from_json(&json).unwrap(), batch);
+    }
+
+    #[test]
     fn viewport_operations_reject_ambiguous_or_unbounded_values() {
         for operation in [
             AutomationViewportOperation::PanBases { delta: 0 },
@@ -1451,6 +1499,28 @@ mod tests {
     }
 
     #[test]
+    fn older_alignment_selection_commands_receive_safe_reveal_and_revision_defaults() {
+        let batch = AutomationBatch::from_json(
+            r#"{
+                "schema_version": 2,
+                "commands": [{
+                    "command": "select_alignment",
+                    "handle": "opaque-fixture-handle"
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            batch.commands.as_slice(),
+            [AutomationCommand::SelectAlignment {
+                reveal: AutomationAlignmentReveal::None,
+                expected_workspace_revision: None,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
     fn sensitive_alignment_selectors_are_redacted_from_persisted_batches() {
         let batch = AutomationBatch {
             schema_version: AUTOMATION_SCHEMA_VERSION,
@@ -1475,6 +1545,7 @@ mod tests {
             evidence_revision: 3,
             workspace_revision_at_selection: 7,
             panel_id: PanelId::new(1),
+            contig: "chr1".to_owned(),
             track_id: Some(TrackId::new(7)),
             kind: AutomationSelectionKind::Pileup,
             granularity: Some(AutomationSelectionGranularity::ExactBase),
@@ -1493,6 +1564,7 @@ mod tests {
             stale: false,
             stale_reason: None,
             truncated: false,
+            presentation_truncated: false,
         };
         let workspace = AutomationWorkspaceSnapshot {
             application_version: "0.1.0".to_owned(),

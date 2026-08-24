@@ -496,7 +496,14 @@ impl Viewer {
                     }
                     if self.primary_alignment_filters().show_reads {
                         let mut read_details = Vec::new();
-                        if query.stats.truncated {
+                        let overview =
+                            self.panels.active().viewport.detail_level() == DetailLevel::Overview;
+                        if overview {
+                            read_details.push(alignment::overview_read_detail(
+                                query.stats.records_eligible,
+                                query.stats.cancelled,
+                            ));
+                        } else if query.stats.truncated {
                             read_details.push(format!(
                                 "sampled {}/{}",
                                 query.stats.records_emitted, query.stats.records_eligible

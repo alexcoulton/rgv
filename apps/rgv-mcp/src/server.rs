@@ -3,14 +3,14 @@ use std::path::Path;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection,
-    AlignmentSortMode, AutomationAlignmentRelationship, AutomationAlignmentSelector,
-    AutomationAlignmentState, AutomationBatch, AutomationCommand, AutomationCommandStatus,
-    AutomationExportKind, AutomationHistoryNavigation, AutomationNavigationDestination,
-    AutomationReviewNavigation, AutomationRunReport, AutomationSelection,
-    AutomationSelectionGranularity, AutomationSetting, AutomationSnapshotFormat,
-    AutomationSnapshotScope, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
-    AutomationWorkspaceSnapshot, ModifiedBaseColorMode, OverlappingMatePolicy, PanelId,
-    ReadBaseDisplayMode, TrackId, TrackKind, TrackSource,
+    AlignmentSortMode, AutomationAlignmentRelationship, AutomationAlignmentReveal,
+    AutomationAlignmentSelector, AutomationAlignmentState, AutomationBatch, AutomationCommand,
+    AutomationCommandStatus, AutomationExportKind, AutomationHistoryNavigation,
+    AutomationNavigationDestination, AutomationReviewNavigation, AutomationRunReport,
+    AutomationSelection, AutomationSelectionGranularity, AutomationSetting,
+    AutomationSnapshotFormat, AutomationSnapshotScope, AutomationUnsavedChangesPolicy,
+    AutomationViewportOperation, AutomationWorkspaceSnapshot, ModifiedBaseColorMode,
+    OverlappingMatePolicy, PanelId, ReadBaseDisplayMode, TrackId, TrackKind, TrackSource,
 };
 use rmcp::schemars;
 use rmcp::{
@@ -392,10 +392,16 @@ impl RgvMcpServer {
         &self,
         Parameters(args): Parameters<AlignmentHandleArgs>,
     ) -> CallToolResult {
-        self.execute(vec![AutomationCommand::SelectAlignment {
-            handle: args.handle,
-        }])
-        .await
+        let commands = with_optional_settle(
+            vec![AutomationCommand::SelectAlignment {
+                handle: args.handle,
+                reveal: args.reveal.into_core(),
+                expected_workspace_revision: args.expected_workspace_revision,
+            }],
+            args.wait_until_settled,
+            args.timeout_millis,
+        );
+        self.execute(commands).await
     }
 
     /// Describe mate and supplementary-chain availability for the selected alignment.
@@ -443,6 +449,7 @@ impl RgvMcpServer {
                 relationship: args.relationship.into_core(),
                 segment_index: args.segment_index,
                 destination: args.destination.into_core(),
+                expected_workspace_revision: args.expected_workspace_revision,
             }],
             args.wait_until_settled,
             args.timeout_millis,
@@ -751,6 +758,141 @@ impl RgvMcpServer {
         });
         let mut result = CallToolResult::success(vec![
             ContentBlock::text("Captured the settled live RGV view"),
+            ContentBlock::image(encoded, "image/png"),
+        ]);
+        result.structured_content = Some(structured);
+        result
+    }
+
+    /// Capture the native RGV window client area without activating or focusing it.
+    #[tool(
+        name = "rgv_capture_window",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn capture_window(
+        &self,
+        Parameters(args): Parameters<CaptureWindowArgs>,
+    ) -> CallToolResult {
+        let path = self.artifacts.temporary_path("png");
+        let mut commands = Vec::new();
+        if args.wait_until_settled {
+            commands.push(AutomationCommand::WaitUntilSettled {
+                timeout_millis: args.timeout_millis,
+            });
+        }
+        let snapshot_result_index = commands.len();
+        commands.push(AutomationCommand::Snapshot {
+            path: path.display().to_string(),
+            scope: AutomationSnapshotScope::NativeWindow,
+            format: AutomationSnapshotFormat::Png,
+        });
+        commands.push(AutomationCommand::DescribeWorkspace);
+        let report = match self
+            .control
+            .run_batch(&AutomationBatch {
+                schema_version: AUTOMATION_SCHEMA_VERSION,
+                commands,
+            })
+            .await
+        {
+            Ok(report) if report.succeeded => report,
+            Ok(report) => {
+                self.artifacts.discard_temporary(&path);
+                return report_failure(&report);
+            }
+            Err(error) => {
+                self.artifacts.discard_temporary(&path);
+                return control_failure(&error);
+            }
+        };
+        let workspace = report.results.last().and_then(|result| {
+            serde_json::from_value::<AutomationWorkspaceSnapshot>(result.data.clone()).ok()
+        });
+        let Some(workspace) = workspace else {
+            self.artifacts.discard_temporary(&path);
+            return adapter_failure(
+                "invalid_response",
+                "RGV omitted the workspace associated with its window capture",
+            );
+        };
+        let status = match self.control.status().await {
+            Ok(status) => status,
+            Err(error) => {
+                self.artifacts.discard_temporary(&path);
+                return control_failure(&error);
+            }
+        };
+        if status.schema_version != AUTOMATION_SCHEMA_VERSION
+            || status
+                .control_schema_version
+                .is_some_and(|version| version != AUTOMATION_SCHEMA_VERSION)
+        {
+            return adapter_failure(
+                "unsupported_version",
+                "RGV changed control protocol before native window capture",
+            );
+        }
+        if status.process_id == 0
+            || status.application_instance_id.is_empty()
+            || status.application_instance_id != workspace.application_instance_id
+        {
+            return adapter_failure(
+                "application_identity_mismatch",
+                "RGV process identity could not be bound to the authenticated workspace",
+            );
+        }
+        let bytes = match self.artifacts.read_temporary_capture(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => return artifact_failure(&error),
+        };
+        let Some((png_width, png_height)) = png_dimensions(&bytes) else {
+            return adapter_failure("artifact_error", "RGV returned a malformed window PNG");
+        };
+        let capture = report
+            .results
+            .get(snapshot_result_index)
+            .map(|result| &result.data)
+            .cloned()
+            .unwrap_or(Value::Null);
+        if capture.get("width").and_then(Value::as_u64) != Some(u64::from(png_width))
+            || capture.get("height").and_then(Value::as_u64) != Some(u64::from(png_height))
+        {
+            return adapter_failure(
+                "invalid_response",
+                "RGV window capture metadata did not match the PNG dimensions",
+            );
+        }
+        let encoded = BASE64_STANDARD.encode(&bytes);
+        let loci = workspace
+            .panels
+            .iter()
+            .map(|panel| panel.locus.as_str())
+            .collect::<Vec<_>>();
+        let structured = json!({
+            "mime_type": "image/png",
+            "bytes": bytes.len(),
+            "capture_kind": "native_window_client_area",
+            "platform": std::env::consts::OS,
+            "width": png_width,
+            "height": png_height,
+            "process_id": status.process_id,
+            "includes_native_frame": false,
+            "foreground_activated": false,
+            "application_instance_id": &workspace.application_instance_id,
+            "workspace_revision": workspace.workspace_revision,
+            "selection_id": workspace.selection.as_ref().map(|selection| &selection.selection_id),
+            "evidence_revision": workspace.selection.as_ref().map(|selection| selection.evidence_revision),
+            "panels": &workspace.panels,
+            "loci": loci,
+            "report": public_report(&report),
+        });
+        let mut result = CallToolResult::success(vec![
+            ContentBlock::text("Captured the native RGV window client area without activating it"),
             ContentBlock::image(encoded, "image/png"),
         ]);
         result.structured_content = Some(structured);
@@ -1873,6 +2015,32 @@ impl ToolAlignmentState {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AlignmentHandleArgs {
     pub handle: String,
+    pub expected_workspace_revision: Option<u64>,
+    #[serde(default)]
+    pub reveal: ToolAlignmentReveal,
+    #[serde(default = "default_true")]
+    pub wait_until_settled: bool,
+    #[serde(default = "default_timeout")]
+    #[schemars(range(min = 100, max = 600_000))]
+    pub timeout_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAlignmentReveal {
+    #[default]
+    None,
+    Center,
+    Fit,
+}
+impl ToolAlignmentReveal {
+    fn into_core(self) -> AutomationAlignmentReveal {
+        match self {
+            Self::None => AutomationAlignmentReveal::None,
+            Self::Center => AutomationAlignmentReveal::Center,
+            Self::Fit => AutomationAlignmentReveal::Fit,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1881,6 +2049,7 @@ pub struct RelatedNavigationArgs {
     pub segment_index: Option<usize>,
     #[serde(default)]
     pub destination: ToolNavigationDestination,
+    pub expected_workspace_revision: Option<u64>,
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
     #[serde(default = "default_timeout")]
@@ -1923,6 +2092,15 @@ impl ToolNavigationDestination {
 pub struct CaptureArgs {
     #[serde(default)]
     pub scope: ToolSnapshotScope,
+    #[serde(default = "default_true")]
+    pub wait_until_settled: bool,
+    #[serde(default = "default_timeout")]
+    #[schemars(range(min = 100, max = 600_000))]
+    pub timeout_millis: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CaptureWindowArgs {
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
     #[serde(default = "default_timeout")]
@@ -2172,6 +2350,7 @@ mod tests {
             names,
             [
                 "rgv_capture_view",
+                "rgv_capture_window",
                 "rgv_change_viewport",
                 "rgv_clear_selection",
                 "rgv_configure",
@@ -2239,6 +2418,19 @@ mod tests {
         )
         .unwrap();
         assert!(navigate_schema.contains("\"maxItems\":16"));
+        let select_alignment_schema = serde_json::to_string(
+            tools
+                .iter()
+                .find(|tool| tool.name == "rgv_select_alignment")
+                .unwrap()
+                .input_schema
+                .as_ref(),
+        )
+        .unwrap();
+        assert!(select_alignment_schema.contains("reveal"));
+        assert!(select_alignment_schema.contains("center"));
+        assert!(select_alignment_schema.contains("fit"));
+        assert!(select_alignment_schema.contains("expected_workspace_revision"));
         for open_world_tool in ["rgv_load_track", "rgv_execute_batch"] {
             assert_eq!(
                 tools

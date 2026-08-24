@@ -98,13 +98,15 @@ pub(crate) fn automation_read_evidence_field_is_public(key: &str) -> bool {
 pub(crate) fn observed_retained_selection(
     retained: &AutomationSelectionSnapshot,
     viewport: GenomicInterval,
+    viewport_contig: &str,
 ) -> AutomationSelectionSnapshot {
     let mut snapshot = retained.clone();
-    snapshot.visible_in_active_view = snapshot
-        .evidence_start
-        .zip(snapshot.evidence_end)
-        .and_then(|(start, end)| GenomicInterval::new(viewport.contig(), start, end).ok())
-        .is_none_or(|evidence| viewport.contains_interval(evidence));
+    snapshot.visible_in_active_view = snapshot.contig == viewport_contig
+        && snapshot
+            .evidence_start
+            .zip(snapshot.evidence_end)
+            .and_then(|(start, end)| GenomicInterval::new(viewport.contig(), start, end).ok())
+            .is_some_and(|evidence| viewport.contains_interval(evidence));
     snapshot
 }
 
@@ -142,7 +144,7 @@ pub(crate) fn automation_viewport_after_operation(
 
 impl Viewer {
     pub(crate) fn automation_is_settled(&self) -> bool {
-        !self.display_dirty && self.automation_data_is_settled()
+        !self.display_dirty && self.next_egui_repaint.is_none() && self.automation_data_is_settled()
     }
 
     /// Whether the observable workspace data has settled. Receiving a local-control
@@ -150,6 +152,7 @@ impl Viewer {
     /// snapshots must not treat that control-only repaint as unsettled genomic data.
     fn automation_data_is_settled(&self) -> bool {
         if !self.export_tasks.is_empty()
+            || self.pending_native_window_capture.is_some()
             || !self.session_save_tasks.is_empty()
             || !self.session_load_tasks.is_empty()
             || !self.workspace_list_import_tasks.is_empty()
@@ -1220,10 +1223,33 @@ impl Viewer {
                     message: "Found bounded alignment matches".to_owned(),
                     data,
                 },
+                Err(error)
+                    if error
+                        .to_string()
+                        .starts_with("modified-base evidence is unavailable") =>
+                {
+                    automation_failure(AutomationErrorCode::EffectiveStateUnavailable, error)
+                }
                 Err(error) => automation_failure(AutomationErrorCode::ResourceNotFound, error),
             },
-            AutomationCommand::SelectAlignment { handle } => {
-                match self.select_automation_alignment(&handle) {
+            AutomationCommand::SelectAlignment {
+                handle,
+                reveal,
+                expected_workspace_revision,
+            } => {
+                if expected_workspace_revision
+                    .is_some_and(|expected| expected != self.workspace_revision)
+                {
+                    return automation_failure(
+                        AutomationErrorCode::WorkspaceRevisionConflict,
+                        anyhow::anyhow!(
+                            "workspace revision changed: expected {}, observed {}",
+                            expected_workspace_revision.unwrap_or_default(),
+                            self.workspace_revision
+                        ),
+                    );
+                }
+                match self.select_automation_alignment(&handle, reveal) {
                     Ok(data) => AutomationExecution::Complete {
                         message: "Selected an opaque alignment handle".to_owned(),
                         data,
@@ -1246,19 +1272,34 @@ impl Viewer {
                 relationship,
                 segment_index,
                 destination,
-            } => match self.navigate_automation_related_alignment(
-                relationship,
-                segment_index,
-                destination,
-            ) {
-                Ok(data) => AutomationExecution::Complete {
-                    message: "Navigated to a related alignment".to_owned(),
-                    data,
-                },
-                Err(error) => {
-                    automation_failure(AutomationErrorCode::RelatedAlignmentUnavailable, error)
+                expected_workspace_revision,
+            } => {
+                if expected_workspace_revision
+                    .is_some_and(|expected| expected != self.workspace_revision)
+                {
+                    return automation_failure(
+                        AutomationErrorCode::WorkspaceRevisionConflict,
+                        anyhow::anyhow!(
+                            "workspace revision changed: expected {}, observed {}",
+                            expected_workspace_revision.unwrap_or_default(),
+                            self.workspace_revision
+                        ),
+                    );
                 }
-            },
+                match self.navigate_automation_related_alignment(
+                    relationship,
+                    segment_index,
+                    destination,
+                ) {
+                    Ok(data) => AutomationExecution::Complete {
+                        message: "Navigated to a related alignment".to_owned(),
+                        data,
+                    },
+                    Err(error) => {
+                        automation_failure(AutomationErrorCode::RelatedAlignmentUnavailable, error)
+                    }
+                }
+            }
             AutomationCommand::NavigateReviewItem { action } => {
                 match self.apply_automation_review_navigation(&action) {
                     Ok(data) => AutomationExecution::Complete {
@@ -1520,6 +1561,7 @@ impl Viewer {
         Some(observed_retained_selection(
             &self.panels.active().retained_evidence.as_ref()?.selection,
             self.panels.active().viewport.interval(),
+            &self.panels.active().contig_name,
         ))
     }
 
@@ -1548,6 +1590,7 @@ impl Viewer {
                 evidence_revision: 0,
                 workspace_revision_at_selection: self.workspace_revision,
                 panel_id: panel.id,
+                contig: panel.contig_name.clone(),
                 track_id,
                 kind,
                 granularity: None,
@@ -1559,10 +1602,14 @@ impl Viewer {
                 end,
                 fields,
                 provenance: Vec::new(),
-                visible_in_active_view: true,
+                visible_in_active_view: start.zip(end).is_some_and(|(start, end)| {
+                    GenomicInterval::new(panel.viewport.interval().contig(), start, end)
+                        .is_ok_and(|evidence| panel.viewport.interval().contains_interval(evidence))
+                }),
                 stale: false,
                 stale_reason: None,
                 truncated,
+                presentation_truncated: false,
             }
         };
 
@@ -1827,6 +1874,10 @@ impl Viewer {
             AutomationSelectionKind::Junction => self.junction_inspector_snapshot(),
             _ => None,
         };
+        selection.presentation_truncated = inspector
+            .as_ref()
+            .and_then(|inspector| inspector.cigar.as_ref())
+            .is_some_and(|cigar| cigar.len() > 256);
         let export = inspector.as_ref().map_or_else(
             || {
                 if selection.fields.is_empty() {
@@ -2445,7 +2496,34 @@ impl Viewer {
                 .unwrap_or_default();
             let has_navigable_chain = chain.as_ref().is_some_and(|chain| chain.segments.len() > 1)
                 || query_chain_segments > 1;
-            let modifications = decode_modified_bases(&record).unwrap_or_default();
+            let modification_result = if matches!(record.sequence, SequenceData::NotLoaded)
+                && record.auxiliary_fields.is_empty()
+            {
+                None
+            } else {
+                Some(decode_modified_bases(&record))
+            };
+            let modifications = modification_result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok());
+            let modification_evidence_status = match &modification_result {
+                None => "unavailable",
+                Some(Ok(calls)) if calls.is_empty() => "absent",
+                Some(Ok(_)) => "present",
+                Some(Err(_)) => "malformed",
+            };
+            if matches!(
+                selector,
+                AutomationAlignmentSelector::Semantic {
+                    has_modified_bases: Some(_),
+                    ..
+                }
+            ) && modification_evidence_status == "unavailable"
+            {
+                anyhow::bail!(
+                    "modified-base evidence is unavailable at the current query detail; enable modified-base display or zoom to read detail"
+                );
+            }
             let is_match = match selector {
                 AutomationAlignmentSelector::ExactReadName { read_name } => {
                     record.read_name == read_name.as_bytes()
@@ -2480,8 +2558,9 @@ impl Viewer {
                         && has_mapped_mate.is_none_or(|expected| expected == mate_available)
                         && has_supplementary_chain
                             .is_none_or(|expected| expected == has_navigable_chain)
-                        && has_modified_bases
-                            .is_none_or(|expected| expected != modifications.is_empty())
+                        && has_modified_bases.is_none_or(|expected| {
+                            modifications.is_some_and(|calls| expected != calls.is_empty())
+                        })
                 }
             };
             if !is_match {
@@ -2505,6 +2584,11 @@ impl Viewer {
                 "handle": handle,
                 "panel_id": panel_id.get(),
                 "track_id": track_id.get(),
+                "contig": self.panels
+                    .iter()
+                    .find(|panel| panel.id == panel_id)
+                    .map(|panel| panel.contig_name.as_str())
+                    .unwrap_or_default(),
                 "start": record.start,
                 "end": record.end,
                 "flags": record.flags.bits(),
@@ -2517,17 +2601,23 @@ impl Viewer {
                     .as_ref()
                     .map_or(0, |chain| chain.segments.len())
                     .max(query_chain_segments),
-                "modification_code_count": modifications
-                    .iter()
-                    .map(|call| call.code)
-                    .collect::<HashSet<_>>()
-                    .len(),
+                "modification_code_count": modifications.map_or(0, |calls| {
+                    calls.iter().map(|call| call.code).collect::<HashSet<_>>().len()
+                }),
+                "modification_evidence_status": modification_evidence_status,
             }));
         }
         Ok(serde_json::json!({
             "application_instance_id": self.application_instance_id,
             "workspace_revision": self.workspace_revision,
             "query_generation": generation,
+            "query_contig": self.panels
+                .iter()
+                .find(|panel| panel.id == panel_id)
+                .map(|panel| panel.contig_name.as_str())
+                .unwrap_or_default(),
+            "query_start": query.interval.start(),
+            "query_end": query.interval.end(),
             "hits": hits,
             "truncated": matched_count > maximum_results,
         }))
@@ -2536,6 +2626,7 @@ impl Viewer {
     pub(crate) fn select_automation_alignment(
         &mut self,
         handle: &str,
+        reveal: AutomationAlignmentReveal,
     ) -> Result<serde_json::Value> {
         let target = self
             .automation_alignment_handles
@@ -2569,8 +2660,39 @@ impl Viewer {
         self.bump_workspace_revision();
         self.retain_active_selection(None);
         self.rebuild_genomic_display();
+        let mut navigated = false;
+        if reveal != AutomationAlignmentReveal::None {
+            let operation = match reveal {
+                AutomationAlignmentReveal::None => unreachable!(),
+                AutomationAlignmentReveal::Fit => AutomationViewportOperation::FitInterval {
+                    start: record.start,
+                    end: record.end,
+                },
+                AutomationAlignmentReveal::Center => {
+                    let span = self.panels.active().viewport.interval().len();
+                    let midpoint = record.start.saturating_add(record.end) / 2;
+                    let start = midpoint.saturating_sub(span / 2);
+                    AutomationViewportOperation::FitInterval {
+                        start,
+                        end: start.saturating_add(span),
+                    }
+                }
+            };
+            self.apply_automation_viewport_operation(target.panel_id, operation)?;
+            self.panels.active_mut().pending_read_selection =
+                Some((target.track_id, record.read_name.clone()));
+            navigated = true;
+        }
+        let interval = self.panels.active().viewport.interval();
         Ok(serde_json::json!({
             "selection": self.automation_selection_snapshot(),
+            "reveal": format!("{reveal:?}").to_ascii_lowercase(),
+            "navigated": navigated,
+            "viewport": {
+                "contig": self.panels.active().contig_name,
+                "start": interval.start(),
+                "end": interval.end(),
+            },
             "workspace_revision": self.workspace_revision,
         }))
     }
@@ -3014,6 +3136,41 @@ impl Viewer {
         scope: AutomationSnapshotScope,
         format: AutomationSnapshotFormat,
     ) -> Result<()> {
+        if scope == AutomationSnapshotScope::NativeWindow {
+            anyhow::ensure!(
+                format == AutomationSnapshotFormat::Png,
+                "native window snapshots support PNG only"
+            );
+            anyhow::ensure!(
+                self.pending_native_window_capture.is_none(),
+                "a native window capture is already in progress"
+            );
+            anyhow::ensure!(
+                !self.export_tasks.iter().any(|task| task.path == path),
+                "an export to {} is already in progress",
+                path.display()
+            );
+            let width = self.surface_config.width;
+            let height = self.surface_config.height;
+            self.pending_native_window_capture = Some(NativeWindowCaptureTask {
+                path,
+                automation_command: command_index,
+                automation_data: serde_json::json!({
+                    "width": width,
+                    "height": height,
+                    "scope": scope,
+                    "scope_description": "native window client area",
+                    "truncated": false,
+                    "application_instance_id": self.application_instance_id,
+                    "workspace_revision": self.workspace_revision,
+                    "selection_id": self.automation_selection_snapshot().map(|selection| selection.selection_id),
+                    "evidence_revision": self.automation_selection_snapshot().map(|selection| selection.evidence_revision),
+                }),
+            });
+            self.display_dirty = true;
+            self.window.request_redraw();
+            return Ok(());
+        }
         let (display, width, height, scope_label) = match scope {
             AutomationSnapshotScope::VisibleWorkspace => {
                 let width = logical_surface_dimension(
@@ -3041,6 +3198,7 @@ impl Viewer {
                 )
             }
             AutomationSnapshotScope::FullActivePanel => self.full_active_panel_export_display(),
+            AutomationSnapshotScope::NativeWindow => unreachable!(),
         };
         let mut metadata = automation_snapshot_metadata(
             &self.assembly_name,

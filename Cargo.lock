@@ -4019,6 +4019,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "image",
  "pollster",
  "rfd",
  "rgv-core",

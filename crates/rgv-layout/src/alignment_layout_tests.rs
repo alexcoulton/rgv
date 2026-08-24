@@ -944,6 +944,44 @@ fn group_and_sort_directions_are_independent_and_deterministic() {
 }
 
 #[test]
+fn sparse_alignment_groups_are_packed_without_reserved_empty_rows() {
+    let forward = row_test_record(b"forward", 10, 30);
+    let mut reverse = row_test_record(b"reverse", 10, 30);
+    reverse.flags = AlignmentFlags::from_bits(0x10);
+    let query = row_test_query(&[forward, reverse]);
+    let options = AlignmentLayoutOptions {
+        group_mode: AlignmentGroupMode::Strand,
+        max_rows: 4_096,
+        ..AlignmentLayoutOptions::default()
+    };
+
+    let rows = assign_alignment_rows(&query, options, None);
+
+    assert_eq!(rows.rows, vec![Some(0), Some(1)]);
+}
+
+#[test]
+fn history_preserves_local_rows_while_compacting_following_groups() {
+    let leading = row_test_record(b"leading", 10, 40);
+    let retained = row_test_record(b"retained", 20, 50);
+    let mut reverse = row_test_record(b"reverse", 20, 50);
+    reverse.flags = AlignmentFlags::from_bits(0x10);
+    let broad_query = row_test_query(&[leading, retained, reverse.clone()]);
+    let options = AlignmentLayoutOptions {
+        group_mode: AlignmentGroupMode::Strand,
+        max_rows: 4_096,
+        ..AlignmentLayoutOptions::default()
+    };
+    let broad_rows = assign_alignment_rows(&broad_query, options, None);
+    assert_eq!(broad_rows.rows, vec![Some(0), Some(1), Some(2)]);
+
+    let refined_query = row_test_query(&[row_test_record(b"retained", 20, 50), reverse]);
+    let refined_rows = assign_alignment_rows(&refined_query, options, Some(&broad_rows));
+
+    assert_eq!(refined_rows.rows, vec![Some(1), Some(2)]);
+}
+
+#[test]
 fn selected_read_promotion_precedes_configured_sort_without_changing_identity() {
     let records = [
         row_test_record(b"alpha", 10, 30),
@@ -1239,7 +1277,12 @@ fn chromosome_scale_start_establishes_rows_before_reads_appear() {
         junctions: rgv_hts::JunctionSummary::default(),
         pairs: rgv_hts::PairSummary::default(),
         reference: None,
-        stats: QueryStats::default(),
+        stats: QueryStats {
+            records_seen: records.len(),
+            records_eligible: records.len(),
+            records_emitted: records.len(),
+            ..QueryStats::default()
+        },
     };
     let options = AlignmentLayoutOptions::default();
     let rows = assign_alignment_rows(&query, options, None);
@@ -1255,6 +1298,11 @@ fn chromosome_scale_start_establishes_rows_before_reads_appear() {
             .iter()
             .all(|primitive| primitive.object_id == 0)
     );
+    assert!(overview.display_list.texts.iter().any(|primitive| {
+        primitive.text == "2 alignments present — zoom in to view individual reads"
+    }));
+    assert_eq!(overview.stats.rendered_alignments, 0);
+    assert_eq!(overview.stats.hidden_alignments, 2);
 
     let reads = Viewport::new(
         GenomicInterval::new(ContigId::new(0), 900_250, 900_650).unwrap(),

@@ -392,6 +392,7 @@ impl Viewer {
             variant_predicate_value: String::new(),
             variant_predicate_missing: VariantMissingValueRule::Exclude,
             export_tasks: Vec::new(),
+            pending_native_window_capture: None,
             session_save_tasks: Vec::new(),
             session_load_tasks: Vec::new(),
             workspace_list_import_tasks: Vec::new(),
@@ -485,25 +486,51 @@ impl Viewer {
                 .update_texture(&self.device, &self.queue, *id, image_delta);
         }
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                self.reconfigure_surface();
-                frame
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.reconfigure_surface();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                tracing::warn!("surface validation failed while acquiring a frame");
-                return;
-            }
+        let capture_task = self.pending_native_window_capture.take();
+        let capture_texture = capture_task.as_ref().map(|_| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("RGV native window capture"),
+                size: wgpu::Extent3d {
+                    width: self.surface_config.width,
+                    height: self.surface_config.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.surface_config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        });
+        let mut surface_frame = None;
+        let view = if let Some(texture) = capture_texture.as_ref() {
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
+        } else {
+            let frame = match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+                wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                    self.reconfigure_surface();
+                    frame
+                }
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return;
+                }
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    self.reconfigure_surface();
+                    return;
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    tracing::warn!("surface validation failed while acquiring a frame");
+                    return;
+                }
+            };
+            let view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            surface_frame = Some(frame);
+            view
         };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -563,9 +590,51 @@ impl Viewer {
                 .render(&mut pass.forget_lifetime(), &paint_jobs, &screen_descriptor);
         }
 
+        let capture_readback = capture_texture.as_ref().map(|texture| {
+            let unpadded_bytes_per_row = self.surface_config.width * 4;
+            let padded_bytes_per_row = unpadded_bytes_per_row
+                .div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+                * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("RGV native window capture readback"),
+                size: u64::from(padded_bytes_per_row) * u64::from(self.surface_config.height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bytes_per_row),
+                        rows_per_image: Some(self.surface_config.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: self.surface_config.width,
+                    height: self.surface_config.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            (buffer, padded_bytes_per_row)
+        });
+
         self.queue
             .submit(callback_commands.into_iter().chain([encoder.finish()]));
-        frame.present();
+        if let Some(frame) = surface_frame {
+            frame.present();
+        }
+        if let (Some(task), Some((buffer, padded_bytes_per_row))) = (capture_task, capture_readback)
+        {
+            let pixels = self.read_native_window_capture(&buffer, padded_bytes_per_row);
+            self.complete_native_window_capture(task, pixels);
+        }
         let frame_ms = frame_started.elapsed().as_secs_f64() * 1_000.0;
         self.smoothed_frame_ms = self.smoothed_frame_ms * 0.9 + frame_ms * 0.1;
         if let Some(runner) = self.automation.as_mut().filter(|runner| !runner.finished) {
@@ -588,5 +657,140 @@ impl Viewer {
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
+    }
+
+    fn read_native_window_capture(
+        &self,
+        buffer: &wgpu::Buffer,
+        padded_bytes_per_row: u32,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let slice = buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| format!("GPU capture polling failed: {error}"))?;
+        receiver
+            .recv()
+            .map_err(|_| "GPU capture mapping callback was lost".to_owned())?
+            .map_err(|error| format!("GPU capture mapping failed: {error}"))?;
+        let mapped = slice.get_mapped_range();
+        let pixels = decoded_capture_pixels(
+            &mapped,
+            self.surface_config.width,
+            self.surface_config.height,
+            padded_bytes_per_row,
+            self.surface_config.format,
+        );
+        drop(mapped);
+        buffer.unmap();
+        pixels
+    }
+
+    fn complete_native_window_capture(
+        &mut self,
+        task: NativeWindowCaptureTask,
+        pixels: std::result::Result<Vec<u8>, String>,
+    ) {
+        let NativeWindowCaptureTask {
+            path,
+            automation_command,
+            automation_data,
+        } = task;
+        let pixels = match pixels {
+            Ok(pixels) => pixels,
+            Err(message) => {
+                self.finish_automation_command(
+                    automation_command,
+                    Err((AutomationErrorCode::Internal, message)),
+                );
+                return;
+            }
+        };
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let start = self.start_automation_export_job_with_data(
+            automation_command,
+            path,
+            automation_data,
+            move |path| {
+                image::save_buffer_with_format(
+                    path,
+                    &pixels,
+                    width,
+                    height,
+                    image::ColorType::Rgba8,
+                    image::ImageFormat::Png,
+                )
+                .map_err(std::io::Error::other)
+            },
+        );
+        if let Err(error) = start {
+            self.finish_automation_command(
+                automation_command,
+                Err((AutomationErrorCode::Io, error.to_string())),
+            );
+        }
+    }
+}
+
+fn decoded_capture_pixels(
+    mapped: &[u8],
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    format: wgpu::TextureFormat,
+) -> std::result::Result<Vec<u8>, String> {
+    let unpadded_bytes_per_row = width as usize * 4;
+    let mut pixels = Vec::with_capacity(unpadded_bytes_per_row * height as usize);
+    for row in mapped
+        .chunks_exact(padded_bytes_per_row as usize)
+        .take(height as usize)
+    {
+        pixels.extend_from_slice(&row[..unpadded_bytes_per_row]);
+    }
+    match format {
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {}
+        format => {
+            return Err(format!(
+                "unsupported native capture texture format {format:?}"
+            ));
+        }
+    }
+    Ok(pixels)
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::decoded_capture_pixels;
+
+    #[test]
+    fn readback_removes_row_padding_and_converts_bgra_to_rgba() {
+        let mut mapped = vec![0_u8; 512];
+        mapped[..8].copy_from_slice(&[30, 20, 10, 255, 60, 50, 40, 128]);
+        mapped[256..264].copy_from_slice(&[90, 80, 70, 255, 120, 110, 100, 64]);
+        let pixels =
+            decoded_capture_pixels(&mapped, 2, 2, 256, wgpu::TextureFormat::Bgra8UnormSrgb)
+                .unwrap();
+        assert_eq!(
+            pixels,
+            [
+                10, 20, 30, 255, 40, 50, 60, 128, 70, 80, 90, 255, 100, 110, 120, 64,
+            ]
+        );
+    }
+
+    #[test]
+    fn readback_rejects_non_four_byte_surface_formats() {
+        assert!(
+            decoded_capture_pixels(&[0; 256], 1, 1, 256, wgpu::TextureFormat::Rgba16Float).is_err()
+        );
     }
 }

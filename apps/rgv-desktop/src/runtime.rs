@@ -188,6 +188,7 @@ impl ApplicationHandler for Application {
                 || viewer.reference_engine.is_some()
                 || viewer.track_engine.is_some()
                 || !viewer.export_tasks.is_empty()
+                || viewer.pending_native_window_capture.is_some()
                 || !viewer.session_save_tasks.is_empty()
                 || !viewer.session_load_tasks.is_empty()
                 || !viewer.workspace_list_import_tasks.is_empty()

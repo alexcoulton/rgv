@@ -86,6 +86,19 @@ fn zoom_out_retains_data_from_the_overlapping_loaded_interval() {
 }
 
 #[test]
+fn overview_read_detail_distinguishes_present_empty_and_incomplete_data() {
+    assert_eq!(
+        overview_read_detail(31, false),
+        "31 present · hidden at this zoom"
+    );
+    assert_eq!(overview_read_detail(0, false), "no alignments in region");
+    assert_eq!(
+        overview_read_detail(31, true),
+        "31+ found · overview incomplete"
+    );
+}
+
+#[test]
 fn alignment_layer_partition_keeps_the_header_out_of_the_read_scroll() {
     let primitive = |y, object_id| rgv_layout::RectPrimitive {
         x: 0.0,

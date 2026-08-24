@@ -578,13 +578,12 @@ where
                 window,
                 score,
                 stats.records_seen,
-                if options.detail == QueryDetail::Full {
-                    match normalized_for_modifications {
-                        Some(normalized) => normalized,
-                        None => normalize_record(&record, header, options.detail)?,
-                    }
-                } else {
-                    normalize_record(&record, header, options.detail)?
+                match normalized_for_modifications {
+                    // Keep the record used for modification aggregation so
+                    // inspectors and automation cannot contradict the
+                    // rendered/exported modification evidence.
+                    Some(normalized) => normalized,
+                    None => normalize_record(&record, header, options.detail)?,
                 },
             );
         }
@@ -1010,6 +1009,7 @@ fn add_pileup(
         .transpose()?
         .map(|value| value.get());
     let mut collapsed_bases = 0_u64;
+    let mut aligned_segments = Vec::new();
     let mut record_junctions = RecordJunctionCollector::default();
     for result in record.cigar().iter() {
         let operation = result?;
@@ -1022,9 +1022,7 @@ fn add_pileup(
                     reference_position,
                     end,
                     overlap_mask,
-                    |start, end| {
-                        pileup.add_aligned_segment(start, end, reverse, mapping_quality);
-                    },
+                    |start, end| aligned_segments.push((start, end)),
                 ));
                 if let (Some(sequence), Some(qualities)) = (&sequence, &qualities) {
                     for offset in 0..length {
@@ -1071,6 +1069,7 @@ fn add_pileup(
             Kind::HardClip | Kind::Pad => {}
         }
     }
+    pileup.add_aligned_record(aligned_segments, reverse, mapping_quality);
     let (record_junctions, dropped_record_junctions) = record_junctions.finish();
     junctions.add_record_junctions(
         &record_junctions,
@@ -1689,7 +1688,7 @@ mod tests {
             .query(
                 GenomicInterval::new(ContigId::new(1), 0, 2_000_000).unwrap(),
                 QueryOptions {
-                    detail: QueryDetail::Full,
+                    detail: QueryDetail::Layout,
                     collect_modifications: true,
                     ..QueryOptions::default()
                 },

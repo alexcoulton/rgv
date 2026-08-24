@@ -294,6 +294,51 @@ pub(crate) fn format_cigar(cigar: &[rgv_hts::CigarOp]) -> String {
     })
 }
 
+pub(crate) fn inspector_cigar_value(cigar: &[rgv_hts::CigarOp], formatted: &str) -> String {
+    const INLINE_OPERATION_LIMIT: usize = 32;
+    const INLINE_BYTE_LIMIT: usize = 256;
+    const PREVIEW_BYTES: usize = 72;
+
+    if cigar.len() <= INLINE_OPERATION_LIMIT && formatted.len() <= INLINE_BYTE_LIMIT {
+        return formatted.to_owned();
+    }
+    let query_span = cigar.iter().fold(0_u64, |total, operation| {
+        if matches!(
+            operation.kind,
+            CigarOpKind::Match
+                | CigarOpKind::Insertion
+                | CigarOpKind::SoftClip
+                | CigarOpKind::SequenceMatch
+                | CigarOpKind::SequenceMismatch
+        ) {
+            total.saturating_add(u64::from(operation.len))
+        } else {
+            total
+        }
+    });
+    let reference_span = cigar.iter().fold(0_u64, |total, operation| {
+        if matches!(
+            operation.kind,
+            CigarOpKind::Match
+                | CigarOpKind::Deletion
+                | CigarOpKind::ReferenceSkip
+                | CigarOpKind::SequenceMatch
+                | CigarOpKind::SequenceMismatch
+        ) {
+            total.saturating_add(u64::from(operation.len))
+        } else {
+            total
+        }
+    });
+    let prefix = &formatted[..formatted.len().min(PREVIEW_BYTES)];
+    let suffix_start = formatted.len().saturating_sub(PREVIEW_BYTES);
+    let suffix = &formatted[suffix_start..];
+    format!(
+        "{} operations · {query_span} bp query span · {reference_span} bp reference span · {prefix}…{suffix}",
+        cigar.len()
+    )
+}
+
 pub(crate) fn format_aux_value(value: &AuxValue) -> String {
     match value {
         AuxValue::Character(value) => char::from(*value).to_string(),

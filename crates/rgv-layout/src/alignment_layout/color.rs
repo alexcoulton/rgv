@@ -386,7 +386,7 @@ pub(crate) fn alignment_color(
                 Some(PairOrientation::Inward) => Rgba::new(0.35, 0.68, 0.48, alpha),
                 Some(PairOrientation::Outward) => Rgba::new(0.91, 0.45, 0.18, alpha),
                 Some(PairOrientation::SameStrand) => Rgba::new(0.62, 0.36, 0.76, alpha),
-                Some(PairOrientation::Unknown) | None => Rgba::new(0.56, 0.60, 0.68, alpha),
+                Some(PairOrientation::Unknown) | None => neutral_alignment_color(alpha),
             }
         }
         AlignmentColorMode::UnexpectedPair => {
@@ -396,7 +396,7 @@ pub(crate) fn alignment_color(
                 Some(PairClassification::Proper | PairClassification::Concordant) => {
                     Rgba::new(0.72, 0.76, 0.80, alpha)
                 }
-                Some(PairClassification::Unpaired) | None => Rgba::new(0.56, 0.60, 0.68, alpha),
+                Some(PairClassification::Unpaired) | None => neutral_alignment_color(alpha),
                 Some(_) => Rgba::new(0.91, 0.29, 0.24, alpha),
             }
         }
@@ -441,6 +441,12 @@ pub(crate) fn alignment_color(
                 palette_color(&label, alpha)
             }),
     }
+}
+
+fn neutral_alignment_color(alpha: f32) -> Rgba {
+    // Sparse neutral reads need to remain legible against the white canvas;
+    // the previous 0.56/0.60/0.68 body was easily lost at regional scale.
+    Rgba::new(0.38, 0.43, 0.52, alpha.max(0.94))
 }
 
 pub(crate) fn record_tag_label(

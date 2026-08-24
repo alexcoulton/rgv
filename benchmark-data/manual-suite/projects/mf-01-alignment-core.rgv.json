@@ -532,7 +532,7 @@
       "locus": {
         "contig": "chr2",
         "start": 0,
-        "end": 2000000
+        "end": 30000
       },
       "status": "Pending",
       "notes": "Expected manual fixture truth for Long/supplementary/modifications.",
@@ -544,7 +544,7 @@
       "locus": {
         "contig": "chr2",
         "start": 2500000,
-        "end": 2550000
+        "end": 2510000
       },
       "status": "Pending",
       "notes": "Expected manual fixture truth for 70,000-operation CIGAR.",

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Any, Optional
 
 EXPECTED_TOOLS = {
     "rgv_capture_view",
+    "rgv_capture_window",
     "rgv_change_viewport",
     "rgv_clear_selection",
     "rgv_configure",
@@ -51,29 +53,33 @@ def png_size(path: Path) -> tuple[int, int]:
     return int.from_bytes(prefix[16:20], "big"), int.from_bytes(prefix[20:24], "big")
 
 
-def macos_pid_screenshot(path: Path, process_id: int) -> dict[str, Any]:
+def save_mcp_window_capture(path: Path, result: dict[str, Any]) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    script = (
-        'on run argv\n'
-        'set capturePath to item 1 of argv\n'
-        'set targetPid to item 2 of argv as integer\n'
-        'tell application "System Events" to set frontmost of first application process whose unix id is targetPid to true\n'
-        'delay 1\n'
-        'do shell script "/usr/sbin/screencapture -x " & quoted form of capturePath\n'
-        'end run'
-    )
-    subprocess.run(
-        ["osascript", "-e", script, "--", str(path), str(process_id)],
-        check=True,
-    )
+    images = [item for item in result.get("content", []) if item.get("type") == "image"]
+    if len(images) != 1 or images[0].get("mimeType") != "image/png":
+        raise RuntimeError("rgv_capture_window did not return one PNG image")
+    try:
+        data = base64.b64decode(images[0]["data"], validate=True)
+    except (KeyError, ValueError) as error:
+        raise RuntimeError("rgv_capture_window returned malformed image data") from error
+    path.write_bytes(data)
     data = path.read_bytes()
     width, height = png_size(path)
+    metadata = structured(result)
+    if metadata.get("width") != width or metadata.get("height") != height:
+        raise RuntimeError("rgv_capture_window metadata did not match its PNG")
+    if metadata.get("foreground_activated") is not False:
+        raise RuntimeError("rgv_capture_window did not certify background capture")
     return {
         "name": path.name,
         "bytes": len(data),
         "width": width,
         "height": height,
         "sha256": hashlib.sha256(data).hexdigest(),
+        "window_id": metadata.get("window_id"),
+        "window_bounds_points": metadata.get("window_bounds_points"),
+        "includes_native_frame": metadata.get("includes_native_frame"),
+        "foreground_activated": metadata.get("foreground_activated"),
     }
 
 
@@ -112,13 +118,19 @@ class McpClient:
         self._write(payload)
 
     def call_tool(self, name: str, arguments: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        result = self.call_tool_result(name, arguments)
+        if result.get("isError"):
+            value = result.get("structuredContent", {})
+            raise RuntimeError(f"{name} failed: {value.get('error', value)}")
+        return result
+
+    def call_tool_result(
+        self, name: str, arguments: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
         result = self.request(
             "tools/call",
             {"name": name, "arguments": arguments or {}},
         )
-        if result.get("isError"):
-            structured = result.get("structuredContent", {})
-            raise RuntimeError(f"{name} failed: {structured.get('error', structured)}")
         return result
 
     def _write(self, payload: dict[str, Any]) -> None:
@@ -141,17 +153,54 @@ def workspace_interval(result: dict[str, Any]) -> tuple[int, int, int]:
     return active_panel_id, panel["start"], panel["end"]
 
 
+def alignment_search(result: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    matches = structured(result)["matches"]
+    required = {"query_contig", "query_start", "query_end", "query_generation", "hits"}
+    if not required.issubset(matches):
+        raise RuntimeError("alignment search omitted its settled query scope")
+    for hit in matches["hits"]:
+        if hit.get("contig") != matches["query_contig"]:
+            raise RuntimeError("alignment search returned an unmarked cross-contig hit")
+        if not (
+            int(hit["start"]) < int(matches["query_end"])
+            and int(matches["query_start"]) < int(hit["end"])
+        ):
+            raise RuntimeError("alignment search returned a hit outside its reported query scope")
+    return matches, matches["hits"]
+
+
+def modification_export_provenance(path: Path) -> dict[str, int]:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("# track_provenance\t"):
+            continue
+        values: dict[str, int] = {}
+        for field in line.split("\t")[3:]:
+            key, separator, value = field.partition("=")
+            if separator and value.isdigit():
+                values[key] = int(value)
+        return values
+    raise RuntimeError("modification export omitted track provenance")
+
+
 def summarize_tool_result(name: str, result: dict[str, Any]) -> dict[str, Any]:
     content_types = [item.get("type", "unknown") for item in result.get("content", [])]
     value = structured(result)
-    if name == "rgv_capture_view":
+    if name in {"rgv_capture_view", "rgv_capture_window"}:
         value = {
             "mime_type": value.get("mime_type"),
             "bytes": value.get("bytes"),
             "scope": value.get("scope"),
+            "capture_kind": value.get("capture_kind"),
+            "platform": value.get("platform"),
             "width": value.get("width"),
             "height": value.get("height"),
             "truncated": value.get("truncated"),
+            "process_id": value.get("process_id"),
+            "window_id": value.get("window_id"),
+            "window_bounds_points": value.get("window_bounds_points"),
+            "included_shadow": value.get("included_shadow"),
+            "includes_native_frame": value.get("includes_native_frame"),
+            "foreground_activated": value.get("foreground_activated"),
             "genome": value.get("genome"),
             "loci": value.get("loci"),
             "application_instance_id": value.get("application_instance_id"),
@@ -250,9 +299,22 @@ def main() -> int:
                 raise RuntimeError(f"checkpoint {name} observed an unsettled workspace")
             selection = workspace.get("selection") or {}
             screenshot_root = confined_output(root, arguments.screenshot_directory)
-            screenshot = macos_pid_screenshot(
+            captured = client.call_tool(
+                "rgv_capture_window",
+                {"wait_until_settled": True},
+            )
+            actions.append(summarize_tool_result("rgv_capture_window", captured))
+            captured_metadata = structured(captured)
+            if (
+                captured_metadata.get("application_instance_id")
+                != workspace["application_instance_id"]
+                or captured_metadata.get("workspace_revision")
+                != workspace["workspace_revision"]
+            ):
+                raise RuntimeError(f"checkpoint {name} capture identity changed")
+            screenshot = save_mcp_window_capture(
                 screenshot_root / f"{len(screenshots):02d}-{name}.png",
-                process_id,
+                captured,
             )
             screenshot.update(
                 {
@@ -264,6 +326,7 @@ def main() -> int:
                     "panels": [
                         {
                             "id": panel["id"],
+                            "contig": panel["contig"],
                             "start": panel["start"],
                             "end": panel["end"],
                             "render_generation": panel["render_generation"],
@@ -283,12 +346,21 @@ def main() -> int:
             raise RuntimeError(f"MF-01 review queue contained {len(review_items)} items, expected 5")
         if any("notes" in item or "assignment" in item for item in review_items):
             raise RuntimeError("review queue exposed private notes or assignments")
+        expected_review_intervals = {
+            "Long/supplementary/modifications": ("chr2", 0, 30_000),
+            "70,000-operation CIGAR": ("chr2", 2_500_000, 2_510_000),
+        }
+        for item in review_items:
+            expected = expected_review_intervals.get(item["label"])
+            if expected and (item["contig"], item["start"], item["end"]) != expected:
+                raise RuntimeError(f"MF-01 review item {item['label']} has a non-focused locus")
         for item in review_items:
             navigated = client.call_tool(
                 "rgv_navigate_review_item",
                 {"action": {"action": "item", "review_item_id": item["id"]}},
             )
             actions.append(summarize_tool_result("rgv_navigate_review_item", navigated))
+            checkpoint(f"review-{item['id']}-initial")
             current = client.call_tool("rgv_get_workspace")
             current_panel_id, _, _ = workspace_interval(current)
             zoomed = client.call_tool(
@@ -309,7 +381,7 @@ def main() -> int:
                 },
             )
             actions.append(summarize_tool_result("rgv_change_viewport", panned))
-            checkpoint(f"review-{item['id']}")
+            checkpoint(f"review-{item['id']}-manipulated")
 
         deep_item = next(item for item in review_items if item["label"] == "Deep coverage")
         deep_navigation = client.call_tool(
@@ -496,16 +568,42 @@ def main() -> int:
                     },
                 )
                 actions.append(summarize_tool_result("rgv_find_alignments", found))
-                matches = structured(found)["matches"]["hits"]
+                found_scope, matches = alignment_search(found)
                 if not matches:
                     raise RuntimeError("named MF-01 alignment control was not found")
                 serialized_match = json.dumps(structured(found))
                 if read_name in serialized_match:
                     raise RuntimeError("sensitive read name was echoed in an alignment result")
-                selected = client.call_tool("rgv_select_alignment", {"handle": matches[0]["handle"]})
+                selected = client.call_tool(
+                    "rgv_select_alignment",
+                    {
+                        "handle": matches[0]["handle"],
+                        "reveal": "fit",
+                        "expected_workspace_revision": found_scope["workspace_revision"],
+                        "wait_until_settled": True,
+                    },
+                )
                 actions.append(summarize_tool_result("rgv_select_alignment", selected))
+                selected_data = structured(selected)["report"]["results"][0]["data"]
+                if not selected_data["selection"]["visible_in_active_view"]:
+                    raise RuntimeError("named alignment reveal left the selection off-screen")
                 related = client.call_tool("rgv_get_related_alignments")
                 actions.append(summarize_tool_result("rgv_get_related_alignments", related))
+                restored_named_search_locus = client.call_tool(
+                    "rgv_navigate", {"loci": [arguments.locus], "wait_until_settled": True}
+                )
+                actions.append(
+                    summarize_tool_result("rgv_navigate", restored_named_search_locus)
+                )
+
+            structural_item = next(
+                item for item in review_items if item["label"] == "Structural pairs"
+            )
+            structural_navigation = client.call_tool(
+                "rgv_navigate_review_item",
+                {"action": {"action": "item", "review_item_id": structural_item["id"]}},
+            )
+            actions.append(summarize_tool_result("rgv_navigate_review_item", structural_navigation))
 
             mate_search = client.call_tool(
                 "rgv_find_alignments",
@@ -517,7 +615,7 @@ def main() -> int:
                 },
             )
             actions.append(summarize_tool_result("rgv_find_alignments", mate_search))
-            mate_hits = structured(mate_search)["matches"]["hits"]
+            _, mate_hits = alignment_search(mate_search)
             if not mate_hits:
                 raise RuntimeError("MF-01 structural locus exposed no mapped-mate handle")
             mate_selection = client.call_tool(
@@ -556,6 +654,78 @@ def main() -> int:
                 {"action": {"action": "item", "review_item_id": long_item["id"]}},
             )
             actions.append(summarize_tool_result("rgv_navigate_review_item", long_navigation))
+            modification_search = client.call_tool(
+                "rgv_find_alignments",
+                {
+                    "panel_id": panel_id,
+                    "track_id": track_id,
+                    "selector": {
+                        "selector": "semantic",
+                        "has_modified_bases": True,
+                    },
+                    "maximum_results": 128,
+                },
+            )
+            actions.append(summarize_tool_result("rgv_find_alignments", modification_search))
+            modification_matches, modification_hits = alignment_search(modification_search)
+            if not modification_hits:
+                raise RuntimeError("rendered MF-01 modifications were undiscoverable through MCP")
+            if any(
+                hit.get("modification_evidence_status") != "present"
+                or int(hit.get("modification_code_count", 0)) <= 0
+                for hit in modification_hits
+            ):
+                raise RuntimeError("modified-base search returned contradictory hit summaries")
+            modification_export_relative = "mcp-qualification/modifications.tsv"
+            modification_export = client.call_tool(
+                "rgv_export",
+                {
+                    "path": modification_export_relative,
+                    "kind": "modifications",
+                    "wait_until_settled": True,
+                },
+            )
+            actions.append(summarize_tool_result("rgv_export", modification_export))
+            modification_provenance = modification_export_provenance(
+                confined_output(root, modification_export_relative)
+            )
+            if modification_provenance.get("tagged_records") != len(modification_hits):
+                raise RuntimeError(
+                    "modified-base semantic hits disagree with export tagged-record provenance"
+                )
+            if modification_provenance.get("decoded_calls", 0) <= 0:
+                raise RuntimeError("modified-base export contained no decoded calls")
+            modified_selection = client.call_tool(
+                "rgv_select_alignment",
+                {
+                    "handle": modification_hits[0]["handle"],
+                    "reveal": "fit",
+                    "expected_workspace_revision": modification_matches["workspace_revision"],
+                    "wait_until_settled": True,
+                },
+            )
+            actions.append(summarize_tool_result("rgv_select_alignment", modified_selection))
+            modified_selection_data = structured(modified_selection)["report"]["results"][0]["data"]
+            selected_modification = modified_selection_data["selection"]
+            if not selected_modification["visible_in_active_view"]:
+                raise RuntimeError("revealed modified read was still reported off-screen")
+            modified_calls = next(
+                (
+                    field["value"]
+                    for field in selected_modification["fields"]
+                    if field["key"] == "Modified-base calls"
+                ),
+                "0",
+            )
+            if not modified_calls.isdigit() or int(modified_calls) <= 0:
+                raise RuntimeError("selected modified read disagreed with modification search")
+            checkpoint("long-read-modification-selected")
+
+            long_navigation = client.call_tool(
+                "rgv_navigate_review_item",
+                {"action": {"action": "item", "review_item_id": long_item["id"]}},
+            )
+            actions.append(summarize_tool_result("rgv_navigate_review_item", long_navigation))
             supplementary_search = client.call_tool(
                 "rgv_find_alignments",
                 {
@@ -569,13 +739,79 @@ def main() -> int:
                 },
             )
             actions.append(summarize_tool_result("rgv_find_alignments", supplementary_search))
-            supplementary_hits = structured(supplementary_search)["matches"]["hits"]
+            supplementary_matches, supplementary_hits = alignment_search(supplementary_search)
             if not supplementary_hits:
                 raise RuntimeError("MF-01 long-read locus exposed no supplementary-chain handle")
+            baseline_chain_count = max(
+                int(hit["supplementary_segment_count"]) for hit in supplementary_hits
+            )
+            for chain_scope_end in (200_000, 2_000_000):
+                widened = client.call_tool(
+                    "rgv_change_viewport",
+                    {
+                        "panel_id": panel_id,
+                        "operation": {
+                            "operation": "fit_interval",
+                            "start": 0,
+                            "end": chain_scope_end,
+                        },
+                        "wait_until_settled": True,
+                    },
+                )
+                actions.append(summarize_tool_result("rgv_change_viewport", widened))
+                widened_search = client.call_tool(
+                    "rgv_find_alignments",
+                    {
+                        "panel_id": panel_id,
+                        "track_id": track_id,
+                        "selector": {
+                            "selector": "semantic",
+                            "has_supplementary_chain": True,
+                        },
+                        "maximum_results": 8,
+                    },
+                )
+                actions.append(summarize_tool_result("rgv_find_alignments", widened_search))
+                _, widened_hits = alignment_search(widened_search)
+                if not widened_hits or max(
+                    int(hit["supplementary_segment_count"]) for hit in widened_hits
+                ) != baseline_chain_count:
+                    raise RuntimeError(
+                        "supplementary-chain availability changed with viewport width"
+                    )
+            long_navigation = client.call_tool(
+                "rgv_navigate_review_item",
+                {"action": {"action": "item", "review_item_id": long_item["id"]}},
+            )
+            actions.append(summarize_tool_result("rgv_navigate_review_item", long_navigation))
+            supplementary_search = client.call_tool(
+                "rgv_find_alignments",
+                {
+                    "panel_id": panel_id,
+                    "track_id": track_id,
+                    "selector": {
+                        "selector": "semantic",
+                        "has_supplementary_chain": True,
+                    },
+                    "maximum_results": 8,
+                },
+            )
+            actions.append(summarize_tool_result("rgv_find_alignments", supplementary_search))
+            supplementary_matches, supplementary_hits = alignment_search(supplementary_search)
             chain_selection = client.call_tool(
-                "rgv_select_alignment", {"handle": supplementary_hits[0]["handle"]}
+                "rgv_select_alignment",
+                {
+                    "handle": supplementary_hits[0]["handle"],
+                    "reveal": "fit",
+                    "expected_workspace_revision": supplementary_matches["workspace_revision"],
+                    "wait_until_settled": True,
+                },
             )
             actions.append(summarize_tool_result("rgv_select_alignment", chain_selection))
+            chain_selection_data = structured(chain_selection)["report"]["results"][0]["data"]
+            if not chain_selection_data["selection"]["visible_in_active_view"]:
+                raise RuntimeError("supplementary-chain reveal did not make the record visible")
+            checkpoint("supplementary-chain-selected")
             chain_related = client.call_tool("rgv_get_related_alignments")
             actions.append(summarize_tool_result("rgv_get_related_alignments", chain_related))
             segments = structured(chain_related)["related"]["supplementary_segments"]
@@ -590,6 +826,7 @@ def main() -> int:
                     "relationship": "supplementary_segment",
                     "segment_index": destination_segment["segment_index"],
                     "destination": "current_panel",
+                    "expected_workspace_revision": chain_selection_data["workspace_revision"],
                 },
             )
             actions.append(
@@ -605,31 +842,97 @@ def main() -> int:
                 {"action": {"action": "item", "review_item_id": long_item["id"]}},
             )
             actions.append(summarize_tool_result("rgv_navigate_review_item", long_navigation))
-            for _ in range(4):
-                long_workspace = client.call_tool("rgv_get_workspace")
-                long_state = structured(long_workspace)["workspace"]
-                active_panel = next(
-                    panel
-                    for panel in long_state["panels"]
-                    if panel["id"] == long_state["active_panel_id"]
-                )
-                reads_lane = next(
-                    lane for lane in active_panel["render_lanes"] if lane["lane"] == "reads"
-                )
-                if reads_lane["rendered"]:
-                    break
-                zoom_to_reads = client.call_tool(
-                    "rgv_change_viewport",
-                    {
-                        "panel_id": panel_id,
-                        "operation": {"operation": "zoom", "factor": 10.0},
-                        "wait_until_settled": True,
-                    },
-                )
-                actions.append(summarize_tool_result("rgv_change_viewport", zoom_to_reads))
-            else:
+            long_workspace = client.call_tool("rgv_get_workspace")
+            long_state = structured(long_workspace)["workspace"]
+            active_panel = next(
+                panel
+                for panel in long_state["panels"]
+                if panel["id"] == long_state["active_panel_id"]
+            )
+            reads_lane = next(
+                lane for lane in active_panel["render_lanes"] if lane["lane"] == "reads"
+            )
+            if not reads_lane["rendered"] or int(reads_lane["rendered_items"]) <= 0:
                 raise RuntimeError("MF-01 long-read lane remained omitted after bounded zooming")
             checkpoint("long-reads-rendered")
+
+            cigar_item = next(
+                item for item in review_items if item["label"] == "70,000-operation CIGAR"
+            )
+            cigar_navigation = client.call_tool(
+                "rgv_navigate_review_item",
+                {"action": {"action": "item", "review_item_id": cigar_item["id"]}},
+            )
+            actions.append(summarize_tool_result("rgv_navigate_review_item", cigar_navigation))
+            checkpoint("pathological-cigar-visible")
+            cigar_search = client.call_tool(
+                "rgv_find_alignments",
+                {
+                    "panel_id": panel_id,
+                    "track_id": track_id,
+                    "selector": {
+                        "selector": "interval",
+                        "start": cigar_item["start"],
+                        "end": cigar_item["end"],
+                    },
+                    "maximum_results": 4,
+                },
+            )
+            actions.append(summarize_tool_result("rgv_find_alignments", cigar_search))
+            cigar_matches, cigar_hits = alignment_search(cigar_search)
+            if len(cigar_hits) != 1:
+                raise RuntimeError("pathological-CIGAR review locus did not expose exactly one record")
+            revision_conflict = client.call_tool_result(
+                "rgv_select_alignment",
+                {
+                    "handle": cigar_hits[0]["handle"],
+                    "expected_workspace_revision": cigar_matches["workspace_revision"] + 1,
+                },
+            )
+            if not revision_conflict.get("isError") or (
+                revision_conflict.get("structuredContent", {}).get("error", {}).get("code")
+                != "workspace_revision_conflict"
+            ):
+                raise RuntimeError("stale workspace revision did not reject handle selection")
+            cigar_selection = client.call_tool(
+                "rgv_select_alignment",
+                {
+                    "handle": cigar_hits[0]["handle"],
+                    "reveal": "fit",
+                    "expected_workspace_revision": cigar_matches["workspace_revision"],
+                    "wait_until_settled": True,
+                },
+            )
+            actions.append(summarize_tool_result("rgv_select_alignment", cigar_selection))
+            cigar_selection_data = structured(cigar_selection)["report"]["results"][0]["data"]
+            selected_cigar = cigar_selection_data["selection"]
+            if not selected_cigar["visible_in_active_view"]:
+                raise RuntimeError("pathological CIGAR reveal left the record off-screen")
+            if not selected_cigar.get("presentation_truncated"):
+                raise RuntimeError("pathological CIGAR selection omitted presentation bounds")
+            cigar_field = next(
+                (field["value"] for field in selected_cigar["fields"] if field["key"] == "CIGAR"),
+                "",
+            )
+            if not cigar_field.startswith("70000 operations") or len(cigar_field) >= 320:
+                raise RuntimeError("pathological CIGAR was not returned as a bounded summary")
+            checkpoint("pathological-cigar-selected")
+
+            first_review = next(item for item in review_items if item["id"] == 1)
+            cross_contig_navigation = client.call_tool(
+                "rgv_navigate_review_item",
+                {"action": {"action": "item", "review_item_id": first_review["id"]}},
+            )
+            actions.append(
+                summarize_tool_result("rgv_navigate_review_item", cross_contig_navigation)
+            )
+            offscreen_selection_result = client.call_tool("rgv_get_selection")
+            actions.append(summarize_tool_result("rgv_get_selection", offscreen_selection_result))
+            offscreen_selection = structured(offscreen_selection_result)["selection"]
+            if offscreen_selection["contig"] != "chr2" or offscreen_selection["visible_in_active_view"]:
+                raise RuntimeError("retained selection visibility was incorrect after cross-contig navigation")
+            cleared_cigar = client.call_tool("rgv_clear_selection")
+            actions.append(summarize_tool_result("rgv_clear_selection", cleared_cigar))
 
             evidence_navigation = client.call_tool(
                 "rgv_navigate",
@@ -750,7 +1053,7 @@ def main() -> int:
         checkpoint("reopened")
 
         report = {
-            "schema_version": 2,
+            "schema_version": 3,
             "qualified": True,
             "commit": subprocess.run(
                 ["git", "rev-parse", "HEAD"],

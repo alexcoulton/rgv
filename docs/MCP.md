@@ -101,7 +101,8 @@ host configuration details. This example passes only the protected file's path; 
 - Panel and track IDs are positive stable identities. Inspect the workspace after changes rather
   than inferring an ID from display order.
 - Every workspace observation carries an unpredictable per-process `application_instance_id` and
-  monotonic `workspace_revision`. Status also reports the local PID used for PID-targeted capture.
+  monotonic `workspace_revision`. Status also reports the local PID used for authenticated native
+  window capture.
 - A selected evidence object is immutable. `selection_id`, `evidence_revision`, fields, exact
   half-open evidence interval, and selected-evidence export do not change after pan or zoom.
   `rgv_refresh_selection` is the only operation that replaces that evidence explicitly.
@@ -122,8 +123,8 @@ host configuration details. This example passes only the protected file's path; 
 | `rgv_navigate_review_item` | Navigates by item ID or to the next pending item. |
 | `rgv_get_navigation_history` | Observes history without moving its cursor. |
 | `rgv_navigate_history` | Moves backward, forward, or to a bounded history index. |
-| `rgv_find_alignments` | Finds records and returns opaque generation-scoped handles. |
-| `rgv_select_alignment` | Selects one opaque alignment handle. |
+| `rgv_find_alignments` | Finds records in the reported settled query scope and returns opaque generation-scoped handles. |
+| `rgv_select_alignment` | Selects one opaque alignment handle and can atomically leave it, center it, or fit it in view. |
 | `rgv_get_related_alignments` | Describes mate and supplementary-chain availability. |
 | `rgv_navigate_related_alignment` | Opens a mate or chain segment. |
 | `rgv_navigate` | Replaces the visible panel arrangement with exact locus strings. |
@@ -136,6 +137,7 @@ host configuration details. This example passes only the protected file's path; 
 | `rgv_filter_alignments` | Applies RGV's validated alignment-filter expression. |
 | `rgv_select` | Selects a panel, track, or zero-based genomic position. |
 | `rgv_capture_view` | Waits if requested and returns a bounded PNG as MCP image content. |
+| `rgv_capture_window` | Captures the complete native RGV client area without activating it. |
 | `rgv_export` | Writes a structured export under the root and inlines only small UTF-8 results. |
 | `rgv_save_workspace` | Saves an RGV project under the root. |
 | `rgv_open_workspace` | Explicitly replaces the window with a root-confined saved project. |
@@ -156,6 +158,10 @@ from a mutation that changed the viewer.
 - Workspace snapshots contain at most 16 panels and 1,024 tracks; selection snapshots contain at
   most 128 fields, with explicit truncation flags.
 - Captured PNG files are capped at 64 MiB and removed after being read.
+- `rgv_capture_window` renders the complete application client area—including menus, navigation,
+  tracks, status, and inspectors—to a private GPU target owned by the authenticated RGV process.
+  It never activates the application and remains current when the OS window is obscured or
+  minimized. The PNG intentionally excludes the operating-system title bar, border, and shadow.
 - Text exports are inlined only through 256 KiB; larger results remain root-relative artifacts.
 - Workspace and selection inspection omit source paths, credentials, signed URLs, read names,
   read sequences, and arbitrary alignment tags.
@@ -179,7 +185,7 @@ include `unavailable`, `unauthorized`, `unsupported_version`, `invalid_input`, `
 codes, including `invalid_setting_scope`, `setting_out_of_range`, `effective_state_unavailable`,
 `no_selection`, `selection_stale`, `stale_handle`, `ambiguous_alignment_match`,
 `related_alignment_unavailable`, `review_item_not_found`, `history_boundary`, `unsaved_changes`,
-and `workspace_replacement_not_confirmed`.
+`workspace_replacement_not_confirmed`, and `workspace_revision_conflict`.
 Selection, setting, history, review, relationship, and persistence failures additionally preserve
 `no_selection`, `selection_stale`, `stale_handle`, `setting_out_of_range`,
 `effective_state_unavailable`, `review_item_not_found`, `history_boundary`,
@@ -198,8 +204,24 @@ Selection, setting, history, review, relationship, and persistence failures addi
   the resulting workspace; restore connectivity before retrying.
 - `artifact_error`: verify root permissions and ensure no path component is a symbolic link.
 
-Calls are serialized in the adapter and again in the viewer. After a cancelled call, observe the
+Calls are mutually exclusive in the adapter and again in the viewer, but concurrently submitted
+JSON-RPC requests have no guaranteed admission order. Await a response before issuing a dependent
+operation, or put the dependent commands in `rgv_execute_batch`. Handle- and selection-derived
+mutations accept an optional `expected_workspace_revision`; a mismatch fails as
+`workspace_revision_conflict` without changing the viewer. After a cancelled call, observe the
 workspace before issuing another mutation because the first operation may still have completed.
+
+Alignment search results include `query_contig`, zero-based half-open `query_start`/`query_end`,
+and the query generation. Ordinary hits overlap that declared scope. Mate and supplementary
+records outside it are exposed only by the relationship tools. Modification hit summaries include
+`present`, `absent`, `malformed`, or `unavailable`; a semantic modified-base search fails with
+`effective_state_unavailable` rather than treating unloaded evidence as absent.
+
+`rgv_select_alignment` accepts `reveal: none|center|fit` (default `none`). `center` preserves the
+current span, while `fit` fits the selected record. Both return the resulting viewport and wait for
+the refreshed query by default. Pathological CIGARs are summarized in structured selection fields;
+`presentation_truncated` records that fact, and exact CIGAR text remains available through explicit
+selected-evidence export.
 
 ## Native release qualification
 
@@ -228,8 +250,8 @@ python3 validation/rgv_mcp_qualification.py \
 
 The harness performs MCP initialization and tool discovery, observes state, navigates, zooms,
 pans, traverses the review queue, exercises typed settings, optionally finds/selects alignments,
-proves selected evidence remains stable across viewport changes, captures PID-targeted macOS
-screenshots when requested, saves and opens the project in-process, and writes a path-free
+proves selected evidence remains stable across viewport changes, captures background native macOS
+window screenshots through `rgv_capture_window`, saves and opens the project in-process, and writes a path-free
 structured report under the control root. Run it twice from clean launches and retain each uniquely
 named screenshot. Visual correctness still comes from inspecting those images, not from structured
 renderer metadata.

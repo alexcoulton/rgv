@@ -220,8 +220,8 @@ pub(crate) fn write_projects(suite_root: &Path) -> Result<()> {
         review_item(1, "Paired short reads", "chr1", 0, 200_000),
         review_item(2, "Deep coverage", "chr1", 900_000, 920_000),
         review_item(3, "Structural pairs", "chr1", 2_590_000, 2_650_000),
-        review_item(4, "Long/supplementary/modifications", "chr2", 0, 2_000_000),
-        review_item(5, "70,000-operation CIGAR", "chr2", 2_500_000, 2_550_000),
+        review_item(4, "Long/supplementary/modifications", "chr2", 0, 30_000),
+        review_item(5, "70,000-operation CIGAR", "chr2", 2_500_000, 2_510_000),
     ];
     write_session(&projects.join(PROJECTS[0].filename), &core)?;
 

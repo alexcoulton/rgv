@@ -101,7 +101,10 @@ impl Viewer {
                     .mapping_quality
                     .map_or_else(|| "missing".to_owned(), |value| value.to_string()),
             ),
-            ("CIGAR".to_owned(), cigar.clone()),
+            (
+                "CIGAR".to_owned(),
+                inspector_cigar_value(&record.cigar, &cigar),
+            ),
             ("Mate".to_owned(), mate),
             (
                 "Template length".to_owned(),

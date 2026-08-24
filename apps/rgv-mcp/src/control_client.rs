@@ -378,6 +378,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_batches_do_not_overlap_on_the_control_transport() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let worker = thread::spawn(move || {
+            let mut first = server.recv().unwrap();
+            let mut first_body = String::new();
+            first.as_reader().read_to_string(&mut first_body).unwrap();
+
+            // The client deliberately makes no FIFO promise for independently
+            // scheduled calls, but it must never admit a second batch while the
+            // first batch is still awaiting its response.
+            let early_second = server.recv_timeout(Duration::from_millis(150)).unwrap();
+            let overlapped = early_second.is_some();
+            first
+                .respond(
+                    Response::from_string(r#"{"schema_version":1,"succeeded":true,"results":[]}"#)
+                        .with_header(response_header("Content-Type", "application/json")),
+                )
+                .unwrap();
+
+            let mut second = early_second.unwrap_or_else(|| server.recv().unwrap());
+            let mut second_body = String::new();
+            second.as_reader().read_to_string(&mut second_body).unwrap();
+            second
+                .respond(
+                    Response::from_string(r#"{"schema_version":1,"succeeded":true,"results":[]}"#)
+                        .with_header(response_header("Content-Type", "application/json")),
+                )
+                .unwrap();
+            (overlapped, [first_body, second_body])
+        });
+
+        let client = ControlClient::new(
+            Url::parse(&format!("http://{address}")).unwrap(),
+            "x".repeat(32),
+        )
+        .unwrap();
+        let first = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::Goto {
+                loci: vec!["chr1:1-100".to_owned()],
+            }],
+        };
+        let second = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::Goto {
+                loci: vec!["chr2:1-100".to_owned()],
+            }],
+        };
+
+        let (first_result, second_result) =
+            tokio::join!(client.run_batch(&first), client.run_batch(&second));
+        first_result.unwrap();
+        second_result.unwrap();
+        let (overlapped, bodies) = worker.join().unwrap();
+        assert!(!overlapped);
+        assert!(bodies.iter().any(|body| body.contains("chr1:1-100")));
+        assert!(bodies.iter().any(|body| body.contains("chr2:1-100")));
+    }
+
+    #[tokio::test]
     async fn authentication_and_malformed_json_have_distinct_errors() {
         let (url, worker) = serve_once(
             401,

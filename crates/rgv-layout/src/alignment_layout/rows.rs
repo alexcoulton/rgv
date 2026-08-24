@@ -16,12 +16,13 @@ pub fn assign_alignment_rows(
         options.pair_length_bounds,
         options.promoted_read_name_hash,
     );
-    let ordered_groups = ordered_group_indices(&groups, options.group_order);
+    let ordered_groups = ordered_group_entries(&groups, options.group_order);
     let group_count = groups.len().max(1);
     let max_rows = options.max_rows.max(1);
     let rows_per_group = (max_rows / group_count).max(1);
     let identities = alignment_row_identities(query, &pairs);
     let mut rows = vec![None; query.batch.len()];
+    let mut group_starts = BTreeMap::new();
     let compatible_previous = previous.filter(|layout| layout.compatible_with(&options));
 
     if let Some(previous) = compatible_previous {
@@ -33,9 +34,17 @@ pub fn assign_alignment_rows(
             &identities,
             previous,
             &mut rows,
+            &mut group_starts,
         );
     } else {
-        assign_rows_from_scratch(&ordered_groups, &pairs, rows_per_group, max_rows, &mut rows);
+        assign_rows_from_scratch(
+            &ordered_groups,
+            &pairs,
+            rows_per_group,
+            max_rows,
+            &mut rows,
+            &mut group_starts,
+        );
     }
     copy_pair_rows(&pairs, &mut rows);
 
@@ -43,6 +52,7 @@ pub fn assign_alignment_rows(
         rows,
         identities,
         pair_representatives: pairs.representatives,
+        group_starts,
         group_mode: options.group_mode,
         group_order: options.group_order,
         sort_mode: options.sort_mode,
@@ -122,16 +132,23 @@ pub(crate) fn copy_pair_rows(pairs: &PairLayoutMetadata, rows: &mut [Option<usiz
 }
 
 pub(crate) fn assign_rows_from_scratch(
-    groups: &[&[usize]],
+    groups: &[(&AlignmentGroupKey, &[usize])],
     pairs: &PairLayoutMetadata,
     rows_per_group: usize,
     max_rows: usize,
     rows: &mut [Option<usize>],
+    group_starts: &mut BTreeMap<AlignmentGroupKey, usize>,
 ) {
-    for (group_index, indices) in groups.iter().enumerate() {
+    let mut next_group_row = 0_usize;
+    for &(group_key, indices) in groups {
+        if next_group_row >= max_rows {
+            break;
+        }
+        group_starts.insert(group_key.clone(), next_group_row);
+        let group_capacity = rows_per_group.min(max_rows - next_group_row);
         let mut occupied = BinaryHeap::<Reverse<(u64, usize)>>::new();
         let mut allocated = 0_usize;
-        for &index in *indices {
+        for &index in indices {
             if pairs.representatives[index] != index {
                 continue;
             }
@@ -141,34 +158,31 @@ pub(crate) fn assign_rows_from_scratch(
             {
                 let Reverse((_, row)) = occupied.pop().expect("peeked row must exist");
                 row
-            } else if allocated < rows_per_group {
+            } else if allocated < group_capacity {
                 let row = allocated;
                 allocated += 1;
                 row
             } else {
                 continue;
             };
-            let absolute_row = group_index
-                .saturating_mul(rows_per_group)
-                .saturating_add(local_row);
-            if absolute_row >= max_rows {
-                continue;
-            }
+            let absolute_row = next_group_row.saturating_add(local_row);
             occupied.push(Reverse((pairs.ends[index], local_row)));
             rows[index] = Some(absolute_row);
         }
+        next_group_row = next_group_row.saturating_add(allocated);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assign_rows_with_history(
-    groups: &[&[usize]],
+    groups: &[(&AlignmentGroupKey, &[usize])],
     pairs: &PairLayoutMetadata,
     rows_per_group: usize,
     max_rows: usize,
     identities: &[AlignmentRowIdentity],
     previous: &AlignmentRowLayout,
     rows: &mut [Option<usize>],
+    group_starts: &mut BTreeMap<AlignmentGroupKey, usize>,
 ) {
     let previous_rows = previous
         .identities
@@ -177,42 +191,49 @@ pub(crate) fn assign_rows_with_history(
         .zip(previous.rows.iter().copied())
         .filter_map(|(identity, row)| row.map(|row| (identity, row)))
         .collect::<HashMap<_, _>>();
-    let mut occupied = vec![Vec::<(u64, u64, usize)>::new(); max_rows];
+    let mut next_group_row = 0_usize;
+    for &(group_key, indices) in groups {
+        if next_group_row >= max_rows {
+            break;
+        }
+        let group_capacity = rows_per_group.min(max_rows - next_group_row);
+        let previous_group_start = previous.group_starts.get(group_key).copied();
+        group_starts.insert(group_key.clone(), next_group_row);
+        let mut occupied = vec![Vec::<(u64, u64, usize)>::new(); group_capacity];
 
-    for (group_index, indices) in groups.iter().enumerate() {
-        let row_start = group_index.saturating_mul(rows_per_group);
-        let row_end = row_start.saturating_add(rows_per_group).min(max_rows);
-        for &index in *indices {
+        for &index in indices {
             if pairs.representatives[index] != index {
                 continue;
             }
             let Some(&preferred) = previous_rows.get(&identities[index]) else {
                 continue;
             };
-            if (row_start..row_end).contains(&preferred) {
-                occupied[preferred].push((pairs.starts[index], pairs.ends[index], index));
+            let Some(previous_group_start) = previous_group_start else {
+                continue;
+            };
+            let Some(local_row) = preferred.checked_sub(previous_group_start) else {
+                continue;
+            };
+            if local_row < group_capacity {
+                occupied[local_row].push((pairs.starts[index], pairs.ends[index], index));
             }
         }
-    }
 
-    for (row, intervals) in occupied.iter_mut().enumerate() {
-        intervals.sort_unstable();
-        let mut retained = Vec::with_capacity(intervals.len());
-        let mut previous_end = 0_u64;
-        for &(start, end, index) in intervals.iter() {
-            if retained.is_empty() || start >= previous_end {
-                retained.push((start, end, index));
-                previous_end = end;
-                rows[index] = Some(row);
+        for (local_row, intervals) in occupied.iter_mut().enumerate() {
+            intervals.sort_unstable();
+            let mut retained = Vec::with_capacity(intervals.len());
+            let mut previous_end = 0_u64;
+            for &(start, end, index) in intervals.iter() {
+                if retained.is_empty() || start >= previous_end {
+                    retained.push((start, end, index));
+                    previous_end = end;
+                    rows[index] = Some(next_group_row + local_row);
+                }
             }
+            *intervals = retained;
         }
-        *intervals = retained;
-    }
 
-    for (group_index, indices) in groups.iter().enumerate() {
-        let row_start = group_index.saturating_mul(rows_per_group);
-        let row_end = row_start.saturating_add(rows_per_group).min(max_rows);
-        for &index in *indices {
+        for &index in indices {
             if pairs.representatives[index] != index {
                 continue;
             }
@@ -221,16 +242,22 @@ pub(crate) fn assign_rows_with_history(
             }
             let start = pairs.starts[index];
             let end = pairs.ends[index];
-            let Some(row) =
-                (row_start..row_end).find(|&row| interval_fits(&occupied[row], start, end))
+            let Some(local_row) =
+                (0..group_capacity).find(|&row| interval_fits(&occupied[row], start, end))
             else {
                 continue;
             };
-            let insert_at =
-                occupied[row].partition_point(|&(existing_start, _, _)| existing_start <= start);
-            occupied[row].insert(insert_at, (start, end, index));
-            rows[index] = Some(row);
+            let insert_at = occupied[local_row]
+                .partition_point(|&(existing_start, _, _)| existing_start <= start);
+            occupied[local_row].insert(insert_at, (start, end, index));
+            rows[index] = Some(next_group_row + local_row);
         }
+
+        let used_rows = occupied
+            .iter()
+            .rposition(|intervals| !intervals.is_empty())
+            .map_or(0, |last| last + 1);
+        next_group_row = next_group_row.saturating_add(used_rows);
     }
 }
 
@@ -543,13 +570,20 @@ pub(crate) fn effective_sort_position(options: &AlignmentLayoutOptions) -> Optio
         .flatten()
 }
 
-pub(crate) fn ordered_group_indices(
+pub(crate) fn ordered_group_entries(
     groups: &BTreeMap<AlignmentGroupKey, Vec<usize>>,
     order: AlignmentOrderDirection,
-) -> Vec<&[usize]> {
+) -> Vec<(&AlignmentGroupKey, &[usize])> {
     match order {
-        AlignmentOrderDirection::Natural => groups.values().map(Vec::as_slice).collect(),
-        AlignmentOrderDirection::Reverse => groups.values().rev().map(Vec::as_slice).collect(),
+        AlignmentOrderDirection::Natural => groups
+            .iter()
+            .map(|(key, indices)| (key, indices.as_slice()))
+            .collect(),
+        AlignmentOrderDirection::Reverse => groups
+            .iter()
+            .rev()
+            .map(|(key, indices)| (key, indices.as_slice()))
+            .collect(),
     }
 }
 

@@ -367,13 +367,14 @@ impl AlignmentSource for LocalAlignmentSource {
                     window,
                     score,
                     stats.records_seen,
-                    if options.detail == QueryDetail::Full {
-                        match normalized_for_modifications {
-                            Some(normalized) => normalized,
-                            None => normalize_record(&record, options.detail)?,
-                        }
-                    } else {
-                        normalize_record(&record, options.detail)?
+                    match normalized_for_modifications {
+                        // Modification rendering, export, inspection, and MCP
+                        // discovery must all observe the same retained record.
+                        // The summary already paid the cost to normalize the
+                        // full record, so do not discard its sequence/tags at
+                        // Regional or Overview detail.
+                        Some(normalized) => normalized,
+                        None => normalize_record(&record, options.detail)?,
                     },
                 );
             }
@@ -468,6 +469,7 @@ fn add_record_pileup(
     let reverse = record.is_reverse();
     let mapping_quality = (record.mapq() != u8::MAX).then_some(record.mapq());
     let mut collapsed_bases = 0_u64;
+    let mut aligned_segments = Vec::new();
     let mut record_junctions = RecordJunctionCollector::default();
     for operation in &record.cigar() {
         match operation {
@@ -478,9 +480,7 @@ fn add_record_pileup(
                     reference_position,
                     end,
                     overlap_mask,
-                    |start, end| {
-                        pileup.add_aligned_segment(start, end, reverse, mapping_quality);
-                    },
+                    |start, end| aligned_segments.push((start, end)),
                 ));
                 if collect_alleles {
                     for offset in 0..*len as usize {
@@ -527,6 +527,7 @@ fn add_record_pileup(
             Cigar::HardClip(_) | Cigar::Pad(_) => {}
         }
     }
+    pileup.add_aligned_record(aligned_segments, reverse, mapping_quality);
     let (record_junctions, dropped_record_junctions) = record_junctions.finish();
     junctions.add_record_junctions(
         &record_junctions,
@@ -739,7 +740,7 @@ mod tests {
             .query(
                 GenomicInterval::new(ContigId::new(1), 0, 2_000_000).unwrap(),
                 QueryOptions {
-                    detail: QueryDetail::Full,
+                    detail: QueryDetail::Layout,
                     collect_modifications: true,
                     ..QueryOptions::default()
                 },
@@ -749,6 +750,17 @@ mod tests {
         assert!(query.batch.validate());
         assert!(query.stats.records_emitted >= 1_500);
         assert!((0..query.batch.len()).any(|index| query.batch.has_auxiliary_tag(index, *b"MM")));
+        assert!((0..query.batch.len()).any(|index| query.batch.has_auxiliary_tag(index, *b"SA")));
+        assert!((0..query.batch.len()).any(|index| {
+            query
+                .materialize_record(index)
+                .is_ok_and(|record| matches!(record.sequence, SequenceData::Present { .. }))
+        }));
+        assert!((0..query.batch.len()).any(|index| {
+            query.materialize_record(index).is_ok_and(|record| {
+                crate::decode_modified_bases(&record).is_ok_and(|calls| !calls.is_empty())
+            })
+        }));
         assert!(!query.pileup.modifications.is_empty());
         assert_eq!(
             query
