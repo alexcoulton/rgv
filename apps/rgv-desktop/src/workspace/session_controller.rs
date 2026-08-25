@@ -321,6 +321,7 @@ impl Viewer {
                     },
                 );
                 saved.vertical_scroll_points = panel.vertical_scroll_points;
+                saved.vertical_content_origin_points = panel.vertical_content_origin_points;
                 saved
             })
             .collect();

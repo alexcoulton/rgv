@@ -390,7 +390,7 @@ pub(crate) fn add_aligned_bases(
             color,
             object_id: read_detail_object_id(object_id),
         });
-        if width >= 7.0 {
+        if width >= MINIMUM_BASE_GLYPH_PIXEL_WIDTH {
             add_base_glyph(
                 display_list,
                 base,

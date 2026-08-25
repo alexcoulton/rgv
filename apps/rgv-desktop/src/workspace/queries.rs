@@ -7,9 +7,10 @@ impl Viewer {
     }
 
     pub(crate) fn request_reference_query(&mut self) {
-        let at_base_detail = self.panels.active_mut().viewport.detail_level() == DetailLevel::Bases;
+        let base_marks_visible = self.panels.active_mut().viewport.bases_per_pixel()
+            <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL;
         self.panels.active_mut().pending_queries.reference =
-            self.reference_engine.is_some() && at_base_detail;
+            self.reference_engine.is_some() && base_marks_visible;
         self.dispatch_reference_query();
     }
 
@@ -258,6 +259,8 @@ impl Viewer {
                                     panel.home_interval = interval;
                                     panel.navigation_history = NavigationHistory::new(interval);
                                     panel.vertical_scroll_points = 0.0;
+                                    panel.vertical_content_origin_points = 0.0;
+                                    panel.latent_vertical_scroll_fraction = None;
                                     panel.reference_slice = None;
                                 }
                                 Err(error) if id == active_panel_id => {
@@ -480,6 +483,8 @@ impl Viewer {
                                 panel.home_interval = interval;
                                 panel.navigation_history = NavigationHistory::new(interval);
                                 panel.vertical_scroll_points = 0.0;
+                                panel.vertical_content_origin_points = 0.0;
+                                panel.latent_vertical_scroll_fraction = None;
                             }
                             Err(error) if id == active_panel_id => {
                                 self.data_status = error.to_string();

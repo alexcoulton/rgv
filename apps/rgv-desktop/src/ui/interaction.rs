@@ -4,6 +4,7 @@ fn alignment_query_supports_gesture_detail(
     query: &AlignmentQuery,
     interval: GenomicInterval,
     detail: DetailLevel,
+    bases_per_pixel: f64,
     reference_available: bool,
 ) -> bool {
     if !query.interval.contains_interval(interval) {
@@ -19,7 +20,7 @@ fn alignment_query_supports_gesture_detail(
     {
         return false;
     }
-    detail != DetailLevel::Bases
+    bases_per_pixel > MAXIMUM_BASE_MARK_BASES_PER_PIXEL
         || !reference_available
         || query
             .reference
@@ -150,6 +151,10 @@ impl Viewer {
             return;
         }
         self.panels.active_mut().vertical_scroll_points = next;
+        if maximum > f32::EPSILON {
+            self.panels.active_mut().latent_vertical_scroll_fraction =
+                Some((next / maximum).clamp(0.0, 1.0));
+        }
         if self.synthetic || !self.refresh_active_panel_scroll_display() {
             self.display_dirty = true;
         }
@@ -262,7 +267,8 @@ impl Viewer {
                     .track_snapshot_interval
                     .is_some_and(|loaded| loaded.contains_interval(interval));
             let reference_covers_viewport = self.reference_engine.is_none()
-                || self.panels.active().viewport.detail_level() != DetailLevel::Bases
+                || self.panels.active().viewport.bases_per_pixel()
+                    > MAXIMUM_BASE_MARK_BASES_PER_PIXEL
                 || self
                     .panels
                     .active()
@@ -291,7 +297,8 @@ impl Viewer {
             return;
         }
         let interval = self.panels.active().viewport.interval();
-        let detail = self.panels.active().viewport.detail_level();
+        let viewport = self.panels.active().viewport;
+        let detail = viewport.detail_level();
         let reference_available = self.reference_engine.is_some();
         let alignment_needs_refinement = self.has_alignment_engine()
             && !self.primary_alignment_query().is_some_and(|query| {
@@ -299,6 +306,7 @@ impl Viewer {
                     query,
                     interval,
                     detail,
+                    viewport.bases_per_pixel(),
                     reference_available,
                 )
             });
@@ -309,7 +317,7 @@ impl Viewer {
                 .track_snapshot_interval
                 .is_some_and(|loaded| loaded.contains_interval(interval));
         let reference_needs_refinement = self.reference_engine.is_some()
-            && self.panels.active_mut().viewport.detail_level() == DetailLevel::Bases
+            && viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
             && !self
                 .panels
                 .active()
@@ -522,6 +530,14 @@ impl Viewer {
         let maximum = (self.panels.active().content_bottom_points
             - self.canvas_geometry.viewport.bottom())
         .max(0.0);
+        let camera_viewport_height = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.height(), |cache| {
+                (self.canvas_geometry.viewport.bottom() - cache.scroll_clip_top).max(1.0)
+            });
         // A fitting track stack has no vertical pan range, but the same control must
         // remain draggable horizontally so the user can expand it into an overflow.
         let scale = self.window.scale_factor().max(f64::EPSILON);
@@ -529,11 +545,28 @@ impl Viewer {
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
         );
-        let geometry = ui::scrollbar_geometry_for_density(
-            self.canvas_geometry.scrollbar,
-            maximum,
-            self.panels.active().vertical_scroll_points,
-            self.primary_alignment_filters().alignment_density,
+        let latent_fraction = self.panels.active().latent_vertical_scroll_fraction;
+        let scroll_fraction = (maximum > f32::EPSILON)
+            .then(|| (self.panels.active().vertical_scroll_points / maximum).clamp(0.0, 1.0));
+        let geometry = scroll_fraction.or(latent_fraction).map_or_else(
+            || {
+                ui::scrollbar_geometry_for_density_in_viewport(
+                    self.canvas_geometry.scrollbar,
+                    maximum,
+                    self.panels.active().vertical_scroll_points,
+                    self.primary_alignment_filters().alignment_density,
+                    camera_viewport_height,
+                )
+            },
+            |fraction| {
+                ui::scrollbar_geometry_for_density_at_fraction_in_viewport(
+                    self.canvas_geometry.scrollbar,
+                    maximum,
+                    self.primary_alignment_filters().alignment_density,
+                    fraction,
+                    camera_viewport_height,
+                )
+            },
         );
         let thumb_hit = geometry.thumb.contains(pointer);
         let thumb_grab_fraction = if thumb_hit && geometry.thumb.height() > f32::EPSILON {
@@ -541,11 +574,9 @@ impl Viewer {
         } else {
             0.5
         };
-        let virtual_scroll_fraction = if maximum <= f32::EPSILON {
-            thumb_grab_fraction
-        } else {
-            (self.panels.active().vertical_scroll_points / maximum).clamp(0.0, 1.0)
-        };
+        let virtual_scroll_fraction = scroll_fraction
+            .or(latent_fraction)
+            .unwrap_or(thumb_grab_fraction);
         self.vertical_overview_drag = Some(VerticalOverviewDrag {
             panel_id: self.panels.active().id,
             grab_offset: if thumb_hit {
@@ -611,11 +642,20 @@ impl Viewer {
         let maximum = (self.panels.active().content_bottom_points
             - self.canvas_geometry.viewport.bottom())
         .max(0.0);
-        let geometry = ui::scrollbar_geometry_for_density(
+        let camera_viewport_height = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.height(), |cache| {
+                (self.canvas_geometry.viewport.bottom() - cache.scroll_clip_top).max(1.0)
+            });
+        let geometry = ui::scrollbar_geometry_for_density_in_viewport(
             self.canvas_geometry.scrollbar,
             maximum,
             self.panels.active().vertical_scroll_points,
             self.primary_alignment_filters().alignment_density,
+            camera_viewport_height,
         );
         let next = ui::scrollbar_offset_at_grab(geometry, maximum, pointer.y, drag.grab_offset);
         let change = next - self.panels.active().vertical_scroll_points;
@@ -752,17 +792,44 @@ impl Viewer {
         }
         let previous_density = self.primary_alignment_filters().alignment_density;
         let density = density_from_horizontal_drag(previous_density, delta_x);
-        let maximum = (self.panels.active().content_bottom_points
-            - self.canvas_geometry.viewport.bottom())
-        .max(0.0);
-        let geometry = ui::scrollbar_geometry_for_density_at_fraction(
+        let viewport_height = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.height(), |cache| {
+                (self.canvas_geometry.viewport.bottom() - cache.scroll_clip_top).max(1.0)
+            });
+        let previous_padding = vertical_density_camera_padding(viewport_height, previous_density);
+        let actual_content_bottom = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or_else(
+                || {
+                    (self.panels.active().content_bottom_points - previous_padding)
+                        .max(self.canvas_geometry.viewport.bottom())
+                },
+                |cache| cache.actual_content_bottom,
+            );
+        let maximum = vertical_camera_maximum(
+            actual_content_bottom,
+            self.canvas_geometry.viewport.bottom(),
+            viewport_height,
+            density,
+        );
+        let geometry = ui::scrollbar_geometry_for_density_at_fraction_in_viewport(
             self.canvas_geometry.scrollbar,
             maximum,
             density,
             drag.virtual_scroll_fraction,
+            viewport_height,
         );
-        drag.virtual_pointer_y += delta_y;
         let grab_fraction = drag.thumb_grab_fraction.clamp(0.0, 1.0);
+        let zoom_fraction =
+            ui::scrollbar_fraction_at_grab(geometry, drag.virtual_pointer_y, grab_fraction);
+        drag.virtual_pointer_y += delta_y;
         let minimum_pointer = geometry.track.top() + grab_fraction * geometry.thumb.height();
         let maximum_pointer =
             geometry.track.bottom() - (1.0 - grab_fraction) * geometry.thumb.height();
@@ -773,11 +840,18 @@ impl Viewer {
         drag.virtual_scroll_fraction =
             ui::scrollbar_fraction_at_grab(geometry, drag.virtual_pointer_y, grab_fraction);
         let next_scroll = drag.virtual_scroll_fraction * maximum;
+        let previous_effective_scroll = self.panels.active().effective_vertical_scroll_points();
+        let camera_padding = vertical_density_camera_padding(viewport_height, density);
+        let zoom_scroll = zoom_fraction * maximum;
+        let content_origin = (zoom_scroll - previous_effective_scroll).clamp(0.0, camera_padding);
         let density_changed = (density - previous_density).abs() > 1.0e-4;
         let scroll_changed =
             (next_scroll - self.panels.active().vertical_scroll_points).abs() > f32::EPSILON;
         self.vertical_overview_drag = Some(drag);
         self.panels.active_mut().vertical_scroll_points = next_scroll;
+        self.panels.active_mut().vertical_content_origin_points = content_origin;
+        self.panels.active_mut().latent_vertical_scroll_fraction =
+            Some(drag.virtual_scroll_fraction);
         if density_changed {
             self.primary_alignment_filters_mut().alignment_density = density;
             self.display_dirty = true;
@@ -1052,7 +1126,7 @@ impl Viewer {
 
     pub(crate) fn inspector_activation_at_cursor(&self) -> InspectorActivation {
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
-        let content_y = cursor_y + self.panels.active().vertical_scroll_points;
+        let content_y = cursor_y + self.panels.active().effective_vertical_scroll_points();
         alignment_track_at_content_y(&self.panels.active().track_frames, content_y).map_or(
             self.primary_alignment_filters().inspector_activation,
             |id| {
@@ -1130,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn gesture_query_refines_immediately_when_crossing_base_detail() {
+    fn gesture_query_refines_immediately_when_crossing_base_mark_threshold() {
         let contig = ContigId::new(0);
         let loaded = GenomicInterval::new(contig, 100, 300).unwrap();
         let visible = GenomicInterval::new(contig, 150, 200).unwrap();
@@ -1140,12 +1214,14 @@ mod tests {
             &query,
             visible,
             DetailLevel::Reads,
+            MAXIMUM_BASE_MARK_BASES_PER_PIXEL + 0.01,
             true,
         ));
         assert!(!alignment_query_supports_gesture_detail(
             &query,
             visible,
-            DetailLevel::Bases,
+            DetailLevel::Reads,
+            MAXIMUM_BASE_MARK_BASES_PER_PIXEL,
             true,
         ));
 
@@ -1156,7 +1232,8 @@ mod tests {
         assert!(alignment_query_supports_gesture_detail(
             &query,
             visible,
-            DetailLevel::Bases,
+            DetailLevel::Reads,
+            MAXIMUM_BASE_MARK_BASES_PER_PIXEL,
             true,
         ));
     }

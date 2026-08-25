@@ -40,7 +40,8 @@ impl Viewer {
         let record_allocations = allocate_workspace_records(panel_record_budget, &record_requests);
         let viewport_interval = self.panels.active().viewport.interval();
         let contig_name = self.panels.active().contig_name.clone();
-        let detail_level = self.panels.active().viewport.detail_level();
+        let viewport = self.panels.active().viewport;
+        let detail_level = viewport.detail_level();
         let visible_bases = usize::try_from(viewport_interval.len()).unwrap_or(usize::MAX);
         let coverage_bins = (self.panels.active().viewport.pixel_width().round() as usize)
             .clamp(64, 4_096)
@@ -57,8 +58,13 @@ impl Viewer {
             ) else {
                 continue;
             };
-            let options =
-                alignment_query_options(track, detail_level, record_allocation, coverage_bins);
+            let options = alignment_query_options(
+                track,
+                detail_level,
+                viewport.bases_per_pixel(),
+                record_allocation,
+                coverage_bins,
+            );
             let (request, clock) = {
                 let projection = track.projection_mut(panel_id);
                 (

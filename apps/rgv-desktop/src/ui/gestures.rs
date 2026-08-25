@@ -119,6 +119,25 @@ pub(crate) fn density_from_horizontal_drag(origin: f32, drag_pixels: f32) -> f32
     (origin * (drag_pixels * 0.012).exp()).clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY)
 }
 
+/// Extra vertical world space introduced by the two-axis density navigator.
+/// At minimum density the control is an ordinary scrollbar. Expanding density
+/// creates a real camera range instead of merely drawing a smaller, inert thumb.
+pub(crate) fn vertical_density_camera_padding(viewport_height: f32, density: f32) -> f32 {
+    let scale = density.clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY) / MIN_VERTICAL_DENSITY;
+    viewport_height.max(0.0) * (scale - 1.0).max(0.0)
+}
+
+pub(crate) fn vertical_camera_maximum(
+    actual_content_bottom: f32,
+    viewport_bottom: f32,
+    viewport_height: f32,
+    density: f32,
+) -> f32 {
+    (actual_content_bottom + vertical_density_camera_padding(viewport_height, density)
+        - viewport_bottom)
+        .max(0.0)
+}
+
 pub(crate) fn vertical_overview_step(
     density: f32,
     scroll: f32,
@@ -141,6 +160,33 @@ pub(crate) fn vertical_overview_pan_gain(density: f32) -> f32 {
         / (MAX_VERTICAL_DENSITY - MIN_VERTICAL_DENSITY))
         .clamp(0.0, 1.0);
     2.0 + 6.0 * compact_fraction.sqrt()
+}
+
+pub(crate) fn reconcile_vertical_scroll(
+    current_scroll: f32,
+    previous_maximum: f32,
+    maximum: f32,
+    latent_fraction: Option<f32>,
+    gesture_fraction: Option<f32>,
+) -> (f32, Option<f32>) {
+    let previous_maximum = previous_maximum.max(0.0);
+    let maximum = maximum.max(0.0);
+    let restored_fraction = (previous_maximum <= f32::EPSILON && maximum > f32::EPSILON)
+        .then_some(latent_fraction)
+        .flatten();
+    let active_fraction = gesture_fraction.or(restored_fraction);
+    let scroll = active_fraction.map_or_else(
+        || current_scroll.clamp(0.0, maximum),
+        |fraction| fraction.clamp(0.0, 1.0) * maximum,
+    );
+    let retained_fraction = if maximum > f32::EPSILON {
+        Some((scroll / maximum).clamp(0.0, 1.0))
+    } else {
+        gesture_fraction
+            .or(latent_fraction)
+            .map(|fraction| fraction.clamp(0.0, 1.0))
+    };
+    (scroll, retained_fraction)
 }
 
 pub(crate) fn auxiliary_track_scale(density: f32) -> f32 {

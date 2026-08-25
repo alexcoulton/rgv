@@ -1628,6 +1628,74 @@ fn base_layout_compares_m_operations_with_reference() {
 }
 
 #[test]
+fn mismatch_marks_precede_base_letters_at_read_detail() {
+    let record = AlignmentRecord {
+        contig: ContigId::new(0),
+        start: 100,
+        end: 104,
+        flags: AlignmentFlags::from_bits(0),
+        mapping_quality: Some(60),
+        mate_contig: None,
+        mate_start: None,
+        template_length: 0,
+        read_name: b"mismatch-thresholds".to_vec(),
+        cigar: vec![CigarOp {
+            kind: CigarOpKind::Match,
+            len: 4,
+        }],
+        sequence: SequenceData::Present {
+            bases: b"ACGT".to_vec(),
+            qualities: Some(vec![40; 4]),
+        },
+        auxiliary_fields: Vec::new(),
+    };
+    let mut batch = AlignmentBatch::default();
+    batch.push(&record).unwrap();
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 104).unwrap();
+    let query = AlignmentQuery {
+        interval,
+        header: Arc::default(),
+        batch,
+        pileup: PileupSummary::from_depths(vec![1; 4]),
+        junctions: rgv_hts::JunctionSummary::default(),
+        pairs: rgv_hts::PairSummary::default(),
+        reference: Some(ReferenceSlice {
+            interval,
+            bases: b"ACAT".to_vec(),
+        }),
+        stats: QueryStats {
+            records_seen: 1,
+            records_eligible: 1,
+            records_emitted: 1,
+            ..QueryStats::default()
+        },
+    };
+    let options = AlignmentLayoutOptions {
+        show_reference: false,
+        ..AlignmentLayoutOptions::default()
+    };
+
+    let wider = layout_alignment_query(&query, Viewport::new(interval, 3.0).unwrap(), options);
+    assert!(!wider.display_list.rectangles.iter().any(|primitive| {
+        primitive.object_id & READ_DETAIL_OBJECT_BIT != 0
+            && record_object_id(primitive.object_id) == 1
+    }));
+
+    let marks = layout_alignment_query(&query, Viewport::new(interval, 4.0).unwrap(), options);
+    assert!(marks.display_list.rectangles.iter().any(|primitive| {
+        primitive.object_id & READ_DETAIL_OBJECT_BIT != 0
+            && record_object_id(primitive.object_id) == 1
+    }));
+    assert!(marks.display_list.texts.is_empty());
+
+    let letter_viewport = Viewport::new(interval, 28.0).unwrap();
+    assert_eq!(letter_viewport.detail_level(), DetailLevel::Reads);
+    let letters = layout_alignment_query(&query, letter_viewport, options);
+    assert_eq!(letters.display_list.texts.len(), 1);
+    assert_eq!(letters.display_list.texts[0].text, "G");
+}
+
+#[test]
 fn read_base_labels_contrast_with_each_nucleotide_fill() {
     for base in [b'A', b'G'] {
         let color = read_base_label_color(base);

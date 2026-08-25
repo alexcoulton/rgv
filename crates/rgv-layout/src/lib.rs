@@ -11,12 +11,12 @@ pub use alignment_layout::{
     BisulfiteContext, JunctionAnnotationLookup, JunctionAnnotationStatus, MAX_ANNOTATED_JUNCTIONS,
     MAX_HIDDEN_MODIFICATION_CODES, MAX_RENDERED_BISULFITE_MARKS, MAX_RENDERED_JUNCTION_LABELS,
     MAX_RENDERED_SBX_TAIL_MARKS, MAX_RENDERED_SMRT_KINETICS_MARKS,
-    MAX_RENDERED_ULTIMA_QUALITY_MARKS, SbxDisplayOptions, SbxSimplexTailMode, SmrtKineticsMode,
-    UltimaDisplayOptions, UltimaQualityMode, alignment_read_name_hash, assign_alignment_rows,
-    junction_count_value, layout_alignment_query, layout_alignment_query_with_rows,
-    layout_alignment_query_with_rows_and_annotations, layout_reference_slice,
-    layout_reference_slice_oriented, layout_reference_translation, layout_sashimi,
-    modification_code_color, ultima_quality_color,
+    MAX_RENDERED_ULTIMA_QUALITY_MARKS, MINIMUM_BASE_GLYPH_PIXEL_WIDTH, SbxDisplayOptions,
+    SbxSimplexTailMode, SmrtKineticsMode, UltimaDisplayOptions, UltimaQualityMode,
+    alignment_read_name_hash, assign_alignment_rows, junction_count_value, layout_alignment_query,
+    layout_alignment_query_with_rows, layout_alignment_query_with_rows_and_annotations,
+    layout_reference_slice, layout_reference_slice_oriented, layout_reference_translation,
+    layout_sashimi, modification_code_color, ultima_quality_color,
 };
 pub use display::{
     DisplayList, READ_DETAIL_OBJECT_BIT, RectPrimitive, Rgba, TextPrimitive, read_detail_object_id,

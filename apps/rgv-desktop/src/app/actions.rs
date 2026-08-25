@@ -120,7 +120,7 @@ impl Viewer {
                             draft.track_frames,
                             &order,
                             pointer_y,
-                            self.panels.active().vertical_scroll_points,
+                            self.panels.active().effective_vertical_scroll_points(),
                         );
                         outcome.alignment_move = Some((id, target));
                     } else {
@@ -133,7 +133,7 @@ impl Viewer {
                             draft.track_frames,
                             &order,
                             pointer_y,
-                            self.panels.active().vertical_scroll_points,
+                            self.panels.active().effective_vertical_scroll_points(),
                         );
                         outcome.auxiliary_move = Some((id, target));
                     }

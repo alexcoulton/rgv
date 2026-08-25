@@ -12,7 +12,7 @@ pub(crate) struct PanelScrollDisplayCache {
     pub(crate) scrollable: DisplayList,
     pub(crate) pinned: DisplayList,
     pub(crate) overview: ScrollbarOverview,
-    pub(crate) content_bottom: f32,
+    pub(crate) actual_content_bottom: f32,
     pub(crate) scroll_clip_top: f32,
     pub(crate) supports_fast_scroll: bool,
 }
@@ -59,6 +59,13 @@ pub(crate) struct ViewPanelController {
     pub(crate) track_snapshot_interval: Option<GenomicInterval>,
     pub(crate) track_settled_generation: Option<u64>,
     pub(crate) vertical_scroll_points: f32,
+    /// Position of the laid-out scrollable content inside the density-expanded
+    /// vertical world. Rendering uses `vertical_scroll_points - origin`, while
+    /// the scrollbar and overview use the real world-space camera position.
+    pub(crate) vertical_content_origin_points: f32,
+    /// Normalized vertical camera retained while the content has no scroll
+    /// range, so a density gesture does not snap its thumb back to the top.
+    pub(crate) latent_vertical_scroll_fraction: Option<f32>,
     pub(crate) content_bottom_points: f32,
     pub(crate) track_frames: Vec<TrackFrame>,
     pub(crate) selected_track: Option<TrackFrameKey>,
@@ -135,6 +142,7 @@ impl PanelWorkspace {
                     contig_length,
                 );
                 panel.vertical_scroll_points = saved.vertical_scroll_points;
+                panel.vertical_content_origin_points = saved.vertical_content_origin_points;
                 panel.content_bottom_points = content_top;
                 Ok(panel)
             })
@@ -334,6 +342,8 @@ impl ViewPanelController {
             track_snapshot_interval: None,
             track_settled_generation: None,
             vertical_scroll_points: 0.0,
+            vertical_content_origin_points: 0.0,
+            latent_vertical_scroll_fraction: None,
             content_bottom_points: 0.0,
             track_frames: Vec::new(),
             selected_track: None,
@@ -373,5 +383,11 @@ impl ViewPanelController {
         self.pending_read_selection = None;
         self.hovered_record = None;
         self.hover_inspector_target = None;
+    }
+}
+
+impl ViewPanelController {
+    pub(crate) fn effective_vertical_scroll_points(&self) -> f32 {
+        self.vertical_scroll_points - self.vertical_content_origin_points
     }
 }

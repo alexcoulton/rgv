@@ -104,7 +104,7 @@ pub(crate) fn add_cigar(
         match operation.kind {
             CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
                 let end = reference_position.saturating_add(length);
-                if viewport.detail_level() == DetailLevel::Bases {
+                if viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL {
                     add_aligned_bases(
                         display_list,
                         query,
@@ -745,7 +745,7 @@ pub(crate) fn add_reference_bases(
             color: with_alpha(base_color(base), 0.32),
             object_id: 0,
         });
-        if width >= 7.0 {
+        if width >= MINIMUM_BASE_GLYPH_PIXEL_WIDTH {
             add_base_glyph(
                 display_list,
                 base,

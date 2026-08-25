@@ -42,6 +42,8 @@ pub struct SessionViewPanel {
     pub locus: SessionLocus,
     #[serde(default)]
     pub vertical_scroll_points: f32,
+    #[serde(default)]
+    pub vertical_content_origin_points: f32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -186,6 +188,7 @@ impl SessionViewPanel {
             id,
             locus,
             vertical_scroll_points: 0.0,
+            vertical_content_origin_points: 0.0,
         }
     }
 }
@@ -908,6 +911,8 @@ impl SessionDocument {
                 || panel.locus.start >= panel.locus.end
                 || !panel.vertical_scroll_points.is_finite()
                 || panel.vertical_scroll_points < 0.0
+                || !panel.vertical_content_origin_points.is_finite()
+                || panel.vertical_content_origin_points < 0.0
             {
                 return Err(SessionError::InvalidPanels);
             }

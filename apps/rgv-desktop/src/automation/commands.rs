@@ -177,7 +177,7 @@ impl Viewer {
                 return false;
             }
             if self.reference_engine.is_some()
-                && panel.viewport.detail_level() == DetailLevel::Bases
+                && panel.viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
                 && (panel.reference_slice.as_ref().is_none_or(|slice| {
                     !slice.interval.contains_interval(panel.viewport.interval())
                 }) || panel.reference_settled_generation
@@ -3367,6 +3367,7 @@ impl Viewer {
     pub(crate) fn full_active_panel_export_display(&mut self) -> (DisplayList, u32, u32, String) {
         let original_geometry = self.canvas_geometry;
         let original_scroll = self.panels.active().vertical_scroll_points;
+        let original_content_origin = self.panels.active().vertical_content_origin_points;
         let content_height = (self.panels.active().content_bottom_points
             - self.canvas_geometry.viewport.top())
         .ceil()
@@ -3382,6 +3383,7 @@ impl Viewer {
         );
         self.canvas_geometry = CanvasGeometry::from_viewport(expanded_viewport);
         self.panels.active_mut().vertical_scroll_points = 0.0;
+        self.panels.active_mut().vertical_content_origin_points = 0.0;
         self.rebuild_genomic_display();
         let bounds = self.active_panel_rect();
         let display = cropped_display_list(&self.panels.active().display_list, bounds);
@@ -3389,6 +3391,7 @@ impl Viewer {
 
         self.canvas_geometry = original_geometry;
         self.panels.active_mut().vertical_scroll_points = original_scroll;
+        self.panels.active_mut().vertical_content_origin_points = original_content_origin;
         self.rebuild_genomic_display();
         self.composite_display_list = composite_panel_display_lists(&self.panels);
         self.display_dirty = true;

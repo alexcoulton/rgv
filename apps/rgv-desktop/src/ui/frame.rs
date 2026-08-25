@@ -418,10 +418,23 @@ impl Viewer {
             .scroll_display_cache
             .as_ref()
             .map(|cache| cache.overview.clone());
+        let vertical_camera_viewport_height = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.height(), |cache| {
+                (self.canvas_geometry.viewport.bottom() - cache.scroll_clip_top).max(1.0)
+            });
         let vertical_scroll_preview = self
             .vertical_overview_drag
             .filter(|drag| drag.density_dragging && drag.panel_id == self.panels.active().id)
-            .map(|drag| drag.virtual_scroll_fraction);
+            .map(|drag| drag.virtual_scroll_fraction)
+            .or_else(|| {
+                (maximum_vertical_scroll <= f32::EPSILON)
+                    .then_some(self.panels.active().latent_vertical_scroll_fraction)
+                    .flatten()
+            });
         let genomic_texts = self.composite_display_list.texts.clone();
         let selected_track = self.panels.active().selected_track;
         let assembly = self.assembly.clone();
@@ -1314,7 +1327,7 @@ impl Viewer {
                     ui,
                     geometry,
                     &track_frames,
-                    self.panels.active().vertical_scroll_points,
+                    self.panels.active().effective_vertical_scroll_points(),
                     selected_track,
                     &self.panels.active().selected_alignment_tracks,
                 );
@@ -1376,6 +1389,7 @@ impl Viewer {
                     maximum_vertical_scroll,
                     &mut vertical_scroll_points,
                     alignment_density,
+                    vertical_camera_viewport_height,
                     vertical_scroll_preview,
                     scrollbar_overview.as_ref(),
                 );

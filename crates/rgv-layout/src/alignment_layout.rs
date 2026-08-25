@@ -9,8 +9,8 @@ pub use rgv_core::{
     SmrtKineticsMode, UltimaDisplayOptions, UltimaQualityMode,
 };
 use rgv_core::{
-    DetailLevel, GeneticCode, ModifiedBaseColorMode, ReadBaseDisplayMode,
-    ReferenceTranslationFrame, Viewport,
+    DetailLevel, GeneticCode, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, ModifiedBaseColorMode,
+    ReadBaseDisplayMode, ReferenceTranslationFrame, Viewport,
 };
 use rgv_core::{JunctionDisplayMode, SashimiCountMode};
 use rgv_hts::{
@@ -35,6 +35,7 @@ pub const MAX_RENDERED_SMRT_KINETICS_MARKS: usize = 50_000;
 pub const MAX_RENDERED_SBX_TAIL_MARKS: usize = 50_000;
 pub const MAX_RENDERED_ULTIMA_QUALITY_MARKS: usize = 50_000;
 pub const MAX_RENDERED_REGIONAL_INSERTIONS: usize = 50_000;
+pub const MINIMUM_BASE_GLYPH_PIXEL_WIDTH: f32 = 7.0;
 const MAX_EXPANDED_JUNCTION_ROWS: usize = 12;
 pub const MAX_ANNOTATED_JUNCTIONS: usize = 100_000;
 
@@ -510,7 +511,7 @@ pub fn layout_alignment_query_with_rows_and_annotations(
     debug_assert_eq!(query.batch.len(), rows.len());
     let mut display_list = DisplayList::default();
     if options.show_reference
-        && viewport.detail_level() == DetailLevel::Bases
+        && viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
         && let Some(reference) = &query.reference
     {
         add_reference_bases(

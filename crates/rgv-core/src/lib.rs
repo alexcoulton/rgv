@@ -49,7 +49,7 @@ pub use genome::{
     MAXIMUM_DEFAULT_ANNOTATIONS, MAXIMUM_GENOME_ASSET_PROVENANCE, ReferenceTranslationFrame,
     parse_ucsc_cytobands,
 };
-pub use lod::{DetailLevel, RenderBudget};
+pub use lod::{DetailLevel, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, RenderBudget};
 pub use navigation::NavigationHistory;
 pub use panel::{PanelGeneration, PanelId, PanelTrackId};
 pub use sample_metadata::{

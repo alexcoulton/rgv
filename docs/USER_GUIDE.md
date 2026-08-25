@@ -169,14 +169,13 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   the wheel/trackpad to move through vertically stacked tracks and deep read rows.
 - The right overview is also an Ableton-style two-axis control: drag up/down to scroll and
   left/right to compact/expand track heights and read rows. Diagonal motion combines both actions,
-  density changes retain the row beneath the exact grabbed point, and the thumb contracts around
-  that point from the first horizontal movement even when sparse content still fits without
-  scrolling. In that fitting state the control retains a latent vertical camera position, so
-  up/down motion remains visible and becomes the real scroll offset continuously when expanded
-  content first overflows. Read rows can expand to roughly 64 pixels for close inspection;
-  auxiliary tracks use a gentler scale above their normal size so they do not consume the entire
-  canvas. It uses the same captured-pointer behavior and visual language as the chromosome
-  overview. Clicking the rail jumps to that vertical position.
+  density changes retain the row beneath the exact grabbed point, and expansion creates a real
+  density-scaled vertical camera even when the loaded rows are sparse. The thumb and coloured
+  activity bands share that camera's coordinates: moving the thumb away from an occupied band
+  moves those rows out of view instead of leaving an inert preview behind. Read rows can expand to
+  roughly 64 pixels for close inspection; auxiliary tracks use a gentler scale above their normal
+  size so they do not consume the entire canvas. It uses the same captured-pointer behavior and
+  visual language as the chromosome overview. Clicking the rail jumps to that vertical position.
 - Arrow Left/Right pans by ten percent; `+` and `-` zoom around the centre.
 - Home returns to the initial locus; Alt+Left/Right traverses locus history.
 - `Ctrl/Cmd+L` focuses the locus field and Enter navigates.
@@ -230,8 +229,10 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   stable record identity and cyan linked-read highlighting across panels. This override and the
   typed name are deliberately ephemeral: neither is written to sessions, settings, or diagnostics,
   and selecting or clearing another read removes the override.
-- Alignment appearance controls select mismatch-only, all-base, or hidden-base display. Quality
-  shading can be disabled without changing the underlying base qualities. “Show indels ≥” removes
+- Alignment appearance controls select mismatch-only, all-base, or hidden-base display. At wider
+  read detail, individual bases first appear as nucleotide-coloured marks; their letters are added
+  only once each base has enough screen width to remain legible. Quality shading can be disabled
+  without changing the underlying base qualities. “Show indels ≥” removes
   smaller insertion/deletion markers while “Label events ≥” independently suppresses text labels;
   reference skips remain visible because hiding them would misrepresent spliced alignment geometry.
   Regional views retain CIGAR insertions as fixed-pixel marks: short events use fine pale notches,

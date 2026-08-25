@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+/// Widest horizontal scale at which individual read/reference base marks are useful.
+///
+/// At this scale a base occupies one pixel. Base glyphs have a separate, tighter
+/// display threshold in the layout layer.
+pub const MAXIMUM_BASE_MARK_BASES_PER_PIXEL: f64 = 1.0;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum DetailLevel {
     Overview,

@@ -185,15 +185,21 @@ impl Viewer {
             }
             let mut subtracks = Vec::new();
             if reference_expanded {
-                let reference_is_zoomed_out =
-                    self.panels.active().viewport.detail_level() != DetailLevel::Bases;
+                let bases_per_pixel = self.panels.active().viewport.bases_per_pixel();
+                let reference_detail = if bases_per_pixel > MAXIMUM_BASE_MARK_BASES_PER_PIXEL {
+                    Some("zoom in to see sequence".to_owned())
+                } else if 1.0 / bases_per_pixel < f64::from(MINIMUM_BASE_GLYPH_PIXEL_WIDTH) {
+                    Some("zoom in to see base letters".to_owned())
+                } else {
+                    None
+                };
                 subtracks.push(TrackSubtrack {
                     label: if self.reference_reverse_complement {
                         "Bases · reverse strand".to_owned()
                     } else {
                         "Bases · forward".to_owned()
                     },
-                    detail: reference_is_zoomed_out.then(|| "zoom in to see sequence".to_owned()),
+                    detail: reference_detail,
                     top: sequence_top,
                     bottom: sequence_top + 20.0,
                     collapsed: false,
@@ -1086,9 +1092,9 @@ impl Viewer {
                                 &effective_copy_number_settings,
                                 &member.quantitative,
                                 shared_range,
-                                self.panels.active().vertical_scroll_points
+                                self.panels.active().effective_vertical_scroll_points()
                                     + self.canvas_geometry.viewport.top(),
-                                self.panels.active().vertical_scroll_points
+                                self.panels.active().effective_vertical_scroll_points()
                                     + self.canvas_geometry.viewport.bottom(),
                             );
                             if effective_copy_number_settings.show_sample_names {
@@ -1117,9 +1123,9 @@ impl Viewer {
                                 self.panels.active().viewport,
                                 options,
                                 &effective_mutation_settings,
-                                self.panels.active().vertical_scroll_points
+                                self.panels.active().effective_vertical_scroll_points()
                                     + self.canvas_geometry.viewport.top(),
-                                self.panels.active().vertical_scroll_points
+                                self.panels.active().effective_vertical_scroll_points()
                                     + self.canvas_geometry.viewport.bottom(),
                             );
                             if effective_mutation_settings.show_sample_names {
@@ -1181,17 +1187,29 @@ impl Viewer {
             top,
             self.canvas_geometry.viewport.bottom(),
         );
-        let content_bottom = display
+        let actual_content_bottom = display
             .rectangles
             .iter()
             .map(|rectangle| rectangle.y + rectangle.height)
             .fold(top, f32::max)
             .max(self.canvas_geometry.viewport.bottom());
+        let camera_padding = vertical_density_camera_padding(
+            (self.canvas_geometry.viewport.bottom() - scroll_clip_top).max(1.0),
+            self.primary_alignment_filters().alignment_density,
+        );
+        self.panels.active_mut().vertical_content_origin_points = self
+            .panels
+            .active()
+            .vertical_content_origin_points
+            .clamp(0.0, camera_padding);
+        let content_bottom = actual_content_bottom + camera_padding;
         let overview = ui::scrollbar_overview(
             &self.panels.active().track_frames,
             &display,
-            self.canvas_geometry.viewport.top(),
+            scroll_clip_top,
             content_bottom,
+            scroll_clip_top,
+            self.panels.active().vertical_content_origin_points,
             self.canvas_geometry.genomic.width(),
             128,
         );
@@ -1199,7 +1217,7 @@ impl Viewer {
             scrollable: display,
             pinned: pinned_display,
             overview,
-            content_bottom,
+            actual_content_bottom,
             scroll_clip_top,
             supports_fast_scroll,
         });
@@ -1213,28 +1231,45 @@ impl Viewer {
             self.interaction_trace
                 .record(InteractionTraceStage::ScrollDisplayStarted);
         }
-        let Some((content_bottom, scroll_clip_top)) = self
+        let Some((actual_content_bottom, scroll_clip_top)) = self
             .panels
             .active()
             .scroll_display_cache
             .as_ref()
-            .map(|cache| (cache.content_bottom, cache.scroll_clip_top))
+            .map(|cache| (cache.actual_content_bottom, cache.scroll_clip_top))
         else {
             return false;
         };
+        let camera_padding = vertical_density_camera_padding(
+            (self.canvas_geometry.viewport.bottom() - scroll_clip_top).max(1.0),
+            self.primary_alignment_filters().alignment_density,
+        );
+        let content_bottom = actual_content_bottom + camera_padding;
         let maximum_scroll = (content_bottom - self.canvas_geometry.viewport.bottom()).max(0.0);
+        let previous_maximum_scroll = (self.panels.active().content_bottom_points
+            - self.canvas_geometry.viewport.bottom())
+        .max(0.0);
         let active_panel_id = self.panels.active().id;
         let density_drag_fraction = self
             .vertical_overview_drag
             .filter(|drag| drag.density_dragging && drag.panel_id == active_panel_id)
             .map(|drag| drag.virtual_scroll_fraction);
         let panel = self.panels.active_mut();
+        panel.vertical_content_origin_points = panel
+            .vertical_content_origin_points
+            .clamp(0.0, camera_padding);
         panel.content_bottom_points = content_bottom;
-        panel.vertical_scroll_points = density_drag_fraction.map_or_else(
-            || panel.vertical_scroll_points.clamp(0.0, maximum_scroll),
-            |fraction| fraction.clamp(0.0, 1.0) * maximum_scroll,
+        (
+            panel.vertical_scroll_points,
+            panel.latent_vertical_scroll_fraction,
+        ) = reconcile_vertical_scroll(
+            panel.vertical_scroll_points,
+            previous_maximum_scroll,
+            maximum_scroll,
+            panel.latent_vertical_scroll_fraction,
+            density_drag_fraction,
         );
-        let scroll = self.panels.active().vertical_scroll_points;
+        let scroll = self.panels.active().effective_vertical_scroll_points();
         let mut display = std::mem::take(&mut self.panels.active_mut().display_list);
         let rectangle_capacity = display.rectangles.capacity();
         let text_capacity = display.texts.capacity();
@@ -1355,26 +1390,45 @@ impl Viewer {
     ) {
         let panel_rect = self.active_panel_rect();
         let active_panel_id = self.panels.active().id;
+        let previous_maximum_scroll = (self.panels.active().content_bottom_points
+            - self.canvas_geometry.viewport.bottom())
+        .max(0.0);
         let density_drag_fraction = self
             .vertical_overview_drag
             .filter(|drag| drag.density_dragging && drag.panel_id == active_panel_id)
             .map(|drag| drag.virtual_scroll_fraction);
-        self.panels.active_mut().content_bottom_points = display
+        let actual_content_bottom = display
             .rectangles
             .iter()
             .map(|rectangle| rectangle.y + rectangle.height)
             .fold(minimum_bottom, f32::max)
             .max(self.canvas_geometry.viewport.bottom());
+        let camera_padding = vertical_density_camera_padding(
+            (self.canvas_geometry.viewport.bottom() - scroll_clip_top).max(1.0),
+            self.primary_alignment_filters().alignment_density,
+        );
+        self.panels.active_mut().vertical_content_origin_points = self
+            .panels
+            .active()
+            .vertical_content_origin_points
+            .clamp(0.0, camera_padding);
+        self.panels.active_mut().content_bottom_points = actual_content_bottom + camera_padding;
         let maximum_scroll = (self.panels.active().content_bottom_points
             - self.canvas_geometry.viewport.bottom())
         .max(0.0);
         let current_scroll = self.panels.active().vertical_scroll_points;
-        self.panels.active_mut().vertical_scroll_points = density_drag_fraction.map_or_else(
-            || current_scroll.clamp(0.0, maximum_scroll),
-            |fraction| fraction.clamp(0.0, 1.0) * maximum_scroll,
+        let (scroll, latent_fraction) = reconcile_vertical_scroll(
+            current_scroll,
+            previous_maximum_scroll,
+            maximum_scroll,
+            self.panels.active().latent_vertical_scroll_fraction,
+            density_drag_fraction,
         );
+        self.panels.active_mut().vertical_scroll_points = scroll;
+        self.panels.active_mut().latent_vertical_scroll_fraction = latent_fraction;
+        let effective_scroll = self.panels.active().effective_vertical_scroll_points();
         display.scroll_and_clip_vertical(
-            self.panels.active().vertical_scroll_points,
+            effective_scroll,
             scroll_clip_top,
             self.canvas_geometry.viewport.bottom(),
         );

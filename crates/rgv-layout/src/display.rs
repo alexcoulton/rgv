@@ -158,7 +158,10 @@ impl DisplayList {
         bottom: f32,
         output: &mut Self,
     ) {
-        let offset = offset.max(0.0);
+        // Density navigation can place the laid-out content below the top of a
+        // larger virtual world. In that case the effective offset is negative:
+        // subtracting it translates content down into the camera before clipping.
+        let offset = if offset.is_finite() { offset } else { 0.0 };
         output
             .rectangles
             .extend(self.rectangles.iter().filter_map(|rectangle| {
@@ -274,6 +277,25 @@ mod tests {
         assert!((display.rectangles[0].height - 30.0).abs() < f32::EPSILON);
         assert_eq!(display.texts.len(), 1);
         assert!((display.texts[0].y - 160.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn negative_effective_scroll_places_content_inside_virtual_top_padding() {
+        let display = DisplayList {
+            rectangles: vec![RectPrimitive {
+                x: 0.0,
+                y: 100.0,
+                width: 10.0,
+                height: 20.0,
+                color: Rgba::new(1.0, 1.0, 1.0, 1.0),
+                object_id: 1,
+            }],
+            texts: Vec::new(),
+        };
+
+        let translated = display.scrolled_and_clipped_vertical(-50.0, 80.0, 200.0);
+        assert_eq!(translated.rectangles.len(), 1);
+        assert!((translated.rectangles[0].y - 150.0).abs() < f32::EPSILON);
     }
 
     #[test]

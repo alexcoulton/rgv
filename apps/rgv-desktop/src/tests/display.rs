@@ -204,6 +204,38 @@ fn horizontal_track_overview_drag_scales_density_logarithmically() {
 }
 
 #[test]
+fn density_navigation_creates_a_real_camera_for_sparse_content() {
+    let viewport_height = 600.0;
+    let actual_bottom = 700.0;
+    let viewport_bottom = 700.0;
+    assert!(
+        vertical_camera_maximum(
+            actual_bottom,
+            viewport_bottom,
+            viewport_height,
+            MIN_VERTICAL_DENSITY,
+        )
+        .abs()
+            < f32::EPSILON
+    );
+
+    let density = 1.0;
+    let maximum = vertical_camera_maximum(actual_bottom, viewport_bottom, viewport_height, density);
+    let expected = viewport_height * (density / MIN_VERTICAL_DENSITY - 1.0);
+    assert!((maximum - expected).abs() < 1.0e-3);
+
+    let rect = egui::Rect::from_min_max(egui::pos2(0.0, 100.0), egui::pos2(22.0, 700.0));
+    let geometry = ui::scrollbar_geometry_for_density_in_viewport(
+        rect,
+        maximum,
+        0.0,
+        density,
+        viewport_height,
+    );
+    assert!(geometry.thumb.height() < geometry.track.height());
+}
+
+#[test]
 fn vertical_overview_couples_navigation_to_live_density() {
     let (expanded_density, anchored_scroll) =
         vertical_overview_step(1.0, 1_000.0, 200.0, 50.0, 0.0);
@@ -214,6 +246,23 @@ fn vertical_overview_couples_navigation_to_live_density() {
     let (_, compact_pan) = vertical_overview_step(MIN_VERTICAL_DENSITY, 1_000.0, 200.0, 0.0, 50.0);
     let (_, expanded_pan) = vertical_overview_step(MAX_VERTICAL_DENSITY, 1_000.0, 200.0, 0.0, 50.0);
     assert!(compact_pan - 1_000.0 > expanded_pan - 1_000.0);
+}
+
+#[test]
+fn vertical_overview_retains_its_camera_while_content_fits() {
+    let (fitting_scroll, latent) = reconcile_vertical_scroll(0.0, 0.0, 0.0, None, Some(0.68));
+    assert!(fitting_scroll.abs() < f32::EPSILON);
+    assert_eq!(latent, Some(0.68));
+
+    let (overflow_scroll, retained) =
+        reconcile_vertical_scroll(fitting_scroll, 0.0, 400.0, latent, None);
+    assert!((overflow_scroll - 272.0).abs() < 1.0e-4);
+    assert_eq!(retained, Some(0.68));
+
+    let (ordinary_scroll, ordinary_fraction) =
+        reconcile_vertical_scroll(300.0, 400.0, 600.0, retained, None);
+    assert!((ordinary_scroll - 300.0).abs() < f32::EPSILON);
+    assert_eq!(ordinary_fraction, Some(0.5));
 }
 
 #[test]

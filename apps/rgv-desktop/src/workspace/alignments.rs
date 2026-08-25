@@ -297,6 +297,7 @@ pub(crate) fn alignment_panel_projections(
 pub(crate) fn alignment_query_options(
     track: &AlignmentTrackController,
     detail_level: DetailLevel,
+    bases_per_pixel: f64,
     record_allocation: usize,
     coverage_bins: usize,
 ) -> QueryOptions {
@@ -320,6 +321,7 @@ pub(crate) fn alignment_query_options(
         include_reference: alignment_query_needs_reference(
             filters.alignment_color_mode,
             detail_level,
+            bases_per_pixel,
         ),
         filter: track.active_filters.alignment.clone(),
         ..QueryOptions::default()
@@ -329,8 +331,9 @@ pub(crate) fn alignment_query_options(
 pub(crate) fn alignment_query_needs_reference(
     color_mode: AlignmentColorMode,
     detail_level: DetailLevel,
+    bases_per_pixel: f64,
 ) -> bool {
-    detail_level == DetailLevel::Bases
+    bases_per_pixel <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
         || (detail_level == DetailLevel::Reads && alignment_color_mode_needs_reference(color_mode))
 }
 

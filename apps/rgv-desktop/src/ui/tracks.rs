@@ -216,6 +216,8 @@ pub fn scrollbar_overview(
     display: &DisplayList,
     content_top: f32,
     content_bottom: f32,
+    scrollable_top: f32,
+    scrollable_offset: f32,
     genomic_width: f32,
     maximum_bins: usize,
 ) -> ScrollbarOverview {
@@ -238,13 +240,28 @@ pub fn scrollbar_overview(
         let y = content_top + (index as f32 + 0.5) * bin_height;
         bin.kind = frames
             .iter()
-            .find(|frame| frame.visible && y >= frame.top && y < frame.bottom)
+            .find(|frame| {
+                if !frame.visible {
+                    return false;
+                }
+                let top = if frame.top >= scrollable_top {
+                    frame.top + scrollable_offset
+                } else {
+                    frame.top
+                };
+                let bottom = if frame.bottom > scrollable_top {
+                    frame.bottom + scrollable_offset
+                } else {
+                    frame.bottom
+                };
+                y >= top && y < bottom
+            })
             .map(|frame| frame.kind);
     }
     let width = genomic_width.max(1.0);
     for rectangle in &display.rectangles {
-        let top = rectangle.y.max(content_top);
-        let bottom = (rectangle.y + rectangle.height).min(content_bottom);
+        let top = (rectangle.y + scrollable_offset).max(content_top);
+        let bottom = (rectangle.y + scrollable_offset + rectangle.height).min(content_bottom);
         if bottom <= top || rectangle.color.alpha <= f32::EPSILON {
             continue;
         }
@@ -269,7 +286,14 @@ pub fn scrollbar_overview(
     let mut boundaries = frames
         .iter()
         .filter(|frame| frame.visible)
-        .map(|frame| ((frame.top - content_top) / span).clamp(0.0, 1.0))
+        .map(|frame| {
+            let top = if frame.top >= scrollable_top {
+                frame.top + scrollable_offset
+            } else {
+                frame.top
+            };
+            ((top - content_top) / span).clamp(0.0, 1.0)
+        })
         .collect::<Vec<_>>();
     boundaries.sort_by(f32::total_cmp);
     boundaries.dedup_by(|left, right| (*left - *right).abs() < 0.002);
@@ -295,33 +319,90 @@ pub fn scrollbar_geometry(rect: Rect, maximum: f32, offset: f32) -> ScrollbarGeo
     } else {
         offset.clamp(0.0, maximum) / maximum
     };
-    scrollbar_geometry_with_visible_fraction(rect, maximum, 1.0, fraction)
+    scrollbar_geometry_with_visible_fraction(rect, maximum, rect.height(), 1.0, fraction)
 }
 
+#[cfg(test)]
 pub fn scrollbar_geometry_for_density(
     rect: Rect,
     maximum: f32,
     offset: f32,
     density: f32,
 ) -> ScrollbarGeometry {
+    scrollbar_geometry_for_density_in_viewport(rect, maximum, offset, density, rect.height())
+}
+
+pub fn scrollbar_geometry_for_density_in_viewport(
+    rect: Rect,
+    maximum: f32,
+    offset: f32,
+    density: f32,
+    camera_viewport_height: f32,
+) -> ScrollbarGeometry {
     let fraction = if maximum <= f32::EPSILON {
         0.0
     } else {
         offset.clamp(0.0, maximum) / maximum
     };
-    scrollbar_geometry_for_density_at_fraction(rect, maximum, density, fraction)
+    if maximum <= f32::EPSILON {
+        scrollbar_geometry_with_visible_fraction(
+            rect,
+            maximum,
+            camera_viewport_height,
+            1.0,
+            fraction,
+        )
+    } else {
+        scrollbar_geometry_for_density_at_fraction_in_viewport(
+            rect,
+            maximum,
+            density,
+            fraction,
+            camera_viewport_height,
+        )
+    }
 }
 
+#[cfg(test)]
 pub fn scrollbar_geometry_for_density_at_fraction(
     rect: Rect,
     maximum: f32,
     density: f32,
     scroll_fraction: f32,
 ) -> ScrollbarGeometry {
+    scrollbar_geometry_for_density_at_fraction_in_viewport(
+        rect,
+        maximum,
+        density,
+        scroll_fraction,
+        rect.height(),
+    )
+}
+
+pub fn scrollbar_geometry_for_density_at_fraction_in_viewport(
+    rect: Rect,
+    maximum: f32,
+    density: f32,
+    scroll_fraction: f32,
+    camera_viewport_height: f32,
+) -> ScrollbarGeometry {
+    // The thumb represents the actual viewport, not a prospective camera position.
+    // When the content fits there is no vertical range outside that viewport, so a
+    // saved or in-progress density anchor must not contract or position the thumb.
+    if maximum <= f32::EPSILON {
+        return scrollbar_geometry_with_visible_fraction(
+            rect,
+            maximum,
+            camera_viewport_height,
+            1.0,
+            0.0,
+        );
+    }
     let density = density.clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);
     scrollbar_geometry_with_visible_fraction(
         rect,
         maximum,
+        camera_viewport_height,
         (MIN_VERTICAL_DENSITY / density).clamp(0.0, 1.0),
         scroll_fraction,
     )
@@ -330,12 +411,13 @@ pub fn scrollbar_geometry_for_density_at_fraction(
 fn scrollbar_geometry_with_visible_fraction(
     rect: Rect,
     maximum: f32,
+    camera_viewport_height: f32,
     scale_visible_fraction: f32,
     scroll_fraction: f32,
 ) -> ScrollbarGeometry {
     let track = rect.shrink2(egui::vec2(6.0, 5.0));
     let maximum = maximum.max(0.0);
-    let viewport_height = rect.height().max(1.0);
+    let viewport_height = camera_viewport_height.max(1.0);
     let content_height = viewport_height + maximum;
     let visible_fraction = (viewport_height / content_height).min(scale_visible_fraction);
     let thumb_height =
@@ -395,6 +477,7 @@ pub fn paint_vertical_scrollbar(
     maximum: f32,
     offset: &mut f32,
     density: f32,
+    camera_viewport_height: f32,
     preview_scroll_fraction: Option<f32>,
     overview: Option<&ScrollbarOverview>,
 ) -> ScrollbarInteraction {
@@ -444,8 +527,24 @@ pub fn paint_vertical_scrollbar(
     }
     let pointer_down = response.is_pointer_button_down_on() || response.dragged();
     let geometry = preview_scroll_fraction.map_or_else(
-        || scrollbar_geometry_for_density(rect, maximum, *offset, density),
-        |fraction| scrollbar_geometry_for_density_at_fraction(rect, maximum, density, fraction),
+        || {
+            scrollbar_geometry_for_density_in_viewport(
+                rect,
+                maximum,
+                *offset,
+                density,
+                camera_viewport_height,
+            )
+        },
+        |fraction| {
+            scrollbar_geometry_for_density_at_fraction_in_viewport(
+                rect,
+                maximum,
+                density,
+                fraction,
+                camera_viewport_height,
+            )
+        },
     );
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, Color32::from_gray(250));
@@ -1181,7 +1280,7 @@ mod tests {
             texts: Vec::new(),
         };
 
-        let overview = scrollbar_overview(&frames, &display, 100.0, 500.0, 100.0, 40);
+        let overview = scrollbar_overview(&frames, &display, 100.0, 500.0, 100.0, 0.0, 100.0, 40);
         assert_eq!(overview.bins.len(), 40);
         assert!(overview.bins[..15].iter().all(|bin| bin.density == 0.0));
         assert!(overview.bins[20..25].iter().any(|bin| bin.density > 0.5));
@@ -1192,6 +1291,38 @@ mod tests {
                 .all(|bin| bin.kind == Some(TrackKind::Alignment))
         );
         assert_eq!(overview.boundaries, vec![0.0]);
+    }
+
+    #[test]
+    fn scrollbar_overview_places_activity_in_the_density_camera_world() {
+        let frames = [TrackFrame {
+            key: TrackFrameKey::Alignment(TrackId::new(1)),
+            name: "reads".to_owned(),
+            kind: TrackKind::Alignment,
+            source_label: None,
+            top: 100.0,
+            bottom: 500.0,
+            visible: true,
+            collapsed: false,
+            frozen_bottom: Some(200.0),
+            subtracks: Vec::new(),
+        }];
+        let display = DisplayList {
+            rectangles: vec![rgv_layout::RectPrimitive {
+                x: 0.0,
+                y: 220.0,
+                width: 80.0,
+                height: 10.0,
+                color: rgv_layout::Rgba::new(0.2, 0.4, 0.8, 1.0),
+                object_id: 1,
+            }],
+            texts: Vec::new(),
+        };
+
+        let overview = scrollbar_overview(&frames, &display, 100.0, 900.0, 200.0, 300.0, 100.0, 80);
+        assert!(overview.bins[40..45].iter().any(|bin| bin.density > 0.0));
+        assert!(overview.bins[..35].iter().all(|bin| bin.density == 0.0));
+        assert_eq!(overview.bins[42].kind, Some(TrackKind::Alignment));
     }
 
     #[test]
@@ -1214,6 +1345,7 @@ mod tests {
                     1_000.0,
                     &mut offset,
                     1.0,
+                    400.0,
                     None,
                     None,
                 );
@@ -1248,6 +1380,7 @@ mod tests {
                     1_000.0,
                     &mut offset,
                     1.0,
+                    400.0,
                     None,
                     None,
                 );
@@ -1275,6 +1408,7 @@ mod tests {
                     1_000.0,
                     &mut offset,
                     1.0,
+                    400.0,
                     None,
                     None,
                 );
@@ -1629,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn density_aware_thumb_responds_before_content_overflows() {
+    fn fitting_content_always_uses_a_full_thumb() {
         let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(22.0, 600.0));
         let compact = scrollbar_geometry_for_density(rect, 0.0, 0.0, MIN_VERTICAL_DENSITY);
         let first_expansion = scrollbar_geometry_for_density(
@@ -1640,18 +1774,41 @@ mod tests {
         );
 
         assert_close(compact.thumb.height(), compact.track.height());
-        assert!(first_expansion.thumb.height() < compact.thumb.height());
+        assert_close(first_expansion.thumb.height(), compact.thumb.height());
+
+        let anchored =
+            scrollbar_geometry_for_density_at_fraction(rect, 0.0, MIN_VERTICAL_DENSITY * 2.0, 0.5);
+        assert_close(anchored.thumb.height(), compact.track.height());
+        assert_close(anchored.thumb.top(), compact.track.top());
     }
 
     #[test]
-    fn density_thumb_can_shrink_around_a_grabbed_point_before_overflow() {
+    fn density_thumb_does_not_imply_overflow_during_a_fitting_density_gesture() {
         let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(22.0, 600.0));
         let compact = scrollbar_geometry_for_density(rect, 0.0, 0.0, MIN_VERTICAL_DENSITY);
         let grabbed_y = compact.track.center().y;
         let expanded =
             scrollbar_geometry_for_density_at_fraction(rect, 0.0, MIN_VERTICAL_DENSITY * 2.0, 0.5);
 
+        assert_close(expanded.thumb.height(), expanded.track.height());
         assert_close(expanded.thumb.center().y, grabbed_y);
         assert_close(scrollbar_fraction_at_grab(expanded, grabbed_y, 0.5), 0.5);
+    }
+
+    #[test]
+    fn density_thumb_uses_the_scrollable_height_below_pinned_tracks() {
+        let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(22.0, 600.0));
+        let geometry = scrollbar_geometry_for_density_in_viewport(
+            rect,
+            600.0,
+            0.0,
+            MIN_VERTICAL_DENSITY,
+            300.0,
+        );
+        let expected_fraction = 300.0 / (300.0 + 600.0);
+        assert_close(
+            geometry.thumb.height(),
+            geometry.track.height() * expected_fraction,
+        );
     }
 }

@@ -4,31 +4,43 @@ use super::super::*;
 fn reference_aware_read_modes_request_context_before_base_detail() {
     assert!(alignment_query_needs_reference(
         AlignmentColorMode::Bisulfite(BisulfiteContext::Cg),
-        DetailLevel::Reads
+        DetailLevel::Reads,
+        5.0,
     ));
     assert!(alignment_query_needs_reference(
         AlignmentColorMode::None,
-        DetailLevel::Bases
+        DetailLevel::Bases,
+        0.125,
+    ));
+    assert!(alignment_query_needs_reference(
+        AlignmentColorMode::None,
+        DetailLevel::Reads,
+        MAXIMUM_BASE_MARK_BASES_PER_PIXEL,
     ));
     assert!(alignment_query_needs_reference(
         AlignmentColorMode::Ultima(UltimaDisplayOptions::default()),
-        DetailLevel::Reads
+        DetailLevel::Reads,
+        5.0,
     ));
     assert!(!alignment_query_needs_reference(
         AlignmentColorMode::None,
-        DetailLevel::Reads
+        DetailLevel::Reads,
+        MAXIMUM_BASE_MARK_BASES_PER_PIXEL + 0.01,
     ));
     assert!(!alignment_query_needs_reference(
         AlignmentColorMode::Bisulfite(BisulfiteContext::Cg),
-        DetailLevel::Regional
+        DetailLevel::Regional,
+        10.0,
     ));
     assert!(!alignment_query_needs_reference(
         AlignmentColorMode::SmrtKinetics(SmrtKineticsMode::CcsForwardIpd),
-        DetailLevel::Reads
+        DetailLevel::Reads,
+        5.0,
     ));
     assert!(!alignment_query_needs_reference(
         AlignmentColorMode::Ultima(UltimaDisplayOptions::default()),
-        DetailLevel::Regional
+        DetailLevel::Regional,
+        10.0,
     ));
 }
 
@@ -669,6 +681,8 @@ fn session_panel_workspace_restores_order_active_locus_and_width() {
     ];
     session.panels[0].vertical_scroll_points = 73.0;
     session.panels[1].vertical_scroll_points = 145.0;
+    session.panels[0].vertical_content_origin_points = 33.0;
+    session.panels[1].vertical_content_origin_points = 105.0;
     session.active_panel = PanelId::new(4);
 
     let workspace = PanelWorkspace::from_session(&session, 800.0, 120.0).unwrap();
@@ -680,6 +694,9 @@ fn session_panel_workspace_restores_order_active_locus_and_width() {
     assert_eq!(workspace.active().id, PanelId::new(4));
     assert!((workspace.panels[0].vertical_scroll_points - 73.0).abs() < f32::EPSILON);
     assert!((workspace.panels[1].vertical_scroll_points - 145.0).abs() < f32::EPSILON);
+    assert!((workspace.panels[0].vertical_content_origin_points - 33.0).abs() < f32::EPSILON);
+    assert!((workspace.panels[1].vertical_content_origin_points - 105.0).abs() < f32::EPSILON);
+    assert!((workspace.panels[1].effective_vertical_scroll_points() - 40.0).abs() < f32::EPSILON);
     assert_eq!(workspace.active().contig_name, "chr2");
     assert_eq!(workspace.active().viewport.interval().start(), 500);
     assert_eq!(workspace.active().viewport.interval().end(), 800);

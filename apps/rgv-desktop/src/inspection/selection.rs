@@ -122,7 +122,7 @@ impl Viewer {
             self.panels.active_mut().selected_chain = selected_chain;
         }
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
-        let content_y = cursor_y + self.panels.active().vertical_scroll_points;
+        let content_y = cursor_y + self.panels.active().effective_vertical_scroll_points();
         self.panels.active_mut().selected_track = self
             .panels
             .active()
@@ -152,7 +152,7 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().vertical_scroll_points;
+        let content_y = y + self.panels.active().effective_vertical_scroll_points();
         let frame = self.panels.active().track_frames.iter().find(|frame| {
             matches!(frame.kind, TrackKind::Feature | TrackKind::GeneModel)
                 && content_y >= frame.top
@@ -224,7 +224,7 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().vertical_scroll_points;
+        let content_y = y + self.panels.active().effective_vertical_scroll_points();
         let frame = self.panels.active().track_frames.iter().find(|frame| {
             frame.kind == TrackKind::Variant && content_y >= frame.top && content_y < frame.bottom
         })?;
@@ -284,7 +284,7 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().vertical_scroll_points;
+        let content_y = y + self.panels.active().effective_vertical_scroll_points();
         let frame = self.panels.active().track_frames.iter().find(|frame| {
             frame.kind == TrackKind::Gwas && content_y >= frame.top && content_y < frame.bottom
         })?;
@@ -333,7 +333,7 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().vertical_scroll_points;
+        let content_y = y + self.panels.active().effective_vertical_scroll_points();
         let frame = self.panels.active().track_frames.iter().find(|frame| {
             frame.kind == TrackKind::Quantitative
                 && content_y >= frame.top
@@ -421,7 +421,7 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().vertical_scroll_points;
+        let content_y = y + self.panels.active().effective_vertical_scroll_points();
         let frame = self.panels.active().track_frames.iter().find(|frame| {
             frame.kind == TrackKind::Mutation && content_y >= frame.top && content_y < frame.bottom
         })?;
@@ -483,7 +483,7 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().vertical_scroll_points;
+        let content_y = y + self.panels.active().effective_vertical_scroll_points();
         let frame = self.panels.active().track_frames.iter().find(|frame| {
             frame.kind == TrackKind::CopyNumber
                 && content_y >= frame.top
@@ -558,7 +558,7 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().vertical_scroll_points;
+        let content_y = y + self.panels.active().effective_vertical_scroll_points();
         let frame = self.panels.active().track_frames.iter().find(|frame| {
             frame.kind == TrackKind::Interaction
                 && content_y >= frame.top
@@ -943,7 +943,7 @@ impl Viewer {
             &self.panels.active().track_frames,
             "Modifications",
             y,
-            self.panels.active().vertical_scroll_points,
+            self.panels.active().effective_vertical_scroll_points(),
         )?;
         let query = self.alignment_query_for_track(track_id)?;
         modification_position_from_pointer(
@@ -967,7 +967,7 @@ impl Viewer {
             &self.panels.active().track_frames,
             "Coverage",
             y,
-            self.panels.active().vertical_scroll_points,
+            self.panels.active().effective_vertical_scroll_points(),
         )?;
         let query = self.alignment_query_for_track(track_id)?;
         pileup_position_from_pointer(
@@ -991,7 +991,7 @@ impl Viewer {
             &self.panels.active().track_frames,
             "Sashimi",
             y,
-            self.panels.active().vertical_scroll_points,
+            self.panels.active().effective_vertical_scroll_points(),
         )?;
         let query = self.alignment_query_for_track(track_id)?;
         let local_x = f64::from(x - panel_rect.left());
@@ -1016,7 +1016,7 @@ impl Viewer {
         if !panel_rect.contains(egui::pos2(x, y)) {
             return None;
         }
-        let content_y = y + self.panels.active().vertical_scroll_points;
+        let content_y = y + self.panels.active().effective_vertical_scroll_points();
         let track_id = alignment_track_at_content_y(&self.panels.active().track_frames, content_y)?;
         if track_id != self.primary_alignment_track_id() {
             let track = self
