@@ -14,20 +14,21 @@ use rgv_core::{
 };
 use rgv_core::{JunctionDisplayMode, SashimiCountMode};
 use rgv_hts::{
-    AlignmentFlags, AlignmentQuery, AuxValue, BisulfiteObservation, CigarOp, CigarOpKind,
-    ImplicitModificationMode, JunctionEvidence, JunctionSummary, ModificationBin, ModificationCode,
-    ModificationSummary, PairClassification, PairOrientation, PileupBin, PileupSummary,
-    ReferenceSlice, SbxInsertionState, SbxTailBounds, SequenceView, SmrtKineticsSeries,
-    TemplateLengthBounds, UltimaEvidenceError, UltimaRecordAnalysis, UltimaTagOrientation,
-    aligned_position_for_sequencer_position, analyze_ultima_record_with_tag_orientation,
-    bisulfite_strand_is_reverse, classify_bisulfite_observation, classify_sbx_insertion,
-    decode_modified_bases_parts, decode_smrt_kinetics, pair_evidence_at, sbx_tail_bounds,
-    sequencer_base_matches, smrt_kinetics_tag,
+    AlignedBaseClassification, AlignmentFlags, AlignmentQuery, AuxValue, BisulfiteObservation,
+    CigarOp, CigarOpKind, ImplicitModificationMode, JunctionEvidence, JunctionSummary,
+    ModificationBin, ModificationCode, ModificationSummary, PairClassification, PairOrientation,
+    PileupBin, PileupSummary, ReferenceSlice, SbxInsertionState, SbxTailBounds, SequenceView,
+    SmrtKineticsSeries, TemplateLengthBounds, UltimaEvidenceError, UltimaRecordAnalysis,
+    UltimaTagOrientation, aligned_position_for_sequencer_position,
+    analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse, classify_aligned_base,
+    classify_bisulfite_observation, classify_sbx_insertion, decode_modified_bases_parts,
+    decode_smrt_kinetics, pair_evidence_at, sbx_tail_bounds, sequencer_base_matches,
+    smrt_kinetics_tag,
 };
 
 use crate::{
-    DisplayList, RectPrimitive, RectShape, Rgba, TextPrimitive, read_detail_object_id,
-    record_object_id,
+    DisplayList, RectPrimitive, RectShape, Rgba, TextPrimitive, junction_arc_stroke_width,
+    read_detail_object_id, record_object_id,
 };
 
 pub const MAX_HIDDEN_MODIFICATION_CODES: usize = 8;
@@ -738,7 +739,7 @@ use coverage::{
     add_spans,
 };
 mod reads;
-use reads::add_reads;
+use reads::{add_read_direction_terminals, add_reads, aligned_reference_blocks};
 mod cigar;
 #[cfg(test)]
 use cigar::add_modified_base_calls;

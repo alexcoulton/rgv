@@ -22,10 +22,10 @@ mod tracks;
 mod ultima;
 
 pub use alignment::{
-    AlignmentBatch, AlignmentFlags, AlignmentHeaderMetadata, AlignmentReadGroup, AlignmentRecord,
-    AlignmentReferenceSequence, AuxField, AuxValue, CigarOp, CigarOpKind,
-    MAX_ALIGNMENT_READ_GROUPS, PackedRecordError, SequenceData, SequenceView, UltimaTagOrientation,
-    recognize_assembly_from_header,
+    AlignedBaseClassification, AlignmentBatch, AlignmentFlags, AlignmentHeaderMetadata,
+    AlignmentReadGroup, AlignmentRecord, AlignmentReferenceSequence, AuxField, AuxValue, CigarOp,
+    CigarOpKind, MAX_ALIGNMENT_READ_GROUPS, PackedRecordError, SequenceData, SequenceView,
+    UltimaTagOrientation, classify_aligned_base, recognize_assembly_from_header,
 };
 pub use bisulfite::{
     BisulfiteObservation, BisulfiteSummary, bisulfite_context_matches, bisulfite_strand_is_reverse,

@@ -1,5 +1,8 @@
 use super::super::*;
-use rgv_layout::{Direction, RectShape, breakend_bracket_dimensions, read_arrow_head_width};
+use rgv_layout::{
+    Direction, RectShape, breakend_bracket_dimensions, junction_arc_stroke_width,
+    read_arrow_head_width,
+};
 
 pub(crate) fn cropped_display_list(display: &DisplayList, bounds: egui::Rect) -> DisplayList {
     let mut cropped = DisplayList::default();
@@ -9,6 +12,13 @@ pub(crate) fn cropped_display_list(display: &DisplayList, bounds: egui::Rect) ->
         let right = (rectangle.x + rectangle.width).min(bounds.right());
         let bottom = (rectangle.y + rectangle.height).min(bounds.bottom());
         if right > left && bottom > top {
+            let clipped = top > rectangle.y
+                || bottom < rectangle.y + rectangle.height
+                || left > rectangle.x
+                || right < rectangle.x + rectangle.width;
+            if clipped && rectangle.shape.is_junction_arc() {
+                continue;
+            }
             cropped.rectangles.push(RectPrimitive {
                 x: left - bounds.left(),
                 y: top - bounds.top(),
@@ -120,7 +130,32 @@ pub(crate) fn display_list_svg_export(
         let green = (rectangle.color.green.clamp(0.0, 1.0) * 255.0).round() as u8;
         let blue = (rectangle.color.blue.clamp(0.0, 1.0) * 255.0).round() as u8;
         let opacity = rectangle.color.alpha.clamp(0.0, 1.0);
-        let element = if matches!(
+        let element = if rectangle.shape.is_junction_arc() {
+            let left = rectangle.x;
+            let right = rectangle.x + rectangle.width;
+            let top = rectangle.y;
+            let bottom = rectangle.y + rectangle.height;
+            let shoulder = rectangle.width * 0.18;
+            let stroke_width = junction_arc_stroke_width(rectangle.height);
+            let (start_y, control_y, end_y) = if rectangle.shape == RectShape::JunctionArcUp {
+                (
+                    bottom - stroke_width * 0.5,
+                    top + stroke_width * 0.5,
+                    bottom - stroke_width * 0.5,
+                )
+            } else {
+                (
+                    top + stroke_width * 0.5,
+                    bottom - stroke_width * 0.5,
+                    top + stroke_width * 0.5,
+                )
+            };
+            format!(
+                "<path d=\"M {left:.2} {start_y:.2} C {:.2} {control_y:.2}, {:.2} {control_y:.2}, {right:.2} {end_y:.2}\" fill=\"none\" stroke=\"rgb({red},{green},{blue})\" stroke-opacity=\"{opacity:.3}\" stroke-width=\"{stroke_width:.2}\" stroke-linecap=\"round\"/>\n",
+                left + shoulder,
+                right - shoulder,
+            )
+        } else if matches!(
             rectangle.shape,
             RectShape::BreakendJoinBefore | RectShape::BreakendJoinAfter
         ) {
@@ -308,13 +343,14 @@ pub(crate) fn automation_alignments_export(
         let _ = push_automation_export_line(
             &mut output,
             &format!(
-                "# track_provenance\t{}\t{}\trecords_seen={}\trecords_eligible={}\trecords_retained={}\tretained_truncated={}\tsecondary_filtered={}\tsupplementary_filtered={}\tuser_filtered={}\tduplicate_filtered={}\tqc_failed_filtered={}",
+                "# track_provenance\t{}\t{}\trecords_seen={}\trecords_eligible={}\trecords_retained={}\tretained_truncated={}\tunmapped_ignored={}\tsecondary_filtered={}\tsupplementary_filtered={}\tuser_filtered={}\tduplicate_filtered={}\tqc_failed_filtered={}",
                 track.id.get(),
                 sanitized_tsv_field(&track.name, 4_096),
                 query.stats.records_seen,
                 query.stats.records_eligible,
                 query.batch.len(),
                 query.stats.truncated,
+                query.stats.records_filtered_unmapped,
                 query.stats.records_filtered_secondary,
                 query.stats.records_filtered_supplementary,
                 query.stats.records_filtered_user,

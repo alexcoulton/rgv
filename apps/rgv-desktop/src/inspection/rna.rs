@@ -417,14 +417,39 @@ pub(crate) fn sashimi_svg_export(
         let red = (rectangle.color.red.clamp(0.0, 1.0) * 255.0).round() as u8;
         let green = (rectangle.color.green.clamp(0.0, 1.0) * 255.0).round() as u8;
         let blue = (rectangle.color.blue.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let element = format!(
-            "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"rgb({red},{green},{blue})\" fill-opacity=\"{:.3}\"/>\n",
-            rectangle.x,
-            rectangle.y,
-            rectangle.width,
-            rectangle.height,
-            rectangle.color.alpha.clamp(0.0, 1.0),
-        );
+        let opacity = rectangle.color.alpha.clamp(0.0, 1.0);
+        let element = if rectangle.shape.is_junction_arc() {
+            let left = rectangle.x;
+            let right = rectangle.x + rectangle.width;
+            let top = rectangle.y;
+            let bottom = rectangle.y + rectangle.height;
+            let shoulder = rectangle.width * 0.18;
+            let stroke_width = rgv_layout::junction_arc_stroke_width(rectangle.height);
+            let (start_y, control_y, end_y) =
+                if rectangle.shape == rgv_layout::RectShape::JunctionArcUp {
+                    (
+                        bottom - stroke_width * 0.5,
+                        top + stroke_width * 0.5,
+                        bottom - stroke_width * 0.5,
+                    )
+                } else {
+                    (
+                        top + stroke_width * 0.5,
+                        bottom - stroke_width * 0.5,
+                        top + stroke_width * 0.5,
+                    )
+                };
+            format!(
+                "<path d=\"M {left:.2} {start_y:.2} C {:.2} {control_y:.2}, {:.2} {control_y:.2}, {right:.2} {end_y:.2}\" fill=\"none\" stroke=\"rgb({red},{green},{blue})\" stroke-opacity=\"{opacity:.3}\" stroke-width=\"{stroke_width:.2}\" stroke-linecap=\"round\"/>\n",
+                left + shoulder,
+                right - shoulder,
+            )
+        } else {
+            format!(
+                "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"rgb({red},{green},{blue})\" fill-opacity=\"{opacity:.3}\"/>\n",
+                rectangle.x, rectangle.y, rectangle.width, rectangle.height,
+            )
+        };
         if output
             .len()
             .saturating_add(element.len())

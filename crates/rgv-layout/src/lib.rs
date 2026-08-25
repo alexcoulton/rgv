@@ -20,7 +20,8 @@ pub use alignment_layout::{
 };
 pub use display::{
     Direction, DisplayList, READ_DETAIL_OBJECT_BIT, RectPrimitive, RectShape, Rgba, TextPrimitive,
-    breakend_bracket_dimensions, read_arrow_head_width, read_detail_object_id, record_object_id,
+    breakend_bracket_dimensions, junction_arc_stroke_width, read_arrow_head_width,
+    read_detail_object_id, record_object_id,
 };
 pub use genome_context::{
     CoordinateRulerLayout, CoordinateRulerOptions, IdeogramLayout, IdeogramSegment, RulerTick,

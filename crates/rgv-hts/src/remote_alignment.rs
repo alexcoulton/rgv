@@ -545,6 +545,10 @@ where
         }
         match eligibility(&record, header, options)? {
             Eligibility::Eligible => {}
+            Eligibility::Unmapped => {
+                stats.records_filtered_unmapped = stats.records_filtered_unmapped.saturating_add(1);
+                continue;
+            }
             Eligibility::Secondary => {
                 stats.records_filtered_secondary =
                     stats.records_filtered_secondary.saturating_add(1);
@@ -959,6 +963,7 @@ fn cancelled_query(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Eligibility {
     Eligible,
+    Unmapped,
     Secondary,
     Supplementary,
     UserFilter { duplicate: bool, qc_failed: bool },
@@ -970,6 +975,9 @@ fn eligibility(
     options: &QueryOptions,
 ) -> Result<Eligibility, AlignmentError> {
     let flags = record.flags()?.bits();
+    if flags & 0x4 != 0 {
+        return Ok(Eligibility::Unmapped);
+    }
     if !options.include_secondary && flags & 0x100 != 0 {
         return Ok(Eligibility::Secondary);
     }
@@ -1675,6 +1683,40 @@ mod tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(value).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn placed_unmapped_record_is_ineligible_before_all_visibility_filters() {
+        let header = sam::Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZero::new(1_000).unwrap()),
+            )
+            .build();
+        let record = RecordBuf::builder()
+            .set_name("placed-unmapped")
+            .set_flags(Flags::from_bits_truncate(0x04 | 0x100 | 0x800))
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::try_from(101).unwrap())
+            .set_mapping_quality(MappingQuality::new(60).unwrap())
+            .set_cigar(
+                [Op::new(CigarKind::SequenceMatch, 20)]
+                    .into_iter()
+                    .collect(),
+            )
+            .set_sequence(Sequence::from(b"ACGTACGTACGTACGTACGT".as_slice()))
+            .set_quality_scores(QualityScores::from(vec![35; 20]))
+            .build();
+        let options = QueryOptions {
+            include_secondary: true,
+            include_supplementary: true,
+            ..QueryOptions::default()
+        };
+
+        assert_eq!(
+            eligibility(&record, &header, &options).unwrap(),
+            Eligibility::Unmapped
+        );
     }
 
     fn assert_mismatched_cram_reference_is_rejected(

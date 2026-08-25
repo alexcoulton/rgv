@@ -167,17 +167,26 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   When zooming beyond the loaded interval, overlapping retained reads and coverage remain visible
   while throttled background refinements expand the query; release commits one final query.
 - Drag horizontally to pan and use the wheel or trackpad to zoom around the pointer.
-- Scroll over the fixed track-label gutter, drag the right-edge scrollbar, or hold Shift while using
-  the wheel/trackpad to move through vertically stacked tracks and deep read rows.
-- The right overview is also an Ableton-style two-axis control: drag up/down to scroll and
-  left/right to compact/expand track heights and read rows. Diagonal motion combines both actions,
+- Annotation tracks occupy the upper pane and reads occupy the lower pane. Every annotation row has
+  an eye control for collapsing or expanding it. Configurable auxiliary annotations expose thin
+  horizontal resize boundaries in the left label gutter; the pointer changes to a vertical-resize
+  cursor at a boundary. Drag the horizontal divider across the genomic canvas to allocate more
+  height to either the annotation pane or the read pane. Annotation heights do not change with
+  read density. Every track header has a visible gear button that opens its settings; right-clicking
+  the header opens the same track menu. The read-pane eye hides or restores the Reads lane without
+  collapsing the complete alignment track.
+- The right edge contains two scrollbar segments on the same x-axis. The upper segment is a
+  conventional annotation-stack scrollbar; the lower segment is the read-stack overview and
+  density control. Scrolling over either pane moves only that pane, and the two offsets are saved
+  independently in project sessions.
+- The lower read overview is an Ableton-style two-axis control: drag up/down to scroll and
+  left/right to compact/expand read rows. Diagonal motion combines both actions,
   density changes retain the row beneath the exact grabbed point, and expansion creates a real
   density-scaled vertical camera even when the loaded rows are sparse. The thumb and coloured
   activity bands share that camera's coordinates: moving the thumb away from an occupied band
   moves those rows out of view instead of leaving an inert preview behind. Read rows can expand to
-  roughly 64 pixels for close inspection; auxiliary tracks use a gentler scale above their normal
-  size so they do not consume the entire canvas. It uses the same captured-pointer behavior and
-  visual language as the chromosome overview. Clicking the rail jumps to that vertical position.
+  roughly 64 pixels for close inspection. It uses the same captured-pointer behavior and visual
+  language as the chromosome overview. Clicking the lower rail jumps to that read position.
 - Arrow Left/Right pans by ten percent; `+` and `-` zoom around the centre.
 - Home returns to the initial locus; Alt+Left/Right traverses locus history.
 - `Ctrl/Cmd+L` focuses the locus field and Enter navigates.
@@ -206,11 +215,19 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   navigate. **Open active segment in new panel** retains the origin locus; **Open all segments in
   panels** opens as many linked loci as the bounded panel workspace permits and reports the cap.
   Malformed entries, invalid tag types, and the 64-segment cap are reported rather than hidden.
-- Click an insertion, deletion, reference skip, soft/hard clip, or padding marker to add semantic
-  event details to the read inspector. Insertions and soft clips include read positions, a bounded
-  sequence preview, mean event quality, and a copy-sequence action. Preview generation is capped at
-  120 bases; copying is capped at one million bases and the inspector reports when a separate full
-  export is required. Reverse-strand event sequence and quality order match the displayed read.
+- Click an individual visible substitution, insertion, deletion, reference skip, soft/hard clip, or
+  padding marker to add semantic event details to the selected read's inspector. A substitution
+  reports its exact one-based genomic locus, aligned-read position, reference and observed bases,
+  base quality, and whether it came from explicit CIGAR `X` or read/reference comparison. This
+  per-base hit testing is available whenever coloured base marks are rendered, including the
+  intermediate level where letters remain suppressed. If loaded read/reference bases contradict
+  an explicit CIGAR `X` or `=` assertion, RGV renders a distinct warning marker instead of a
+  nucleotide-coloured substitution; selecting it reports both the assertion and the observed
+  comparison. Insertions and soft clips include read
+  positions, a bounded sequence preview, mean event quality, and a copy-sequence action. Preview
+  generation is capped at 120 bases; copying is capped at one million bases and the inspector
+  reports when a separate full export is required. Reverse-strand event sequence and quality order
+  match the displayed read.
 - `N` and `P` select the next or previous visible read without using the pointer. Select a track in
   the label gutter and press Enter to open its settings.
 - **Open inspectors on** chooses the default locked click behavior or semantic hover activation.
@@ -528,6 +545,8 @@ range. Changing linear versus signed-log scaling on one member updates the compl
 saved session cannot restore incompatible axes. Clear **Overlay with group** to separate a track;
 an optional scale group shares an axis without overlaying geometry. Overlay member labels are
 bounded to the available gutter space, with an explicit omitted-member count for large groups.
+The overlay header eye shows or hides every member atomically; each visible member row also has its
+own eye for independently showing or hiding that layer within the composite.
 
 BEDPE and UCSC 18-column interact files render intra-chromosomal relationships as score-scaled arcs
 or endpoint blocks. Inter-chromosomal records use labelled partner markers. The inspector preserves

@@ -11,8 +11,13 @@ pub const GENOME_OVERVIEW_BINS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenomeOverviewData {
+    /// Exact depth loaded from alignment records.
     pub bins: Vec<f32>,
+    /// Bins for which record-derived depth is authoritative, including zero.
     pub observed: Vec<bool>,
+    /// Coarse occupancy inferred from BAM/CRAM index chunks. Index bins locate
+    /// candidate file chunks, not the exact span of the records in them.
+    pub estimated_bins: Vec<f32>,
 }
 
 impl Default for GenomeOverviewData {
@@ -20,6 +25,7 @@ impl Default for GenomeOverviewData {
         Self {
             bins: vec![0.0; GENOME_OVERVIEW_BINS],
             observed: vec![false; GENOME_OVERVIEW_BINS],
+            estimated_bins: vec![0.0; GENOME_OVERVIEW_BINS],
         }
     }
 }
@@ -44,8 +50,8 @@ impl GenomeOverviewData {
                 .copied()
                 .max()
                 .unwrap_or_default() as f32;
-            self.bins[target] = self.bins[target].max(density.ln_1p() / denominator);
-            self.observed[target] = true;
+            self.estimated_bins[target] =
+                self.estimated_bins[target].max(density.ln_1p() / denominator);
         }
     }
 
@@ -58,6 +64,10 @@ impl GenomeOverviewData {
         {
             *density = density.max(*other_density);
             *observed |= *other_observed;
+        }
+        for (estimate, other_estimate) in self.estimated_bins.iter_mut().zip(&other.estimated_bins)
+        {
+            *estimate = estimate.max(*other_estimate);
         }
     }
 
@@ -185,7 +195,7 @@ pub fn paint_genome_context(
         )
         .on_hover_cursor(egui::CursorIcon::AllScroll)
         .on_hover_text(
-            "Coverage/read density overview · drag left/right to pan · drag down/up to zoom in/out · double-click to show all",
+            "Read overview: blue is exact loaded coverage; grey ticks are coarse index estimates · drag left/right to pan · drag down/up to zoom in/out · double-click to show all",
         );
     let visible_interval = viewport.interval();
     overview_response.widget_info(|| {
@@ -356,30 +366,35 @@ pub fn paint_genome_context(
 }
 
 fn paint_genome_overview_data(painter: &egui::Painter, rect: Rect, overview: &GenomeOverviewData) {
-    if overview.bins.is_empty() || overview.bins.len() != overview.observed.len() {
+    if overview.bins.is_empty()
+        || overview.bins.len() != overview.observed.len()
+        || overview.bins.len() != overview.estimated_bins.len()
+    {
         return;
     }
     let bin_width = rect.width() / overview.bins.len() as f32;
-    let mut run_start = None;
-    for (index, observed) in overview
-        .observed
-        .iter()
-        .copied()
-        .chain(std::iter::once(false))
-        .enumerate()
-    {
-        if observed && run_start.is_none() {
-            run_start = Some(index);
-        } else if !observed && let Some(start) = run_start.take() {
-            painter.rect_filled(
-                Rect::from_min_max(
-                    pos2(rect.left() + start as f32 * bin_width, rect.top()),
-                    pos2(rect.left() + index as f32 * bin_width, rect.bottom()),
-                ),
-                0.0,
-                Color32::from_rgba_unmultiplied(26, 118, 152, 32),
-            );
+    // Keep index-only occupancy visibly distinct and deliberately slight. A
+    // BAI bin can cover 16 kb even when its reads occupy only a few bases, so
+    // painting it as full-height coverage materially exaggerates data extent.
+    for (index, estimate) in overview.estimated_bins.iter().copied().enumerate() {
+        if estimate <= f32::EPSILON || overview.observed[index] {
+            continue;
         }
+        let height = 1.0 + estimate.clamp(0.0, 1.0) * 2.0;
+        painter.rect_filled(
+            Rect::from_min_max(
+                pos2(
+                    rect.left() + index as f32 * bin_width,
+                    rect.bottom() - height,
+                ),
+                pos2(
+                    rect.left() + (index + 1) as f32 * bin_width + 0.5,
+                    rect.bottom(),
+                ),
+            ),
+            0.0,
+            Color32::from_rgba_unmultiplied(85, 101, 108, 105),
+        );
     }
     for (index, density) in overview.bins.iter().copied().enumerate() {
         if density <= f32::EPSILON {
@@ -492,6 +507,7 @@ mod tests {
         let mut overview = GenomeOverviewData {
             bins: vec![0.0; 10],
             observed: vec![false; 10],
+            estimated_bins: vec![0.0; 10],
         };
         overview.add_depths(1_000, interval, [0, 10, 100].into_iter());
         overview.normalize_logarithmically();
@@ -512,9 +528,28 @@ mod tests {
 
         overview.add_index_density(&density);
 
-        assert!(overview.observed.iter().all(|observed| *observed));
-        assert!(overview.bins[16] > 0.0);
-        assert!((overview.bins[192] - 1.0).abs() < f32::EPSILON);
-        assert!(overview.bins[100].abs() < f32::EPSILON);
+        assert!(overview.observed.iter().all(|observed| !*observed));
+        assert!(overview.estimated_bins[16] > 0.0);
+        assert!((overview.estimated_bins[192] - 1.0).abs() < f32::EPSILON);
+        assert!(overview.estimated_bins[100].abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn exact_loaded_depth_masks_a_coarse_index_estimate() {
+        let interval =
+            rgv_core::GenomicInterval::new(rgv_core::ContigId::new(0), 100, 400).unwrap();
+        let mut overview = GenomeOverviewData {
+            bins: vec![0.0; 10],
+            observed: vec![false; 10],
+            estimated_bins: vec![1.0; 10],
+        };
+
+        overview.add_depths(1_000, interval, [0, 10, 0].into_iter());
+
+        assert!(overview.observed[1..4].iter().all(|observed| *observed));
+        assert!(overview.bins[1].abs() < f32::EPSILON);
+        assert_eq!(overview.bins[2], 10.0);
+        assert!(overview.bins[3].abs() < f32::EPSILON);
+        assert_eq!(overview.estimated_bins, vec![1.0; 10]);
     }
 }

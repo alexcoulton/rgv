@@ -406,6 +406,19 @@ impl Viewer {
             .active()
             .vertical_scroll_points
             .clamp(0.0, maximum_vertical_scroll);
+        let maximum_annotation_scroll = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(0.0, |cache| {
+                (cache.annotation_content_bottom - cache.annotation_clip_bottom).max(0.0)
+            });
+        let mut annotation_scroll_points = self
+            .panels
+            .active()
+            .annotation_scroll_points
+            .clamp(0.0, maximum_annotation_scroll);
         let mut clear_recent_requested = false;
         let mut recent_alignment_requested = None;
         let mut recent_session_requested = None;
@@ -418,13 +431,35 @@ impl Viewer {
             .scroll_display_cache
             .as_ref()
             .map(|cache| cache.overview.clone());
+        let annotation_scrollbar_overview = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map(|cache| cache.annotation_overview.clone());
+        let annotation_clip_top = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                cache.annotation_clip_top
+            });
+        let annotation_clip_bottom = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                cache.annotation_clip_bottom
+            });
         let vertical_camera_viewport_height = self
             .panels
             .active()
             .scroll_display_cache
             .as_ref()
             .map_or(self.canvas_geometry.viewport.height(), |cache| {
-                (self.canvas_geometry.viewport.bottom() - cache.scroll_clip_top).max(1.0)
+                (cache.scroll_clip_bottom - cache.scroll_clip_top).max(1.0)
             });
         let vertical_scroll_preview = self
             .vertical_overview_drag
@@ -497,7 +532,6 @@ impl Viewer {
                         });
                     if let Some(index_bins) = index_bins {
                         genome_overview.add_index_density(index_bins);
-                        continue;
                     }
                     let query = track
                         .projection(panel.id)
@@ -1327,7 +1361,10 @@ impl Viewer {
                     ui,
                     geometry,
                     &track_frames,
+                    self.panels.active().annotation_scroll_points,
                     self.panels.active().effective_vertical_scroll_points(),
+                    annotation_clip_top,
+                    annotation_clip_bottom,
                     selected_track,
                     &self.panels.active().selected_alignment_tracks,
                 );
@@ -1383,15 +1420,39 @@ impl Viewer {
                         );
                     }
                 }
+                let split_y = annotation_clip_bottom
+                    .clamp(geometry.scrollbar.top() + 1.0, geometry.scrollbar.bottom() - 1.0);
+                let annotation_scrollbar = egui::Rect::from_min_max(
+                    geometry.scrollbar.min,
+                    egui::pos2(geometry.scrollbar.right(), split_y),
+                );
+                let read_scrollbar = egui::Rect::from_min_max(
+                    egui::pos2(geometry.scrollbar.left(), split_y),
+                    geometry.scrollbar.max,
+                );
+                let _annotation_scrollbar_interaction = ui::paint_annotation_scrollbar(
+                    ui,
+                    annotation_scrollbar,
+                    maximum_annotation_scroll,
+                    &mut annotation_scroll_points,
+                    annotation_scrollbar_overview.as_ref(),
+                );
                 scrollbar_interaction = ui::paint_vertical_scrollbar(
                     ui,
-                    geometry.scrollbar,
+                    read_scrollbar,
                     maximum_vertical_scroll,
                     &mut vertical_scroll_points,
                     alignment_density,
                     vertical_camera_viewport_height,
                     vertical_scroll_preview,
                     scrollbar_overview.as_ref(),
+                );
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(geometry.scrollbar.left(), split_y),
+                        egui::pos2(geometry.scrollbar.right(), split_y),
+                    ],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(125)),
                 );
             });
             if let Some(key) = rendered_track_settings_panel {
@@ -2267,6 +2328,15 @@ impl Viewer {
             let change = vertical_scroll_points - self.panels.active().vertical_scroll_points;
             self.scroll_tracks_by(change);
         }
+        if (annotation_scroll_points - self.panels.active().annotation_scroll_points).abs()
+            > f32::EPSILON
+        {
+            self.panels.active_mut().annotation_scroll_points = annotation_scroll_points;
+            if self.synthetic || !self.refresh_active_panel_scroll_display() {
+                self.display_dirty = true;
+            }
+            self.window.request_redraw();
+        }
         if let Some(id) = editing_alignment_id
             && let Some((_, name, visible, collapsed, height)) = alignment_track_controls
                 .iter_mut()
@@ -2349,7 +2419,8 @@ impl Viewer {
         let alignment_track_move = track_effects.alignment_move;
         let alignment_subtracks_to_toggle = track_effects.alignment_subtracks_to_toggle;
         track_move = track_effects.auxiliary_move.or(track_move);
-        let mut alignment_configuration_changed = false;
+        let mut alignment_configuration_changed =
+            track_effects.annotation_geometry_changed || track_effects.read_geometry_changed;
         let mut alignment_query_membership_changed = Vec::new();
         for (id, name, visible, collapsed, height) in alignment_track_controls {
             if let Some(track) = self
@@ -3162,8 +3233,7 @@ impl Viewer {
                 .coverage_scale_transform = coverage_scale_transform;
             self.primary_alignment_filters_mut()
                 .show_coverage_center_line = show_coverage_center_line;
-            self.primary_alignment_filters_mut().alignment_density =
-                alignment_density.clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);
+            self.set_shared_alignment_density(alignment_density);
             self.primary_alignment_filters_mut().read_base_display_mode = read_base_display_mode;
             self.primary_alignment_filters_mut()
                 .shade_read_bases_by_quality = shade_read_bases_by_quality;
@@ -3508,6 +3578,10 @@ impl Viewer {
                     apply_filter,
                 },
             );
+            if self.set_shared_alignment_density(alignment_density) {
+                self.rebuild_all_panel_displays();
+                self.display_dirty = true;
+            }
         }
         if !bulk_alignment_ids.is_empty()
             && (bulk_alignment_visibility.is_some() || bulk_alignment_collapsed.is_some())

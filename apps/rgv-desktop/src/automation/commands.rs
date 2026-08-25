@@ -1410,6 +1410,10 @@ impl Viewer {
                 let interval = panel.viewport.interval();
                 let maximum_scroll =
                     (panel.content_bottom_points - self.canvas_geometry.viewport.bottom()).max(0.0);
+                let maximum_annotation_scroll =
+                    panel.scroll_display_cache.as_ref().map_or(0.0, |cache| {
+                        (cache.annotation_content_bottom - cache.annotation_clip_bottom).max(0.0)
+                    });
                 let filters = self.primary_alignment_filters();
                 let query = self
                     .alignment_tracks
@@ -1465,6 +1469,8 @@ impl Viewer {
                                 .saturating_sub(query.stats.records_emitted)
                         }),
                         truncated: query.is_some_and(|query| query.stats.truncated),
+                        filtered_unmapped_items: query
+                            .map_or(0, |query| query.stats.records_filtered_unmapped),
                         filtered_secondary_items: query
                             .map_or(0, |query| query.stats.records_filtered_secondary),
                         filtered_supplementary_items: query
@@ -1507,6 +1513,8 @@ impl Viewer {
                     bases_per_pixel: panel.viewport.bases_per_pixel(),
                     vertical_scroll_points: panel.vertical_scroll_points,
                     maximum_vertical_scroll_points: maximum_scroll,
+                    annotation_scroll_points: panel.annotation_scroll_points,
+                    maximum_annotation_scroll_points: maximum_annotation_scroll,
                     render_generation: panel.generation_clock.current().get(),
                     settled: !panel.pending_queries.alignment
                         && !panel.pending_queries.reference
@@ -2122,7 +2130,7 @@ impl Viewer {
                             (MIN_VERTICAL_DENSITY..=MAX_VERTICAL_DENSITY).contains(&density),
                             "{key} must be between {MIN_VERTICAL_DENSITY} and {MAX_VERTICAL_DENSITY}"
                         );
-                        self.primary_alignment_filters_mut().alignment_density = density;
+                        self.set_shared_alignment_density(density);
                     }
                     "coverage_scale_maximum" => {
                         let maximum = automation_optional_u64(value, key)?
@@ -2210,11 +2218,6 @@ impl Viewer {
                         }
                         "collapsed" => track.collapsed = automation_bool(value, key)?,
                         "height" => {
-                            anyhow::ensure!(
-                                !matches!(track.kind, TrackKind::Mutation | TrackKind::CopyNumber),
-                                "{:?} track height is derived from its semantic rows",
-                                track.kind
-                            );
                             let height = automation_f32(value, key)?;
                             anyhow::ensure!(
                                 (40.0..=600.0).contains(&height),
@@ -2246,6 +2249,15 @@ impl Viewer {
                         anyhow::ensure!(scroll >= 0.0, "{key} must be non-negative");
                         panel.vertical_scroll_points =
                             scroll.min(panel.content_bottom_points.max(0.0));
+                    }
+                    "annotation_scroll_points" => {
+                        let scroll = automation_f32(value, key)?;
+                        anyhow::ensure!(scroll >= 0.0, "{key} must be non-negative");
+                        let maximum = panel.scroll_display_cache.as_ref().map_or(0.0, |cache| {
+                            (cache.annotation_content_bottom - cache.annotation_clip_bottom)
+                                .max(0.0)
+                        });
+                        panel.annotation_scroll_points = scroll.min(maximum);
                     }
                     _ => anyhow::bail!("unknown panel option {key}"),
                 }
@@ -2380,6 +2392,14 @@ impl Viewer {
                     "vertical_scroll_points",
                     &serde_json::json!(value),
                 )?,
+            AutomationSetting::AnnotationScrollPoints { panel_id, value } => self
+                .apply_automation_option(
+                    &AutomationOptionScope::Panel {
+                        panel_id: *panel_id,
+                    },
+                    "annotation_scroll_points",
+                    &serde_json::json!(value),
+                )?,
         }
         self.bump_workspace_revision();
         let workspace = self.automation_workspace_snapshot();
@@ -2390,6 +2410,11 @@ impl Viewer {
                 .iter()
                 .find(|panel| panel.id == *panel_id)
                 .map(|panel| serde_json::json!(panel.vertical_scroll_points)),
+            AutomationSetting::AnnotationScrollPoints { panel_id, .. } => workspace
+                .panels
+                .iter()
+                .find(|panel| panel.id == *panel_id)
+                .map(|panel| serde_json::json!(panel.annotation_scroll_points)),
             AutomationSetting::TrackHeight { track_id, .. } => workspace
                 .tracks
                 .iter()

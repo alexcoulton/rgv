@@ -13,7 +13,9 @@
         "start": 4900,
         "end": 5400
       },
-      "vertical_scroll_points": 0.0
+      "vertical_scroll_points": 0.0,
+      "annotation_scroll_points": 0.0,
+      "vertical_content_origin_points": 0.0
     }
   ],
   "active_panel": 1,
@@ -66,19 +68,20 @@
         "show_junction_labels": true,
         "show_reads": true,
         "coverage_scale_maximum": null,
+        "coverage_scale_transform": "linear",
         "show_coverage_center_line": true,
         "alignment_density": 1.0,
         "inspector_activation": "click",
         "read_base_display_mode": "mismatches",
         "shade_read_bases_by_quality": true,
         "minimum_indel_size": 1,
-        "minimum_event_label_size": 1,
+        "minimum_event_label_size": 10,
         "show_modified_bases": true,
         "show_modification_frequency": true,
         "minimum_modification_probability": 0,
         "modified_base_color_mode": "by_type",
         "hidden_modification_codes": [],
-        "include_secondary": true,
+        "include_secondary": false,
         "include_supplementary": true,
         "auxiliary_predicates": []
       },
@@ -91,6 +94,7 @@
     }
   },
   "genome_name": "RGV tagged single-cell truth",
+  "assembly_identity": null,
   "cytobands": null,
   "reference_reverse_complement": false,
   "reference_translation_frames": [],

@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "name": "RGV portable manual genome",
+  "assembly_identity": null,
   "reference": {
     "Local": {
       "path": "../../variants.fa"
@@ -24,5 +25,6 @@
         }
       }
     }
-  ]
+  ],
+  "asset_provenance": []
 }

@@ -7,6 +7,7 @@
 /igv_layout_gui.png
 /rgv_layout_gui.png
 /rgv_zoom_*.png
+/.rgv-mcp-artifacts/
 
 # HTSlib may cache this adjacent remote-test index in the crate working directory.
 /crates/rgv-hts/variants.bcf.csi

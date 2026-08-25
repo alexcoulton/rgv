@@ -130,6 +130,8 @@ impl Default for AlignmentOpenOptions {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryStats {
     pub records_seen: usize,
+    /// Unmapped records ignored even when an index returns a placed record.
+    pub records_filtered_unmapped: usize,
     /// Secondary records excluded by the dedicated visibility option.
     pub records_filtered_secondary: usize,
     /// Supplementary records excluded by the dedicated visibility option.
@@ -347,6 +349,10 @@ impl AlignmentSource for LocalAlignmentSource {
                 break;
             }
             let flags = AlignmentFlags::from_bits(record.flags());
+            if flags.is_unmapped() {
+                stats.records_filtered_unmapped += 1;
+                continue;
+            }
             if !options.include_secondary && flags.is_secondary() {
                 stats.records_filtered_secondary += 1;
                 continue;
@@ -723,6 +729,47 @@ mod tests {
 
     use super::*;
 
+    fn write_placed_unmapped_fixture(path: &Path) {
+        use rust_htslib::bam::{
+            Format, Header, Record, Writer,
+            header::HeaderRecord,
+            record::{Cigar, CigarString},
+        };
+
+        let mut header = Header::new();
+        header.push_record(
+            HeaderRecord::new(b"HD")
+                .push_tag(b"VN", "1.6")
+                .push_tag(b"SO", "coordinate"),
+        );
+        header.push_record(
+            HeaderRecord::new(b"SQ")
+                .push_tag(b"SN", "chr1")
+                .push_tag(b"LN", 1_000),
+        );
+        let mut writer = Writer::from_path(path, &header, Format::Bam).unwrap();
+        for (name, position, flags) in [
+            (b"mapped".as_slice(), 100, 0),
+            (b"placed-unmapped", 110, 0x4),
+        ] {
+            let mut record = Record::new();
+            record.set(
+                name,
+                Some(&CigarString(vec![Cigar::Equal(20)])),
+                b"ACGTACGTACGTACGTACGT",
+                &[35; 20],
+            );
+            record.set_tid(0);
+            record.set_pos(position);
+            record.set_mapq(60);
+            record.set_flags(flags);
+            writer.write(&record).unwrap();
+        }
+        drop(writer);
+        let index = PathBuf::from(format!("{}.bai", path.display()));
+        bam::index::build(path, Some(&index), bam::index::Type::Bai, 1).unwrap();
+    }
+
     #[test]
     fn modification_collection_participates_in_query_cache_identity() {
         let baseline = QueryOptions::default();
@@ -760,6 +807,38 @@ mod tests {
             .unwrap();
         assert!(query.stats.cancelled);
         assert!(query.batch.is_empty());
+    }
+
+    #[test]
+    fn placed_unmapped_records_do_not_contribute_genomic_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("placed-unmapped.bam");
+        write_placed_unmapped_fixture(&path);
+        let mut source =
+            LocalAlignmentSource::open(path, &AlignmentOpenOptions::default()).unwrap();
+        let query = source
+            .query(
+                GenomicInterval::new(ContigId::new(0), 90, 150).unwrap(),
+                QueryOptions {
+                    coverage_bins: NonZeroUsize::new(60).unwrap(),
+                    collect_alleles: true,
+                    ..QueryOptions::default()
+                },
+                &|| true,
+            )
+            .unwrap();
+
+        assert_eq!(query.stats.records_seen, 2);
+        assert_eq!(query.stats.records_filtered_unmapped, 1);
+        assert_eq!(query.stats.records_eligible, 1);
+        assert_eq!(query.stats.records_emitted, 1);
+        assert_eq!(query.batch.len(), 1);
+        assert_eq!(
+            query.batch.materialize_record(0).unwrap().read_name,
+            b"mapped"
+        );
+        assert_eq!(query.pileup.maximum_depth(), 1);
+        assert!(query.junctions.junctions.is_empty());
     }
 
     #[test]

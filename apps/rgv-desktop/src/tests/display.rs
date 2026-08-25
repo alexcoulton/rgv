@@ -1,9 +1,102 @@
 use super::super::*;
+use crate::display::{
+    ANNOTATION_PANE_BACKGROUND, PINNED_ALIGNMENT_COVERAGE_HEIGHT,
+    PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT, PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
+    PINNED_ALIGNMENT_MODIFICATION_HEIGHT, PINNED_ALIGNMENT_REFERENCE_HEIGHT,
+    append_annotation_pane_background, pinned_gene_track_height, primary_pinned_gene_id,
+};
+
+#[test]
+fn annotation_pane_background_is_bounded_and_precedes_track_geometry() {
+    let foreground = RectPrimitive {
+        x: 20.0,
+        y: 30.0,
+        width: 40.0,
+        height: 5.0,
+        color: Rgba::new(0.2, 0.4, 0.8, 1.0),
+        object_id: 7,
+        shape: Default::default(),
+    };
+    let mut display = DisplayList::default();
+    append_annotation_pane_background(&mut display, 300.0, 10.0, 90.0);
+    display.rectangles.push(foreground);
+
+    assert_eq!(display.rectangles.len(), 2);
+    assert_eq!(display.rectangles[0].x, 0.0);
+    assert_eq!(display.rectangles[0].y, 10.0);
+    assert_eq!(display.rectangles[0].width, 300.0);
+    assert_eq!(display.rectangles[0].height, 80.0);
+    assert_eq!(display.rectangles[0].color, ANNOTATION_PANE_BACKGROUND);
+    assert_eq!(display.rectangles[0].object_id, 0);
+    assert_eq!(display.rectangles[1], foreground);
+
+    append_annotation_pane_background(&mut display, 300.0, 90.0, 90.0);
+    assert_eq!(display.rectangles.len(), 2);
+}
 
 #[test]
 fn reference_gutter_labels_include_a_colour_independent_orientation_indicator() {
     assert_eq!(reference_bases_label(false), "> Bases · forward");
     assert_eq!(reference_bases_label(true), "< Bases · reverse strand");
+}
+
+#[test]
+fn only_the_primary_visible_gene_model_is_pinned() {
+    let source = |name: &str| TrackSource::Local {
+        path: format!("{name}.gtf"),
+    };
+    let feature = TrackConfig::new(
+        TrackId::new(1),
+        "Features".to_owned(),
+        TrackKind::Feature,
+        source("features"),
+    );
+    let mut hidden_gene = TrackConfig::new(
+        TrackId::new(2),
+        "Hidden genes".to_owned(),
+        TrackKind::GeneModel,
+        source("hidden"),
+    );
+    hidden_gene.visible = false;
+    let primary_gene = TrackConfig::new(
+        TrackId::new(3),
+        "Primary genes".to_owned(),
+        TrackKind::GeneModel,
+        source("primary"),
+    );
+    let comparative_gene = TrackConfig::new(
+        TrackId::new(4),
+        "Comparative genes".to_owned(),
+        TrackKind::GeneModel,
+        source("comparative"),
+    );
+
+    assert_eq!(
+        primary_pinned_gene_id(&[feature, hidden_gene, primary_gene, comparative_gene]),
+        Some(TrackId::new(3))
+    );
+}
+
+#[test]
+fn pinned_context_heights_are_fixed_layout_dimensions() {
+    let mut gene = TrackConfig::new(
+        TrackId::new(1),
+        "Primary genes".to_owned(),
+        TrackKind::GeneModel,
+        TrackSource::Local {
+            path: "genes.gtf".to_owned(),
+        },
+    );
+    gene.height = 84.0;
+    assert!((pinned_gene_track_height(&gene) - 84.0).abs() < f32::EPSILON);
+    gene.collapsed = true;
+    assert!((pinned_gene_track_height(&gene) - 26.0).abs() < f32::EPSILON);
+
+    assert!((PINNED_ALIGNMENT_REFERENCE_HEIGHT - 28.0).abs() < f32::EPSILON);
+    assert!((PINNED_ALIGNMENT_COVERAGE_HEIGHT - 48.0).abs() < f32::EPSILON);
+    assert!((PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT - 52.0).abs() < f32::EPSILON);
+    assert!((PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT - 120.0).abs() < f32::EPSILON);
+    assert!((PINNED_ALIGNMENT_MODIFICATION_HEIGHT - 26.0).abs() < f32::EPSILON);
 }
 
 #[test]
@@ -105,6 +198,15 @@ fn overview_read_detail_distinguishes_present_empty_and_incomplete_data() {
 }
 
 #[test]
+fn filtered_read_details_report_ignored_unmapped_records() {
+    let details = filtered_read_details(rgv_hts::QueryStats {
+        records_filtered_unmapped: 3,
+        ..rgv_hts::QueryStats::default()
+    });
+    assert_eq!(details, ["3 unmapped ignored"]);
+}
+
+#[test]
 fn alignment_layer_partition_keeps_the_header_out_of_the_read_scroll() {
     let primitive = |y, object_id| rgv_layout::RectPrimitive {
         x: 0.0,
@@ -134,7 +236,7 @@ fn alignment_layer_partition_keeps_the_header_out_of_the_read_scroll() {
     let mut pinned = DisplayList::default();
     let mut scrollable = DisplayList::default();
 
-    extend_alignment_layers(&mut pinned, &mut scrollable, &layout);
+    extend_alignment_layers(&mut pinned, &mut scrollable, &layout, None);
 
     assert_eq!(pinned.rectangles, vec![primitive(120.0, 0)]);
     assert_eq!(pinned.texts, vec![text(120.0, "A")]);
@@ -143,57 +245,31 @@ fn alignment_layer_partition_keeps_the_header_out_of_the_read_scroll() {
 }
 
 #[test]
-fn a_lone_alignment_track_fills_unused_canvas_height() {
-    let mut frames = vec![TrackFrame {
-        key: TrackFrameKey::Alignment(TrackId::new(1)),
-        name: "variants.bam".to_owned(),
-        kind: TrackKind::Alignment,
-        source_label: None,
-        top: 100.0,
-        bottom: 300.0,
-        visible: true,
-        collapsed: false,
-        frozen_bottom: Some(200.0),
-        subtracks: vec![TrackSubtrack {
-            label: "Reads".to_owned(),
-            detail: None,
-            top: 200.0,
-            bottom: 300.0,
-            collapsed: false,
-        }],
-    }];
-    let content_bottom = fill_lone_alignment_track(&mut frames, 300.0, 900.0);
-    assert!((content_bottom - 900.0).abs() < f32::EPSILON);
-    assert!((frames[0].bottom - 900.0).abs() < f32::EPSILON);
-    assert!((frames[0].subtracks[0].bottom - 900.0).abs() < f32::EPSILON);
-}
+fn alignment_layer_partition_clips_reads_to_the_resized_group() {
+    let layout = AlignmentLayout {
+        display_list: DisplayList {
+            rectangles: vec![rgv_layout::RectPrimitive {
+                x: 0.0,
+                y: 280.0,
+                width: 10.0,
+                height: 10.0,
+                color: rgv_layout::Rgba::new(0.5, 0.5, 0.5, 1.0),
+                object_id: 1,
+                shape: Default::default(),
+            }],
+            texts: Vec::new(),
+        },
+        pinned_rectangle_count: 0,
+        pinned_text_count: 0,
+        stats: AlignmentLayoutStats::default(),
+    };
+    let mut pinned = DisplayList::default();
+    let mut scrollable = DisplayList::default();
 
-#[test]
-fn a_collapsed_alignment_lane_stays_compact_when_its_frame_fills_the_canvas() {
-    let mut frames = vec![TrackFrame {
-        key: TrackFrameKey::Alignment(TrackId::new(1)),
-        name: "variants.bam".to_owned(),
-        kind: TrackKind::Alignment,
-        source_label: None,
-        top: 100.0,
-        bottom: 142.0,
-        visible: true,
-        collapsed: false,
-        frozen_bottom: Some(142.0),
-        subtracks: vec![TrackSubtrack {
-            label: "Reads".to_owned(),
-            detail: None,
-            top: 122.0,
-            bottom: 142.0,
-            collapsed: true,
-        }],
-    }];
+    extend_alignment_layers(&mut pinned, &mut scrollable, &layout, Some((250.0, 284.0)));
 
-    let content_bottom = fill_lone_alignment_track(&mut frames, 142.0, 900.0);
-
-    assert!((content_bottom - 900.0).abs() < f32::EPSILON);
-    assert!((frames[0].bottom - 900.0).abs() < f32::EPSILON);
-    assert!((frames[0].subtracks[0].bottom - 142.0).abs() < f32::EPSILON);
+    assert_eq!(scrollable.rectangles.len(), 1);
+    assert!((scrollable.rectangles[0].height - 4.0).abs() < f32::EPSILON);
 }
 
 #[test]
@@ -273,15 +349,6 @@ fn vertical_overview_retains_its_camera_while_content_fits() {
 }
 
 #[test]
-fn auxiliary_tracks_expand_more_slowly_than_alignment_rows() {
-    assert!((auxiliary_track_scale(1.0) - 1.0).abs() < f32::EPSILON);
-    assert!((auxiliary_track_scale(MAX_VERTICAL_DENSITY) - 3.0).abs() < f32::EPSILON);
-    assert!(
-        (auxiliary_track_scale(MIN_VERTICAL_DENSITY) - MIN_VERTICAL_DENSITY).abs() < f32::EPSILON
-    );
-}
-
-#[test]
 fn read_detail_primitives_remain_pickable_as_their_parent_record() {
     assert_eq!(alignment_record_index(1), Some(0));
     assert_eq!(
@@ -342,24 +409,25 @@ fn alignment_picking_routes_by_stable_track_frame_before_record_id() {
 }
 
 #[test]
-fn alignment_lane_picking_distinguishes_frozen_and_scrolled_tracks() {
+fn alignment_lane_picking_distinguishes_scrolled_read_groups() {
     let frames = vec![
         TrackFrame {
             key: TrackFrameKey::Alignment(TrackId::new(10)),
             name: "Tumour".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
-            top: 100.0,
+            top: 300.0,
             bottom: 500.0,
             visible: true,
             collapsed: false,
-            frozen_bottom: Some(180.0),
+            frozen_bottom: Some(322.0),
             subtracks: vec![TrackSubtrack {
-                label: "Coverage".to_owned(),
+                label: "Reads".to_owned(),
                 detail: None,
-                top: 125.0,
-                bottom: 175.0,
+                top: 325.0,
+                bottom: 375.0,
                 collapsed: false,
+                composite_member: None,
             }],
         },
         TrackFrame {
@@ -371,24 +439,36 @@ fn alignment_lane_picking_distinguishes_frozen_and_scrolled_tracks() {
             bottom: 800.0,
             visible: true,
             collapsed: false,
-            frozen_bottom: None,
+            frozen_bottom: Some(522.0),
             subtracks: vec![TrackSubtrack {
-                label: "Coverage".to_owned(),
+                label: "Reads".to_owned(),
                 detail: None,
                 top: 525.0,
                 bottom: 575.0,
                 collapsed: false,
+                composite_member: None,
             }],
         },
     ];
 
     assert_eq!(
-        alignment_lane_at_screen_y(&frames, "Coverage", 150.0, 400.0),
+        alignment_lane_at_screen_y(
+            &frames, "Reads", 350.0, 0.0, 0.0, 300.0, 100.0, 100.0, 800.0,
+        ),
         Some(TrackId::new(10))
     );
     assert_eq!(
-        alignment_lane_at_screen_y(&frames, "Coverage", 200.0, 350.0),
+        alignment_lane_at_screen_y(
+            &frames, "Reads", 350.0, 200.0, 0.0, 300.0, 100.0, 100.0, 800.0,
+        ),
         Some(TrackId::new(11))
+    );
+    assert_eq!(
+        alignment_lane_at_screen_y(
+            &frames, "Reads", 250.0, 200.0, 0.0, 300.0, 100.0, 100.0, 800.0,
+        ),
+        None,
+        "a read lane must not be pickable through the annotation pane"
     );
 }
 
@@ -410,11 +490,14 @@ fn collapsed_alignment_lanes_are_not_pickable() {
             top: 122.0,
             bottom: 142.0,
             collapsed: true,
+            composite_member: None,
         }],
     }];
 
     assert_eq!(
-        alignment_lane_at_screen_y(&frames, "Coverage", 130.0, 0.0),
+        alignment_lane_at_screen_y(
+            &frames, "Coverage", 130.0, 0.0, 0.0, 180.0, 180.0, 100.0, 500.0,
+        ),
         None
     );
 }
@@ -799,6 +882,41 @@ fn quantitative_overlay_gutter_labels_are_bounded() {
     assert_eq!(subtracks.len(), MAX_OVERLAY_GUTTER_MEMBERS);
     assert_eq!(subtracks.last().unwrap().label, "+11 more tracks");
     assert!(subtracks.iter().all(|subtrack| subtrack.bottom <= 2_100.0));
+}
+
+#[test]
+fn quantitative_overlay_rows_keep_member_identity_and_visibility_state() {
+    let mut first = TrackConfig::new(
+        TrackId::new(1),
+        "tumour".to_owned(),
+        TrackKind::Quantitative,
+        TrackSource::Local {
+            path: "tumour.bw".to_owned(),
+        },
+    );
+    first.quantitative.overlay_group = Some(3);
+    let mut second = TrackConfig::new(
+        TrackId::new(2),
+        "normal".to_owned(),
+        TrackKind::Quantitative,
+        TrackSource::Local {
+            path: "normal.bw".to_owned(),
+        },
+    );
+    second.quantitative.overlay_group = Some(3);
+    second.collapsed = true;
+
+    let rows = quantitative_overlay_subtracks(&[&first, &second], 100.0, 120.0);
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].composite_member, Some(TrackId::new(1)));
+    assert!(!rows[0].collapsed);
+    assert_eq!(rows[1].composite_member, Some(TrackId::new(2)));
+    assert!(rows[1].collapsed);
+
+    let collapsed_rows = quantitative_overlay_subtracks(&[&first, &second], 100.0, 26.0);
+    assert_eq!(collapsed_rows.len(), 1);
+    assert_eq!(collapsed_rows[0].composite_member, Some(TrackId::new(1)));
 }
 
 #[test]

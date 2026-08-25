@@ -329,13 +329,13 @@ pub(crate) fn add_aligned_bases(
             .reference
             .as_ref()
             .and_then(|value| value.base_at(position));
-        let mismatch = match cigar_kind {
-            CigarOpKind::SequenceMismatch => true,
-            CigarOpKind::Match => {
-                reference_base.is_some_and(|reference| !base.eq_ignore_ascii_case(&reference))
-            }
-            _ => false,
-        };
+        let base_classification = classify_aligned_base(cigar_kind, Some(base), reference_base);
+        let mismatch = matches!(
+            base_classification,
+            AlignedBaseClassification::Substitution
+                | AlignedBaseClassification::DeclaredSubstitution
+        );
+        let encoding_conflict = base_classification == AlignedBaseClassification::EncodingConflict;
         let bisulfite = match color_mode {
             AlignmentColorMode::Bisulfite(context) => {
                 bisulfite_observation(query, index, context, position, base)
@@ -351,7 +351,9 @@ pub(crate) fn add_aligned_bases(
             && smrt_kinetics.is_none()
             && !sbx_tail
             && (base_display_mode == ReadBaseDisplayMode::Hidden
-                || (base_display_mode == ReadBaseDisplayMode::Mismatches && !mismatch))
+                || (base_display_mode == ReadBaseDisplayMode::Mismatches
+                    && !mismatch
+                    && !encoding_conflict))
         {
             continue;
         }
@@ -397,6 +399,9 @@ pub(crate) fn add_aligned_bases(
         if width >= MINIMUM_BASE_GLYPH_PIXEL_WIDTH {
             add_base_glyph(
                 display_list,
+                // Preserve the observed evidence even when it contradicts an
+                // explicit CIGAR assertion. The inspector communicates the
+                // conflict without replacing or recolouring the nucleotide.
                 base,
                 x,
                 y + 1.0,

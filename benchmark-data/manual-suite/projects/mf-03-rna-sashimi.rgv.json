@@ -2,18 +2,20 @@
   "schema_version": 3,
   "locus": {
     "contig": "chrManual",
-    "start": 19900,
-    "end": 21100
+    "start": 20111,
+    "end": 20201
   },
   "panels": [
     {
       "id": 1,
       "locus": {
         "contig": "chrManual",
-        "start": 19900,
-        "end": 21100
+        "start": 20111,
+        "end": 20201
       },
-      "vertical_scroll_points": 0.0
+      "vertical_scroll_points": 94.06681,
+      "annotation_scroll_points": 0.0,
+      "vertical_content_origin_points": 94.06681
     }
   ],
   "active_panel": 1,
@@ -23,13 +25,14 @@
       "name": "RNA sample A: shared and A-specific junctions",
       "source": {
         "Local": {
-          "path": "../data/alignments/rna-sample-a.bam"
+          "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/manual-suite/data/alignments/rna-sample-a.bam"
         }
       },
       "sample_key": null,
       "visible": true,
       "collapsed": false,
       "height": 420.0,
+      "read_group_height": 252.95312,
       "filters": {
         "alignment_color_mode": "strand",
         "alignment_group_mode": "none",
@@ -56,19 +59,20 @@
         "show_junction_labels": true,
         "show_reads": true,
         "coverage_scale_maximum": null,
+        "coverage_scale_transform": "linear",
         "show_coverage_center_line": true,
-        "alignment_density": 1.0,
+        "alignment_density": 3.111876,
         "inspector_activation": "click",
         "read_base_display_mode": "mismatches",
         "shade_read_bases_by_quality": true,
         "minimum_indel_size": 1,
-        "minimum_event_label_size": 1,
+        "minimum_event_label_size": 10,
         "show_modified_bases": true,
         "show_modification_frequency": true,
         "minimum_modification_probability": 0,
         "modified_base_color_mode": "by_type",
         "hidden_modification_codes": [],
-        "include_secondary": true,
+        "include_secondary": false,
         "include_supplementary": true,
         "auxiliary_predicates": []
       },
@@ -79,7 +83,7 @@
       "name": "RNA sample B: shared and B-specific junctions",
       "source": {
         "Local": {
-          "path": "../data/alignments/rna-sample-b.bam"
+          "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/manual-suite/data/alignments/rna-sample-b.bam"
         }
       },
       "sample_key": null,
@@ -110,21 +114,22 @@
         "sashimi_fixed_scale_maximum": 100,
         "sashimi_count_mode": "raw",
         "show_junction_labels": true,
-        "show_reads": true,
+        "show_reads": false,
         "coverage_scale_maximum": null,
+        "coverage_scale_transform": "linear",
         "show_coverage_center_line": true,
-        "alignment_density": 1.0,
+        "alignment_density": 3.111876,
         "inspector_activation": "click",
         "read_base_display_mode": "mismatches",
         "shade_read_bases_by_quality": true,
         "minimum_indel_size": 1,
-        "minimum_event_label_size": 1,
+        "minimum_event_label_size": 10,
         "show_modified_bases": true,
         "show_modification_frequency": true,
         "minimum_modification_probability": 0,
         "modified_base_color_mode": "by_type",
         "hidden_modification_codes": [],
-        "include_secondary": true,
+        "include_secondary": false,
         "include_supplementary": true,
         "auxiliary_predicates": []
       },
@@ -133,10 +138,11 @@
   ],
   "reference": {
     "Local": {
-      "path": "../data/references/manual.fa"
+      "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/manual-suite/data/references/manual.fa"
     }
   },
   "genome_name": "RGV two-sample RNA junction truth",
+  "assembly_identity": null,
   "cytobands": null,
   "reference_reverse_complement": false,
   "reference_translation_frames": [],
@@ -152,13 +158,13 @@
       "kind": "GeneModel",
       "source": {
         "Local": {
-          "path": "../data/tracks/rna-transcripts.gff3"
+          "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/manual-suite/data/tracks/rna-transcripts.gff3"
         }
       },
       "sample_key": null,
       "visible": true,
       "collapsed": false,
-      "height": 120.0,
+      "height": 48.0,
       "variant": {
         "minimum_quality": null,
         "quality_missing": "exclude",

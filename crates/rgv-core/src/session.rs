@@ -43,6 +43,8 @@ pub struct SessionViewPanel {
     #[serde(default)]
     pub vertical_scroll_points: f32,
     #[serde(default)]
+    pub annotation_scroll_points: f32,
+    #[serde(default)]
     pub vertical_content_origin_points: f32,
 }
 
@@ -188,6 +190,7 @@ impl SessionViewPanel {
             id,
             locus,
             vertical_scroll_points: 0.0,
+            annotation_scroll_points: 0.0,
             vertical_content_origin_points: 0.0,
         }
     }
@@ -565,6 +568,14 @@ pub struct SessionAlignmentTrack {
     pub collapsed: bool,
     #[serde(default = "default_alignment_track_height")]
     pub height: f32,
+    /// Optional independently resized height of this track's annotation
+    /// summary. The shared read-pane height remains in `height`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation_height: Option<f32>,
+    /// Optional independently resized height of this sample's read group
+    /// inside the shared, scrollable read pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_group_height: Option<f32>,
     #[serde(default)]
     pub filters: SessionFilters,
     #[serde(default = "default_maximum_alignments")]
@@ -582,6 +593,8 @@ impl SessionAlignmentTrack {
             visible: true,
             collapsed: false,
             height: default_alignment_track_height(),
+            annotation_height: None,
+            read_group_height: None,
             filters: SessionFilters::default(),
             maximum_alignments: default_maximum_alignments(),
         }
@@ -911,6 +924,8 @@ impl SessionDocument {
                 || panel.locus.start >= panel.locus.end
                 || !panel.vertical_scroll_points.is_finite()
                 || panel.vertical_scroll_points < 0.0
+                || !panel.annotation_scroll_points.is_finite()
+                || panel.annotation_scroll_points < 0.0
                 || !panel.vertical_content_origin_points.is_finite()
                 || panel.vertical_content_origin_points < 0.0
             {
@@ -950,6 +965,12 @@ impl SessionDocument {
                 || !valid_sample_association(track.sample_key.as_deref())
                 || !track.height.is_finite()
                 || track.height < 26.0
+                || track
+                    .annotation_height
+                    .is_some_and(|height| !height.is_finite() || !(80.0..=600.0).contains(&height))
+                || track.read_group_height.is_some_and(|height| {
+                    !height.is_finite() || !(40.0..=1_200.0).contains(&height)
+                })
             {
                 return Err(SessionError::InvalidAlignmentTrack);
             }

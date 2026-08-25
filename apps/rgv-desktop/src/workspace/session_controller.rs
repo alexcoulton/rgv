@@ -209,6 +209,7 @@ impl Viewer {
         let alignment = primary_alignment_track(session).cloned();
         self.apply_primary_alignment_config(alignment.as_ref(), session.maximum_alignments)?;
         self.reference_source.clone_from(&session.reference);
+        self.reference_annotation_height = None;
         self.remote_reference_index_url
             .clone_from(&session.remote_reference_index_url);
         self.reference_reverse_complement = session.reference_reverse_complement;
@@ -321,6 +322,7 @@ impl Viewer {
                     },
                 );
                 saved.vertical_scroll_points = panel.vertical_scroll_points;
+                saved.annotation_scroll_points = panel.annotation_scroll_points;
                 saved.vertical_content_origin_points = panel.vertical_content_origin_points;
                 saved
             })

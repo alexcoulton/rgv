@@ -312,6 +312,7 @@ pub(crate) fn write_rna_bam(path: &Path, sample: char) -> Result<()> {
         writer.write(record)?;
     }
     drop(writer);
+    ensure_fixture_alignments_are_mapped(path)?;
     let index = PathBuf::from(format!("{}.bai", path.display()));
     bam::index::build(path, Some(&index), bam::index::Type::Bai, 1)?;
     Ok(())
@@ -348,9 +349,10 @@ pub(crate) fn rna_record(
     record.set_tid(0);
     record.set_pos(position);
     record.set_mapq(60);
-    if reverse {
-        record.set_reverse();
-    }
+    // `Record::new` starts life as an unmapped record. These fixtures describe
+    // real alignments, so replace the default flags instead of only OR-ing in
+    // the reverse-strand bit.
+    record.set_flags(if reverse { 0x10 } else { 0 });
     record.push_aux(b"RG", Aux::String(read_group))?;
     match strand_tag {
         RnaStrandTag::Positive => record.push_aux(b"XS", Aux::Char(b'+'))?,
@@ -431,6 +433,7 @@ pub(crate) fn write_smrt_bam(path: &Path) -> Result<()> {
         writer.write(record)?;
     }
     drop(writer);
+    ensure_fixture_alignments_are_mapped(path)?;
     let index = PathBuf::from(format!("{}.bai", path.display()));
     bam::index::build(path, Some(&index), bam::index::Type::Bai, 1)?;
     Ok(())
@@ -546,9 +549,7 @@ pub(crate) fn write_sbx_bam(path: &Path) -> Result<()> {
         record.set_tid(0);
         record.set_pos(40_000 + i64::try_from(offset)? * 10);
         record.set_mapq(60);
-        if reverse {
-            record.set_reverse();
-        }
+        record.set_flags(if reverse { 0x10 } else { 0 });
         records.push(record);
     }
     let mut writer = Writer::from_path(path, &header, Format::Bam)?;
@@ -556,6 +557,7 @@ pub(crate) fn write_sbx_bam(path: &Path) -> Result<()> {
         writer.write(record)?;
     }
     drop(writer);
+    ensure_fixture_alignments_are_mapped(path)?;
     let index = PathBuf::from(format!("{}.bai", path.display()));
     bam::index::build(path, Some(&index), bam::index::Type::Bai, 1)?;
     Ok(())
@@ -609,9 +611,7 @@ pub(crate) fn write_ultima_bam(path: &Path) -> Result<()> {
         record.set_pos(50_000 + i64::try_from(offset)? * 10);
         record.set_mapq(60);
         record.push_aux(b"RG", Aux::String("ultima"))?;
-        if reverse {
-            record.set_reverse();
-        }
+        record.set_flags(if reverse { 0x10 } else { 0 });
         match tp_case {
             Some("valid") => record.push_aux(b"tp", Aux::ArrayI32((&tp[..]).into()))?,
             Some("short") => record.push_aux(b"tp", Aux::ArrayI32((&tp[..3]).into()))?,
@@ -639,6 +639,7 @@ pub(crate) fn write_ultima_bam(path: &Path) -> Result<()> {
         record.set_tid(0);
         record.set_pos(i64::try_from(start)?);
         record.set_mapq(60);
+        record.set_flags(0);
         record.push_aux(b"RG", Aux::String("ultima"))?;
         let tp = vec![0_i32; sequence.len()];
         record.push_aux(b"tp", Aux::ArrayI32((&tp[..]).into()))?;
@@ -660,6 +661,7 @@ pub(crate) fn write_ultima_bam(path: &Path) -> Result<()> {
         writer.write(record)?;
     }
     drop(writer);
+    ensure_fixture_alignments_are_mapped(path)?;
     let index = PathBuf::from(format!("{}.bai", path.display()));
     bam::index::build(path, Some(&index), bam::index::Type::Bai, 1)?;
     Ok(())
@@ -823,10 +825,32 @@ pub(crate) fn write_specialist_bam(path: &Path) -> Result<()> {
         writer.write(record)?;
     }
     drop(writer);
+    ensure_fixture_alignments_are_mapped(path)?;
     let bai = PathBuf::from(format!("{}.bai", path.display()));
     bam::index::build(path, Some(&bai), bam::index::Type::Bai, 1)?;
     let csi = PathBuf::from(format!("{}.csi", path.display()));
     bam::index::build(path, Some(&csi), bam::index::Type::Csi(14), 1)?;
+    Ok(())
+}
+
+fn ensure_fixture_alignments_are_mapped(path: &Path) -> Result<()> {
+    let mut reader = Reader::from_path(path)?;
+    let mut count = 0_usize;
+    for result in reader.records() {
+        let record = result?;
+        count += 1;
+        ensure!(
+            !record.is_unmapped(),
+            "manual fixture {} contains an unintentionally unmapped record: {}",
+            path.display(),
+            String::from_utf8_lossy(record.qname())
+        );
+    }
+    ensure!(
+        count > 0,
+        "manual alignment fixture {} contains no records",
+        path.display()
+    );
     Ok(())
 }
 

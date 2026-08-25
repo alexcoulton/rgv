@@ -474,10 +474,28 @@ fn read_event_selection_and_preview_follow_cigar_coordinates() {
         auxiliary_fields: Vec::new(),
     };
 
-    assert_eq!(find_read_event(&record, 105.1, 0.5), Some(1));
-    assert_eq!(find_read_event(&record, 200.0, 0.5), Some(3));
-    assert_eq!(find_read_event(&record, 610.0, 0.5), Some(4));
-    let insertion = read_event_details(&record, 1, "chr1").unwrap();
+    assert_eq!(
+        find_read_event(&record, None, 105.1, 0.5, true),
+        Some(ReadEventHit {
+            operation_index: 1,
+            operation_offset: None,
+        })
+    );
+    assert_eq!(
+        find_read_event(&record, None, 200.0, 0.5, true),
+        Some(ReadEventHit {
+            operation_index: 3,
+            operation_offset: None,
+        })
+    );
+    assert_eq!(
+        find_read_event(&record, None, 610.0, 0.5, true),
+        Some(ReadEventHit {
+            operation_index: 4,
+            operation_offset: None,
+        })
+    );
+    let insertion = read_event_details(&record, 1, None, None, "chr1").unwrap();
     assert_eq!(
         insertion.copy_sequence.as_deref().map(str::len),
         Some(1_000)
@@ -488,18 +506,147 @@ fn read_event_selection_and_preview_follow_cigar_coordinates() {
             .iter()
             .any(|(label, value)| { label == "Sequence preview" && value.contains("+880 bases") })
     );
-    let deletion = read_event_details(&record, 3, "chr1").unwrap();
+    let deletion = read_event_details(&record, 3, None, None, "chr1").unwrap();
     assert!(deletion.copy_sequence.is_none());
     assert!(
         deletion
             .fields
             .contains(&("Event locus".to_owned(), "chr1:111-610".to_owned()))
     );
-    let clip = read_event_details(&record, 4, "chr1").unwrap();
+    let clip = read_event_details(&record, 4, None, None, "chr1").unwrap();
     assert_eq!(clip.copy_sequence.as_deref(), Some("TTTT"));
     assert_eq!(
         aligned_event_sequence(b"AACG", Some(&[10, 20, 30, 40]), 0..2),
         (b"AA".to_vec(), Some(vec![10, 20]))
+    );
+}
+
+#[test]
+fn individual_substitution_selection_reports_exact_read_and_reference_evidence() {
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 110).unwrap();
+    let reference = ReferenceSlice {
+        interval,
+        bases: vec![b'A'; 10],
+    };
+    let mut observed = vec![b'A'; 10];
+    observed[4] = b'G';
+    let record = AlignmentRecord {
+        contig: ContigId::new(0),
+        start: 100,
+        end: 110,
+        flags: rgv_hts::AlignmentFlags::from_bits(0),
+        mapping_quality: Some(60),
+        mate_contig: None,
+        mate_start: None,
+        template_length: 0,
+        read_name: b"substitution-read".to_vec(),
+        cigar: vec![rgv_hts::CigarOp {
+            kind: CigarOpKind::Match,
+            len: 10,
+        }],
+        sequence: SequenceData::Present {
+            bases: observed,
+            qualities: Some(vec![37; 10]),
+        },
+        auxiliary_fields: Vec::new(),
+    };
+
+    assert_eq!(
+        find_read_event(&record, Some(&reference), 104.25, 0.5, true),
+        Some(ReadEventHit {
+            operation_index: 0,
+            operation_offset: Some(4),
+        })
+    );
+    assert_eq!(
+        find_read_event(&record, Some(&reference), 103.25, 0.5, true),
+        None,
+        "a matching base is not a selectable substitution"
+    );
+    assert_eq!(
+        find_read_event(&record, Some(&reference), 104.25, 0.5, false),
+        None,
+        "substitution hit testing follows the visible base-mark threshold"
+    );
+
+    let details = read_event_details(&record, 0, Some(4), Some(&reference), "chr1").unwrap();
+    for expected in [
+        ("Selected event", "Base substitution"),
+        ("Event locus", "chr1:105"),
+        ("Aligned read position", "5"),
+        ("Reference base", "A"),
+        ("Observed base", "G"),
+        ("Base quality", "37"),
+        ("Substitution evidence", "read/reference comparison"),
+    ] {
+        assert!(
+            details
+                .fields
+                .contains(&(expected.0.to_owned(), expected.1.to_owned()))
+        );
+    }
+    assert_eq!(details.copy_sequence.as_deref(), Some("G"));
+
+    let mut explicit = record.clone();
+    explicit.cigar[0].kind = CigarOpKind::SequenceMismatch;
+    assert_eq!(
+        find_read_event(&explicit, None, 103.25, 0.5, true),
+        Some(ReadEventHit {
+            operation_index: 0,
+            operation_offset: Some(3),
+        }),
+        "an explicit CIGAR X remains selectable without loaded reference bases"
+    );
+    let explicit_details = read_event_details(&explicit, 0, Some(3), None, "chr1").unwrap();
+    assert!(explicit_details.fields.contains(&(
+        "Substitution evidence".to_owned(),
+        "explicit CIGAR X (unvalidated: a base is unavailable)".to_owned(),
+    )));
+
+    let conflict_reference = ReferenceSlice {
+        interval,
+        bases: vec![b'A'; 10],
+    };
+    assert_eq!(
+        find_read_event(&explicit, Some(&conflict_reference), 103.25, 0.5, true),
+        Some(ReadEventHit {
+            operation_index: 0,
+            operation_offset: Some(3),
+        }),
+        "an explicit X that contradicts equal bases remains selectable as a warning"
+    );
+    let conflict =
+        read_event_details(&explicit, 0, Some(3), Some(&conflict_reference), "chr1").unwrap();
+    for expected in [
+        ("Selected event", "Alignment encoding conflict"),
+        ("Reference base", "A"),
+        ("Observed base", "A"),
+        ("CIGAR assertion", "X (mismatch)"),
+        ("Observed comparison", "bases agree (A = A)"),
+        (
+            "Validation",
+            "CIGAR X asserts a mismatch, but the loaded read and reference bases agree",
+        ),
+    ] {
+        assert!(
+            conflict
+                .fields
+                .contains(&(expected.0.to_owned(), expected.1.to_owned()))
+        );
+    }
+
+    let mut contradicted_match = record.clone();
+    contradicted_match.cigar[0].kind = CigarOpKind::SequenceMatch;
+    let contradicted_match_details =
+        read_event_details(&contradicted_match, 0, Some(4), Some(&reference), "chr1").unwrap();
+    assert!(contradicted_match_details.fields.contains(&(
+        "Selected event".to_owned(),
+        "Alignment encoding conflict".to_owned(),
+    )));
+    assert!(
+        contradicted_match_details
+            .fields
+            .contains(&("CIGAR assertion".to_owned(), "= (match)".to_owned()))
     );
 }
 

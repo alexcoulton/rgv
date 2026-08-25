@@ -169,6 +169,25 @@ impl Viewer {
             })
     }
 
+    /// The lower read pane has one vertical density camera. Keep every sample
+    /// on that same absolute row scale regardless of which input path changed
+    /// it (settings, keyboard, MCP, or scrollbar gesture).
+    pub(crate) fn set_shared_alignment_density(&mut self, density: f32) -> bool {
+        let density = density.clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);
+        if self.alignment_tracks.is_empty() {
+            let changed =
+                (self.empty_alignment.filters.alignment_density - density).abs() > f32::EPSILON;
+            self.empty_alignment.filters.alignment_density = density;
+            return changed;
+        }
+        let mut changed = false;
+        for track in &mut self.alignment_tracks {
+            changed |= (track.config.filters.alignment_density - density).abs() > f32::EPSILON;
+            track.config.filters.alignment_density = density;
+        }
+        changed
+    }
+
     pub(crate) fn primary_filter_editor(&self) -> &FilterEditor {
         self.alignment_tracks
             .first()
@@ -294,12 +313,38 @@ pub(crate) fn alignment_panel_projections(
         .collect()
 }
 
+pub(crate) const MAXIMUM_COVERAGE_BINS: usize = 4_096;
+pub(crate) const MAXIMUM_ALLELE_COVERAGE_BASES_PER_PIXEL: f64 = 2.0;
+
+pub(crate) fn alignment_coverage_query_plan(
+    visible_bases: usize,
+    pixel_width: f64,
+    bases_per_pixel: f64,
+) -> (usize, bool) {
+    let visible_bases = visible_bases.max(1);
+    let collect_alleles = bases_per_pixel <= MAXIMUM_ALLELE_COVERAGE_BASES_PER_PIXEL
+        && visible_bases <= MAXIMUM_COVERAGE_BINS;
+    let bins = if collect_alleles {
+        // Allele composition is meaningful only when each pileup bin maps to
+        // one reference base. Keep this exact representation bounded by the
+        // same hard cap used for ordinary screen-resolution coverage.
+        visible_bases
+    } else {
+        (pixel_width.round() as usize)
+            .clamp(64, MAXIMUM_COVERAGE_BINS)
+            .min(visible_bases)
+            .max(1)
+    };
+    (bins, collect_alleles)
+}
+
 pub(crate) fn alignment_query_options(
     track: &AlignmentTrackController,
     detail_level: DetailLevel,
     bases_per_pixel: f64,
     record_allocation: usize,
     coverage_bins: usize,
+    collect_alleles: bool,
 ) -> QueryOptions {
     let filters = &track.config.filters;
     QueryOptions {
@@ -310,7 +355,7 @@ pub(crate) fn alignment_query_options(
         },
         max_records: NonZeroUsize::new(record_allocation).unwrap(),
         coverage_bins: NonZeroUsize::new(coverage_bins).unwrap(),
-        collect_alleles: detail_level == DetailLevel::Bases,
+        collect_alleles,
         collect_modifications: filters.show_modification_frequency
             && detail_level != DetailLevel::Overview,
         overlapping_mate_policy: filters.overlapping_mate_policy,
@@ -318,11 +363,12 @@ pub(crate) fn alignment_query_options(
         minimum_junction_flank: filters.minimum_junction_flank,
         include_secondary: track.active_filters.include_secondary,
         include_supplementary: track.active_filters.include_supplementary,
-        include_reference: alignment_query_needs_reference(
-            filters.alignment_color_mode,
-            detail_level,
-            bases_per_pixel,
-        ),
+        include_reference: collect_alleles
+            || alignment_query_needs_reference(
+                filters.alignment_color_mode,
+                detail_level,
+                bases_per_pixel,
+            ),
         filter: track.active_filters.alignment.clone(),
         ..QueryOptions::default()
     }

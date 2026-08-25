@@ -61,6 +61,9 @@ pub struct TrackSubtrack {
     /// A compact placeholder for a hidden alignment lane. The gutter keeps
     /// its label and closed-eye control so visibility can be restored in place.
     pub collapsed: bool,
+    /// Stable owner for a composite member row. Ordinary informational and
+    /// alignment subtrack rows derive their controls from the parent frame.
+    pub composite_member: Option<TrackId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +89,7 @@ pub enum TrackUiAction {
     ToggleVisibility(TrackFrameKey),
     ToggleCollapsed(TrackFrameKey),
     ToggleAlignmentSubtrack(TrackId, AlignmentSubtrack),
+    ToggleCompositeMember(TrackId),
     Export(TrackFrameKey),
     Remove(TrackFrameKey),
     ReorderDropped(TrackId, f32),
@@ -94,6 +98,18 @@ pub enum TrackUiAction {
     ResizeDragged(TrackId, f32),
     ResizeStopped(TrackId),
     ResizeKeyboard(TrackId, f32),
+    ResizeAnnotationStarted(TrackFrameKey, f32),
+    ResizeAnnotationDragged(TrackFrameKey, f32),
+    ResizeAnnotationStopped(TrackFrameKey),
+    ResizeAnnotationKeyboard(TrackFrameKey, f32, f32),
+    ResizeReadTrackStarted(TrackId, f32),
+    ResizeReadTrackDragged(TrackId, f32),
+    ResizeReadTrackStopped(TrackId),
+    ResizeReadTrackKeyboard(TrackId, f32, f32),
+    ResizeReadPaneStarted,
+    ResizeReadPaneDragged(f32),
+    ResizeReadPaneStopped,
+    ResizeReadPaneKeyboard(f32),
 }
 
 #[derive(Default)]
@@ -103,6 +119,8 @@ pub struct TrackGutterResult {
 
 const GUTTER_TEXT_GAP: f32 = 6.0;
 const MAX_GUTTER_LABEL_FRACTION: f32 = 0.55;
+const ANNOTATION_PANE_GUTTER_COLOR: Color32 = Color32::from_rgb(234, 241, 248);
+const READ_PANE_GUTTER_COLOR: Color32 = Color32::from_gray(249);
 
 fn gutter_row_widths(label_width: f32, detail_width: f32, available_width: f32) -> (f32, f32) {
     let available_width = available_width.max(0.0);
@@ -158,11 +176,21 @@ pub fn track_drop_index(
     track_order: &[TrackId],
     pointer_y: f32,
     vertical_scroll: f32,
+    scroll_clip_top: f32,
 ) -> usize {
-    let content_y = pointer_y + vertical_scroll;
     let target = frames
         .iter()
-        .find_map(|frame| (content_y < (frame.top + frame.bottom) * 0.5).then_some(frame.key));
+        .filter_map(|frame| {
+            let bounds = clipped_frame_screen_bounds(
+                frame,
+                vertical_scroll,
+                scroll_clip_top,
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+            )?;
+            (pointer_y < (bounds.top + bounds.bottom) * 0.5).then_some(frame.key)
+        })
+        .next();
     match target {
         Some(TrackFrameKey::Reference) => 0,
         Some(TrackFrameKey::Auxiliary(target)) => track_order
@@ -187,6 +215,23 @@ pub fn keyboard_reorder_index(current: usize, count: usize, direction: i32) -> u
 
 pub fn resized_track_height(origin: f32, drag_delta: f32) -> f32 {
     (origin + drag_delta).clamp(40.0, 600.0)
+}
+
+pub fn resized_annotation_track_height(origin: f32, drag_delta: f32) -> f32 {
+    (origin + drag_delta).clamp(80.0, 600.0)
+}
+
+pub fn resized_read_track_height(origin: f32, drag_delta: f32) -> f32 {
+    (origin + drag_delta).clamp(40.0, 1_200.0)
+}
+
+pub fn resized_read_pane_height(
+    current_height: f32,
+    divider_delta: f32,
+    viewport_height: f32,
+) -> f32 {
+    let maximum = (viewport_height - 80.0).max(100.0);
+    (current_height - divider_delta).clamp(100.0, maximum)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -312,7 +357,6 @@ pub struct ScrollbarInteraction {
     pub keyboard_density_pixels: f32,
 }
 
-#[cfg(test)]
 pub fn scrollbar_geometry(rect: Rect, maximum: f32, offset: f32) -> ScrollbarGeometry {
     let fraction = if maximum <= f32::EPSILON {
         0.0
@@ -320,6 +364,151 @@ pub fn scrollbar_geometry(rect: Rect, maximum: f32, offset: f32) -> ScrollbarGeo
         offset.clamp(0.0, maximum) / maximum
     };
     scrollbar_geometry_with_visible_fraction(rect, maximum, rect.height(), 1.0, fraction)
+}
+
+/// Paints the ordinary annotation-stack scrollbar. Unlike the adjacent read
+/// navigator it has one axis and never changes density.
+pub fn paint_annotation_scrollbar(
+    ui: &mut Ui,
+    rect: Rect,
+    maximum: f32,
+    offset: &mut f32,
+    overview: Option<&ScrollbarOverview>,
+) -> ScrollbarInteraction {
+    let maximum = maximum.max(0.0);
+    *offset = offset.clamp(0.0, maximum);
+    let response = ui
+        .interact(
+            rect,
+            egui::Id::new("annotation-vertical-scrollbar"),
+            Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+        .on_hover_text("Annotation tracks · drag up/down to scroll");
+    let scroll_percent = if maximum <= f32::EPSILON {
+        0.0
+    } else {
+        f64::from(*offset / maximum * 100.0)
+    };
+    response.widget_info(|| {
+        egui::WidgetInfo::slider(
+            true,
+            scroll_percent,
+            "Annotation track scrollbar; arrow up and down scroll, Page Up and Page Down scroll by a page, Home and End reach the stack boundaries",
+        )
+    });
+    if response.has_focus() {
+        ui.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                *offset -= 40.0;
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                *offset += 40.0;
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+                *offset -= rect.height() * 0.8;
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+                *offset += rect.height() * 0.8;
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
+                *offset = 0.0;
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::End) {
+                *offset = maximum;
+            }
+        });
+        *offset = offset.clamp(0.0, maximum);
+    }
+    let mut geometry = scrollbar_geometry(rect, maximum, *offset);
+    let drag_state_id = egui::Id::new("annotation-scrollbar-drag-state");
+    if response.drag_started()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        let grab = if geometry.thumb.contains(pointer) {
+            pointer.y - geometry.thumb.top()
+        } else {
+            geometry.thumb.height() * 0.5
+        };
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(drag_state_id, (*offset, grab)));
+    }
+    if response.dragged()
+        && let Some(pointer) = response.interact_pointer_pos()
+        && let Some((origin, grab)) = ui
+            .ctx()
+            .data(|data| data.get_temp::<(f32, f32)>(drag_state_id))
+    {
+        let origin_geometry = scrollbar_geometry(rect, maximum, origin);
+        *offset = scrollbar_offset_at_grab(origin_geometry, maximum, pointer.y, grab);
+        geometry = scrollbar_geometry(rect, maximum, *offset);
+    }
+    if response.drag_stopped() {
+        ui.ctx().data_mut(|data| {
+            data.remove::<(f32, f32)>(drag_state_id);
+        });
+    }
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, Color32::from_gray(250));
+    painter.rect_filled(geometry.track, 0.0, Color32::WHITE);
+    if let Some(overview) = overview.filter(|overview| !overview.bins.is_empty()) {
+        let bin_height = geometry.track.height() / overview.bins.len() as f32;
+        for (index, bin) in overview.bins.iter().enumerate() {
+            let top = geometry.track.top() + index as f32 * bin_height;
+            let bottom = if index + 1 == overview.bins.len() {
+                geometry.track.bottom()
+            } else {
+                top + bin_height + 0.5
+            };
+            painter.rect_filled(
+                Rect::from_min_max(
+                    pos2(geometry.track.left(), top),
+                    pos2(geometry.track.right(), bottom),
+                ),
+                0.0,
+                scrollbar_overview_color(bin.kind, bin.density),
+            );
+        }
+        for boundary in &overview.boundaries {
+            let y = egui::lerp(geometry.track.y_range(), boundary.clamp(0.0, 1.0));
+            painter.line_segment(
+                [
+                    pos2(geometry.track.left(), y),
+                    pos2(geometry.track.right(), y),
+                ],
+                Stroke::new(0.75, Color32::from_gray(72)),
+            );
+        }
+    }
+    painter.rect_stroke(
+        geometry.track,
+        0.0,
+        Stroke::new(0.75, Color32::from_gray(95)),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_filled(
+        geometry.thumb,
+        1.0,
+        Color32::from_rgba_unmultiplied(75, 91, 112, 42),
+    );
+    painter.rect_stroke(
+        geometry.thumb,
+        1.0,
+        Stroke::new(1.5, Color32::from_rgb(75, 91, 112)),
+        egui::StrokeKind::Outside,
+    );
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(1.0),
+            1.0,
+            Stroke::new(2.0, Color32::BLACK),
+            egui::StrokeKind::Inside,
+        );
+    }
+    ScrollbarInteraction {
+        pointer_down: response.is_pointer_button_down_on() || response.dragged(),
+        drag_started: response.drag_started(),
+        dragging: response.dragged(),
+        drag_stopped: response.drag_stopped(),
+        drag_delta: response.drag_delta(),
+        pointer: response.interact_pointer_pos(),
+        keyboard_density_pixels: 0.0,
+    }
 }
 
 #[cfg(test)]
@@ -488,7 +677,7 @@ pub fn paint_vertical_scrollbar(
         .interact(rect, id, Sense::click_and_drag())
         .on_hover_cursor(egui::CursorIcon::AllScroll)
         .on_hover_text(
-            "Drag up/down to scroll · drag left/right to change track and read-row density",
+            "Read stack · drag up/down to scroll · drag left/right to change read-row density",
         );
     let scroll_percent = if maximum <= f32::EPSILON {
         0.0
@@ -499,7 +688,7 @@ pub fn paint_vertical_scrollbar(
         egui::WidgetInfo::slider(
             true,
             scroll_percent,
-            "Track overview; arrow up and down scroll, Page Up and Page Down scroll by a page, Home and End reach the stack boundaries, arrow left and right change row density",
+            "Read stack overview; arrow up and down scroll, Page Up and Page Down scroll by a page, Home and End reach the read boundaries, arrow left and right change read-row density",
         )
     });
     let mut keyboard_density_pixels = 0.0;
@@ -649,25 +838,66 @@ pub fn paint_track_viewport_chrome(
     ui: &mut Ui,
     geometry: CanvasGeometry,
     frames: &[TrackFrame],
-    vertical_scroll: f32,
+    annotation_scroll: f32,
+    read_scroll: f32,
+    scroll_clip_top: f32,
+    annotation_clip_bottom: f32,
     selected: Option<TrackFrameKey>,
     selected_alignments: &[TrackId],
 ) -> TrackGutterResult {
     let mut result = TrackGutterResult::default();
     let painter = ui.painter();
-    painter.rect_filled(geometry.gutter, 0.0, Color32::from_gray(249));
+    painter.rect_filled(geometry.gutter, 0.0, READ_PANE_GUTTER_COLOR);
+    let annotation_gutter = Rect::from_min_max(
+        geometry.gutter.min,
+        pos2(
+            geometry.gutter.right(),
+            annotation_clip_bottom.clamp(geometry.gutter.top(), geometry.gutter.bottom()),
+        ),
+    );
+    if annotation_gutter.height() > 0.0 {
+        painter.rect_filled(annotation_gutter, 0.0, ANNOTATION_PANE_GUTTER_COLOR);
+    }
     painter.line_segment(
         [geometry.gutter.right_top(), geometry.gutter.right_bottom()],
         Stroke::new(1.0, Color32::from_gray(175)),
     );
 
     for frame in frames {
-        let (top, bottom) = frame_screen_bounds(frame, vertical_scroll);
-        if bottom <= geometry.viewport.top() || top >= geometry.viewport.bottom() {
+        // The primary alignment is represented by one frame in the annotation
+        // pane and another in the read pane. Keep every egui widget scoped to
+        // its pane: reusing the track key alone gives both headers the same ID,
+        // which makes popups and clicks fight each other between frames.
+        let read_pane_frame = frame.frozen_bottom.is_some();
+        let frame_scroll = if read_pane_frame {
+            read_scroll
+        } else {
+            annotation_scroll
+        };
+        let (natural_top, bottom) = frame_screen_bounds(frame, frame_scroll);
+        let frame_clip_top = if read_pane_frame {
+            annotation_clip_bottom
+        } else {
+            scroll_clip_top
+        };
+        let visible_top = natural_top.max(frame_clip_top).max(geometry.viewport.top());
+        let frame_clip_bottom = frame
+            .frozen_bottom
+            .map_or(annotation_clip_bottom, |_| geometry.viewport.bottom());
+        let visible_bottom = bottom
+            .min(frame_clip_bottom)
+            .min(geometry.viewport.bottom());
+        if visible_bottom <= visible_top {
             continue;
         }
-        let visible_top = top.max(geometry.viewport.top());
-        let visible_bottom = bottom.min(geometry.viewport.bottom());
+        // Read groups share one scrollable pane. Keep the current sample's
+        // header visible until the following group pushes it away, while its
+        // read geometry continues to move under the common scrollbar.
+        let header_top = if read_pane_frame {
+            natural_top.max(frame_clip_top).min(bottom - 22.0)
+        } else {
+            natural_top
+        };
         let label_rect = Rect::from_min_max(
             pos2(geometry.gutter.left(), visible_top),
             pos2(geometry.gutter.right(), visible_bottom),
@@ -677,58 +907,117 @@ pub fn paint_track_viewport_chrome(
             TrackFrameKey::Reference | TrackFrameKey::Auxiliary(_) => false,
         };
         if selected == Some(frame.key) || selected_as_part_of_group {
-            painter.rect_filled(label_rect, 0.0, Color32::from_rgb(229, 238, 252));
+            // Preserve the pane colour: selection is an accent, not a new row
+            // fill that makes adjacent tracks look zebra-striped.
+            painter.rect_filled(
+                Rect::from_min_max(
+                    label_rect.left_top(),
+                    pos2(label_rect.left() + 3.0, label_rect.bottom()),
+                ),
+                0.0,
+                Color32::from_rgb(45, 92, 175),
+            );
         }
-        let header_rect = Rect::from_min_max(
-            label_rect.left_top(),
-            pos2(
-                label_rect.right(),
-                (label_rect.top() + 22.0).min(label_rect.bottom()),
-            ),
+        let raw_header_rect = Rect::from_min_max(
+            pos2(label_rect.left(), header_top),
+            pos2(label_rect.right(), (header_top + 22.0).min(bottom)),
         );
+        let header_rect = raw_header_rect.intersect(label_rect);
         let eye_rect = Rect::from_center_size(
-            pos2(header_rect.left() + 11.0, header_rect.center().y),
+            pos2(raw_header_rect.left() + 11.0, raw_header_rect.center().y),
             egui::vec2(16.0, 16.0),
+        );
+        let settings_rect = Rect::from_center_size(
+            pos2(raw_header_rect.right() - 11.0, raw_header_rect.center().y),
+            egui::vec2(18.0, 18.0),
         );
         let response = ui.interact(
             Rect::from_min_max(
-                pos2(header_rect.left() + 22.0, header_rect.top()),
-                header_rect.max,
-            ),
-            egui::Id::new(("track-label", frame.key)),
+                pos2(raw_header_rect.left() + 22.0, raw_header_rect.top()),
+                pos2(settings_rect.left(), raw_header_rect.bottom()),
+            )
+            .intersect(header_rect),
+            egui::Id::new(("track-label", frame.key, read_pane_frame)),
             Sense::click_and_drag(),
         );
         let eye = ui.interact(
-            eye_rect,
-            egui::Id::new(("track-collapse", frame.key)),
+            eye_rect.intersect(header_rect),
+            egui::Id::new(("track-collapse", frame.key, read_pane_frame)),
             Sense::click(),
         );
+        let settings = ui.interact(
+            settings_rect.intersect(header_rect),
+            egui::Id::new(("track-settings", frame.key, read_pane_frame)),
+            Sense::click(),
+        );
+        let is_composite = frame
+            .subtracks
+            .iter()
+            .any(|subtrack| subtrack.composite_member.is_some());
+        let frame_eye_action = match (frame.key, read_pane_frame) {
+            (TrackFrameKey::Alignment(track_id), true) => {
+                TrackUiAction::ToggleAlignmentSubtrack(track_id, AlignmentSubtrack::Reads)
+            }
+            _ => TrackUiAction::ToggleCollapsed(frame.key),
+        };
         eye.widget_info(|| {
             egui::WidgetInfo::selected(
                 egui::WidgetType::Checkbox,
                 true,
                 !frame.collapsed,
-                format!(
-                    "{} track {}",
-                    frame.name,
-                    if frame.collapsed {
-                        "collapsed"
-                    } else {
-                        "expanded"
-                    }
-                ),
+                if read_pane_frame {
+                    format!(
+                        "{} read content {}",
+                        frame.name,
+                        if frame.collapsed { "hidden" } else { "visible" }
+                    )
+                } else if is_composite {
+                    format!(
+                        "{} composite {}",
+                        frame.name,
+                        if frame.collapsed { "hidden" } else { "visible" }
+                    )
+                } else {
+                    format!(
+                        "{} track content {}",
+                        frame.name,
+                        if frame.collapsed { "hidden" } else { "visible" }
+                    )
+                },
             )
         });
         if eye.clicked() {
-            result
-                .actions
-                .push(TrackUiAction::ToggleCollapsed(frame.key));
+            result.actions.push(frame_eye_action);
         }
-        eye.clone().on_hover_text(if frame.collapsed {
-            format!("Expand {} track", frame.name)
+        eye.clone().on_hover_text(if read_pane_frame {
+            if frame.collapsed {
+                "Show reads".to_owned()
+            } else {
+                "Hide reads".to_owned()
+            }
+        } else if is_composite {
+            if frame.collapsed {
+                format!("Show all layers in {}", frame.name)
+            } else {
+                format!("Hide all layers in {}", frame.name)
+            }
+        } else if frame.collapsed {
+            format!("Show all content in {}", frame.name)
         } else {
-            format!("Collapse {} track", frame.name)
+            format!("Hide all content in {}", frame.name)
         });
+        settings.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                format!("Open settings for {}", frame.name),
+            )
+        });
+        if settings.clicked() {
+            result.actions.push(TrackUiAction::Select(frame.key));
+            result.actions.push(TrackUiAction::OpenSettings(frame.key));
+        }
+        settings.clone().on_hover_text("Track settings");
         if response.clicked() {
             result.actions.push(TrackUiAction::Select(frame.key));
         }
@@ -759,9 +1048,7 @@ pub fn paint_track_viewport_chrome(
                     .push(TrackUiAction::ToggleVisibility(frame.key));
             }
             if toggle_collapsed && frame.visible && !matches!(frame.key, TrackFrameKey::Reference) {
-                result
-                    .actions
-                    .push(TrackUiAction::ToggleCollapsed(frame.key));
+                result.actions.push(frame_eye_action);
             }
             if let Some(id) = match frame.key {
                 TrackFrameKey::Reference => None,
@@ -828,7 +1115,24 @@ pub fn paint_track_viewport_chrome(
                 result.actions.push(TrackUiAction::OpenSettings(frame.key));
                 ui.close();
             }
-            if !matches!(frame.key, TrackFrameKey::Reference)
+            if read_pane_frame
+                && let TrackFrameKey::Alignment(track_id) = frame.key
+                && ui
+                    .button(if frame.collapsed {
+                        "Show reads"
+                    } else {
+                        "Hide reads"
+                    })
+                    .clicked()
+            {
+                result.actions.push(TrackUiAction::ToggleAlignmentSubtrack(
+                    track_id,
+                    AlignmentSubtrack::Reads,
+                ));
+                ui.close();
+            }
+            if !read_pane_frame
+                && !matches!(frame.key, TrackFrameKey::Reference)
                 && ui
                     .button(if frame.visible {
                         "Hide track"
@@ -842,9 +1146,16 @@ pub fn paint_track_viewport_chrome(
                     .push(TrackUiAction::ToggleVisibility(frame.key));
                 ui.close();
             }
-            if frame.visible
+            if !read_pane_frame
+                && frame.visible
                 && ui
-                    .button(if frame.collapsed {
+                    .button(if is_composite {
+                        if frame.collapsed {
+                            "Show all overlay layers"
+                        } else {
+                            "Hide all overlay layers"
+                        }
+                    } else if frame.collapsed {
                         "Expand track"
                     } else {
                         "Collapse track"
@@ -895,20 +1206,45 @@ pub fn paint_track_viewport_chrome(
         } else {
             label_painter.circle_filled(eye_rect.center(), 1.6, eye_color);
         }
+        if settings.hovered() {
+            label_painter.rect_filled(
+                settings_rect,
+                3.0,
+                Color32::from_rgba_unmultiplied(45, 92, 175, 24),
+            );
+        }
+        label_painter.text(
+            settings_rect.center(),
+            Align2::CENTER_CENTER,
+            "⚙",
+            FontId::proportional(13.0),
+            if settings.hovered() {
+                Color32::from_rgb(45, 92, 175)
+            } else {
+                Color32::from_gray(95)
+            },
+        );
         paint_elided_text(
             &label_painter,
             &frame.name,
             FontId::proportional(11.0),
             text_color,
-            (label_rect.width() - 31.0).max(0.0),
-            pos2(label_rect.left() + 22.0, label_rect.top() + 11.0),
+            (label_rect.width() - 53.0).max(0.0),
+            pos2(label_rect.left() + 22.0, header_top + 11.0),
             false,
         );
         for subtrack in &frame.subtracks {
-            let (subtrack_top, subtrack_bottom) =
-                subtrack_screen_bounds(frame, subtrack, vertical_scroll);
-            let subtrack_top = subtrack_top.max(label_rect.top() + 19.0);
-            let subtrack_bottom = subtrack_bottom.min(label_rect.bottom());
+            let (raw_subtrack_top, raw_subtrack_bottom) =
+                subtrack_screen_bounds(frame, subtrack, frame_scroll);
+            let subtrack_clip_top = frame_clip_top;
+            let subtrack_top = raw_subtrack_top
+                .max(header_top + 19.0)
+                .max(subtrack_clip_top)
+                .max(geometry.viewport.top());
+            let subtrack_bottom = raw_subtrack_bottom
+                .min(label_rect.bottom())
+                .min(frame_clip_bottom)
+                .min(geometry.viewport.bottom());
             if subtrack_bottom <= subtrack_top {
                 continue;
             }
@@ -929,7 +1265,10 @@ pub fn paint_track_viewport_chrome(
                 });
                 orientation.on_hover_text(tooltip);
             }
-            let y = (subtrack_top + 9.0).min(subtrack_bottom - 2.0);
+            let y = (raw_subtrack_top + 9.0).min(raw_subtrack_bottom - 2.0);
+            if y < subtrack_top || y >= subtrack_bottom {
+                continue;
+            }
             let alignment_subtrack = match frame.key {
                 TrackFrameKey::Alignment(_) => AlignmentSubtrack::from_label(&subtrack.label),
                 TrackFrameKey::Reference | TrackFrameKey::Auxiliary(_) => None,
@@ -959,11 +1298,15 @@ pub fn paint_track_viewport_chrome(
                     egui::vec2(16.0, 16.0),
                 );
                 let eye = ui.interact(
-                    eye_rect,
+                    eye_rect.intersect(Rect::from_min_max(
+                        pos2(label_rect.left(), subtrack_top),
+                        pos2(label_rect.right(), subtrack_bottom),
+                    )),
                     egui::Id::new((
                         "alignment-subtrack-visibility",
                         track_id,
                         alignment_subtrack,
+                        read_pane_frame,
                     )),
                     Sense::click(),
                 );
@@ -1031,6 +1374,88 @@ pub fn paint_track_viewport_chrome(
                     label_painter.circle_filled(eye_rect.center(), 1.6, eye_color);
                 }
             }
+            if let Some(member_id) = subtrack.composite_member {
+                if subtrack.collapsed {
+                    painter.rect_filled(
+                        Rect::from_min_max(
+                            pos2(geometry.gutter.left(), subtrack_top),
+                            pos2(geometry.gutter.right(), subtrack_bottom),
+                        ),
+                        0.0,
+                        Color32::from_gray(242),
+                    );
+                }
+                let eye_rect = Rect::from_center_size(
+                    pos2(label_rect.left() + 11.0, y),
+                    egui::vec2(16.0, 16.0),
+                );
+                let eye = ui.interact(
+                    eye_rect.intersect(Rect::from_min_max(
+                        pos2(label_rect.left(), subtrack_top),
+                        pos2(label_rect.right(), subtrack_bottom),
+                    )),
+                    egui::Id::new(("composite-member-visibility", member_id, read_pane_frame)),
+                    Sense::click(),
+                );
+                eye.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Checkbox,
+                        true,
+                        !subtrack.collapsed,
+                        format!(
+                            "{} composite member {}",
+                            subtrack.label,
+                            if subtrack.collapsed {
+                                "hidden"
+                            } else {
+                                "visible"
+                            }
+                        ),
+                    )
+                });
+                if eye.clicked() {
+                    result
+                        .actions
+                        .push(TrackUiAction::ToggleCompositeMember(member_id));
+                }
+                let visibility_action = if subtrack.collapsed { "Show" } else { "Hide" };
+                eye.clone().on_hover_text(format!(
+                    "{visibility_action} {} in this overlay",
+                    subtrack.label
+                ));
+                eye.context_menu(|ui| {
+                    if ui
+                        .button(format!("{visibility_action} {}", subtrack.label))
+                        .clicked()
+                    {
+                        result
+                            .actions
+                            .push(TrackUiAction::ToggleCompositeMember(member_id));
+                        ui.close();
+                    }
+                });
+                let eye_color = if eye.hovered() {
+                    Color32::from_rgb(45, 92, 175)
+                } else {
+                    Color32::from_gray(115)
+                };
+                label_painter.add(egui::epaint::Shape::ellipse_stroke(
+                    eye_rect.center(),
+                    egui::vec2(5.0, 3.2),
+                    Stroke::new(1.0, eye_color),
+                ));
+                if subtrack.collapsed {
+                    label_painter.line_segment(
+                        [
+                            eye_rect.left_top() + egui::vec2(2.5, 2.5),
+                            eye_rect.right_bottom() - egui::vec2(2.5, 2.5),
+                        ],
+                        Stroke::new(1.4, eye_color),
+                    );
+                } else {
+                    label_painter.circle_filled(eye_rect.center(), 1.6, eye_color);
+                }
+            }
             let label_font = FontId::proportional(10.0);
             let detail_font = FontId::proportional(9.0);
             let label_color = Color32::from_gray(if subtrack.collapsed { 115 } else { 75 });
@@ -1069,25 +1494,37 @@ pub fn paint_track_viewport_chrome(
                 );
             }
         }
-        painter.line_segment(
-            [
-                pos2(geometry.viewport.left(), bottom),
-                pos2(geometry.viewport.right(), bottom),
-            ],
-            Stroke::new(1.0, Color32::from_gray(205)),
-        );
+        if boundary_inside_clip(bottom, frame_clip_top, frame_clip_bottom) {
+            painter.line_segment(
+                [
+                    pos2(geometry.viewport.left(), bottom),
+                    pos2(geometry.viewport.right(), bottom),
+                ],
+                Stroke::new(1.0, Color32::from_gray(205)),
+            );
+        }
 
-        let TrackFrameKey::Auxiliary(id) = frame.key else {
+        if frame.collapsed {
             continue;
-        };
-        if bottom < geometry.viewport.top() || bottom > geometry.viewport.bottom() {
+        }
+        if !boundary_inside_clip(bottom, frame_clip_top, frame_clip_bottom) {
             continue;
         }
         let handle = Rect::from_min_max(
             pos2(geometry.gutter.left(), bottom - 3.0),
             pos2(geometry.gutter.right(), bottom + 3.0),
-        );
-        let resize = ui.interact(handle, egui::Id::new(("track-resize", id)), Sense::drag());
+        )
+        .intersect(Rect::from_min_max(
+            pos2(geometry.gutter.left(), frame_clip_top),
+            pos2(geometry.gutter.right(), frame_clip_bottom),
+        ));
+        let resize = ui
+            .interact(
+                handle,
+                egui::Id::new(("track-resize", frame.key, read_pane_frame)),
+                Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
         resize.widget_info(|| {
             egui::WidgetInfo::labeled(
                 egui::WidgetType::ResizeHandle,
@@ -1109,9 +1546,31 @@ pub fn paint_track_viewport_chrome(
                 }
             });
             if delta != 0.0 {
-                result
-                    .actions
-                    .push(TrackUiAction::ResizeKeyboard(id, delta));
+                if read_pane_frame {
+                    let TrackFrameKey::Alignment(id) = frame.key else {
+                        continue;
+                    };
+                    result.actions.push(TrackUiAction::ResizeReadTrackKeyboard(
+                        id,
+                        frame.bottom - frame.top,
+                        delta,
+                    ));
+                } else {
+                    match frame.key {
+                        TrackFrameKey::Auxiliary(id) => {
+                            result
+                                .actions
+                                .push(TrackUiAction::ResizeKeyboard(id, delta));
+                        }
+                        TrackFrameKey::Reference | TrackFrameKey::Alignment(_) => {
+                            result.actions.push(TrackUiAction::ResizeAnnotationKeyboard(
+                                frame.key,
+                                frame.bottom - frame.top,
+                                delta,
+                            ));
+                        }
+                    }
+                }
             }
             painter.line_segment(
                 [handle.left_center(), handle.right_center()],
@@ -1119,30 +1578,181 @@ pub fn paint_track_viewport_chrome(
             );
         }
         if resize.drag_started() {
-            result.actions.push(TrackUiAction::ResizeStarted(id));
+            if read_pane_frame {
+                let TrackFrameKey::Alignment(id) = frame.key else {
+                    continue;
+                };
+                result.actions.push(TrackUiAction::ResizeReadTrackStarted(
+                    id,
+                    frame.bottom - frame.top,
+                ));
+            } else {
+                match frame.key {
+                    TrackFrameKey::Auxiliary(id) => {
+                        result.actions.push(TrackUiAction::ResizeStarted(id));
+                    }
+                    TrackFrameKey::Reference | TrackFrameKey::Alignment(_) => {
+                        result.actions.push(TrackUiAction::ResizeAnnotationStarted(
+                            frame.key,
+                            frame.bottom - frame.top,
+                        ));
+                    }
+                }
+            }
         }
         if resize.dragged() {
-            result
-                .actions
-                .push(TrackUiAction::ResizeDragged(id, resize.drag_delta().y));
+            if read_pane_frame {
+                let TrackFrameKey::Alignment(id) = frame.key else {
+                    continue;
+                };
+                let delta = resize.drag_delta().y;
+                if delta != 0.0 {
+                    result
+                        .actions
+                        .push(TrackUiAction::ResizeReadTrackDragged(id, delta));
+                }
+            } else {
+                match frame.key {
+                    TrackFrameKey::Auxiliary(id) => result
+                        .actions
+                        .push(TrackUiAction::ResizeDragged(id, resize.drag_delta().y)),
+                    TrackFrameKey::Reference | TrackFrameKey::Alignment(_) => result.actions.push(
+                        TrackUiAction::ResizeAnnotationDragged(frame.key, resize.drag_delta().y),
+                    ),
+                }
+            }
         }
         if resize.drag_stopped() {
-            result.actions.push(TrackUiAction::ResizeStopped(id));
+            if read_pane_frame {
+                let TrackFrameKey::Alignment(id) = frame.key else {
+                    continue;
+                };
+                result
+                    .actions
+                    .push(TrackUiAction::ResizeReadTrackStopped(id));
+            } else {
+                match frame.key {
+                    TrackFrameKey::Auxiliary(id) => {
+                        result.actions.push(TrackUiAction::ResizeStopped(id));
+                    }
+                    TrackFrameKey::Reference | TrackFrameKey::Alignment(_) => result
+                        .actions
+                        .push(TrackUiAction::ResizeAnnotationStopped(frame.key)),
+                }
+            }
         }
+    }
+    if annotation_clip_bottom > geometry.viewport.top()
+        && annotation_clip_bottom < geometry.viewport.bottom()
+    {
+        let divider_handle = Rect::from_min_max(
+            pos2(geometry.gutter.left(), annotation_clip_bottom - 4.0),
+            pos2(geometry.scrollbar.left(), annotation_clip_bottom + 4.0),
+        );
+        let divider = ui
+            .interact(
+                divider_handle,
+                egui::Id::new("annotation-read-pane-divider"),
+                Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text("Resize annotation and read panes");
+        divider.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::ResizeHandle,
+                true,
+                "Resize annotation and read panes; arrow up enlarges reads and arrow down enlarges annotations",
+            )
+        });
+        if divider.has_focus() {
+            let delta = ui.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    -10.0
+                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    10.0
+                } else {
+                    0.0
+                }
+            });
+            if delta != 0.0 {
+                result
+                    .actions
+                    .push(TrackUiAction::ResizeReadPaneKeyboard(delta));
+            }
+        }
+        if divider.drag_started() {
+            result.actions.push(TrackUiAction::ResizeReadPaneStarted);
+        }
+        if divider.dragged() {
+            let delta = divider.drag_delta().y;
+            if delta != 0.0 {
+                result
+                    .actions
+                    .push(TrackUiAction::ResizeReadPaneDragged(delta));
+            }
+        }
+        if divider.drag_stopped() {
+            result.actions.push(TrackUiAction::ResizeReadPaneStopped);
+        }
+        painter.line_segment(
+            [
+                pos2(geometry.viewport.left(), annotation_clip_bottom),
+                pos2(geometry.viewport.right(), annotation_clip_bottom),
+            ],
+            Stroke::new(1.5, Color32::from_gray(165)),
+        );
     }
     result
 }
 
+fn boundary_inside_clip(boundary: f32, clip_top: f32, clip_bottom: f32) -> bool {
+    boundary >= clip_top && boundary <= clip_bottom
+}
+
 fn frame_screen_bounds(frame: &TrackFrame, vertical_scroll: f32) -> (f32, f32) {
-    frame.frozen_bottom.map_or_else(
-        || (frame.top - vertical_scroll, frame.bottom - vertical_scroll),
-        |frozen_bottom| {
-            (
-                frame.top,
-                (frame.bottom - vertical_scroll).max(frozen_bottom),
-            )
-        },
-    )
+    (frame.top - vertical_scroll, frame.bottom - vertical_scroll)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VerticalScreenBounds {
+    top: f32,
+    bottom: f32,
+}
+
+fn clipped_frame_screen_bounds(
+    frame: &TrackFrame,
+    vertical_scroll: f32,
+    scroll_clip_top: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+) -> Option<VerticalScreenBounds> {
+    let (top, bottom) = frame_screen_bounds(frame, vertical_scroll);
+    let clip_top = scroll_clip_top;
+    let bounds = VerticalScreenBounds {
+        top: top.max(clip_top).max(viewport_top),
+        bottom: bottom.min(viewport_bottom),
+    };
+    (bounds.bottom > bounds.top).then_some(bounds)
+}
+
+/// Converts a visible screen-space row back into its frame-local content
+/// coordinate using the same pane scroll as rendering.
+pub fn frame_content_y_at_screen_y(
+    frame: &TrackFrame,
+    screen_y: f32,
+    vertical_scroll: f32,
+    scroll_clip_top: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+) -> Option<f32> {
+    if screen_y < viewport_top || screen_y >= viewport_bottom {
+        return None;
+    }
+    if screen_y < scroll_clip_top {
+        return None;
+    }
+    let content_y = screen_y + vertical_scroll;
+    (content_y >= frame.top && content_y < frame.bottom).then_some(content_y)
 }
 
 fn reference_orientation_accessibility(label: &str) -> Option<(&'static str, &'static str)> {
@@ -1162,24 +1772,14 @@ fn reference_orientation_accessibility(label: &str) -> Option<(&'static str, &'s
 }
 
 fn subtrack_screen_bounds(
-    frame: &TrackFrame,
+    _frame: &TrackFrame,
     subtrack: &TrackSubtrack,
     vertical_scroll: f32,
 ) -> (f32, f32) {
-    let Some(frozen_bottom) = frame.frozen_bottom else {
-        return (
-            subtrack.top - vertical_scroll,
-            subtrack.bottom - vertical_scroll,
-        );
-    };
-    if subtrack.top < frozen_bottom {
-        (subtrack.top, subtrack.bottom.min(frozen_bottom))
-    } else {
-        (
-            subtrack.top,
-            (subtrack.bottom - vertical_scroll).max(subtrack.top),
-        )
-    }
+    (
+        subtrack.top - vertical_scroll,
+        subtrack.bottom - vertical_scroll,
+    )
 }
 
 pub fn paint_genomic_text(ui: &Ui, clip_rect: Rect, texts: &[TextPrimitive]) {
@@ -1204,6 +1804,14 @@ pub fn paint_genomic_text(ui: &Ui, clip_rect: Rect, texts: &[TextPrimitive]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotation_boundaries_cannot_enter_the_read_pane() {
+        assert!(boundary_inside_clip(240.0, 100.0, 300.0));
+        assert!(boundary_inside_clip(300.0, 100.0, 300.0));
+        assert!(!boundary_inside_clip(301.0, 100.0, 300.0));
+        assert!(!boundary_inside_clip(480.0, 100.0, 300.0));
+    }
 
     #[test]
     fn reference_orientation_indicator_has_accessible_names_and_tooltips() {
@@ -1292,8 +1900,8 @@ mod tests {
     fn drop_target_accounts_for_vertical_scroll() {
         let frames = [frame(1, 200.0), frame(2, 300.0), frame(3, 400.0)];
         let order = [TrackId::new(1), TrackId::new(2), TrackId::new(3)];
-        assert_eq!(track_drop_index(&frames, &order, 220.0, 100.0), 1);
-        assert_eq!(track_drop_index(&frames, &order, 500.0, 100.0), 2);
+        assert_eq!(track_drop_index(&frames, &order, 220.0, 100.0, 0.0), 1);
+        assert_eq!(track_drop_index(&frames, &order, 500.0, 100.0, 0.0), 2);
     }
 
     #[test]
@@ -1403,6 +2011,14 @@ mod tests {
                     None,
                     None,
                 );
+                let mut annotation_offset = 500.0;
+                let _ = paint_annotation_scrollbar(
+                    ui,
+                    Rect::from_min_size(egui::pos2(40.0, 10.0), egui::vec2(22.0, 400.0)),
+                    1_000.0,
+                    &mut annotation_offset,
+                    None,
+                );
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
@@ -1410,8 +2026,15 @@ mod tests {
             node.role() == egui::accesskit::Role::Slider
                 && node
                     .label()
-                    .is_some_and(|label| label.starts_with("Track overview"))
+                    .is_some_and(|label| label.starts_with("Read stack overview"))
                 && node.numeric_value() == Some(25.0)
+        }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Slider
+                && node
+                    .label()
+                    .is_some_and(|label| label.starts_with("Annotation track scrollbar"))
+                && node.numeric_value() == Some(50.0)
         }));
     }
 
@@ -1494,6 +2117,9 @@ mod tests {
                     geometry,
                     &frames,
                     0.0,
+                    0.0,
+                    geometry.viewport.top(),
+                    geometry.viewport.bottom(),
                     Some(TrackFrameKey::Auxiliary(TrackId::new(7))),
                     &[],
                 );
@@ -1517,9 +2143,272 @@ mod tests {
             node.role() == egui::accesskit::Role::CheckBox
                 && node
                     .label()
-                    .is_some_and(|label| label == "track-7 track expanded")
+                    .is_some_and(|label| label == "track-7 track content visible")
                 && node.toggled() == Some(egui::accesskit::Toggled::True)
         }));
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node
+                    .label()
+                    .is_some_and(|label| label == "Open settings for track-7")
+        }));
+    }
+
+    #[test]
+    fn duplicated_primary_alignment_frames_have_distinct_header_controls() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 500.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let track_id = TrackId::new(9);
+                let frames = [
+                    TrackFrame {
+                        key: TrackFrameKey::Alignment(track_id),
+                        name: "exact-bases.bam".to_owned(),
+                        kind: TrackKind::Alignment,
+                        source_label: None,
+                        top: 20.0,
+                        bottom: 120.0,
+                        visible: true,
+                        collapsed: false,
+                        frozen_bottom: None,
+                        subtracks: Vec::new(),
+                    },
+                    TrackFrame {
+                        key: TrackFrameKey::Alignment(track_id),
+                        name: "Reads · exact-bases.bam".to_owned(),
+                        kind: TrackKind::Alignment,
+                        source_label: None,
+                        top: 180.0,
+                        bottom: 420.0,
+                        visible: true,
+                        collapsed: false,
+                        frozen_bottom: Some(202.0),
+                        subtracks: Vec::new(),
+                    },
+                ];
+                let geometry = CanvasGeometry::from_viewport(ui.max_rect());
+                let _ = paint_track_viewport_chrome(
+                    ui,
+                    geometry,
+                    &frames,
+                    0.0,
+                    0.0,
+                    0.0,
+                    180.0,
+                    None,
+                    &[],
+                );
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        let settings_buttons = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == egui::accesskit::Role::Button
+                    && node
+                        .label()
+                        .is_some_and(|label| label.starts_with("Open settings for "))
+            })
+            .count();
+        let visibility_eyes = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == egui::accesskit::Role::CheckBox
+                    && node
+                        .label()
+                        .is_some_and(|label| label.contains("content visible"))
+            })
+            .count();
+
+        assert_eq!(settings_buttons, 2);
+        assert_eq!(visibility_eyes, 2);
+    }
+
+    #[test]
+    fn duplicated_primary_alignment_header_context_menu_stays_open() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let track_id = TrackId::new(9);
+        let frames = [
+            TrackFrame {
+                key: TrackFrameKey::Alignment(track_id),
+                name: "exact-bases.bam".to_owned(),
+                kind: TrackKind::Alignment,
+                source_label: None,
+                top: 20.0,
+                bottom: 120.0,
+                visible: true,
+                collapsed: false,
+                frozen_bottom: None,
+                subtracks: Vec::new(),
+            },
+            TrackFrame {
+                key: TrackFrameKey::Alignment(track_id),
+                name: "Reads · exact-bases.bam".to_owned(),
+                kind: TrackKind::Alignment,
+                source_label: None,
+                top: 180.0,
+                bottom: 420.0,
+                visible: true,
+                collapsed: false,
+                frozen_bottom: Some(202.0),
+                subtracks: Vec::new(),
+            },
+        ];
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &frames,
+                0.0,
+                0.0,
+                0.0,
+                180.0,
+                None,
+                &[],
+            )
+        };
+        let pointer = pos2(50.0, 31.0);
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let popup_id =
+            egui::Id::new(("track-label", TrackFrameKey::Alignment(track_id), false)).with("popup");
+        assert!(egui::Popup::is_id_open(&context, popup_id));
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        assert!(egui::Popup::is_id_open(&context, popup_id));
+    }
+
+    #[test]
+    fn clicking_visible_track_settings_button_opens_settings() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let frames = [frame(7, 20.0)];
+        let pointer = pos2(157.0, 31.0);
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &frames,
+                0.0,
+                0.0,
+                0.0,
+                ui.max_rect().bottom(),
+                None,
+                &[],
+            )
+        };
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                actions = render(ui).actions;
+            },
+        );
+
+        assert_eq!(
+            actions,
+            vec![
+                TrackUiAction::Select(TrackFrameKey::Auxiliary(TrackId::new(7))),
+                TrackUiAction::OpenSettings(TrackFrameKey::Auxiliary(TrackId::new(7))),
+            ]
+        );
     }
 
     #[test]
@@ -1534,6 +2423,9 @@ mod tests {
                 CanvasGeometry::from_viewport(ui.max_rect()),
                 &frames,
                 0.0,
+                0.0,
+                0.0,
+                ui.max_rect().bottom(),
                 None,
                 &[],
             )
@@ -1592,6 +2484,91 @@ mod tests {
     }
 
     #[test]
+    fn clicking_read_pane_eye_toggles_reads_instead_of_the_whole_track() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let track_id = TrackId::new(9);
+        let frames = [TrackFrame {
+            key: TrackFrameKey::Alignment(track_id),
+            name: "Reads · exact-bases.bam".to_owned(),
+            kind: TrackKind::Alignment,
+            source_label: None,
+            top: 180.0,
+            bottom: 420.0,
+            visible: true,
+            collapsed: true,
+            frozen_bottom: Some(202.0),
+            subtracks: Vec::new(),
+        }];
+        let pointer = pos2(11.0, 191.0);
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &frames,
+                0.0,
+                0.0,
+                0.0,
+                180.0,
+                None,
+                &[],
+            )
+        };
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                actions = render(ui).actions;
+            },
+        );
+
+        assert_eq!(
+            actions,
+            vec![TrackUiAction::ToggleAlignmentSubtrack(
+                track_id,
+                AlignmentSubtrack::Reads,
+            )]
+        );
+    }
+
+    #[test]
     fn hidden_alignment_subtrack_keeps_a_collapsed_closed_eye_row() {
         let context = egui::Context::default();
         context.enable_accesskit();
@@ -1622,9 +2599,20 @@ mod tests {
                         top: 42.0,
                         bottom: 62.0,
                         collapsed: true,
+                        composite_member: None,
                     }],
                 }];
-                let _ = paint_track_viewport_chrome(ui, geometry, &frames, 0.0, None, &[]);
+                let _ = paint_track_viewport_chrome(
+                    ui,
+                    geometry,
+                    &frames,
+                    0.0,
+                    0.0,
+                    0.0,
+                    geometry.viewport.bottom(),
+                    None,
+                    &[],
+                );
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
@@ -1658,6 +2646,7 @@ mod tests {
                 top: 42.0,
                 bottom: 62.0,
                 collapsed: true,
+                composite_member: None,
             }],
         }];
         let pointer = pos2(11.0, 51.0);
@@ -1667,6 +2656,9 @@ mod tests {
                 CanvasGeometry::from_viewport(ui.max_rect()),
                 &frames,
                 0.0,
+                0.0,
+                0.0,
+                ui.max_rect().bottom(),
                 None,
                 &[],
             )
@@ -1726,14 +2718,258 @@ mod tests {
     }
 
     #[test]
+    fn clicking_composite_member_eye_targets_only_that_member() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let member_id = TrackId::new(9);
+        let frames = [TrackFrame {
+            key: TrackFrameKey::Auxiliary(TrackId::new(7)),
+            name: "Overlay 1 · 3 tracks".to_owned(),
+            kind: TrackKind::Quantitative,
+            source_label: None,
+            top: 20.0,
+            bottom: 140.0,
+            visible: true,
+            collapsed: false,
+            frozen_bottom: None,
+            subtracks: vec![TrackSubtrack {
+                label: "normal".to_owned(),
+                detail: Some("overlay 1".to_owned()),
+                top: 42.0,
+                bottom: 62.0,
+                collapsed: false,
+                composite_member: Some(member_id),
+            }],
+        }];
+        let pointer = pos2(11.0, 51.0);
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &frames,
+                0.0,
+                0.0,
+                0.0,
+                ui.max_rect().bottom(),
+                None,
+                &[],
+            )
+        };
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+
+        assert_eq!(
+            actions,
+            vec![TrackUiAction::ToggleCompositeMember(member_id)]
+        );
+    }
+
+    #[test]
     fn resize_clamps_to_track_height_constraints() {
         assert_close(resized_track_height(120.0, 30.0), 150.0);
         assert_close(resized_track_height(120.0, -500.0), 40.0);
         assert_close(resized_track_height(120.0, 900.0), 600.0);
+        assert_close(resized_read_track_height(120.0, 30.0), 150.0);
+        assert_close(resized_read_track_height(120.0, -500.0), 40.0);
+        assert_close(resized_read_track_height(120.0, 2_000.0), 1_200.0);
     }
 
     #[test]
-    fn frozen_alignment_header_does_not_follow_read_scroll() {
+    fn read_group_boundary_is_resizable_from_the_left_gutter() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let track_id = TrackId::new(9);
+        let frames = [TrackFrame {
+            key: TrackFrameKey::Alignment(track_id),
+            name: "Reads · sample A".to_owned(),
+            kind: TrackKind::Alignment,
+            source_label: None,
+            top: 200.0,
+            bottom: 300.0,
+            visible: true,
+            collapsed: false,
+            frozen_bottom: Some(222.0),
+            subtracks: vec![TrackSubtrack {
+                label: "Reads".to_owned(),
+                detail: None,
+                top: 222.0,
+                bottom: 300.0,
+                collapsed: false,
+                composite_member: None,
+            }],
+        }];
+        let pointer = pos2(50.0, 300.0);
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &frames,
+                0.0,
+                0.0,
+                0.0,
+                200.0,
+                None,
+                &[],
+            )
+        };
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+
+        assert_eq!(
+            actions,
+            vec![TrackUiAction::ResizeReadTrackStarted(track_id, 100.0)]
+        );
+    }
+
+    #[test]
+    fn incremental_track_resize_deltas_accumulate() {
+        let after_first_frame = resized_track_height(120.0, 10.0);
+        let after_second_frame = resized_track_height(after_first_frame, 10.0);
+        assert_close(after_second_frame, 140.0);
+    }
+
+    #[test]
+    fn pane_resize_moves_the_divider_and_preserves_both_minimums() {
+        assert_close(resized_read_pane_height(360.0, -30.0, 800.0), 390.0);
+        assert_close(resized_read_pane_height(360.0, 30.0, 800.0), 330.0);
+        assert_close(resized_read_pane_height(120.0, 200.0, 800.0), 100.0);
+        assert_close(resized_read_pane_height(700.0, -200.0, 800.0), 720.0);
+    }
+
+    #[test]
+    fn pane_divider_reports_incremental_drag_actions() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &[],
+                0.0,
+                0.0,
+                0.0,
+                250.0,
+                None,
+                &[],
+            )
+        };
+        // The pane divider must be draggable from the left gutter as well as
+        // from the genomic canvas.
+        let pointer = pos2(50.0, 250.0);
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+        assert_eq!(actions, vec![TrackUiAction::ResizeReadPaneStarted]);
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerMoved(pos2(50.0, 260.0))],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+        assert_eq!(actions, vec![TrackUiAction::ResizeReadPaneDragged(10.0)]);
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerMoved(pos2(50.0, 270.0))],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+        assert_eq!(actions, vec![TrackUiAction::ResizeReadPaneDragged(10.0)]);
+    }
+
+    #[test]
+    fn alignment_read_groups_follow_the_shared_read_scroll() {
         let frame = TrackFrame {
             key: TrackFrameKey::Alignment(TrackId::new(1)),
             name: "reads.bam".to_owned(),
@@ -1751,6 +2987,7 @@ mod tests {
                     top: 125.0,
                     bottom: 165.0,
                     collapsed: false,
+                    composite_member: None,
                 },
                 TrackSubtrack {
                     label: "Reads".to_owned(),
@@ -1758,18 +2995,109 @@ mod tests {
                     top: 260.0,
                     bottom: 800.0,
                     collapsed: false,
+                    composite_member: None,
                 },
             ],
         };
 
-        assert_eq!(frame_screen_bounds(&frame, 300.0), (100.0, 500.0));
+        assert_eq!(frame_screen_bounds(&frame, 300.0), (-200.0, 500.0));
         assert_eq!(
             subtrack_screen_bounds(&frame, &frame.subtracks[0], 300.0),
-            (125.0, 165.0)
+            (-175.0, -135.0)
         );
         assert_eq!(
             subtrack_screen_bounds(&frame, &frame.subtracks[1], 300.0),
-            (260.0, 500.0)
+            (-40.0, 500.0)
+        );
+    }
+
+    #[test]
+    fn scrollable_frame_bounds_are_clipped_below_the_pinned_gutter() {
+        let crossing = frame(1, 200.0);
+        let below = frame(2, 300.0);
+
+        assert_eq!(
+            clipped_frame_screen_bounds(&crossing, 0.0, 260.0, 100.0, 700.0),
+            Some(VerticalScreenBounds {
+                top: 260.0,
+                bottom: 300.0,
+            })
+        );
+        assert_eq!(
+            clipped_frame_screen_bounds(&crossing, 40.0, 260.0, 100.0, 700.0),
+            None
+        );
+        assert_eq!(
+            clipped_frame_screen_bounds(&below, 20.5, 260.0, 100.0, 700.0),
+            Some(VerticalScreenBounds {
+                top: 279.5,
+                bottom: 379.5,
+            })
+        );
+    }
+
+    #[test]
+    fn adjacent_scrolled_frames_never_overlap_after_boundary_clipping() {
+        let frames = [frame(1, 200.0), frame(2, 300.0), frame(3, 400.0)];
+        for scroll in [0.0, 25.5, 100.0, 240.0] {
+            let visible = frames
+                .iter()
+                .filter_map(|frame| clipped_frame_screen_bounds(frame, scroll, 260.0, 100.0, 700.0))
+                .collect::<Vec<_>>();
+            assert!(visible.windows(2).all(|pair| pair[0].bottom <= pair[1].top));
+        }
+    }
+
+    #[test]
+    fn screen_to_content_mapping_uses_one_scroll_world_for_read_groups() {
+        let scrollable = frame(1, 300.0);
+        assert_eq!(
+            frame_content_y_at_screen_y(&scrollable, 220.0, 100.0, 260.0, 100.0, 700.0),
+            None
+        );
+        assert_eq!(
+            frame_content_y_at_screen_y(&scrollable, 260.0, 100.0, 260.0, 100.0, 700.0),
+            Some(360.0)
+        );
+
+        let mut read_group = frame(2, 120.0);
+        read_group.bottom = 720.0;
+        read_group.frozen_bottom = Some(142.0);
+        assert_eq!(
+            frame_content_y_at_screen_y(&read_group, 260.0, 300.0, 260.0, 100.0, 700.0),
+            Some(560.0)
+        );
+
+        let mut split = frame(3, 100.0);
+        split.bottom = 800.0;
+        split.frozen_bottom = Some(260.0);
+        assert_eq!(
+            frame_content_y_at_screen_y(&split, 150.0, 300.0, 260.0, 100.0, 700.0),
+            None
+        );
+        assert_eq!(
+            frame_content_y_at_screen_y(&split, 260.0, 300.0, 260.0, 100.0, 700.0),
+            Some(560.0)
+        );
+
+        split.bottom = 800.0;
+        split.subtracks = vec![TrackSubtrack {
+            label: "Reads".to_owned(),
+            detail: None,
+            top: 260.0,
+            bottom: 900.0,
+            collapsed: false,
+            composite_member: None,
+        }];
+        assert_eq!(
+            frame_content_y_at_screen_y(&split, 420.0, 300.0, 260.0, 100.0, 700.0),
+            Some(720.0),
+            "a read group maps through the shared lower-pane scroll"
+        );
+        assert_eq!(
+            frame_content_y_at_screen_y(&split, 520.0, 300.0, 260.0, 100.0, 700.0),
+            None,
+            "the read scrollbar cannot pick through the annotation pane"
         );
     }
 

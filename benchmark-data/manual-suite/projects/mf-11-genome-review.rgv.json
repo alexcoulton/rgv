@@ -13,7 +13,9 @@
         "start": 8500,
         "end": 12500
       },
-      "vertical_scroll_points": 0.0
+      "vertical_scroll_points": 0.0,
+      "annotation_scroll_points": 0.0,
+      "vertical_content_origin_points": 0.0
     }
   ],
   "active_panel": 1,
@@ -24,6 +26,7 @@
     }
   },
   "genome_name": "RGV portable genome review",
+  "assembly_identity": null,
   "cytobands": {
     "Local": {
       "path": "../data/tracks/cytobands.txt"
@@ -114,7 +117,7 @@
       "sample_key": null,
       "visible": true,
       "collapsed": false,
-      "height": 120.0,
+      "height": 48.0,
       "variant": {
         "minimum_quality": null,
         "quality_missing": "exclude",

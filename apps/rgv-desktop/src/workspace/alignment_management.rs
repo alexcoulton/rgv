@@ -43,10 +43,11 @@ impl Viewer {
         let viewport = self.panels.active().viewport;
         let detail_level = viewport.detail_level();
         let visible_bases = usize::try_from(viewport_interval.len()).unwrap_or(usize::MAX);
-        let coverage_bins = (self.panels.active().viewport.pixel_width().round() as usize)
-            .clamp(64, 4_096)
-            .min(visible_bases)
-            .max(1);
+        let (coverage_bins, collect_alleles) = alignment_coverage_query_plan(
+            visible_bases,
+            viewport.pixel_width(),
+            viewport.bases_per_pixel(),
+        );
         let mut sent = 0_usize;
         let panel_id = self.panels.active().id;
         for (track, record_allocation) in self.alignment_tracks.iter_mut().zip(record_allocations) {
@@ -64,6 +65,7 @@ impl Viewer {
                 viewport.bases_per_pixel(),
                 record_allocation,
                 coverage_bins,
+                collect_alleles,
             );
             let (request, clock) = {
                 let projection = track.projection_mut(panel_id);

@@ -1,6 +1,71 @@
 use super::super::*;
 
 impl Viewer {
+    fn active_scroll_clip_top(&self) -> f32 {
+        self.panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                cache.scroll_clip_top
+            })
+    }
+
+    fn active_annotation_clip_top(&self) -> f32 {
+        self.panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                cache.annotation_clip_top
+            })
+    }
+
+    fn active_annotation_clip_bottom(&self) -> f32 {
+        self.panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                cache.annotation_clip_bottom
+            })
+    }
+
+    fn visible_track_frame_at_screen_y(
+        &self,
+        screen_y: f32,
+        predicate: impl Fn(&TrackFrame) -> bool,
+    ) -> Option<(&TrackFrame, f32)> {
+        let panel = self.panels.active();
+        let scroll_clip_top = self.active_scroll_clip_top();
+        let annotation_clip_top = self.active_annotation_clip_top();
+        panel.track_frames.iter().find_map(|frame| {
+            let (scroll, clip_top) = if frame.frozen_bottom.is_some() {
+                (panel.effective_vertical_scroll_points(), scroll_clip_top)
+            } else {
+                (panel.annotation_scroll_points, annotation_clip_top)
+            };
+            let clip_bottom = if frame.frozen_bottom.is_some() {
+                self.canvas_geometry.viewport.bottom()
+            } else {
+                self.active_annotation_clip_bottom()
+            };
+            predicate(frame)
+                .then(|| {
+                    ui::frame_content_y_at_screen_y(
+                        frame,
+                        screen_y,
+                        scroll,
+                        clip_top,
+                        self.canvas_geometry.viewport.top(),
+                        clip_bottom,
+                    )
+                    .map(|content_y| (frame, content_y))
+                })
+                .flatten()
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn select_at_cursor(&mut self) {
         self.clear_promoted_read();
@@ -122,14 +187,10 @@ impl Viewer {
             self.panels.active_mut().selected_chain = selected_chain;
         }
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
-        let content_y = cursor_y + self.panels.active().effective_vertical_scroll_points();
-        self.panels.active_mut().selected_track = self
-            .panels
-            .active()
-            .track_frames
-            .iter()
-            .find(|frame| content_y >= frame.top && content_y < frame.bottom)
-            .map(|frame| frame.key);
+        let selected_track = self
+            .visible_track_frame_at_screen_y(cursor_y, |_| true)
+            .map(|(frame, _)| frame.key);
+        self.panels.active_mut().selected_track = selected_track;
         self.panels.active_mut().selected_alignment_tracks.clear();
         if let Some(TrackFrameKey::Alignment(id)) = self.panels.active_mut().selected_track {
             self.panels.active_mut().selected_alignment_tracks.push(id);
@@ -152,11 +213,8 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().effective_vertical_scroll_points();
-        let frame = self.panels.active().track_frames.iter().find(|frame| {
+        let (frame, content_y) = self.visible_track_frame_at_screen_y(y, |frame| {
             matches!(frame.kind, TrackKind::Feature | TrackKind::GeneModel)
-                && content_y >= frame.top
-                && content_y < frame.bottom
         })?;
         let TrackFrameKey::Auxiliary(track_id) = frame.key else {
             return None;
@@ -224,10 +282,8 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().effective_vertical_scroll_points();
-        let frame = self.panels.active().track_frames.iter().find(|frame| {
-            frame.kind == TrackKind::Variant && content_y >= frame.top && content_y < frame.bottom
-        })?;
+        let (frame, _) =
+            self.visible_track_frame_at_screen_y(y, |frame| frame.kind == TrackKind::Variant)?;
         let TrackFrameKey::Auxiliary(track_id) = frame.key else {
             return None;
         };
@@ -284,10 +340,8 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().effective_vertical_scroll_points();
-        let frame = self.panels.active().track_frames.iter().find(|frame| {
-            frame.kind == TrackKind::Gwas && content_y >= frame.top && content_y < frame.bottom
-        })?;
+        let (frame, content_y) =
+            self.visible_track_frame_at_screen_y(y, |frame| frame.kind == TrackKind::Gwas)?;
         let TrackFrameKey::Auxiliary(track_id) = frame.key else {
             return None;
         };
@@ -333,12 +387,8 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().effective_vertical_scroll_points();
-        let frame = self.panels.active().track_frames.iter().find(|frame| {
-            frame.kind == TrackKind::Quantitative
-                && content_y >= frame.top
-                && content_y < frame.bottom
-        })?;
+        let (frame, content_y) =
+            self.visible_track_frame_at_screen_y(y, |frame| frame.kind == TrackKind::Quantitative)?;
         let TrackFrameKey::Auxiliary(track_id) = frame.key else {
             return None;
         };
@@ -421,10 +471,8 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().effective_vertical_scroll_points();
-        let frame = self.panels.active().track_frames.iter().find(|frame| {
-            frame.kind == TrackKind::Mutation && content_y >= frame.top && content_y < frame.bottom
-        })?;
+        let (frame, content_y) =
+            self.visible_track_frame_at_screen_y(y, |frame| frame.kind == TrackKind::Mutation)?;
         let TrackFrameKey::Auxiliary(track_id) = frame.key else {
             return None;
         };
@@ -453,9 +501,7 @@ impl Viewer {
         if local_row < 0.0 {
             return None;
         }
-        let row_height = (settings.row_height
-            * auxiliary_track_scale(self.primary_alignment_filters().alignment_density))
-        .clamp(8.0, 40.0);
+        let row_height = settings.row_height.clamp(8.0, 40.0);
         let sample_index = (local_row / row_height).floor() as usize;
         if sample_index >= query.samples.len() {
             return None;
@@ -483,12 +529,8 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().effective_vertical_scroll_points();
-        let frame = self.panels.active().track_frames.iter().find(|frame| {
-            frame.kind == TrackKind::CopyNumber
-                && content_y >= frame.top
-                && content_y < frame.bottom
-        })?;
+        let (frame, content_y) =
+            self.visible_track_frame_at_screen_y(y, |frame| frame.kind == TrackKind::CopyNumber)?;
         let TrackFrameKey::Auxiliary(track_id) = frame.key else {
             return None;
         };
@@ -517,9 +559,7 @@ impl Viewer {
         if local_row < 0.0 {
             return None;
         }
-        let row_height = (settings.row_height
-            * auxiliary_track_scale(self.primary_alignment_filters().alignment_density))
-        .clamp(6.0, 40.0);
+        let row_height = settings.row_height.clamp(6.0, 40.0);
         let row_index = (local_row / row_height).floor() as usize;
         let order = copy_number_sample_order(
             query.samples.len(),
@@ -558,12 +598,8 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let content_y = y + self.panels.active().effective_vertical_scroll_points();
-        let frame = self.panels.active().track_frames.iter().find(|frame| {
-            frame.kind == TrackKind::Interaction
-                && content_y >= frame.top
-                && content_y < frame.bottom
-        })?;
+        let (frame, _) =
+            self.visible_track_frame_at_screen_y(y, |frame| frame.kind == TrackKind::Interaction)?;
         let TrackFrameKey::Auxiliary(track_id) = frame.key else {
             return None;
         };
@@ -944,6 +980,11 @@ impl Viewer {
             "Modifications",
             y,
             self.panels.active().effective_vertical_scroll_points(),
+            self.panels.active().annotation_scroll_points,
+            self.active_scroll_clip_top(),
+            self.active_annotation_clip_top(),
+            self.canvas_geometry.viewport.top(),
+            self.canvas_geometry.viewport.bottom(),
         )?;
         let query = self.alignment_query_for_track(track_id)?;
         modification_position_from_pointer(
@@ -968,6 +1009,11 @@ impl Viewer {
             "Coverage",
             y,
             self.panels.active().effective_vertical_scroll_points(),
+            self.panels.active().annotation_scroll_points,
+            self.active_scroll_clip_top(),
+            self.active_annotation_clip_top(),
+            self.canvas_geometry.viewport.top(),
+            self.canvas_geometry.viewport.bottom(),
         )?;
         let query = self.alignment_query_for_track(track_id)?;
         pileup_position_from_pointer(
@@ -992,6 +1038,11 @@ impl Viewer {
             "Sashimi",
             y,
             self.panels.active().effective_vertical_scroll_points(),
+            self.panels.active().annotation_scroll_points,
+            self.active_scroll_clip_top(),
+            self.active_annotation_clip_top(),
+            self.canvas_geometry.viewport.top(),
+            self.canvas_geometry.viewport.bottom(),
         )?;
         let query = self.alignment_query_for_track(track_id)?;
         let local_x = f64::from(x - panel_rect.left());
@@ -1016,8 +1067,12 @@ impl Viewer {
         if !panel_rect.contains(egui::pos2(x, y)) {
             return None;
         }
-        let content_y = y + self.panels.active().effective_vertical_scroll_points();
-        let track_id = alignment_track_at_content_y(&self.panels.active().track_frames, content_y)?;
+        let (frame, content_y) = self.visible_track_frame_at_screen_y(y, |frame| {
+            matches!(frame.key, TrackFrameKey::Alignment(_))
+        })?;
+        let TrackFrameKey::Alignment(track_id) = frame.key else {
+            unreachable!("alignment predicate only returns alignment frames");
+        };
         if track_id != self.primary_alignment_track_id() {
             let track = self
                 .alignment_tracks
@@ -1048,8 +1103,20 @@ impl Viewer {
         let local_x = x - f64::from(self.active_panel_rect().left());
         let position = self.panels.active().viewport.genomic_at_pixel(local_x);
         let tolerance = (self.panels.active().viewport.bases_per_pixel() * 6.0).max(0.5);
-        let operation_index = find_read_event(&record, position, tolerance)?;
-        let operation = record.cigar.get(operation_index)?;
+        let include_substitutions = self.panels.active().viewport.bases_per_pixel()
+            <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
+            && self
+                .alignment_filters_for_track(track_id)
+                .read_base_display_mode
+                != ReadBaseDisplayMode::Hidden;
+        let event = find_read_event(
+            &record,
+            query.reference.as_ref(),
+            position,
+            tolerance,
+            include_substitutions,
+        )?;
+        let operation = record.cigar.get(event.operation_index)?;
         if matches!(
             operation.kind,
             CigarOpKind::Insertion | CigarOpKind::Deletion
@@ -1059,7 +1126,8 @@ impl Viewer {
         }
         Some(ReadEventSelection {
             record_index,
-            operation_index,
+            operation_index: event.operation_index,
+            operation_offset: event.operation_offset,
         })
     }
 

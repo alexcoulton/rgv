@@ -1302,6 +1302,109 @@ fn unpaired_reverse_read_keeps_direction_at_regional_detail() {
 }
 
 #[test]
+fn visible_spliced_blocks_keep_direction_when_the_outer_terminal_is_clipped() {
+    let mut reverse = row_test_record(b"spliced-reverse", 40, 180);
+    reverse.flags = AlignmentFlags::from_bits(0x10);
+    reverse.cigar = vec![
+        CigarOp {
+            kind: CigarOpKind::Match,
+            len: 20,
+        },
+        CigarOp {
+            kind: CigarOpKind::ReferenceSkip,
+            len: 100,
+        },
+        CigarOp {
+            kind: CigarOpKind::Match,
+            len: 20,
+        },
+    ];
+    let reverse_query = row_test_query(&[reverse]);
+    let reverse_viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 130, 190).unwrap(),
+        300.0,
+    )
+    .unwrap();
+    let reverse_layout = layout_alignment_query(
+        &reverse_query,
+        reverse_viewport,
+        AlignmentLayoutOptions::default(),
+    );
+    let visible_block_left = reverse_viewport.pixel_at_genomic(160) as f32;
+    assert!(
+        reverse_layout
+            .display_list
+            .rectangles
+            .iter()
+            .any(|primitive| {
+                primitive.shape == RectShape::DirectionalTerminalLeft
+                    && (primitive.x - visible_block_left).abs() <= 1.0
+            })
+    );
+
+    let mut forward = reverse_query.materialize_record(0).unwrap();
+    forward.read_name = b"spliced-forward".to_vec();
+    forward.flags = AlignmentFlags::from_bits(0);
+    let forward_query = row_test_query(&[forward]);
+    let forward_viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 30, 100).unwrap(),
+        350.0,
+    )
+    .unwrap();
+    let forward_layout = layout_alignment_query(
+        &forward_query,
+        forward_viewport,
+        AlignmentLayoutOptions::default(),
+    );
+    let visible_block_right = forward_viewport.pixel_at_genomic(60) as f32;
+    assert!(
+        forward_layout
+            .display_list
+            .rectangles
+            .iter()
+            .any(|primitive| {
+                primitive.shape == RectShape::DirectionalTerminalRight
+                    && (primitive.x + primitive.width - visible_block_right).abs() <= 1.0
+            })
+    );
+}
+
+#[test]
+fn spliced_block_direction_survives_regional_detail() {
+    let mut reverse = row_test_record(b"regional-spliced-reverse", 40, 180);
+    reverse.flags = AlignmentFlags::from_bits(0x10);
+    reverse.cigar = vec![
+        CigarOp {
+            kind: CigarOpKind::Match,
+            len: 20,
+        },
+        CigarOp {
+            kind: CigarOpKind::ReferenceSkip,
+            len: 100,
+        },
+        CigarOp {
+            kind: CigarOpKind::Match,
+            len: 20,
+        },
+    ];
+    let query = row_test_query(&[reverse]);
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 130, 190).unwrap(),
+        5.0,
+    )
+    .unwrap();
+    assert_eq!(viewport.detail_level(), DetailLevel::Regional);
+    let layout = layout_alignment_query(&query, viewport, AlignmentLayoutOptions::default());
+    assert!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .any(|primitive| primitive.shape == RectShape::DirectionalTerminalLeft)
+    );
+}
+
+#[test]
 fn clipped_alignment_edges_are_not_presented_as_biological_terminals() {
     let forward = row_test_record(b"clipped-forward", 40, 160);
     let mut reverse = row_test_record(b"clipped-reverse", 40, 160);
@@ -1385,10 +1488,14 @@ fn every_alignment_class_keeps_its_biological_terminal() {
                 && primitive.shape == RectShape::DirectionalTerminalRight
         })
         .collect::<Vec<_>>();
-    assert!(!spliced_terminals.is_empty());
-    assert!(spliced_terminals.iter().all(|primitive| {
-        primitive.x + primitive.width > viewport.pixel_at_genomic(179) as f32
-    }));
+    for block_end in [120, 180] {
+        let expected_x = viewport.pixel_at_genomic(block_end) as f32;
+        assert!(
+            spliced_terminals
+                .iter()
+                .any(|primitive| { (primitive.x + primitive.width - expected_x).abs() <= 1.0 })
+        );
+    }
 }
 
 #[test]
@@ -1887,6 +1994,80 @@ fn mismatch_marks_precede_base_letters_at_read_detail() {
 }
 
 #[test]
+fn contradictory_explicit_match_uses_the_observed_nucleotide_rendering() {
+    let contig = ContigId::new(0);
+    let interval = GenomicInterval::new(contig, 100, 101).unwrap();
+    let record = AlignmentRecord {
+        contig,
+        start: 100,
+        end: 101,
+        flags: AlignmentFlags::from_bits(0),
+        mapping_quality: Some(60),
+        mate_contig: None,
+        mate_start: None,
+        template_length: 0,
+        read_name: b"contradictory-equal".to_vec(),
+        cigar: vec![CigarOp {
+            kind: CigarOpKind::SequenceMatch,
+            len: 1,
+        }],
+        sequence: SequenceData::Present {
+            bases: vec![b'C'],
+            qualities: Some(vec![40]),
+        },
+        auxiliary_fields: Vec::new(),
+    };
+    let mut batch = AlignmentBatch::default();
+    batch.push(&record).unwrap();
+    let query = AlignmentQuery {
+        interval,
+        header: Arc::default(),
+        batch,
+        pileup: PileupSummary::default(),
+        junctions: rgv_hts::JunctionSummary::default(),
+        pairs: rgv_hts::PairSummary::default(),
+        reference: Some(ReferenceSlice {
+            interval,
+            bases: vec![b'T'],
+        }),
+        stats: QueryStats::default(),
+    };
+    let viewport = Viewport::new(interval, 28.0).unwrap();
+    let rendered = layout_alignment_query(
+        &query,
+        viewport,
+        AlignmentLayoutOptions {
+            show_reference: false,
+            show_coverage: false,
+            ..AlignmentLayoutOptions::default()
+        },
+    );
+
+    assert!(
+        rendered
+            .display_list
+            .texts
+            .iter()
+            .any(|text| text.text == "C")
+    );
+    assert!(
+        rendered
+            .display_list
+            .texts
+            .iter()
+            .all(|text| text.text != "!"),
+        "an encoding conflict must not replace the observed base"
+    );
+    let nucleotide = base_color(b'C');
+    assert!(rendered.display_list.rectangles.iter().any(|rectangle| {
+        rectangle.object_id & READ_DETAIL_OBJECT_BIT != 0
+            && (rectangle.color.red - nucleotide.red).abs() < f32::EPSILON
+            && (rectangle.color.green - nucleotide.green).abs() < f32::EPSILON
+            && (rectangle.color.blue - nucleotide.blue).abs() < f32::EPSILON
+    }));
+}
+
+#[test]
 fn read_base_labels_contrast_with_each_nucleotide_fill() {
     for base in [b'A', b'G'] {
         let color = read_base_label_color(base);
@@ -2292,26 +2473,44 @@ fn junction_lane_renders_bounded_strand_aware_full_evidence() {
         ..AlignmentLayoutOptions::default()
     };
     let layout = layout_alignment_query(&query, viewport, options);
-    assert_eq!(layout.display_list.rectangles.len(), 8);
-    assert_eq!(layout.pinned_rectangle_count, 8);
+    assert_eq!(layout.display_list.rectangles.len(), 7);
+    assert_eq!(layout.pinned_rectangle_count, 7);
     assert_eq!(layout.stats.rendered_junctions, 2);
     assert_eq!(layout.stats.hidden_junctions, 0);
     assert_eq!(layout.stats.maximum_junction_depth, 9);
     assert_eq!(
-        layout.display_list.rectangles[0].color,
-        Rgba::new(0.84, 0.30, 0.38, 0.88)
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .find(|rectangle| rectangle.shape == RectShape::JunctionArcUp)
+            .unwrap()
+            .color,
+        Rgba::new(0.84, 0.30, 0.38, 0.82)
     );
     assert_eq!(
-        layout.display_list.rectangles[4].color,
-        Rgba::new(0.25, 0.45, 0.82, 0.88)
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .find(|rectangle| rectangle.shape == RectShape::JunctionArcDown)
+            .unwrap()
+            .color,
+        Rgba::new(0.25, 0.45, 0.82, 0.82)
     );
-    assert_eq!(
-        layout.display_list.rectangles[3].shape,
-        RectShape::ChevronRight
+    assert!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::ChevronRight)
     );
-    assert_eq!(
-        layout.display_list.rectangles[7].shape,
-        RectShape::ChevronLeft
+    assert!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::ChevronLeft)
     );
     assert_eq!(query.junctions.provenance.eligible_records, 13);
 
@@ -2332,6 +2531,7 @@ fn junction_lane_renders_bounded_strand_aware_full_evidence() {
             .display_list
             .rectangles
             .iter()
+            .filter(|rectangle| rectangle.shape != RectShape::Rectangle)
             .all(|rectangle| rectangle.color == Rgba::new(0.08, 0.08, 0.10, 1.0))
     );
 }
@@ -2391,10 +2591,15 @@ fn sashimi_layout_applies_exact_cpm_fixed_scale_and_expanded_rows() {
     assert_eq!(layout.stats.rendered_junctions, 2);
     assert!((layout.stats.maximum_junction_value - 8.0).abs() < f64::EPSILON);
     assert!(layout.stats.junction_normalization_available);
-    assert!(
-        (layout.display_list.rectangles[0].y - layout.display_list.rectangles[4].y).abs()
-            > f32::EPSILON
-    );
+    let arc_tops = layout
+        .display_list
+        .rectangles
+        .iter()
+        .filter(|rectangle| rectangle.shape.is_junction_arc())
+        .map(|rectangle| rectangle.y)
+        .collect::<Vec<_>>();
+    assert_eq!(arc_tops.len(), 2);
+    assert!((arc_tops[0] - arc_tops[1]).abs() > f32::EPSILON);
     assert_eq!(layout.display_list.texts.len(), 2);
     assert_eq!(layout.display_list.texts[0].text, "2.0 CPM");
     assert_eq!(layout.display_list.texts[1].text, "8.0 CPM");
@@ -2414,13 +2619,19 @@ fn sashimi_layout_applies_exact_cpm_fixed_scale_and_expanded_rows() {
         Some(&annotations),
     );
     assert_eq!(annotated_layout.display_list.rectangles.len(), 10);
-    assert_eq!(
-        annotated_layout.display_list.rectangles[4].color,
-        Rgba::new(0.16, 0.58, 0.28, 1.0)
+    assert!(
+        annotated_layout
+            .display_list
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.color == Rgba::new(0.16, 0.58, 0.28, 1.0))
     );
-    assert_eq!(
-        annotated_layout.display_list.rectangles[9].color,
-        Rgba::new(0.92, 0.48, 0.10, 1.0)
+    assert!(
+        annotated_layout
+            .display_list
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.color == Rgba::new(0.92, 0.48, 0.10, 1.0))
     );
 
     let raw_fallback = JunctionSummary {
@@ -2473,12 +2684,50 @@ fn high_density_sashimi_output_has_hard_arc_and_label_caps() {
     );
     assert_eq!(
         layout.display_list.rectangles.len(),
-        MAX_RENDERED_JUNCTIONS * 4
+        1 + MAX_RENDERED_JUNCTIONS * 2 + layout.display_list.texts.len()
     );
-    assert_eq!(
-        layout.display_list.texts.len(),
-        MAX_RENDERED_JUNCTION_LABELS
+    assert!(!layout.display_list.texts.is_empty());
+    assert!(layout.display_list.texts.len() <= MAX_RENDERED_JUNCTION_LABELS);
+}
+
+#[test]
+fn collapsed_sashimi_suppresses_colliding_count_labels() {
+    let summary = JunctionSummary {
+        junctions: vec![
+            JunctionEvidence {
+                start: 20,
+                end: 80,
+                depth: 4,
+                positive_depth: 4,
+                ..JunctionEvidence::default()
+            },
+            JunctionEvidence {
+                start: 20,
+                end: 81,
+                depth: 1,
+                positive_depth: 1,
+                ..JunctionEvidence::default()
+            },
+        ],
+        ..JunctionSummary::default()
+    };
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 0, 100).unwrap(),
+        500.0,
+    )
+    .unwrap();
+    let layout = layout_sashimi(
+        &summary,
+        viewport,
+        AlignmentLayoutOptions {
+            show_junctions: true,
+            junction_height: 52.0,
+            ..AlignmentLayoutOptions::default()
+        },
+        None,
     );
+    assert_eq!(layout.stats.rendered_junctions, 2);
+    assert_eq!(layout.display_list.texts.len(), 1);
 }
 
 #[test]

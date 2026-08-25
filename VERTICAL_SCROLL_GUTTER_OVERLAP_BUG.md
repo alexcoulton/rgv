@@ -1,6 +1,6 @@
 # Vertical scrollbar causes track sections to overlap
 
-Status: documented; fix not started
+Status: fixed; automated and MF-10 native-window qualification complete at 2x
 
 Date observed: 25 August 2026
 
@@ -118,3 +118,72 @@ with a failing regression test before changing behavior.
 
 This report does not change the chromosome overview, the vertical scrollbar density preview, track
 ordering, configured track heights, or directionality glyph semantics.
+
+## Resolution
+
+Implemented on 25 August 2026.
+
+The defect had two related causes:
+
+1. The genomic display list clipped ordinary frames at `scroll_clip_top`, but gutter painting only
+   clipped them at the outer viewport. It also derived header and subtrack label anchors from the
+   already-clipped rectangle, causing a partially hidden row to appear to stick to the clipping
+   edge.
+2. Every visible `GeneModel` track was classified as pinned context. In MF-10, seven gene-model
+   tracks consumed the complete viewport. Correctly applying the clip would therefore prevent the
+   overlap but leave no usable scrollable area.
+
+The final fix replaces the mixed pinned/scrollable stack with two explicit panes:
+
+- all reference, gene-model, coverage, Sashimi, modification, secondary-alignment, and auxiliary
+  annotation layers occupy a fixed-height upper pane;
+- the primary read stack occupies the lower pane;
+- annotation layers retain their configured heights and collapse controls, while read density
+  changes only read-row geometry;
+- the right edge reserves one column, split vertically into a conventional upper annotation
+  scrollbar and the lower read density/scroll navigator;
+- each pane owns and persists its own scroll offset;
+- genomic primitives, labels, eyes, separators, resize handles, selection, and semantic hit
+  testing use the same pane-specific clip rectangle; and
+- track headers and subtrack anchors remain in transformed content coordinates, so partially hidden
+  rows are clipped instead of being relocated onto a pane boundary.
+
+A follow-up MCP reproduction found that annotation frame separators and their resize hit regions
+still used the outer window bottom after the two-pane split. At deep annotation scroll offsets this
+painted a horizontal annotation boundary inside the read pane and left an invisible annotation
+resize target there. Both now use the annotation pane bottom, and the split itself is painted as one
+fixed divider independent of either stack's content.
+
+A second interaction follow-up found that egui supplies resize movement as an incremental delta for
+each rendered frame, while the track handler reapplied every increment to the drag's original
+height. The boundary therefore snapped back toward its starting point and appeared to stutter.
+Track resizing now accumulates each delta against the last accepted height. The annotation/read
+split is also an explicit draggable divider, with a vertical-resize cursor, keyboard support, and
+minimum heights for both panes; its hit region stays outside the annotation-track gutter handles.
+
+## Qualification
+
+- `cargo test -p rgv-desktop`: 183 tests passed after replacing obsolete single-stack fill tests
+  with pane-aware clipping and hit-testing coverage.
+- Added pure geometry regressions for crossing, fractional, middle, and deep offsets; adjacent
+  interval non-overlap; pinned/split-frame screen-to-content mapping; and hidden alignment-lane hit
+  rejection.
+- Added session and automation coverage for the independent annotation scroll offset and geometry
+  coverage proving both controls share one x-axis.
+- Rebuilt the release desktop and exercised MF-10 through the MCP at scroll offsets `0`, `1954.5`,
+  and `3909` out of `3909` points.
+- Captured settled 2560 x 1600 native-window images at 2x:
+  `.rgv-mcp-artifacts/scroll-fixed-top.png`,
+  `.rgv-mcp-artifacts/scroll-fixed-middle.png`, and
+  `.rgv-mcp-artifacts/scroll-fixed-bottom.png`.
+- Repeated the original overlap qualification at alignment densities `0.35x`, `1x`, and `4x` in
+  `.rgv-mcp-artifacts/density-fixed-min.png`,
+  `.rgv-mcp-artifacts/density-fixed-default.png`, and
+  `.rgv-mcp-artifacts/density-fixed-max.png` before the final two-pane refinement. In the final
+  layout, annotations remain fixed-height in the upper pane and only lower-pane read rows respond to
+  density.
+- A settled 2560 x 1600 MCP native-window capture of the final release build confirms the upper
+  annotation/lower read order and the vertically stacked scrollbar segments.
+
+A separate 1x native-scale capture remains useful release-matrix coverage; scale-independent bounds
+and existing 1x/2x scissor tests cover the transform mechanically in this environment.

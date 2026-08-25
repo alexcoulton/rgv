@@ -75,6 +75,44 @@ pub enum CigarOpKind {
     SequenceMismatch,
 }
 
+/// The result of reconciling an aligned read base with its CIGAR assertion
+/// and, when available, the loaded reference base.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlignedBaseClassification {
+    Match,
+    Substitution,
+    /// CIGAR `X` declares a substitution, but one of the bases required to
+    /// validate that assertion is unavailable.
+    DeclaredSubstitution,
+    /// The loaded bases contradict an explicit CIGAR `=` or `X` assertion.
+    EncodingConflict,
+    Unknown,
+}
+
+pub fn classify_aligned_base(
+    cigar_kind: CigarOpKind,
+    observed: Option<u8>,
+    reference: Option<u8>,
+) -> AlignedBaseClassification {
+    use AlignedBaseClassification::{
+        DeclaredSubstitution, EncodingConflict, Match, Substitution, Unknown,
+    };
+
+    let bases_agree = observed
+        .zip(reference)
+        .map(|(observed, reference)| observed.eq_ignore_ascii_case(&reference));
+    match (cigar_kind, bases_agree) {
+        (CigarOpKind::SequenceMismatch, Some(false)) => Substitution,
+        (CigarOpKind::SequenceMismatch, Some(true)) => EncodingConflict,
+        (CigarOpKind::SequenceMismatch, None) => DeclaredSubstitution,
+        (CigarOpKind::SequenceMatch, Some(true) | None) => Match,
+        (CigarOpKind::SequenceMatch, Some(false)) => EncodingConflict,
+        (CigarOpKind::Match, Some(true)) => Match,
+        (CigarOpKind::Match, Some(false)) => Substitution,
+        (CigarOpKind::Match, None) | (_, _) => Unknown,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CigarOp {
     pub kind: CigarOpKind,
@@ -816,6 +854,48 @@ pub enum PackedRecordError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aligned_base_classification_reconciles_explicit_cigar_assertions() {
+        use AlignedBaseClassification::{
+            DeclaredSubstitution, EncodingConflict, Match, Substitution, Unknown,
+        };
+
+        for (kind, observed, reference, expected) in [
+            (
+                CigarOpKind::SequenceMismatch,
+                Some(b'G'),
+                Some(b'C'),
+                Substitution,
+            ),
+            (
+                CigarOpKind::SequenceMismatch,
+                Some(b'c'),
+                Some(b'C'),
+                EncodingConflict,
+            ),
+            (
+                CigarOpKind::SequenceMismatch,
+                Some(b'C'),
+                None,
+                DeclaredSubstitution,
+            ),
+            (CigarOpKind::SequenceMatch, Some(b'C'), Some(b'c'), Match),
+            (
+                CigarOpKind::SequenceMatch,
+                Some(b'G'),
+                Some(b'C'),
+                EncodingConflict,
+            ),
+            (CigarOpKind::SequenceMatch, Some(b'C'), None, Match),
+            (CigarOpKind::Match, Some(b'C'), Some(b'C'), Match),
+            (CigarOpKind::Match, Some(b'G'), Some(b'C'), Substitution),
+            (CigarOpKind::Match, Some(b'C'), None, Unknown),
+            (CigarOpKind::Insertion, Some(b'G'), Some(b'C'), Unknown),
+        ] {
+            assert_eq!(classify_aligned_base(kind, observed, reference), expected);
+        }
+    }
 
     #[test]
     fn alignment_header_preserves_bounded_ultima_read_group_metadata() {

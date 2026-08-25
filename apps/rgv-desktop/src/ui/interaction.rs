@@ -105,12 +105,12 @@ impl Viewer {
             return Some(HoverInspectorTarget::Junction(track_id, start, end));
         }
         let (track_id, index) = self.record_at_cursor()?;
+        let event = self.read_event_at_cursor(track_id, index);
         Some(HoverInspectorTarget::Record {
             track_id,
             index,
-            operation_index: self
-                .read_event_at_cursor(track_id, index)
-                .map(|event| event.operation_index),
+            operation_index: event.map(|event| event.operation_index),
+            operation_offset: event.and_then(|event| event.operation_offset),
         })
     }
 
@@ -139,7 +139,20 @@ impl Viewer {
 
     pub(crate) fn scroll_tracks(&mut self, delta: MouseScrollDelta) {
         let points = wheel_primary_axis(delta);
-        self.scroll_tracks_by(-points);
+        let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
+        let annotation_clip_bottom = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                cache.annotation_clip_bottom
+            });
+        if cursor_y < annotation_clip_bottom {
+            self.scroll_annotations_by(-points);
+        } else {
+            self.scroll_tracks_by(-points);
+        }
     }
 
     pub(crate) fn scroll_tracks_by(&mut self, points: f32) {
@@ -155,6 +168,26 @@ impl Viewer {
             self.panels.active_mut().latent_vertical_scroll_fraction =
                 Some((next / maximum).clamp(0.0, 1.0));
         }
+        if self.synthetic || !self.refresh_active_panel_scroll_display() {
+            self.display_dirty = true;
+        }
+        self.window.request_redraw();
+    }
+
+    pub(crate) fn scroll_annotations_by(&mut self, points: f32) {
+        let maximum = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(0.0, |cache| {
+                (cache.annotation_content_bottom - cache.annotation_clip_bottom).max(0.0)
+            });
+        let next = (self.panels.active().annotation_scroll_points + points).clamp(0.0, maximum);
+        if (next - self.panels.active().annotation_scroll_points).abs() <= f32::EPSILON {
+            return;
+        }
+        self.panels.active_mut().annotation_scroll_points = next;
         if self.synthetic || !self.refresh_active_panel_scroll_display() {
             self.display_dirty = true;
         }
@@ -512,7 +545,7 @@ impl Viewer {
                 0.0,
             );
             if (density - self.primary_alignment_filters().alignment_density).abs() > 1.0e-4 {
-                self.primary_alignment_filters_mut().alignment_density = density;
+                self.set_shared_alignment_density(density);
                 self.display_dirty = true;
             }
             let maximum = (self.panels.active().content_bottom_points
@@ -536,7 +569,7 @@ impl Viewer {
             .scroll_display_cache
             .as_ref()
             .map_or(self.canvas_geometry.viewport.height(), |cache| {
-                (self.canvas_geometry.viewport.bottom() - cache.scroll_clip_top).max(1.0)
+                (cache.scroll_clip_bottom - cache.scroll_clip_top).max(1.0)
             });
         // A fitting track stack has no vertical pan range, but the same control must
         // remain draggable horizontally so the user can expand it into an overflow.
@@ -551,7 +584,7 @@ impl Viewer {
         let geometry = scroll_fraction.or(latent_fraction).map_or_else(
             || {
                 ui::scrollbar_geometry_for_density_in_viewport(
-                    self.canvas_geometry.scrollbar,
+                    self.read_vertical_scrollbar_rect(),
                     maximum,
                     self.panels.active().vertical_scroll_points,
                     self.primary_alignment_filters().alignment_density,
@@ -560,7 +593,7 @@ impl Viewer {
             },
             |fraction| {
                 ui::scrollbar_geometry_for_density_at_fraction_in_viewport(
-                    self.canvas_geometry.scrollbar,
+                    self.read_vertical_scrollbar_rect(),
                     maximum,
                     self.primary_alignment_filters().alignment_density,
                     fraction,
@@ -648,10 +681,10 @@ impl Viewer {
             .scroll_display_cache
             .as_ref()
             .map_or(self.canvas_geometry.viewport.height(), |cache| {
-                (self.canvas_geometry.viewport.bottom() - cache.scroll_clip_top).max(1.0)
+                (cache.scroll_clip_bottom - cache.scroll_clip_top).max(1.0)
             });
         let geometry = ui::scrollbar_geometry_for_density_in_viewport(
-            self.canvas_geometry.scrollbar,
+            self.read_vertical_scrollbar_rect(),
             maximum,
             self.panels.active().vertical_scroll_points,
             self.primary_alignment_filters().alignment_density,
@@ -798,7 +831,15 @@ impl Viewer {
             .scroll_display_cache
             .as_ref()
             .map_or(self.canvas_geometry.viewport.height(), |cache| {
-                (self.canvas_geometry.viewport.bottom() - cache.scroll_clip_top).max(1.0)
+                (cache.scroll_clip_bottom - cache.scroll_clip_top).max(1.0)
+            });
+        let read_viewport_bottom = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.bottom(), |cache| {
+                cache.scroll_clip_bottom
             });
         let previous_padding = vertical_density_camera_padding(viewport_height, previous_density);
         let actual_content_bottom = self
@@ -809,18 +850,18 @@ impl Viewer {
             .map_or_else(
                 || {
                     (self.panels.active().content_bottom_points - previous_padding)
-                        .max(self.canvas_geometry.viewport.bottom())
+                        .max(read_viewport_bottom)
                 },
                 |cache| cache.actual_content_bottom,
             );
         let maximum = vertical_camera_maximum(
             actual_content_bottom,
-            self.canvas_geometry.viewport.bottom(),
+            read_viewport_bottom,
             viewport_height,
             density,
         );
         let geometry = ui::scrollbar_geometry_for_density_at_fraction_in_viewport(
-            self.canvas_geometry.scrollbar,
+            self.read_vertical_scrollbar_rect(),
             maximum,
             density,
             drag.virtual_scroll_fraction,
@@ -853,7 +894,7 @@ impl Viewer {
         self.panels.active_mut().latent_vertical_scroll_fraction =
             Some(drag.virtual_scroll_fraction);
         if density_changed {
-            self.primary_alignment_filters_mut().alignment_density = density;
+            self.set_shared_alignment_density(density);
             self.display_dirty = true;
             self.interaction_trace
                 .record_once(InteractionTraceStage::DensityChanged);
@@ -1116,18 +1157,90 @@ impl Viewer {
         ))
     }
 
+    pub(crate) fn cursor_over_unobstructed_track_viewport(&self) -> bool {
+        if !self.cursor_in_track_viewport() {
+            return false;
+        }
+        let scale = self.window.scale_factor();
+        let pointer = egui::pos2(
+            (self.cursor.x / scale) as f32,
+            (self.cursor.y / scale) as f32,
+        );
+        pointer_targets_unobstructed_canvas(
+            true,
+            self.genomic_canvas_layer_id,
+            self.egui_context.layer_id_at(pointer),
+        )
+    }
+
     pub(crate) fn cursor_in_vertical_scrollbar(&self) -> bool {
         let scale = self.window.scale_factor();
-        self.canvas_geometry.scrollbar.contains(egui::pos2(
+        self.read_vertical_scrollbar_rect().contains(egui::pos2(
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
         ))
     }
 
+    fn read_vertical_scrollbar_rect(&self) -> egui::Rect {
+        let full = self.canvas_geometry.scrollbar;
+        let top = self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .map_or(full.top(), |cache| cache.scroll_clip_top)
+            .clamp(full.top(), full.bottom());
+        egui::Rect::from_min_max(egui::pos2(full.left(), top), full.max)
+    }
+
     pub(crate) fn inspector_activation_at_cursor(&self) -> InspectorActivation {
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
-        let content_y = cursor_y + self.panels.active().effective_vertical_scroll_points();
-        alignment_track_at_content_y(&self.panels.active().track_frames, content_y).map_or(
+        let panel = self.panels.active();
+        let scroll_clip_top = panel
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                cache.scroll_clip_top
+            });
+        let annotation_clip_top = panel
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                cache.annotation_clip_top
+            });
+        let annotation_clip_bottom = panel
+            .scroll_display_cache
+            .as_ref()
+            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                cache.annotation_clip_bottom
+            });
+        let alignment_track = panel.track_frames.iter().find_map(|frame| {
+            let TrackFrameKey::Alignment(id) = frame.key else {
+                return None;
+            };
+            ui::frame_content_y_at_screen_y(
+                frame,
+                cursor_y,
+                if frame.frozen_bottom.is_some() {
+                    panel.effective_vertical_scroll_points()
+                } else {
+                    panel.annotation_scroll_points
+                },
+                if frame.frozen_bottom.is_some() {
+                    scroll_clip_top
+                } else {
+                    annotation_clip_top
+                },
+                self.canvas_geometry.viewport.top(),
+                if frame.frozen_bottom.is_some() {
+                    self.canvas_geometry.viewport.bottom()
+                } else {
+                    annotation_clip_bottom
+                },
+            )
+            .map(|_| id)
+        });
+        alignment_track.map_or(
             self.primary_alignment_filters().inspector_activation,
             |id| {
                 if id == self.primary_alignment_track_id() {
@@ -1149,6 +1262,17 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_targets_distinguish_substitutions_inside_one_cigar_operation() {
+        let target = |operation_offset| HoverInspectorTarget::Record {
+            track_id: TrackId::new(1),
+            index: 7,
+            operation_index: Some(2),
+            operation_offset: Some(operation_offset),
+        };
+        assert_ne!(target(3), target(4));
+    }
 
     fn gesture_query(interval: GenomicInterval) -> AlignmentQuery {
         AlignmentQuery {
@@ -1286,6 +1410,51 @@ mod tests {
             false,
             Some(canvas),
             Some(canvas),
+        ));
+    }
+
+    #[test]
+    fn track_settings_window_blocks_native_viewer_wheel_navigation() {
+        let context = egui::Context::default();
+        let pointer = egui::pos2(80.0, 80.0);
+        let mut viewer_layer = None;
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 240.0),
+                )),
+                events: vec![egui::Event::PointerMoved(pointer)],
+                ..egui::RawInput::default()
+            },
+            |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    let response = ui.interact(
+                        ui.max_rect(),
+                        egui::Id::new("test-track-viewport"),
+                        egui::Sense::focusable_noninteractive(),
+                    );
+                    viewer_layer = Some(response.layer_id);
+                });
+                egui::Window::new("Track settings")
+                    .fixed_pos(egui::pos2(20.0, 20.0))
+                    .fixed_size(egui::vec2(180.0, 160.0))
+                    .vscroll(true)
+                    .show(root.ctx(), |ui| {
+                        ui.label("Alignment track");
+                        for index in 0..20 {
+                            ui.label(format!("Setting {index}"));
+                        }
+                    });
+            },
+        );
+
+        let layer_under_pointer = context.layer_id_at(pointer);
+        assert_ne!(layer_under_pointer, viewer_layer);
+        assert!(!pointer_targets_unobstructed_canvas(
+            true,
+            viewer_layer,
+            layer_under_pointer,
         ));
     }
 }

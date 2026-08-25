@@ -594,6 +594,10 @@ pub enum AutomationSetting {
         panel_id: PanelId,
         value: f32,
     },
+    AnnotationScrollPoints {
+        panel_id: PanelId,
+        value: f32,
+    },
 }
 
 impl AutomationSetting {
@@ -625,7 +629,8 @@ impl AutomationSetting {
             Self::TrackCollapsed { track_id, .. } | Self::TrackVisible { track_id, .. } => {
                 validate_track_id(*track_id)
             }
-            Self::VerticalScrollPoints { panel_id, value } => {
+            Self::VerticalScrollPoints { panel_id, value }
+            | Self::AnnotationScrollPoints { panel_id, value } => {
                 validate_panel_id(*panel_id)?;
                 if value.is_finite() && *value >= 0.0 {
                     Ok(())
@@ -804,6 +809,10 @@ pub struct AutomationPanelSnapshot {
     #[serde(default)]
     pub maximum_vertical_scroll_points: f32,
     #[serde(default)]
+    pub annotation_scroll_points: f32,
+    #[serde(default)]
+    pub maximum_annotation_scroll_points: f32,
+    #[serde(default)]
     pub render_generation: u64,
     #[serde(default)]
     pub settled: bool,
@@ -826,6 +835,8 @@ pub struct AutomationRenderLaneSnapshot {
     pub sampled_items: usize,
     #[serde(default)]
     pub truncated: bool,
+    #[serde(default)]
+    pub filtered_unmapped_items: usize,
     #[serde(default)]
     pub filtered_secondary_items: usize,
     #[serde(default)]
@@ -1705,6 +1716,8 @@ mod tests {
                 bases_per_pixel: 0.1,
                 vertical_scroll_points: 0.0,
                 maximum_vertical_scroll_points: 0.0,
+                annotation_scroll_points: 0.0,
+                maximum_annotation_scroll_points: 0.0,
                 render_generation: 1,
                 settled: true,
                 render_lanes: Vec::new(),

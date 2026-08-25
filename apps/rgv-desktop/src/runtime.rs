@@ -141,9 +141,13 @@ impl ApplicationHandler for Application {
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if viewer.cursor_in_track_viewport() => {
+            WindowEvent::MouseWheel { delta, .. }
+                if viewer.cursor_over_unobstructed_track_viewport() =>
+            {
                 // The central panel is painted by egui, which may mark wheel input as
-                // consumed even though the genomic canvas itself is GPU rendered.
+                // consumed even though the genomic canvas itself is GPU rendered. Use
+                // the painted layer under the pointer instead: floating windows and
+                // popups must own their wheel input and block the viewer underneath.
                 if viewer.modifiers.shift_key() || !viewer.cursor_in_genomic_canvas() {
                     viewer.scroll_tracks(delta);
                 } else {

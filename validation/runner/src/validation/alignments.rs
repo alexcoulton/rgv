@@ -114,6 +114,17 @@ pub(crate) fn query_alignment(
     start: u64,
     end: u64,
 ) -> Result<AlignmentQuery> {
+    query_alignment_including_secondary(path, reference, contig, start, end, false)
+}
+
+fn query_alignment_including_secondary(
+    path: &Path,
+    reference: Option<&Path>,
+    contig: &str,
+    start: u64,
+    end: u64,
+    include_secondary: bool,
+) -> Result<AlignmentQuery> {
     let mut source = LocalAlignmentSource::open(
         path,
         &AlignmentOpenOptions {
@@ -137,6 +148,7 @@ pub(crate) fn query_alignment(
             QueryOptions {
                 detail: QueryDetail::Full,
                 collect_modifications: true,
+                include_secondary,
                 ..QueryOptions::default()
             },
             &|| true,
@@ -177,7 +189,10 @@ pub(crate) fn named_alignment_record(
 }
 
 pub(crate) fn verify_mixed_sparse_controls(path: &Path) -> Result<()> {
-    let query = query_alignment(path, None, "chr1", 2_650_000, 2_652_150)?;
+    // This semantic audit inspects the secondary control explicitly; it must
+    // not inherit the viewer's hide-secondary default.
+    let query =
+        query_alignment_including_secondary(path, None, "chr1", 2_650_000, 2_652_150, true)?;
     let duplicate = named_alignment_record(&query, b"Control-000000", "MF-01 controls")?;
     let qc_fail = named_alignment_record(&query, b"Control-000001", "MF-01 controls")?;
     let low_mapq = named_alignment_record(&query, b"Control-000002", "MF-01 controls")?;
@@ -549,8 +564,8 @@ pub(crate) fn verify_event_and_ultima_truth(root: &Path, manifest: &FixtureManif
         .bin_at(events.interval, 10_289)
         .context("MF-02 lacks the exact pileup bin at chrVariants:10290")?;
     ensure!(
-        pileup.depth == 7
-            && pileup.forward_depth == 6
+        pileup.depth == 5
+            && pileup.forward_depth == 4
             && pileup.reverse_depth == 1
             && pileup.alleles.deletion == 2,
         "MF-02 chrVariants:10290 pileup changed: {pileup:?}"

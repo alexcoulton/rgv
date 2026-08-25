@@ -64,6 +64,7 @@ pub(crate) fn extend_alignment_layers(
     pinned: &mut DisplayList,
     scrollable: &mut DisplayList,
     layout: &AlignmentLayout,
+    scrollable_clip: Option<(f32, f32)>,
 ) {
     debug_assert!(layout.pinned_rectangle_count <= layout.display_list.rectangles.len());
     debug_assert!(layout.pinned_text_count <= layout.display_list.texts.len());
@@ -81,33 +82,15 @@ pub(crate) fn extend_alignment_layers(
     pinned
         .texts
         .extend(layout.display_list.texts[..text_boundary].iter().cloned());
-    scrollable.rectangles.extend(
-        layout.display_list.rectangles[rectangle_boundary..]
-            .iter()
-            .copied(),
-    );
-    scrollable
-        .texts
-        .extend(layout.display_list.texts[text_boundary..].iter().cloned());
-}
-
-pub(crate) fn fill_lone_alignment_track(
-    frames: &mut [TrackFrame],
-    content_bottom: f32,
-    viewport_bottom: f32,
-) -> f32 {
-    if frames.len() != 1
-        || !matches!(frames[0].key, TrackFrameKey::Alignment(_))
-        || content_bottom >= viewport_bottom
-    {
-        return content_bottom;
+    let mut read_layer = DisplayList {
+        rectangles: layout.display_list.rectangles[rectangle_boundary..].to_vec(),
+        texts: layout.display_list.texts[text_boundary..].to_vec(),
+    };
+    if let Some((top, bottom)) = scrollable_clip {
+        read_layer.scroll_and_clip_vertical(0.0, top, bottom);
     }
-    let frame = &mut frames[0];
-    frame.bottom = viewport_bottom;
-    if let Some(reads) = frame.subtracks.last_mut().filter(|reads| !reads.collapsed) {
-        reads.bottom = viewport_bottom;
-    }
-    viewport_bottom
+    scrollable.rectangles.append(&mut read_layer.rectangles);
+    scrollable.texts.append(&mut read_layer.texts);
 }
 
 pub(crate) fn overview_pan_gain(span: f64, contig_length: u64) -> f64 {
@@ -187,13 +170,4 @@ pub(crate) fn reconcile_vertical_scroll(
             .map(|fraction| fraction.clamp(0.0, 1.0))
     };
     (scroll, retained_fraction)
-}
-
-pub(crate) fn auxiliary_track_scale(density: f32) -> f32 {
-    let density = density.clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);
-    if density <= 1.0 {
-        density
-    } else {
-        density.sqrt()
-    }
 }

@@ -7,7 +7,7 @@ use std::path::Path;
 use image::{ImageError, RgbaImage};
 use rgv_layout::{
     Direction, DisplayList, RectPrimitive, RectShape, TextPrimitive, breakend_bracket_dimensions,
-    read_arrow_head_width,
+    junction_arc_stroke_width, read_arrow_head_width,
 };
 use wgpu::util::DeviceExt;
 
@@ -401,6 +401,20 @@ fn rasterize_rectangle(image: &mut RgbaImage, rectangle: RectPrimitive) {
 fn rectangle_contains_pixel(rectangle: RectPrimitive, x: u32, y: u32) -> bool {
     let local_x = x as f32 + 0.5 - rectangle.x;
     let local_y = y as f32 + 0.5 - rectangle.y;
+    if rectangle.shape.is_junction_arc() {
+        let stroke = junction_arc_stroke_width(rectangle.height);
+        let inner_height = (rectangle.height - stroke).max(0.0);
+        let fraction = (local_x / rectangle.width.max(f32::EPSILON)).clamp(0.0, 1.0);
+        let parabola = 4.0 * (fraction - 0.5).powi(2);
+        let curve_y = if rectangle.shape == RectShape::JunctionArcUp {
+            stroke * 0.5 + inner_height * parabola
+        } else {
+            rectangle.height - stroke * 0.5 - inner_height * parabola
+        };
+        let slope = 8.0 * inner_height * (fraction - 0.5) / rectangle.width.max(1.0);
+        let distance = (local_y - curve_y).abs() / (1.0 + slope * slope).sqrt();
+        return distance <= stroke * 0.5;
+    }
     if matches!(
         rectangle.shape,
         RectShape::BreakendJoinBefore | RectShape::BreakendJoinAfter
@@ -624,6 +638,29 @@ mod tests {
         assert!(!rectangle_contains_pixel(after, 0, 0));
         assert!(rectangle_contains_pixel(after, 7, 0));
         assert!(rectangle_contains_pixel(after, 0, 3));
+    }
+
+    #[test]
+    fn junction_arcs_meet_the_baseline_and_curve_to_the_opposite_edge() {
+        let up = RectPrimitive {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 10.0,
+            color: Rgba::new(1.0, 0.0, 0.0, 1.0),
+            object_id: 0,
+            shape: RectShape::JunctionArcUp,
+        };
+        let down = RectPrimitive {
+            shape: RectShape::JunctionArcDown,
+            ..up
+        };
+        assert!(rectangle_contains_pixel(up, 0, 8));
+        assert!(rectangle_contains_pixel(up, 9, 0));
+        assert!(!rectangle_contains_pixel(up, 9, 8));
+        assert!(rectangle_contains_pixel(down, 0, 1));
+        assert!(rectangle_contains_pixel(down, 9, 9));
+        assert!(!rectangle_contains_pixel(down, 9, 1));
     }
 
     #[test]

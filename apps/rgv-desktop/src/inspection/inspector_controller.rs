@@ -49,12 +49,13 @@ impl Viewer {
             |calls| calls.len().to_string(),
         );
         let selected_filters = self.alignment_filters_for_track(track_id);
-        let selected_operation_index = self
+        let selected_event = self
             .panels
             .active()
             .selected_read_event
             .filter(|event| event.record_index == index)
-            .map(|event| event.operation_index);
+            .map(|event| (event.operation_index, event.operation_offset));
+        let selected_operation_index = selected_event.map(|(operation_index, _)| operation_index);
         let pair_bounds = effective_template_length_bounds_for_filters(&selected_filters, query);
         let pair = pair_evidence(
             &record,
@@ -401,9 +402,14 @@ impl Viewer {
                 )
             })
             .collect();
-        let event_sequence = selected_operation_index.and_then(|operation_index| {
-            let details =
-                read_event_details(&record, operation_index, &self.panels.active().contig_name)?;
+        let event_sequence = selected_event.and_then(|(operation_index, operation_offset)| {
+            let details = read_event_details(
+                &record,
+                operation_index,
+                operation_offset,
+                query.reference.as_ref(),
+                &self.panels.active().contig_name,
+            )?;
             fields.extend(details.fields);
             details.copy_sequence
         });

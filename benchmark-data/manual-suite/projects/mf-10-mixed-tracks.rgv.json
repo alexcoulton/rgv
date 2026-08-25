@@ -13,7 +13,9 @@
         "start": 8500,
         "end": 16000
       },
-      "vertical_scroll_points": 0.0
+      "vertical_scroll_points": 0.0,
+      "annotation_scroll_points": 0.0,
+      "vertical_content_origin_points": 0.0
     }
   ],
   "active_panel": 1,
@@ -56,6 +58,7 @@
         "show_junction_labels": true,
         "show_reads": true,
         "coverage_scale_maximum": null,
+        "coverage_scale_transform": "square_root",
         "show_coverage_center_line": true,
         "alignment_density": 1.0,
         "inspector_activation": "click",
@@ -81,6 +84,7 @@
     }
   },
   "genome_name": "RGV complete mixed-format manual fixture",
+  "assembly_identity": null,
   "cytobands": null,
   "reference_reverse_complement": false,
   "reference_translation_frames": [],
@@ -2184,7 +2188,7 @@
       "sample_key": null,
       "visible": true,
       "collapsed": false,
-      "height": 120.0,
+      "height": 48.0,
       "variant": {
         "minimum_quality": null,
         "quality_missing": "exclude",
@@ -2288,7 +2292,7 @@
       "sample_key": null,
       "visible": true,
       "collapsed": false,
-      "height": 120.0,
+      "height": 48.0,
       "variant": {
         "minimum_quality": null,
         "quality_missing": "exclude",
@@ -2392,7 +2396,7 @@
       "sample_key": null,
       "visible": true,
       "collapsed": false,
-      "height": 120.0,
+      "height": 48.0,
       "variant": {
         "minimum_quality": null,
         "quality_missing": "exclude",
@@ -2496,7 +2500,7 @@
       "sample_key": null,
       "visible": true,
       "collapsed": false,
-      "height": 120.0,
+      "height": 48.0,
       "variant": {
         "minimum_quality": null,
         "quality_missing": "exclude",

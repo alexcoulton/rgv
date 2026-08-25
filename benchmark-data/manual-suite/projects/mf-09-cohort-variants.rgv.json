@@ -13,7 +13,9 @@
         "start": 14900,
         "end": 18100
       },
-      "vertical_scroll_points": 0.0
+      "vertical_scroll_points": 0.0,
+      "annotation_scroll_points": 0.0,
+      "vertical_content_origin_points": 0.0
     }
   ],
   "active_panel": 1,
@@ -24,6 +26,7 @@
     }
   },
   "genome_name": "RGV cohort variant truth",
+  "assembly_identity": null,
   "cytobands": null,
   "reference_reverse_complement": false,
   "reference_translation_frames": [],

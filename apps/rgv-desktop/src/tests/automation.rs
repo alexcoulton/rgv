@@ -209,6 +209,26 @@ fn automation_svg_exports_semantic_direction_shapes_as_polygons() {
 }
 
 #[test]
+fn automation_svg_exports_junction_arcs_as_curved_paths() {
+    let display = DisplayList {
+        rectangles: vec![RectPrimitive {
+            x: 10.0,
+            y: 10.0,
+            width: 40.0,
+            height: 20.0,
+            color: Rgba::new(0.8, 0.2, 0.4, 0.8),
+            object_id: 0,
+            shape: rgv_layout::RectShape::JunctionArcUp,
+        }],
+        texts: Vec::new(),
+    };
+    let svg = display_list_svg_export(&display, 100, 80, "junction");
+    assert!(svg.contains("<path"));
+    assert!(svg.contains(" C "));
+    assert!(svg.contains("stroke-linecap=\"round\""));
+}
+
+#[test]
 fn automation_svg_exports_breakends_as_brackets_instead_of_arrows() {
     let display = DisplayList {
         rectangles: vec![RectPrimitive {

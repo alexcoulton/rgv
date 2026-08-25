@@ -847,6 +847,24 @@ fn invalid_coverage_scale_and_alignment_density_are_rejected() {
 }
 
 #[test]
+fn invalid_resized_read_group_height_is_rejected() {
+    let mut document = SessionDocument::new(SessionLocus {
+        contig: "chr1".to_owned(),
+        start: 0,
+        end: 1,
+    });
+    add_test_alignment(&mut document);
+    document.alignment_tracks[0].read_group_height = Some(39.0);
+    assert!(matches!(
+        document.to_json(),
+        Err(SessionError::InvalidAlignmentTrack)
+    ));
+
+    document.alignment_tracks[0].read_group_height = Some(240.0);
+    assert!(document.to_json().is_ok());
+}
+
+#[test]
 fn invalid_alignment_style_tags_are_rejected_for_every_style_mode() {
     let mut document = SessionDocument::new(SessionLocus {
         contig: "chr1".to_owned(),

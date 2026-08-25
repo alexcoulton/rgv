@@ -240,9 +240,9 @@ pub(crate) fn basic_record_with_quality(
     record.set_tid(0);
     record.set_pos(position);
     record.set_mapq(60);
-    if reverse {
-        record.set_reverse();
-    }
+    // `Record::new` defaults to FLAG 0x4. Every record produced by this helper
+    // is an alignment, so explicitly replace that default with its strand flag.
+    record.set_flags(if reverse { 0x10 } else { 0 });
     Ok(record)
 }
 

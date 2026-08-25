@@ -10,10 +10,16 @@ pub(crate) struct PendingQueries {
 
 pub(crate) struct PanelScrollDisplayCache {
     pub(crate) scrollable: DisplayList,
+    pub(crate) annotations: DisplayList,
     pub(crate) pinned: DisplayList,
     pub(crate) overview: ScrollbarOverview,
+    pub(crate) annotation_overview: ScrollbarOverview,
     pub(crate) actual_content_bottom: f32,
     pub(crate) scroll_clip_top: f32,
+    pub(crate) scroll_clip_bottom: f32,
+    pub(crate) annotation_content_bottom: f32,
+    pub(crate) annotation_clip_top: f32,
+    pub(crate) annotation_clip_bottom: f32,
     pub(crate) supports_fast_scroll: bool,
 }
 
@@ -59,6 +65,9 @@ pub(crate) struct ViewPanelController {
     pub(crate) track_snapshot_interval: Option<GenomicInterval>,
     pub(crate) track_settled_generation: Option<u64>,
     pub(crate) vertical_scroll_points: f32,
+    /// Conventional scroll offset for fixed-height annotation tracks above the
+    /// primary read pane. This is deliberately independent of read density.
+    pub(crate) annotation_scroll_points: f32,
     /// Position of the laid-out scrollable content inside the density-expanded
     /// vertical world. Rendering uses `vertical_scroll_points - origin`, while
     /// the scrollbar and overview use the real world-space camera position.
@@ -142,6 +151,7 @@ impl PanelWorkspace {
                     contig_length,
                 );
                 panel.vertical_scroll_points = saved.vertical_scroll_points;
+                panel.annotation_scroll_points = saved.annotation_scroll_points;
                 panel.vertical_content_origin_points = saved.vertical_content_origin_points;
                 panel.content_bottom_points = content_top;
                 Ok(panel)
@@ -342,6 +352,7 @@ impl ViewPanelController {
             track_snapshot_interval: None,
             track_settled_generation: None,
             vertical_scroll_points: 0.0,
+            annotation_scroll_points: 0.0,
             vertical_content_origin_points: 0.0,
             latent_vertical_scroll_fraction: None,
             content_bottom_points: 0.0,
@@ -388,6 +399,6 @@ impl ViewPanelController {
 
 impl ViewPanelController {
     pub(crate) fn effective_vertical_scroll_points(&self) -> f32 {
-        self.vertical_scroll_points - self.vertical_content_origin_points
+        (self.vertical_scroll_points - self.vertical_content_origin_points).max(0.0)
     }
 }

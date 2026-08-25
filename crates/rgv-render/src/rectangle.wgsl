@@ -55,7 +55,24 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    if input.shape == 5u || input.shape == 6u {
+    var output_color = input.color;
+    if input.shape == 7u || input.shape == 8u {
+        let stroke = clamp(1.0 + input.size.y * 0.075, 1.25, 4.5);
+        let inner_height = max(input.size.y - stroke, 0.0);
+        let fraction = clamp(input.local_point.x / max(input.size.x, 0.0001), 0.0, 1.0);
+        let parabola = 4.0 * (fraction - 0.5) * (fraction - 0.5);
+        var curve_y = stroke * 0.5 + inner_height * parabola;
+        if input.shape == 8u {
+            curve_y = input.size.y - stroke * 0.5 - inner_height * parabola;
+        }
+        let slope = 8.0 * inner_height * (fraction - 0.5) / max(input.size.x, 1.0);
+        let distance = abs(input.local_point.y - curve_y) / sqrt(1.0 + slope * slope);
+        let coverage = 1.0 - smoothstep(max(stroke * 0.5 - 0.75, 0.0), stroke * 0.5 + 0.75, distance);
+        if coverage <= 0.0 {
+            discard;
+        }
+        output_color.a *= coverage;
+    } else if input.shape == 5u || input.shape == 6u {
         let bar_width = min(input.size.x, 2.0);
         let stem_half_height = min(
             max(input.size.y * 0.14, min(input.size.y, 1.0)),
@@ -90,10 +107,10 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
     if input.object_id != 0u && input.object_id == screen.selected_object_id {
-        return vec4<f32>(mix(input.color.rgb, vec3<f32>(0.16, 0.42, 0.92), 0.58), 1.0);
+        return vec4<f32>(mix(output_color.rgb, vec3<f32>(0.16, 0.42, 0.92), 0.58), 1.0);
     }
     if input.object_id != 0u && input.object_id == screen.hovered_object_id {
-        return vec4<f32>(mix(input.color.rgb, vec3<f32>(0.28, 0.52, 0.94), 0.26), 1.0);
+        return vec4<f32>(mix(output_color.rgb, vec3<f32>(0.28, 0.52, 0.94), 0.26), 1.0);
     }
-    return input.color;
+    return output_color;
 }

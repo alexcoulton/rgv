@@ -1,5 +1,42 @@
 use super::*;
 
+pub(crate) fn apply_alignment_annotation_height(
+    options: &mut AlignmentLayoutOptions,
+    frame_top: f32,
+    natural_bottom: f32,
+    requested_height: Option<f32>,
+) -> f32 {
+    let Some(requested_height) = requested_height else {
+        return natural_bottom;
+    };
+    let header_height = 22.0;
+    let content_top = frame_top + header_height;
+    let natural_content_height = (natural_bottom - content_top).max(1.0);
+    let target_height = requested_height.clamp(80.0, 600.0);
+    let target_content_height = (target_height - header_height).max(1.0);
+    let scale = target_content_height / natural_content_height;
+    let scale_top = |top: f32| content_top + (top - content_top) * scale;
+
+    options.reference_top = scale_top(options.reference_top);
+    options.coverage_top = scale_top(options.coverage_top);
+    options.coverage_height = (options.coverage_height * scale).max(8.0);
+    options.junction_top = scale_top(options.junction_top);
+    options.junction_height = (options.junction_height * scale).max(8.0);
+    options.modification_top = scale_top(options.modification_top);
+    options.modification_height = (options.modification_height * scale).max(8.0);
+    frame_top + target_height
+}
+
+pub(crate) fn resolved_read_group_bottom(
+    frame_top: f32,
+    natural_bottom: f32,
+    requested_height: Option<f32>,
+) -> f32 {
+    requested_height.map_or(natural_bottom, |height| {
+        frame_top + height.clamp(40.0, 1_200.0)
+    })
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn secondary_alignment_track_layout(
     panel_id: PanelId,
@@ -7,21 +44,17 @@ pub(crate) fn secondary_alignment_track_layout(
     viewport: Viewport,
     contig_name: &str,
     frame_top: f32,
+    read_frame_top: f32,
     selected_read_name_hash: Option<u64>,
     promoted_read_name_hash: Option<u64>,
     shared_sashimi_raw: Option<f64>,
     shared_sashimi_cpm: Option<f64>,
     junction_annotations: &JunctionAnnotationLookup,
-) -> (Option<Arc<AlignmentLayout>>, TrackFrame) {
+) -> (Option<Arc<AlignmentLayout>>, TrackFrame, Option<TrackFrame>) {
     let config = track.config.clone();
     let lifecycle = track.lifecycle.clone();
     let active_filters = track.active_filters.clone();
-    let frame_height = config.height.clamp(40.0, 1_200.0);
-    let mut frame_bottom = if config.collapsed {
-        frame_top + 26.0
-    } else {
-        frame_top + frame_height
-    };
+    let mut frame_bottom = frame_top + 26.0;
     let source_label = Some(config.source.redacted_label());
     if config.collapsed {
         return (
@@ -38,6 +71,7 @@ pub(crate) fn secondary_alignment_track_layout(
                 frozen_bottom: None,
                 subtracks: Vec::new(),
             },
+            None,
         );
     }
     let expected_interval = track
@@ -75,8 +109,10 @@ pub(crate) fn secondary_alignment_track_layout(
                     top: frame_top + 22.0,
                     bottom: frame_bottom,
                     collapsed: false,
+                    composite_member: None,
                 }],
             },
+            None,
         );
     };
 
@@ -105,8 +141,8 @@ pub(crate) fn secondary_alignment_track_layout(
     options.show_junctions = show_junctions;
     options.junction_top = lane_top;
     options.junction_height = match filters.junction_display_mode {
-        JunctionDisplayMode::Collapsed => (34.0 * secondary_scale).clamp(24.0, 58.0),
-        JunctionDisplayMode::Expanded => (104.0 * secondary_scale).clamp(72.0, 180.0),
+        JunctionDisplayMode::Collapsed => (52.0 * secondary_scale).clamp(40.0, 80.0),
+        JunctionDisplayMode::Expanded => (120.0 * secondary_scale).clamp(90.0, 210.0),
     };
     options.minimum_junction_depth = filters.minimum_junction_depth;
     options.junction_display_mode = filters.junction_display_mode;
@@ -137,18 +173,17 @@ pub(crate) fn secondary_alignment_track_layout(
     } else if modification_frequency_supported {
         lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
     }
+    let annotation_context_bottom = lane_top.max(frame_top + 22.0);
     options.show_reads = filters.show_reads;
-    options.reads_top = lane_top + if filters.show_reads { 1.0 } else { 0.0 };
-    if !options.show_reads {
-        lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
-    }
+    options.reads_top = read_frame_top + if filters.show_reads { 22.0 } else { 0.0 };
     options.row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
     options.read_height = (5.0 * density).clamp(1.5, (options.row_height - 1.0).max(1.5));
-    frame_bottom = frame_bottom.max(if options.show_reads {
-        options.reads_top + options.row_height + 6.0
-    } else {
-        lane_top + 6.0
-    });
+    frame_bottom = apply_alignment_annotation_height(
+        &mut options,
+        frame_top,
+        annotation_context_bottom,
+        config.annotation_height,
+    );
     options.color_mode = filters.alignment_color_mode;
     options.group_mode = filters.alignment_group_mode;
     options.group_order = filters.alignment_group_order;
@@ -177,14 +212,11 @@ pub(crate) fn secondary_alignment_track_layout(
     ) {
         *slot = Some(code);
     }
-    let available_read_height = (frame_bottom - options.reads_top - 6.0).max(options.row_height);
-    options.max_rows = if options.show_reads {
-        (available_read_height / options.row_height)
-            .floor()
-            .clamp(1.0, 4_096.0) as usize
-    } else {
-        1
-    };
+    // The query safety cap already bounds retained records. Every BAM in the
+    // shared read pane must give each retained record a row opportunity; the
+    // pane scrollbar, rather than an annotation-track height, limits what is
+    // visible at once.
+    options.max_rows = query.batch.len().max(1);
 
     let rows_match = projection.alignment_rows.as_ref().is_some_and(|cached| {
         Arc::ptr_eq(&cached.query, &query)
@@ -257,7 +289,7 @@ pub(crate) fn secondary_alignment_track_layout(
         projection.cached_layout = Some((key, Arc::clone(&layout)));
         layout
     };
-    let mut subtracks = Vec::with_capacity(4);
+    let mut subtracks = Vec::with_capacity(3);
     if options.show_coverage {
         subtracks.push(TrackSubtrack {
             label: "Coverage".to_owned(),
@@ -270,6 +302,7 @@ pub(crate) fn secondary_alignment_track_layout(
             top: options.coverage_top,
             bottom: options.coverage_top + options.coverage_height,
             collapsed: false,
+            composite_member: None,
         });
     } else {
         subtracks.push(collapsed_alignment_subtrack(
@@ -290,6 +323,7 @@ pub(crate) fn secondary_alignment_track_layout(
             top: options.junction_top,
             bottom: options.junction_top + options.junction_height,
             collapsed: false,
+            composite_member: None,
         });
     } else if junctions_available {
         subtracks.push(collapsed_alignment_subtrack(
@@ -304,6 +338,7 @@ pub(crate) fn secondary_alignment_track_layout(
             top: options.modification_top,
             bottom: options.modification_top + options.modification_height,
             collapsed: false,
+            composite_member: None,
         });
     } else if modification_frequency_supported {
         subtracks.push(collapsed_alignment_subtrack(
@@ -419,31 +454,80 @@ pub(crate) fn secondary_alignment_track_layout(
                 "bisulfite conversion unavailable: load a matching reference FASTA".to_owned(),
             );
         }
-        subtracks.push(TrackSubtrack {
+        let natural_read_content_bottom = layout
+            .display_list
+            .rectangles
+            .iter()
+            .skip(layout.pinned_rectangle_count)
+            .map(|rectangle| rectangle.y + rectangle.height)
+            .fold(options.reads_top + options.row_height, f32::max)
+            + 6.0;
+        let read_content_bottom = resolved_read_group_bottom(
+            read_frame_top,
+            natural_read_content_bottom,
+            config.read_group_height,
+        );
+        let reads = TrackSubtrack {
             label: "Reads".to_owned(),
             detail: (!read_details.is_empty()).then(|| read_details.join(" · ")),
             top: options.reads_top,
-            bottom: frame_bottom,
+            bottom: read_content_bottom,
             collapsed: false,
-        });
-    } else {
-        subtracks.push(collapsed_alignment_subtrack("Reads", options.reads_top));
-    }
-    (
-        Some(layout),
-        TrackFrame {
+            composite_member: None,
+        };
+        let annotation_frame = TrackFrame {
             key: TrackFrameKey::Alignment(config.id),
-            name: config.name,
+            name: config.name.clone(),
             kind: TrackKind::Alignment,
-            source_label,
+            source_label: source_label.clone(),
             top: frame_top,
             bottom: frame_bottom,
             visible: true,
             collapsed: false,
             frozen_bottom: None,
             subtracks,
-        },
-    )
+        };
+        let read_frame = TrackFrame {
+            key: TrackFrameKey::Alignment(config.id),
+            name: format!("Reads · {}", config.name),
+            kind: TrackKind::Alignment,
+            source_label,
+            top: read_frame_top,
+            bottom: read_content_bottom.max(read_frame_top + 22.0),
+            visible: true,
+            collapsed: false,
+            frozen_bottom: Some(options.reads_top),
+            subtracks: vec![reads],
+        };
+        return (Some(layout), annotation_frame, Some(read_frame));
+    } else {
+        let read_bottom = read_frame_top + COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
+        let annotation_frame = TrackFrame {
+            key: TrackFrameKey::Alignment(config.id),
+            name: config.name.clone(),
+            kind: TrackKind::Alignment,
+            source_label: source_label.clone(),
+            top: frame_top,
+            bottom: frame_bottom,
+            visible: true,
+            collapsed: false,
+            frozen_bottom: None,
+            subtracks,
+        };
+        let read_frame = TrackFrame {
+            key: TrackFrameKey::Alignment(config.id),
+            name: format!("Reads · {}", config.name),
+            kind: TrackKind::Alignment,
+            source_label,
+            top: read_frame_top,
+            bottom: read_bottom,
+            visible: true,
+            collapsed: true,
+            frozen_bottom: Some(read_bottom),
+            subtracks: vec![collapsed_alignment_subtrack("Reads", read_frame_top)],
+        };
+        return (Some(layout), annotation_frame, Some(read_frame));
+    }
 }
 
 pub(crate) fn overview_read_detail(count: usize, cancelled: bool) -> String {
@@ -462,6 +546,12 @@ pub(crate) fn overview_read_detail(count: usize, cancelled: bool) -> String {
 
 pub(crate) fn filtered_read_details(stats: rgv_hts::QueryStats) -> Vec<String> {
     let mut details = Vec::new();
+    if stats.records_filtered_unmapped > 0 {
+        details.push(format!(
+            "{} unmapped ignored",
+            stats.records_filtered_unmapped
+        ));
+    }
     if stats.records_filtered_secondary > 0 {
         details.push(format!(
             "{} secondary filtered",

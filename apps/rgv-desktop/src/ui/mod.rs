@@ -21,9 +21,11 @@ pub use navigation::{
 pub use status::status_bar;
 pub use tracks::{
     AlignmentSubtrack, ScrollbarInteraction, ScrollbarOverview, TrackFrame, TrackFrameKey,
-    TrackSubtrack, TrackUiAction, keyboard_reorder_index, paint_genomic_text,
-    paint_track_viewport_chrome, paint_vertical_scrollbar, resized_track_height,
-    scrollbar_fraction_at_grab, scrollbar_geometry_for_density_at_fraction_in_viewport,
+    TrackSubtrack, TrackUiAction, frame_content_y_at_screen_y, keyboard_reorder_index,
+    paint_annotation_scrollbar, paint_genomic_text, paint_track_viewport_chrome,
+    paint_vertical_scrollbar, resized_annotation_track_height, resized_read_pane_height,
+    resized_read_track_height, resized_track_height, scrollbar_fraction_at_grab,
+    scrollbar_geometry_for_density_at_fraction_in_viewport,
     scrollbar_geometry_for_density_in_viewport, scrollbar_offset_at_grab, scrollbar_overview,
     track_drop_index,
 };
@@ -39,6 +41,7 @@ pub struct CanvasGeometry {
     pub viewport: egui::Rect,
     pub gutter: egui::Rect,
     pub genomic: egui::Rect,
+    pub annotation_scrollbar: egui::Rect,
     pub scrollbar: egui::Rect,
 }
 
@@ -62,6 +65,10 @@ impl CanvasGeometry {
             egui::pos2(viewport.right() - scrollbar_width, viewport.top()),
             viewport.max,
         );
+        // The annotation and read controls occupy upper and lower segments of
+        // this one right-hand column. Their vertical split is data-dependent
+        // and is applied by the frame UI once the pane layout is available.
+        let annotation_scrollbar = scrollbar;
         let genomic = egui::Rect::from_min_max(
             egui::pos2(gutter.right(), viewport.top()),
             egui::pos2(scrollbar.left(), viewport.bottom()),
@@ -70,6 +77,7 @@ impl CanvasGeometry {
             viewport,
             gutter,
             genomic,
+            annotation_scrollbar,
             scrollbar,
         }
     }
@@ -131,6 +139,8 @@ mod tests {
         let geometry = CanvasGeometry::initial(1_280.0, 800.0);
         assert!((geometry.gutter.width() - TRACK_GUTTER_WIDTH).abs() < f32::EPSILON);
         assert!((geometry.scrollbar.width() - SCROLLBAR_WIDTH).abs() < f32::EPSILON);
+        assert!((geometry.annotation_scrollbar.width() - SCROLLBAR_WIDTH).abs() < f32::EPSILON);
+        assert_eq!(geometry.annotation_scrollbar, geometry.scrollbar);
         assert!(geometry.genomic.width() > 1_000.0);
         assert!((geometry.genomic.top() - geometry.viewport.top()).abs() < f32::EPSILON);
     }

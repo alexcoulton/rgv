@@ -1531,6 +1531,12 @@ pub enum ToolSetting {
         #[schemars(range(min = 0.0))]
         value: f32,
     },
+    AnnotationScrollPoints {
+        #[schemars(range(min = 1))]
+        panel_id: u64,
+        #[schemars(range(min = 0.0))]
+        value: f32,
+    },
 }
 
 impl ToolSetting {
@@ -1598,6 +1604,12 @@ impl ToolSetting {
             },
             Self::VerticalScrollPoints { panel_id, value } => {
                 AutomationSetting::VerticalScrollPoints {
+                    panel_id: PanelId::new(panel_id),
+                    value,
+                }
+            }
+            Self::AnnotationScrollPoints { panel_id, value } => {
+                AutomationSetting::AnnotationScrollPoints {
                     panel_id: PanelId::new(panel_id),
                     value,
                 }

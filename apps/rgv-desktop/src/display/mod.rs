@@ -5,6 +5,32 @@ pub(crate) mod hit_test;
 use super::*;
 
 pub(super) const COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT: f32 = 20.0;
+pub(super) const PINNED_ALIGNMENT_REFERENCE_HEIGHT: f32 = 28.0;
+pub(super) const PINNED_ALIGNMENT_COVERAGE_HEIGHT: f32 = 48.0;
+pub(super) const PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT: f32 = 52.0;
+pub(super) const PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT: f32 = 120.0;
+pub(super) const PINNED_ALIGNMENT_MODIFICATION_HEIGHT: f32 = 26.0;
+pub(crate) const ANNOTATION_PANE_BACKGROUND: Rgba = Rgba::new(0.953, 0.969, 0.984, 1.0);
+
+pub(crate) fn append_annotation_pane_background(
+    display: &mut DisplayList,
+    width: f32,
+    top: f32,
+    bottom: f32,
+) {
+    if width <= 0.0 || bottom <= top {
+        return;
+    }
+    display.rectangles.push(RectPrimitive {
+        x: 0.0,
+        y: top,
+        width,
+        height: bottom - top,
+        color: ANNOTATION_PANE_BACKGROUND,
+        object_id: 0,
+        shape: Default::default(),
+    });
+}
 
 pub(crate) fn reference_bases_label(reverse_complement: bool) -> String {
     if reverse_complement {
@@ -21,6 +47,22 @@ pub(super) fn collapsed_alignment_subtrack(label: &str, top: f32) -> TrackSubtra
         top,
         bottom: top + COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT,
         collapsed: true,
+        composite_member: None,
+    }
+}
+
+pub(super) fn primary_pinned_gene_id(tracks: &[TrackConfig]) -> Option<TrackId> {
+    tracks
+        .iter()
+        .find(|track| track.visible && track.kind == TrackKind::GeneModel)
+        .map(|track| track.id)
+}
+
+pub(super) fn pinned_gene_track_height(track: &TrackConfig) -> f32 {
+    if track.collapsed {
+        26.0
+    } else {
+        track.height.clamp(40.0, 1_200.0)
     }
 }
 
@@ -116,6 +158,8 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn rebuild_genomic_display(&mut self) {
+        let shared_density = self.primary_alignment_filters().alignment_density;
+        self.set_shared_alignment_density(shared_density);
         self.ensure_alignment_rows();
         let shared_sashimi_raw = self.shared_sashimi_maximum(SashimiCountMode::Raw);
         let shared_sashimi_cpm = self.shared_sashimi_maximum(SashimiCountMode::CountsPerMillion);
@@ -125,9 +169,20 @@ impl Viewer {
             .primary_alignment_source()
             .map(TrackSource::redacted_label);
         let mut display = DisplayList::default();
+        let mut annotation_display = DisplayList::default();
         let mut pinned_display = DisplayList::default();
         let mut top = self.canvas_geometry.viewport.top();
-        let mut scroll_clip_top = top;
+        let viewport_height = self.canvas_geometry.viewport.height().max(1.0);
+        let configured_read_height = self
+            .alignment_tracks
+            .first()
+            .map_or(240.0, |track| track.config.height)
+            .clamp(100.0, (viewport_height - 80.0).max(100.0));
+        let scroll_clip_top = (self.canvas_geometry.viewport.bottom() - configured_read_height)
+            .max(self.canvas_geometry.viewport.top() + 80.0);
+        let scroll_clip_bottom = self.canvas_geometry.viewport.bottom();
+        let mut actual_read_content_bottom = scroll_clip_top;
+        let mut read_top = scroll_clip_top;
         self.panels.active_mut().track_frames.clear();
         let viewport_interval = self.panels.active().viewport.interval();
         let junction_annotations = junction_annotation_context(
@@ -151,11 +206,16 @@ impl Viewer {
             let reference_expanded = self.primary_alignment_filters().show_reference;
             let sequence_top = frame_top + 25.0;
             let translation_top = sequence_top + 23.0;
-            let bottom = if reference_expanded {
+            let natural_bottom = if reference_expanded {
                 frame_top + 49.0 + self.reference_translation_frames.len() as f32 * 20.0
             } else {
                 frame_top + 26.0
             };
+            let bottom = self
+                .reference_annotation_height
+                .map_or(natural_bottom, |height| {
+                    frame_top + height.clamp(80.0, 600.0)
+                });
             if reference_expanded
                 && let Some(reference) = self
                     .panels
@@ -207,6 +267,7 @@ impl Viewer {
                     top: sequence_top,
                     bottom: sequence_top + 20.0,
                     collapsed: false,
+                    composite_member: None,
                 });
                 subtracks.extend(
                     self.reference_translation_frames
@@ -219,6 +280,7 @@ impl Viewer {
                             top: translation_top + index as f32 * 20.0,
                             bottom: translation_top + (index + 1) as f32 * 20.0,
                             collapsed: false,
+                            composite_member: None,
                         }),
                 );
             }
@@ -234,32 +296,32 @@ impl Viewer {
                 bottom,
                 visible: true,
                 collapsed: !reference_expanded,
-                frozen_bottom: Some(bottom),
+                frozen_bottom: None,
                 subtracks,
             };
             self.panels.active_mut().track_frames.push(frame);
             top = bottom;
-            scroll_clip_top = bottom;
         }
         // Gene models are reference context, so keep them immediately above the
         // primary alignment instead of placing them below an arbitrarily tall
         // read stack. This preserves visible gene context while reads scroll.
+        // Keep one primary annotation alongside the reference as persistent
+        // genomic context. Additional gene-model tracks are comparative data:
+        // pinning every one can consume the complete viewport and leave no
+        // visible scrollable region (MF-10 has seven of them).
+        let pinned_gene_id = primary_pinned_gene_id(self.tracks.tracks());
         let pinned_gene_configs = self
             .tracks
             .tracks()
             .iter()
-            .filter(|track| track.visible && track.kind == TrackKind::GeneModel)
+            .filter(|track| Some(track.id) == pinned_gene_id)
             .cloned()
             .collect::<Vec<_>>();
         for config in pinned_gene_configs {
             let frame_top = top;
-            let height = if config.collapsed {
-                26.0
-            } else {
-                (config.height
-                    * auxiliary_track_scale(self.primary_alignment_filters().alignment_density))
-                .clamp(40.0, 1_200.0)
-            };
+            // A density gesture may resize the scrollable stack, but persistent
+            // context must not move the scroll clip boundary underneath it.
+            let height = pinned_gene_track_height(&config);
             let bottom = frame_top + height;
             if !config.collapsed
                 && tracks_overlap_viewport
@@ -305,11 +367,10 @@ impl Viewer {
                 bottom,
                 visible: true,
                 collapsed: config.collapsed,
-                frozen_bottom: Some(bottom),
+                frozen_bottom: None,
                 subtracks: Vec::new(),
             });
             top = bottom;
-            scroll_clip_top = bottom;
         }
         if self.primary_alignment_visible()
             && !self.primary_alignment_collapsed()
@@ -320,7 +381,6 @@ impl Viewer {
         {
             let mut options = AlignmentLayoutOptions::default();
             let density = self.primary_alignment_filters().alignment_density;
-            let secondary_scale = density.sqrt();
             let modification_frequency_supported =
                 self.panels.active().viewport.detail_level() != DetailLevel::Overview;
             let show_modification_frequency =
@@ -332,7 +392,7 @@ impl Viewer {
             let embedded_reference_supported = self.reference_engine.is_none();
             let embedded_reference =
                 self.primary_alignment_filters().show_reference && embedded_reference_supported;
-            let reference_height = (28.0 * secondary_scale).clamp(20.0, 52.0);
+            let reference_height = PINNED_ALIGNMENT_REFERENCE_HEIGHT;
             let frame_top = top;
             let content_top = frame_top + 22.0;
             let mut lane_top = content_top;
@@ -350,7 +410,7 @@ impl Viewer {
             }
             options.show_coverage = self.primary_alignment_filters().show_coverage;
             options.coverage_top = lane_top;
-            options.coverage_height = (48.0 * secondary_scale).clamp(28.0, 84.0);
+            options.coverage_height = PINNED_ALIGNMENT_COVERAGE_HEIGHT;
             options.coverage_scale_maximum =
                 self.primary_alignment_filters().coverage_scale_maximum;
             options.coverage_scale_transform =
@@ -363,8 +423,8 @@ impl Viewer {
             options.show_junctions = show_junctions;
             options.junction_top = lane_top;
             options.junction_height = match self.primary_alignment_filters().junction_display_mode {
-                JunctionDisplayMode::Collapsed => (34.0 * secondary_scale).clamp(24.0, 58.0),
-                JunctionDisplayMode::Expanded => (104.0 * secondary_scale).clamp(72.0, 180.0),
+                JunctionDisplayMode::Collapsed => PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT,
+                JunctionDisplayMode::Expanded => PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
             };
             options.minimum_junction_depth =
                 self.primary_alignment_filters().minimum_junction_depth;
@@ -402,26 +462,24 @@ impl Viewer {
             }
             options.show_modification_frequency = show_modification_frequency;
             options.modification_top = lane_top;
-            options.modification_height = (26.0 * secondary_scale).clamp(20.0, 40.0);
+            options.modification_height = PINNED_ALIGNMENT_MODIFICATION_HEIGHT;
             if show_modification_frequency {
                 lane_top += options.modification_height + 8.0;
             } else if modification_frequency_supported {
                 lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
             }
+            let mut annotation_context_bottom = lane_top;
             options.show_reads = self.primary_alignment_filters().show_reads;
-            options.reads_top = lane_top
+            options.reads_top = scroll_clip_top
                 + if self.primary_alignment_filters().show_reads {
-                    1.0
+                    22.0
                 } else {
                     0.0
                 };
-            if !options.show_reads {
-                lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
-            }
             let frozen_bottom = if options.show_reads {
                 options.reads_top
             } else {
-                lane_top
+                scroll_clip_top + COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT
             };
             options.row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
             options.read_height = (5.0 * density).clamp(1.5, (options.row_height - 1.0).max(1.5));
@@ -487,6 +545,14 @@ impl Viewer {
             {
                 *slot = Some(code);
             }
+            annotation_context_bottom = alignment::apply_alignment_annotation_height(
+                &mut options,
+                frame_top,
+                annotation_context_bottom,
+                self.alignment_tracks
+                    .first()
+                    .and_then(|track| track.config.annotation_height),
+            );
             // The query safety cap already bounds retained records. The
             // scrollable primary track must give every retained record a row
             // opportunity instead of imposing a second display-only cap.
@@ -524,58 +590,67 @@ impl Viewer {
                 let _ = self.layout_cache.insert(key, Arc::clone(&layout), weight);
                 layout
             };
-            extend_alignment_layers(&mut pinned_display, &mut display, &layout);
-            scroll_clip_top = frozen_bottom;
             if let Some(track) = self.alignment_tracks.first_mut() {
                 track.projection_mut(self.panels.active().id).cached_layout =
                     Some((key, Arc::clone(&layout)));
             }
-            let pinned_bottom = frozen_bottom;
-            let natural_bottom = if self.primary_alignment_filters().show_reads {
-                layout
+            actual_read_content_bottom = if self.primary_alignment_filters().show_reads {
+                let natural_bottom = layout
                     .display_list
                     .rectangles
                     .iter()
                     .skip(layout.pinned_rectangle_count)
                     .map(|rectangle| rectangle.y + rectangle.height)
                     .fold(options.reads_top + options.row_height, f32::max)
-                    + 6.0
+                    + 6.0;
+                alignment::resolved_read_group_bottom(
+                    scroll_clip_top,
+                    natural_bottom,
+                    self.alignment_tracks
+                        .first()
+                        .and_then(|track| track.config.read_group_height),
+                )
             } else {
-                pinned_bottom.max(frame_top + 26.0) + 6.0
+                frozen_bottom + 6.0
             };
-            let bottom = alignment_frame_bottom(
-                frame_top,
-                natural_bottom,
-                self.shared_primary_alignment_height,
+            extend_alignment_layers(
+                &mut pinned_display,
+                &mut display,
+                &layout,
+                Some((scroll_clip_top, actual_read_content_bottom)),
             );
-            let alignment_frame = TrackFrame {
+            let mut subtracks = {
+                let mut subtracks = Vec::with_capacity(5);
+                if embedded_reference {
+                    subtracks.push(TrackSubtrack {
+                        label: "Reference".to_owned(),
+                        detail: None,
+                        top: options.reference_top,
+                        bottom: options.reference_top + reference_height,
+                        collapsed: false,
+                        composite_member: None,
+                    });
+                } else if embedded_reference_supported
+                    && !self.primary_alignment_filters().show_reference
+                {
+                    subtracks.push(collapsed_alignment_subtrack(
+                        "Reference",
+                        options.reference_top,
+                    ));
+                }
+                subtracks
+            };
+            let mut alignment_context_frame = TrackFrame {
                 key: TrackFrameKey::Alignment(primary_alignment_id),
                 name: primary_alignment_name.clone(),
                 kind: TrackKind::Alignment,
                 source_label: primary_source_label.clone(),
                 top: frame_top,
-                bottom,
+                bottom: annotation_context_bottom.max(frame_top + 22.0),
                 visible: true,
                 collapsed: false,
-                frozen_bottom: Some(frozen_bottom),
+                frozen_bottom: None,
                 subtracks: {
-                    let mut subtracks = Vec::with_capacity(5);
-                    if embedded_reference {
-                        subtracks.push(TrackSubtrack {
-                            label: "Reference".to_owned(),
-                            detail: None,
-                            top: options.reference_top,
-                            bottom: options.reference_top + reference_height,
-                            collapsed: false,
-                        });
-                    } else if embedded_reference_supported
-                        && !self.primary_alignment_filters().show_reference
-                    {
-                        subtracks.push(collapsed_alignment_subtrack(
-                            "Reference",
-                            options.reference_top,
-                        ));
-                    }
                     if self.primary_alignment_filters().show_coverage {
                         let scale = alignment::coverage_scale_detail(
                             layout.stats.maximum_coverage,
@@ -589,6 +664,7 @@ impl Viewer {
                             top: options.coverage_top,
                             bottom: options.coverage_top + options.coverage_height,
                             collapsed: false,
+                            composite_member: None,
                         });
                     } else {
                         subtracks.push(collapsed_alignment_subtrack(
@@ -609,6 +685,7 @@ impl Viewer {
                             top: options.junction_top,
                             bottom: options.junction_top + options.junction_height,
                             collapsed: false,
+                            composite_member: None,
                         });
                     } else if junctions_available {
                         subtracks.push(collapsed_alignment_subtrack(
@@ -638,6 +715,7 @@ impl Viewer {
                             top: options.modification_top,
                             bottom: options.modification_top + options.modification_height,
                             collapsed: false,
+                            composite_member: None,
                         });
                     } else if modification_frequency_supported {
                         subtracks.push(collapsed_alignment_subtrack(
@@ -766,8 +844,9 @@ impl Viewer {
                             label: "Reads".to_owned(),
                             detail: (!read_details.is_empty()).then(|| read_details.join(" · ")),
                             top: options.reads_top,
-                            bottom,
+                            bottom: actual_read_content_bottom.max(options.reads_top),
                             collapsed: false,
+                            composite_member: None,
                         });
                     } else {
                         subtracks.push(collapsed_alignment_subtrack("Reads", options.reads_top));
@@ -775,8 +854,32 @@ impl Viewer {
                     subtracks
                 },
             };
-            self.panels.active_mut().track_frames.push(alignment_frame);
-            top = bottom;
+            let reads = alignment_context_frame
+                .subtracks
+                .iter()
+                .position(|subtrack| subtrack.label == "Reads")
+                .map(|index| alignment_context_frame.subtracks.remove(index))
+                .into_iter()
+                .collect();
+            self.panels
+                .active_mut()
+                .track_frames
+                .push(alignment_context_frame);
+            self.panels.active_mut().track_frames.push(TrackFrame {
+                key: TrackFrameKey::Alignment(primary_alignment_id),
+                name: format!("Reads · {primary_alignment_name}"),
+                kind: TrackKind::Alignment,
+                source_label: primary_source_label.clone(),
+                top: scroll_clip_top,
+                bottom: actual_read_content_bottom.max(scroll_clip_top + 22.0),
+                visible: true,
+                collapsed: !options.show_reads,
+                frozen_bottom: Some(frozen_bottom),
+                subtracks: reads,
+            });
+            read_top = actual_read_content_bottom.max(scroll_clip_top + 22.0);
+            actual_read_content_bottom = read_top;
+            top = annotation_context_bottom;
         } else if self.primary_alignment_source().is_some() {
             if let Some(track) = self.alignment_tracks.first_mut() {
                 track.projection_mut(self.panels.active().id).cached_layout = None;
@@ -823,12 +926,13 @@ impl Viewer {
             .filter(|track| track.config.visible)
         {
             let track_id = track.config.id;
-            let (layout, frame) = secondary_alignment_track_layout(
+            let (layout, frame, read_frame) = secondary_alignment_track_layout(
                 self.panels.active_mut().id,
                 track,
                 self.panels.active_mut().viewport,
                 &self.panels.active_mut().contig_name,
                 top,
+                read_top,
                 (selected_alignment_track == Some(track_id))
                     .then_some(selected_chain_read_name_hash)
                     .flatten(),
@@ -843,31 +947,65 @@ impl Viewer {
                 // CPU semantic picking resolves the owning TrackId from the frame.
                 // Keep GPU object IDs clear because they are only unique within
                 // one alignment query, not across the complete workspace.
-                display
-                    .rectangles
-                    .extend(
-                        layout
-                            .display_list
-                            .rectangles
-                            .iter()
-                            .copied()
-                            .map(|mut rectangle| {
-                                rectangle.object_id = 0;
-                                rectangle
-                            }),
-                    );
-                display
-                    .texts
-                    .extend(layout.display_list.texts.iter().cloned());
+                annotation_display.rectangles.extend(
+                    layout
+                        .display_list
+                        .rectangles
+                        .iter()
+                        .take(layout.pinned_rectangle_count)
+                        .copied()
+                        .map(|mut rectangle| {
+                            rectangle.object_id = 0;
+                            rectangle
+                        }),
+                );
+                annotation_display.texts.extend(
+                    layout
+                        .display_list
+                        .texts
+                        .iter()
+                        .take(layout.pinned_text_count)
+                        .cloned(),
+                );
+                let mut read_display = DisplayList {
+                    rectangles: layout
+                        .display_list
+                        .rectangles
+                        .iter()
+                        .skip(layout.pinned_rectangle_count)
+                        .copied()
+                        .map(|mut rectangle| {
+                            rectangle.object_id = 0;
+                            rectangle
+                        })
+                        .collect(),
+                    texts: layout
+                        .display_list
+                        .texts
+                        .iter()
+                        .skip(layout.pinned_text_count)
+                        .cloned()
+                        .collect(),
+                };
+                if let Some(read_frame) = &read_frame {
+                    read_display.scroll_and_clip_vertical(0.0, read_frame.top, read_frame.bottom);
+                }
+                display.rectangles.append(&mut read_display.rectangles);
+                display.texts.append(&mut read_display.texts);
             }
             top = frame.bottom;
             self.panels.active_mut().track_frames.push(frame);
+            if let Some(read_frame) = read_frame {
+                read_top = read_frame.bottom;
+                actual_read_content_bottom = actual_read_content_bottom.max(read_frame.bottom);
+                self.panels.active_mut().track_frames.push(read_frame);
+            }
         }
         let visible_configs = self
             .tracks
             .tracks()
             .iter()
-            .filter(|track| track.visible && track.kind != TrackKind::GeneModel)
+            .filter(|track| track.visible && Some(track.id) != pinned_gene_id)
             .collect::<Vec<_>>();
         let mut rendered_overlay_groups = BTreeSet::new();
         for config in &visible_configs {
@@ -882,50 +1020,15 @@ impl Viewer {
                 vec![*config]
             };
             let collapsed = members.iter().all(|member| member.collapsed);
-            let anchor_snapshot = self
-                .panels
-                .active()
-                .track_snapshots
-                .iter()
-                .find(|snapshot| snapshot.id == config.id);
-            let mut effective_copy_number_settings = config.copy_number.clone();
-            effective_copy_number_settings.row_height = (effective_copy_number_settings.row_height
-                * auxiliary_track_scale(self.primary_alignment_filters().alignment_density))
-            .clamp(6.0, 40.0);
-            let mut effective_mutation_settings = config.mutation.clone();
-            effective_mutation_settings.row_height = (effective_mutation_settings.row_height
-                * auxiliary_track_scale(self.primary_alignment_filters().alignment_density))
-            .clamp(8.0, 40.0);
+            let effective_copy_number_settings = config.copy_number.clone();
+            let effective_mutation_settings = config.mutation.clone();
             let height = if collapsed {
                 26.0
-            } else if let Some(TrackSnapshot {
-                data: TrackSnapshotData::CopyNumber(query),
-                ..
-            }) = anchor_snapshot
-            {
-                copy_number_track_height(
-                    query.samples.len(),
-                    effective_copy_number_settings.row_height,
-                )
-                .max(40.0)
-            } else if let Some(TrackSnapshot {
-                data: TrackSnapshotData::Mutations(query),
-                ..
-            }) = anchor_snapshot
-            {
-                mutation_track_height(query.samples.len(), effective_mutation_settings.row_height)
-                    .max(40.0)
             } else {
                 members
                     .iter()
                     .filter(|member| !member.collapsed)
-                    .map(|member| {
-                        (member.height
-                            * auxiliary_track_scale(
-                                self.primary_alignment_filters().alignment_density,
-                            ))
-                        .clamp(40.0, 1_200.0)
-                    })
+                    .map(|member| member.height.clamp(40.0, 1_200.0))
                     .reduce(f32::max)
                     .unwrap_or(40.0)
             };
@@ -1036,6 +1139,7 @@ impl Viewer {
                                     top: top + 19.0,
                                     bottom: (top + 39.0).min(bottom),
                                     collapsed: false,
+                                    composite_member: None,
                                 });
                             }
                             layout_gwas(
@@ -1096,10 +1200,9 @@ impl Viewer {
                                 &effective_copy_number_settings,
                                 &member.quantitative,
                                 shared_range,
-                                self.panels.active().effective_vertical_scroll_points()
+                                self.panels.active().annotation_scroll_points
                                     + self.canvas_geometry.viewport.top(),
-                                self.panels.active().effective_vertical_scroll_points()
-                                    + self.canvas_geometry.viewport.bottom(),
+                                self.panels.active().annotation_scroll_points + scroll_clip_top,
                             );
                             if effective_copy_number_settings.show_sample_names {
                                 subtracks.extend(layout.visible_rows.iter().filter_map(|row| {
@@ -1115,6 +1218,7 @@ impl Viewer {
                                             top: row.top,
                                             bottom: row.bottom,
                                             collapsed: false,
+                                            composite_member: None,
                                         }
                                     })
                                 }));
@@ -1127,10 +1231,9 @@ impl Viewer {
                                 self.panels.active().viewport,
                                 options,
                                 &effective_mutation_settings,
-                                self.panels.active().effective_vertical_scroll_points()
+                                self.panels.active().annotation_scroll_points
                                     + self.canvas_geometry.viewport.top(),
-                                self.panels.active().effective_vertical_scroll_points()
-                                    + self.canvas_geometry.viewport.bottom(),
+                                self.panels.active().annotation_scroll_points + scroll_clip_top,
                             );
                             if effective_mutation_settings.show_sample_names {
                                 subtracks.extend(layout.visible_rows.iter().filter_map(|row| {
@@ -1141,6 +1244,7 @@ impl Viewer {
                                             top: row.top,
                                             bottom: row.bottom,
                                             collapsed: false,
+                                            composite_member: None,
                                         }
                                     })
                                 }));
@@ -1158,8 +1262,10 @@ impl Viewer {
                             .0
                         }
                     };
-                    display.rectangles.extend(track_display.rectangles);
-                    display.texts.extend(track_display.texts);
+                    annotation_display
+                        .rectangles
+                        .extend(track_display.rectangles);
+                    annotation_display.texts.extend(track_display.texts);
                 }
             }
             let overlay_group = config.quantitative.overlay_group;
@@ -1186,19 +1292,22 @@ impl Viewer {
             });
             top = bottom;
         }
-        top = fill_lone_alignment_track(
-            &mut self.panels.active_mut().track_frames,
-            top,
-            self.canvas_geometry.viewport.bottom(),
-        );
-        let actual_content_bottom = display
+        // Reference, gene models, alignment summaries, and every auxiliary
+        // track belong to the independently scrollable annotation pane.
+        annotation_display
+            .rectangles
+            .append(&mut pinned_display.rectangles);
+        annotation_display.texts.append(&mut pinned_display.texts);
+        let annotation_clip_top = self.canvas_geometry.viewport.top();
+        let annotation_clip_bottom = scroll_clip_top;
+        let annotation_content_bottom = annotation_display
             .rectangles
             .iter()
             .map(|rectangle| rectangle.y + rectangle.height)
             .fold(top, f32::max)
-            .max(self.canvas_geometry.viewport.bottom());
+            .max(annotation_clip_bottom);
         let camera_padding = vertical_density_camera_padding(
-            (self.canvas_geometry.viewport.bottom() - scroll_clip_top).max(1.0),
+            (scroll_clip_bottom - scroll_clip_top).max(1.0),
             self.primary_alignment_filters().alignment_density,
         );
         self.panels.active_mut().vertical_content_origin_points = self
@@ -1206,9 +1315,25 @@ impl Viewer {
             .active()
             .vertical_content_origin_points
             .clamp(0.0, camera_padding);
-        let content_bottom = actual_content_bottom + camera_padding;
-        let overview = ui::scrollbar_overview(
-            &self.panels.active().track_frames,
+        let content_bottom = actual_read_content_bottom + camera_padding;
+        let read_frames = self
+            .panels
+            .active()
+            .track_frames
+            .iter()
+            .filter(|frame| frame.frozen_bottom.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let annotation_frames = self
+            .panels
+            .active()
+            .track_frames
+            .iter()
+            .filter(|frame| frame.frozen_bottom.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut overview = ui::scrollbar_overview(
+            &read_frames,
             &display,
             scroll_clip_top,
             content_bottom,
@@ -1217,12 +1342,34 @@ impl Viewer {
             self.canvas_geometry.genomic.width(),
             128,
         );
+        for bin in &mut overview.bins {
+            if bin.density > f32::EPSILON {
+                bin.kind = Some(TrackKind::Alignment);
+            }
+        }
+        overview.boundaries.clear();
+        let annotation_overview = ui::scrollbar_overview(
+            &annotation_frames,
+            &annotation_display,
+            annotation_clip_top,
+            annotation_content_bottom,
+            annotation_clip_top,
+            0.0,
+            self.canvas_geometry.genomic.width(),
+            128,
+        );
         self.panels.active_mut().scroll_display_cache = Some(PanelScrollDisplayCache {
             scrollable: display,
+            annotations: annotation_display,
             pinned: pinned_display,
             overview,
-            actual_content_bottom,
+            annotation_overview,
+            actual_content_bottom: actual_read_content_bottom,
             scroll_clip_top,
+            scroll_clip_bottom,
+            annotation_content_bottom,
+            annotation_clip_top,
+            annotation_clip_bottom,
             supports_fast_scroll,
         });
         let rebuilt = self.rebuild_active_panel_from_scroll_cache();
@@ -1235,21 +1382,37 @@ impl Viewer {
             self.interaction_trace
                 .record(InteractionTraceStage::ScrollDisplayStarted);
         }
-        let Some((actual_content_bottom, scroll_clip_top)) = self
+        let Some((
+            actual_content_bottom,
+            scroll_clip_top,
+            scroll_clip_bottom,
+            annotation_content_bottom,
+            annotation_clip_top,
+            annotation_clip_bottom,
+        )) = self
             .panels
             .active()
             .scroll_display_cache
             .as_ref()
-            .map(|cache| (cache.actual_content_bottom, cache.scroll_clip_top))
+            .map(|cache| {
+                (
+                    cache.actual_content_bottom,
+                    cache.scroll_clip_top,
+                    cache.scroll_clip_bottom,
+                    cache.annotation_content_bottom,
+                    cache.annotation_clip_top,
+                    cache.annotation_clip_bottom,
+                )
+            })
         else {
             return false;
         };
         let camera_padding = vertical_density_camera_padding(
-            (self.canvas_geometry.viewport.bottom() - scroll_clip_top).max(1.0),
+            (scroll_clip_bottom - scroll_clip_top).max(1.0),
             self.primary_alignment_filters().alignment_density,
         );
         let content_bottom = actual_content_bottom + camera_padding;
-        let maximum_scroll = (content_bottom - self.canvas_geometry.viewport.bottom()).max(0.0);
+        let maximum_scroll = (content_bottom - scroll_clip_bottom).max(0.0);
         let previous_maximum_scroll = (self.panels.active().content_bottom_points
             - self.canvas_geometry.viewport.bottom())
         .max(0.0);
@@ -1262,7 +1425,11 @@ impl Viewer {
         panel.vertical_content_origin_points = panel
             .vertical_content_origin_points
             .clamp(0.0, camera_padding);
-        panel.content_bottom_points = content_bottom;
+        panel.content_bottom_points = self.canvas_geometry.viewport.bottom() + maximum_scroll;
+        panel.annotation_scroll_points = panel.annotation_scroll_points.clamp(
+            0.0,
+            (annotation_content_bottom - annotation_clip_bottom).max(0.0),
+        );
         (
             panel.vertical_scroll_points,
             panel.latent_vertical_scroll_fraction,
@@ -1274,9 +1441,19 @@ impl Viewer {
             density_drag_fraction,
         );
         let scroll = self.panels.active().effective_vertical_scroll_points();
+        let annotation_scroll = self.panels.active().annotation_scroll_points;
         let mut display = std::mem::take(&mut self.panels.active_mut().display_list);
         let rectangle_capacity = display.rectangles.capacity();
         let text_capacity = display.texts.capacity();
+        display.rectangles.clear();
+        display.texts.clear();
+        let panel_rect = self.active_panel_rect();
+        append_annotation_pane_background(
+            &mut display,
+            panel_rect.width(),
+            annotation_clip_top,
+            annotation_clip_bottom,
+        );
         {
             let cache = self
                 .panels
@@ -1284,20 +1461,25 @@ impl Viewer {
                 .scroll_display_cache
                 .as_ref()
                 .expect("scroll display cache was observed above");
-            cache.scrollable.write_scrolled_and_clipped_vertical(
+            cache.scrollable.append_scrolled_and_clipped_vertical(
                 scroll,
                 scroll_clip_top,
-                self.canvas_geometry.viewport.bottom(),
+                scroll_clip_bottom,
+                &mut display,
+            );
+            cache.annotations.append_scrolled_and_clipped_vertical(
+                annotation_scroll,
+                annotation_clip_top,
+                annotation_clip_bottom,
                 &mut display,
             );
             cache.pinned.append_scrolled_and_clipped_vertical(
                 0.0,
                 self.canvas_geometry.viewport.top(),
-                scroll_clip_top,
+                annotation_clip_bottom,
                 &mut display,
             );
         }
-        let panel_rect = self.active_panel_rect();
         display.translate_and_clip_horizontal(
             panel_rect.left(),
             panel_rect.left(),
@@ -1528,6 +1710,7 @@ impl Viewer {
                                 top: top + 30.0,
                                 bottom: top + 90.0,
                                 collapsed: false,
+                                composite_member: None,
                             },
                             TrackSubtrack {
                                 label: "Reads".to_owned(),
@@ -1535,6 +1718,7 @@ impl Viewer {
                                 top: top + 100.0,
                                 bottom,
                                 collapsed: false,
+                                composite_member: None,
                             },
                         ]
                     },

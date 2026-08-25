@@ -161,12 +161,13 @@ pub(crate) fn add_reads(
             ultima_analysis.as_ref(),
             &mut ultima_budget,
         );
-        add_read_direction_terminal(
+        add_read_direction_terminals(
             display_list,
             first_read_primitive,
             viewport,
             batch.starts[index],
             batch.ends[index],
+            batch.cigar(index),
             batch.flags[index].is_reverse(),
             y,
             options.read_height,
@@ -212,74 +213,137 @@ pub(crate) fn add_reads(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn add_read_direction_terminal(
+pub(crate) fn aligned_reference_blocks(
+    alignment_start: u64,
+    alignment_end: u64,
+    cigar: Option<&[CigarOp]>,
+) -> Vec<(u64, u64)> {
+    let Some(cigar) = cigar.filter(|cigar| !cigar.is_empty()) else {
+        return (alignment_start < alignment_end)
+            .then_some((alignment_start, alignment_end))
+            .into_iter()
+            .collect();
+    };
+
+    let mut blocks = Vec::new();
+    let mut reference_position = alignment_start;
+    let mut block_start = None;
+    let mut block_end = None;
+    for operation in cigar {
+        let length = u64::from(operation.len);
+        match operation.kind {
+            CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
+                block_start.get_or_insert(reference_position);
+                reference_position = reference_position.saturating_add(length);
+                block_end = Some(reference_position);
+            }
+            CigarOpKind::Deletion => {
+                reference_position = reference_position.saturating_add(length);
+            }
+            CigarOpKind::ReferenceSkip => {
+                if let (Some(start), Some(end)) = (block_start.take(), block_end.take())
+                    && start < end
+                {
+                    blocks.push((start, end));
+                }
+                reference_position = reference_position.saturating_add(length);
+            }
+            CigarOpKind::Insertion
+            | CigarOpKind::SoftClip
+            | CigarOpKind::HardClip
+            | CigarOpKind::Padding => {}
+        }
+    }
+    if let (Some(start), Some(end)) = (block_start, block_end)
+        && start < end
+    {
+        blocks.push((start, end));
+    }
+    blocks
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_read_direction_terminals(
     display_list: &mut DisplayList,
     first_primitive: usize,
     viewport: Viewport,
     alignment_start: u64,
     alignment_end: u64,
+    cigar: Option<&[CigarOp]>,
     reverse: bool,
     y: f32,
     height: f32,
     object_id: u32,
 ) {
     let interval = viewport.interval();
-    let terminal_is_visible = if reverse {
-        alignment_start >= interval.start() && alignment_start < interval.end()
-    } else {
-        alignment_end > interval.start() && alignment_end <= interval.end()
-    };
-    if !terminal_is_visible {
-        return;
-    }
-
     let body_height_minimum = (height - 1.7).max(0.5);
-    let mut terminal = None::<f32>;
-    for primitive in &display_list.rectangles[first_primitive..] {
-        if record_object_id(primitive.object_id) != object_id
-            || primitive.height < body_height_minimum
-            || primitive.y < y - 0.1
-            || primitive.y + primitive.height > y + height + 0.1
-        {
-            continue;
-        }
-        let edge = if reverse {
-            primitive.x
-        } else {
-            primitive.x + primitive.width
-        };
-        terminal = Some(terminal.map_or(edge, |current| {
-            if reverse {
-                current.min(edge)
-            } else {
-                current.max(edge)
-            }
-        }));
-    }
-    let Some(terminal) = terminal else {
-        return;
-    };
-
     let shape = if reverse {
         RectShape::DirectionalTerminalLeft
     } else {
         RectShape::DirectionalTerminalRight
     };
-    for primitive in &mut display_list.rectangles[first_primitive..] {
-        if record_object_id(primitive.object_id) != object_id
-            || primitive.height < body_height_minimum
-            || primitive.y < y - 0.1
-            || primitive.y + primitive.height > y + height + 0.1
-        {
+    for (block_start, block_end) in aligned_reference_blocks(alignment_start, alignment_end, cigar)
+    {
+        let terminal_is_visible = if reverse {
+            block_start >= interval.start() && block_start < interval.end()
+        } else {
+            block_end > interval.start() && block_end <= interval.end()
+        };
+        if !terminal_is_visible {
             continue;
         }
-        let edge = if reverse {
-            primitive.x
-        } else {
-            primitive.x + primitive.width
+        let (block_x, block_width) = clipped_geometry(block_start, block_end, viewport);
+        if block_width <= 0.0 {
+            continue;
+        }
+        let block_right = block_x + block_width;
+        let in_block = |primitive: &RectPrimitive| {
+            let primitive_right = primitive.x + primitive.width;
+            primitive_right > block_x + 0.01 && primitive.x < block_right - 0.01
         };
-        if (edge - terminal).abs() <= 1.0 {
-            primitive.shape = shape;
+        let mut terminal = None::<f32>;
+        for primitive in &display_list.rectangles[first_primitive..] {
+            if record_object_id(primitive.object_id) != object_id
+                || primitive.height < body_height_minimum
+                || primitive.y < y - 0.1
+                || primitive.y + primitive.height > y + height + 0.1
+                || !in_block(primitive)
+            {
+                continue;
+            }
+            let edge = if reverse {
+                primitive.x
+            } else {
+                primitive.x + primitive.width
+            };
+            terminal = Some(terminal.map_or(edge, |current| {
+                if reverse {
+                    current.min(edge)
+                } else {
+                    current.max(edge)
+                }
+            }));
+        }
+        let Some(terminal) = terminal else {
+            continue;
+        };
+        for primitive in &mut display_list.rectangles[first_primitive..] {
+            if record_object_id(primitive.object_id) != object_id
+                || primitive.height < body_height_minimum
+                || primitive.y < y - 0.1
+                || primitive.y + primitive.height > y + height + 0.1
+                || !in_block(primitive)
+            {
+                continue;
+            }
+            let edge = if reverse {
+                primitive.x
+            } else {
+                primitive.x + primitive.width
+            };
+            if (edge - terminal).abs() <= 1.0 {
+                primitive.shape = shape;
+            }
         }
     }
 }

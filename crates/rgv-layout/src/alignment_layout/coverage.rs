@@ -171,67 +171,101 @@ pub(crate) fn add_junctions(
     };
     let row_count = expanded_rows.iter().copied().max().unwrap_or(0) + 1;
     let width = viewport.pixel_width() as f32;
+    let band_height = options.junction_height / row_count.max(1) as f32;
+    for row in 0..row_count {
+        display_list.rectangles.push(RectPrimitive {
+            x: 0.0,
+            y: options.junction_top + (row as f32 + 0.5) * band_height,
+            width,
+            height: 1.0,
+            color: Rgba::new(0.36, 0.38, 0.42, 0.24),
+            object_id: 0,
+            shape: RectShape::Rectangle,
+        });
+    }
     let mut rendered_labels = 0_usize;
+    let mut occupied_label_bounds = Vec::<(f32, f32, f32, f32)>::new();
     for ((_, junction), row) in visible.iter().zip(expanded_rows) {
         let left = (viewport.pixel_at_genomic(junction.start) as f32).clamp(0.0, width);
         let right = (viewport.pixel_at_genomic(junction.end) as f32).clamp(0.0, width);
         if right <= left {
             continue;
         }
-        let value = junction_count_value(summary, junction, options.junction_count_mode);
-        let fraction = (value / scale_maximum).clamp(0.0, 1.0).sqrt() as f32;
-        let (baseline, arc_height) =
-            if options.junction_display_mode == JunctionDisplayMode::Expanded {
-                let band_height = options.junction_height / row_count.max(1) as f32;
-                let baseline = options.junction_top + (row + 1) as f32 * band_height;
-                let arc_height = (band_height * (0.25 + 0.70 * fraction)).clamp(2.0, band_height);
-                (baseline, arc_height)
-            } else {
-                let baseline = options.junction_top + options.junction_height;
-                let arc_height =
-                    (options.junction_height * fraction).clamp(3.0, options.junction_height);
-                (baseline, arc_height)
-            };
-        let arc_top = baseline - arc_height;
+        let band_top = options.junction_top + row as f32 * band_height;
+        let band_bottom = band_top + band_height;
+        let baseline = band_top + band_height * 0.5;
+        let available_height = (band_height * 0.5 - 1.5).max(3.0);
         let selected = options.selected_junction == [junction.start, junction.end];
-        let color = if selected {
-            Rgba::new(0.08, 0.08, 0.10, 1.0)
-        } else {
-            junction_color(junction)
-        };
-        let thickness = if selected { 2.5 } else { 1.0 + fraction };
-        for rectangle in [
-            RectPrimitive {
+        let selected_color = Rgba::new(0.08, 0.08, 0.10, 1.0);
+        let components = [
+            (
+                junction.positive_depth,
+                RectShape::JunctionArcUp,
+                Rgba::new(0.84, 0.30, 0.38, 0.82),
+                Some(RectShape::ChevronRight),
+            ),
+            (
+                junction.negative_depth,
+                RectShape::JunctionArcDown,
+                Rgba::new(0.25, 0.45, 0.82, 0.82),
+                Some(RectShape::ChevronLeft),
+            ),
+            (
+                junction.unknown_depth,
+                RectShape::JunctionArcUp,
+                Rgba::new(0.42, 0.45, 0.50, 0.76),
+                None,
+            ),
+        ];
+        let mut component_apices = Vec::with_capacity(3);
+        for (depth, arc_shape, strand_color, direction_shape) in components {
+            if depth == 0 {
+                continue;
+            }
+            let component_value =
+                junction_component_value(summary, junction, depth, options.junction_count_mode);
+            let fraction = (component_value / scale_maximum).clamp(0.0, 1.0).sqrt() as f32;
+            let arc_height =
+                (available_height * (0.18 + 0.82 * fraction)).clamp(3.0, available_height);
+            let arc_top = if arc_shape == RectShape::JunctionArcUp {
+                baseline - arc_height
+            } else {
+                baseline
+            };
+            let color = if selected {
+                selected_color
+            } else {
+                strand_color
+            };
+            display_list.rectangles.push(RectPrimitive {
                 x: left,
                 y: arc_top,
-                width: thickness,
+                width: right - left,
                 height: arc_height,
                 color,
                 object_id: 0,
-                shape: Default::default(),
-            },
-            RectPrimitive {
-                x: left,
-                y: arc_top,
-                width: (right - left).max(thickness),
-                height: thickness,
-                color,
-                object_id: 0,
-                shape: Default::default(),
-            },
-            RectPrimitive {
-                x: (right - thickness).max(left),
-                y: arc_top,
-                width: thickness,
-                height: arc_height,
-                color,
-                object_id: 0,
-                shape: Default::default(),
-            },
-        ] {
-            display_list.rectangles.push(rectangle);
+                shape: arc_shape,
+            });
+            if let Some(direction_shape) = direction_shape {
+                add_junction_direction_marker(
+                    display_list,
+                    left,
+                    right,
+                    arc_top,
+                    arc_height,
+                    arc_shape,
+                    direction_shape,
+                    color,
+                );
+            }
+            let stroke = junction_arc_stroke_width(arc_height);
+            let apex = if arc_shape == RectShape::JunctionArcUp {
+                arc_top + stroke * 0.5
+            } else {
+                arc_top + arc_height - stroke * 0.5
+            };
+            component_apices.push((depth, arc_shape, apex));
         }
-        add_junction_direction_markers(display_list, junction, left, right, arc_top, color);
         if let Some(annotations) = annotations {
             let status = annotations.status(junction.start, junction.end);
             let marker_color = match status {
@@ -241,7 +275,7 @@ pub(crate) fn add_junctions(
             };
             display_list.rectangles.push(RectPrimitive {
                 x: ((left + right) * 0.5 - 2.5).clamp(0.0, (width - 5.0).max(0.0)),
-                y: (arc_top - 2.5).max(options.junction_top),
+                y: baseline - 2.5,
                 width: 5.0,
                 height: 5.0,
                 color: marker_color,
@@ -253,10 +287,50 @@ pub(crate) fn add_junctions(
             && rendered_labels < MAX_RENDERED_JUNCTION_LABELS
             && right - left >= 30.0
         {
+            let label = junction_count_label(summary, junction, options.junction_count_mode);
+            let label_width = (label.chars().count() as f32 * 6.2 + 8.0).clamp(16.0, right - left);
+            let label_y = component_apices
+                .iter()
+                .max_by_key(|(depth, _, _)| *depth)
+                .map_or(baseline - 7.0, |(_, shape, apex)| {
+                    if *shape == RectShape::JunctionArcUp {
+                        *apex + 7.0
+                    } else {
+                        *apex - 7.0
+                    }
+                })
+                .clamp(band_top + 7.0, band_bottom - 7.0);
+            let label_left =
+                ((left + right - label_width) * 0.5).clamp(0.0, (width - label_width).max(0.0));
+            let label_bounds = (
+                label_left,
+                label_y - 6.5,
+                label_left + label_width,
+                label_y + 6.5,
+            );
+            let overlaps_existing = occupied_label_bounds.iter().any(|bounds| {
+                label_bounds.0 < bounds.2 + 2.0
+                    && label_bounds.2 > bounds.0 - 2.0
+                    && label_bounds.1 < bounds.3 + 2.0
+                    && label_bounds.3 > bounds.1 - 2.0
+            });
+            if overlaps_existing {
+                continue;
+            }
+            occupied_label_bounds.push(label_bounds);
+            display_list.rectangles.push(RectPrimitive {
+                x: label_left,
+                y: label_y - 6.5,
+                width: label_width,
+                height: 13.0,
+                color: Rgba::new(1.0, 1.0, 1.0, 0.88),
+                object_id: 0,
+                shape: RectShape::Rectangle,
+            });
             display_list.texts.push(TextPrimitive {
                 x: (left + right) * 0.5,
-                y: (arc_top - 5.5).max(options.junction_top + 5.5),
-                text: junction_count_label(summary, junction, options.junction_count_mode),
+                y: label_y,
+                text: label,
                 font_size: 10.0,
                 color: Rgba::new(0.10, 0.10, 0.12, 0.94),
             });
@@ -271,12 +345,15 @@ pub(crate) fn add_junctions(
     )
 }
 
-fn add_junction_direction_markers(
+#[allow(clippy::too_many_arguments)]
+fn add_junction_direction_marker(
     display_list: &mut DisplayList,
-    junction: &JunctionEvidence,
     left: f32,
     right: f32,
     arc_top: f32,
+    arc_height: f32,
+    arc_shape: RectShape,
+    direction_shape: RectShape,
     color: Rgba,
 ) {
     const MARKER_WIDTH: f32 = 5.0;
@@ -284,37 +361,42 @@ fn add_junction_direction_markers(
     if right - left < 12.0 {
         return;
     }
-    let shapes: &[RectShape] = match (
-        junction.positive_depth > 0,
-        junction.negative_depth > 0,
-        junction.unknown_depth > 0,
-    ) {
-        (true, false, false) => &[RectShape::ChevronRight],
-        (false, true, false) => &[RectShape::ChevronLeft],
-        (true, true, _) => &[RectShape::ChevronLeft, RectShape::ChevronRight],
-        _ => &[],
+    let fraction = if direction_shape == RectShape::ChevronLeft {
+        0.30
+    } else {
+        0.70
     };
-    let centre = (left + right) * 0.5;
-    for (index, shape) in shapes.iter().copied().enumerate() {
-        let offset: f32 = if shapes.len() == 2 {
-            if index == 0 { -6.0 } else { 6.0 }
-        } else if shape == RectShape::ChevronLeft {
-            -6.0
-        } else {
-            6.0
-        };
-        let centre_x =
-            (centre + offset).clamp(left + MARKER_WIDTH * 0.5, right - MARKER_WIDTH * 0.5);
-        display_list.rectangles.push(RectPrimitive {
-            x: centre_x - MARKER_WIDTH * 0.5,
-            y: arc_top - MARKER_HEIGHT * 0.5,
-            width: MARKER_WIDTH,
-            height: MARKER_HEIGHT,
-            color,
-            object_id: 0,
-            shape,
-        });
+    let centre_x = left + (right - left) * fraction;
+    let stroke = junction_arc_stroke_width(arc_height);
+    let inner_height = (arc_height - stroke).max(0.0);
+    let parabola = 4.0 * (fraction - 0.5).powi(2);
+    let centre_y = if arc_shape == RectShape::JunctionArcUp {
+        arc_top + stroke * 0.5 + inner_height * parabola
+    } else {
+        arc_top + arc_height - stroke * 0.5 - inner_height * parabola
+    };
+    display_list.rectangles.push(RectPrimitive {
+        x: centre_x - MARKER_WIDTH * 0.5,
+        y: centre_y - MARKER_HEIGHT * 0.5,
+        width: MARKER_WIDTH,
+        height: MARKER_HEIGHT,
+        color,
+        object_id: 0,
+        shape: direction_shape,
+    });
+}
+
+fn junction_component_value(
+    summary: &JunctionSummary,
+    junction: &JunctionEvidence,
+    component_depth: u32,
+    mode: SashimiCountMode,
+) -> f64 {
+    if junction.depth == 0 {
+        return 0.0;
     }
+    junction_count_value(summary, junction, mode) * f64::from(component_depth)
+        / f64::from(junction.depth)
 }
 
 /// Returns a junction count in the declared Sashimi units. If whole-file index metadata is not
@@ -383,19 +465,6 @@ pub(crate) fn expanded_junction_rows(visible: &[(usize, &JunctionEvidence)]) -> 
             }
         })
         .collect()
-}
-
-pub(crate) fn junction_color(junction: &JunctionEvidence) -> Rgba {
-    match (
-        junction.positive_depth > 0,
-        junction.negative_depth > 0,
-        junction.unknown_depth > 0,
-    ) {
-        (true, false, false) => Rgba::new(0.84, 0.30, 0.38, 0.88),
-        (false, true, false) => Rgba::new(0.25, 0.45, 0.82, 0.88),
-        (false, false, true) => Rgba::new(0.42, 0.45, 0.50, 0.82),
-        _ => Rgba::new(0.58, 0.34, 0.70, 0.88),
-    }
 }
 
 pub(crate) fn add_modification_frequency(
@@ -596,8 +665,12 @@ pub(crate) fn add_spans(
     let mut stats = ReadRenderStats::default();
     let mut insertions = BTreeMap::<(usize, i32), RegionalInsertion>::new();
     for index in 0..batch.len() {
-        let (x, width) = clipped_geometry(batch.starts[index], batch.ends[index], viewport);
-        if width <= 0.0 {
+        let blocks =
+            aligned_reference_blocks(batch.starts[index], batch.ends[index], batch.cigar(index));
+        if blocks.iter().all(|&(start, end)| {
+            let (_, width) = clipped_geometry(start, end, viewport);
+            width <= 0.0
+        }) {
             continue;
         }
         let Some(row) = rows.rows[index] else {
@@ -613,32 +686,48 @@ pub(crate) fn add_spans(
             0.78,
         );
         let object_id = u32::try_from(representative + 1).unwrap_or(u32::MAX);
-        let terminal_is_visible = if batch.flags[index].is_reverse() {
-            batch.starts[index] >= viewport.interval().start()
-                && batch.starts[index] < viewport.interval().end()
-        } else {
-            batch.ends[index] > viewport.interval().start()
-                && batch.ends[index] <= viewport.interval().end()
-        };
         let first_primitive = display_list.rectangles.len();
-        add_read_body(
+        let y = options.reads_top + row as f32 * options.row_height;
+        for &(start, end) in &blocks {
+            let (x, width) = clipped_geometry(start, end, viewport);
+            if width > 0.0 {
+                add_read_body(
+                    display_list,
+                    x,
+                    y,
+                    width.max(1.0),
+                    options.read_height,
+                    read_fill,
+                    object_id,
+                );
+            }
+        }
+        for pair in blocks.windows(2) {
+            let (x, width) = clipped_geometry(pair[0].1, pair[1].0, viewport);
+            if width > 0.0 {
+                display_list.rectangles.push(RectPrimitive {
+                    x,
+                    y: y + options.read_height * 0.48,
+                    width: width.max(1.0),
+                    height: 1.0,
+                    color: Rgba::new(0.26, 0.36, 0.52, 0.92),
+                    object_id: read_detail_object_id(object_id),
+                    shape: RectShape::Rectangle,
+                });
+            }
+        }
+        add_read_direction_terminals(
             display_list,
-            x,
-            options.reads_top + row as f32 * options.row_height,
-            width.max(1.0),
+            first_primitive,
+            viewport,
+            batch.starts[index],
+            batch.ends[index],
+            batch.cigar(index),
+            batch.flags[index].is_reverse(),
+            y,
             options.read_height,
-            read_fill,
             object_id,
         );
-        if terminal_is_visible
-            && let Some(primitive) = display_list.rectangles.get_mut(first_primitive)
-        {
-            primitive.shape = if batch.flags[index].is_reverse() {
-                RectShape::DirectionalTerminalLeft
-            } else {
-                RectShape::DirectionalTerminalRight
-            };
-        }
         if options
             .selected_chain_read_name_hash
             .is_some_and(|selected| {
@@ -652,7 +741,7 @@ pub(crate) fn add_spans(
                 batch.starts[index],
                 batch.ends[index],
                 viewport,
-                options.reads_top + row as f32 * options.row_height,
+                y,
                 options.read_height,
             );
         }

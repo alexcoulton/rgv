@@ -123,7 +123,7 @@ pub(crate) fn verify_mixed_snapshot_exact(snapshot: &rgv_engine::TrackSnapshot) 
         "Broad peaks" => Some(("broad-region", 10_800, 11_400)),
         "PSL target alignments" => Some(("query-demo", 9_800, 9_890)),
         "Generic BigBed" => Some(("indexed-feature", 8_700, 9_000)),
-        "Indexed transcripts" => Some(("DEMO-BIG", 9_000, 10_200)),
+        "Indexed transcripts" => Some(("DEMO-BIG-alt", 9_000, 10_200)),
         "Indexed peaks" => Some(("indexed-peak", 10_600, 11_100)),
         "Plain BED annotations" => Some(("EXPECTED_SEARCH_FEATURE", 8_500, 9_200)),
         "Plain GFF3 gene models" => Some(("Expected gene", 14_500, 17_500)),

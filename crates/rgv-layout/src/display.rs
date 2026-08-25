@@ -42,6 +42,10 @@ pub enum RectShape {
     ChevronRight = 4,
     BreakendJoinBefore = 5,
     BreakendJoinAfter = 6,
+    /// A smooth splice-junction arc whose endpoints meet the bottom edge.
+    JunctionArcUp = 7,
+    /// A smooth splice-junction arc whose endpoints meet the top edge.
+    JunctionArcDown = 8,
 }
 
 impl RectShape {
@@ -53,9 +57,20 @@ impl RectShape {
             Self::DirectionalTerminalRight | Self::ChevronRight | Self::BreakendJoinAfter => {
                 Some(Direction::Right)
             }
-            Self::Rectangle => None,
+            Self::Rectangle | Self::JunctionArcUp | Self::JunctionArcDown => None,
         }
     }
+
+    pub const fn is_junction_arc(self) -> bool {
+        matches!(self, Self::JunctionArcUp | Self::JunctionArcDown)
+    }
+}
+
+/// Stroke width for a junction arc. Arc height already carries the support
+/// scale, so deriving the stroke from it keeps both visual channels in sync
+/// without expanding the dominant rectangle instance format.
+pub fn junction_arc_stroke_width(height: f32) -> f32 {
+    (1.0 + height.max(0.0) * 0.075).clamp(1.25, 4.5)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -237,6 +252,9 @@ impl DisplayList {
                 }
                 if clipped_bottom {
                     rectangle.height = bottom - rectangle.y;
+                }
+                if (clipped_top || clipped_bottom) && rectangle.shape.is_junction_arc() {
+                    return None;
                 }
                 if clipped_top || clipped_bottom {
                     rectangle.shape = RectShape::Rectangle;

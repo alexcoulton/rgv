@@ -1,6 +1,29 @@
 use super::super::*;
 
 #[test]
+fn coverage_alleles_are_collected_at_read_detail_with_exact_bounded_bins() {
+    let (bins, collect_alleles) = alignment_coverage_query_plan(1_060, 1_390.0, 0.763);
+    assert_eq!(bins, 1_060);
+    assert!(collect_alleles);
+
+    let (bins, collect_alleles) = alignment_coverage_query_plan(
+        MAXIMUM_COVERAGE_BINS + 1,
+        5_000.0,
+        MAXIMUM_ALLELE_COVERAGE_BASES_PER_PIXEL,
+    );
+    assert_eq!(bins, MAXIMUM_COVERAGE_BINS);
+    assert!(!collect_alleles);
+
+    let (bins, collect_alleles) = alignment_coverage_query_plan(1_930, 1_390.0, 1.39);
+    assert_eq!(bins, 1_930);
+    assert!(collect_alleles);
+
+    let (bins, collect_alleles) = alignment_coverage_query_plan(2_800, 1_390.0, 2.01);
+    assert_eq!(bins, 1_390);
+    assert!(!collect_alleles);
+}
+
+#[test]
 fn reference_aware_read_modes_request_context_before_base_detail() {
     assert!(alignment_query_needs_reference(
         AlignmentColorMode::Bisulfite(BisulfiteContext::Cg),
@@ -161,6 +184,7 @@ fn auxiliary_removal_clears_every_track_owned_panel_reference() {
         track_id: removed_id,
         index: 0,
         operation_index: None,
+        operation_offset: None,
     });
     panel.selected_track = Some(TrackFrameKey::Auxiliary(removed_id));
     panel.track_settled_generation = Some(panel.generation_clock.current().get());
@@ -293,6 +317,7 @@ fn alignment_removal_clears_deleted_identity_from_every_panel() {
     selected.selected_read_event = Some(ReadEventSelection {
         record_index: 3,
         operation_index: 1,
+        operation_offset: None,
     });
     selected.selected_pileup_position = Some(120);
     selected.selected_modification_position = Some(121);
@@ -681,6 +706,8 @@ fn session_panel_workspace_restores_order_active_locus_and_width() {
     ];
     session.panels[0].vertical_scroll_points = 73.0;
     session.panels[1].vertical_scroll_points = 145.0;
+    session.panels[0].annotation_scroll_points = 19.0;
+    session.panels[1].annotation_scroll_points = 81.0;
     session.panels[0].vertical_content_origin_points = 33.0;
     session.panels[1].vertical_content_origin_points = 105.0;
     session.active_panel = PanelId::new(4);
@@ -694,6 +721,8 @@ fn session_panel_workspace_restores_order_active_locus_and_width() {
     assert_eq!(workspace.active().id, PanelId::new(4));
     assert!((workspace.panels[0].vertical_scroll_points - 73.0).abs() < f32::EPSILON);
     assert!((workspace.panels[1].vertical_scroll_points - 145.0).abs() < f32::EPSILON);
+    assert!((workspace.panels[0].annotation_scroll_points - 19.0).abs() < f32::EPSILON);
+    assert!((workspace.panels[1].annotation_scroll_points - 81.0).abs() < f32::EPSILON);
     assert!((workspace.panels[0].vertical_content_origin_points - 33.0).abs() < f32::EPSILON);
     assert!((workspace.panels[1].vertical_content_origin_points - 105.0).abs() < f32::EPSILON);
     assert!((workspace.panels[1].effective_vertical_scroll_points() - 40.0).abs() < f32::EPSILON);

@@ -83,14 +83,14 @@ use rgv_engine::{
     TrackSpec, TrackSpecKind, WeightedLruCache,
 };
 use rgv_hts::{
-    AlignmentFilter, AlignmentOpenOptions, AlignmentQuery, AlignmentRecord, AuxPredicate, AuxValue,
-    CigarOpKind, FastaOpenOptions, HttpRangeConfig, ModificationCode, QUALITY_WEIGHT_SCALE,
-    QueryDetail, QueryOptions, QueryStats, ReferenceSlice, RemoteAuthentication, RemoteIoStats,
-    SequenceData, SupplementarySegment, TemplateLengthBounds, UltimaEventUnavailable,
-    UltimaIndelKind, UltimaQualitySource, UltimaTagOrientation,
-    analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse, decode_modified_bases,
-    decode_supplementary_chain, pair_evidence, smrt_kinetics_series, summarize_bisulfite_record,
-    summarize_sbx_record,
+    AlignedBaseClassification, AlignmentFilter, AlignmentOpenOptions, AlignmentQuery,
+    AlignmentRecord, AuxPredicate, AuxValue, CigarOpKind, FastaOpenOptions, HttpRangeConfig,
+    ModificationCode, QUALITY_WEIGHT_SCALE, QueryDetail, QueryOptions, QueryStats, ReferenceSlice,
+    RemoteAuthentication, RemoteIoStats, SequenceData, SupplementarySegment, TemplateLengthBounds,
+    UltimaEventUnavailable, UltimaIndelKind, UltimaQualitySource, UltimaTagOrientation,
+    analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse, classify_aligned_base,
+    decode_modified_bases, decode_supplementary_chain, pair_evidence, smrt_kinetics_series,
+    summarize_bisulfite_record, summarize_sbx_record,
 };
 use rgv_layout::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentLayout, AlignmentLayoutOptions,
@@ -98,13 +98,11 @@ use rgv_layout::{
     COPY_NUMBER_HEADER_HEIGHT, DisplayList, JunctionAnnotationLookup, JunctionAnnotationStatus,
     MAX_HIDDEN_MODIFICATION_CODES, MINIMUM_BASE_GLYPH_PIXEL_WIDTH, MUTATION_HEADER_HEIGHT,
     QuantitativeRange, RectPrimitive, Rgba, TrackLayoutOptions, alignment_read_name_hash,
-    assign_alignment_rows, compose_quantitative_records, copy_number_sample_order,
-    copy_number_track_height, gwas_point_y, junction_count_value,
-    layout_alignment_query_with_rows_and_annotations, layout_copy_number, layout_features,
-    layout_gwas, layout_interactions, layout_mutations, layout_quantitative,
+    assign_alignment_rows, compose_quantitative_records, copy_number_sample_order, gwas_point_y,
+    junction_count_value, layout_alignment_query_with_rows_and_annotations, layout_copy_number,
+    layout_features, layout_gwas, layout_interactions, layout_mutations, layout_quantitative,
     layout_reference_slice_oriented, layout_reference_translation, layout_sashimi, layout_variants,
-    modification_code_color, mutation_track_height, quantitative_data_range, record_object_id,
-    ultima_quality_color,
+    modification_code_color, quantitative_data_range, record_object_id, ultima_quality_color,
 };
 use rgv_render::{PrepareStats, RectangleRenderer, export_png};
 use runtime::*;
@@ -408,6 +406,7 @@ enum HoverInspectorTarget {
         track_id: TrackId,
         index: usize,
         operation_index: Option<usize>,
+        operation_offset: Option<u32>,
     },
 }
 
@@ -690,6 +689,10 @@ struct Viewer {
     cache_budgets: CacheBudgets,
     locus_editor: String,
     resizing_track: Option<(TrackId, f32)>,
+    resizing_annotation_track: Option<(TrackFrameKey, f32)>,
+    resizing_read_track: Option<(TrackId, f32)>,
+    reference_annotation_height: Option<f32>,
+    resizing_read_pane: Option<f32>,
     horizontal_overview_drag: Option<HorizontalOverviewDrag>,
     vertical_overview_drag: Option<VerticalOverviewDrag>,
     overview_capture: Option<OverviewCapture>,

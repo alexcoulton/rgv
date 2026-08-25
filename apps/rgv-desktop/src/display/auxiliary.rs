@@ -39,10 +39,11 @@ pub(crate) fn quantitative_overlay_subtracks(
     let available_rows =
         (((height - 22.0).max(0.0) / 14.0).floor() as usize).clamp(1, MAX_OVERLAY_GUTTER_MEMBERS);
     let truncated = members.len() > available_rows;
-    let member_rows = if truncated {
+    let show_omitted_summary = truncated && available_rows > 1;
+    let member_rows = if show_omitted_summary {
         available_rows.saturating_sub(1)
     } else {
-        members.len()
+        members.len().min(available_rows)
     };
     let mut subtracks = members
         .iter()
@@ -56,10 +57,11 @@ pub(crate) fn quantitative_overlay_subtracks(
                 .map(|group| format!("overlay {group}")),
             top: top + 22.0 + index as f32 * 14.0,
             bottom: top + 36.0 + index as f32 * 14.0,
-            collapsed: false,
+            collapsed: member.collapsed,
+            composite_member: Some(member.id),
         })
         .collect::<Vec<_>>();
-    if truncated {
+    if show_omitted_summary {
         let omitted = members.len().saturating_sub(member_rows);
         let index = subtracks.len();
         subtracks.push(TrackSubtrack {
@@ -68,6 +70,7 @@ pub(crate) fn quantitative_overlay_subtracks(
             top: top + 22.0 + index as f32 * 14.0,
             bottom: top + 36.0 + index as f32 * 14.0,
             collapsed: false,
+            composite_member: None,
         });
     }
     subtracks

@@ -160,6 +160,8 @@ pub(crate) fn alignment_edit_fields(record: &AlignmentRecord) -> Vec<(String, St
 pub(crate) fn read_event_details(
     record: &AlignmentRecord,
     operation_index: usize,
+    operation_offset: Option<u32>,
+    reference: Option<&ReferenceSlice>,
     contig_name: &str,
 ) -> Option<ReadEventDetails> {
     let operation = *record.cigar.get(operation_index)?;
@@ -179,6 +181,127 @@ pub(crate) fn read_event_details(
             }
             CigarOpKind::HardClip | CigarOpKind::Padding => {}
         }
+    }
+
+    if let Some(operation_offset) = operation_offset {
+        if !matches!(
+            operation.kind,
+            CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch
+        ) || operation_offset >= operation.len
+        {
+            return None;
+        }
+        let genomic_position = reference_position.saturating_add(u64::from(operation_offset));
+        let aligned_read_position = read_position.saturating_add(operation_offset as usize);
+        let (observed, quality) = match &record.sequence {
+            SequenceData::Present { bases, qualities } => (
+                bases.get(aligned_read_position).copied(),
+                qualities
+                    .as_deref()
+                    .and_then(|values| values.get(aligned_read_position))
+                    .copied(),
+            ),
+            SequenceData::NotLoaded | SequenceData::Missing => (None, None),
+        };
+        let reference_base = reference.and_then(|slice| slice.base_at(genomic_position));
+        let classification = classify_aligned_base(operation.kind, observed, reference_base);
+        if matches!(
+            classification,
+            AlignedBaseClassification::Match | AlignedBaseClassification::Unknown
+        ) {
+            return None;
+        }
+        let base_label = |base: Option<u8>| {
+            base.map_or_else(
+                || "unavailable".to_owned(),
+                |base| char::from(base.to_ascii_uppercase()).to_string(),
+            )
+        };
+        let mut fields = vec![
+            (
+                "Selected event".to_owned(),
+                if classification == AlignedBaseClassification::EncodingConflict {
+                    "Alignment encoding conflict".to_owned()
+                } else {
+                    "Base substitution".to_owned()
+                },
+            ),
+            ("Event length".to_owned(), "1 bp".to_owned()),
+            (
+                "Event locus".to_owned(),
+                format!("{contig_name}:{}", genomic_position.saturating_add(1)),
+            ),
+            (
+                "Aligned read position".to_owned(),
+                aligned_read_position.saturating_add(1).to_string(),
+            ),
+            ("Reference base".to_owned(), base_label(reference_base)),
+            ("Observed base".to_owned(), base_label(observed)),
+            (
+                "Base quality".to_owned(),
+                quality.map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
+            ),
+        ];
+        if classification == AlignedBaseClassification::EncodingConflict {
+            let cigar_assertion = match operation.kind {
+                CigarOpKind::SequenceMismatch => "X (mismatch)",
+                CigarOpKind::SequenceMatch => "= (match)",
+                _ => unreachable!("only explicit CIGAR assertions can conflict"),
+            };
+            let comparison = match observed.zip(reference_base) {
+                Some((observed, reference)) if observed.eq_ignore_ascii_case(&reference) => {
+                    format!(
+                        "bases agree ({} = {})",
+                        base_label(observed.into()),
+                        base_label(reference.into())
+                    )
+                }
+                Some((observed, reference)) => format!(
+                    "bases differ ({} ≠ {})",
+                    base_label(observed.into()),
+                    base_label(reference.into())
+                ),
+                None => "unavailable".to_owned(),
+            };
+            fields.extend([
+                ("CIGAR assertion".to_owned(), cigar_assertion.to_owned()),
+                ("Observed comparison".to_owned(), comparison),
+                (
+                    "Validation".to_owned(),
+                    match operation.kind {
+                        CigarOpKind::SequenceMismatch => {
+                            "CIGAR X asserts a mismatch, but the loaded read and reference bases agree"
+                        }
+                        CigarOpKind::SequenceMatch => {
+                            "CIGAR = asserts a match, but the loaded read and reference bases differ"
+                        }
+                        _ => unreachable!(),
+                    }
+                    .to_owned(),
+                ),
+            ]);
+        } else {
+            fields.push((
+                "Substitution evidence".to_owned(),
+                match classification {
+                    AlignedBaseClassification::DeclaredSubstitution => {
+                        "explicit CIGAR X (unvalidated: a base is unavailable)"
+                    }
+                    AlignedBaseClassification::Substitution
+                        if operation.kind == CigarOpKind::SequenceMismatch =>
+                    {
+                        "explicit CIGAR X, confirmed by read/reference comparison"
+                    }
+                    AlignedBaseClassification::Substitution => "read/reference comparison",
+                    _ => unreachable!(),
+                }
+                .to_owned(),
+            ));
+        }
+        return Some(ReadEventDetails {
+            fields,
+            copy_sequence: observed.map(|base| char::from(base).to_string()),
+        });
     }
 
     let kind = match operation.kind {
