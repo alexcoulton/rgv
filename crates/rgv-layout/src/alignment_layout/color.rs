@@ -135,6 +135,7 @@ pub(crate) fn add_read_body(
         height,
         color: Rgba::new(0.60, 0.62, 0.65, 0.92),
         object_id,
+        shape: Default::default(),
     });
     let inset = 0.8;
     if width > inset * 2.0 && height > inset * 2.0 {
@@ -145,6 +146,7 @@ pub(crate) fn add_read_body(
             height: height - inset * 2.0,
             color: fill,
             object_id,
+            shape: Default::default(),
         });
     }
 }
@@ -173,6 +175,7 @@ pub(crate) fn add_event_label(
         height: 12.0,
         color: Rgba::new(1.0, 1.0, 1.0, 0.96),
         object_id: 0,
+        shape: Default::default(),
     });
     display_list.texts.push(TextPrimitive {
         x: center_x,
@@ -201,6 +204,7 @@ pub(crate) fn add_marker(
             height: height + 2.0,
             color,
             object_id: read_detail_object_id(object_id),
+            shape: Default::default(),
         });
     }
 }
@@ -234,6 +238,7 @@ pub(crate) fn add_ultima_insertion_quality_mark(
         height: stroke,
         color: ultima_quality_color(quality),
         object_id: read_detail_object_id(object_id),
+        shape: Default::default(),
     });
 }
 
@@ -256,6 +261,7 @@ pub(crate) fn add_ultima_deletion_quality_mark(
         height,
         color: ultima_quality_color(quality),
         object_id: read_detail_object_id(object_id),
+        shape: Default::default(),
     });
 }
 

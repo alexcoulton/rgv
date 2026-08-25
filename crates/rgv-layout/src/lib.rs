@@ -19,8 +19,8 @@ pub use alignment_layout::{
     layout_sashimi, modification_code_color, ultima_quality_color,
 };
 pub use display::{
-    DisplayList, READ_DETAIL_OBJECT_BIT, RectPrimitive, Rgba, TextPrimitive, read_detail_object_id,
-    record_object_id,
+    Direction, DisplayList, READ_DETAIL_OBJECT_BIT, RectPrimitive, RectShape, Rgba, TextPrimitive,
+    breakend_bracket_dimensions, read_arrow_head_width, read_detail_object_id, record_object_id,
 };
 pub use genome_context::{
     CoordinateRulerLayout, CoordinateRulerOptions, IdeogramLayout, IdeogramSegment, RulerTick,

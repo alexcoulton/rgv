@@ -306,7 +306,9 @@ fn decode_variant_header(header: &bcf::header::HeaderView) -> (VariantHeader, us
     let omitted_info = bound_variant_schemas(
         &mut info,
         MAX_VARIANT_INFO_FIELDS,
-        &["END", "SVTYPE", "SVLEN", "CIPOS", "CIEND", "AF", "AC", "AN"],
+        &[
+            "END", "SVTYPE", "SVLEN", "STRANDS", "CIPOS", "CIEND", "AF", "AC", "AN",
+        ],
     );
     let omitted_formats = bound_variant_schemas(
         &mut formats,
@@ -424,6 +426,7 @@ fn decode_variant_record(
             parse_breakend_partner(alternate_index, alternate)
         })
         .collect();
+    let breakpoint_orientations = parse_breakpoint_orientations(&info);
     let id = record.id();
     Ok((
         VariantRecord {
@@ -439,6 +442,7 @@ fn decode_variant_record(
             genotypes,
             variant_types,
             breakends,
+            breakpoint_orientations,
         },
         loaded,
         omitted,
@@ -963,6 +967,43 @@ fn integer_info_value(fields: &[VariantField], key: &str) -> Option<i32> {
                 VariantValue::Flag(_) | VariantValue::Floats(_) | VariantValue::Strings(_) => None,
             })
     })
+}
+
+pub(super) fn parse_breakpoint_orientations(fields: &[VariantField]) -> Vec<BreakpointOrientation> {
+    const MAX_ORIENTATIONS: usize = 16;
+    let Some(VariantValue::Strings(values)) = fields
+        .iter()
+        .find(|field| field.key == "STRANDS")
+        .map(|field| &field.value)
+    else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|value| {
+            let (orientation, support) = value
+                .split_once(':')
+                .map_or((value, None), |(orientation, support)| {
+                    (orientation, support.parse::<u32>().ok())
+                });
+            let mut characters = orientation.chars();
+            let local = characters.next()?;
+            let partner = characters.next()?;
+            if characters.next().is_some()
+                || !matches!(local, '+' | '-')
+                || !matches!(partner, '+' | '-')
+            {
+                return None;
+            }
+            Some(BreakpointOrientation {
+                local_join_after_position: local == '+',
+                partner_join_after_position: partner == '+',
+                support,
+            })
+        })
+        .take(MAX_ORIENTATIONS)
+        .collect()
 }
 
 pub(super) fn classify_variant(reference: &[u8], alternate: &[u8]) -> VariantType {

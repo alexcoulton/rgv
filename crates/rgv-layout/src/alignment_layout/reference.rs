@@ -71,6 +71,7 @@ pub fn layout_reference_translation(
                 Rgba::new(0.96, 0.97, 0.98, 1.0)
             },
             object_id: 0,
+            shape: Default::default(),
         });
         if width >= 12.0 {
             display.texts.push(TextPrimitive {

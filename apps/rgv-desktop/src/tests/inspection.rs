@@ -347,7 +347,18 @@ fn variant_alignment_summary_is_observational_and_allele_specific_when_exact() {
         info: Vec::new(),
         genotypes: Vec::new(),
         variant_types: vec![rgv_hts::VariantType::Snv],
-        breakends: Vec::new(),
+        breakends: vec![rgv_hts::BreakendPartner {
+            alternate_index: 0,
+            contig: "chr2".to_owned(),
+            position: 300,
+            local_join_after_position: true,
+            partner_join_after_position: false,
+        }],
+        breakpoint_orientations: vec![rgv_hts::BreakpointOrientation {
+            local_join_after_position: false,
+            partner_join_after_position: true,
+            support: Some(8),
+        }],
     };
     let bin = rgv_hts::PileupBin {
         alleles: rgv_hts::AlleleSupport {
@@ -386,7 +397,12 @@ fn variant_alignment_summary_is_observational_and_allele_specific_when_exact() {
     let variant_tsv = variant_genotype_export_tsv(&inspector);
     assert!(variant_tsv.contains("# RGV selected variant and genotype export v1"));
     assert!(variant_tsv.contains("calls cohort"));
+    assert!(variant_tsv.contains("breakend\t1\tafter\tchr2\t301\tbefore"));
+    assert!(variant_tsv.contains("breakpoint_orientation\t1\tbefore\tafter\t8"));
     assert!(variant_tsv.len() <= MAX_VARIANT_EXPORT_BYTES);
+    let details = variant_details_text(&variant_inspector_fields(&inspector, &record), &record);
+    assert!(details.contains("local join after -> chr2:301 partner join before"));
+    assert!(details.contains("local join before -> partner join after · support 8"));
     let evidence = VariantAlignmentEvidence {
         track_id: TrackId::new(1),
         track_name: "reads".to_owned(),

@@ -23,6 +23,7 @@ pub(crate) fn add_chain_highlight(
             height: stroke,
             color,
             object_id: 0,
+            shape: Default::default(),
         },
         RectPrimitive {
             x,
@@ -31,6 +32,7 @@ pub(crate) fn add_chain_highlight(
             height: stroke,
             color,
             object_id: 0,
+            shape: Default::default(),
         },
         RectPrimitive {
             x: x - stroke,
@@ -39,6 +41,7 @@ pub(crate) fn add_chain_highlight(
             height: height + stroke * 2.0,
             color,
             object_id: 0,
+            shape: Default::default(),
         },
         RectPrimitive {
             x: x + width,
@@ -47,6 +50,7 @@ pub(crate) fn add_chain_highlight(
             height: height + stroke * 2.0,
             color,
             object_id: 0,
+            shape: Default::default(),
         },
     ] {
         display_list.rectangles.push(rectangle);
@@ -225,6 +229,7 @@ pub(crate) fn add_cigar(
                             Rgba::new(0.12, 0.12, 0.14, 0.96)
                         },
                         object_id: read_detail_object_id(object_id),
+                        shape: Default::default(),
                     });
                     if width >= 18.0 && operation.len >= options.minimum_event_label_size {
                         let label = if operation.kind == CigarOpKind::ReferenceSkip {
@@ -428,6 +433,7 @@ pub(crate) fn add_mate_connector(
         height: 1.0,
         color: Rgba::new(0.58, 0.64, 0.74, 0.62),
         object_id,
+        shape: Default::default(),
     });
 }
 
@@ -524,6 +530,7 @@ pub(crate) fn add_modified_base_calls(
             height: (height * 0.22).clamp(2.0, 4.0),
             color,
             object_id: read_detail_object_id(object_id),
+            shape: Default::default(),
         });
         *budget -= 1;
     }
@@ -620,6 +627,7 @@ pub(crate) fn add_unmodified_base_calls(
                 height: (height * 0.22).clamp(2.0, 4.0),
                 color: Rgba::new(0.14, 0.44, 0.82, 0.72),
                 object_id: read_detail_object_id(object_id),
+                shape: Default::default(),
             });
             *budget -= 1;
         }
@@ -744,6 +752,7 @@ pub(crate) fn add_reference_bases(
             height: 20.0,
             color: with_alpha(base_color(base), 0.32),
             object_id: 0,
+            shape: Default::default(),
         });
         if width >= MINIMUM_BASE_GLYPH_PIXEL_WIDTH {
             add_base_glyph(

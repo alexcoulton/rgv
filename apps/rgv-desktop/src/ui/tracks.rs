@@ -912,6 +912,23 @@ pub fn paint_track_viewport_chrome(
             if subtrack_bottom <= subtrack_top {
                 continue;
             }
+            if frame.key == TrackFrameKey::Reference
+                && let Some((accessible_name, tooltip)) =
+                    reference_orientation_accessibility(&subtrack.label)
+            {
+                let orientation = ui.interact(
+                    Rect::from_min_max(
+                        pos2(label_rect.left(), subtrack_top),
+                        pos2(label_rect.right(), subtrack_bottom),
+                    ),
+                    egui::Id::new("reference-sequence-orientation"),
+                    Sense::hover(),
+                );
+                orientation.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Label, true, accessible_name)
+                });
+                orientation.on_hover_text(tooltip);
+            }
             let y = (subtrack_top + 9.0).min(subtrack_bottom - 2.0);
             let alignment_subtrack = match frame.key {
                 TrackFrameKey::Alignment(_) => AlignmentSubtrack::from_label(&subtrack.label),
@@ -1128,6 +1145,22 @@ fn frame_screen_bounds(frame: &TrackFrame, vertical_scroll: f32) -> (f32, f32) {
     )
 }
 
+fn reference_orientation_accessibility(label: &str) -> Option<(&'static str, &'static str)> {
+    if label.starts_with('>') {
+        Some((
+            "Reference sequence, forward genomic direction",
+            "Reference sequence is displayed in the forward genomic direction",
+        ))
+    } else if label.starts_with('<') {
+        Some((
+            "Reference sequence, reverse-complement direction",
+            "Reference sequence is displayed as the reverse complement",
+        ))
+    } else {
+        None
+    }
+}
+
 fn subtrack_screen_bounds(
     frame: &TrackFrame,
     subtrack: &TrackSubtrack,
@@ -1171,6 +1204,25 @@ pub fn paint_genomic_text(ui: &Ui, clip_rect: Rect, texts: &[TextPrimitive]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_orientation_indicator_has_accessible_names_and_tooltips() {
+        assert_eq!(
+            reference_orientation_accessibility("> Bases · forward"),
+            Some((
+                "Reference sequence, forward genomic direction",
+                "Reference sequence is displayed in the forward genomic direction"
+            ))
+        );
+        assert_eq!(
+            reference_orientation_accessibility("< Bases · reverse strand"),
+            Some((
+                "Reference sequence, reverse-complement direction",
+                "Reference sequence is displayed as the reverse complement"
+            ))
+        );
+        assert_eq!(reference_orientation_accessibility("Bases"), None);
+    }
 
     #[test]
     fn alignment_subtrack_labels_round_trip_to_gutter_actions() {
@@ -1275,6 +1327,7 @@ mod tests {
                     height: 3.0,
                     color: rgv_layout::Rgba::new(0.2, 0.4, 0.8, 1.0),
                     object_id: index,
+                    shape: Default::default(),
                 })
                 .collect(),
             texts: Vec::new(),
@@ -1315,6 +1368,7 @@ mod tests {
                 height: 10.0,
                 color: rgv_layout::Rgba::new(0.2, 0.4, 0.8, 1.0),
                 object_id: 1,
+                shape: Default::default(),
             }],
             texts: Vec::new(),
         };

@@ -133,6 +133,8 @@ pub struct VariantRecord {
     pub genotypes: Vec<VariantGenotype>,
     pub variant_types: Vec<VariantType>,
     pub breakends: Vec<BreakendPartner>,
+    /// Breakpoint join orientations declared by symbolic-SV `STRANDS` INFO values.
+    pub breakpoint_orientations: Vec<BreakpointOrientation>,
 }
 
 pub const MAX_VARIANT_ID_INDEX_RECORDS: usize = 2_000_000;
@@ -239,6 +241,13 @@ pub struct BreakendPartner {
     pub position: u64,
     pub local_join_after_position: bool,
     pub partner_join_after_position: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BreakpointOrientation {
+    pub local_join_after_position: bool,
+    pub partner_join_after_position: bool,
+    pub support: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -688,7 +697,10 @@ pub use interactions::*;
 mod variants;
 pub use variants::*;
 #[cfg(test)]
-use variants::{classify_variant, parse_breakend_partner, selected_sample_indices};
+use variants::{
+    classify_variant, parse_breakend_partner, parse_breakpoint_orientations,
+    selected_sample_indices,
+};
 
 mod bbi;
 pub use bbi::*;

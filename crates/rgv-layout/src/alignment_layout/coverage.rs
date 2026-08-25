@@ -50,6 +50,7 @@ pub(crate) fn add_coverage(
             height,
             color: Rgba::new(0.48, 0.48, 0.48, 0.90),
             object_id: 0,
+            shape: Default::default(),
         });
         if bin_interval.len() == 1
             && let Some(reference_base) =
@@ -84,6 +85,7 @@ pub(crate) fn add_coverage_navigation_markers(
             height: options.coverage_height,
             color: Rgba::new(0.18, 0.18, 0.18, 0.24),
             object_id: 0,
+            shape: Default::default(),
         });
     }
     if let Some(position) = options
@@ -99,6 +101,7 @@ pub(crate) fn add_coverage_navigation_markers(
             height: options.coverage_height,
             color: Rgba::new(0.08, 0.08, 0.08, 0.32),
             object_id: 0,
+            shape: Default::default(),
         });
     }
 }
@@ -205,6 +208,7 @@ pub(crate) fn add_junctions(
                 height: arc_height,
                 color,
                 object_id: 0,
+                shape: Default::default(),
             },
             RectPrimitive {
                 x: left,
@@ -213,6 +217,7 @@ pub(crate) fn add_junctions(
                 height: thickness,
                 color,
                 object_id: 0,
+                shape: Default::default(),
             },
             RectPrimitive {
                 x: (right - thickness).max(left),
@@ -221,10 +226,12 @@ pub(crate) fn add_junctions(
                 height: arc_height,
                 color,
                 object_id: 0,
+                shape: Default::default(),
             },
         ] {
             display_list.rectangles.push(rectangle);
         }
+        add_junction_direction_markers(display_list, junction, left, right, arc_top, color);
         if let Some(annotations) = annotations {
             let status = annotations.status(junction.start, junction.end);
             let marker_color = match status {
@@ -239,6 +246,7 @@ pub(crate) fn add_junctions(
                 height: 5.0,
                 color: marker_color,
                 object_id: 0,
+                shape: Default::default(),
             });
         }
         if options.show_junction_labels
@@ -261,6 +269,52 @@ pub(crate) fn add_junctions(
         automatic_maximum,
         normalization_available,
     )
+}
+
+fn add_junction_direction_markers(
+    display_list: &mut DisplayList,
+    junction: &JunctionEvidence,
+    left: f32,
+    right: f32,
+    arc_top: f32,
+    color: Rgba,
+) {
+    const MARKER_WIDTH: f32 = 5.0;
+    const MARKER_HEIGHT: f32 = 5.0;
+    if right - left < 12.0 {
+        return;
+    }
+    let shapes: &[RectShape] = match (
+        junction.positive_depth > 0,
+        junction.negative_depth > 0,
+        junction.unknown_depth > 0,
+    ) {
+        (true, false, false) => &[RectShape::ChevronRight],
+        (false, true, false) => &[RectShape::ChevronLeft],
+        (true, true, _) => &[RectShape::ChevronLeft, RectShape::ChevronRight],
+        _ => &[],
+    };
+    let centre = (left + right) * 0.5;
+    for (index, shape) in shapes.iter().copied().enumerate() {
+        let offset: f32 = if shapes.len() == 2 {
+            if index == 0 { -6.0 } else { 6.0 }
+        } else if shape == RectShape::ChevronLeft {
+            -6.0
+        } else {
+            6.0
+        };
+        let centre_x =
+            (centre + offset).clamp(left + MARKER_WIDTH * 0.5, right - MARKER_WIDTH * 0.5);
+        display_list.rectangles.push(RectPrimitive {
+            x: centre_x - MARKER_WIDTH * 0.5,
+            y: arc_top - MARKER_HEIGHT * 0.5,
+            width: MARKER_WIDTH,
+            height: MARKER_HEIGHT,
+            color,
+            object_id: 0,
+            shape,
+        });
+    }
 }
 
 /// Returns a junction count in the declared Sashimi units. If whole-file index metadata is not
@@ -393,6 +447,7 @@ pub(crate) fn add_modification_frequency(
                 height: options.modification_height,
                 color: Rgba::new(0.14, 0.44, 0.82, 0.20),
                 object_id: 0,
+                shape: Default::default(),
             });
         }
         let color = match options.modified_base_color_mode {
@@ -409,6 +464,7 @@ pub(crate) fn add_modification_frequency(
             height,
             color,
             object_id: 0,
+            shape: Default::default(),
         });
     }
     if let Some(position) = options
@@ -422,6 +478,7 @@ pub(crate) fn add_modification_frequency(
             height: options.modification_height,
             color: Rgba::new(0.08, 0.08, 0.08, 0.34),
             object_id: 0,
+            shape: Default::default(),
         });
     }
 }
@@ -493,6 +550,7 @@ pub(crate) fn add_allele_coverage(
             height: height.max(1.0).min(total_height),
             color: base_color(base),
             object_id: 0,
+            shape: Default::default(),
         });
     }
 }
@@ -554,6 +612,15 @@ pub(crate) fn add_spans(
             options.pair_length_bounds,
             0.78,
         );
+        let object_id = u32::try_from(representative + 1).unwrap_or(u32::MAX);
+        let terminal_is_visible = if batch.flags[index].is_reverse() {
+            batch.starts[index] >= viewport.interval().start()
+                && batch.starts[index] < viewport.interval().end()
+        } else {
+            batch.ends[index] > viewport.interval().start()
+                && batch.ends[index] <= viewport.interval().end()
+        };
+        let first_primitive = display_list.rectangles.len();
         add_read_body(
             display_list,
             x,
@@ -561,8 +628,17 @@ pub(crate) fn add_spans(
             width.max(1.0),
             options.read_height,
             read_fill,
-            u32::try_from(representative + 1).unwrap_or(u32::MAX),
+            object_id,
         );
+        if terminal_is_visible
+            && let Some(primitive) = display_list.rectangles.get_mut(first_primitive)
+        {
+            primitive.shape = if batch.flags[index].is_reverse() {
+                RectShape::DirectionalTerminalLeft
+            } else {
+                RectShape::DirectionalTerminalRight
+            };
+        }
         if options
             .selected_chain_read_name_hash
             .is_some_and(|selected| {
@@ -647,6 +723,7 @@ pub(crate) fn add_spans(
             height: options.read_height + 2.0,
             color,
             object_id,
+            shape: Default::default(),
         });
         if labelled {
             display_list.rectangles.push(RectPrimitive {
@@ -656,6 +733,7 @@ pub(crate) fn add_spans(
                 height: 1.5,
                 color,
                 object_id,
+                shape: Default::default(),
             });
         }
         if labelled && options.row_height >= 5.0 {

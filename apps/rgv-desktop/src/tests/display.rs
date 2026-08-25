@@ -1,6 +1,12 @@
 use super::super::*;
 
 #[test]
+fn reference_gutter_labels_include_a_colour_independent_orientation_indicator() {
+    assert_eq!(reference_bases_label(false), "> Bases · forward");
+    assert_eq!(reference_bases_label(true), "< Bases · reverse strand");
+}
+
+#[test]
 fn shifted_macos_wheel_uses_horizontal_fallback_for_vertical_scroll() {
     let horizontal_line = wheel_primary_axis(MouseScrollDelta::LineDelta(2.0, 0.0));
     let horizontal_pixel = wheel_primary_axis(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
@@ -107,6 +113,7 @@ fn alignment_layer_partition_keeps_the_header_out_of_the_read_scroll() {
         height: 5.0,
         color: rgv_layout::Rgba::new(0.5, 0.5, 0.5, 1.0),
         object_id,
+        shape: Default::default(),
     };
     let text = |y, value: &str| rgv_layout::TextPrimitive {
         x: 5.0,
@@ -321,6 +328,7 @@ fn alignment_picking_routes_by_stable_track_frame_before_record_id() {
             height: 10.0,
             color: rgv_layout::Rgba::new(0.5, 0.5, 0.5, 1.0),
             object_id: 8,
+            shape: Default::default(),
         }],
         texts: Vec::new(),
     };

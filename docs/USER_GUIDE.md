@@ -92,7 +92,9 @@ Open the reference track settings to display the reverse strand and enable any c
 three forward and three reverse translation frames. Translation uses absolute genomic phase and an
 explicit **Standard** or **Vertebrate mitochondrial** genetic code. Ambiguous codons render as
 `X`; stop codons render as `*`. These choices and the strand-aware visible-reference copy action are
-persisted in sessions.
+persisted in sessions. The reference gutter begins with `>` for the forward display or `<` for the
+reverse-complement display and retains the corresponding text label, so orientation is not conveyed
+by colour alone.
 
 ### Regions of interest and review queues
 
@@ -223,6 +225,10 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   also available. Group and sort order can be reversed independently; **Re-pack** restores natural
   position packing without discarding the selected grouping. Colour, grouping, ordering, pair
   settings, and custom-tag state survive a JSON session round trip.
+- Every alignment body ends in a bounded directional cap derived from that record's SAM reverse
+  flag. This remains true for single-end, paired, long, spliced, secondary, and supplementary reads,
+  whether pair view is enabled or disabled and through Bases, Reads, and Regional detail. If the
+  biological terminal is outside the viewport, the clipped screen edge stays rectangular.
 - Alignment track settings can select an exact read/template name from the bounded records already
   loaded at the active locus. The read inspector's **Move selected to top** action then promotes
   every loaded record with that name ahead of the configured within-group sort while retaining its
@@ -355,7 +361,9 @@ alignment tracks. Counts can be raw reads or CPM. CPM uses the whole-file mapped
 in the BAM index. If that metadata is absent, RGV explicitly labels the raw fallback instead of
 presenting a regional count as library-size normalization. Arc labels are optional and bounded.
 
-Red arcs have positive-strand support, blue negative, grey unknown, and purple mixed. A small green
+Red arcs have positive-strand support, blue negative, grey unknown, and purple mixed. A right-facing
+chevron marks pure positive-strand evidence and a left-facing chevron marks pure negative-strand
+evidence; mixed evidence has both offset chevrons, while unknown evidence has neither. A small green
 marker means the endpoints match adjacent exons from one transcript in a visible GTF/GFF track;
 orange means novel relative to a complete loaded annotation interval; grey means annotation status
 cannot safely be decided. Click or hover an arc to inspect and copy its skipped interval, intron
@@ -444,14 +452,20 @@ Indexed VCF and BCF tracks retain typed REF/ALT, ID, QUAL, FILTER, header-descri
 fields, GT allele indices and phasing, sample names, symbolic alleles, `END`, and breakend partners.
 SNVs, MNVs, insertions, deletions, inversions, duplications, copy-number records, symbolic SVs,
 spanning deletions, and BNDs use stable type-specific colours rather than being inferred only from
-the first allele's string length.
+the first allele's string length. BND markers use a bracket with its vertical bar on the declared
+join-before or join-after side. A visible same-contig partner is connected and gets its own bracket;
+offscreen and cross-contig partners get bounded edge brackets and retain both join sides in the
+label and inspector. Symbolic SVs use parsed `STRANDS` orientation when supplied and remain
+geometrically neutral when it is absent.
 
 Click a variant marker or span to open the **Variant inspector**. It shows exact one-based locus,
 alleles, all ALT-specific types, quality and filters; INFO keys expose their VCF-header descriptions.
 Genotype rows can be filtered by sample name and are virtualized, so only the visible rows create UI
 widgets. Phased and unphased separators are preserved. A BND's **Open partner** action retains the
 origin panel and opens the partner coordinate in another panel when that contig belongs to the
-active genome. **Copy details** emits a bounded textual record and INFO summary.
+active genome. **Copy details** emits a bounded textual record, INFO summary, breakend join sides,
+and symbolic breakpoint orientations. The variant-and-genotype TSV exports those join sides and
+their optional `STRANDS` support explicitly.
 
 Open a variant track's **Track settings** to configure its persisted cohort view. RGV can restrict
 decoding to a searched sample subset, group inspector rows by genotype, and colour markers by the
@@ -518,7 +532,10 @@ bounded to the available gutter space, with an explicit omitted-member count for
 BEDPE and UCSC 18-column interact files render intra-chromosomal relationships as score-scaled arcs
 or endpoint blocks. Inter-chromosomal records use labelled partner markers. The inspector preserves
 endpoint names, strands, score, value, experiment, colour, and direction where the source provides
-them, and either endpoint can be opened through the common linked-panel navigation. A minimum score
+them. Directed interactions point at the semantic target even when it lies left of the source;
+undirected records have no source-to-target arrow, though declared endpoint strands remain visible.
+Cross-contig labels use `->` for a directed relationship and `<->` for a neutral join. Either endpoint
+can be opened through the common linked-panel navigation. A minimum score
 filter runs before the 100,000-record query cap; drawing and labels have smaller deterministic caps.
 
 ### Segmented copy number
@@ -575,7 +592,10 @@ and half-open. Exon counts and arrays must agree; exons must be sorted, non-over
 and contained by the transcript. Coding sequence is drawn as thick exon segments while UTRs and
 non-coding transcript exons remain thin. refFlat labels use the gene name while the inspector keeps
 the transcript accession; extended genePred also retains its alternate gene name, CDS completion
-status, exon frames, and score.
+status, exon frames, and score. Stranded transcript and blocked-feature connectors carry repeated
+screen-spaced chevrons, and their true terminal block has a compact directional cap. Unstranded
+records remain rectangular. The same geometry is used for GFF3, GTF, BED12, bigGenePred, blocked
+BigBed, and PSL target orientation; simple stranded intervals and peaks use one compact cue.
 
 ENCODE narrowPeak files are parsed as the specified BED6+4 format. The body uses the 0–1000 score
 for visual strength, and a dark vertical mark identifies the point-source summit when supplied.

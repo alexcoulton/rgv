@@ -724,10 +724,16 @@ pub(crate) fn show_properties(
                                     for partner in &record.breakends {
                                         ui.horizontal_wrapped(|ui| {
                                             ui.monospace(format!(
-                                                "ALT {} → {}:{}",
+                                                "ALT {}: local join {} -> {}:{} partner join {}",
                                                 partner.alternate_index + 1,
+                                                breakend_join_side(
+                                                    partner.local_join_after_position
+                                                ),
                                                 partner.contig,
-                                                partner.position + 1
+                                                partner.position + 1,
+                                                breakend_join_side(
+                                                    partner.partner_join_after_position
+                                                ),
                                             ));
                                             if ui
                                                 .add_enabled(
@@ -742,6 +748,32 @@ pub(crate) fn show_properties(
                                                 ));
                                             }
                                         });
+                                    }
+                                },
+                            );
+                        }
+                        if !record.breakpoint_orientations.is_empty() {
+                            ui.collapsing(
+                                format!(
+                                    "Breakpoint orientations ({})",
+                                    record.breakpoint_orientations.len()
+                                ),
+                                |ui| {
+                                    for orientation in &record.breakpoint_orientations {
+                                        ui.monospace(format!(
+                                            "local join {} -> partner join {}{}",
+                                            breakend_join_side(
+                                                orientation.local_join_after_position
+                                            ),
+                                            breakend_join_side(
+                                                orientation.partner_join_after_position
+                                            ),
+                                            orientation
+                                                .support
+                                                .map_or_else(String::new, |support| {
+                                                    format!(" · support {support}")
+                                                }),
+                                        ));
                                     }
                                 },
                             );

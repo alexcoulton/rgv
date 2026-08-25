@@ -51,6 +51,7 @@ pub(crate) fn add_bisulfite_marks(
             height,
             color: with_alpha(bisulfite_color(observation), alpha),
             object_id: read_detail_object_id(object_id),
+            shape: Default::default(),
         });
     }
 }
@@ -92,6 +93,7 @@ pub(crate) fn add_smrt_kinetics_marks(
             height,
             color: smrt_kinetics_color(value),
             object_id: read_detail_object_id(object_id),
+            shape: Default::default(),
         });
     }
 }
@@ -169,6 +171,7 @@ pub(crate) fn add_sbx_tail_marks(
                 height,
                 color: sbx_simplex_tail_color(),
                 object_id: read_detail_object_id(object_id),
+                shape: Default::default(),
             });
         }
     }
@@ -389,6 +392,7 @@ pub(crate) fn add_aligned_bases(
             height,
             color,
             object_id: read_detail_object_id(object_id),
+            shape: Default::default(),
         });
         if width >= MINIMUM_BASE_GLYPH_PIXEL_WIDTH {
             add_base_glyph(

@@ -27,6 +27,35 @@ pub struct RectPrimitive {
     pub height: f32,
     pub color: Rgba,
     pub object_id: u32,
+    /// Semantic geometry used consistently by interactive and export renderers.
+    pub shape: RectShape,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RectShape {
+    #[default]
+    Rectangle = 0,
+    DirectionalTerminalLeft = 1,
+    DirectionalTerminalRight = 2,
+    ChevronLeft = 3,
+    ChevronRight = 4,
+    BreakendJoinBefore = 5,
+    BreakendJoinAfter = 6,
+}
+
+impl RectShape {
+    pub const fn direction(self) -> Option<Direction> {
+        match self {
+            Self::DirectionalTerminalLeft | Self::ChevronLeft | Self::BreakendJoinBefore => {
+                Some(Direction::Left)
+            }
+            Self::DirectionalTerminalRight | Self::ChevronRight | Self::BreakendJoinAfter => {
+                Some(Direction::Right)
+            }
+            Self::Rectangle => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,8 +75,35 @@ pub struct TextPrimitive {
 pub const READ_DETAIL_OBJECT_BIT: u32 = 1 << 31;
 const RECORD_OBJECT_MASK: u32 = !READ_DETAIL_OBJECT_BIT;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Direction {
+    Left,
+    Right,
+}
+
 pub const fn read_detail_object_id(object_id: u32) -> u32 {
     object_id | READ_DETAIL_OBJECT_BIT
+}
+
+/// Width of a read's directional terminal in screen points.
+///
+/// The height-derived size matches the compact IGV cue, while the width cap
+/// guarantees that short reads retain a recognisable rectangular body as the
+/// viewport approaches regional detail.
+pub fn read_arrow_head_width(width: f32, height: f32) -> f32 {
+    (height.max(0.0) * 0.55).min(width.max(0.0) * 0.35)
+}
+
+/// Screen-space dimensions for the orientation-specific breakend bracket.
+///
+/// The vertical bar identifies the join side while the horizontal stem keeps
+/// the glyph legible without making it look like a strand arrow.
+pub fn breakend_bracket_dimensions(width: f32, height: f32) -> (f32, f32) {
+    let width = width.max(0.0);
+    let height = height.max(0.0);
+    let bar_width = width.min(2.0);
+    let stem_half_height = (height * 0.14).max(height.min(1.0)).min(height * 0.5);
+    (bar_width, stem_half_height)
 }
 
 pub const fn record_object_id(object_id: u32) -> u32 {
@@ -85,6 +141,7 @@ impl DisplayList {
                     Rgba::new(0.20, 0.55, 0.92, 0.88)
                 },
                 object_id: index,
+                shape: Default::default(),
             });
         }
         Self {
@@ -108,6 +165,7 @@ impl DisplayList {
                 height,
                 color: Rgba::new(0.24, 0.72, 0.62, 0.82),
                 object_id: 0,
+                shape: Default::default(),
             });
         }
         let reads = Self::synthetic_reads_at(width, rows, count, top + 72.0);
@@ -171,12 +229,17 @@ impl DisplayList {
                 if rectangle_bottom <= top || rectangle.y >= bottom {
                     return None;
                 }
-                if rectangle.y < top {
+                let clipped_top = rectangle.y < top;
+                let clipped_bottom = rectangle.y + rectangle.height > bottom;
+                if clipped_top {
                     rectangle.height -= top - rectangle.y;
                     rectangle.y = top;
                 }
-                if rectangle.y + rectangle.height > bottom {
+                if clipped_bottom {
                     rectangle.height = bottom - rectangle.y;
+                }
+                if clipped_top || clipped_bottom {
+                    rectangle.shape = RectShape::Rectangle;
                 }
                 (rectangle.height > 0.0).then_some(rectangle)
             }));
@@ -196,12 +259,19 @@ impl DisplayList {
             if rectangle_right <= left || rectangle.x >= right {
                 return false;
             }
-            if rectangle.x < left {
+            let clipped_left = rectangle.x < left;
+            let clipped_right = rectangle.x + rectangle.width > right;
+            if clipped_left {
                 rectangle.width -= left - rectangle.x;
                 rectangle.x = left;
             }
-            if rectangle.x + rectangle.width > right {
+            if clipped_right {
                 rectangle.width = right - rectangle.x;
+            }
+            if matches!(rectangle.shape.direction(), Some(Direction::Left)) && clipped_left
+                || matches!(rectangle.shape.direction(), Some(Direction::Right)) && clipped_right
+            {
+                rectangle.shape = RectShape::Rectangle;
             }
             rectangle.width > 0.0
         });
@@ -239,6 +309,22 @@ mod tests {
     }
 
     #[test]
+    fn shape_metadata_does_not_change_record_identity() {
+        let mut primitive = RectPrimitive {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 5.0,
+            color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+            object_id: read_detail_object_id(42),
+            shape: RectShape::DirectionalTerminalLeft,
+        };
+        assert_eq!(record_object_id(primitive.object_id), 42);
+        primitive.shape = RectShape::BreakendJoinAfter;
+        assert_eq!(record_object_id(primitive.object_id), 42);
+    }
+
+    #[test]
     fn vertical_scrolling_culls_and_clips_primitives() {
         let mut display = DisplayList {
             rectangles: vec![
@@ -249,6 +335,7 @@ mod tests {
                     height: 20.0,
                     color: Rgba::new(1.0, 1.0, 1.0, 1.0),
                     object_id: 1,
+                    shape: Default::default(),
                 },
                 RectPrimitive {
                     x: 0.0,
@@ -257,6 +344,7 @@ mod tests {
                     height: 40.0,
                     color: Rgba::new(1.0, 1.0, 1.0, 1.0),
                     object_id: 2,
+                    shape: Default::default(),
                 },
             ],
             texts: vec![TextPrimitive {
@@ -289,6 +377,7 @@ mod tests {
                 height: 20.0,
                 color: Rgba::new(1.0, 1.0, 1.0, 1.0),
                 object_id: 1,
+                shape: Default::default(),
             }],
             texts: Vec::new(),
         };
@@ -309,6 +398,7 @@ mod tests {
                     height: 10.0,
                     color: Rgba::new(1.0, 1.0, 1.0, 1.0),
                     object_id: 1,
+                    shape: Default::default(),
                 },
                 RectPrimitive {
                     x: 95.0,
@@ -317,6 +407,7 @@ mod tests {
                     height: 10.0,
                     color: Rgba::new(1.0, 1.0, 1.0, 1.0),
                     object_id: 2,
+                    shape: Default::default(),
                 },
             ],
             texts: Vec::new(),
@@ -327,6 +418,39 @@ mod tests {
         assert!((display.rectangles[0].width - 20.0).abs() < f32::EPSILON);
         assert!((display.rectangles[1].x - 195.0).abs() < f32::EPSILON);
         assert!((display.rectangles[1].width - 5.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn clipping_removes_a_direction_shape_only_when_its_semantic_tip_is_cut() {
+        let mut display = DisplayList {
+            rectangles: vec![
+                RectPrimitive {
+                    x: 90.0,
+                    y: 10.0,
+                    width: 30.0,
+                    height: 10.0,
+                    color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+                    object_id: 1,
+                    shape: RectShape::DirectionalTerminalLeft,
+                },
+                RectPrimitive {
+                    x: 90.0,
+                    y: 30.0,
+                    width: 30.0,
+                    height: 10.0,
+                    color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+                    object_id: 2,
+                    shape: RectShape::DirectionalTerminalRight,
+                },
+            ],
+            texts: Vec::new(),
+        };
+        display.translate_and_clip_horizontal(0.0, 100.0, 200.0);
+        assert_eq!(display.rectangles[0].shape, RectShape::Rectangle);
+        assert_eq!(
+            display.rectangles[1].shape,
+            RectShape::DirectionalTerminalRight
+        );
     }
 
     #[test]

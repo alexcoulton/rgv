@@ -6,6 +6,14 @@ use super::*;
 
 pub(super) const COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT: f32 = 20.0;
 
+pub(crate) fn reference_bases_label(reverse_complement: bool) -> String {
+    if reverse_complement {
+        "< Bases · reverse strand".to_owned()
+    } else {
+        "> Bases · forward".to_owned()
+    }
+}
+
 pub(super) fn collapsed_alignment_subtrack(label: &str, top: f32) -> TrackSubtrack {
     TrackSubtrack {
         label: label.to_owned(),
@@ -194,11 +202,7 @@ impl Viewer {
                     None
                 };
                 subtracks.push(TrackSubtrack {
-                    label: if self.reference_reverse_complement {
-                        "Bases · reverse strand".to_owned()
-                    } else {
-                        "Bases · forward".to_owned()
-                    },
+                    label: reference_bases_label(self.reference_reverse_complement),
                     detail: reference_detail,
                     top: sequence_top,
                     bottom: sequence_top + 20.0,
@@ -1367,6 +1371,7 @@ impl Viewer {
                 height: self.canvas_geometry.viewport.height(),
                 color,
                 object_id: 0,
+                shape: Default::default(),
             });
             for boundary in [x, right - 1.0] {
                 display.rectangles.push(RectPrimitive {
@@ -1376,6 +1381,7 @@ impl Viewer {
                     height: self.canvas_geometry.viewport.height(),
                     color: Rgba::new(color.red, color.green, color.blue, 0.72),
                     object_id: 0,
+                    shape: Default::default(),
                 });
             }
         }

@@ -25,7 +25,10 @@ use rgv_hts::{
     sequencer_base_matches, smrt_kinetics_tag,
 };
 
-use crate::{DisplayList, RectPrimitive, Rgba, TextPrimitive, read_detail_object_id};
+use crate::{
+    DisplayList, RectPrimitive, RectShape, Rgba, TextPrimitive, read_detail_object_id,
+    record_object_id,
+};
 
 pub const MAX_HIDDEN_MODIFICATION_CODES: usize = 8;
 pub const MAX_RENDERED_JUNCTIONS: usize = 4_096;
@@ -564,6 +567,7 @@ pub fn layout_alignment_query_with_rows_and_annotations(
             height: 3.0,
             color: Rgba::new(0.08, 0.08, 0.08, 1.0),
             object_id: 0,
+            shape: Default::default(),
         });
     }
     // Reference and coverage are emitted first so the desktop can keep this
@@ -687,6 +691,7 @@ fn add_overview_reads_placeholder(
         height: 32.0,
         color: Rgba::new(0.92, 0.94, 0.97, 0.95),
         object_id: 0,
+        shape: Default::default(),
     });
     display_list.rectangles.push(RectPrimitive {
         x: 12.0,
@@ -695,6 +700,7 @@ fn add_overview_reads_placeholder(
         height: 32.0,
         color: Rgba::new(0.25, 0.45, 0.72, 0.90),
         object_id: 0,
+        shape: Default::default(),
     });
     let count = query.stats.records_eligible;
     let text = if query.stats.cancelled {

@@ -1,4 +1,5 @@
 use super::super::*;
+use rgv_layout::{Direction, RectShape, breakend_bracket_dimensions, read_arrow_head_width};
 
 pub(crate) fn cropped_display_list(display: &DisplayList, bounds: egui::Rect) -> DisplayList {
     let mut cropped = DisplayList::default();
@@ -15,6 +16,17 @@ pub(crate) fn cropped_display_list(display: &DisplayList, bounds: egui::Rect) ->
                 height: bottom - top,
                 color: rectangle.color,
                 object_id: rectangle.object_id,
+                shape: if top > rectangle.y
+                    || bottom < rectangle.y + rectangle.height
+                    || matches!(rectangle.shape.direction(), Some(Direction::Left))
+                        && left > rectangle.x
+                    || matches!(rectangle.shape.direction(), Some(Direction::Right))
+                        && right < rectangle.x + rectangle.width
+                {
+                    RectShape::Rectangle
+                } else {
+                    rectangle.shape
+                },
             });
         }
     }
@@ -107,14 +119,62 @@ pub(crate) fn display_list_svg_export(
         let red = (rectangle.color.red.clamp(0.0, 1.0) * 255.0).round() as u8;
         let green = (rectangle.color.green.clamp(0.0, 1.0) * 255.0).round() as u8;
         let blue = (rectangle.color.blue.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let element = format!(
-            "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"rgb({red},{green},{blue})\" fill-opacity=\"{:.3}\"/>\n",
-            rectangle.x,
-            rectangle.y,
-            rectangle.width,
-            rectangle.height,
-            rectangle.color.alpha.clamp(0.0, 1.0),
-        );
+        let opacity = rectangle.color.alpha.clamp(0.0, 1.0);
+        let element = if matches!(
+            rectangle.shape,
+            RectShape::BreakendJoinBefore | RectShape::BreakendJoinAfter
+        ) {
+            let (bar_width, stem_half_height) =
+                breakend_bracket_dimensions(rectangle.width, rectangle.height);
+            let bar_x = if rectangle.shape == RectShape::BreakendJoinBefore {
+                rectangle.x
+            } else {
+                rectangle.x + rectangle.width - bar_width
+            };
+            let stem_y = rectangle.y + rectangle.height * 0.5 - stem_half_height;
+            format!(
+                "<rect x=\"{bar_x:.2}\" y=\"{:.2}\" width=\"{bar_width:.2}\" height=\"{:.2}\" fill=\"rgb({red},{green},{blue})\" fill-opacity=\"{opacity:.3}\"/>\n<rect x=\"{:.2}\" y=\"{stem_y:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"rgb({red},{green},{blue})\" fill-opacity=\"{opacity:.3}\"/>\n",
+                rectangle.y,
+                rectangle.height,
+                rectangle.x,
+                rectangle.width,
+                stem_half_height * 2.0,
+            )
+        } else if let Some(direction) = rectangle.shape.direction() {
+            let left = rectangle.x;
+            let right = rectangle.x + rectangle.width;
+            let top = rectangle.y;
+            let bottom = rectangle.y + rectangle.height;
+            let middle = rectangle.y + rectangle.height * 0.5;
+            let head_width = if matches!(
+                rectangle.shape,
+                RectShape::DirectionalTerminalLeft | RectShape::DirectionalTerminalRight
+            ) {
+                read_arrow_head_width(rectangle.width, rectangle.height)
+            } else {
+                rectangle.width
+            };
+            let points = match direction {
+                Direction::Left => format!(
+                    "{left:.2},{middle:.2} {:.2},{top:.2} {right:.2},{top:.2} {right:.2},{bottom:.2} {:.2},{bottom:.2}",
+                    left + head_width,
+                    left + head_width,
+                ),
+                Direction::Right => format!(
+                    "{left:.2},{top:.2} {:.2},{top:.2} {right:.2},{middle:.2} {:.2},{bottom:.2} {left:.2},{bottom:.2}",
+                    right - head_width,
+                    right - head_width,
+                ),
+            };
+            format!(
+                "<polygon points=\"{points}\" fill=\"rgb({red},{green},{blue})\" fill-opacity=\"{opacity:.3}\"/>\n"
+            )
+        } else {
+            format!(
+                "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"rgb({red},{green},{blue})\" fill-opacity=\"{opacity:.3}\"/>\n",
+                rectangle.x, rectangle.y, rectangle.width, rectangle.height,
+            )
+        };
         if output
             .len()
             .saturating_add(element.len())

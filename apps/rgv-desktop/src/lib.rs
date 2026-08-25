@@ -30,6 +30,8 @@ use app::{actions::*, tasks::*};
 use automation::*;
 use clap::Parser;
 use control_service::{ControlRequest, ControlService, ControlStatusMetadata, read_control_secret};
+#[cfg(test)]
+use display::reference_bases_label;
 use display::{alignment::*, auxiliary::*, hit_test::*};
 use egui_wgpu::{RendererOptions, ScreenDescriptor};
 use inspection::{auxiliary::*, model::*, read::*, rna::*, variant::*};

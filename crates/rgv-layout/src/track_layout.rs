@@ -13,13 +13,14 @@ use rgv_hts::{
     MutationQuery, QuantitativeRecord, Strand, VariantRecord,
 };
 
-use crate::{DisplayList, RectPrimitive, Rgba, TextPrimitive};
+use crate::{DisplayList, RectPrimitive, RectShape, Rgba, TextPrimitive};
 
 pub const MAX_QUANTITATIVE_WINDOWS: usize = 4_096;
 pub const MAX_RAW_QUANTITATIVE_RECORDS: usize = 16_384;
 pub const MAX_RENDERED_INTERACTIONS: usize = 2_048;
 pub const MAX_INTERACTION_LABELS: usize = 512;
 pub const MAX_FEATURE_LABELS: usize = 512;
+pub const MAX_FEATURE_DIRECTION_MARKERS: usize = 16_384;
 pub const MAX_RENDERED_COPY_NUMBER_SEGMENTS: usize = 32_768;
 pub const MAX_COPY_NUMBER_VALUE_LABELS: usize = 2_048;
 pub const COPY_NUMBER_HEADER_HEIGHT: f32 = 24.0;
@@ -176,6 +177,7 @@ pub fn layout_features(
     let mut rendered = 0;
     let mut hidden = 0;
     let mut labels = 0;
+    let mut direction_marker_budget = MAX_FEATURE_DIRECTION_MARKERS;
     for (index, feature) in features.iter().enumerate() {
         if feature.end <= viewport.interval().start() || feature.start >= viewport.interval().end()
         {
@@ -209,6 +211,7 @@ pub fn layout_features(
             (row_height - label_band - 4.0).max(2.0),
             object_id,
             options.selected_record == Some(index),
+            &mut direction_marker_budget,
         );
         if let Some(label) = label.filter(|_| labels < MAX_FEATURE_LABELS) {
             let text = label.chars().take(32).collect::<String>();
@@ -287,6 +290,7 @@ pub fn layout_variants(
                 height: 12.0,
                 color: Rgba::new(0.10, 0.28, 0.62, 0.24),
                 object_id,
+                shape: Default::default(),
             });
         }
         display.rectangles.push(RectPrimitive {
@@ -296,6 +300,7 @@ pub fn layout_variants(
             height: (options.height - 12.0).max(2.0),
             color: with_alpha(color, 0.72),
             object_id,
+            shape: Default::default(),
         });
         display.rectangles.push(RectPrimitive {
             x: x - 4.0,
@@ -304,15 +309,53 @@ pub fn layout_variants(
             height: 8.0,
             color,
             object_id,
+            shape: variant
+                .breakends
+                .first()
+                .map(|partner| breakend_shape(partner.local_join_after_position))
+                .or_else(|| {
+                    variant
+                        .breakpoint_orientations
+                        .first()
+                        .map(|orientation| breakend_shape(orientation.local_join_after_position))
+                })
+                .unwrap_or(RectShape::Rectangle),
         });
-        display.rectangles.push(RectPrimitive {
-            x,
-            y: baseline,
-            width: (right - x).max(2.0),
-            height: 3.0,
-            color,
-            object_id,
-        });
+        if variant.breakends.is_empty() {
+            display.rectangles.push(RectPrimitive {
+                x,
+                y: baseline,
+                width: (right - x).max(2.0),
+                height: 3.0,
+                color,
+                object_id,
+                shape: RectShape::Rectangle,
+            });
+            if let Some(orientation) = variant.breakpoint_orientations.first()
+                && variant.end > viewport.interval().start()
+                && variant.end <= viewport.interval().end()
+            {
+                display.rectangles.push(RectPrimitive {
+                    x: right - 4.0,
+                    y: baseline - 3.0,
+                    width: 8.0,
+                    height: 8.0,
+                    color,
+                    object_id,
+                    shape: breakend_shape(orientation.partner_join_after_position),
+                });
+            }
+        } else {
+            add_breakend_partners(
+                &mut display,
+                variant,
+                viewport,
+                x,
+                baseline,
+                color,
+                object_id,
+            );
+        }
         rendered += 1;
     }
     let primitive_count = display.rectangles.len();
@@ -326,6 +369,126 @@ pub fn layout_variants(
             ..TrackLayoutStats::default()
         },
     )
+}
+
+const fn breakend_shape(join_after_position: bool) -> RectShape {
+    if join_after_position {
+        RectShape::BreakendJoinAfter
+    } else {
+        RectShape::BreakendJoinBefore
+    }
+}
+
+fn add_breakend_partners(
+    display: &mut DisplayList,
+    variant: &VariantRecord,
+    viewport: Viewport,
+    local_x: f32,
+    baseline: f32,
+    color: Rgba,
+    object_id: u32,
+) {
+    const MAX_PARTNERS: usize = 64;
+    const MAX_OFFSCREEN_PARTNER_LABELS: usize = 8;
+    const OFFSCREEN_PARTNER_ROW_HEIGHT: f32 = 10.0;
+    let viewport_width = viewport.pixel_width() as f32;
+    let mut offscreen_partner_count = 0_usize;
+    for partner in variant.breakends.iter().take(MAX_PARTNERS) {
+        let partner_is_visible = partner.contig == variant.contig
+            && partner.position >= viewport.interval().start()
+            && partner.position < viewport.interval().end();
+        if partner_is_visible {
+            let partner_x = viewport.pixel_at_genomic(partner.position) as f32;
+            let left = local_x.min(partner_x);
+            let right = local_x.max(partner_x);
+            display.rectangles.push(RectPrimitive {
+                x: left,
+                y: baseline,
+                width: (right - left).max(2.0),
+                height: 2.0,
+                color: with_alpha(color, 0.72),
+                object_id,
+                shape: RectShape::Rectangle,
+            });
+            display.rectangles.push(RectPrimitive {
+                x: partner_x - 4.0,
+                y: baseline - 3.0,
+                width: 8.0,
+                height: 8.0,
+                color,
+                object_id,
+                shape: breakend_shape(partner.partner_join_after_position),
+            });
+        } else {
+            let marker_on_left = if partner.contig == variant.contig {
+                partner.position < viewport.interval().start()
+            } else {
+                local_x > viewport_width * 0.5
+            };
+            let marker_width = 8.0_f32.min(viewport_width);
+            let row = offscreen_partner_count.min(MAX_OFFSCREEN_PARTNER_LABELS - 1);
+            let marker_y = baseline - 3.0 - row as f32 * OFFSCREEN_PARTNER_ROW_HEIGHT;
+            let marker_x = if marker_on_left {
+                0.0
+            } else {
+                viewport_width - marker_width
+            };
+            if partner.contig == variant.contig {
+                let connector_left = local_x.min(marker_x + marker_width * 0.5);
+                let connector_right = local_x.max(marker_x + marker_width * 0.5);
+                display.rectangles.push(RectPrimitive {
+                    x: connector_left,
+                    y: marker_y + 3.0,
+                    width: (connector_right - connector_left).max(2.0),
+                    height: 2.0,
+                    color: with_alpha(color, 0.72),
+                    object_id,
+                    shape: RectShape::Rectangle,
+                });
+            }
+            display.rectangles.push(RectPrimitive {
+                x: marker_x,
+                y: marker_y,
+                width: marker_width,
+                height: 8.0,
+                color,
+                object_id,
+                shape: breakend_shape(partner.partner_join_after_position),
+            });
+
+            if offscreen_partner_count >= MAX_OFFSCREEN_PARTNER_LABELS {
+                offscreen_partner_count = offscreen_partner_count.saturating_add(1);
+                continue;
+            }
+            let local_side = if partner.local_join_after_position {
+                "after"
+            } else {
+                "before"
+            };
+            let partner_side = if partner.partner_join_after_position {
+                "after"
+            } else {
+                "before"
+            };
+            let text = bounded_interaction_label(&format!(
+                "ALT {} {local_side} <-> {}:{} {partner_side}",
+                partner.alternate_index + 1,
+                partner.contig,
+                partner.position.saturating_add(1)
+            ));
+            let half_text_width = (text.chars().count() as f32 * 9.0 * 0.31)
+                .min(viewport_width * 0.5)
+                .max(0.0);
+            display.texts.push(TextPrimitive {
+                x: local_x.clamp(half_text_width, viewport_width - half_text_width),
+                y: (baseline - 7.0 - row as f32 * OFFSCREEN_PARTNER_ROW_HEIGHT).max(7.0),
+                text,
+                font_size: 9.0,
+                color: Rgba::new(0.18, 0.16, 0.22, 0.92),
+            });
+            offscreen_partner_count = offscreen_partner_count.saturating_add(1);
+        }
+    }
 }
 
 pub fn layout_gwas(
@@ -343,6 +506,7 @@ pub fn layout_gwas(
         height: 1.0,
         color: Rgba::new(0.72, 0.74, 0.77, 0.85),
         object_id: 0,
+        shape: Default::default(),
     });
     display.texts.push(TextPrimitive {
         x: 18.0,
@@ -388,6 +552,7 @@ pub fn layout_gwas(
                 height: halo,
                 color: Rgba::new(0.10, 0.28, 0.62, 0.20),
                 object_id,
+                shape: Default::default(),
             });
         }
         display.rectangles.push(RectPrimitive {
@@ -397,6 +562,7 @@ pub fn layout_gwas(
             height: point_size,
             color: gwas_point_color(&record.contig, settings),
             object_id,
+            shape: Default::default(),
         });
         rendered = rendered.saturating_add(1);
     }
@@ -534,6 +700,7 @@ pub fn layout_interactions(
                 height: options.height,
                 color: Rgba::new(0.10, 0.28, 0.62, 0.10),
                 object_id: 0,
+                shape: Default::default(),
             });
         }
         if source_here && target_here {
@@ -567,19 +734,56 @@ pub fn layout_interactions(
                             height: 2.0,
                             color: Rgba::new(color.red, color.green, color.blue, color.alpha * 0.6),
                             object_id,
+                            shape: Default::default(),
                         });
                     }
                 }
             }
-            for endpoint in [&record.source, &record.target] {
-                add_interaction_endpoint(
+            let source_shape = if record.directional {
+                RectShape::Rectangle
+            } else {
+                strand_terminal_shape(record.source.strand)
+            };
+            let target_shape = if record.directional {
+                if target < source {
+                    RectShape::DirectionalTerminalLeft
+                } else {
+                    RectShape::DirectionalTerminalRight
+                }
+            } else {
+                strand_terminal_shape(record.target.strand)
+            };
+            add_interaction_endpoint(
+                &mut display,
+                record.source.start,
+                record.source.end,
+                viewport,
+                baseline,
+                color,
+                object_id,
+                source_shape,
+            );
+            if record.directional {
+                add_directed_interaction_target(
                     &mut display,
-                    endpoint.start,
-                    endpoint.end,
+                    &record.source,
+                    &record.target,
                     viewport,
                     baseline,
                     color,
                     object_id,
+                    target_shape,
+                );
+            } else {
+                add_interaction_endpoint(
+                    &mut display,
+                    record.target.start,
+                    record.target.end,
+                    viewport,
+                    baseline,
+                    color,
+                    object_id,
+                    target_shape,
                 );
             }
             if settings.show_labels
@@ -617,6 +821,7 @@ pub fn layout_interactions(
                 height: (baseline - options.top - 8.0).max(2.0),
                 color,
                 object_id,
+                shape: Default::default(),
             });
             add_interaction_endpoint(
                 &mut display,
@@ -626,17 +831,16 @@ pub fn layout_interactions(
                 baseline,
                 color,
                 object_id,
+                strand_terminal_shape(local.strand),
             );
             if settings.show_labels && labels < MAX_INTERACTION_LABELS {
                 let partner_name = partner.name.as_deref().unwrap_or("partner");
                 display.texts.push(TextPrimitive {
                     x: bounded_label_x(x, viewport.pixel_width() as f32, 54.0),
                     y: options.top + 7.0,
-                    text: bounded_interaction_label(&format!(
-                        "{} → {}:{} ({partner_name})",
-                        local.name.as_deref().unwrap_or("endpoint"),
-                        partner.contig,
-                        partner.start.saturating_add(1),
+                    text: bounded_interaction_label(&interaction_cross_contig_label(
+                        record,
+                        partner_name,
                     )),
                     font_size: 10.5,
                     color: Rgba::new(0.18, 0.16, 0.22, 0.92),
@@ -683,6 +887,7 @@ fn add_interaction_arc(
             height: (point.1 - previous.1).abs().max(1.5),
             color,
             object_id,
+            shape: Default::default(),
         });
         previous = point;
     }
@@ -696,7 +901,15 @@ fn add_interaction_endpoint(
     baseline: f32,
     color: Rgba,
     object_id: u32,
+    mut shape: RectShape,
 ) {
+    if (matches!(shape.direction(), Some(crate::Direction::Left))
+        && start < viewport.interval().start())
+        || (matches!(shape.direction(), Some(crate::Direction::Right))
+            && end > viewport.interval().end())
+    {
+        shape = RectShape::Rectangle;
+    }
     let start = start.max(viewport.interval().start());
     let end = end.min(viewport.interval().end());
     if start >= end {
@@ -711,7 +924,79 @@ fn add_interaction_endpoint(
         height: 6.0,
         color,
         object_id,
+        shape,
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_directed_interaction_target(
+    display: &mut DisplayList,
+    source: &rgv_hts::InteractionEndpoint,
+    target: &rgv_hts::InteractionEndpoint,
+    viewport: Viewport,
+    baseline: f32,
+    color: Rgba,
+    object_id: u32,
+    shape: RectShape,
+) {
+    let target_is_left =
+        endpoint_center(target.start, target.end) < endpoint_center(source.start, source.end);
+    let target_tip_is_clipped = if target_is_left {
+        target.start < viewport.interval().start()
+    } else {
+        target.end > viewport.interval().end()
+    };
+    if target_tip_is_clipped {
+        let marker_width = 6.0_f32.min(viewport.pixel_width() as f32);
+        display.rectangles.push(RectPrimitive {
+            x: if target_is_left {
+                0.0
+            } else {
+                viewport.pixel_width() as f32 - marker_width
+            },
+            y: baseline - 5.0,
+            width: marker_width,
+            height: 6.0,
+            color,
+            object_id,
+            shape: if target_is_left {
+                RectShape::ChevronLeft
+            } else {
+                RectShape::ChevronRight
+            },
+        });
+    }
+    add_interaction_endpoint(
+        display,
+        target.start,
+        target.end,
+        viewport,
+        baseline,
+        color,
+        object_id,
+        shape,
+    );
+}
+
+const fn strand_terminal_shape(strand: Strand) -> RectShape {
+    match strand {
+        Strand::Forward => RectShape::DirectionalTerminalRight,
+        Strand::Reverse => RectShape::DirectionalTerminalLeft,
+        Strand::Unstranded => RectShape::Rectangle,
+    }
+}
+
+fn interaction_cross_contig_label(record: &InteractionRecord, partner_name: &str) -> String {
+    let source_name = record.source.name.as_deref().unwrap_or("source");
+    let target_name = record.target.name.as_deref().unwrap_or(partner_name);
+    let separator = if record.directional { "->" } else { "<->" };
+    format!(
+        "{source_name} {}:{} {separator} {target_name} {}:{}",
+        record.source.contig,
+        record.source.start.saturating_add(1),
+        record.target.contig,
+        record.target.start.saturating_add(1),
+    )
 }
 
 fn interaction_magnitude(record: &InteractionRecord) -> f32 {
@@ -805,6 +1090,7 @@ pub fn layout_quantitative(
             height: options.height,
             color: Rgba::new(0.10, 0.28, 0.62, 0.14),
             object_id: 0,
+            shape: Default::default(),
         });
     }
     let baseline_y = quantitative_y(settings.baseline, range, settings, options);
@@ -816,6 +1102,7 @@ pub fn layout_quantitative(
             height: 1.0,
             color: Rgba::new(0.42, 0.45, 0.50, 0.42),
             object_id: 0,
+            shape: Default::default(),
         });
     }
     let mut rendered = 0_usize;
@@ -839,6 +1126,7 @@ pub fn layout_quantitative(
                     height: 1.0,
                     color: Rgba::new(0.55, 0.57, 0.60, 0.55),
                     object_id,
+                    shape: Default::default(),
                 }),
                 QuantitativeMissingMode::Marker => display.rectangles.push(RectPrimitive {
                     x,
@@ -847,6 +1135,7 @@ pub fn layout_quantitative(
                     height: options.height,
                     color: Rgba::new(0.72, 0.72, 0.72, 0.18),
                     object_id,
+                    shape: Default::default(),
                 }),
             }
             previous = None;
@@ -873,6 +1162,7 @@ pub fn layout_quantitative(
                     height: (bottom - top).max(1.0),
                     color,
                     object_id,
+                    shape: Default::default(),
                 });
             }
             QuantitativeDisplayMode::Line => {
@@ -883,6 +1173,7 @@ pub fn layout_quantitative(
                     height: 1.5,
                     color,
                     object_id,
+                    shape: Default::default(),
                 });
                 if let Some((previous_end, previous_y)) = previous
                     && previous_end >= window.start
@@ -894,6 +1185,7 @@ pub fn layout_quantitative(
                         height: (previous_y - y).abs().max(1.5),
                         color,
                         object_id,
+                        shape: Default::default(),
                     });
                 }
             }
@@ -904,6 +1196,7 @@ pub fn layout_quantitative(
                 height: 4.0,
                 color,
                 object_id,
+                shape: Default::default(),
             }),
             QuantitativeDisplayMode::Heatmap => {
                 let transformed_value = transform_quantitative(value, settings.scale_transform);
@@ -926,6 +1219,7 @@ pub fn layout_quantitative(
                     height: options.height,
                     color: Rgba::new(color.red, color.green, color.blue, color.alpha * intensity),
                     object_id,
+                    shape: Default::default(),
                 });
             }
         }
@@ -1057,6 +1351,7 @@ pub fn layout_mutations(
                 height: height + 4.0,
                 color: Rgba::new(0.05, 0.12, 0.24, 0.25),
                 object_id: 0,
+                shape: Default::default(),
             });
         }
         display.rectangles.push(RectPrimitive {
@@ -1066,6 +1361,7 @@ pub fn layout_mutations(
             height,
             color,
             object_id,
+            shape: Default::default(),
         });
         if width > 3.0 && height > 3.0 {
             display.rectangles.push(RectPrimitive {
@@ -1075,6 +1371,7 @@ pub fn layout_mutations(
                 height: (height - 2.0).max(1.0),
                 color: Rgba::new(1.0, 1.0, 1.0, 0.90),
                 object_id,
+                shape: Default::default(),
             });
         }
         if multiplicity
@@ -1090,6 +1387,7 @@ pub fn layout_mutations(
                 height: 1.0,
                 color,
                 object_id,
+                shape: Default::default(),
             });
         }
         if settings.show_gene_labels
@@ -1327,6 +1625,7 @@ pub fn layout_copy_number(
             height: (row_height - 2.0).max(1.0),
             color: Rgba::new(color.red, color.green, color.blue, color.alpha * intensity),
             object_id,
+            shape: Default::default(),
         });
         if options.selected_record == Some(segment_index) {
             display.rectangles.push(RectPrimitive {
@@ -1336,6 +1635,7 @@ pub fn layout_copy_number(
                 height: (row_height - 2.0).max(1.0),
                 color: Rgba::new(0.05, 0.12, 0.24, 0.22),
                 object_id: 0,
+                shape: Default::default(),
             });
         }
         if settings.show_values
@@ -1708,6 +2008,7 @@ fn add_feature(
     height: f32,
     object_id: u32,
     selected: bool,
+    direction_marker_budget: &mut usize,
 ) {
     let base_color = match feature.strand {
         Strand::Forward => Rgba::new(0.25, 0.70, 0.94, 0.88),
@@ -1727,6 +2028,7 @@ fn add_feature(
             height: (height * 0.64).max(2.0),
             color,
             object_id,
+            shape: feature_terminal_shape(feature, feature.start, feature.end, viewport),
         });
         if let Some(summit) = peak.summit
             && summit >= viewport.interval().start()
@@ -1740,6 +2042,7 @@ fn add_feature(
                 height: height.max(2.0),
                 color: with_alpha(base_color, 1.0),
                 object_id,
+                shape: Default::default(),
             });
         }
         if selected {
@@ -1754,6 +2057,7 @@ fn add_feature(
         height: 2.0,
         color: with_alpha(base_color, 0.65),
         object_id,
+        shape: Default::default(),
     });
     let default_block = [(feature.start, feature.end)];
     let blocks = if feature.blocks.is_empty() {
@@ -1762,6 +2066,7 @@ fn add_feature(
         &feature.blocks
     };
     let transcript_model = feature.feature_type.as_deref() == Some("transcript");
+    let terminal_geometry = feature_uses_terminal_geometry(feature);
     for &(start, end) in blocks {
         let (x, width) = clipped_geometry(start, end, viewport);
         if width <= 0.0 {
@@ -1779,6 +2084,11 @@ fn add_feature(
             height: block_height,
             color: base_color,
             object_id,
+            shape: if terminal_geometry {
+                feature_terminal_shape(feature, start, end, viewport)
+            } else {
+                RectShape::Rectangle
+            },
         });
         if let Some((coding_start, coding_end)) = feature.coding_interval {
             let coding_start = start.max(coding_start);
@@ -1793,13 +2103,151 @@ fn add_feature(
                         height,
                         color: base_color,
                         object_id,
+                        shape: Default::default(),
                     });
                 }
             }
         }
     }
+    add_feature_connector_chevrons(
+        display,
+        feature,
+        blocks,
+        viewport,
+        y + height * 0.45,
+        base_color,
+        object_id,
+        direction_marker_budget,
+    );
+    if !terminal_geometry {
+        add_component_feature_direction_marker(
+            display,
+            feature,
+            viewport,
+            y + height * 0.5,
+            base_color,
+            object_id,
+            direction_marker_budget,
+        );
+    }
     if selected {
         add_feature_selection_outline(display, x, y, width, height, object_id);
+    }
+}
+
+fn feature_uses_terminal_geometry(feature: &FeatureRecord) -> bool {
+    !feature.blocks.is_empty()
+        || feature.feature_type.is_none()
+        || matches!(
+            feature.feature_type.as_deref(),
+            Some("gene" | "transcript" | "mRNA")
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_component_feature_direction_marker(
+    display: &mut DisplayList,
+    feature: &FeatureRecord,
+    viewport: Viewport,
+    centre_y: f32,
+    color: Rgba,
+    object_id: u32,
+    budget: &mut usize,
+) {
+    let shape = match feature.strand {
+        Strand::Forward => RectShape::ChevronRight,
+        Strand::Reverse => RectShape::ChevronLeft,
+        Strand::Unstranded => return,
+    };
+    const MARKER_SIZE: f32 = 5.0;
+    let (x, width) = clipped_geometry(feature.start, feature.end, viewport);
+    if width < MARKER_SIZE || *budget == 0 {
+        return;
+    }
+    display.rectangles.push(RectPrimitive {
+        x: x + width * 0.5 - MARKER_SIZE * 0.5,
+        y: centre_y - MARKER_SIZE * 0.5,
+        width: MARKER_SIZE,
+        height: MARKER_SIZE,
+        color,
+        object_id,
+        shape,
+    });
+    *budget = budget.saturating_sub(1);
+}
+
+fn feature_terminal_shape(
+    feature: &FeatureRecord,
+    block_start: u64,
+    block_end: u64,
+    viewport: Viewport,
+) -> RectShape {
+    match feature.strand {
+        Strand::Forward
+            if block_end == feature.end
+                && feature.end > viewport.interval().start()
+                && feature.end <= viewport.interval().end() =>
+        {
+            RectShape::DirectionalTerminalRight
+        }
+        Strand::Reverse
+            if block_start == feature.start
+                && feature.start >= viewport.interval().start()
+                && feature.start < viewport.interval().end() =>
+        {
+            RectShape::DirectionalTerminalLeft
+        }
+        Strand::Forward | Strand::Reverse | Strand::Unstranded => RectShape::Rectangle,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_feature_connector_chevrons(
+    display: &mut DisplayList,
+    feature: &FeatureRecord,
+    blocks: &[(u64, u64)],
+    viewport: Viewport,
+    centre_y: f32,
+    color: Rgba,
+    object_id: u32,
+    budget: &mut usize,
+) {
+    let shape = match feature.strand {
+        Strand::Forward => RectShape::ChevronRight,
+        Strand::Reverse => RectShape::ChevronLeft,
+        Strand::Unstranded => return,
+    };
+    if blocks.len() < 2 || *budget == 0 {
+        return;
+    }
+    const SPACING: f32 = 18.0;
+    const MARKER_WIDTH: f32 = 5.0;
+    const MARKER_HEIGHT: f32 = 5.0;
+    for pair in blocks.windows(2) {
+        let gap_start = pair[0].1;
+        let gap_end = pair[1].0;
+        if gap_end <= gap_start {
+            continue;
+        }
+        let (x, width) = clipped_geometry(gap_start, gap_end, viewport);
+        if width < MARKER_WIDTH || *budget == 0 {
+            continue;
+        }
+        let count = ((width / SPACING).floor() as usize).max(1).min(*budget);
+        let step = width / (count + 1) as f32;
+        for marker in 1..=count {
+            let centre_x = x + step * marker as f32;
+            display.rectangles.push(RectPrimitive {
+                x: centre_x - MARKER_WIDTH * 0.5,
+                y: centre_y - MARKER_HEIGHT * 0.5,
+                width: MARKER_WIDTH,
+                height: MARKER_HEIGHT,
+                color,
+                object_id,
+                shape,
+            });
+        }
+        *budget = budget.saturating_sub(count);
     }
 }
 
@@ -1821,6 +2269,7 @@ fn add_feature_selection_outline(
             height: 1.5,
             color,
             object_id,
+            shape: Default::default(),
         },
         RectPrimitive {
             x,
@@ -1829,6 +2278,7 @@ fn add_feature_selection_outline(
             height: 1.5,
             color,
             object_id,
+            shape: Default::default(),
         },
         RectPrimitive {
             x,
@@ -1837,6 +2287,7 @@ fn add_feature_selection_outline(
             height,
             color,
             object_id,
+            shape: Default::default(),
         },
         RectPrimitive {
             x: x + (width - 1.5).max(0.0),
@@ -1845,6 +2296,7 @@ fn add_feature_selection_outline(
             height,
             color,
             object_id,
+            shape: Default::default(),
         },
     ] {
         display.rectangles.push(rectangle);

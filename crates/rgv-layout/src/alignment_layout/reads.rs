@@ -141,6 +141,7 @@ pub(crate) fn add_reads(
                 object_id,
             );
         }
+        let first_read_primitive = display_list.rectangles.len();
         add_cigar(
             display_list,
             query,
@@ -159,6 +160,17 @@ pub(crate) fn add_reads(
             &mut sbx_budget,
             ultima_analysis.as_ref(),
             &mut ultima_budget,
+        );
+        add_read_direction_terminal(
+            display_list,
+            first_read_primitive,
+            viewport,
+            batch.starts[index],
+            batch.ends[index],
+            batch.flags[index].is_reverse(),
+            y,
+            options.read_height,
+            object_id,
         );
         if options
             .selected_chain_read_name_hash
@@ -197,6 +209,79 @@ pub(crate) fn add_reads(
     stats.sbx_unavailable_insertions = sbx_budget.unavailable_insertions;
     stats.ultima_quality_marks_omitted = ultima_budget.omitted;
     stats
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_read_direction_terminal(
+    display_list: &mut DisplayList,
+    first_primitive: usize,
+    viewport: Viewport,
+    alignment_start: u64,
+    alignment_end: u64,
+    reverse: bool,
+    y: f32,
+    height: f32,
+    object_id: u32,
+) {
+    let interval = viewport.interval();
+    let terminal_is_visible = if reverse {
+        alignment_start >= interval.start() && alignment_start < interval.end()
+    } else {
+        alignment_end > interval.start() && alignment_end <= interval.end()
+    };
+    if !terminal_is_visible {
+        return;
+    }
+
+    let body_height_minimum = (height - 1.7).max(0.5);
+    let mut terminal = None::<f32>;
+    for primitive in &display_list.rectangles[first_primitive..] {
+        if record_object_id(primitive.object_id) != object_id
+            || primitive.height < body_height_minimum
+            || primitive.y < y - 0.1
+            || primitive.y + primitive.height > y + height + 0.1
+        {
+            continue;
+        }
+        let edge = if reverse {
+            primitive.x
+        } else {
+            primitive.x + primitive.width
+        };
+        terminal = Some(terminal.map_or(edge, |current| {
+            if reverse {
+                current.min(edge)
+            } else {
+                current.max(edge)
+            }
+        }));
+    }
+    let Some(terminal) = terminal else {
+        return;
+    };
+
+    let shape = if reverse {
+        RectShape::DirectionalTerminalLeft
+    } else {
+        RectShape::DirectionalTerminalRight
+    };
+    for primitive in &mut display_list.rectangles[first_primitive..] {
+        if record_object_id(primitive.object_id) != object_id
+            || primitive.height < body_height_minimum
+            || primitive.y < y - 0.1
+            || primitive.y + primitive.height > y + height + 0.1
+        {
+            continue;
+        }
+        let edge = if reverse {
+            primitive.x
+        } else {
+            primitive.x + primitive.width
+        };
+        if (edge - terminal).abs() <= 1.0 {
+            primitive.shape = shape;
+        }
+    }
 }
 
 pub(crate) const fn ultima_record_evidence_is_unavailable(error: &UltimaEvidenceError) -> bool {

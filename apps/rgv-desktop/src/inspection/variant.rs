@@ -214,11 +214,48 @@ pub(crate) fn variant_details_text(
             format_variant_field(field)
         );
     }
+    for (index, partner) in record.breakends.iter().enumerate() {
+        let _ = write!(
+            details,
+            "\nBreakend ALT {}: local join {} -> {}:{} partner join {}",
+            partner.alternate_index + 1,
+            breakend_join_side(partner.local_join_after_position),
+            partner.contig,
+            partner.position + 1,
+            breakend_join_side(partner.partner_join_after_position),
+        );
+        if index + 1 >= 16 {
+            break;
+        }
+    }
+    for (index, orientation) in record.breakpoint_orientations.iter().enumerate() {
+        let _ = write!(
+            details,
+            "\nBreakpoint orientation {}: local join {} -> partner join {}{}",
+            index + 1,
+            breakend_join_side(orientation.local_join_after_position),
+            breakend_join_side(orientation.partner_join_after_position),
+            orientation
+                .support
+                .map_or_else(String::new, |support| format!(" · support {support}")),
+        );
+        if index + 1 >= 16 {
+            break;
+        }
+    }
     if details.len() > VARIANT_DETAILS_COPY_BYTES {
         truncate_string_to_bytes(&mut details, VARIANT_DETAILS_COPY_BYTES - 32);
         details.push_str("\n… clipboard limit reached");
     }
     details
+}
+
+pub(crate) const fn breakend_join_side(join_after_position: bool) -> &'static str {
+    if join_after_position {
+        "after"
+    } else {
+        "before"
+    }
 }
 
 pub(crate) fn variant_export_file_name(record: &rgv_hts::VariantRecord, suffix: &str) -> String {
@@ -313,6 +350,49 @@ pub(crate) fn variant_genotype_export_tsv(inspector: &VariantInspectorSnapshot) 
         );
         if !push_variant_export_line(&mut output, &line) {
             return output;
+        }
+    }
+    if !record.breakends.is_empty() {
+        if !push_variant_export_line(
+            &mut output,
+            "section\talternate\tlocal_join_side\tpartner_contig\tpartner_position_1based\tpartner_join_side",
+        ) {
+            return output;
+        }
+        for partner in &record.breakends {
+            let line = format!(
+                "breakend\t{}\t{}\t{}\t{}\t{}",
+                partner.alternate_index + 1,
+                breakend_join_side(partner.local_join_after_position),
+                tsv_cell(&partner.contig),
+                partner.position + 1,
+                breakend_join_side(partner.partner_join_after_position),
+            );
+            if !push_variant_export_line(&mut output, &line) {
+                return output;
+            }
+        }
+    }
+    if !record.breakpoint_orientations.is_empty() {
+        if !push_variant_export_line(
+            &mut output,
+            "section\torientation\tlocal_join_side\tpartner_join_side\tsupport",
+        ) {
+            return output;
+        }
+        for (index, orientation) in record.breakpoint_orientations.iter().enumerate() {
+            let line = format!(
+                "breakpoint_orientation\t{}\t{}\t{}\t{}",
+                index + 1,
+                breakend_join_side(orientation.local_join_after_position),
+                breakend_join_side(orientation.partner_join_after_position),
+                orientation
+                    .support
+                    .map_or_else(|| ".".to_owned(), |support| support.to_string()),
+            );
+            if !push_variant_export_line(&mut output, &line) {
+                return output;
+            }
         }
     }
     if !push_variant_export_line(

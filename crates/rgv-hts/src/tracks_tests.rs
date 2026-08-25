@@ -1004,6 +1004,41 @@ fn variant_classification_and_breakend_parsing_are_typed() {
     let leading = parse_breakend_partner(0, b"[chr3:7[G").unwrap();
     assert!(!leading.local_join_after_position);
     assert!(!leading.partner_join_after_position);
+
+    for (alternate, local_after, partner_after) in [
+        (b"[chr4:9[A".as_slice(), false, false),
+        (b"]chr4:9]A".as_slice(), false, true),
+        (b"A[chr4:9[".as_slice(), true, false),
+        (b"A]chr4:9]".as_slice(), true, true),
+    ] {
+        let parsed = parse_breakend_partner(0, alternate).unwrap();
+        assert_eq!(parsed.local_join_after_position, local_after);
+        assert_eq!(parsed.partner_join_after_position, partner_after);
+    }
+}
+
+#[test]
+fn symbolic_sv_strands_are_parsed_as_bounded_breakpoint_orientations() {
+    let fields = vec![VariantField {
+        key: "STRANDS".to_owned(),
+        value: VariantValue::Strings(vec!["+-:12,--:3,invalid".to_owned()]),
+        truncated: false,
+    }];
+    assert_eq!(
+        parse_breakpoint_orientations(&fields),
+        vec![
+            BreakpointOrientation {
+                local_join_after_position: true,
+                partner_join_after_position: false,
+                support: Some(12),
+            },
+            BreakpointOrientation {
+                local_join_after_position: false,
+                partner_join_after_position: false,
+                support: Some(3),
+            },
+        ]
+    );
 }
 
 #[test]

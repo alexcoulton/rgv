@@ -5,7 +5,10 @@ use bytemuck::{Pod, Zeroable};
 use std::path::Path;
 
 use image::{ImageError, RgbaImage};
-use rgv_layout::{DisplayList, RectPrimitive, TextPrimitive};
+use rgv_layout::{
+    Direction, DisplayList, RectPrimitive, RectShape, TextPrimitive, breakend_bracket_dimensions,
+    read_arrow_head_width,
+};
 use wgpu::util::DeviceExt;
 
 const RECTANGLE_SHADER: &str = include_str!("rectangle.wgsl");
@@ -33,7 +36,7 @@ impl From<RectPrimitive> for RectangleInstance {
                 value.color.alpha,
             ],
             object_id: value.object_id,
-            padding: [0; 3],
+            padding: [value.shape as u32, 0, 0],
         }
     }
 }
@@ -386,10 +389,54 @@ fn rasterize_rectangle(image: &mut RgbaImage, rectangle: RectPrimitive) {
         .clamp(0.0, image.height() as f32) as u32;
     for y in top..bottom {
         for x in left..right {
+            if !rectangle_contains_pixel(rectangle, x, y) {
+                continue;
+            }
             let destination = image.get_pixel_mut(x, y);
             blend_pixel(destination, rectangle.color, 1.0);
         }
     }
+}
+
+fn rectangle_contains_pixel(rectangle: RectPrimitive, x: u32, y: u32) -> bool {
+    let local_x = x as f32 + 0.5 - rectangle.x;
+    let local_y = y as f32 + 0.5 - rectangle.y;
+    if matches!(
+        rectangle.shape,
+        RectShape::BreakendJoinBefore | RectShape::BreakendJoinAfter
+    ) {
+        let (bar_width, stem_half_height) =
+            breakend_bracket_dimensions(rectangle.width, rectangle.height);
+        let in_bar = match rectangle.shape {
+            RectShape::BreakendJoinBefore => local_x <= bar_width,
+            RectShape::BreakendJoinAfter => local_x >= rectangle.width - bar_width,
+            _ => unreachable!(),
+        };
+        let in_stem = (local_y - rectangle.height * 0.5).abs() <= stem_half_height;
+        return in_bar || in_stem;
+    }
+    let Some(direction) = rectangle.shape.direction() else {
+        return true;
+    };
+    let terminal = matches!(
+        rectangle.shape,
+        RectShape::DirectionalTerminalLeft | RectShape::DirectionalTerminalRight
+    );
+    let head_width = if terminal {
+        read_arrow_head_width(rectangle.width, rectangle.height)
+    } else {
+        rectangle.width
+    };
+    let distance_from_tip = match direction {
+        Direction::Left => local_x,
+        Direction::Right => rectangle.width - local_x,
+    };
+    if distance_from_tip >= head_width {
+        return true;
+    }
+    let half_height = rectangle.height * 0.5;
+    let allowed_half_height = half_height * (distance_from_tip / head_width).clamp(0.0, 1.0);
+    (local_y - half_height).abs() <= allowed_half_height
 }
 
 #[cfg(test)]
@@ -414,6 +461,7 @@ mod tests {
             height: 4.0,
             color: Rgba::new(0.1, 0.2, 0.3, 0.4),
             object_id: 99,
+            shape: Default::default(),
         };
         let instance = RectangleInstance::from(primitive);
         assert!((instance.origin[0] - 1.0).abs() < f32::EPSILON);
@@ -421,6 +469,23 @@ mod tests {
         assert!((instance.size[0] - 3.0).abs() < f32::EPSILON);
         assert!((instance.size[1] - 4.0).abs() < f32::EPSILON);
         assert_eq!(instance.object_id, 99);
+        assert_eq!(instance.padding[0], 0);
+    }
+
+    #[test]
+    fn arrow_primitive_conversion_preserves_pick_id_and_encodes_direction() {
+        let primitive = RectPrimitive {
+            x: 1.0,
+            y: 2.0,
+            width: 12.0,
+            height: 6.0,
+            color: Rgba::new(0.1, 0.2, 0.3, 0.4),
+            object_id: 99,
+            shape: RectShape::DirectionalTerminalRight,
+        };
+        let instance = RectangleInstance::from(primitive);
+        assert_eq!(instance.object_id, 99);
+        assert_eq!(instance.padding[0], 2);
     }
 
     #[test]
@@ -447,6 +512,7 @@ mod tests {
             height: 4.0,
             color: Rgba::new(0.1, 0.2, 0.3, 0.4),
             object_id: 1,
+            shape: Default::default(),
         });
         let mut changed = instance;
         changed.object_id = 2;
@@ -472,6 +538,7 @@ mod tests {
                 height: 2.0,
                 color: Rgba::new(1.0, 0.0, 0.0, 1.0),
                 object_id: 0,
+                shape: Default::default(),
             }],
             texts: Vec::new(),
         };
@@ -479,6 +546,84 @@ mod tests {
         let decoded = image::open(path).unwrap().to_rgba8();
         assert_eq!(decoded.dimensions(), (8, 8));
         assert_eq!(decoded.get_pixel(2, 1).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn png_export_clips_directional_read_ends_without_moving_the_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("arrow.png");
+        let display = DisplayList {
+            rectangles: vec![RectPrimitive {
+                x: 1.0,
+                y: 1.0,
+                width: 12.0,
+                height: 6.0,
+                color: Rgba::new(1.0, 0.0, 0.0, 1.0),
+                object_id: 1,
+                shape: RectShape::DirectionalTerminalRight,
+            }],
+            texts: Vec::new(),
+        };
+        export_png(&display, 16, 8, &path).unwrap();
+        let decoded = image::open(path).unwrap().to_rgba8();
+        assert_eq!(decoded.get_pixel(11, 1).0, [255, 255, 255, 255]);
+        assert_eq!(decoded.get_pixel(11, 3).0, [255, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(2, 1).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn narrow_directional_reads_keep_a_rectangular_shoulder() {
+        let rectangle = RectPrimitive {
+            x: 1.0,
+            y: 1.0,
+            width: 12.0,
+            height: 30.0,
+            color: Rgba::new(1.0, 0.0, 0.0, 1.0),
+            object_id: 1,
+            shape: RectShape::DirectionalTerminalRight,
+        };
+        assert!(rectangle_contains_pixel(rectangle, 2, 1));
+        assert!(!rectangle_contains_pixel(rectangle, 11, 1));
+        assert!(rectangle_contains_pixel(rectangle, 11, 15));
+    }
+
+    #[test]
+    fn chevrons_are_triangular_without_inheriting_a_read_body() {
+        let chevron = RectPrimitive {
+            x: 0.0,
+            y: 0.0,
+            width: 6.0,
+            height: 6.0,
+            color: Rgba::new(1.0, 0.0, 0.0, 1.0),
+            object_id: 1,
+            shape: RectShape::ChevronRight,
+        };
+        assert!(rectangle_contains_pixel(chevron, 0, 0));
+        assert!(!rectangle_contains_pixel(chevron, 5, 0));
+        assert!(rectangle_contains_pixel(chevron, 4, 2));
+    }
+
+    #[test]
+    fn breakend_brackets_have_a_join_side_bar_and_neutral_stem() {
+        let before = RectPrimitive {
+            x: 0.0,
+            y: 0.0,
+            width: 8.0,
+            height: 8.0,
+            color: Rgba::new(1.0, 0.0, 0.0, 1.0),
+            object_id: 1,
+            shape: RectShape::BreakendJoinBefore,
+        };
+        let after = RectPrimitive {
+            shape: RectShape::BreakendJoinAfter,
+            ..before
+        };
+        assert!(rectangle_contains_pixel(before, 0, 0));
+        assert!(!rectangle_contains_pixel(before, 7, 0));
+        assert!(rectangle_contains_pixel(before, 7, 3));
+        assert!(!rectangle_contains_pixel(after, 0, 0));
+        assert!(rectangle_contains_pixel(after, 7, 0));
+        assert!(rectangle_contains_pixel(after, 0, 3));
     }
 
     #[test]
@@ -578,7 +723,7 @@ mod tests {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
         assert_eq!(
-            hash, 8_067_302_979_932_760_906,
+            hash, 14_537_395_103_464_253_144,
             "update only after reviewing an intentional alignment-event raster change"
         );
     }
@@ -710,7 +855,7 @@ mod tests {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
         assert_eq!(
-            hash, 12_478_327_628_286_139_074,
+            hash, 15_646_548_694_303_010_464,
             "update only after reviewing the Ultima insertion/deletion confidence raster"
         );
     }
@@ -813,7 +958,7 @@ mod tests {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
         assert_eq!(
-            hash, 4_573_482_968_793_436_903,
+            hash, 9_294_248_250_143_442_532,
             "update only after reviewing the short-, long-, spliced-, supplementary-, paired-, and deep-read fixture"
         );
     }

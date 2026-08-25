@@ -27,7 +27,19 @@ fn bed_blocks_are_rendered_as_connected_exons() {
     };
     let (display, stats) = layout_features(&[feature], viewport(), TrackLayoutOptions::default());
     assert_eq!(stats.rendered_records, 1);
-    assert_eq!(display.rectangles.len(), 3);
+    assert!(display.rectangles.len() > 3);
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::ChevronRight)
+    );
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::DirectionalTerminalRight)
+    );
 }
 
 #[test]
@@ -46,10 +58,85 @@ fn gene_models_render_utrs_thinner_than_coding_exons() {
         attributes: Vec::new(),
     };
     let (display, _) = layout_features(&[feature], viewport(), TrackLayoutOptions::default());
-    assert_eq!(display.rectangles.len(), 5);
+    assert!(display.rectangles.len() > 5);
     let exon_height = display.rectangles[1].height;
     let coding_height = display.rectangles[2].height;
     assert!(coding_height > exon_height);
+}
+
+#[test]
+fn reverse_transcripts_use_left_chevrons_and_unstranded_features_remain_neutral() {
+    let transcript = FeatureRecord {
+        contig: "chr1".to_owned(),
+        start: 110,
+        end: 190,
+        name: Some("reverse".to_owned()),
+        feature_type: Some("transcript".to_owned()),
+        score: None,
+        strand: Strand::Reverse,
+        blocks: vec![(110, 130), (170, 190)],
+        coding_interval: None,
+        peak: None,
+        attributes: Vec::new(),
+    };
+    let neutral = FeatureRecord {
+        strand: Strand::Unstranded,
+        name: Some("neutral".to_owned()),
+        start: 111,
+        end: 189,
+        blocks: vec![(111, 131), (169, 189)],
+        ..transcript.clone()
+    };
+    let (reverse, _) = layout_features(&[transcript], viewport(), TrackLayoutOptions::default());
+    assert!(
+        reverse
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::ChevronLeft)
+    );
+    assert!(
+        reverse
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::DirectionalTerminalLeft)
+    );
+    let (neutral, _) = layout_features(&[neutral], viewport(), TrackLayoutOptions::default());
+    assert!(
+        neutral
+            .rectangles
+            .iter()
+            .all(|rectangle| rectangle.shape == RectShape::Rectangle)
+    );
+}
+
+#[test]
+fn component_features_use_compact_chevrons_instead_of_full_terminal_wedges() {
+    let exon = FeatureRecord {
+        contig: "chr1".to_owned(),
+        start: 120,
+        end: 160,
+        name: Some("component-exon".to_owned()),
+        feature_type: Some("exon".to_owned()),
+        score: None,
+        strand: Strand::Forward,
+        blocks: Vec::new(),
+        coding_interval: None,
+        peak: None,
+        attributes: Vec::new(),
+    };
+    let (display, _) = layout_features(&[exon], viewport(), TrackLayoutOptions::default());
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::ChevronRight)
+    );
+    assert!(display.rectangles.iter().all(|rectangle| {
+        !matches!(
+            rectangle.shape,
+            RectShape::DirectionalTerminalLeft | RectShape::DirectionalTerminalRight
+        )
+    }));
 }
 
 #[test]
@@ -610,6 +697,190 @@ fn interaction_layout_draws_intrachromosomal_arcs_and_cross_contig_markers() {
     assert!(display.rectangles.len() >= INTERACTION_ARC_SEGMENTS + 4);
     assert_eq!(display.texts.len(), 2);
     assert!(display.texts[1].text.contains("chr2:501"));
+    assert!(display.texts[1].text.contains("->"));
+}
+
+#[test]
+fn cross_contig_undirected_interactions_use_a_neutral_join_label() {
+    let endpoint = |contig: &str, start| rgv_hts::InteractionEndpoint {
+        contig: contig.to_owned(),
+        start,
+        end: start + 4,
+        name: None,
+        strand: Strand::Unstranded,
+    };
+    let record = InteractionRecord {
+        source: endpoint("chr1", 120),
+        target: endpoint("chr2", 500),
+        name: None,
+        score: Some(1.0),
+        value: None,
+        experiment: None,
+        color: None,
+        directional: false,
+    };
+    let (display, _) = layout_interactions(
+        &[record],
+        "chr1",
+        viewport(),
+        TrackLayoutOptions::default(),
+        &InteractionTrackSettings::default(),
+    );
+    assert!(display.texts.iter().any(|text| text.text.contains("<->")));
+}
+
+#[test]
+fn directed_interactions_point_to_the_semantic_target_in_either_genomic_order() {
+    let endpoint = |start, strand| rgv_hts::InteractionEndpoint {
+        contig: "chr1".to_owned(),
+        start,
+        end: start + 4,
+        name: None,
+        strand,
+    };
+    let records = [
+        InteractionRecord {
+            source: endpoint(110, Strand::Forward),
+            target: endpoint(180, Strand::Reverse),
+            name: None,
+            score: Some(1.0),
+            value: None,
+            experiment: None,
+            color: None,
+            directional: true,
+        },
+        InteractionRecord {
+            source: endpoint(180, Strand::Reverse),
+            target: endpoint(110, Strand::Forward),
+            name: None,
+            score: Some(1.0),
+            value: None,
+            experiment: None,
+            color: None,
+            directional: true,
+        },
+    ];
+    for display_mode in [InteractionDisplayMode::Arcs, InteractionDisplayMode::Blocks] {
+        let (display, _) = layout_interactions(
+            &records,
+            "chr1",
+            viewport(),
+            TrackLayoutOptions::default(),
+            &InteractionTrackSettings {
+                display_mode,
+                show_labels: false,
+                ..InteractionTrackSettings::default()
+            },
+        );
+        let first_target = display.rectangles.iter().any(|rectangle| {
+            rectangle.object_id == TrackLayoutOptions::default().object_id_base
+                && rectangle.shape == RectShape::DirectionalTerminalRight
+        });
+        let second_target = display.rectangles.iter().any(|rectangle| {
+            rectangle.object_id == TrackLayoutOptions::default().object_id_base + 1
+                && rectangle.shape == RectShape::DirectionalTerminalLeft
+        });
+        assert!(first_target, "missing right target in {display_mode:?}");
+        assert!(second_target, "missing left target in {display_mode:?}");
+    }
+}
+
+#[test]
+fn directed_interactions_keep_an_outward_target_marker_when_the_target_is_clipped() {
+    let endpoint = |start, end| rgv_hts::InteractionEndpoint {
+        contig: "chr1".to_owned(),
+        start,
+        end,
+        name: None,
+        strand: Strand::Unstranded,
+    };
+    let records = [
+        InteractionRecord {
+            source: endpoint(130, 134),
+            target: endpoint(80, 90),
+            name: None,
+            score: Some(1.0),
+            value: None,
+            experiment: None,
+            color: None,
+            directional: true,
+        },
+        InteractionRecord {
+            source: endpoint(160, 164),
+            target: endpoint(210, 220),
+            name: None,
+            score: Some(1.0),
+            value: None,
+            experiment: None,
+            color: None,
+            directional: true,
+        },
+    ];
+    let (display, _) = layout_interactions(
+        &records,
+        "chr1",
+        viewport(),
+        TrackLayoutOptions::default(),
+        &InteractionTrackSettings {
+            show_labels: false,
+            ..InteractionTrackSettings::default()
+        },
+    );
+    let object_id_base = TrackLayoutOptions::default().object_id_base;
+    assert!(display.rectangles.iter().any(|rectangle| {
+        rectangle.object_id == object_id_base && rectangle.shape == RectShape::ChevronLeft
+    }));
+    assert!(display.rectangles.iter().any(|rectangle| {
+        rectangle.object_id == object_id_base + 1 && rectangle.shape == RectShape::ChevronRight
+    }));
+}
+
+#[test]
+fn undirected_interactions_use_endpoint_strands_without_inventing_source_target_direction() {
+    let record = InteractionRecord {
+        source: rgv_hts::InteractionEndpoint {
+            contig: "chr1".to_owned(),
+            start: 110,
+            end: 114,
+            name: None,
+            strand: Strand::Forward,
+        },
+        target: rgv_hts::InteractionEndpoint {
+            contig: "chr1".to_owned(),
+            start: 180,
+            end: 184,
+            name: None,
+            strand: Strand::Reverse,
+        },
+        name: None,
+        score: Some(1.0),
+        value: None,
+        experiment: None,
+        color: None,
+        directional: false,
+    };
+    let (display, _) = layout_interactions(
+        &[record],
+        "chr1",
+        viewport(),
+        TrackLayoutOptions::default(),
+        &InteractionTrackSettings {
+            show_labels: false,
+            ..InteractionTrackSettings::default()
+        },
+    );
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::DirectionalTerminalRight)
+    );
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::DirectionalTerminalLeft)
+    );
 }
 
 #[test]
@@ -683,6 +954,7 @@ fn genotype_colour_uses_selected_cohort_calls_instead_of_variant_type() {
         }],
         variant_types: vec![rgv_hts::VariantType::Snv],
         breakends: Vec::new(),
+        breakpoint_orientations: Vec::new(),
     };
     assert_eq!(genotype_color(&record), Rgba::new(0.94, 0.54, 0.12, 0.96));
     let settings = VariantTrackSettings {
@@ -700,6 +972,237 @@ fn genotype_colour_uses_selected_cohort_calls_instead_of_variant_type() {
         display.rectangles[1].color,
         Rgba::new(0.94, 0.54, 0.12, 0.96)
     );
+}
+
+#[test]
+fn breakend_and_symbolic_sv_orientation_reaches_layout_shapes() {
+    let breakend = VariantRecord {
+        contig: "chr1".to_owned(),
+        start: 120,
+        end: 121,
+        id: Some("bnd".to_owned()),
+        reference: b"N".to_vec(),
+        alternates: vec![b"N]chr1:181]".to_vec()],
+        quality: None,
+        filters: Vec::new(),
+        info: Vec::new(),
+        genotypes: Vec::new(),
+        variant_types: vec![rgv_hts::VariantType::Breakend],
+        breakends: vec![rgv_hts::BreakendPartner {
+            alternate_index: 0,
+            contig: "chr1".to_owned(),
+            position: 180,
+            local_join_after_position: true,
+            partner_join_after_position: false,
+        }],
+        breakpoint_orientations: Vec::new(),
+    };
+    let symbolic = VariantRecord {
+        start: 130,
+        end: 170,
+        id: Some("inv".to_owned()),
+        alternates: vec![b"<INV>".to_vec()],
+        variant_types: vec![rgv_hts::VariantType::Inversion],
+        breakends: Vec::new(),
+        breakpoint_orientations: vec![rgv_hts::BreakpointOrientation {
+            local_join_after_position: false,
+            partner_join_after_position: true,
+            support: Some(8),
+        }],
+        ..breakend.clone()
+    };
+    let (display, _) = layout_variants(
+        &[breakend, symbolic],
+        viewport(),
+        TrackLayoutOptions::default(),
+        &VariantTrackSettings::default(),
+    );
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::BreakendJoinAfter)
+    );
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::BreakendJoinBefore)
+    );
+}
+
+#[test]
+fn every_breakend_join_side_combination_reaches_both_display_endpoints() {
+    let join_sides = [(false, false), (false, true), (true, false), (true, true)];
+    let records = join_sides
+        .iter()
+        .enumerate()
+        .map(
+            |(index, &(local_join_after_position, partner_join_after_position))| {
+                let start = 110 + u64::try_from(index).unwrap() * 10;
+                let partner_position = 170 + u64::try_from(index).unwrap() * 5;
+                VariantRecord {
+                    contig: "chr1".to_owned(),
+                    start,
+                    end: start + 1,
+                    id: Some(format!("bnd-{index}")),
+                    reference: b"N".to_vec(),
+                    alternates: vec![b"N]chr1:181]".to_vec()],
+                    quality: None,
+                    filters: Vec::new(),
+                    info: Vec::new(),
+                    genotypes: Vec::new(),
+                    variant_types: vec![rgv_hts::VariantType::Breakend],
+                    breakends: vec![rgv_hts::BreakendPartner {
+                        alternate_index: 0,
+                        contig: "chr1".to_owned(),
+                        position: partner_position,
+                        local_join_after_position,
+                        partner_join_after_position,
+                    }],
+                    breakpoint_orientations: Vec::new(),
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    let options = TrackLayoutOptions::default();
+    let (display, _) = layout_variants(
+        &records,
+        viewport(),
+        options,
+        &VariantTrackSettings::default(),
+    );
+
+    for (index, &(local_after, partner_after)) in join_sides.iter().enumerate() {
+        let object_id = options.object_id_base + u32::try_from(index).unwrap();
+        let shapes = display
+            .rectangles
+            .iter()
+            .filter(|rectangle| rectangle.object_id == object_id)
+            .map(|rectangle| rectangle.shape)
+            .collect::<Vec<_>>();
+        let local_shape = if local_after {
+            RectShape::BreakendJoinAfter
+        } else {
+            RectShape::BreakendJoinBefore
+        };
+        let partner_shape = if partner_after {
+            RectShape::BreakendJoinAfter
+        } else {
+            RectShape::BreakendJoinBefore
+        };
+        assert!(shapes.contains(&local_shape));
+        assert!(shapes.contains(&partner_shape));
+        if local_shape == partner_shape {
+            assert!(shapes.iter().filter(|shape| **shape == local_shape).count() >= 2);
+        }
+    }
+}
+
+#[test]
+fn offscreen_breakend_label_keeps_both_join_sides_inside_the_viewport() {
+    let record = VariantRecord {
+        contig: "chr1".to_owned(),
+        start: 100,
+        end: 101,
+        id: Some("edge-bnd".to_owned()),
+        reference: b"N".to_vec(),
+        alternates: vec![b"N]chr1:301]".to_vec()],
+        quality: None,
+        filters: Vec::new(),
+        info: Vec::new(),
+        genotypes: Vec::new(),
+        variant_types: vec![rgv_hts::VariantType::Breakend],
+        breakends: vec![rgv_hts::BreakendPartner {
+            alternate_index: 0,
+            contig: "chr1".to_owned(),
+            position: 300,
+            local_join_after_position: true,
+            partner_join_after_position: false,
+        }],
+        breakpoint_orientations: Vec::new(),
+    };
+    let (display, _) = layout_variants(
+        &[record],
+        viewport(),
+        TrackLayoutOptions::default(),
+        &VariantTrackSettings::default(),
+    );
+    let label = display.texts.first().expect("offscreen partner label");
+    assert!(label.text.contains("ALT 1 after <-> chr1:301 before"));
+    let approximate_half_width = label.text.chars().count() as f32 * label.font_size * 0.31;
+    assert!(label.x >= approximate_half_width);
+    assert!(label.x + approximate_half_width <= viewport().pixel_width() as f32);
+    assert!(display.rectangles.iter().any(|rectangle| {
+        rectangle.shape == RectShape::BreakendJoinBefore
+            && rectangle.x + rectangle.width >= viewport().pixel_width() as f32
+    }));
+}
+
+#[test]
+fn multiple_offscreen_and_cross_contig_breakend_partners_get_bounded_edge_markers() {
+    let record = VariantRecord {
+        contig: "chr1".to_owned(),
+        start: 150,
+        end: 151,
+        id: Some("multi-bnd".to_owned()),
+        reference: b"N".to_vec(),
+        alternates: vec![
+            b"]chr1:51]N".to_vec(),
+            b"N[chr1:251[".to_vec(),
+            b"N]chr2:401]".to_vec(),
+        ],
+        quality: None,
+        filters: Vec::new(),
+        info: Vec::new(),
+        genotypes: Vec::new(),
+        variant_types: vec![rgv_hts::VariantType::Breakend],
+        breakends: vec![
+            rgv_hts::BreakendPartner {
+                alternate_index: 0,
+                contig: "chr1".to_owned(),
+                position: 50,
+                local_join_after_position: false,
+                partner_join_after_position: true,
+            },
+            rgv_hts::BreakendPartner {
+                alternate_index: 1,
+                contig: "chr1".to_owned(),
+                position: 250,
+                local_join_after_position: true,
+                partner_join_after_position: false,
+            },
+            rgv_hts::BreakendPartner {
+                alternate_index: 2,
+                contig: "chr2".to_owned(),
+                position: 400,
+                local_join_after_position: true,
+                partner_join_after_position: true,
+            },
+        ],
+        breakpoint_orientations: Vec::new(),
+    };
+    let (display, _) = layout_variants(
+        &[record],
+        viewport(),
+        TrackLayoutOptions::default(),
+        &VariantTrackSettings::default(),
+    );
+    assert_eq!(display.texts.len(), 3);
+    assert!(display.texts[0].text.starts_with("ALT 1 before"));
+    assert!(display.texts[1].text.starts_with("ALT 2 after"));
+    assert!(display.texts[2].text.starts_with("ALT 3 after"));
+    assert!(display.rectangles.iter().any(|rectangle| {
+        rectangle.x == 0.0 && rectangle.shape == RectShape::BreakendJoinAfter
+    }));
+    assert!(display.rectangles.iter().any(|rectangle| {
+        rectangle.x + rectangle.width >= viewport().pixel_width() as f32
+            && rectangle.shape == RectShape::BreakendJoinBefore
+    }));
+    assert!(display.rectangles.iter().any(|rectangle| {
+        rectangle.x + rectangle.width >= viewport().pixel_width() as f32
+            && rectangle.shape == RectShape::BreakendJoinAfter
+    }));
 }
 
 #[test]

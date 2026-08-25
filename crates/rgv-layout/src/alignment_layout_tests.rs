@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{READ_DETAIL_OBJECT_BIT, record_object_id};
+use crate::{READ_DETAIL_OBJECT_BIT, RectShape, record_object_id};
 use rgv_core::{ContigId, GenomicInterval};
 use rgv_hts::{
     AlignmentBatch, AlignmentFlags, AlignmentHeaderMetadata, AlignmentReadGroup, AlignmentRecord,
@@ -1229,6 +1229,197 @@ fn pair_view_packs_both_ends_as_one_row_and_one_pick_target() {
         })
         .count();
     assert_eq!(connectors, 1);
+    let terminal_shapes = layout
+        .display_list
+        .rectangles
+        .iter()
+        .filter(|primitive| record_object_id(primitive.object_id) == 1)
+        .map(|primitive| primitive.shape)
+        .collect::<Vec<_>>();
+    assert!(terminal_shapes.contains(&RectShape::DirectionalTerminalRight));
+    assert!(terminal_shapes.contains(&RectShape::DirectionalTerminalLeft));
+}
+
+#[test]
+fn reads_keep_direction_when_pair_view_is_disabled() {
+    let mut record = row_test_record(b"pair", 10, 20);
+    record.flags = AlignmentFlags::from_bits(0x41);
+    record.mate_contig = Some(record.contig);
+    record.mate_start = Some(50);
+    let query = row_test_query(&[record]);
+    let viewport = Viewport::new(query.interval, 800.0).unwrap();
+    let layout = layout_alignment_query(&query, viewport, AlignmentLayoutOptions::default());
+    assert!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .any(|primitive| primitive.shape == RectShape::DirectionalTerminalRight)
+    );
+}
+
+#[test]
+fn paired_read_direction_survives_the_regional_detail_boundary() {
+    let mut record = row_test_record(b"regional-pair", 40, 160);
+    record.flags = AlignmentFlags::from_bits(0x41);
+    record.mate_contig = Some(record.contig);
+    record.mate_start = Some(170);
+    let query = row_test_query(&[record]);
+    let viewport = Viewport::new(query.interval, 10.0).unwrap();
+    assert_eq!(viewport.detail_level(), DetailLevel::Regional);
+    let layout = layout_alignment_query(
+        &query,
+        viewport,
+        AlignmentLayoutOptions {
+            view_as_pairs: true,
+            ..AlignmentLayoutOptions::default()
+        },
+    );
+    assert!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .any(|primitive| { primitive.shape == RectShape::DirectionalTerminalRight })
+    );
+}
+
+#[test]
+fn unpaired_reverse_read_keeps_direction_at_regional_detail() {
+    let mut record = row_test_record(b"regional-reverse", 40, 160);
+    record.flags = AlignmentFlags::from_bits(0x10);
+    let query = row_test_query(&[record]);
+    let viewport = Viewport::new(query.interval, 10.0).unwrap();
+    assert_eq!(viewport.detail_level(), DetailLevel::Regional);
+    let layout = layout_alignment_query(&query, viewport, AlignmentLayoutOptions::default());
+    assert!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .any(|primitive| primitive.shape == RectShape::DirectionalTerminalLeft)
+    );
+}
+
+#[test]
+fn clipped_alignment_edges_are_not_presented_as_biological_terminals() {
+    let forward = row_test_record(b"clipped-forward", 40, 160);
+    let mut reverse = row_test_record(b"clipped-reverse", 40, 160);
+    reverse.flags = AlignmentFlags::from_bits(0x10);
+    let query = row_test_query(&[forward, reverse]);
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 50, 150).unwrap(),
+        500.0,
+    )
+    .unwrap();
+    let layout = layout_alignment_query(&query, viewport, AlignmentLayoutOptions::default());
+    assert!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .all(|primitive| primitive.shape == RectShape::Rectangle)
+    );
+}
+
+#[test]
+fn every_alignment_class_keeps_its_biological_terminal() {
+    let primary = row_test_record(b"primary", 10, 30);
+
+    let mut secondary = row_test_record(b"secondary", 35, 55);
+    secondary.flags = AlignmentFlags::from_bits(0x110);
+
+    let mut supplementary = row_test_record(b"supplementary", 60, 80);
+    supplementary.flags = AlignmentFlags::from_bits(0x800);
+
+    let mut paired = row_test_record(b"paired", 85, 105);
+    paired.flags = AlignmentFlags::from_bits(0x51);
+    paired.mate_contig = Some(paired.contig);
+    paired.mate_start = Some(150);
+
+    let long = row_test_record(b"long", 10, 190);
+
+    let mut spliced = row_test_record(b"spliced", 100, 180);
+    spliced.cigar = vec![
+        CigarOp {
+            kind: CigarOpKind::Match,
+            len: 20,
+        },
+        CigarOp {
+            kind: CigarOpKind::ReferenceSkip,
+            len: 40,
+        },
+        CigarOp {
+            kind: CigarOpKind::Match,
+            len: 20,
+        },
+    ];
+
+    let records = [primary, secondary, supplementary, paired, long, spliced];
+    let query = row_test_query(&records);
+    let viewport = Viewport::new(query.interval, 800.0).unwrap();
+    let layout = layout_alignment_query(&query, viewport, AlignmentLayoutOptions::default());
+
+    let expected = [
+        RectShape::DirectionalTerminalRight,
+        RectShape::DirectionalTerminalLeft,
+        RectShape::DirectionalTerminalRight,
+        RectShape::DirectionalTerminalLeft,
+        RectShape::DirectionalTerminalRight,
+        RectShape::DirectionalTerminalRight,
+    ];
+    for (record_index, expected_shape) in expected.into_iter().enumerate() {
+        let object_id = u32::try_from(record_index + 1).unwrap();
+        assert!(layout.display_list.rectangles.iter().any(|primitive| {
+            record_object_id(primitive.object_id) == object_id && primitive.shape == expected_shape
+        }));
+    }
+
+    let spliced_object_id = u32::try_from(records.len()).unwrap();
+    let spliced_terminals = layout
+        .display_list
+        .rectangles
+        .iter()
+        .filter(|primitive| {
+            record_object_id(primitive.object_id) == spliced_object_id
+                && primitive.shape == RectShape::DirectionalTerminalRight
+        })
+        .collect::<Vec<_>>();
+    assert!(!spliced_terminals.is_empty());
+    assert!(spliced_terminals.iter().all(|primitive| {
+        primitive.x + primitive.width > viewport.pixel_at_genomic(179) as f32
+    }));
+}
+
+#[test]
+fn alignment_direction_is_continuous_across_bases_reads_and_regional_thresholds() {
+    let forward = row_test_record(b"forward", 40, 160);
+    let mut reverse = row_test_record(b"reverse", 40, 160);
+    reverse.flags = AlignmentFlags::from_bits(0x10);
+    let query = row_test_query(&[forward, reverse]);
+
+    for (bases_per_pixel, expected_detail) in [
+        (0.124, DetailLevel::Bases),
+        (0.126, DetailLevel::Reads),
+        (9.99, DetailLevel::Reads),
+        (10.01, DetailLevel::Regional),
+    ] {
+        let viewport = Viewport::new(
+            query.interval,
+            query.interval.len() as f64 / bases_per_pixel,
+        )
+        .unwrap();
+        assert_eq!(viewport.detail_level(), expected_detail);
+        let layout = layout_alignment_query(&query, viewport, AlignmentLayoutOptions::default());
+        assert!(layout.display_list.rectangles.iter().any(|primitive| {
+            record_object_id(primitive.object_id) == 1
+                && primitive.shape == RectShape::DirectionalTerminalRight
+        }));
+        assert!(layout.display_list.rectangles.iter().any(|primitive| {
+            record_object_id(primitive.object_id) == 2
+                && primitive.shape == RectShape::DirectionalTerminalLeft
+        }));
+    }
 }
 
 #[test]
@@ -2101,8 +2292,8 @@ fn junction_lane_renders_bounded_strand_aware_full_evidence() {
         ..AlignmentLayoutOptions::default()
     };
     let layout = layout_alignment_query(&query, viewport, options);
-    assert_eq!(layout.display_list.rectangles.len(), 6);
-    assert_eq!(layout.pinned_rectangle_count, 6);
+    assert_eq!(layout.display_list.rectangles.len(), 8);
+    assert_eq!(layout.pinned_rectangle_count, 8);
     assert_eq!(layout.stats.rendered_junctions, 2);
     assert_eq!(layout.stats.hidden_junctions, 0);
     assert_eq!(layout.stats.maximum_junction_depth, 9);
@@ -2111,8 +2302,16 @@ fn junction_lane_renders_bounded_strand_aware_full_evidence() {
         Rgba::new(0.84, 0.30, 0.38, 0.88)
     );
     assert_eq!(
-        layout.display_list.rectangles[3].color,
+        layout.display_list.rectangles[4].color,
         Rgba::new(0.25, 0.45, 0.82, 0.88)
+    );
+    assert_eq!(
+        layout.display_list.rectangles[3].shape,
+        RectShape::ChevronRight
+    );
+    assert_eq!(
+        layout.display_list.rectangles[7].shape,
+        RectShape::ChevronLeft
     );
     assert_eq!(query.junctions.provenance.eligible_records, 13);
 
@@ -2125,7 +2324,7 @@ fn junction_lane_renders_bounded_strand_aware_full_evidence() {
             ..options
         },
     );
-    assert_eq!(filtered.display_list.rectangles.len(), 3);
+    assert_eq!(filtered.display_list.rectangles.len(), 4);
     assert_eq!(filtered.stats.rendered_junctions, 1);
     assert_eq!(filtered.stats.hidden_junctions, 1);
     assert!(
@@ -2193,7 +2392,7 @@ fn sashimi_layout_applies_exact_cpm_fixed_scale_and_expanded_rows() {
     assert!((layout.stats.maximum_junction_value - 8.0).abs() < f64::EPSILON);
     assert!(layout.stats.junction_normalization_available);
     assert!(
-        (layout.display_list.rectangles[0].y - layout.display_list.rectangles[3].y).abs()
+        (layout.display_list.rectangles[0].y - layout.display_list.rectangles[4].y).abs()
             > f32::EPSILON
     );
     assert_eq!(layout.display_list.texts.len(), 2);
@@ -2214,13 +2413,13 @@ fn sashimi_layout_applies_exact_cpm_fixed_scale_and_expanded_rows() {
         &rows,
         Some(&annotations),
     );
-    assert_eq!(annotated_layout.display_list.rectangles.len(), 8);
+    assert_eq!(annotated_layout.display_list.rectangles.len(), 10);
     assert_eq!(
-        annotated_layout.display_list.rectangles[3].color,
+        annotated_layout.display_list.rectangles[4].color,
         Rgba::new(0.16, 0.58, 0.28, 1.0)
     );
     assert_eq!(
-        annotated_layout.display_list.rectangles[7].color,
+        annotated_layout.display_list.rectangles[9].color,
         Rgba::new(0.92, 0.48, 0.10, 1.0)
     );
 
@@ -2274,11 +2473,70 @@ fn high_density_sashimi_output_has_hard_arc_and_label_caps() {
     );
     assert_eq!(
         layout.display_list.rectangles.len(),
-        MAX_RENDERED_JUNCTIONS * 3
+        MAX_RENDERED_JUNCTIONS * 4
     );
     assert_eq!(
         layout.display_list.texts.len(),
         MAX_RENDERED_JUNCTION_LABELS
+    );
+}
+
+#[test]
+fn mixed_junctions_render_both_directions_and_unknown_junctions_remain_neutral() {
+    let summary = JunctionSummary {
+        junctions: vec![
+            JunctionEvidence {
+                start: 20,
+                end: 80,
+                depth: 7,
+                positive_depth: 4,
+                negative_depth: 3,
+                ..JunctionEvidence::default()
+            },
+            JunctionEvidence {
+                start: 100,
+                end: 180,
+                depth: 5,
+                unknown_depth: 5,
+                ..JunctionEvidence::default()
+            },
+        ],
+        ..JunctionSummary::default()
+    };
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 0, 200).unwrap(),
+        1_000.0,
+    )
+    .unwrap();
+    let layout = layout_sashimi(
+        &summary,
+        viewport,
+        AlignmentLayoutOptions {
+            show_junctions: true,
+            junction_top: 0.0,
+            junction_height: 100.0,
+            show_junction_labels: false,
+            ..AlignmentLayoutOptions::default()
+        },
+        None,
+    );
+    assert_eq!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .filter(|rectangle| rectangle.shape == RectShape::ChevronLeft)
+            .count(),
+        1
+    );
+    assert_eq!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .filter(|rectangle| rectangle.shape == RectShape::ChevronRight)
+            .count(),
+        1
     );
 }
 

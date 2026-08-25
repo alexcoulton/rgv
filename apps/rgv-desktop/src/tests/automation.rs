@@ -127,6 +127,7 @@ fn active_panel_snapshot_cropping_clips_and_rebases_semantic_primitives() {
                 height: 30.0,
                 color: Rgba::new(0.1, 0.2, 0.3, 1.0),
                 object_id: 7,
+                shape: Default::default(),
             },
             RectPrimitive {
                 x: 200.0,
@@ -135,6 +136,7 @@ fn active_panel_snapshot_cropping_clips_and_rebases_semantic_primitives() {
                 height: 10.0,
                 color: Rgba::new(0.2, 0.3, 0.4, 1.0),
                 object_id: 8,
+                shape: Default::default(),
             },
         ],
         texts: vec![rgv_layout::TextPrimitive {
@@ -168,6 +170,7 @@ fn automation_svg_is_deterministic_bounded_and_xml_escaped() {
             height: 4.0,
             color: Rgba::new(1.0, 0.0, 0.0, 0.5),
             object_id: 0,
+            shape: Default::default(),
         }],
         texts: vec![rgv_layout::TextPrimitive {
             x: 5.0,
@@ -184,6 +187,48 @@ fn automation_svg_is_deterministic_bounded_and_xml_escaped() {
     assert!(first.len() < MAX_AUTOMATION_EXPORT_BYTES);
     assert!(first.contains("sample &lt;private&gt; &amp; safe"));
     assert!(first.contains("A&lt;&amp;"));
+}
+
+#[test]
+fn automation_svg_exports_semantic_direction_shapes_as_polygons() {
+    let display = DisplayList {
+        rectangles: vec![RectPrimitive {
+            x: 10.0,
+            y: 10.0,
+            width: 8.0,
+            height: 6.0,
+            color: Rgba::new(0.2, 0.4, 0.8, 1.0),
+            object_id: 77,
+            shape: rgv_layout::RectShape::ChevronLeft,
+        }],
+        texts: Vec::new(),
+    };
+    let svg = display_list_svg_export(&display, 100, 80, "direction");
+    assert!(svg.contains("<polygon"));
+    assert!(!svg.contains("object_id"));
+}
+
+#[test]
+fn automation_svg_exports_breakends_as_brackets_instead_of_arrows() {
+    let display = DisplayList {
+        rectangles: vec![RectPrimitive {
+            x: 10.0,
+            y: 10.0,
+            width: 8.0,
+            height: 8.0,
+            color: Rgba::new(0.8, 0.2, 0.4, 1.0),
+            object_id: 77,
+            shape: rgv_layout::RectShape::BreakendJoinBefore,
+        }],
+        texts: Vec::new(),
+    };
+    let svg = display_list_svg_export(&display, 100, 80, "breakend");
+    assert_eq!(
+        svg.matches("<rect").count(),
+        3,
+        "background plus bracket parts"
+    );
+    assert!(!svg.contains("<polygon"));
 }
 
 #[test]
@@ -352,6 +397,7 @@ fn automation_structured_exports_preserve_active_interval_semantics() {
                 }],
                 variant_types: vec![rgv_hts::VariantType::Snv],
                 breakends: Vec::new(),
+                breakpoint_orientations: Vec::new(),
             }],
             provenance: rgv_hts::VariantQueryProvenance {
                 records_examined: 1,
