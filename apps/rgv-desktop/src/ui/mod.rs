@@ -21,10 +21,11 @@ pub use navigation::{
 pub use status::status_bar;
 pub use tracks::{
     AlignmentSubtrack, ScrollbarInteraction, ScrollbarOverview, TrackFrame, TrackFrameKey,
-    TrackSubtrack, TrackUiAction, frame_content_y_at_screen_y, keyboard_reorder_index,
-    paint_annotation_scrollbar, paint_genomic_text, paint_track_viewport_chrome,
-    paint_vertical_scrollbar, resized_annotation_track_height, resized_read_pane_height,
-    resized_read_track_height, resized_track_height, scrollbar_fraction_at_grab,
+    TrackGroupChrome, TrackPane, TrackSubtrack, TrackUiAction, frame_content_y_at_screen_y,
+    keyboard_reorder_index, paint_genomic_text, paint_read_panel_scrollbar,
+    paint_track_viewport_chrome_with_groups, paint_workspace_annotation_scrollbar,
+    resized_annotation_track_height, resized_read_pane_height, resized_read_track_height,
+    resized_track_height, scrollbar_fraction_at_grab,
     scrollbar_geometry_for_density_at_fraction_in_viewport,
     scrollbar_geometry_for_density_in_viewport, scrollbar_offset_at_grab, scrollbar_overview,
     track_drop_index,
@@ -35,6 +36,45 @@ pub const NAVIGATION_HEIGHT: f32 = 38.0;
 pub const STATUS_HEIGHT: f32 = 24.0;
 pub const TRACK_GUTTER_WIDTH: f32 = 168.0;
 pub const SCROLLBAR_WIDTH: f32 = 22.0;
+
+/// Full horizontal cell owned by one workspace, including its scrollbar.
+pub fn workspace_column_rect(geometry: CanvasGeometry, index: usize, count: usize) -> egui::Rect {
+    let count = count.max(1);
+    let left_edge = geometry.gutter.right();
+    let right_edge = geometry.viewport.right();
+    let width = (right_edge - left_edge) / count as f32;
+    let left = left_edge + index.min(count - 1) as f32 * width;
+    let right = if index + 1 >= count {
+        right_edge
+    } else {
+        left + width
+    };
+    egui::Rect::from_min_max(
+        egui::pos2(left, geometry.viewport.top()),
+        egui::pos2(right, geometry.viewport.bottom()),
+    )
+}
+
+pub fn workspace_genomic_rect(geometry: CanvasGeometry, index: usize, count: usize) -> egui::Rect {
+    let column = workspace_column_rect(geometry, index, count);
+    egui::Rect::from_min_max(
+        column.min,
+        egui::pos2(
+            (column.right() - SCROLLBAR_WIDTH).max(column.left() + 1.0),
+            column.bottom(),
+        ),
+    )
+}
+
+pub fn workspace_scrollbar_rect(
+    geometry: CanvasGeometry,
+    index: usize,
+    count: usize,
+) -> egui::Rect {
+    let column = workspace_column_rect(geometry, index, count);
+    let genomic = workspace_genomic_rect(geometry, index, count);
+    egui::Rect::from_min_max(egui::pos2(genomic.right(), column.top()), column.max)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CanvasGeometry {
@@ -143,6 +183,23 @@ mod tests {
         assert_eq!(geometry.annotation_scrollbar, geometry.scrollbar);
         assert!(geometry.genomic.width() > 1_000.0);
         assert!((geometry.genomic.top() - geometry.viewport.top()).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn split_workspaces_each_reserve_their_own_scrollbar() {
+        let geometry = CanvasGeometry::initial(1_280.0, 800.0);
+        let first = workspace_genomic_rect(geometry, 0, 2);
+        let first_scrollbar = workspace_scrollbar_rect(geometry, 0, 2);
+        let second = workspace_genomic_rect(geometry, 1, 2);
+        let second_scrollbar = workspace_scrollbar_rect(geometry, 1, 2);
+
+        assert_eq!(first.right(), first_scrollbar.left());
+        assert_eq!(first_scrollbar.right(), second.left());
+        assert_eq!(second.right(), second_scrollbar.left());
+        assert_eq!(second_scrollbar.right(), geometry.viewport.right());
+        assert_eq!(first_scrollbar.width(), SCROLLBAR_WIDTH);
+        assert_eq!(second_scrollbar.width(), SCROLLBAR_WIDTH);
+        assert_eq!(first.width(), second.width());
     }
 
     #[test]

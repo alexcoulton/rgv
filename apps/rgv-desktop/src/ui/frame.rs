@@ -36,6 +36,31 @@ fn alignment_subtrack_menu(
     }
 }
 
+#[derive(Clone)]
+struct ReadPanelScrollbarDraft {
+    track_id: TrackId,
+    top: f32,
+    bottom: f32,
+    maximum: f32,
+    offset: f32,
+    density: f32,
+    preview_fraction: Option<f32>,
+    overview: ui::ScrollbarOverview,
+    interaction: ui::ScrollbarInteraction,
+}
+
+#[derive(Clone)]
+struct WorkspaceScrollbarsDraft {
+    index: usize,
+    panel_id: PanelId,
+    annotation_maximum: f32,
+    annotation_offset: f32,
+    annotation_overview: Option<ui::ScrollbarOverview>,
+    annotation_clip_bottom: f32,
+    annotation_interaction: ui::ScrollbarInteraction,
+    read_panels: Vec<ReadPanelScrollbarDraft>,
+}
+
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(super) fn render_shell_frame(
@@ -179,14 +204,29 @@ impl Viewer {
         let mut filter_expression = settings_filter_editor.expression.clone();
         let filter_error = settings_filter_editor.error.clone();
         let mut apply_filter = false;
-        let bulk_alignment_ids = editing_alignment_id
-            .filter(|id| {
-                self.panels.active().selected_alignment_tracks.len() > 1
-                    && self.panels.active().selected_alignment_tracks.contains(id)
-            })
-            .map_or_else(Vec::new, |_| {
-                self.panels.active().selected_alignment_tracks.clone()
-            });
+        let (bulk_alignment_ids, bulk_alignment_pane) = editing_alignment_id.map_or_else(
+            || (Vec::new(), None),
+            |id| {
+                let panel = self.panels.active();
+                if panel.selected_alignment_tracks.len() > 1
+                    && panel.selected_alignment_tracks.contains(&id)
+                {
+                    (
+                        panel.selected_alignment_tracks.clone(),
+                        Some(ui::TrackPane::Annotation),
+                    )
+                } else if panel.selected_read_tracks.len() > 1
+                    && panel.selected_read_tracks.contains(&id)
+                {
+                    (
+                        panel.selected_read_tracks.clone(),
+                        Some(ui::TrackPane::Reads),
+                    )
+                } else {
+                    (Vec::new(), None)
+                }
+            },
+        );
         let mut apply_bulk_alignment_appearance = false;
         let mut bulk_alignment_visibility = None;
         let mut bulk_alignment_collapsed = None;
@@ -398,45 +438,94 @@ impl Viewer {
         let mut reduced_motion = self.settings.reduced_motion;
         let recent_loci = self.settings.recent_loci.clone();
         let current_session_path = self.current_session_path.clone();
-        let maximum_vertical_scroll = (self.panels.active().content_bottom_points
-            - self.canvas_geometry.viewport.bottom())
-        .max(0.0);
-        let mut vertical_scroll_points = self
-            .panels
-            .active()
-            .vertical_scroll_points
-            .clamp(0.0, maximum_vertical_scroll);
-        let maximum_annotation_scroll = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(0.0, |cache| {
-                (cache.annotation_content_bottom - cache.annotation_clip_bottom).max(0.0)
-            });
-        let mut annotation_scroll_points = self
-            .panels
-            .active()
-            .annotation_scroll_points
-            .clamp(0.0, maximum_annotation_scroll);
         let mut clear_recent_requested = false;
         let mut recent_alignment_requested = None;
         let mut recent_session_requested = None;
         let mut recent_locus_requested = None;
         let mut new_canvas_geometry = self.canvas_geometry;
         let track_frames = self.panels.active().track_frames.clone();
-        let scrollbar_overview = self
+        let track_groups = self.alignment_track_group_chrome();
+        let bulk_alignment_group = track_groups.iter().find(|group| {
+            bulk_alignment_pane == Some(group.pane)
+                && bulk_alignment_ids.len() > 1
+                && bulk_alignment_ids.len() == group.members.len()
+                && bulk_alignment_ids
+                    .iter()
+                    .all(|id| group.members.contains(id))
+        });
+        let mut workspace_scrollbars = self
             .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map(|cache| cache.overview.clone());
-        let annotation_scrollbar_overview = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map(|cache| cache.annotation_overview.clone());
+            .iter()
+            .enumerate()
+            .map(|(index, panel)| {
+                let annotation_maximum = panel.scroll_display_cache.as_ref().map_or(0.0, |cache| {
+                    (cache.annotation_content_bottom - cache.annotation_clip_bottom).max(0.0)
+                });
+                let annotation_clip_bottom = panel
+                    .scroll_display_cache
+                    .as_ref()
+                    .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                        cache.annotation_clip_bottom
+                    });
+                let read_panels = panel
+                    .scroll_display_cache
+                    .as_ref()
+                    .map(|cache| {
+                        cache
+                            .read_panels
+                            .iter()
+                            .map(|read_panel| {
+                                let state = panel.read_panel_scroll_state(read_panel.track_id);
+                                let maximum =
+                                    (state.content_bottom_points - read_panel.clip_bottom).max(0.0);
+                                let preview_fraction = self
+                                    .vertical_overview_drag
+                                    .filter(|drag| {
+                                        drag.density_dragging
+                                            && drag.panel_id == panel.id
+                                            && drag.track_id == read_panel.track_id
+                                    })
+                                    .map(|drag| drag.virtual_scroll_fraction)
+                                    .or_else(|| {
+                                        (maximum <= f32::EPSILON)
+                                            .then_some(state.latent_scroll_fraction)
+                                            .flatten()
+                                    });
+                                ReadPanelScrollbarDraft {
+                                    track_id: read_panel.track_id,
+                                    top: read_panel.clip_top,
+                                    bottom: read_panel.clip_bottom,
+                                    maximum,
+                                    offset: state.scroll_points.clamp(0.0, maximum),
+                                    density: self.alignment_density_for_panel_track(
+                                        panel.id,
+                                        read_panel.track_id,
+                                    ),
+                                    preview_fraction,
+                                    overview: read_panel.overview.clone(),
+                                    interaction: ui::ScrollbarInteraction::default(),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                WorkspaceScrollbarsDraft {
+                    index,
+                    panel_id: panel.id,
+                    annotation_maximum,
+                    annotation_offset: panel
+                        .annotation_scroll_points
+                        .clamp(0.0, annotation_maximum),
+                    annotation_overview: panel
+                        .scroll_display_cache
+                        .as_ref()
+                        .map(|cache| cache.annotation_overview.clone()),
+                    annotation_clip_bottom,
+                    annotation_interaction: ui::ScrollbarInteraction::default(),
+                    read_panels,
+                }
+            })
+            .collect::<Vec<_>>();
         let annotation_clip_top = self
             .panels
             .active()
@@ -452,23 +541,6 @@ impl Viewer {
             .as_ref()
             .map_or(self.canvas_geometry.viewport.top(), |cache| {
                 cache.annotation_clip_bottom
-            });
-        let vertical_camera_viewport_height = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(self.canvas_geometry.viewport.height(), |cache| {
-                (cache.scroll_clip_bottom - cache.scroll_clip_top).max(1.0)
-            });
-        let vertical_scroll_preview = self
-            .vertical_overview_drag
-            .filter(|drag| drag.density_dragging && drag.panel_id == self.panels.active().id)
-            .map(|drag| drag.virtual_scroll_fraction)
-            .or_else(|| {
-                (maximum_vertical_scroll <= f32::EPSILON)
-                    .then_some(self.panels.active().latent_vertical_scroll_fraction)
-                    .flatten()
             });
         let genomic_texts = self.composite_display_list.texts.clone();
         let selected_track = self.panels.active().selected_track;
@@ -566,7 +638,6 @@ impl Viewer {
         let mut panel_to_move = None;
         let mut overview_interaction = ui::OverviewInteraction::default();
         let mut overview_panel_id = active_panel_id;
-        let mut scrollbar_interaction = ui::ScrollbarInteraction::default();
         let mut genomic_canvas_layer_id = None;
         let mut diagnostics_open = self.diagnostics_open;
         let mut metadata_open = self.open_panel == Some(UiPanel::Metadata);
@@ -1218,18 +1289,18 @@ impl Viewer {
                         let gutter_width = ui::TRACK_GUTTER_WIDTH
                             .min((rect.width() * 0.35).max(72.0));
                         let content_left = rect.left() + gutter_width;
-                        let content_right = rect.right() - ui::SCROLLBAR_WIDTH;
-                        let panel_width =
-                            (content_right - content_left) / panel_contexts.len() as f32;
+                        let workspace_width =
+                            (rect.right() - content_left) / panel_contexts.len() as f32;
                         for (index, (id, name, length, viewport, genome_overview)) in
                             panel_contexts.iter().enumerate()
                         {
-                            let left = content_left + index as f32 * panel_width;
-                            let right = if index + 1 == panel_contexts.len() {
-                                content_right
+                            let left = content_left + index as f32 * workspace_width;
+                            let workspace_right = if index + 1 == panel_contexts.len() {
+                                rect.right()
                             } else {
-                                left + panel_width
+                                left + workspace_width
                             };
+                            let right = (workspace_right - ui::SCROLLBAR_WIDTH).max(left + 1.0);
                             let panel_rect = egui::Rect::from_min_max(
                                 egui::pos2(left, rect.top()),
                                 egui::pos2(right, rect.bottom()),
@@ -1357,16 +1428,18 @@ impl Viewer {
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 let geometry = CanvasGeometry::from_viewport(ui.max_rect());
                 new_canvas_geometry = geometry;
-                let gutter = ui::paint_track_viewport_chrome(
+                let gutter = ui::paint_track_viewport_chrome_with_groups(
                     ui,
                     geometry,
                     &track_frames,
                     self.panels.active().annotation_scroll_points,
-                    self.panels.active().effective_vertical_scroll_points(),
+                    0.0,
                     annotation_clip_top,
                     annotation_clip_bottom,
                     selected_track,
                     &self.panels.active().selected_alignment_tracks,
+                    &self.panels.active().selected_read_tracks,
+                    &track_groups,
                 );
                 track_ui_actions.extend(gutter.actions);
                 ui::paint_genomic_text(ui, geometry.genomic, &genomic_texts);
@@ -1388,13 +1461,17 @@ impl Viewer {
                     )
                 });
                 if panel_controls.len() > 1 {
-                    let width = geometry.genomic.width() / panel_controls.len() as f32;
                     for index in 1..panel_controls.len() {
-                        let x = geometry.genomic.left() + index as f32 * width;
+                        let x = ui::workspace_column_rect(
+                            geometry,
+                            index,
+                            panel_controls.len(),
+                        )
+                        .left();
                         ui.painter().line_segment(
                             [
-                                egui::pos2(x, geometry.genomic.top()),
-                                egui::pos2(x, geometry.genomic.bottom()),
+                                egui::pos2(x, geometry.viewport.top()),
+                                egui::pos2(x, geometry.viewport.bottom()),
                             ],
                             egui::Stroke::new(1.0, egui::Color32::from_gray(175)),
                         );
@@ -1403,16 +1480,11 @@ impl Viewer {
                         .iter()
                         .position(|(_, id, _)| *id == active_panel_id)
                     {
-                        let left = geometry.genomic.left() + active_index as f32 * width;
-                        let right = if active_index + 1 == panel_controls.len() {
-                            geometry.genomic.right()
-                        } else {
-                            left + width
-                        };
                         ui.painter().rect_stroke(
-                            egui::Rect::from_min_max(
-                                egui::pos2(left, geometry.genomic.top()),
-                                egui::pos2(right, geometry.genomic.bottom()),
+                            ui::workspace_column_rect(
+                                geometry,
+                                active_index,
+                                panel_controls.len(),
                             ),
                             0.0,
                             egui::Stroke::new(1.5, egui::Color32::from_rgb(45, 92, 175)),
@@ -1420,40 +1492,64 @@ impl Viewer {
                         );
                     }
                 }
-                let split_y = annotation_clip_bottom
-                    .clamp(geometry.scrollbar.top() + 1.0, geometry.scrollbar.bottom() - 1.0);
-                let annotation_scrollbar = egui::Rect::from_min_max(
-                    geometry.scrollbar.min,
-                    egui::pos2(geometry.scrollbar.right(), split_y),
-                );
-                let read_scrollbar = egui::Rect::from_min_max(
-                    egui::pos2(geometry.scrollbar.left(), split_y),
-                    geometry.scrollbar.max,
-                );
-                let _annotation_scrollbar_interaction = ui::paint_annotation_scrollbar(
-                    ui,
-                    annotation_scrollbar,
-                    maximum_annotation_scroll,
-                    &mut annotation_scroll_points,
-                    annotation_scrollbar_overview.as_ref(),
-                );
-                scrollbar_interaction = ui::paint_vertical_scrollbar(
-                    ui,
-                    read_scrollbar,
-                    maximum_vertical_scroll,
-                    &mut vertical_scroll_points,
-                    alignment_density,
-                    vertical_camera_viewport_height,
-                    vertical_scroll_preview,
-                    scrollbar_overview.as_ref(),
-                );
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(geometry.scrollbar.left(), split_y),
-                        egui::pos2(geometry.scrollbar.right(), split_y),
-                    ],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(125)),
-                );
+                let workspace_count = workspace_scrollbars.len().max(1);
+                for workspace in &mut workspace_scrollbars {
+                    let full = ui::workspace_scrollbar_rect(
+                        geometry,
+                        workspace.index,
+                        workspace_count,
+                    );
+                    let split_y = workspace
+                        .annotation_clip_bottom
+                        .clamp(full.top() + 1.0, full.bottom() - 1.0);
+                    let annotation_rect = egui::Rect::from_min_max(
+                        full.min,
+                        egui::pos2(full.right(), split_y),
+                    );
+                    workspace.annotation_interaction =
+                        ui::paint_workspace_annotation_scrollbar(
+                            ui,
+                            annotation_rect,
+                            workspace.panel_id,
+                            workspace.annotation_maximum,
+                            &mut workspace.annotation_offset,
+                            workspace.annotation_overview.as_ref(),
+                        );
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(full.left(), split_y),
+                            egui::pos2(full.right(), split_y),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(125)),
+                    );
+                    for scrollbar in &mut workspace.read_panels {
+                        let top = scrollbar.top.clamp(full.top(), full.bottom());
+                        let bottom = scrollbar.bottom.clamp(top, full.bottom());
+                        let rect = egui::Rect::from_min_max(
+                            egui::pos2(full.left(), top),
+                            egui::pos2(full.right(), bottom),
+                        );
+                        scrollbar.interaction = ui::paint_read_panel_scrollbar(
+                            ui,
+                            rect,
+                            workspace.panel_id,
+                            scrollbar.track_id,
+                            scrollbar.maximum,
+                            &mut scrollbar.offset,
+                            scrollbar.density,
+                            rect.height().max(1.0),
+                            scrollbar.preview_fraction,
+                            Some(&scrollbar.overview),
+                        );
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(rect.left(), rect.top()),
+                                egui::pos2(rect.right(), rect.top()),
+                            ],
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(125)),
+                        );
+                    }
+                }
             });
             if let Some(key) = rendered_track_settings_panel {
                 let mut open = true;
@@ -1462,6 +1558,10 @@ impl Viewer {
                     .default_width(460.0)
                     .vscroll(true)
                     .show(ui.ctx(), |ui| match key {
+                        TrackFrameKey::Group(group) => {
+                            ui.heading(format!("Track group {group}"));
+                            ui.label("Use the group eye to minimize or expand it, or right-click the group header to ungroup its tracks.");
+                        }
                         TrackFrameKey::Reference => {
                             ui.heading("Reference sequence");
                             ui.checkbox(&mut show_reference, "Show reference track");
@@ -1515,6 +1615,37 @@ impl Viewer {
                                     "{} alignment tracks selected",
                                     bulk_alignment_ids.len()
                                 ));
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("Group selected tracks").clicked() {
+                                        if let Some(pane) = bulk_alignment_pane {
+                                            track_ui_actions
+                                                .push(TrackUiAction::GroupSelectedTracks(pane));
+                                        }
+                                    }
+                                    if let Some(group) = bulk_alignment_group {
+                                        if ui
+                                            .button(if group.collapsed {
+                                                "Expand group"
+                                            } else {
+                                                "Minimize group"
+                                            })
+                                            .clicked()
+                                        {
+                                            track_ui_actions
+                                                .push(TrackUiAction::ToggleTrackGroup(
+                                                    group.pane,
+                                                    group.id,
+                                                ));
+                                        }
+                                        if ui.button("Ungroup").clicked() {
+                                            track_ui_actions
+                                                .push(TrackUiAction::UngroupTracks(
+                                                    group.pane,
+                                                    group.id,
+                                                ));
+                                        }
+                                    }
+                                });
                                 ui.horizontal_wrapped(|ui| {
                                     if ui.button("Show all").clicked() {
                                         bulk_alignment_visibility = Some(true);
@@ -2318,24 +2449,43 @@ impl Viewer {
             self.activate_view_panel(overview_panel_id);
         }
         self.handle_overview_interaction(overview_interaction);
-        self.apply_vertical_overview_interaction(
-            scrollbar_interaction,
-            &mut vertical_scroll_points,
-        );
-        if (vertical_scroll_points - self.panels.active_mut().vertical_scroll_points).abs()
-            > f32::EPSILON
-        {
-            let change = vertical_scroll_points - self.panels.active().vertical_scroll_points;
-            self.scroll_tracks_by(change);
-        }
-        if (annotation_scroll_points - self.panels.active().annotation_scroll_points).abs()
-            > f32::EPSILON
-        {
-            self.panels.active_mut().annotation_scroll_points = annotation_scroll_points;
-            if self.synthetic || !self.refresh_active_panel_scroll_display() {
-                self.display_dirty = true;
+        for workspace in &mut workspace_scrollbars {
+            let current_annotation_offset = self
+                .panels
+                .get(workspace.panel_id)
+                .map_or(0.0, |panel| panel.annotation_scroll_points);
+            if workspace.annotation_interaction.pointer_down
+                || (workspace.annotation_offset - current_annotation_offset).abs() > f32::EPSILON
+            {
+                self.activate_view_panel(workspace.panel_id);
+                self.panels.active_mut().annotation_scroll_points = workspace.annotation_offset;
+                if self.synthetic || !self.refresh_active_panel_scroll_display() {
+                    self.display_dirty = true;
+                }
+                self.window.request_redraw();
             }
-            self.window.request_redraw();
+            for scrollbar in &mut workspace.read_panels {
+                let current_offset = self
+                    .panels
+                    .get(workspace.panel_id)
+                    .map(|panel| {
+                        panel
+                            .read_panel_scroll_state(scrollbar.track_id)
+                            .scroll_points
+                    })
+                    .unwrap_or_default();
+                if scrollbar.interaction.pointer_down
+                    || scrollbar.interaction.keyboard_density_pixels.abs() > f32::EPSILON
+                    || (scrollbar.offset - current_offset).abs() > f32::EPSILON
+                {
+                    self.activate_view_panel(workspace.panel_id);
+                    self.apply_read_panel_overview_interaction(
+                        scrollbar.track_id,
+                        scrollbar.interaction,
+                        &mut scrollbar.offset,
+                    );
+                }
+            }
         }
         if let Some(id) = editing_alignment_id
             && let Some((_, name, visible, collapsed, height)) = alignment_track_controls
@@ -3233,7 +3383,7 @@ impl Viewer {
                 .coverage_scale_transform = coverage_scale_transform;
             self.primary_alignment_filters_mut()
                 .show_coverage_center_line = show_coverage_center_line;
-            self.set_shared_alignment_density(alignment_density);
+            self.set_alignment_density_for_track(primary_alignment_id, alignment_density);
             self.primary_alignment_filters_mut().read_base_display_mode = read_base_display_mode;
             self.primary_alignment_filters_mut()
                 .shade_read_bases_by_quality = shade_read_bases_by_quality;
@@ -3578,10 +3728,6 @@ impl Viewer {
                     apply_filter,
                 },
             );
-            if self.set_shared_alignment_density(alignment_density) {
-                self.rebuild_all_panel_displays();
-                self.display_dirty = true;
-            }
         }
         if !bulk_alignment_ids.is_empty()
             && (bulk_alignment_visibility.is_some() || bulk_alignment_collapsed.is_some())

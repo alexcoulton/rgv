@@ -2,20 +2,20 @@
   "schema_version": 3,
   "locus": {
     "contig": "chrManual",
-    "start": 20111,
-    "end": 20201
+    "start": 19900,
+    "end": 21100
   },
   "panels": [
     {
       "id": 1,
       "locus": {
         "contig": "chrManual",
-        "start": 20111,
-        "end": 20201
+        "start": 19900,
+        "end": 21100
       },
-      "vertical_scroll_points": 94.06681,
+      "vertical_scroll_points": 0.0,
       "annotation_scroll_points": 0.0,
-      "vertical_content_origin_points": 94.06681
+      "vertical_content_origin_points": 0.0
     }
   ],
   "active_panel": 1,
@@ -25,14 +25,13 @@
       "name": "RNA sample A: shared and A-specific junctions",
       "source": {
         "Local": {
-          "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/manual-suite/data/alignments/rna-sample-a.bam"
+          "path": "../data/alignments/rna-sample-a.bam"
         }
       },
       "sample_key": null,
       "visible": true,
       "collapsed": false,
       "height": 420.0,
-      "read_group_height": 252.95312,
       "filters": {
         "alignment_color_mode": "strand",
         "alignment_group_mode": "none",
@@ -61,7 +60,7 @@
         "coverage_scale_maximum": null,
         "coverage_scale_transform": "linear",
         "show_coverage_center_line": true,
-        "alignment_density": 3.111876,
+        "alignment_density": 1.0,
         "inspector_activation": "click",
         "read_base_display_mode": "mismatches",
         "shade_read_bases_by_quality": true,
@@ -83,7 +82,7 @@
       "name": "RNA sample B: shared and B-specific junctions",
       "source": {
         "Local": {
-          "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/manual-suite/data/alignments/rna-sample-b.bam"
+          "path": "../data/alignments/rna-sample-b.bam"
         }
       },
       "sample_key": null,
@@ -114,11 +113,11 @@
         "sashimi_fixed_scale_maximum": 100,
         "sashimi_count_mode": "raw",
         "show_junction_labels": true,
-        "show_reads": false,
+        "show_reads": true,
         "coverage_scale_maximum": null,
         "coverage_scale_transform": "linear",
         "show_coverage_center_line": true,
-        "alignment_density": 3.111876,
+        "alignment_density": 1.0,
         "inspector_activation": "click",
         "read_base_display_mode": "mismatches",
         "shade_read_bases_by_quality": true,
@@ -138,7 +137,7 @@
   ],
   "reference": {
     "Local": {
-      "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/manual-suite/data/references/manual.fa"
+      "path": "../data/references/manual.fa"
     }
   },
   "genome_name": "RGV two-sample RNA junction truth",
@@ -158,7 +157,7 @@
       "kind": "GeneModel",
       "source": {
         "Local": {
-          "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/manual-suite/data/tracks/rna-transcripts.gff3"
+          "path": "../data/tracks/rna-transcripts.gff3"
         }
       },
       "sample_key": null,

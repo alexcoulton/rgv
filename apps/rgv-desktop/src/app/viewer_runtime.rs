@@ -133,9 +133,13 @@ impl Viewer {
         let panels = options.loaded_session.as_ref().map_or_else(
             || Ok(PanelWorkspace::new(panel)),
             |session| {
+                let panel_count = session.panels.len().max(1);
+                let total_genomic_width =
+                    ui::workspace_genomic_rect(canvas_geometry, 0, panel_count).width()
+                        * panel_count as f32;
                 PanelWorkspace::from_session(
                     session,
-                    canvas_geometry.genomic.width(),
+                    total_genomic_width,
                     canvas_geometry.viewport.top(),
                 )
             },

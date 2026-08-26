@@ -17,6 +17,7 @@ use crate::{
     PairSummary, PileupProvenance, PileupSummary, ReferenceSlice, RemoteError, SequenceData,
     alignment::BatchOverflow,
     alignment::alignment_header_metadata_from_sam,
+    bisulfite_strand_is_reverse,
     index_overview::load_local_alignment_index_overview,
     junction::{
         JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
@@ -506,7 +507,9 @@ fn add_record_pileup(
     let mut read_position = 0_usize;
     let sequence = record.seq().as_bytes();
     let qualities = record.qual();
-    let reverse = record.is_reverse();
+    let flags = AlignmentFlags::from_bits(record.flags());
+    let reverse = flags.is_reverse();
+    let bisulfite_reverse = bisulfite_strand_is_reverse(flags);
     let mapping_quality = (record.mapq() != u8::MAX).then_some(record.mapq());
     let mut collapsed_bases = 0_u64;
     let mut aligned_segments = Vec::new();
@@ -534,7 +537,13 @@ fn add_record_pileup(
                         else {
                             continue;
                         };
-                        pileup.add_base(position, base, quality, reverse);
+                        pileup.add_base_with_bisulfite_strand(
+                            position,
+                            base,
+                            quality,
+                            reverse,
+                            bisulfite_reverse,
+                        );
                     }
                 }
                 read_position = read_position.saturating_add(*len as usize);

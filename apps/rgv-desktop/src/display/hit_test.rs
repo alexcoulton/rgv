@@ -17,7 +17,9 @@ pub(crate) fn alignment_track_at_content_y(
             .then_some(frame.key)
             .and_then(|key| match key {
                 TrackFrameKey::Alignment(id) => Some(id),
-                TrackFrameKey::Reference | TrackFrameKey::Auxiliary(_) => None,
+                TrackFrameKey::Reference
+                | TrackFrameKey::Group(_)
+                | TrackFrameKey::Auxiliary(_) => None,
             })
     })
 }

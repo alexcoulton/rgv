@@ -1906,6 +1906,7 @@ impl Viewer {
                 None,
                 Vec::new(),
             )),
+            Some(TrackFrameKey::Group(_)) => None,
             None => None,
         }
     }
@@ -2130,7 +2131,8 @@ impl Viewer {
                             (MIN_VERTICAL_DENSITY..=MAX_VERTICAL_DENSITY).contains(&density),
                             "{key} must be between {MIN_VERTICAL_DENSITY} and {MAX_VERTICAL_DENSITY}"
                         );
-                        self.set_shared_alignment_density(density);
+                        let track_id = self.primary_alignment_track_id();
+                        self.set_alignment_density_for_track(track_id, density);
                     }
                     "coverage_scale_maximum" => {
                         let maximum = automation_optional_u64(value, key)?
@@ -2240,6 +2242,7 @@ impl Viewer {
                 }
             }
             AutomationOptionScope::Panel { panel_id } => {
+                let primary_track_id = self.primary_alignment_track_id();
                 let Some(panel) = self.panels.get_mut(panel_id) else {
                     anyhow::bail!("panel {} was not found", panel_id.get());
                 };
@@ -2247,8 +2250,29 @@ impl Viewer {
                     "vertical_scroll_points" => {
                         let scroll = automation_f32(value, key)?;
                         anyhow::ensure!(scroll >= 0.0, "{key} must be non-negative");
-                        panel.vertical_scroll_points =
-                            scroll.min(panel.content_bottom_points.max(0.0));
+                        let maximum = panel
+                            .scroll_display_cache
+                            .as_ref()
+                            .and_then(|cache| {
+                                cache
+                                    .read_panels
+                                    .iter()
+                                    .find(|read_panel| read_panel.track_id == primary_track_id)
+                            })
+                            .map_or(0.0, |read_panel| {
+                                (panel
+                                    .read_panel_scroll_state(primary_track_id)
+                                    .content_bottom_points
+                                    - read_panel.clip_bottom)
+                                    .max(0.0)
+                            });
+                        let scroll = scroll.min(maximum);
+                        panel.vertical_scroll_points = scroll;
+                        panel
+                            .read_panel_scrolls
+                            .entry(primary_track_id)
+                            .or_default()
+                            .scroll_points = scroll;
                     }
                     "annotation_scroll_points" => {
                         let scroll = automation_f32(value, key)?;
@@ -3124,7 +3148,7 @@ impl Viewer {
             AutomationSelection::Track { track_id } => {
                 let key = self.automation_track_key(track_id)?;
                 self.panels.active_mut().clear_selection();
-                self.select_track_key(key);
+                self.select_track_key(key, ui::TrackPane::Annotation);
                 self.bump_workspace_revision();
                 self.retain_active_selection(None);
                 Ok(serde_json::json!({
@@ -3393,6 +3417,7 @@ impl Viewer {
         let original_geometry = self.canvas_geometry;
         let original_scroll = self.panels.active().vertical_scroll_points;
         let original_content_origin = self.panels.active().vertical_content_origin_points;
+        let original_read_panel_scrolls = self.panels.active().read_panel_scrolls.clone();
         let content_height = (self.panels.active().content_bottom_points
             - self.canvas_geometry.viewport.top())
         .ceil()
@@ -3409,6 +3434,10 @@ impl Viewer {
         self.canvas_geometry = CanvasGeometry::from_viewport(expanded_viewport);
         self.panels.active_mut().vertical_scroll_points = 0.0;
         self.panels.active_mut().vertical_content_origin_points = 0.0;
+        for state in self.panels.active_mut().read_panel_scrolls.values_mut() {
+            state.scroll_points = 0.0;
+            state.content_origin_points = 0.0;
+        }
         self.rebuild_genomic_display();
         let bounds = self.active_panel_rect();
         let display = cropped_display_list(&self.panels.active().display_list, bounds);
@@ -3417,6 +3446,7 @@ impl Viewer {
         self.canvas_geometry = original_geometry;
         self.panels.active_mut().vertical_scroll_points = original_scroll;
         self.panels.active_mut().vertical_content_origin_points = original_content_origin;
+        self.panels.active_mut().read_panel_scrolls = original_read_panel_scrolls;
         self.rebuild_genomic_display();
         self.composite_display_list = composite_panel_display_lists(&self.panels);
         self.display_dirty = true;

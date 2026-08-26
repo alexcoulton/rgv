@@ -104,7 +104,14 @@ pub struct PileupBin {
     pub alleles: AlleleSupport,
     pub forward_alleles: AlleleSupport,
     pub reverse_alleles: AlleleSupport,
+    /// Alleles partitioned by the conversion strand used by bisulfite display.
+    /// Paired records inherit the first end's strand so both mates contribute
+    /// to the same biological strand.
+    pub bisulfite_forward_alleles: AlleleSupport,
+    pub bisulfite_reverse_alleles: AlleleSupport,
     pub quality_weighted: QualityWeightedAlleleSupport,
+    pub bisulfite_forward_quality_weighted: QualityWeightedAlleleSupport,
+    pub bisulfite_reverse_quality_weighted: QualityWeightedAlleleSupport,
     pub base_quality_sum: u64,
     pub base_quality_observations: u32,
     pub missing_base_quality_observations: u32,
@@ -493,7 +500,19 @@ impl PileupBuilder {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn add_base(&mut self, position: u64, base: u8, quality: Option<u8>, reverse: bool) {
+        self.add_base_with_bisulfite_strand(position, base, quality, reverse, reverse);
+    }
+
+    pub(crate) fn add_base_with_bisulfite_strand(
+        &mut self,
+        position: u64,
+        base: u8,
+        quality: Option<u8>,
+        reverse: bool,
+        bisulfite_reverse: bool,
+    ) {
         let Some(index) = self.bin_index(position) else {
             return;
         };
@@ -507,8 +526,20 @@ impl PileupBuilder {
         } else {
             bin.forward_alleles.increment_base(base);
         }
+        if bisulfite_reverse {
+            bin.bisulfite_reverse_alleles.increment_base(base);
+        } else {
+            bin.bisulfite_forward_alleles.increment_base(base);
+        }
         let weight = quality.map_or(QUALITY_WEIGHT_SCALE, quality_weight);
         bin.quality_weighted.add_base(base, weight);
+        if bisulfite_reverse {
+            bin.bisulfite_reverse_quality_weighted
+                .add_base(base, weight);
+        } else {
+            bin.bisulfite_forward_quality_weighted
+                .add_base(base, weight);
+        }
         if let Some(quality) = quality {
             bin.base_quality_sum = bin.base_quality_sum.saturating_add(u64::from(quality));
             bin.base_quality_observations = bin.base_quality_observations.saturating_add(1);
@@ -713,6 +744,23 @@ mod tests {
         assert_eq!(summary.bins[2].missing_base_quality_observations, 1);
         assert!(summary.bins[0].quality_weighted.a < QUALITY_WEIGHT_SCALE);
         assert!(summary.provenance.all_eligible_records);
+    }
+
+    #[test]
+    fn pileup_keeps_bisulfite_template_strand_separate_from_alignment_strand() {
+        let mut builder = PileupBuilder::new(interval(), 4, 0);
+        builder.add_base_with_bisulfite_strand(100, b'T', Some(30), true, false);
+        let summary = builder.finish(PileupProvenance::default());
+        let bin = summary.bins[0];
+
+        assert_eq!(bin.reverse_alleles.t, 1);
+        assert_eq!(bin.forward_alleles.t, 0);
+        assert_eq!(bin.bisulfite_forward_alleles.t, 1);
+        assert_eq!(bin.bisulfite_reverse_alleles.t, 0);
+        assert_eq!(
+            bin.bisulfite_forward_quality_weighted.t,
+            bin.quality_weighted.t
+        );
     }
 
     #[test]

@@ -347,6 +347,15 @@ pub(crate) fn add_aligned_bases(
         });
         let sbx_tail = highlights_sbx_tails
             && sbx_state.is_some_and(|state| state.tails.is_tail(aligned_read_position));
+        // A conversion belonging to another context is expected bisulfite
+        // evidence, not an ordinary substitution. Suppress only that case;
+        // genuine non-conversion mismatches remain visible as in IGV.
+        if matches!(color_mode, AlignmentColorMode::Bisulfite(_))
+            && bisulfite.is_none()
+            && bisulfite_conversion_mismatch(query, index, position, base)
+        {
+            continue;
+        }
         if bisulfite.is_none()
             && smrt_kinetics.is_none()
             && !sbx_tail
@@ -396,7 +405,7 @@ pub(crate) fn add_aligned_bases(
             object_id: read_detail_object_id(object_id),
             shape: Default::default(),
         });
-        if width >= MINIMUM_BASE_GLYPH_PIXEL_WIDTH {
+        if width >= MINIMUM_BASE_GLYPH_PIXEL_WIDTH && bisulfite.is_none() {
             add_base_glyph(
                 display_list,
                 // Preserve the observed evidence even when it contradicts an
@@ -407,7 +416,7 @@ pub(crate) fn add_aligned_bases(
                 y + 1.0,
                 width,
                 (height - 2.0).max(5.0),
-                if bisulfite.is_some() || smrt_kinetics.is_some() || sbx_tail {
+                if smrt_kinetics.is_some() || sbx_tail {
                     fill_label_color(color)
                 } else {
                     read_base_label_color(base)

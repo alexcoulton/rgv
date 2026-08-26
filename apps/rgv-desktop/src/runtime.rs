@@ -148,12 +148,12 @@ impl ApplicationHandler for Application {
                 // consumed even though the genomic canvas itself is GPU rendered. Use
                 // the painted layer under the pointer instead: floating windows and
                 // popups must own their wheel input and block the viewer underneath.
+                if let Some(panel_id) = viewer.panel_at_cursor() {
+                    viewer.activate_view_panel(panel_id);
+                }
                 if viewer.modifiers.shift_key() || !viewer.cursor_in_genomic_canvas() {
                     viewer.scroll_tracks(delta);
                 } else {
-                    if let Some(panel_id) = viewer.panel_at_cursor() {
-                        viewer.activate_view_panel(panel_id);
-                    }
                     viewer.zoom(delta);
                 }
             }

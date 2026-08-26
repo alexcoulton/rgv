@@ -9,18 +9,41 @@ pub(crate) struct PendingQueries {
 }
 
 pub(crate) struct PanelScrollDisplayCache {
-    pub(crate) scrollable: DisplayList,
     pub(crate) annotations: DisplayList,
     pub(crate) pinned: DisplayList,
-    pub(crate) overview: ScrollbarOverview,
     pub(crate) annotation_overview: ScrollbarOverview,
-    pub(crate) actual_content_bottom: f32,
     pub(crate) scroll_clip_top: f32,
-    pub(crate) scroll_clip_bottom: f32,
     pub(crate) annotation_content_bottom: f32,
     pub(crate) annotation_clip_top: f32,
     pub(crate) annotation_clip_bottom: f32,
     pub(crate) supports_fast_scroll: bool,
+    pub(crate) read_panels: Vec<ReadPanelDisplayCache>,
+}
+
+pub(crate) struct ReadPanelDisplayCache {
+    pub(crate) track_id: TrackId,
+    pub(crate) scrollable: DisplayList,
+    pub(crate) overview: ScrollbarOverview,
+    pub(crate) actual_content_bottom: f32,
+    pub(crate) clip_top: f32,
+    pub(crate) clip_bottom: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ReadPanelScrollState {
+    pub(crate) scroll_points: f32,
+    pub(crate) content_origin_points: f32,
+    pub(crate) latent_scroll_fraction: Option<f32>,
+    pub(crate) content_bottom_points: f32,
+    /// Density selected through this workspace's read navigator. `None` uses
+    /// the track's configured default density.
+    pub(crate) density: Option<f32>,
+}
+
+impl ReadPanelScrollState {
+    pub(crate) fn effective_scroll_points(self) -> f32 {
+        (self.scroll_points - self.content_origin_points).max(0.0)
+    }
 }
 
 /// Runtime state owned by one genomic view panel.
@@ -40,6 +63,11 @@ pub(crate) struct ViewPanelController {
     pub(crate) selected_record: Option<usize>,
     pub(crate) selected_alignment_track: Option<TrackId>,
     pub(crate) selected_alignment_tracks: Vec<TrackId>,
+    pub(crate) alignment_selection_anchor: Option<TrackId>,
+    /// Alignment read panels selected from the lower read-data section. This
+    /// is separate from annotation selection even though both use the same IDs.
+    pub(crate) selected_read_tracks: Vec<TrackId>,
+    pub(crate) read_selection_anchor: Option<TrackId>,
     pub(crate) selected_read_event: Option<ReadEventSelection>,
     pub(crate) selected_pileup_position: Option<u64>,
     pub(crate) selected_modification_position: Option<u64>,
@@ -75,6 +103,10 @@ pub(crate) struct ViewPanelController {
     /// Normalized vertical camera retained while the content has no scroll
     /// range, so a density gesture does not snap its thumb back to the top.
     pub(crate) latent_vertical_scroll_fraction: Option<f32>,
+    /// Independent vertical cameras for the read panel belonging to each
+    /// alignment track. The legacy scalar fields above mirror the primary
+    /// track for backward-compatible sessions and automation.
+    pub(crate) read_panel_scrolls: BTreeMap<TrackId, ReadPanelScrollState>,
     pub(crate) content_bottom_points: f32,
     pub(crate) track_frames: Vec<TrackFrame>,
     pub(crate) selected_track: Option<TrackFrameKey>,
@@ -327,6 +359,9 @@ impl ViewPanelController {
             selected_record: None,
             selected_alignment_track: None,
             selected_alignment_tracks: Vec::new(),
+            alignment_selection_anchor: None,
+            selected_read_tracks: Vec::new(),
+            read_selection_anchor: None,
             selected_read_event: None,
             selected_pileup_position: None,
             selected_modification_position: None,
@@ -355,6 +390,7 @@ impl ViewPanelController {
             annotation_scroll_points: 0.0,
             vertical_content_origin_points: 0.0,
             latent_vertical_scroll_fraction: None,
+            read_panel_scrolls: BTreeMap::new(),
             content_bottom_points: 0.0,
             track_frames: Vec::new(),
             selected_track: None,
@@ -378,6 +414,9 @@ impl ViewPanelController {
         self.selected_record = None;
         self.selected_alignment_track = None;
         self.selected_alignment_tracks.clear();
+        self.alignment_selection_anchor = None;
+        self.selected_read_tracks.clear();
+        self.read_selection_anchor = None;
         self.selected_read_event = None;
         self.selected_pileup_position = None;
         self.selected_modification_position = None;
@@ -400,5 +439,12 @@ impl ViewPanelController {
 impl ViewPanelController {
     pub(crate) fn effective_vertical_scroll_points(&self) -> f32 {
         (self.vertical_scroll_points - self.vertical_content_origin_points).max(0.0)
+    }
+
+    pub(crate) fn read_panel_scroll_state(&self, track_id: TrackId) -> ReadPanelScrollState {
+        self.read_panel_scrolls
+            .get(&track_id)
+            .copied()
+            .unwrap_or_default()
     }
 }

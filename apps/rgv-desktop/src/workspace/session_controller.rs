@@ -250,9 +250,13 @@ impl Viewer {
         );
         self.track_engine =
             (!specifications.is_empty()).then(|| TrackEngine::spawn(specifications, 8));
+        let panel_count = session.panels.len().max(1);
+        let total_genomic_width = ui::workspace_genomic_rect(self.canvas_geometry, 0, panel_count)
+            .width()
+            * panel_count as f32;
         self.panels = PanelWorkspace::from_session(
             session,
-            self.canvas_geometry.genomic.width(),
+            total_genomic_width,
             self.canvas_geometry.viewport.top(),
         )?;
         self.reference_dictionary = None;

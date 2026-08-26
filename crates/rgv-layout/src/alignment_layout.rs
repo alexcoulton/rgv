@@ -20,10 +20,10 @@ use rgv_hts::{
     PileupBin, PileupSummary, ReferenceSlice, SbxInsertionState, SbxTailBounds, SequenceView,
     SmrtKineticsSeries, TemplateLengthBounds, UltimaEvidenceError, UltimaRecordAnalysis,
     UltimaTagOrientation, aligned_position_for_sequencer_position,
-    analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse, classify_aligned_base,
-    classify_bisulfite_observation, classify_sbx_insertion, decode_modified_bases_parts,
-    decode_smrt_kinetics, pair_evidence_at, sbx_tail_bounds, sequencer_base_matches,
-    smrt_kinetics_tag,
+    analyze_ultima_record_with_tag_orientation, bisulfite_context_matches,
+    bisulfite_strand_is_reverse, classify_aligned_base, classify_bisulfite_observation,
+    classify_sbx_insertion, decode_modified_bases_parts, decode_smrt_kinetics, pair_evidence_at,
+    sbx_tail_bounds, sequencer_base_matches, smrt_kinetics_tag,
 };
 
 use crate::{
@@ -765,9 +765,10 @@ pub use color::ultima_quality_color;
 use color::{
     add_base_glyph, add_event_label, add_marker, add_read_body, add_ultima_deletion_quality_mark,
     add_ultima_insertion_quality_mark, aligned_base, alignment_color, base_color,
-    bisulfite_observation, clipped_geometry, complement, fill_label_color, insertion_event_color,
-    palette_color, read_base_label_color, record_tag_label, reference_base_label_color,
-    smrt_kinetics_color, visible_positions, with_alpha,
+    bisulfite_conversion_mismatch, bisulfite_observation, clipped_geometry, complement,
+    fill_label_color, insertion_event_color, palette_color, read_base_label_color,
+    record_tag_label, reference_base_label_color, smrt_kinetics_color, visible_positions,
+    with_alpha,
 };
 
 #[cfg(test)]

@@ -27,14 +27,146 @@ pub(crate) fn apply_alignment_annotation_height(
     frame_top + target_height
 }
 
-pub(crate) fn resolved_read_group_bottom(
-    frame_top: f32,
-    natural_bottom: f32,
-    requested_height: Option<f32>,
-) -> f32 {
-    requested_height.map_or(natural_bottom, |height| {
-        frame_top + height.clamp(40.0, 1_200.0)
-    })
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadPanelKey {
+    Track(TrackId),
+    Group(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReadPanelBounds {
+    pub(crate) key: ReadPanelKey,
+    pub(crate) top: f32,
+    pub(crate) bottom: f32,
+}
+
+/// Partitions the lower read area into stable per-sample viewports. Requested
+/// read-group heights act as relative preferences, while the resulting panels
+/// always fit the available pane and therefore always retain their own visible
+/// navigator.
+pub(crate) fn read_panel_bounds(
+    tracks: &[(ReadPanelKey, bool, Option<f32>)],
+    pane_top: f32,
+    pane_bottom: f32,
+) -> Vec<ReadPanelBounds> {
+    if tracks.is_empty() || pane_bottom <= pane_top {
+        return Vec::new();
+    }
+    let total = pane_bottom - pane_top;
+    let collapsed_total = tracks
+        .iter()
+        .filter(|(_, reads_visible, _)| !reads_visible)
+        .count() as f32
+        * COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
+    let expanded = tracks
+        .iter()
+        .filter(|(_, reads_visible, _)| *reads_visible)
+        .collect::<Vec<_>>();
+    let expanded_available = (total - collapsed_total).max(0.0);
+    let default_weight = if expanded.is_empty() {
+        0.0
+    } else {
+        expanded_available / expanded.len() as f32
+    };
+    let weights = expanded
+        .iter()
+        .map(|(_, _, requested)| requested.unwrap_or(default_weight).max(1.0))
+        .collect::<Vec<_>>();
+    let weight_sum = weights.iter().sum::<f32>().max(f32::EPSILON);
+    let mut expanded_heights = weights
+        .iter()
+        .map(|weight| expanded_available * *weight / weight_sum)
+        .collect::<Vec<_>>();
+    if expanded_available >= expanded_heights.len() as f32 * 40.0 {
+        let mut fixed = vec![false; expanded_heights.len()];
+        loop {
+            let newly_fixed = expanded_heights
+                .iter()
+                .enumerate()
+                .filter(|(index, height)| !fixed[*index] && **height < 40.0)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if newly_fixed.is_empty() {
+                break;
+            }
+            for index in newly_fixed {
+                fixed[index] = true;
+                expanded_heights[index] = 40.0;
+            }
+            let remaining = expanded_available
+                - expanded_heights
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| fixed[*index])
+                    .map(|(_, height)| *height)
+                    .sum::<f32>();
+            let remaining_weight = weights
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !fixed[*index])
+                .map(|(_, weight)| *weight)
+                .sum::<f32>();
+            for (index, height) in expanded_heights.iter_mut().enumerate() {
+                if !fixed[index] {
+                    *height = remaining * weights[index] / remaining_weight.max(f32::EPSILON);
+                }
+            }
+        }
+    }
+    let mut expanded_index = 0_usize;
+    let mut top = pane_top;
+    tracks
+        .iter()
+        .map(|(key, reads_visible, _)| {
+            let height = if *reads_visible {
+                let height = expanded_heights.get(expanded_index).copied().unwrap_or(0.0);
+                expanded_index += 1;
+                height
+            } else {
+                COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT.min((pane_bottom - top).max(0.0))
+            };
+            let bottom = (top + height).min(pane_bottom);
+            let bounds = ReadPanelBounds {
+                key: *key,
+                top,
+                bottom,
+            };
+            top = bottom;
+            bounds
+        })
+        .collect()
+}
+
+/// Returns the allocated read-panel bounds for an expanded alignment track.
+/// A fully collapsed track has no read panel, but still needs a zero-height
+/// placeholder so its annotation header can be laid out and restored.
+pub(crate) fn read_panel_bounds_for_track(
+    bounds: &[ReadPanelBounds],
+    track_id: TrackId,
+    collapsed_fallback_top: f32,
+    collapsed: bool,
+) -> Option<ReadPanelBounds> {
+    bounds
+        .iter()
+        .find(|bounds| bounds.key == ReadPanelKey::Track(track_id))
+        .copied()
+        .or_else(|| {
+            collapsed.then_some(ReadPanelBounds {
+                key: ReadPanelKey::Track(track_id),
+                top: collapsed_fallback_top,
+                bottom: collapsed_fallback_top,
+            })
+        })
+}
+
+pub(crate) fn read_panel_bounds_for_group(
+    bounds: &[ReadPanelBounds],
+    group: u32,
+) -> Option<ReadPanelBounds> {
+    bounds
+        .iter()
+        .find(|bounds| bounds.key == ReadPanelKey::Group(group))
+        .copied()
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -45,6 +177,8 @@ pub(crate) fn secondary_alignment_track_layout(
     contig_name: &str,
     frame_top: f32,
     read_frame_top: f32,
+    read_frame_bottom: f32,
+    read_density: f32,
     selected_read_name_hash: Option<u64>,
     promoted_read_name_hash: Option<u64>,
     shared_sashimi_raw: Option<f64>,
@@ -117,8 +251,8 @@ pub(crate) fn secondary_alignment_track_layout(
     };
 
     let filters = &config.filters;
-    let density = filters.alignment_density;
-    let secondary_scale = density.sqrt();
+    let density = read_density;
+    let annotation_lane_heights = alignment_annotation_lane_heights(filters);
     let content_top = frame_top + 22.0;
     let mut lane_top = content_top;
     let mut options = AlignmentLayoutOptions {
@@ -126,7 +260,7 @@ pub(crate) fn secondary_alignment_track_layout(
         reference_top: lane_top,
         show_coverage: filters.show_coverage,
         coverage_top: lane_top,
-        coverage_height: (48.0 * secondary_scale).clamp(28.0, 84.0),
+        coverage_height: annotation_lane_heights.coverage,
         coverage_scale_maximum: filters.coverage_scale_maximum,
         coverage_scale_transform: filters.coverage_scale_transform,
         ..AlignmentLayoutOptions::default()
@@ -140,10 +274,7 @@ pub(crate) fn secondary_alignment_track_layout(
     let show_junctions = filters.show_junctions && junctions_available;
     options.show_junctions = show_junctions;
     options.junction_top = lane_top;
-    options.junction_height = match filters.junction_display_mode {
-        JunctionDisplayMode::Collapsed => (52.0 * secondary_scale).clamp(40.0, 80.0),
-        JunctionDisplayMode::Expanded => (120.0 * secondary_scale).clamp(90.0, 210.0),
-    };
+    options.junction_height = annotation_lane_heights.junction;
     options.minimum_junction_depth = filters.minimum_junction_depth;
     options.junction_display_mode = filters.junction_display_mode;
     options.junction_count_mode = filters.sashimi_count_mode;
@@ -167,7 +298,7 @@ pub(crate) fn secondary_alignment_track_layout(
         filters.show_modification_frequency && modification_frequency_supported;
     options.show_modification_frequency = show_modification_frequency;
     options.modification_top = lane_top;
-    options.modification_height = (26.0 * secondary_scale).clamp(20.0, 40.0);
+    options.modification_height = annotation_lane_heights.modification;
     if show_modification_frequency {
         lane_top += options.modification_height + 8.0;
     } else if modification_frequency_supported {
@@ -213,7 +344,7 @@ pub(crate) fn secondary_alignment_track_layout(
         *slot = Some(code);
     }
     // The query safety cap already bounds retained records. Every BAM in the
-    // shared read pane must give each retained record a row opportunity; the
+    // sample's read panel must give each retained record a row opportunity; the
     // pane scrollbar, rather than an annotation-track height, limits what is
     // visible at once.
     options.max_rows = query.batch.len().max(1);
@@ -462,16 +593,11 @@ pub(crate) fn secondary_alignment_track_layout(
             .map(|rectangle| rectangle.y + rectangle.height)
             .fold(options.reads_top + options.row_height, f32::max)
             + 6.0;
-        let read_content_bottom = resolved_read_group_bottom(
-            read_frame_top,
-            natural_read_content_bottom,
-            config.read_group_height,
-        );
         let reads = TrackSubtrack {
             label: "Reads".to_owned(),
             detail: (!read_details.is_empty()).then(|| read_details.join(" · ")),
             top: options.reads_top,
-            bottom: read_content_bottom,
+            bottom: natural_read_content_bottom,
             collapsed: false,
             composite_member: None,
         };
@@ -493,7 +619,7 @@ pub(crate) fn secondary_alignment_track_layout(
             kind: TrackKind::Alignment,
             source_label,
             top: read_frame_top,
-            bottom: read_content_bottom.max(read_frame_top + 22.0),
+            bottom: read_frame_bottom.max(read_frame_top + 22.0),
             visible: true,
             collapsed: false,
             frozen_bottom: Some(options.reads_top),
@@ -501,7 +627,8 @@ pub(crate) fn secondary_alignment_track_layout(
         };
         return (Some(layout), annotation_frame, Some(read_frame));
     } else {
-        let read_bottom = read_frame_top + COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
+        let read_bottom =
+            read_frame_bottom.max(read_frame_top + COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT);
         let annotation_frame = TrackFrame {
             key: TrackFrameKey::Alignment(config.id),
             name: config.name.clone(),

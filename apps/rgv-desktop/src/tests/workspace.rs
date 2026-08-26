@@ -313,6 +313,8 @@ fn alignment_removal_clears_deleted_identity_from_every_panel() {
     let mut selected = test_panel(1);
     selected.selected_alignment_track = Some(removed);
     selected.selected_alignment_tracks = vec![surviving, removed];
+    selected.selected_read_tracks = vec![surviving, removed];
+    selected.read_selection_anchor = Some(removed);
     selected.selected_record = Some(3);
     selected.selected_read_event = Some(ReadEventSelection {
         record_index: 3,
@@ -338,6 +340,8 @@ fn alignment_removal_clears_deleted_identity_from_every_panel() {
     let mut unaffected = test_panel(2);
     unaffected.selected_alignment_track = Some(surviving);
     unaffected.selected_alignment_tracks = vec![removed, surviving];
+    unaffected.selected_read_tracks = vec![removed, surviving];
+    unaffected.read_selection_anchor = Some(surviving);
     unaffected.selected_record = Some(7);
     unaffected.selected_track = Some(TrackFrameKey::Alignment(surviving));
 
@@ -361,6 +365,8 @@ fn alignment_removal_clears_deleted_identity_from_every_panel() {
 
     assert_eq!(selected.selected_alignment_track, None);
     assert_eq!(selected.selected_alignment_tracks, [surviving]);
+    assert_eq!(selected.selected_read_tracks, [surviving]);
+    assert_eq!(selected.read_selection_anchor, Some(surviving));
     assert!(selected.selected_record.is_none());
     assert!(selected.selected_read_event.is_none());
     assert!(selected.selected_pileup_position.is_none());
@@ -385,6 +391,8 @@ fn alignment_removal_clears_deleted_identity_from_every_panel() {
 
     assert_eq!(unaffected.selected_alignment_track, Some(surviving));
     assert_eq!(unaffected.selected_alignment_tracks, [surviving]);
+    assert_eq!(unaffected.selected_read_tracks, [surviving]);
+    assert_eq!(unaffected.read_selection_anchor, Some(surviving));
     assert_eq!(unaffected.selected_record, Some(7));
     assert_eq!(
         unaffected.selected_track,
@@ -1081,6 +1089,24 @@ fn additive_alignment_selection_toggles_stable_track_ids() {
     assert_eq!(
         updated_alignment_selection(&selected, first, false),
         vec![first]
+    );
+}
+
+#[test]
+fn shift_alignment_selection_includes_the_complete_ordered_range() {
+    let order = (1..=6).map(TrackId::new).collect::<Vec<_>>();
+
+    assert_eq!(
+        alignment_range_selection(&order, TrackId::new(2), TrackId::new(5)),
+        order[1..=4]
+    );
+    assert_eq!(
+        alignment_range_selection(&order, TrackId::new(5), TrackId::new(2)),
+        order[1..=4]
+    );
+    assert_eq!(
+        alignment_range_selection(&order, TrackId::new(99), TrackId::new(3)),
+        [TrackId::new(3)]
     );
 }
 

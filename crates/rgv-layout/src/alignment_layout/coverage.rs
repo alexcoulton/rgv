@@ -1,3 +1,4 @@
+use super::technologies::bisulfite_color;
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
@@ -53,23 +54,105 @@ pub(crate) fn add_coverage(
             shape: Default::default(),
         });
         if bin_interval.len() == 1
-            && let Some(reference_base) =
-                reference.and_then(|reference| reference.base_at(bin_interval.start()))
+            && let Some(reference) = reference
+            && let Some(reference_base) = reference.base_at(bin_interval.start())
         {
-            add_allele_coverage(
-                display_list,
-                bin,
-                reference_base,
-                x,
-                options.coverage_top + options.coverage_height,
-                (right - x).max(1.0).min(width),
-                height,
-                options.minimum_allele_fraction,
-                options.quality_weighted_alleles,
-            );
+            if let AlignmentColorMode::Bisulfite(context) = options.color_mode {
+                add_bisulfite_coverage(
+                    display_list,
+                    bin,
+                    reference,
+                    context,
+                    bin_interval.start(),
+                    x,
+                    options.coverage_top + options.coverage_height,
+                    (right - x).max(1.0).min(width),
+                    height,
+                    options.quality_weighted_alleles,
+                );
+            } else {
+                add_allele_coverage(
+                    display_list,
+                    bin,
+                    reference_base,
+                    x,
+                    options.coverage_top + options.coverage_height,
+                    (right - x).max(1.0).min(width),
+                    height,
+                    options.minimum_allele_fraction,
+                    options.quality_weighted_alleles,
+                );
+            }
         }
     }
     maximum
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_bisulfite_coverage(
+    display_list: &mut DisplayList,
+    bin: PileupBin,
+    reference: &ReferenceSlice,
+    context: BisulfiteContext,
+    position: u64,
+    x: f32,
+    bottom: f32,
+    width: f32,
+    total_height: f32,
+    quality_weighted: bool,
+) {
+    let (alleles, weighted, protected_base, converted_base) =
+        if bisulfite_context_matches(reference, position, false, context) {
+            (
+                bin.bisulfite_forward_alleles,
+                bin.bisulfite_forward_quality_weighted,
+                b'C',
+                b'T',
+            )
+        } else if bisulfite_context_matches(reference, position, true, context) {
+            (
+                bin.bisulfite_reverse_alleles,
+                bin.bisulfite_reverse_quality_weighted,
+                b'G',
+                b'A',
+            )
+        } else {
+            return;
+        };
+    let denominator = if quality_weighted {
+        bin.quality_weighted.total() as f64
+    } else {
+        f64::from(bin.alleles.base_observations())
+    };
+    if denominator <= 0.0 {
+        return;
+    }
+
+    let mut cursor = bottom;
+    for (observation, base) in [
+        (BisulfiteObservation::Protected, protected_base),
+        (BisulfiteObservation::Converted, converted_base),
+    ] {
+        let support = if quality_weighted {
+            weighted.for_base(base) as f64
+        } else {
+            f64::from(alleles.for_base(base))
+        };
+        if support <= 0.0 {
+            continue;
+        }
+        let height = (support / denominator) as f32 * total_height;
+        cursor -= height;
+        display_list.rectangles.push(RectPrimitive {
+            x,
+            y: cursor,
+            width,
+            height: height.max(1.0).min(total_height),
+            color: bisulfite_color(observation),
+            object_id: 0,
+            shape: Default::default(),
+        });
+    }
 }
 
 pub(crate) fn add_coverage_navigation_markers(
@@ -194,7 +277,14 @@ pub(crate) fn add_junctions(
         let band_top = options.junction_top + row as f32 * band_height;
         let band_bottom = band_top + band_height;
         let baseline = band_top + band_height * 0.5;
-        let available_height = (band_height * 0.5 - 1.5).max(3.0);
+        // Keep a narrow text lane beyond each apex when counts are visible. This
+        // lets the label sit outside the curve instead of erasing part of it.
+        let apex_clearance = if options.show_junction_labels {
+            11.0
+        } else {
+            1.5
+        };
+        let available_height = (band_height * 0.5 - apex_clearance).max(3.0);
         let selected = options.selected_junction == [junction.start, junction.end];
         let selected_color = Rgba::new(0.08, 0.08, 0.10, 1.0);
         let components = [
@@ -286,27 +376,28 @@ pub(crate) fn add_junctions(
         if options.show_junction_labels
             && rendered_labels < MAX_RENDERED_JUNCTION_LABELS
             && right - left >= 30.0
+            && band_height >= 28.0
         {
             let label = junction_count_label(summary, junction, options.junction_count_mode);
-            let label_width = (label.chars().count() as f32 * 6.2 + 8.0).clamp(16.0, right - left);
+            let label_width = (label.chars().count() as f32 * 6.2 + 2.0).clamp(10.0, right - left);
             let label_y = component_apices
                 .iter()
                 .max_by_key(|(depth, _, _)| *depth)
                 .map_or(baseline - 7.0, |(_, shape, apex)| {
                     if *shape == RectShape::JunctionArcUp {
-                        *apex + 7.0
-                    } else {
                         *apex - 7.0
+                    } else {
+                        *apex + 7.0
                     }
                 })
-                .clamp(band_top + 7.0, band_bottom - 7.0);
+                .clamp(band_top + 5.5, band_bottom - 5.5);
             let label_left =
                 ((left + right - label_width) * 0.5).clamp(0.0, (width - label_width).max(0.0));
             let label_bounds = (
                 label_left,
-                label_y - 6.5,
+                label_y - 5.5,
                 label_left + label_width,
-                label_y + 6.5,
+                label_y + 5.5,
             );
             let overlaps_existing = occupied_label_bounds.iter().any(|bounds| {
                 label_bounds.0 < bounds.2 + 2.0
@@ -318,15 +409,6 @@ pub(crate) fn add_junctions(
                 continue;
             }
             occupied_label_bounds.push(label_bounds);
-            display_list.rectangles.push(RectPrimitive {
-                x: label_left,
-                y: label_y - 6.5,
-                width: label_width,
-                height: 13.0,
-                color: Rgba::new(1.0, 1.0, 1.0, 0.88),
-                object_id: 0,
-                shape: RectShape::Rectangle,
-            });
             display_list.texts.push(TextPrimitive {
                 x: (left + right) * 0.5,
                 y: label_y,

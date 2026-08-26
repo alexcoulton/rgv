@@ -150,23 +150,53 @@ impl Viewer {
             });
         if cursor_y < annotation_clip_bottom {
             self.scroll_annotations_by(-points);
-        } else {
-            self.scroll_tracks_by(-points);
+        } else if let Some(track_id) = self.read_panel_at_screen_y(cursor_y) {
+            self.scroll_read_panel_by(track_id, -points);
         }
     }
 
+    /// Backward-compatible primary-track entry point used by automation and
+    /// older tests. Pointer interaction calls `scroll_read_panel_by` directly.
     pub(crate) fn scroll_tracks_by(&mut self, points: f32) {
-        let maximum = (self.panels.active().content_bottom_points
-            - self.canvas_geometry.viewport.bottom())
-        .max(0.0);
-        let next = (self.panels.active().vertical_scroll_points + points).clamp(0.0, maximum);
-        if (next - self.panels.active().vertical_scroll_points).abs() <= f32::EPSILON {
+        self.scroll_read_panel_by(self.primary_alignment_track_id(), points);
+    }
+
+    pub(crate) fn scroll_read_panel_by(&mut self, track_id: TrackId, points: f32) {
+        let current = self
+            .panels
+            .active()
+            .read_panel_scroll_state(track_id)
+            .scroll_points;
+        self.set_read_panel_scroll(track_id, current + points);
+    }
+
+    fn set_read_panel_scroll(&mut self, track_id: TrackId, requested: f32) {
+        let Some((_, clip_bottom, _)) = self.read_panel_metrics(track_id) else {
+            return;
+        };
+        let state = self.panels.active().read_panel_scroll_state(track_id);
+        let maximum = (state.content_bottom_points - clip_bottom).max(0.0);
+        let next = requested.clamp(0.0, maximum);
+        if (next - state.scroll_points).abs() <= f32::EPSILON {
             return;
         }
-        self.panels.active_mut().vertical_scroll_points = next;
-        if maximum > f32::EPSILON {
-            self.panels.active_mut().latent_vertical_scroll_fraction =
-                Some((next / maximum).clamp(0.0, 1.0));
+        let primary_track_id = self.primary_alignment_track_id();
+        let latent_fraction = {
+            let state = self
+                .panels
+                .active_mut()
+                .read_panel_scrolls
+                .entry(track_id)
+                .or_default();
+            state.scroll_points = next;
+            if maximum > f32::EPSILON {
+                state.latent_scroll_fraction = Some((next / maximum).clamp(0.0, 1.0));
+            }
+            state.latent_scroll_fraction
+        };
+        if track_id == primary_track_id {
+            self.panels.active_mut().vertical_scroll_points = next;
+            self.panels.active_mut().latent_vertical_scroll_fraction = latent_fraction;
         }
         if self.synthetic || !self.refresh_active_panel_scroll_display() {
             self.display_dirty = true;
@@ -526,8 +556,9 @@ impl Viewer {
         }
     }
 
-    pub(crate) fn apply_vertical_overview_interaction(
+    pub(crate) fn apply_read_panel_overview_interaction(
         &mut self,
+        track_id: TrackId,
         interaction: ui::ScrollbarInteraction,
         requested_scroll: &mut f32,
     ) {
@@ -536,41 +567,45 @@ impl Viewer {
                 .record_once(InteractionTraceStage::EguiPointerDown);
         }
         if interaction.keyboard_density_pixels.abs() > f32::EPSILON {
-            let anchor_y = self.canvas_geometry.viewport.height() * 0.5;
+            let viewport_height = self.read_panel_metrics(track_id).map_or(
+                self.canvas_geometry.viewport.height(),
+                |(top, bottom, _)| (bottom - top).max(1.0),
+            );
+            let panel_id = self.panels.active().id;
+            let previous_density = self.alignment_density_for_panel_track(panel_id, track_id);
+            let anchor_y = viewport_height * 0.5;
             let (density, scroll) = vertical_overview_step(
-                self.primary_alignment_filters().alignment_density,
+                previous_density,
                 *requested_scroll,
                 anchor_y,
                 interaction.keyboard_density_pixels,
                 0.0,
             );
-            if (density - self.primary_alignment_filters().alignment_density).abs() > 1.0e-4 {
-                self.set_shared_alignment_density(density);
+            if (density - previous_density).abs() > 1.0e-4 {
+                self.set_read_panel_density(panel_id, track_id, density);
                 self.display_dirty = true;
             }
-            let maximum = (self.panels.active().content_bottom_points
-                - self.canvas_geometry.viewport.bottom())
-            .max(0.0);
+            let maximum = self
+                .read_panel_metrics(track_id)
+                .map_or(0.0, |(_, clip_bottom, _)| {
+                    (self
+                        .panels
+                        .active()
+                        .read_panel_scroll_state(track_id)
+                        .content_bottom_points
+                        - clip_bottom)
+                        .max(0.0)
+                });
             *requested_scroll = scroll.clamp(0.0, maximum);
             self.display_dirty = true;
         }
+        self.set_read_panel_scroll(track_id, *requested_scroll);
     }
 
     pub(crate) fn begin_vertical_scrollbar_drag(&mut self) -> bool {
         if self.vertical_overview_drag.is_some() || !self.cursor_in_vertical_scrollbar() {
             return false;
         }
-        let maximum = (self.panels.active().content_bottom_points
-            - self.canvas_geometry.viewport.bottom())
-        .max(0.0);
-        let camera_viewport_height = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(self.canvas_geometry.viewport.height(), |cache| {
-                (cache.scroll_clip_bottom - cache.scroll_clip_top).max(1.0)
-            });
         // A fitting track stack has no vertical pan range, but the same control must
         // remain draggable horizontally so the user can expand it into an overflow.
         let scale = self.window.scale_factor().max(f64::EPSILON);
@@ -578,24 +613,50 @@ impl Viewer {
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
         );
-        let latent_fraction = self.panels.active().latent_vertical_scroll_fraction;
-        let scroll_fraction = (maximum > f32::EPSILON)
-            .then(|| (self.panels.active().vertical_scroll_points / maximum).clamp(0.0, 1.0));
+        let target_panel = self.panels.iter().enumerate().find_map(|(index, panel)| {
+            (self.panel_scrollbar_rect_at(index).contains(pointer)
+                && panel.scroll_display_cache.as_ref().is_some_and(|cache| {
+                    cache.read_panels.iter().any(|read_panel| {
+                        pointer.y >= read_panel.clip_top && pointer.y < read_panel.clip_bottom
+                    })
+                }))
+            .then_some(panel.id)
+        });
+        let Some(target_panel) = target_panel else {
+            return false;
+        };
+        self.activate_view_panel(target_panel);
+        let Some(track_id) = self.read_panel_at_screen_y(pointer.y) else {
+            return false;
+        };
+        let Some((clip_top, clip_bottom, _)) = self.read_panel_metrics(track_id) else {
+            return false;
+        };
+        let state = self.panels.active().read_panel_scroll_state(track_id);
+        let maximum = (state.content_bottom_points - clip_bottom).max(0.0);
+        let camera_viewport_height = (clip_bottom - clip_top).max(1.0);
+        let scrollbar_rect = self
+            .read_panel_scrollbar_rect(track_id)
+            .unwrap_or(self.canvas_geometry.scrollbar);
+        let density = self.alignment_density_for_panel_track(self.panels.active().id, track_id);
+        let latent_fraction = state.latent_scroll_fraction;
+        let scroll_fraction =
+            (maximum > f32::EPSILON).then(|| (state.scroll_points / maximum).clamp(0.0, 1.0));
         let geometry = scroll_fraction.or(latent_fraction).map_or_else(
             || {
                 ui::scrollbar_geometry_for_density_in_viewport(
-                    self.read_vertical_scrollbar_rect(),
+                    scrollbar_rect,
                     maximum,
-                    self.panels.active().vertical_scroll_points,
-                    self.primary_alignment_filters().alignment_density,
+                    state.scroll_points,
+                    density,
                     camera_viewport_height,
                 )
             },
             |fraction| {
                 ui::scrollbar_geometry_for_density_at_fraction_in_viewport(
-                    self.read_vertical_scrollbar_rect(),
+                    scrollbar_rect,
                     maximum,
-                    self.primary_alignment_filters().alignment_density,
+                    density,
                     fraction,
                     camera_viewport_height,
                 )
@@ -612,6 +673,7 @@ impl Viewer {
             .unwrap_or(thumb_grab_fraction);
         self.vertical_overview_drag = Some(VerticalOverviewDrag {
             panel_id: self.panels.active().id,
+            track_id,
             grab_offset: if thumb_hit {
                 pointer.y - geometry.thumb.top()
             } else {
@@ -672,27 +734,25 @@ impl Viewer {
             self.window.request_redraw();
             return true;
         }
-        let maximum = (self.panels.active().content_bottom_points
-            - self.canvas_geometry.viewport.bottom())
-        .max(0.0);
-        let camera_viewport_height = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(self.canvas_geometry.viewport.height(), |cache| {
-                (cache.scroll_clip_bottom - cache.scroll_clip_top).max(1.0)
-            });
+        let Some((clip_top, clip_bottom, _)) = self.read_panel_metrics(drag.track_id) else {
+            return false;
+        };
+        let state = self.panels.active().read_panel_scroll_state(drag.track_id);
+        let maximum = (state.content_bottom_points - clip_bottom).max(0.0);
+        let camera_viewport_height = (clip_bottom - clip_top).max(1.0);
+        let density = self.alignment_density_for_panel_track(drag.panel_id, drag.track_id);
+        let scrollbar_rect = self
+            .read_panel_scrollbar_rect(drag.track_id)
+            .unwrap_or(self.canvas_geometry.scrollbar);
         let geometry = ui::scrollbar_geometry_for_density_in_viewport(
-            self.read_vertical_scrollbar_rect(),
+            scrollbar_rect,
             maximum,
-            self.panels.active().vertical_scroll_points,
-            self.primary_alignment_filters().alignment_density,
+            state.scroll_points,
+            density,
             camera_viewport_height,
         );
         let next = ui::scrollbar_offset_at_grab(geometry, maximum, pointer.y, drag.grab_offset);
-        let change = next - self.panels.active().vertical_scroll_points;
-        self.scroll_tracks_by(change);
+        self.set_read_panel_scroll(drag.track_id, next);
         drag.last_pointer_x = pointer.x;
         self.vertical_overview_drag = Some(drag);
         self.window.request_redraw();
@@ -823,45 +883,25 @@ impl Viewer {
         if drag.panel_id != self.panels.active().id {
             return;
         }
-        let previous_density = self.primary_alignment_filters().alignment_density;
+        let previous_density = self.alignment_density_for_panel_track(drag.panel_id, drag.track_id);
         let density = density_from_horizontal_drag(previous_density, delta_x);
-        let viewport_height = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(self.canvas_geometry.viewport.height(), |cache| {
-                (cache.scroll_clip_bottom - cache.scroll_clip_top).max(1.0)
-            });
-        let read_viewport_bottom = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(self.canvas_geometry.viewport.bottom(), |cache| {
-                cache.scroll_clip_bottom
-            });
-        let previous_padding = vertical_density_camera_padding(viewport_height, previous_density);
-        let actual_content_bottom = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or_else(
-                || {
-                    (self.panels.active().content_bottom_points - previous_padding)
-                        .max(read_viewport_bottom)
-                },
-                |cache| cache.actual_content_bottom,
-            );
+        let Some((read_viewport_top, read_viewport_bottom, actual_content_bottom)) =
+            self.read_panel_metrics(drag.track_id)
+        else {
+            return;
+        };
+        let viewport_height = (read_viewport_bottom - read_viewport_top).max(1.0);
         let maximum = vertical_camera_maximum(
             actual_content_bottom,
             read_viewport_bottom,
             viewport_height,
             density,
         );
+        let scrollbar_rect = self
+            .read_panel_scrollbar_rect(drag.track_id)
+            .unwrap_or(self.canvas_geometry.scrollbar);
         let geometry = ui::scrollbar_geometry_for_density_at_fraction_in_viewport(
-            self.read_vertical_scrollbar_rect(),
+            scrollbar_rect,
             maximum,
             density,
             drag.virtual_scroll_fraction,
@@ -881,20 +921,33 @@ impl Viewer {
         drag.virtual_scroll_fraction =
             ui::scrollbar_fraction_at_grab(geometry, drag.virtual_pointer_y, grab_fraction);
         let next_scroll = drag.virtual_scroll_fraction * maximum;
-        let previous_effective_scroll = self.panels.active().effective_vertical_scroll_points();
+        let previous_state = self.panels.active().read_panel_scroll_state(drag.track_id);
+        let previous_effective_scroll = previous_state.effective_scroll_points();
         let camera_padding = vertical_density_camera_padding(viewport_height, density);
         let zoom_scroll = zoom_fraction * maximum;
         let content_origin = (zoom_scroll - previous_effective_scroll).clamp(0.0, camera_padding);
         let density_changed = (density - previous_density).abs() > 1.0e-4;
-        let scroll_changed =
-            (next_scroll - self.panels.active().vertical_scroll_points).abs() > f32::EPSILON;
+        let scroll_changed = (next_scroll - previous_state.scroll_points).abs() > f32::EPSILON;
         self.vertical_overview_drag = Some(drag);
-        self.panels.active_mut().vertical_scroll_points = next_scroll;
-        self.panels.active_mut().vertical_content_origin_points = content_origin;
-        self.panels.active_mut().latent_vertical_scroll_fraction =
-            Some(drag.virtual_scroll_fraction);
+        let state = self
+            .panels
+            .active_mut()
+            .read_panel_scrolls
+            .entry(drag.track_id)
+            .or_default();
+        state.scroll_points = next_scroll;
+        state.content_origin_points = content_origin;
+        state.latent_scroll_fraction = Some(drag.virtual_scroll_fraction);
+        state.content_bottom_points = read_viewport_bottom + maximum;
+        if drag.track_id == self.primary_alignment_track_id() {
+            self.panels.active_mut().vertical_scroll_points = next_scroll;
+            self.panels.active_mut().vertical_content_origin_points = content_origin;
+            self.panels.active_mut().latent_vertical_scroll_fraction =
+                Some(drag.virtual_scroll_fraction);
+            self.panels.active_mut().content_bottom_points = read_viewport_bottom + maximum;
+        }
         if density_changed {
-            self.set_shared_alignment_density(density);
+            self.set_read_panel_density(drag.panel_id, drag.track_id, density);
             self.display_dirty = true;
             self.interaction_trace
                 .record_once(InteractionTraceStage::DensityChanged);
@@ -965,10 +1018,14 @@ impl Viewer {
 
     pub(crate) fn cursor_in_genomic_canvas(&self) -> bool {
         let scale = self.window.scale_factor();
-        self.canvas_geometry.genomic.contains(egui::pos2(
+        let point = egui::pos2(
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
-        ))
+        );
+        (0..self.panels.len()).any(|index| {
+            ui::workspace_genomic_rect(self.canvas_geometry, index, self.panels.len())
+                .contains(point)
+        })
     }
 
     pub(crate) fn cursor_over_unobstructed_genomic_canvas(&self) -> bool {
@@ -988,19 +1045,15 @@ impl Viewer {
     }
 
     pub(crate) fn panel_column_rect_at(&self, index: usize) -> egui::Rect {
-        let canvas = self.canvas_geometry.genomic;
-        let count = self.panels.len().max(1) as f32;
-        let width = canvas.width() / count;
-        let left = canvas.left() + index as f32 * width;
-        let right = if index + 1 == self.panels.len() {
-            canvas.right()
-        } else {
-            left + width
-        };
-        egui::Rect::from_min_max(
-            egui::pos2(left, canvas.top()),
-            egui::pos2(right, canvas.bottom()),
-        )
+        ui::workspace_genomic_rect(self.canvas_geometry, index, self.panels.len())
+    }
+
+    pub(crate) fn panel_workspace_rect_at(&self, index: usize) -> egui::Rect {
+        ui::workspace_column_rect(self.canvas_geometry, index, self.panels.len())
+    }
+
+    pub(crate) fn panel_scrollbar_rect_at(&self, index: usize) -> egui::Rect {
+        ui::workspace_scrollbar_rect(self.canvas_geometry, index, self.panels.len())
     }
 
     pub(crate) fn panel_column_rect(&self, id: PanelId) -> Option<egui::Rect> {
@@ -1022,7 +1075,7 @@ impl Viewer {
             (self.cursor.y / scale) as f32,
         );
         self.panels.iter().enumerate().find_map(|(index, panel)| {
-            self.panel_column_rect_at(index)
+            self.panel_workspace_rect_at(index)
                 .contains(point)
                 .then_some(panel.id)
         })
@@ -1085,7 +1138,8 @@ impl Viewer {
             "a workspace supports at most {MAXIMUM_VIEW_PANELS} view panels"
         );
         anyhow::ensure!(
-            self.canvas_geometry.genomic.width() / (self.panels.len() + 1) as f32 >= 140.0,
+            ui::workspace_genomic_rect(self.canvas_geometry, 0, self.panels.len() + 1,).width()
+                >= 140.0,
             "the window is too narrow to add another readable panel"
         );
         let dictionary = self
@@ -1100,7 +1154,9 @@ impl Viewer {
             resolve_initial_locus(dictionary, &self.contig_aliases, Some(locus))?;
         let id = self.panels.next_id();
         let width = f64::from(
-            (self.canvas_geometry.genomic.width() / (self.panels.len() + 1) as f32).max(1.0),
+            ui::workspace_genomic_rect(self.canvas_geometry, 0, self.panels.len() + 1)
+                .width()
+                .max(1.0),
         );
         let viewport = Viewport::new(interval, width)?;
         let mut panel = ViewPanelController::new(
@@ -1175,33 +1231,61 @@ impl Viewer {
 
     pub(crate) fn cursor_in_vertical_scrollbar(&self) -> bool {
         let scale = self.window.scale_factor();
-        self.read_vertical_scrollbar_rect().contains(egui::pos2(
+        let point = egui::pos2(
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
-        ))
+        );
+        self.panels.iter().enumerate().any(|(index, panel)| {
+            self.panel_scrollbar_rect_at(index).contains(point)
+                && panel.scroll_display_cache.as_ref().is_some_and(|cache| {
+                    cache.read_panels.iter().any(|read_panel| {
+                        point.y >= read_panel.clip_top && point.y < read_panel.clip_bottom
+                    })
+                })
+        })
     }
 
-    fn read_vertical_scrollbar_rect(&self) -> egui::Rect {
-        let full = self.canvas_geometry.scrollbar;
-        let top = self
-            .panels
+    fn read_panel_at_screen_y(&self, screen_y: f32) -> Option<TrackId> {
+        self.panels
             .active()
             .scroll_display_cache
-            .as_ref()
-            .map_or(full.top(), |cache| cache.scroll_clip_top)
-            .clamp(full.top(), full.bottom());
-        egui::Rect::from_min_max(egui::pos2(full.left(), top), full.max)
+            .as_ref()?
+            .read_panels
+            .iter()
+            .find(|panel| screen_y >= panel.clip_top && screen_y < panel.clip_bottom)
+            .map(|panel| panel.track_id)
+    }
+
+    fn read_panel_metrics(&self, track_id: TrackId) -> Option<(f32, f32, f32)> {
+        self.panels
+            .active()
+            .scroll_display_cache
+            .as_ref()?
+            .read_panels
+            .iter()
+            .find(|panel| panel.track_id == track_id)
+            .map(|panel| {
+                (
+                    panel.clip_top,
+                    panel.clip_bottom,
+                    panel.actual_content_bottom,
+                )
+            })
+    }
+
+    fn read_panel_scrollbar_rect(&self, track_id: TrackId) -> Option<egui::Rect> {
+        let (top, bottom, _) = self.read_panel_metrics(track_id)?;
+        let active_index = self.panels.active;
+        let full = self.panel_scrollbar_rect_at(active_index);
+        Some(egui::Rect::from_min_max(
+            egui::pos2(full.left(), top.clamp(full.top(), full.bottom())),
+            egui::pos2(full.right(), bottom.clamp(full.top(), full.bottom())),
+        ))
     }
 
     pub(crate) fn inspector_activation_at_cursor(&self) -> InspectorActivation {
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
         let panel = self.panels.active();
-        let scroll_clip_top = panel
-            .scroll_display_cache
-            .as_ref()
-            .map_or(self.canvas_geometry.viewport.top(), |cache| {
-                cache.scroll_clip_top
-            });
         let annotation_clip_top = panel
             .scroll_display_cache
             .as_ref()
@@ -1222,18 +1306,18 @@ impl Viewer {
                 frame,
                 cursor_y,
                 if frame.frozen_bottom.is_some() {
-                    panel.effective_vertical_scroll_points()
+                    0.0
                 } else {
                     panel.annotation_scroll_points
                 },
                 if frame.frozen_bottom.is_some() {
-                    scroll_clip_top
+                    frame.top
                 } else {
                     annotation_clip_top
                 },
                 self.canvas_geometry.viewport.top(),
                 if frame.frozen_bottom.is_some() {
-                    self.canvas_geometry.viewport.bottom()
+                    frame.bottom
                 } else {
                     annotation_clip_bottom
                 },

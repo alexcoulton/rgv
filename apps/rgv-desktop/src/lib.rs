@@ -379,6 +379,7 @@ struct HorizontalOverviewDrag {
 #[derive(Clone, Copy)]
 struct VerticalOverviewDrag {
     panel_id: PanelId,
+    track_id: TrackId,
     grab_offset: f32,
     press_x: f32,
     press_y: f32,
@@ -426,12 +427,32 @@ fn clear_removed_alignment_panel_state(
     removed: TrackId,
     removed_was_primary: bool,
 ) {
+    panel.read_panel_scrolls.remove(&removed);
+    if let Some(cache) = panel.scroll_display_cache.as_mut() {
+        cache
+            .read_panels
+            .retain(|read_panel| read_panel.track_id != removed);
+    }
+    if removed_was_primary {
+        panel.vertical_scroll_points = 0.0;
+        panel.vertical_content_origin_points = 0.0;
+        panel.latent_vertical_scroll_fraction = None;
+    }
     panel
         .track_frames
         .retain(|frame| frame.key != TrackFrameKey::Alignment(removed));
     panel
         .selected_alignment_tracks
         .retain(|candidate| *candidate != removed);
+    panel
+        .selected_read_tracks
+        .retain(|candidate| *candidate != removed);
+    if panel.read_selection_anchor == Some(removed) {
+        panel.read_selection_anchor = panel.selected_read_tracks.last().copied();
+    }
+    if panel.alignment_selection_anchor == Some(removed) {
+        panel.alignment_selection_anchor = panel.selected_alignment_tracks.last().copied();
+    }
     let removed_owned_evidence = panel.selected_alignment_track == Some(removed)
         || (removed_was_primary
             && panel.selected_alignment_track.is_none()
@@ -463,6 +484,7 @@ fn clear_removed_alignment_panel_state(
             .selected_alignment_tracks
             .last()
             .copied()
+            .or_else(|| panel.selected_read_tracks.last().copied())
             .map(TrackFrameKey::Alignment);
     }
 }

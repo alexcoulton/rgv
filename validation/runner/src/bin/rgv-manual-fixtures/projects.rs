@@ -292,12 +292,16 @@ pub(crate) fn write_projects(suite_root: &Path) -> Result<()> {
     .into_iter()
     .enumerate()
     {
-        bisulfite.alignment_tracks.push(alignment_track(
+        let mut track = alignment_track(
             u64::try_from(offset)? + 1,
             &format!("{context:?} converted/protected evidence"),
             "../data/alignments/specialist.bam",
             AlignmentColorMode::Bisulfite(context),
-        ));
+        );
+        // IGV counts both overlapping ends in this comparison fixture. Keep
+        // the parity project explicit without changing RGV's safer default.
+        track.filters.overlapping_mate_policy = OverlappingMatePolicy::CountBoth;
+        bisulfite.alignment_tracks.push(track);
     }
     write_session(&projects.join(PROJECTS[3].filename), &bisulfite)?;
 

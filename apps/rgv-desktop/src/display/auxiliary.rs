@@ -14,12 +14,12 @@ pub(crate) fn snapshot_record_count(snapshot: &TrackSnapshot) -> usize {
 
 pub(crate) fn quantitative_overlay_members<'a>(
     anchor: &'a TrackConfig,
-    visible_tracks: &[&'a TrackConfig],
+    tracks: &[&'a TrackConfig],
 ) -> Vec<&'a TrackConfig> {
     let Some(group) = anchor.quantitative.overlay_group else {
         return vec![anchor];
     };
-    visible_tracks
+    tracks
         .iter()
         .copied()
         .filter(|track| {
@@ -57,7 +57,7 @@ pub(crate) fn quantitative_overlay_subtracks(
                 .map(|group| format!("overlay {group}")),
             top: top + 22.0 + index as f32 * 14.0,
             bottom: top + 36.0 + index as f32 * 14.0,
-            collapsed: member.collapsed,
+            collapsed: !member.visible || member.collapsed,
             composite_member: Some(member.id),
         })
         .collect::<Vec<_>>();

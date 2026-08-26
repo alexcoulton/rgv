@@ -18,11 +18,12 @@ use flate2::{Compression, write::GzEncoder};
 use rgv_core::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentSortMode, BisulfiteContext,
     GENOME_CONFIGURATION_SCHEMA_VERSION, GenomeAnnotation, GenomeConfiguration,
-    JunctionDisplayMode, PanelId, QuantitativeArithmetic, QuantitativeScaleMode,
-    ReadBaseDisplayMode, ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus,
-    SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode, SessionAlignmentTrack,
-    SessionDocument, SessionLocus, SessionViewPanel, SmrtKineticsMode, TrackConfig, TrackFormat,
-    TrackId, TrackKind, TrackSource, UltimaDisplayOptions, UltimaQualityMode,
+    JunctionDisplayMode, OverlappingMatePolicy, PanelId, QuantitativeArithmetic,
+    QuantitativeScaleMode, ReadBaseDisplayMode, ReferenceTranslationFrame, RegionOfInterest,
+    ReviewItem, ReviewStatus, SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode,
+    SessionAlignmentTrack, SessionDocument, SessionLocus, SessionViewPanel, SmrtKineticsMode,
+    TrackConfig, TrackFormat, TrackId, TrackKind, TrackSource, UltimaDisplayOptions,
+    UltimaQualityMode,
 };
 use rgv_validation_runner::{
     CoverageCatalog, CoverageDisposition, CoverageEntry, CoverageSource, DEFAULT_SUITE_ROOT,
@@ -96,9 +97,7 @@ pub(crate) use support::{
 };
 #[path = "rgv-manual-fixtures/variants.rs"]
 mod variants;
-pub(crate) use variants::{
-    basic_record, basic_record_with_quality, repeating_bases, write_cohort_variants,
-};
+pub(crate) use variants::{basic_record, repeating_bases, write_cohort_variants};
 #[path = "rgv-manual-fixtures/truth.rs"]
 mod truth;
 pub(crate) use truth::write_truth_documents;

@@ -37,28 +37,36 @@ impl Viewer {
         predicate: impl Fn(&TrackFrame) -> bool,
     ) -> Option<(&TrackFrame, f32)> {
         let panel = self.panels.active();
-        let scroll_clip_top = self.active_scroll_clip_top();
         let annotation_clip_top = self.active_annotation_clip_top();
         panel.track_frames.iter().find_map(|frame| {
-            let (scroll, clip_top) = if frame.frozen_bottom.is_some() {
-                (panel.effective_vertical_scroll_points(), scroll_clip_top)
-            } else {
-                (panel.annotation_scroll_points, annotation_clip_top)
-            };
-            let clip_bottom = if frame.frozen_bottom.is_some() {
-                self.canvas_geometry.viewport.bottom()
-            } else {
-                self.active_annotation_clip_bottom()
-            };
+            let read_panel = frame.frozen_bottom.is_some();
             predicate(frame)
                 .then(|| {
+                    if read_panel {
+                        if screen_y < frame.top || screen_y >= frame.bottom {
+                            return None;
+                        }
+                        let track_id = match frame.key {
+                            TrackFrameKey::Alignment(track_id) => track_id,
+                            TrackFrameKey::Reference
+                            | TrackFrameKey::Group(_)
+                            | TrackFrameKey::Auxiliary(_) => return None,
+                        };
+                        return Some((
+                            frame,
+                            screen_y
+                                + panel
+                                    .read_panel_scroll_state(track_id)
+                                    .effective_scroll_points(),
+                        ));
+                    }
                     ui::frame_content_y_at_screen_y(
                         frame,
                         screen_y,
-                        scroll,
-                        clip_top,
+                        panel.annotation_scroll_points,
+                        annotation_clip_top,
                         self.canvas_geometry.viewport.top(),
-                        clip_bottom,
+                        self.active_annotation_clip_bottom(),
                     )
                     .map(|content_y| (frame, content_y))
                 })
@@ -1199,6 +1207,9 @@ impl Viewer {
             return;
         };
         match track_key {
+            TrackFrameKey::Group(group) => {
+                self.data_status = format!("Track group {group} has no discrete evidence records");
+            }
             TrackFrameKey::Reference => {
                 "The reference track has no discrete evidence records"
                     .clone_into(&mut self.data_status);

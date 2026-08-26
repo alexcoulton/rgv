@@ -566,6 +566,22 @@ pub struct SessionAlignmentTrack {
     pub visible: bool,
     #[serde(default)]
     pub collapsed: bool,
+    /// Optional presentation group for alignment tracks. Group membership is
+    /// independent of alignment read grouping and quantitative overlays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_group: Option<u32>,
+    /// Whether the complete presentation group is minimized. The value is
+    /// mirrored across every member so projects remain self-contained when
+    /// tracks are reordered or removed.
+    #[serde(default)]
+    pub track_group_collapsed: bool,
+    /// Optional presentation group for the read-data pane. This is deliberately
+    /// independent from `track_group`, which groups annotation summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_track_group: Option<u32>,
+    /// Whether this track's read-data group is minimized.
+    #[serde(default)]
+    pub read_track_group_collapsed: bool,
     #[serde(default = "default_alignment_track_height")]
     pub height: f32,
     /// Optional independently resized height of this track's annotation
@@ -592,6 +608,10 @@ impl SessionAlignmentTrack {
             sample_key: None,
             visible: true,
             collapsed: false,
+            track_group: None,
+            track_group_collapsed: false,
+            read_track_group: None,
+            read_track_group_collapsed: false,
             height: default_alignment_track_height(),
             annotation_height: None,
             read_group_height: None,
@@ -963,6 +983,10 @@ impl SessionDocument {
             }
             if track.name.trim().is_empty()
                 || !valid_sample_association(track.sample_key.as_deref())
+                || track.track_group == Some(0)
+                || (track.track_group.is_none() && track.track_group_collapsed)
+                || track.read_track_group == Some(0)
+                || (track.read_track_group.is_none() && track.read_track_group_collapsed)
                 || !track.height.is_finite()
                 || track.height < 26.0
                 || track

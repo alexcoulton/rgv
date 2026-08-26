@@ -458,6 +458,7 @@ impl Viewer {
         let removed_was_primary = index == 0;
         let removed_track = self.alignment_tracks.remove(index);
         self.retire_alignment_track_controller(removed_track);
+        self.normalize_alignment_track_groups();
         if self
             .promoted_read
             .is_some_and(|(track_id, _)| track_id == id)

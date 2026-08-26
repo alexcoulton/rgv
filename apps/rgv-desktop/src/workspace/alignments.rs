@@ -169,23 +169,61 @@ impl Viewer {
             })
     }
 
-    /// The lower read pane has one vertical density camera. Keep every sample
-    /// on that same absolute row scale regardless of which input path changed
-    /// it (settings, keyboard, MCP, or scrollbar gesture).
-    pub(crate) fn set_shared_alignment_density(&mut self, density: f32) -> bool {
+    pub(crate) fn set_alignment_density_for_track(
+        &mut self,
+        track_id: TrackId,
+        density: f32,
+    ) -> bool {
         let density = density.clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);
-        if self.alignment_tracks.is_empty() {
-            let changed =
-                (self.empty_alignment.filters.alignment_density - density).abs() > f32::EPSILON;
-            self.empty_alignment.filters.alignment_density = density;
-            return changed;
-        }
-        let mut changed = false;
-        for track in &mut self.alignment_tracks {
-            changed |= (track.config.filters.alignment_density - density).abs() > f32::EPSILON;
-            track.config.filters.alignment_density = density;
+        let filters =
+            if track_id == SYNTHETIC_ALIGNMENT_TRACK_ID && self.alignment_tracks.is_empty() {
+                &mut self.empty_alignment.filters
+            } else if let Some(track) = self
+                .alignment_tracks
+                .iter_mut()
+                .find(|track| track.config.id == track_id)
+            {
+                &mut track.config.filters
+            } else {
+                return false;
+            };
+        let changed = (filters.alignment_density - density).abs() > f32::EPSILON;
+        filters.alignment_density = density;
+        for panel in &mut self.panels.panels {
+            if let Some(state) = panel.read_panel_scrolls.get_mut(&track_id) {
+                state.density = None;
+            }
         }
         changed
+    }
+
+    pub(crate) fn alignment_density_for_panel_track(
+        &self,
+        panel_id: PanelId,
+        track_id: TrackId,
+    ) -> f32 {
+        self.panels
+            .get(panel_id)
+            .and_then(|panel| panel.read_panel_scrolls.get(&track_id))
+            .and_then(|state| state.density)
+            .unwrap_or_else(|| self.alignment_filters_for_track(track_id).alignment_density)
+    }
+
+    pub(crate) fn set_read_panel_density(
+        &mut self,
+        panel_id: PanelId,
+        track_id: TrackId,
+        density: f32,
+    ) -> bool {
+        let density = density.clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);
+        let default_density = self.alignment_filters_for_track(track_id).alignment_density;
+        let Some(panel) = self.panels.get_mut(panel_id) else {
+            return false;
+        };
+        let state = panel.read_panel_scrolls.entry(track_id).or_default();
+        let previous = state.density.unwrap_or(default_density);
+        state.density = Some(density);
+        (previous - density).abs() > f32::EPSILON
     }
 
     pub(crate) fn primary_filter_editor(&self) -> &FilterEditor {
@@ -447,6 +485,25 @@ pub(crate) fn updated_alignment_selection(
         next.push(id);
     }
     next
+}
+
+pub(crate) fn alignment_range_selection(
+    track_order: &[TrackId],
+    anchor: TrackId,
+    clicked: TrackId,
+) -> Vec<TrackId> {
+    let Some(anchor_index) = track_order.iter().position(|id| *id == anchor) else {
+        return vec![clicked];
+    };
+    let Some(clicked_index) = track_order.iter().position(|id| *id == clicked) else {
+        return vec![clicked];
+    };
+    let (start, end) = if anchor_index <= clicked_index {
+        (anchor_index, clicked_index)
+    } else {
+        (clicked_index, anchor_index)
+    };
+    track_order[start..=end].to_vec()
 }
 
 pub(crate) fn interval_for_track(

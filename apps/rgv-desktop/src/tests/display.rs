@@ -1,10 +1,97 @@
 use super::super::*;
+use crate::display::alignment::{ReadPanelKey, read_panel_bounds, read_panel_bounds_for_track};
 use crate::display::{
-    ANNOTATION_PANE_BACKGROUND, PINNED_ALIGNMENT_COVERAGE_HEIGHT,
-    PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT, PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
-    PINNED_ALIGNMENT_MODIFICATION_HEIGHT, PINNED_ALIGNMENT_REFERENCE_HEIGHT,
+    ANNOTATION_PANE_BACKGROUND, COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT,
+    PINNED_ALIGNMENT_COVERAGE_HEIGHT, PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT,
+    PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT, PINNED_ALIGNMENT_MODIFICATION_HEIGHT,
+    PINNED_ALIGNMENT_REFERENCE_HEIGHT, alignment_annotation_lane_heights,
     append_annotation_pane_background, pinned_gene_track_height, primary_pinned_gene_id,
 };
+
+#[test]
+fn read_panels_tile_the_read_pane_with_independent_viewport_heights() {
+    let first = TrackId::new(101);
+    let second = TrackId::new(202);
+    let bounds = read_panel_bounds(
+        &[
+            (ReadPanelKey::Track(first), true, Some(300.0)),
+            (ReadPanelKey::Track(second), true, Some(100.0)),
+        ],
+        200.0,
+        600.0,
+    );
+
+    assert_eq!(bounds.len(), 2);
+    assert_eq!(bounds[0].key, ReadPanelKey::Track(first));
+    assert_eq!((bounds[0].top, bounds[0].bottom), (200.0, 500.0));
+    assert_eq!(bounds[1].key, ReadPanelKey::Track(second));
+    assert_eq!((bounds[1].top, bounds[1].bottom), (500.0, 600.0));
+    assert_eq!(bounds[0].bottom, bounds[1].top);
+}
+
+#[test]
+fn resizing_one_read_panel_reallocates_its_own_scrollbar_segment() {
+    let first = TrackId::new(101);
+    let second = TrackId::new(202);
+    let equal = read_panel_bounds(
+        &[
+            (ReadPanelKey::Track(first), true, Some(100.0)),
+            (ReadPanelKey::Track(second), true, Some(100.0)),
+        ],
+        200.0,
+        600.0,
+    );
+    let resized = read_panel_bounds(
+        &[
+            (ReadPanelKey::Track(first), true, Some(300.0)),
+            (ReadPanelKey::Track(second), true, Some(100.0)),
+        ],
+        200.0,
+        600.0,
+    );
+
+    assert_eq!(equal[0].bottom - equal[0].top, 200.0);
+    assert_eq!(equal[1].bottom - equal[1].top, 200.0);
+    assert_eq!(resized[0].bottom - resized[0].top, 300.0);
+    assert_eq!(resized[1].bottom - resized[1].top, 100.0);
+    assert_eq!(resized.last().map(|panel| panel.bottom), Some(600.0));
+}
+
+#[test]
+fn read_group_header_reserves_only_read_pane_space() {
+    let first = TrackId::new(101);
+    let second = TrackId::new(202);
+    let bounds = read_panel_bounds(
+        &[
+            (ReadPanelKey::Group(7), false, None),
+            (ReadPanelKey::Track(first), true, Some(100.0)),
+            (ReadPanelKey::Track(second), true, Some(100.0)),
+        ],
+        200.0,
+        600.0,
+    );
+
+    assert_eq!(bounds[0].key, ReadPanelKey::Group(7));
+    assert_eq!(
+        bounds[0].bottom - bounds[0].top,
+        COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT
+    );
+    assert_eq!(bounds[1].key, ReadPanelKey::Track(first));
+    assert_eq!(bounds[2].key, ReadPanelKey::Track(second));
+    assert_eq!(bounds[0].bottom, bounds[1].top);
+    assert_eq!(bounds[1].bottom, bounds[2].top);
+    assert_eq!(bounds[2].bottom, 600.0);
+}
+
+#[test]
+fn collapsed_alignment_without_a_read_panel_keeps_annotation_header_bounds() {
+    let track_id = TrackId::new(303);
+    let fallback = read_panel_bounds_for_track(&[], track_id, 600.0, true).unwrap();
+
+    assert_eq!(fallback.key, ReadPanelKey::Track(track_id));
+    assert_eq!((fallback.top, fallback.bottom), (600.0, 600.0));
+    assert!(read_panel_bounds_for_track(&[], track_id, 600.0, false).is_none());
+}
 
 #[test]
 fn annotation_pane_background_is_bounded_and_precedes_track_geometry() {
@@ -97,6 +184,34 @@ fn pinned_context_heights_are_fixed_layout_dimensions() {
     assert!((PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT - 52.0).abs() < f32::EPSILON);
     assert!((PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT - 120.0).abs() < f32::EPSILON);
     assert!((PINNED_ALIGNMENT_MODIFICATION_HEIGHT - 26.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn read_density_does_not_change_alignment_annotation_lane_heights() {
+    let mut filters = SessionFilters {
+        alignment_density: MIN_VERTICAL_DENSITY,
+        ..SessionFilters::default()
+    };
+    let compact_reads = alignment_annotation_lane_heights(&filters);
+    filters.alignment_density = MAX_VERTICAL_DENSITY;
+    let expanded_reads = alignment_annotation_lane_heights(&filters);
+
+    assert_eq!(compact_reads, expanded_reads);
+    assert_eq!(compact_reads.coverage, PINNED_ALIGNMENT_COVERAGE_HEIGHT);
+    assert_eq!(
+        compact_reads.junction,
+        PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT
+    );
+    assert_eq!(
+        compact_reads.modification,
+        PINNED_ALIGNMENT_MODIFICATION_HEIGHT
+    );
+
+    filters.junction_display_mode = JunctionDisplayMode::Expanded;
+    assert_eq!(
+        alignment_annotation_lane_heights(&filters).junction,
+        PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT
+    );
 }
 
 #[test]

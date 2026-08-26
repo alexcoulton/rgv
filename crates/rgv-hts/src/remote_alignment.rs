@@ -29,7 +29,7 @@ use crate::{
     AuxValue, CigarOp, CigarOpKind, FastaOpenOptions, FastaReference, HttpRangeConfig,
     HttpRangeReader, JunctionSummary, LocalAlignmentSource, MAX_ALIGNMENT_READ_GROUPS,
     PileupProvenance, PileupSummary, QueryDetail, QueryOptions, QueryStats, RemoteCancellation,
-    RemoteError, RemoteIoStats, SequenceData, associated_remote_url,
+    RemoteError, RemoteIoStats, SequenceData, associated_remote_url, bisulfite_strand_is_reverse,
     junction::{
         JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
     },
@@ -1070,7 +1070,9 @@ fn add_pileup(
                 .collect::<io::Result<Vec<_>>>()
         })
         .transpose()?;
-    let reverse = record.flags()?.bits() & 0x10 != 0;
+    let flags = AlignmentFlags::from_bits(record.flags()?.bits());
+    let reverse = flags.is_reverse();
+    let bisulfite_reverse = bisulfite_strand_is_reverse(flags);
     let mapping_quality = record
         .mapping_quality()
         .transpose()?
@@ -1103,7 +1105,13 @@ fn add_pileup(
                         else {
                             continue;
                         };
-                        pileup.add_base(position, base, quality, reverse);
+                        pileup.add_base_with_bisulfite_strand(
+                            position,
+                            base,
+                            quality,
+                            reverse,
+                            bisulfite_reverse,
+                        );
                     }
                 }
                 read_position = read_position.saturating_add(length);

@@ -24,6 +24,10 @@ fn json_round_trip_preserves_schema_and_sources() {
     };
     alignment.remote_index_url = Some("https://indexes.example.org/sample.custom.bai".to_owned());
     alignment.sample_key = Some("tumour".to_owned());
+    alignment.track_group = Some(3);
+    alignment.track_group_collapsed = true;
+    alignment.read_track_group = Some(4);
+    alignment.read_track_group_collapsed = true;
     let filters = &mut alignment.filters;
     filters.alignment_color_mode = AlignmentColorMode::Tag(*b"YC");
     filters.alignment_group_mode = AlignmentGroupMode::Chimeric;
@@ -92,6 +96,40 @@ fn invalid_track_sample_associations_are_rejected() {
         end: 200,
     });
     add_test_alignment(&mut document).sample_key = Some(" \n".to_owned());
+    assert!(matches!(
+        document.to_json(),
+        Err(SessionError::InvalidAlignmentTrack)
+    ));
+}
+
+#[test]
+fn invalid_alignment_track_group_state_is_rejected() {
+    let mut document = SessionDocument::new(SessionLocus {
+        contig: "chr1".to_owned(),
+        start: 100,
+        end: 200,
+    });
+    add_test_alignment(&mut document).track_group_collapsed = true;
+    assert!(matches!(
+        document.to_json(),
+        Err(SessionError::InvalidAlignmentTrack)
+    ));
+
+    document.alignment_tracks[0].track_group = Some(0);
+    assert!(matches!(
+        document.to_json(),
+        Err(SessionError::InvalidAlignmentTrack)
+    ));
+
+    document.alignment_tracks[0].track_group = None;
+    document.alignment_tracks[0].track_group_collapsed = false;
+    document.alignment_tracks[0].read_track_group_collapsed = true;
+    assert!(matches!(
+        document.to_json(),
+        Err(SessionError::InvalidAlignmentTrack)
+    ));
+
+    document.alignment_tracks[0].read_track_group = Some(0);
     assert!(matches!(
         document.to_json(),
         Err(SessionError::InvalidAlignmentTrack)

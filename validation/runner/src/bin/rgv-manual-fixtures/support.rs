@@ -708,22 +708,24 @@ pub(crate) fn write_specialist_bam(path: &Path) -> Result<()> {
     .enumerate()
     {
         let start = 1_000 + offset * 4;
+        // BAM SEQ is stored in reference-aligned orientation. Reverse-strand
+        // conversion therefore appears as G-to-A, not as an independently
+        // reverse-complemented sequence.
         let mut sequence = reference[start..start + 160].to_vec();
-        if reverse {
-            sequence = reverse_complement(&sequence);
-        }
         if converted {
+            let source = if reverse { b'G' } else { b'C' };
+            let converted = if reverse { b'A' } else { b'T' };
             for base in &mut sequence {
-                if *base == b'C' {
-                    *base = b'T';
+                if *base == source {
+                    *base = converted;
                 }
             }
         }
-        let mut record = basic_record(name, i64::try_from(start)?, &sequence, reverse)?;
+        let mut record = specialist_record(name, i64::try_from(start)?, &sequence, reverse, 35)?;
         record.push_aux(b"RG", Aux::String("bisulfite"))?;
         records.push(record);
     }
-    let mut low_quality = basic_record_with_quality(
+    let mut low_quality = specialist_record(
         "EXPECTED_BISULFITE_LOW_QUALITY",
         1_020,
         &reference[1_020..1_180],
@@ -732,39 +734,45 @@ pub(crate) fn write_specialist_bam(path: &Path) -> Result<()> {
     )?;
     low_quality.push_aux(b"RG", Aux::String("bisulfite"))?;
     records.push(low_quality);
-    let mut missing = basic_record(
+    let mut missing = specialist_record(
         "EXPECTED_BISULFITE_MISSING_EVIDENCE",
         1_024,
         &[b'N'; 160],
         false,
+        35,
     )?;
     missing.push_aux(b"RG", Aux::String("bisulfite"))?;
     records.push(missing);
     let pair_name = "EXPECTED_BISULFITE_PAIRED_ORIENTATION";
     let left_start = 1_040_usize;
     let right_start = 1_120_usize;
-    let mut left = basic_record(
+    let mut left = specialist_record(
         pair_name,
         i64::try_from(left_start)?,
         &reference[left_start..left_start + 160],
         false,
+        35,
     )?;
     left.set_flags(0x63);
     left.set_mtid(0);
     left.set_mpos(i64::try_from(right_start)?);
     left.set_insert_size(240);
     left.push_aux(b"RG", Aux::String("bisulfite"))?;
-    let mut right_sequence = reverse_complement(&reference[right_start..right_start + 160]);
+    // Both ends inherit the first end's conversion strand. Although the right
+    // alignment carries the reverse flag, its aligned bisulfite evidence is
+    // still forward-strand C-to-T.
+    let mut right_sequence = reference[right_start..right_start + 160].to_vec();
     for base in &mut right_sequence {
         if *base == b'C' {
             *base = b'T';
         }
     }
-    let mut right = basic_record(
+    let mut right = specialist_record(
         pair_name,
         i64::try_from(right_start)?,
         &right_sequence,
         true,
+        35,
     )?;
     right.set_flags(0x93);
     right.set_mtid(0);
@@ -831,6 +839,26 @@ pub(crate) fn write_specialist_bam(path: &Path) -> Result<()> {
     let csi = PathBuf::from(format!("{}.csi", path.display()));
     bam::index::build(path, Some(&csi), bam::index::Type::Csi(14), 1)?;
     Ok(())
+}
+
+fn specialist_record(
+    name: &str,
+    position: i64,
+    sequence: &[u8],
+    reverse: bool,
+    quality: u8,
+) -> Result<Record> {
+    let mut record = Record::new();
+    // These records intentionally contain conversion differences, so `M` is
+    // the valid CIGAR operation; `=` would falsely assert every base matches.
+    let cigar = CigarString(vec![Cigar::Match(u32::try_from(sequence.len())?)]);
+    let qualities = vec![quality; sequence.len()];
+    record.set(name.as_bytes(), Some(&cigar), sequence, &qualities);
+    record.set_tid(0);
+    record.set_pos(position);
+    record.set_mapq(60);
+    record.set_flags(if reverse { 0x10 } else { 0 });
+    Ok(record)
 }
 
 fn ensure_fixture_alignments_are_mapped(path: &Path) -> Result<()> {

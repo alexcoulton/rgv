@@ -9,6 +9,7 @@ use rgv_hts::{
     bisulfite_context_matches,
 };
 
+use super::technologies::bisulfite_color;
 use super::*;
 
 fn row_test_record(name: &[u8], start: u64, end: u64) -> AlignmentRecord {
@@ -159,6 +160,24 @@ fn bisulfite_observations_distinguish_protected_and_converted_on_both_strands() 
 }
 
 #[test]
+fn bisulfite_conversion_mismatch_is_specific_to_the_biological_strand() {
+    let reference_bases = b"ACG";
+    let forward = row_test_record(b"forward", 0, reference_bases.len() as u64);
+    let mut reverse = row_test_record(b"reverse", 0, reference_bases.len() as u64);
+    reverse.flags = AlignmentFlags::from_bits(0x10);
+    let mut query = row_test_query(&[forward, reverse]);
+    query.reference = Some(ReferenceSlice {
+        interval: GenomicInterval::new(ContigId::new(0), 0, reference_bases.len() as u64).unwrap(),
+        bases: reference_bases.to_vec(),
+    });
+
+    assert!(bisulfite_conversion_mismatch(&query, 0, 1, b'T'));
+    assert!(!bisulfite_conversion_mismatch(&query, 0, 1, b'A'));
+    assert!(bisulfite_conversion_mismatch(&query, 1, 2, b'A'));
+    assert!(!bisulfite_conversion_mismatch(&query, 1, 2, b'T'));
+}
+
+#[test]
 fn bisulfite_render_budget_records_every_omitted_mark() {
     let mut budget = BisulfiteRenderBudget::new(1);
     assert!(budget.take());
@@ -225,7 +244,86 @@ fn bisulfite_marks_remain_visible_across_base_and_read_detail_levels() {
             .count();
         assert_eq!((protected, converted), (1, 1));
         assert_eq!(layout.stats.bisulfite_marks_omitted, 0);
+        assert!(layout.display_list.texts.is_empty());
     }
+}
+
+#[test]
+fn bisulfite_mode_suppresses_ordinary_mismatches_outside_selected_context() {
+    let reference_bases = b"ACGTCACG";
+    let mut record = row_test_record(b"converted", 0, reference_bases.len() as u64);
+    let mut observed = reference_bases.to_vec();
+    observed[4] = b'T';
+    observed[6] = b'T';
+    observed[3] = b'A';
+    record.sequence = SequenceData::Present {
+        bases: observed,
+        qualities: None,
+    };
+    let mut query = row_test_query(&[record]);
+    query.reference = Some(ReferenceSlice {
+        interval: GenomicInterval::new(ContigId::new(0), 0, reference_bases.len() as u64).unwrap(),
+        bases: reference_bases.to_vec(),
+    });
+    let options = AlignmentLayoutOptions {
+        reference_top: 0.0,
+        coverage_top: 0.0,
+        reads_top: 0.0,
+        show_reference: false,
+        show_coverage: false,
+        show_junctions: false,
+        show_modification_frequency: false,
+        show_modified_bases: false,
+        color_mode: AlignmentColorMode::Bisulfite(BisulfiteContext::Cg),
+        read_base_display_mode: ReadBaseDisplayMode::Mismatches,
+        ..AlignmentLayoutOptions::default()
+    };
+    let rows = assign_alignment_rows(&query, options, None);
+    let viewport =
+        Viewport::new(GenomicInterval::new(ContigId::new(0), 0, 8).unwrap(), 80.0).unwrap();
+    let layout = layout_alignment_query_with_rows(&query, viewport, options, &rows);
+
+    let protected = bisulfite_color(BisulfiteObservation::Protected);
+    let converted = bisulfite_color(BisulfiteObservation::Converted);
+    let ordinary_t = base_color(b'T');
+    let ordinary_a = base_color(b'A');
+    let read_detail_colors = layout
+        .display_list
+        .rectangles
+        .iter()
+        .filter(|rectangle| rectangle.object_id & READ_DETAIL_OBJECT_BIT != 0)
+        .map(|rectangle| rectangle.color)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        read_detail_colors
+            .iter()
+            .filter(|color| color.red == protected.red && color.green == protected.green)
+            .count(),
+        1
+    );
+    assert_eq!(
+        read_detail_colors
+            .iter()
+            .filter(|color| color.red == converted.red && color.blue == converted.blue)
+            .count(),
+        1
+    );
+    assert_eq!(
+        read_detail_colors
+            .iter()
+            .filter(|color| color.red == ordinary_t.red && color.green == ordinary_t.green)
+            .count(),
+        0
+    );
+    assert_eq!(
+        read_detail_colors
+            .iter()
+            .filter(|color| color.red == ordinary_a.red && color.green == ordinary_a.green)
+            .count(),
+        1
+    );
+    assert_eq!(layout.display_list.texts.len(), 1);
 }
 
 #[test]
@@ -2473,11 +2571,50 @@ fn junction_lane_renders_bounded_strand_aware_full_evidence() {
         ..AlignmentLayoutOptions::default()
     };
     let layout = layout_alignment_query(&query, viewport, options);
-    assert_eq!(layout.display_list.rectangles.len(), 7);
-    assert_eq!(layout.pinned_rectangle_count, 7);
+    assert_eq!(layout.display_list.rectangles.len(), 5);
+    assert_eq!(layout.pinned_rectangle_count, 5);
     assert_eq!(layout.stats.rendered_junctions, 2);
     assert_eq!(layout.stats.hidden_junctions, 0);
     assert_eq!(layout.stats.maximum_junction_depth, 9);
+    assert_eq!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .filter(|rectangle| rectangle.shape == RectShape::Rectangle)
+            .count(),
+        1,
+        "count labels must not add opaque backing rectangles"
+    );
+    let positive_arc = layout
+        .display_list
+        .rectangles
+        .iter()
+        .find(|rectangle| rectangle.shape == RectShape::JunctionArcUp)
+        .unwrap();
+    let positive_label = layout
+        .display_list
+        .texts
+        .iter()
+        .find(|text| text.text == "4")
+        .unwrap();
+    assert!(positive_label.y + positive_label.font_size * 0.5 <= positive_arc.y + 0.01);
+    let negative_arc = layout
+        .display_list
+        .rectangles
+        .iter()
+        .find(|rectangle| rectangle.shape == RectShape::JunctionArcDown)
+        .unwrap();
+    let negative_label = layout
+        .display_list
+        .texts
+        .iter()
+        .find(|text| text.text == "9")
+        .unwrap();
+    assert!(
+        negative_label.y - negative_label.font_size * 0.5
+            >= negative_arc.y + negative_arc.height - 0.01
+    );
     assert_eq!(
         layout
             .display_list
@@ -2523,7 +2660,7 @@ fn junction_lane_renders_bounded_strand_aware_full_evidence() {
             ..options
         },
     );
-    assert_eq!(filtered.display_list.rectangles.len(), 4);
+    assert_eq!(filtered.display_list.rectangles.len(), 3);
     assert_eq!(filtered.stats.rendered_junctions, 1);
     assert_eq!(filtered.stats.hidden_junctions, 1);
     assert!(
@@ -2618,7 +2755,7 @@ fn sashimi_layout_applies_exact_cpm_fixed_scale_and_expanded_rows() {
         &rows,
         Some(&annotations),
     );
-    assert_eq!(annotated_layout.display_list.rectangles.len(), 10);
+    assert_eq!(annotated_layout.display_list.rectangles.len(), 8);
     assert!(
         annotated_layout
             .display_list
@@ -2684,7 +2821,7 @@ fn high_density_sashimi_output_has_hard_arc_and_label_caps() {
     );
     assert_eq!(
         layout.display_list.rectangles.len(),
-        1 + MAX_RENDERED_JUNCTIONS * 2 + layout.display_list.texts.len()
+        1 + MAX_RENDERED_JUNCTIONS * 2
     );
     assert!(!layout.display_list.texts.is_empty());
     assert!(layout.display_list.texts.len() <= MAX_RENDERED_JUNCTION_LABELS);
@@ -2843,6 +2980,92 @@ fn coverage_colours_only_reference_discordant_support_above_threshold() {
         },
     );
     assert_eq!(display.rectangles.len(), 1);
+}
+
+#[test]
+fn bisulfite_coverage_uses_context_and_template_strand_instead_of_base_palette() {
+    let contig = ContigId::new(0);
+    let interval = GenomicInterval::new(contig, 100, 102).unwrap();
+    let viewport = Viewport::new(interval, 200.0).unwrap();
+    let pileup = PileupSummary {
+        bins: vec![
+            PileupBin {
+                depth: 4,
+                alleles: AlleleSupport {
+                    a: 1,
+                    c: 2,
+                    t: 1,
+                    ..AlleleSupport::default()
+                },
+                bisulfite_forward_alleles: AlleleSupport {
+                    c: 2,
+                    t: 1,
+                    ..AlleleSupport::default()
+                },
+                ..PileupBin::default()
+            },
+            PileupBin {
+                depth: 4,
+                alleles: AlleleSupport {
+                    a: 2,
+                    c: 1,
+                    g: 1,
+                    ..AlleleSupport::default()
+                },
+                bisulfite_reverse_alleles: AlleleSupport {
+                    a: 2,
+                    g: 1,
+                    ..AlleleSupport::default()
+                },
+                ..PileupBin::default()
+            },
+        ],
+        ..PileupSummary::default()
+    };
+    let reference = ReferenceSlice {
+        interval,
+        bases: b"CG".to_vec(),
+    };
+    let options = AlignmentLayoutOptions {
+        coverage_height: 40.0,
+        color_mode: AlignmentColorMode::Bisulfite(BisulfiteContext::Cg),
+        quality_weighted_alleles: false,
+        ..AlignmentLayoutOptions::default()
+    };
+    let mut display = DisplayList::default();
+
+    add_coverage(
+        &mut display,
+        &pileup,
+        Some(&reference),
+        interval,
+        viewport,
+        200.0,
+        &options,
+    );
+
+    assert_eq!(display.rectangles.len(), 6);
+    assert_eq!(
+        display
+            .rectangles
+            .iter()
+            .filter(|rectangle| rectangle.color == bisulfite_color(BisulfiteObservation::Protected))
+            .count(),
+        2
+    );
+    assert_eq!(
+        display
+            .rectangles
+            .iter()
+            .filter(|rectangle| rectangle.color == bisulfite_color(BisulfiteObservation::Converted))
+            .count(),
+        2
+    );
+    assert!(!display.rectangles.iter().any(|rectangle| {
+        [b'A', b'C', b'G', b'T']
+            .into_iter()
+            .any(|base| rectangle.color == base_color(base))
+    }));
 }
 
 #[test]

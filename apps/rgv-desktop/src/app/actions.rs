@@ -37,6 +37,15 @@ fn toggle_composite_members(controls: &mut [TrackControl], members: &BTreeSet<Tr
     }
 }
 
+fn toggle_track_visibility(visible: &mut bool, collapsed: &mut bool) {
+    if *visible {
+        *visible = false;
+    } else {
+        *visible = true;
+        *collapsed = false;
+    }
+}
+
 impl Viewer {
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub(crate) fn dispatch_track_actions(
@@ -50,30 +59,32 @@ impl Viewer {
         };
         for action in actions {
             match action {
+                TrackUiAction::OpenSettings(TrackFrameKey::Group(_)) => {}
                 TrackUiAction::OpenSettings(key) => outcome.settings_panel = Some(key),
                 TrackUiAction::ToggleVisibility(TrackFrameKey::Alignment(id)) => {
-                    if let Some((_, _, visible, _, _)) = draft
+                    if let Some((_, _, visible, collapsed, _)) = draft
                         .alignment_controls
                         .iter_mut()
                         .find(|(candidate, _, _, _, _)| *candidate == id)
                     {
-                        *visible = !*visible;
+                        toggle_track_visibility(visible, collapsed);
                     } else if id == draft.primary_alignment_id {
-                        *draft.primary_visible = !*draft.primary_visible;
+                        toggle_track_visibility(draft.primary_visible, draft.primary_collapsed);
                     }
                 }
                 TrackUiAction::ToggleVisibility(TrackFrameKey::Auxiliary(id)) => {
-                    if let Some((_, _, visible, _, _)) = draft
+                    if let Some((_, _, visible, collapsed, _)) = draft
                         .auxiliary_controls
                         .iter_mut()
                         .find(|(candidate, _, _, _, _)| *candidate == id)
                     {
-                        *visible = !*visible;
+                        toggle_track_visibility(visible, collapsed);
                     }
                 }
                 TrackUiAction::ToggleVisibility(TrackFrameKey::Reference) => {
                     *draft.show_reference = !*draft.show_reference;
                 }
+                TrackUiAction::ToggleVisibility(TrackFrameKey::Group(_)) => {}
                 TrackUiAction::ToggleCollapsed(TrackFrameKey::Alignment(id)) => {
                     if let Some((_, _, _, collapsed, _)) = draft
                         .alignment_controls
@@ -116,17 +127,45 @@ impl Viewer {
                 TrackUiAction::ToggleCollapsed(TrackFrameKey::Reference) => {
                     *draft.show_reference = !*draft.show_reference;
                 }
-                TrackUiAction::Remove(TrackFrameKey::Reference) => {}
+                TrackUiAction::ToggleCollapsed(TrackFrameKey::Group(group)) => {
+                    if self.toggle_alignment_track_group(ui::TrackPane::Annotation, group) {
+                        outcome.annotation_geometry_changed = true;
+                        outcome.read_geometry_changed = true;
+                    }
+                }
+                TrackUiAction::Remove(TrackFrameKey::Reference | TrackFrameKey::Group(_)) => {}
                 TrackUiAction::ToggleAlignmentSubtrack(track_id, subtrack) => outcome
                     .alignment_subtracks_to_toggle
                     .push((track_id, subtrack)),
                 TrackUiAction::ToggleCompositeMember(track_id) => {
-                    if let Some((_, _, _, collapsed, _)) = draft
+                    if let Some((_, _, visible, collapsed, _)) = draft
                         .auxiliary_controls
                         .iter_mut()
                         .find(|(candidate, _, _, _, _)| *candidate == track_id)
                     {
-                        *collapsed = !*collapsed;
+                        if *visible {
+                            *collapsed = !*collapsed;
+                        } else {
+                            toggle_track_visibility(visible, collapsed);
+                        }
+                    }
+                }
+                TrackUiAction::GroupSelectedTracks(pane) => {
+                    if self.group_selected_alignment_tracks(pane) {
+                        outcome.annotation_geometry_changed = true;
+                        outcome.read_geometry_changed = true;
+                    }
+                }
+                TrackUiAction::ToggleTrackGroup(pane, group) => {
+                    if self.toggle_alignment_track_group(pane, group) {
+                        outcome.annotation_geometry_changed = true;
+                        outcome.read_geometry_changed = true;
+                    }
+                }
+                TrackUiAction::UngroupTracks(pane, group) => {
+                    if self.ungroup_alignment_tracks(pane, group) {
+                        outcome.annotation_geometry_changed = true;
+                        outcome.read_geometry_changed = true;
                     }
                 }
                 TrackUiAction::Export(_) => outcome.export_requested = true,
@@ -303,7 +342,7 @@ impl Viewer {
                                     outcome.annotation_geometry_changed = true;
                                 }
                             }
-                            TrackFrameKey::Auxiliary(_) => {}
+                            TrackFrameKey::Group(_) | TrackFrameKey::Auxiliary(_) => {}
                         }
                     }
                 }
@@ -332,7 +371,7 @@ impl Viewer {
                                 outcome.annotation_geometry_changed = true;
                             }
                         }
-                        TrackFrameKey::Auxiliary(_) => {}
+                        TrackFrameKey::Group(_) | TrackFrameKey::Auxiliary(_) => {}
                     }
                 }
                 TrackUiAction::ResizeReadTrackStarted(id, height) => {
@@ -413,7 +452,7 @@ impl Viewer {
                         );
                     }
                 }
-                TrackUiAction::Select(key) => self.select_track_key(key),
+                TrackUiAction::Select(key, pane) => self.select_track_key(key, pane),
             }
         }
         outcome
@@ -511,5 +550,16 @@ mod tests {
         assert!(!controls[0].3);
         assert!(!controls[1].3);
         assert!(!controls[2].3);
+    }
+
+    #[test]
+    fn restoring_track_visibility_also_expands_its_content() {
+        let mut visible = false;
+        let mut collapsed = true;
+
+        toggle_track_visibility(&mut visible, &mut collapsed);
+
+        assert!(visible);
+        assert!(!collapsed);
     }
 }

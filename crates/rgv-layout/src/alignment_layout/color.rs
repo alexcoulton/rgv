@@ -36,6 +36,28 @@ pub(crate) fn bisulfite_observation(
     )
 }
 
+pub(crate) fn bisulfite_conversion_mismatch(
+    query: &AlignmentQuery,
+    index: usize,
+    position: u64,
+    observed_base: u8,
+) -> bool {
+    let Some(reference_base) = query
+        .reference
+        .as_ref()
+        .and_then(|reference| reference.base_at(position))
+        .map(|base| base.to_ascii_uppercase())
+    else {
+        return false;
+    };
+    let observed_base = observed_base.to_ascii_uppercase();
+    if bisulfite_strand_is_reverse(query.batch.flags[index]) {
+        reference_base == b'G' && observed_base == b'A'
+    } else {
+        reference_base == b'C' && observed_base == b'T'
+    }
+}
+
 pub(crate) fn aligned_base(
     bases: &[u8],
     qualities: Option<&[u8]>,
