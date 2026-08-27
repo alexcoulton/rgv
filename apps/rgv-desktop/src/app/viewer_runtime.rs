@@ -165,11 +165,10 @@ impl Viewer {
             || Ok(PanelWorkspace::new(panel)),
             |session| {
                 let panel_count = session.panels.len().max(1);
-                let total_genomic_width =
-                    bootstrap_layout.projected_canvas_width(panel_count) * panel_count as f32;
+                let panel_canvas_width = bootstrap_layout.projected_canvas_width(panel_count);
                 PanelWorkspace::from_session(
                     session,
-                    total_genomic_width,
+                    panel_canvas_width,
                     canvas_geometry.viewport.top(),
                 )
             },
@@ -426,7 +425,6 @@ impl Viewer {
             egui_renderer,
             panels,
             workspace_layout,
-            canvas_geometry,
             genomic_canvas_layer_id: None,
             composite_display_list: DisplayList::default(),
             shared_primary_alignment_height: None,
@@ -515,6 +513,8 @@ impl Viewer {
             display_dirty: true,
             display_upload_pending_metrics: false,
             pending_resolution_query_refresh: None,
+            automation_properties_resize_active: false,
+            properties_resize_gesture_active: false,
             workspace_layout_recomputations: 0,
             resize_query_refreshes: 0,
             dragging: false,
@@ -708,7 +708,7 @@ impl Viewer {
                 })],
                 ..Default::default()
             });
-            let scissor = self.canvas_geometry.physical_scissor(
+            let scissor = self.workspace_layout.physical_genomic_scissor(
                 self.window.scale_factor() as f32,
                 self.surface_config.width,
                 self.surface_config.height,

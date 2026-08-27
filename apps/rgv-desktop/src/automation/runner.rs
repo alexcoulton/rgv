@@ -393,9 +393,3 @@ pub(crate) fn parse_automation_sam_tag(tag: &str) -> Result<[u8; 2]> {
     );
     Ok([bytes[0], bytes[1]])
 }
-
-pub(crate) fn logical_surface_dimension(physical: u32, scale_factor: f64) -> u32 {
-    (f64::from(physical) / scale_factor.max(f64::EPSILON))
-        .round()
-        .clamp(1.0, f64::from(u32::MAX)) as u32
-}

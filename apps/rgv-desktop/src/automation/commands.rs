@@ -1405,8 +1405,9 @@ impl Viewer {
             .iter()
             .map(|panel| {
                 let interval = panel.viewport.interval();
-                let maximum_scroll =
-                    (panel.content_bottom_points - self.canvas_geometry.viewport.bottom()).max(0.0);
+                let maximum_scroll = (panel.content_bottom_points
+                    - self.canvas_geometry().viewport.bottom())
+                .max(0.0);
                 let maximum_annotation_scroll =
                     panel.scroll_display_cache.as_ref().map_or(0.0, |cache| {
                         (cache.annotation_content_bottom - cache.annotation_clip_bottom).max(0.0)
@@ -1820,6 +1821,7 @@ impl Viewer {
             workspace: to_rect(self.workspace_layout.workspace),
             properties: to_rect(self.workspace_layout.properties),
             properties_expanded: self.workspace_layout.properties_expanded,
+            properties_resize_active: self.properties_resize_gesture_active,
             display_scale: self.workspace_layout.display_scale,
             accessibility_scale: self.workspace_layout.accessibility_scale,
             genome_context: to_rect(self.workspace_layout.genome_context),
@@ -2661,7 +2663,10 @@ impl Viewer {
         let mut deferred_shell_change = false;
         match setting {
             AutomationSetting::WindowSize { width, height } => {
-                let current = self.window.inner_size().to_logical::<f64>(self.window.scale_factor());
+                let current = self
+                    .window
+                    .inner_size()
+                    .to_logical::<f64>(self.window.scale_factor());
                 deferred_shell_change = (current.width - f64::from(*width)).abs() >= 0.5
                     || (current.height - f64::from(*height)).abs() >= 0.5;
                 let _ = self.window.request_inner_size(winit::dpi::LogicalSize::new(
@@ -2704,6 +2709,20 @@ impl Viewer {
                         egui::containers::panel::PanelState { outer_rect: rect },
                     );
                 });
+                self.egui_context.request_repaint();
+                self.window.request_redraw();
+            }
+            AutomationSetting::PropertiesPanelResizeActive { value } => {
+                deferred_shell_change = self.automation_properties_resize_active != *value;
+                self.automation_properties_resize_active = *value;
+                if *value {
+                    // A held sash may pause long enough for inspection or a
+                    // native capture. Gesture lifecycle, not elapsed wall
+                    // time, decides when the final resolution query is due.
+                    self.pending_resolution_query_refresh = None;
+                } else if deferred_shell_change {
+                    self.schedule_resolution_query_refresh();
+                }
                 self.egui_context.request_repaint();
                 self.window.request_redraw();
             }
@@ -3902,19 +3921,17 @@ impl Viewer {
         }
         let (display, width, height, scope_label) = match scope {
             AutomationSnapshotScope::VisibleWorkspace => {
-                let width = logical_surface_dimension(
-                    self.surface_config.width,
-                    self.window.scale_factor(),
-                );
-                let height = logical_surface_dimension(
-                    self.surface_config.height,
-                    self.window.scale_factor(),
-                );
+                let bounds = self.workspace_layout.workspace;
+                let width = bounds.width().ceil().max(1.0) as u32;
+                let height = bounds.height().ceil().max(1.0) as u32;
                 (
-                    self.composite_display_list.clone(),
+                    cropped_display_list(&self.composite_display_list, bounds),
                     width,
                     height,
-                    "visible workspace".to_owned(),
+                    format!(
+                        "visible workspace; committed layout revision {}",
+                        self.workspace_layout.revision
+                    ),
                 )
             }
             AutomationSnapshotScope::ActivePanel => {
@@ -3977,13 +3994,12 @@ impl Viewer {
     }
 
     pub(crate) fn full_active_panel_export_display(&mut self) -> (DisplayList, u32, u32, String) {
-        let original_geometry = self.canvas_geometry;
         let original_workspace_layout = self.workspace_layout.clone();
         let original_scroll = self.panels.active().vertical_scroll_points;
         let original_content_origin = self.panels.active().vertical_content_origin_points;
         let original_read_panel_scrolls = self.panels.active().read_panel_scrolls.clone();
         let content_height = (self.panels.active().content_bottom_points
-            - self.canvas_geometry.viewport.top())
+            - self.canvas_geometry().viewport.top())
         .ceil()
         .max(1.0);
         let export_height = content_height.min(MAX_AUTOMATION_FULL_PANEL_HEIGHT as f32) as u32;
@@ -4022,7 +4038,6 @@ impl Viewer {
             },
             original_workspace_layout.revision,
         );
-        self.canvas_geometry = self.workspace_layout.canvas_geometry();
         self.panels.active_mut().vertical_scroll_points = 0.0;
         self.panels.active_mut().vertical_content_origin_points = 0.0;
         for state in self.panels.active_mut().read_panel_scrolls.values_mut() {
@@ -4034,7 +4049,6 @@ impl Viewer {
         let display = cropped_display_list(&self.panels.active().display_list, bounds);
         let width = bounds.width().ceil().max(1.0) as u32;
 
-        self.canvas_geometry = original_geometry;
         self.workspace_layout = original_workspace_layout;
         self.panels.active_mut().vertical_scroll_points = original_scroll;
         self.panels.active_mut().vertical_content_origin_points = original_content_origin;

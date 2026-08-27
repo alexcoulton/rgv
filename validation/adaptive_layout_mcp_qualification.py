@@ -60,6 +60,7 @@ def assert_layout(
     properties_width: float,
     cytobands: list[str],
     accessibility_scale: float,
+    properties_resize_active: bool = False,
 ) -> dict[str, Any]:
     if workspace.get("schema_version") != 4:
         raise RuntimeError(f"expected automation schema 4, got {workspace.get('schema_version')}")
@@ -70,6 +71,8 @@ def assert_layout(
     track_viewport = layout["track_viewport"]
     if layout["properties_expanded"] is not properties_expanded:
         raise RuntimeError("Properties expansion state disagrees with committed layout")
+    if layout.get("properties_resize_active") is not properties_resize_active:
+        raise RuntimeError("Properties resize gesture state disagrees with committed layout")
     if not close(properties["right"] - properties["left"], properties_width, 0.75):
         raise RuntimeError(
             f"Properties width was {properties['right'] - properties['left']}, "
@@ -151,20 +154,34 @@ def stable_track_state(workspace: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def physical_edges(layout: dict[str, Any], scale: float) -> dict[str, Any]:
+def physical_edges(
+    layout: dict[str, Any],
+    scale: float,
+    *,
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+) -> dict[str, Any]:
+    def x(value: float) -> int:
+        return round((value - origin_x) * scale)
+
+    def y(value: float) -> int:
+        return round((value - origin_y) * scale)
+
     return {
         "effective_pixels_per_point": scale,
-        "workspace_right": round(layout["workspace"]["right"] * scale),
-        "properties_left": round(layout["properties"]["left"] * scale),
-        "context_bottom": round(layout["genome_context"]["bottom"] * scale),
-        "track_top": round(layout["track_viewport"]["top"] * scale),
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "workspace_right": x(layout["workspace"]["right"]),
+        "properties_left": x(layout["properties"]["left"]),
+        "context_bottom": y(layout["genome_context"]["bottom"]),
+        "track_top": y(layout["track_viewport"]["top"]),
         "panel_edges": [
             {
-                "header_left": round(panel["header_genomic"]["left"] * scale),
-                "canvas_left": round(panel["canvas"]["left"] * scale),
-                "header_right": round(panel["header_genomic"]["right"] * scale),
-                "canvas_right": round(panel["canvas"]["right"] * scale),
-                "scrollbar_right": round(panel["scrollbar"]["right"] * scale),
+                "header_left": x(panel["header_genomic"]["left"]),
+                "canvas_left": x(panel["canvas"]["left"]),
+                "header_right": x(panel["header_genomic"]["right"]),
+                "canvas_right": x(panel["canvas"]["right"]),
+                "scrollbar_right": x(panel["scrollbar"]["right"]),
             }
             for panel in layout["panels"]
         ],
@@ -209,6 +226,7 @@ def main() -> int:
     captures: list[dict[str, Any]] = []
     logical_captures: list[dict[str, Any]] = []
     states: list[dict[str, Any]] = []
+    interaction_probes: list[dict[str, Any]] = []
 
     def call(name: str, values: dict[str, Any] | None = None) -> dict[str, Any]:
         return structured(client.call_tool(name, values))
@@ -219,12 +237,99 @@ def main() -> int:
             raise RuntimeError("workspace did not settle before observation")
         return value
 
+    def current_workspace() -> dict[str, Any]:
+        return call("rgv_get_workspace")["workspace"]
+
     def configure(change: dict[str, Any]) -> None:
         call("rgv_configure", {"change": change})
 
-    def capture(name: str, current: dict[str, Any]) -> None:
+    def exercise_reflow_controls(
+        label: str,
+        current: dict[str, Any],
+        expected_track_state: dict[str, Any] | None,
+        resize_track_id: int | None,
+    ) -> None:
+        activated: list[int] = []
+        adjusted_read_panels = 0
+        for panel in current["panels"]:
+            panel_id = panel["id"]
+            call(
+                "rgv_select",
+                {"selection": {"selection": "panel", "panel_id": panel_id}},
+            )
+            activated.append(panel_id)
+            if not panel["read_panel_states"]:
+                continue
+            read_state = panel["read_panel_states"][0]
+            original_scroll = read_state["scroll_points"]
+            configure(
+                {
+                    "setting": "read_panel_scroll_points",
+                    "panel_id": panel_id,
+                    "track_id": read_state["track_id"],
+                    "value": original_scroll + 1.0,
+                }
+            )
+            configure(
+                {
+                    "setting": "read_panel_scroll_points",
+                    "panel_id": panel_id,
+                    "track_id": read_state["track_id"],
+                    "value": original_scroll,
+                }
+            )
+            adjusted_read_panels += 1
+        if resize_track_id is not None:
+            configure(
+                {
+                    "setting": "presentation_node_height",
+                    "target": {
+                        "kind": "track",
+                        "channel": "reads",
+                        "track_id": resize_track_id,
+                    },
+                    "value": 421.0,
+                }
+            )
+            configure(
+                {
+                    "setting": "presentation_node_height",
+                    "target": {
+                        "kind": "track",
+                        "channel": "reads",
+                        "track_id": resize_track_id,
+                    },
+                    "value": 420.0,
+                }
+            )
+        observed = workspace()
+        if activated and observed["active_panel_id"] != activated[-1]:
+            raise RuntimeError(f"panel activation failed after {label}")
+        if (
+            expected_track_state is not None
+            and stable_track_state(observed) != expected_track_state
+        ):
+            raise RuntimeError(f"reversible control probes changed track state after {label}")
+        interaction_probes.append(
+            {
+                "state": label,
+                "activated_panel_ids": activated,
+                "adjusted_read_panels": adjusted_read_panels,
+                "resized_track_id": resize_track_id,
+            }
+        )
+
+    def capture(
+        name: str,
+        current: dict[str, Any],
+        *,
+        wait_until_settled: bool = True,
+    ) -> None:
         layout = layout_snapshot(current)
-        result = client.call_tool("rgv_capture_window", {"wait_until_settled": True})
+        result = client.call_tool(
+            "rgv_capture_window",
+            {"wait_until_settled": wait_until_settled},
+        )
         saved = save_mcp_window_capture(evidence / f"{name}.png", result)
         effective_scale = layout["display_scale"] * layout["accessibility_scale"]
         expected_width = round(layout["properties"]["right"] * effective_scale)
@@ -237,6 +342,7 @@ def main() -> int:
                 f"committed logical bounds {expected_width}x{expected_height}"
             )
         saved["layout_revision"] = layout["revision"]
+        saved["requested_settled_capture"] = wait_until_settled
         saved["logical_layout"] = layout
         saved["expected_physical_edges"] = physical_edges(layout, effective_scale)
         captures.append(saved)
@@ -257,6 +363,14 @@ def main() -> int:
         if metadata.get("width") != width or metadata.get("height") != height:
             raise RuntimeError("logical capture metadata disagrees with PNG dimensions")
         layout = layout_snapshot(current)
+        workspace_rect = layout["workspace"]
+        expected_width = round(workspace_rect["right"] - workspace_rect["left"])
+        expected_height = round(workspace_rect["bottom"] - workspace_rect["top"])
+        if width != expected_width or height != expected_height:
+            raise RuntimeError(
+                f"visible-workspace capture was {width}x{height}, expected committed "
+                f"workspace bounds {expected_width}x{expected_height}"
+            )
         logical_captures.append(
             {
                 "name": path.name,
@@ -266,7 +380,12 @@ def main() -> int:
                 "sha256": hashlib.sha256(data).hexdigest(),
                 "scope": metadata.get("scope"),
                 "layout_revision": layout["revision"],
-                "expected_logical_edges": physical_edges(layout, 1.0),
+                "expected_logical_edges": physical_edges(
+                    layout,
+                    1.0,
+                    origin_x=workspace_rect["left"],
+                    origin_y=workspace_rect["top"],
+                ),
             }
         )
 
@@ -288,6 +407,7 @@ def main() -> int:
             "interface_scale_percent",
             "properties_panel_expanded",
             "properties_panel_width",
+            "properties_panel_resize_active",
         ]:
             if required not in encoded_schema:
                 raise RuntimeError(f"MCP configure schema omitted {required}")
@@ -352,6 +472,9 @@ def main() -> int:
         capture("mf12-default-expanded", default)
         capture_logical("mf12-default-logical-1x", default)
         states.append({"name": "default-expanded", "layout": layout_snapshot(default)})
+        exercise_reflow_controls(
+            "default-expanded", default, preserved_state, alignment_ids[0]
+        )
 
         for name, expanded, width in [
             ("collapsed", False, 30.0),
@@ -373,16 +496,68 @@ def main() -> int:
                 raise RuntimeError(f"track navigation/presentation state changed after {name}")
             capture(f"mf12-{name}", current)
             states.append({"name": name, "layout": layout_snapshot(current)})
+            exercise_reflow_controls(name, current, preserved_state, alignment_ids[0])
 
-        before_drag = layout_snapshot(workspace())["settled_resize_query_refreshes"]
-        for width in [300.0, 360.0, 420.0, 480.0]:
-            call(
-                "rgv_configure",
-                {
-                    "change": {"setting": "properties_panel_width", "value": width},
-                    "wait_until_settled": False,
+        configure({"setting": "properties_panel_resize_active", "value": True})
+        resize_start = workspace()
+        assert_layout(
+            resize_start,
+            properties_expanded=True,
+            properties_width=520.0,
+            cytobands=["absent", "absent"],
+            accessibility_scale=1.0,
+            properties_resize_active=True,
+        )
+        before_drag = layout_snapshot(resize_start)["settled_resize_query_refreshes"]
+        capture("mf12-resize-start", resize_start)
+        states.append({"name": "resize-start", "layout": layout_snapshot(resize_start)})
+        exercise_reflow_controls(
+            "resize-start", resize_start, preserved_state, alignment_ids[0]
+        )
+        call(
+            "rgv_configure",
+            {
+                "change": {"setting": "properties_panel_width", "value": 390.0},
+                "wait_until_settled": False,
+            },
+        )
+        resize_midpoint = current_workspace()
+        midpoint_layout = assert_layout(
+            resize_midpoint,
+            properties_expanded=True,
+            properties_width=390.0,
+            cytobands=["absent", "absent"],
+            accessibility_scale=1.0,
+            properties_resize_active=True,
+        )
+        if stable_track_state(resize_midpoint) != preserved_state:
+            raise RuntimeError("Properties resize midpoint changed track state")
+        capture(
+            "mf12-resize-midpoint",
+            resize_midpoint,
+            wait_until_settled=False,
+        )
+        states.append({"name": "resize-midpoint", "layout": midpoint_layout})
+        exercise_reflow_controls(
+            "resize-midpoint", resize_midpoint, preserved_state, alignment_ids[0]
+        )
+        call(
+            "rgv_configure",
+            {
+                "change": {"setting": "properties_panel_width", "value": 480.0},
+                "wait_until_settled": False,
+            },
+        )
+        call(
+            "rgv_configure",
+            {
+                "change": {
+                    "setting": "properties_panel_resize_active",
+                    "value": False,
                 },
-            )
+                "wait_until_settled": False,
+            },
+        )
         call(
             "rgv_execute_batch",
             {
@@ -408,6 +583,9 @@ def main() -> int:
             raise RuntimeError("continuous Properties resize changed track state")
         capture("mf12-resize-end", after_drag_state)
         states.append({"name": "resize-end", "layout": drag_layout})
+        exercise_reflow_controls(
+            "resize-end", after_drag_state, preserved_state, alignment_ids[0]
+        )
 
         configure({"setting": "properties_panel_expanded", "value": False})
         configure({"setting": "window_size", "width": 800, "height": 600})
@@ -424,6 +602,9 @@ def main() -> int:
             raise RuntimeError("narrow/enlarged-text reflow changed track state")
         capture("mf12-narrow-enlarged-text", narrow)
         states.append({"name": "narrow-enlarged-text", "layout": layout_snapshot(narrow)})
+        exercise_reflow_controls(
+            "narrow-enlarged-text", narrow, preserved_state, alignment_ids[0]
+        )
 
         configure({"setting": "window_size", "width": 1280, "height": 800})
         configure({"setting": "interface_scale_percent", "value": 100})
@@ -439,6 +620,40 @@ def main() -> int:
         )
         if stable_track_state(restored) != preserved_state:
             raise RuntimeError("restoring the shell changed track state")
+
+        call(
+            "rgv_execute_batch",
+            {
+                "commands": [
+                    {"command": "close_panel", "panel_id": panel_ids[1]},
+                    {"command": "wait_until_settled", "timeout_millis": 600_000},
+                ]
+            },
+        )
+        expected_one_panel_state = dict(preserved_state)
+        expected_one_panel_state["panels"] = preserved_state["panels"][:1]
+        for name, expanded, width in [
+            ("one-panel-collapsed", False, 30.0),
+            ("one-panel-expanded", True, 340.0),
+        ]:
+            if expanded:
+                configure({"setting": "properties_panel_width", "value": width})
+            configure({"setting": "properties_panel_expanded", "value": expanded})
+            current = workspace()
+            assert_layout(
+                current,
+                properties_expanded=expanded,
+                properties_width=width,
+                cytobands=["absent"],
+                accessibility_scale=1.0,
+            )
+            if stable_track_state(current) != expected_one_panel_state:
+                raise RuntimeError(f"one-panel track state changed after {name}")
+            capture(f"mf12-{name}", current)
+            states.append({"name": name, "layout": layout_snapshot(current)})
+            exercise_reflow_controls(
+                name, current, expected_one_panel_state, alignment_ids[0]
+            )
 
         call(
             "rgv_open_workspace",
@@ -459,6 +674,7 @@ def main() -> int:
         capture("mixed-cytobands", mixed)
         capture_logical("mixed-cytobands-logical-1x", mixed)
         states.append({"name": "mixed-cytobands", "layout": layout_snapshot(mixed)})
+        exercise_reflow_controls("mixed-cytobands", mixed, None, None)
 
         report = {
             "result": "passed",
@@ -468,6 +684,7 @@ def main() -> int:
             "native_capture_effective_scale": layout_snapshot(mixed)["display_scale"],
             "logical_capture_scale": 1.0,
             "resize_query_refreshes": resize_queries,
+            "interaction_probes": interaction_probes,
             "states": states,
             "captures": captures,
             "logical_captures": logical_captures,

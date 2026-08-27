@@ -161,10 +161,10 @@ impl PanelWorkspace {
 
     pub(crate) fn from_session(
         session: &SessionDocument,
-        total_width: f32,
+        canvas_width: f32,
         content_top: f32,
     ) -> Result<Self> {
-        let panel_width = f64::from((total_width / session.panels.len().max(1) as f32).max(1.0));
+        let panel_width = f64::from(canvas_width.max(1.0));
         let panels = session
             .panels
             .iter()

@@ -442,15 +442,16 @@ impl Viewer {
             .map(TrackSource::redacted_label);
         let mut annotation_display = DisplayList::default();
         let mut pinned_display = DisplayList::default();
-        let mut top = self.canvas_geometry.viewport.top();
-        let viewport_height = self.canvas_geometry.viewport.height().max(1.0);
+        let geometry = self.canvas_geometry();
+        let mut top = geometry.viewport.top();
+        let viewport_height = geometry.viewport.height().max(1.0);
         let configured_read_height = self
             .track_presentation
             .read_pane_height
             .clamp(100.0, (viewport_height - 80.0).max(100.0));
-        let scroll_clip_top = (self.canvas_geometry.viewport.bottom() - configured_read_height)
-            .max(self.canvas_geometry.viewport.top() + 80.0);
-        let scroll_clip_bottom = self.canvas_geometry.viewport.bottom();
+        let scroll_clip_top = (geometry.viewport.bottom() - configured_read_height)
+            .max(geometry.viewport.top() + 80.0);
+        let scroll_clip_bottom = geometry.viewport.bottom();
         let alignment_track_groups = self.alignment_track_group_chrome();
         let annotation_track_groups = alignment_track_groups
             .iter()
@@ -1847,7 +1848,7 @@ impl Viewer {
                                 &member.quantitative,
                                 shared_range,
                                 self.panels.active().annotation_scroll_points
-                                    + self.canvas_geometry.viewport.top(),
+                                    + self.canvas_geometry().viewport.top(),
                                 self.panels.active().annotation_scroll_points + scroll_clip_top,
                             );
                             if effective_copy_number_settings.show_sample_names {
@@ -1878,7 +1879,7 @@ impl Viewer {
                                 options,
                                 &effective_mutation_settings,
                                 self.panels.active().annotation_scroll_points
-                                    + self.canvas_geometry.viewport.top(),
+                                    + self.canvas_geometry().viewport.top(),
                                 self.panels.active().annotation_scroll_points + scroll_clip_top,
                             );
                             if effective_mutation_settings.show_sample_names {
@@ -2022,11 +2023,12 @@ impl Viewer {
             &annotation_fallback_frames,
             top,
         );
+        let viewport_top = self.canvas_geometry().viewport.top();
         top = reflow_annotation_presentation(
             &self.track_presentation,
             &mut self.panels.active_mut().track_frames,
             &mut annotation_display,
-            self.canvas_geometry.viewport.top(),
+            viewport_top,
         );
         self.panels
             .active_mut()
@@ -2037,7 +2039,7 @@ impl Viewer {
                     .then_with(|| left.top.total_cmp(&right.top))
                     .then_with(|| left.bottom.total_cmp(&right.bottom))
             });
-        let annotation_clip_top = self.canvas_geometry.viewport.top();
+        let annotation_clip_top = viewport_top;
         let annotation_clip_bottom = scroll_clip_top;
         let annotation_content_bottom = annotation_display
             .rectangles
@@ -2285,7 +2287,7 @@ impl Viewer {
             );
             cache.pinned.append_scrolled_and_clipped_vertical(
                 0.0,
-                self.canvas_geometry.viewport.top(),
+                self.canvas_geometry().viewport.top(),
                 annotation_clip_bottom,
                 &mut display,
             );
@@ -2358,9 +2360,9 @@ impl Viewer {
             );
             display.rectangles.push(RectPrimitive {
                 x,
-                y: self.canvas_geometry.viewport.top(),
+                y: self.canvas_geometry().viewport.top(),
                 width: (right - x).max(1.0),
-                height: self.canvas_geometry.viewport.height(),
+                height: self.canvas_geometry().viewport.height(),
                 color,
                 object_id: 0,
                 shape: Default::default(),
@@ -2368,9 +2370,9 @@ impl Viewer {
             for boundary in [x, right - 1.0] {
                 display.rectangles.push(RectPrimitive {
                     x: boundary,
-                    y: self.canvas_geometry.viewport.top(),
+                    y: self.canvas_geometry().viewport.top(),
                     width: 1.0,
-                    height: self.canvas_geometry.viewport.height(),
+                    height: self.canvas_geometry().viewport.height(),
                     color: Rgba::new(color.red, color.green, color.blue, 0.72),
                     object_id: 0,
                     shape: Default::default(),
@@ -2389,7 +2391,7 @@ impl Viewer {
         let panel_rect = self.active_panel_rect();
         let active_panel_id = self.panels.active().id;
         let previous_maximum_scroll = (self.panels.active().content_bottom_points
-            - self.canvas_geometry.viewport.bottom())
+            - self.canvas_geometry().viewport.bottom())
         .max(0.0);
         let density_drag_fraction = self
             .vertical_overview_drag
@@ -2400,9 +2402,9 @@ impl Viewer {
             .iter()
             .map(|rectangle| rectangle.y + rectangle.height)
             .fold(minimum_bottom, f32::max)
-            .max(self.canvas_geometry.viewport.bottom());
+            .max(self.canvas_geometry().viewport.bottom());
         let camera_padding = vertical_density_camera_padding(
-            (self.canvas_geometry.viewport.bottom() - scroll_clip_top).max(1.0),
+            (self.canvas_geometry().viewport.bottom() - scroll_clip_top).max(1.0),
             self.primary_alignment_filters().alignment_density,
         );
         self.panels.active_mut().vertical_content_origin_points = self
@@ -2412,7 +2414,7 @@ impl Viewer {
             .clamp(0.0, camera_padding);
         self.panels.active_mut().content_bottom_points = actual_content_bottom + camera_padding;
         let maximum_scroll = (self.panels.active().content_bottom_points
-            - self.canvas_geometry.viewport.bottom())
+            - self.canvas_geometry().viewport.bottom())
         .max(0.0);
         let current_scroll = self.panels.active().vertical_scroll_points;
         let (scroll, latent_fraction) = reconcile_vertical_scroll(
@@ -2428,7 +2430,7 @@ impl Viewer {
         display.scroll_and_clip_vertical(
             effective_scroll,
             scroll_clip_top,
-            self.canvas_geometry.viewport.bottom(),
+            self.canvas_geometry().viewport.bottom(),
         );
         display.translate_and_clip_horizontal(
             panel_rect.left(),
@@ -2437,7 +2439,7 @@ impl Viewer {
         );
         pinned_display.scroll_and_clip_vertical(
             0.0,
-            self.canvas_geometry.viewport.top(),
+            self.canvas_geometry().viewport.top(),
             scroll_clip_top,
         );
         pinned_display.translate_and_clip_horizontal(
@@ -2479,7 +2481,7 @@ impl Viewer {
             return;
         }
         if self.synthetic {
-            let top = self.canvas_geometry.viewport.top();
+            let top = self.canvas_geometry().viewport.top();
             let mut display =
                 if self.primary_alignment_visible() && !self.primary_alignment_collapsed() {
                     DisplayList::synthetic_coverage_and_reads_at(
@@ -2541,7 +2543,7 @@ impl Viewer {
                 &mut display,
                 &mut DisplayList::default(),
                 bottom,
-                self.canvas_geometry.viewport.top(),
+                self.canvas_geometry().viewport.top(),
             );
             self.panels.active_mut().display_list = display;
             self.composite_display_list = self.panels.active().display_list.clone();

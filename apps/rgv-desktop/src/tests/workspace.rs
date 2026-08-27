@@ -769,7 +769,7 @@ fn session_panel_workspace_restores_order_active_locus_and_width() {
     }];
     session.active_panel = PanelId::new(4);
 
-    let workspace = PanelWorkspace::from_session(&session, 800.0, 120.0).unwrap();
+    let workspace = PanelWorkspace::from_session(&session, 400.0, 120.0).unwrap();
 
     assert_eq!(
         workspace.iter().map(|panel| panel.id).collect::<Vec<_>>(),

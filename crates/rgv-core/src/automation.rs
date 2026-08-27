@@ -548,6 +548,11 @@ pub enum AutomationSetting {
     PropertiesPanelWidth {
         value: f32,
     },
+    /// Transient control signal matching a held Properties resize sash. This
+    /// gesture state is never persisted in a project.
+    PropertiesPanelResizeActive {
+        value: bool,
+    },
     ShowReference {
         value: bool,
     },
@@ -670,11 +675,11 @@ impl AutomationSetting {
             .ok_or_else(|| {
                 "window size must be between 640x400 and 3840x2160 logical points".to_owned()
             }),
-            Self::InterfaceScalePercent { value } =>
-                (crate::MINIMUM_INTERFACE_SCALE_PERCENT..=crate::MAXIMUM_INTERFACE_SCALE_PERCENT)
-                    .contains(value)
-                    .then_some(())
-                    .ok_or_else(|| "interface scale must be between 75 and 200 percent".to_owned()),
+            Self::InterfaceScalePercent { value } => (crate::MINIMUM_INTERFACE_SCALE_PERCENT
+                ..=crate::MAXIMUM_INTERFACE_SCALE_PERCENT)
+                .contains(value)
+                .then_some(())
+                .ok_or_else(|| "interface scale must be between 75 and 200 percent".to_owned()),
             Self::PropertiesPanelWidth { value } => (value.is_finite()
                 && (280.0..=520.0).contains(value))
             .then_some(())
@@ -1014,6 +1019,8 @@ pub struct AutomationWorkspaceLayoutSnapshot {
     pub properties: AutomationRectSnapshot,
     #[serde(default)]
     pub properties_expanded: bool,
+    #[serde(default)]
+    pub properties_resize_active: bool,
     #[serde(default = "default_automation_scale")]
     pub display_scale: f32,
     #[serde(default = "default_automation_scale")]
@@ -2090,6 +2097,7 @@ mod tests {
                     bottom: 776.0,
                 },
                 properties_expanded: true,
+                properties_resize_active: false,
                 display_scale: 2.0,
                 accessibility_scale: 1.0,
                 genome_context: AutomationRectSnapshot {
@@ -2271,6 +2279,9 @@ mod tests {
                 },
                 AutomationCommand::Configure {
                     setting: AutomationSetting::PropertiesPanelWidth { value: 520.0 },
+                },
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::PropertiesPanelResizeActive { value: true },
                 },
             ],
         };

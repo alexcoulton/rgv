@@ -156,8 +156,10 @@ from a mutation that changed the viewer.
 Automation schema version 4 exposes the normalized presentation model and committed workspace
 geometry structurally. The `workspace_layout` field reports one revision for the shared workspace,
 adaptive genome-context rows, track viewport, gutter, and each panel's header, canvas, and scrollbar
-rectangles together with cytoband availability. These are the same logical-point bounds used for
-native rendering and interaction. Workspace snapshots also include ordered, channel-qualified
+rectangles together with cytoband availability. It also records the exact Properties rectangle and
+expanded state, native display scale, accessibility/interface scale, layout-recomputation counter,
+and settled resize-query counter. These are the same logical-point bounds used for native rendering,
+interaction, accessibility, and visible-workspace export. Workspace snapshots also include ordered, channel-qualified
 presentation nodes and groups; desired and effective
 visibility; preferred heights; the shared immutable pane-layout rectangles; pane and stack scroll
 offsets; every read panel's maximum/offset/effective density; the canonical pane selection; source
@@ -167,6 +169,18 @@ availability; and the target of any active resize or annotation/read scrollbar g
 `presentation_ungroup`, `read_pane_height`,
 `annotation_scroll_points`, `read_stack_scroll_points`, `read_panel_scroll_points`, and
 `read_panel_density` settings all execute through the same reducer used by the GUI.
+The qualification-only `window_size`, `interface_scale_percent`,
+`properties_panel_expanded`, and `properties_panel_width` settings make shell reflow reproducible;
+they affect the running window and do not persist calculated layout rectangles into a project.
+The transient `properties_panel_resize_active` setting brackets held-sash qualification so a
+mid-gesture capture cannot be mistaken for pointer release; setting it back to `false` schedules
+the single final resolution-dependent refresh.
+
+`rgv_capture_view` with `scope: "visible_workspace"` crops and rebases PNG output to the exact
+committed workspace rectangle. `active_panel` uses the committed active canvas, while
+`full_active_panel` extends that canvas vertically within the documented safety bound.
+`rgv_capture_window` remains the complete native client area, including the application shell and
+Properties panel.
 
 `rgv_get_interaction_trace` is observational. Drag the vertical scrollbar in the live window, then
 call the tool to inspect the first 500 ms of the gesture. The trace separates pointer receipt,
@@ -277,3 +291,20 @@ window screenshots through `rgv_capture_window`, saves and opens the project in-
 structured report under the control root. Run it twice from clean launches and retain each uniquely
 named screenshot. Visual correctness still comes from inspecting those images, not from structured
 renderer metadata.
+
+For the adaptive workspace-layout gate, run the focused harness against a fresh release process
+whose control root is the repository root:
+
+```sh
+python3 validation/adaptive_layout_mcp_qualification.py \
+  --mcp-binary target/release/rgv-mcp \
+  --control-url http://127.0.0.1:60159 \
+  --secret-file /tmp/rgv-adaptive-layout.secret \
+  --control-root "$PWD"
+```
+
+It checks one- and two-panel shells; collapsed, minimum, default, maximum, and continuously resized
+Properties states; mixed cytoband availability; a narrow 150%-scale window; retained per-panel
+scroll/density/track-height state; committed export bounds; and resize-query coalescing. It writes
+structured geometry plus native and logical PNG evidence under
+`validation/adaptive-layout-evidence/`.

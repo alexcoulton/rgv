@@ -51,6 +51,13 @@ fn pointer_targets_unobstructed_canvas(
 }
 
 impl Viewer {
+    /// One-way compatibility projection for display/layout code that still
+    /// consumes the compact canvas view. The immutable workspace snapshot is
+    /// the only stored geometry authority.
+    pub(crate) fn canvas_geometry(&self) -> ui::CanvasGeometry {
+        self.workspace_layout.canvas_geometry()
+    }
+
     pub(crate) fn cursor_moved(&mut self, position: PhysicalPosition<f64>, consumed: bool) {
         self.cursor = position;
         if self.dragging && !consumed {
@@ -145,7 +152,7 @@ impl Viewer {
             .active()
             .scroll_display_cache
             .as_ref()
-            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+            .map_or(self.canvas_geometry().viewport.top(), |cache| {
                 cache.annotation_clip_bottom
             });
         if cursor_y < annotation_clip_bottom {
@@ -568,7 +575,7 @@ impl Viewer {
         }
         if interaction.keyboard_density_pixels.abs() > f32::EPSILON {
             let viewport_height = self.read_panel_metrics(track_id).map_or(
-                self.canvas_geometry.viewport.height(),
+                self.canvas_geometry().viewport.height(),
                 |(top, bottom, _)| (bottom - top).max(1.0),
             );
             let panel_id = self.panels.active().id;
@@ -637,7 +644,7 @@ impl Viewer {
         let camera_viewport_height = (clip_bottom - clip_top).max(1.0);
         let scrollbar_rect = self
             .read_panel_scrollbar_rect(track_id)
-            .unwrap_or(self.canvas_geometry.scrollbar);
+            .unwrap_or(self.canvas_geometry().scrollbar);
         let density = self.alignment_density_for_panel_track(self.panels.active().id, track_id);
         let latent_fraction = state.latent_scroll_fraction;
         let scroll_fraction =
@@ -743,7 +750,7 @@ impl Viewer {
         let density = self.alignment_density_for_panel_track(drag.panel_id, drag.track_id);
         let scrollbar_rect = self
             .read_panel_scrollbar_rect(drag.track_id)
-            .unwrap_or(self.canvas_geometry.scrollbar);
+            .unwrap_or(self.canvas_geometry().scrollbar);
         let geometry = ui::scrollbar_geometry_for_density_in_viewport(
             scrollbar_rect,
             maximum,
@@ -899,7 +906,7 @@ impl Viewer {
         );
         let scrollbar_rect = self
             .read_panel_scrollbar_rect(drag.track_id)
-            .unwrap_or(self.canvas_geometry.scrollbar);
+            .unwrap_or(self.canvas_geometry().scrollbar);
         let geometry = ui::scrollbar_geometry_for_density_at_fraction_in_viewport(
             scrollbar_rect,
             maximum,
@@ -1013,7 +1020,7 @@ impl Viewer {
     }
 
     pub(crate) fn canvas_page_height(&self) -> f32 {
-        self.canvas_geometry.viewport.height().max(80.0) * 0.8
+        self.canvas_geometry().viewport.height().max(80.0) * 0.8
     }
 
     pub(crate) fn cursor_in_genomic_canvas(&self) -> bool {
@@ -1069,7 +1076,7 @@ impl Viewer {
 
     pub(crate) fn active_panel_rect(&self) -> egui::Rect {
         self.panel_column_rect(self.panels.active().id)
-            .unwrap_or(self.canvas_geometry.genomic)
+            .expect("committed workspace layout contains the active locus panel")
     }
 
     pub(crate) fn panel_at_cursor(&self) -> Option<PanelId> {
@@ -1134,7 +1141,6 @@ impl Viewer {
             );
             self.workspace_layout_recomputations =
                 self.workspace_layout_recomputations.saturating_add(1);
-            self.canvas_geometry = self.workspace_layout.canvas_geometry();
         }
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in &ids {
@@ -1222,7 +1228,7 @@ impl Viewer {
             contig_name,
             contig_length,
         );
-        panel.content_bottom_points = self.canvas_geometry.viewport.top();
+        panel.content_bottom_points = self.canvas_geometry().viewport.top();
         anyhow::ensure!(self.panels.push(panel), "view panel identity collision");
         for track in &mut self.alignment_tracks {
             track.projection_mut(id).pending_query =
@@ -1264,7 +1270,7 @@ impl Viewer {
 
     pub(crate) fn cursor_in_track_viewport(&self) -> bool {
         let scale = self.window.scale_factor();
-        self.canvas_geometry.viewport.contains(egui::pos2(
+        self.canvas_geometry().viewport.contains(egui::pos2(
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
         ))
@@ -1346,13 +1352,13 @@ impl Viewer {
         let annotation_clip_top = panel
             .scroll_display_cache
             .as_ref()
-            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+            .map_or(self.canvas_geometry().viewport.top(), |cache| {
                 cache.annotation_clip_top
             });
         let annotation_clip_bottom = panel
             .scroll_display_cache
             .as_ref()
-            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+            .map_or(self.canvas_geometry().viewport.top(), |cache| {
                 cache.annotation_clip_bottom
             });
         let alignment_track = panel
@@ -1383,7 +1389,7 @@ impl Viewer {
                     } else {
                         annotation_clip_top
                     },
-                    self.canvas_geometry.viewport.top(),
+                    self.canvas_geometry().viewport.top(),
                     if read_panel {
                         frame.bottom
                     } else {

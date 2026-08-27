@@ -10,6 +10,8 @@
       "expected_physical_edges": {
         "context_bottom": 266,
         "effective_pixels_per_point": 2.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
         "panel_edges": [
           {
             "canvas_left": 336,
@@ -33,7 +35,7 @@
       "foreground_activated": false,
       "height": 1600,
       "includes_native_frame": false,
-      "layout_revision": 41,
+      "layout_revision": 21,
       "logical_layout": {
         "accessibility_scale": 1.0,
         "context_gutter": {
@@ -189,10 +191,11 @@
           "top": 62.0
         },
         "properties_expanded": true,
-        "recomputations": 40,
+        "properties_resize_active": false,
+        "recomputations": 20,
         "resolution_query_refresh_pending": false,
-        "revision": 41,
-        "settled_resize_query_refreshes": 20,
+        "revision": 21,
+        "settled_resize_query_refreshes": 11,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -213,6 +216,7 @@
         }
       },
       "name": "mf12-default-expanded.png",
+      "requested_settled_capture": true,
       "sha256": "beac00fa04e70d515505a0434d945d746cfbe02d859a274534214d791e046380",
       "width": 2560,
       "window_bounds_points": null,
@@ -223,6 +227,8 @@
       "expected_physical_edges": {
         "context_bottom": 266,
         "effective_pixels_per_point": 2.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
         "panel_edges": [
           {
             "canvas_left": 336,
@@ -246,7 +252,7 @@
       "foreground_activated": false,
       "height": 1600,
       "includes_native_frame": false,
-      "layout_revision": 42,
+      "layout_revision": 22,
       "logical_layout": {
         "accessibility_scale": 1.0,
         "context_gutter": {
@@ -402,10 +408,11 @@
           "top": 62.0
         },
         "properties_expanded": false,
-        "recomputations": 41,
+        "properties_resize_active": false,
+        "recomputations": 21,
         "resolution_query_refresh_pending": false,
-        "revision": 42,
-        "settled_resize_query_refreshes": 21,
+        "revision": 22,
+        "settled_resize_query_refreshes": 12,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -426,6 +433,7 @@
         }
       },
       "name": "mf12-collapsed.png",
+      "requested_settled_capture": true,
       "sha256": "5e6de2952fb6ac91e539184375d6b5641f6c5705c93025cc06460d1ed447abc8",
       "width": 2560,
       "window_bounds_points": null,
@@ -436,6 +444,8 @@
       "expected_physical_edges": {
         "context_bottom": 266,
         "effective_pixels_per_point": 2.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
         "panel_edges": [
           {
             "canvas_left": 336,
@@ -459,7 +469,7 @@
       "foreground_activated": false,
       "height": 1600,
       "includes_native_frame": false,
-      "layout_revision": 43,
+      "layout_revision": 23,
       "logical_layout": {
         "accessibility_scale": 1.0,
         "context_gutter": {
@@ -615,10 +625,11 @@
           "top": 62.0
         },
         "properties_expanded": true,
-        "recomputations": 42,
+        "properties_resize_active": false,
+        "recomputations": 22,
         "resolution_query_refresh_pending": false,
-        "revision": 43,
-        "settled_resize_query_refreshes": 22,
+        "revision": 23,
+        "settled_resize_query_refreshes": 13,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -639,6 +650,7 @@
         }
       },
       "name": "mf12-minimum-expanded.png",
+      "requested_settled_capture": true,
       "sha256": "9451fc8f10f57fe961e31af428c7d0ebdc44d4aacf187d266b6a209c96db1875",
       "width": 2560,
       "window_bounds_points": null,
@@ -649,6 +661,8 @@
       "expected_physical_edges": {
         "context_bottom": 266,
         "effective_pixels_per_point": 2.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
         "panel_edges": [
           {
             "canvas_left": 336,
@@ -672,7 +686,7 @@
       "foreground_activated": false,
       "height": 1600,
       "includes_native_frame": false,
-      "layout_revision": 44,
+      "layout_revision": 24,
       "logical_layout": {
         "accessibility_scale": 1.0,
         "context_gutter": {
@@ -828,10 +842,11 @@
           "top": 62.0
         },
         "properties_expanded": true,
-        "recomputations": 43,
+        "properties_resize_active": false,
+        "recomputations": 23,
         "resolution_query_refresh_pending": false,
-        "revision": 44,
-        "settled_resize_query_refreshes": 23,
+        "revision": 24,
+        "settled_resize_query_refreshes": 14,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -852,16 +867,453 @@
         }
       },
       "name": "mf12-maximum-expanded.png",
+      "requested_settled_capture": true,
       "sha256": "3cdfb6ec88ef1c491cdb6747e2cbcc8bf29e8a0be9bee2da5a08b455b5fe3d9c",
       "width": 2560,
       "window_bounds_points": null,
       "window_id": null
     },
     {
-      "bytes": 649467,
+      "bytes": 630129,
       "expected_physical_edges": {
         "context_bottom": 266,
         "effective_pixels_per_point": 2.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+        "panel_edges": [
+          {
+            "canvas_left": 336,
+            "canvas_right": 884,
+            "header_left": 336,
+            "header_right": 884,
+            "scrollbar_right": 928
+          },
+          {
+            "canvas_left": 928,
+            "canvas_right": 1476,
+            "header_left": 928,
+            "header_right": 1476,
+            "scrollbar_right": 1520
+          }
+        ],
+        "properties_left": 1520,
+        "track_top": 266,
+        "workspace_right": 1520
+      },
+      "foreground_activated": false,
+      "height": 1600,
+      "includes_native_frame": false,
+      "layout_revision": 24,
+      "logical_layout": {
+        "accessibility_scale": 1.0,
+        "context_gutter": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 62.0
+        },
+        "display_scale": 2.0,
+        "genome_context": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 760.0,
+          "top": 62.0
+        },
+        "has_cytoband_row": false,
+        "panels": [
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 442.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 464.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 464.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 442.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 442.0,
+              "right": 464.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 168.0,
+              "right": 442.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 176.0,
+              "right": 434.0,
+              "top": 79.0
+            },
+            "panel_id": 1,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 442.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 442.0,
+              "right": 464.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 168.0,
+              "right": 442.0,
+              "top": 92.0
+            }
+          },
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 464.0,
+              "right": 738.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 464.0,
+              "right": 760.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 464.0,
+              "right": 760.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 464.0,
+              "right": 738.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 738.0,
+              "right": 760.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 464.0,
+              "right": 738.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 472.0,
+              "right": 730.0,
+              "top": 79.0
+            },
+            "panel_id": 2,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 464.0,
+              "right": 738.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 738.0,
+              "right": 760.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 464.0,
+              "right": 738.0,
+              "top": 92.0
+            }
+          }
+        ],
+        "properties": {
+          "bottom": 776.0,
+          "left": 760.0,
+          "right": 1280.0,
+          "top": 62.0
+        },
+        "properties_expanded": true,
+        "properties_resize_active": true,
+        "recomputations": 23,
+        "resolution_query_refresh_pending": false,
+        "revision": 24,
+        "settled_resize_query_refreshes": 14,
+        "track_gutter": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 133.0
+        },
+        "track_viewport": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 760.0,
+          "top": 133.0
+        },
+        "workspace": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 760.0,
+          "top": 62.0
+        }
+      },
+      "name": "mf12-resize-start.png",
+      "requested_settled_capture": true,
+      "sha256": "3cdfb6ec88ef1c491cdb6747e2cbcc8bf29e8a0be9bee2da5a08b455b5fe3d9c",
+      "width": 2560,
+      "window_bounds_points": null,
+      "window_id": null
+    },
+    {
+      "bytes": 674478,
+      "expected_physical_edges": {
+        "context_bottom": 266,
+        "effective_pixels_per_point": 2.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+        "panel_edges": [
+          {
+            "canvas_left": 336,
+            "canvas_right": 1014,
+            "header_left": 336,
+            "header_right": 1014,
+            "scrollbar_right": 1058
+          },
+          {
+            "canvas_left": 1058,
+            "canvas_right": 1736,
+            "header_left": 1058,
+            "header_right": 1736,
+            "scrollbar_right": 1780
+          }
+        ],
+        "properties_left": 1780,
+        "track_top": 266,
+        "workspace_right": 1780
+      },
+      "foreground_activated": false,
+      "height": 1600,
+      "includes_native_frame": false,
+      "layout_revision": 25,
+      "logical_layout": {
+        "accessibility_scale": 1.0,
+        "context_gutter": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 62.0
+        },
+        "display_scale": 2.0,
+        "genome_context": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 890.0,
+          "top": 62.0
+        },
+        "has_cytoband_row": false,
+        "panels": [
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 507.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 529.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 529.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 507.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 507.0,
+              "right": 529.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 168.0,
+              "right": 507.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 176.0,
+              "right": 499.0,
+              "top": 79.0
+            },
+            "panel_id": 1,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 507.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 507.0,
+              "right": 529.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 168.0,
+              "right": 507.0,
+              "top": 92.0
+            }
+          },
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 529.0,
+              "right": 868.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 529.0,
+              "right": 890.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 529.0,
+              "right": 890.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 529.0,
+              "right": 868.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 868.0,
+              "right": 890.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 529.0,
+              "right": 868.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 537.0,
+              "right": 860.0,
+              "top": 79.0
+            },
+            "panel_id": 2,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 529.0,
+              "right": 868.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 868.0,
+              "right": 890.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 529.0,
+              "right": 868.0,
+              "top": 92.0
+            }
+          }
+        ],
+        "properties": {
+          "bottom": 776.0,
+          "left": 890.0,
+          "right": 1280.0,
+          "top": 62.0
+        },
+        "properties_expanded": true,
+        "properties_resize_active": true,
+        "recomputations": 24,
+        "resolution_query_refresh_pending": false,
+        "revision": 25,
+        "settled_resize_query_refreshes": 14,
+        "track_gutter": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 133.0
+        },
+        "track_viewport": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 890.0,
+          "top": 133.0
+        },
+        "workspace": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 890.0,
+          "top": 62.0
+        }
+      },
+      "name": "mf12-resize-midpoint.png",
+      "requested_settled_capture": false,
+      "sha256": "318549661cdefd15bcf3438a2b357e12679810b01023556c67c47bb9b3eee0a8",
+      "width": 2560,
+      "window_bounds_points": null,
+      "window_id": null
+    },
+    {
+      "bytes": 650242,
+      "expected_physical_edges": {
+        "context_bottom": 266,
+        "effective_pixels_per_point": 2.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
         "panel_edges": [
           {
             "canvas_left": 336,
@@ -885,7 +1337,7 @@
       "foreground_activated": false,
       "height": 1600,
       "includes_native_frame": false,
-      "layout_revision": 48,
+      "layout_revision": 26,
       "logical_layout": {
         "accessibility_scale": 1.0,
         "context_gutter": {
@@ -1041,10 +1493,11 @@
           "top": 62.0
         },
         "properties_expanded": true,
-        "recomputations": 47,
+        "properties_resize_active": false,
+        "recomputations": 25,
         "resolution_query_refresh_pending": false,
-        "revision": 48,
-        "settled_resize_query_refreshes": 23,
+        "revision": 26,
+        "settled_resize_query_refreshes": 15,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -1065,7 +1518,8 @@
         }
       },
       "name": "mf12-resize-end.png",
-      "sha256": "cbd056d130f5828d95435eed154b0148e346c87d9cda21c54661a8f53a3fc7f7",
+      "requested_settled_capture": true,
+      "sha256": "63acb6ab7c7aee5e31ac6ea701b0ee2d04fcd17d59a2fa48791aa401861df2ad",
       "width": 2560,
       "window_bounds_points": null,
       "window_id": null
@@ -1075,6 +1529,8 @@
       "expected_physical_edges": {
         "context_bottom": 399,
         "effective_pixels_per_point": 3.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
         "panel_edges": [
           {
             "canvas_left": 504,
@@ -1098,7 +1554,7 @@
       "foreground_activated": false,
       "height": 1200,
       "includes_native_frame": false,
-      "layout_revision": 51,
+      "layout_revision": 31,
       "logical_layout": {
         "accessibility_scale": 1.5,
         "context_gutter": {
@@ -1254,10 +1710,11 @@
           "top": 62.0
         },
         "properties_expanded": false,
-        "recomputations": 50,
+        "properties_resize_active": false,
+        "recomputations": 30,
         "resolution_query_refresh_pending": false,
-        "revision": 51,
-        "settled_resize_query_refreshes": 26,
+        "revision": 31,
+        "settled_resize_query_refreshes": 18,
         "track_gutter": {
           "bottom": 376.0,
           "left": 0.0,
@@ -1278,8 +1735,299 @@
         }
       },
       "name": "mf12-narrow-enlarged-text.png",
+      "requested_settled_capture": true,
       "sha256": "210db8d16a630f495d1ac18b47d25c95dd56caa4fb12ad7eacf088e0427a01ce",
       "width": 1600,
+      "window_bounds_points": null,
+      "window_id": null
+    },
+    {
+      "bytes": 736654,
+      "expected_physical_edges": {
+        "context_bottom": 266,
+        "effective_pixels_per_point": 2.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+        "panel_edges": [
+          {
+            "canvas_left": 336,
+            "canvas_right": 2456,
+            "header_left": 336,
+            "header_right": 2456,
+            "scrollbar_right": 2500
+          }
+        ],
+        "properties_left": 2500,
+        "track_top": 266,
+        "workspace_right": 2500
+      },
+      "foreground_activated": false,
+      "height": 1600,
+      "includes_native_frame": false,
+      "layout_revision": 36,
+      "logical_layout": {
+        "accessibility_scale": 1.0,
+        "context_gutter": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 62.0
+        },
+        "display_scale": 2.0,
+        "genome_context": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 1250.0,
+          "top": 62.0
+        },
+        "has_cytoband_row": false,
+        "panels": [
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 1228.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 1250.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 1250.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 1228.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 1228.0,
+              "right": 1250.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 168.0,
+              "right": 1228.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 176.0,
+              "right": 1220.0,
+              "top": 79.0
+            },
+            "panel_id": 1,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 1228.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 1228.0,
+              "right": 1250.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 168.0,
+              "right": 1228.0,
+              "top": 92.0
+            }
+          }
+        ],
+        "properties": {
+          "bottom": 776.0,
+          "left": 1250.0,
+          "right": 1280.0,
+          "top": 62.0
+        },
+        "properties_expanded": false,
+        "properties_resize_active": false,
+        "recomputations": 35,
+        "resolution_query_refresh_pending": false,
+        "revision": 36,
+        "settled_resize_query_refreshes": 22,
+        "track_gutter": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 133.0
+        },
+        "track_viewport": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 1250.0,
+          "top": 133.0
+        },
+        "workspace": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 1250.0,
+          "top": 62.0
+        }
+      },
+      "name": "mf12-one-panel-collapsed.png",
+      "requested_settled_capture": true,
+      "sha256": "57022a064697a58c7e528c397ce58a77824c884cdc080854ec69c270e17d3072",
+      "width": 2560,
+      "window_bounds_points": null,
+      "window_id": null
+    },
+    {
+      "bytes": 680937,
+      "expected_physical_edges": {
+        "context_bottom": 266,
+        "effective_pixels_per_point": 2.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+        "panel_edges": [
+          {
+            "canvas_left": 336,
+            "canvas_right": 1836,
+            "header_left": 336,
+            "header_right": 1836,
+            "scrollbar_right": 1880
+          }
+        ],
+        "properties_left": 1880,
+        "track_top": 266,
+        "workspace_right": 1880
+      },
+      "foreground_activated": false,
+      "height": 1600,
+      "includes_native_frame": false,
+      "layout_revision": 37,
+      "logical_layout": {
+        "accessibility_scale": 1.0,
+        "context_gutter": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 62.0
+        },
+        "display_scale": 2.0,
+        "genome_context": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 940.0,
+          "top": 62.0
+        },
+        "has_cytoband_row": false,
+        "panels": [
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 918.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 940.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 940.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 918.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 918.0,
+              "right": 940.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 168.0,
+              "right": 918.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 176.0,
+              "right": 910.0,
+              "top": 79.0
+            },
+            "panel_id": 1,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 918.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 918.0,
+              "right": 940.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 168.0,
+              "right": 918.0,
+              "top": 92.0
+            }
+          }
+        ],
+        "properties": {
+          "bottom": 776.0,
+          "left": 940.0,
+          "right": 1280.0,
+          "top": 62.0
+        },
+        "properties_expanded": true,
+        "properties_resize_active": false,
+        "recomputations": 36,
+        "resolution_query_refresh_pending": false,
+        "revision": 37,
+        "settled_resize_query_refreshes": 23,
+        "track_gutter": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 133.0
+        },
+        "track_viewport": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 940.0,
+          "top": 133.0
+        },
+        "workspace": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 940.0,
+          "top": 62.0
+        }
+      },
+      "name": "mf12-one-panel-expanded.png",
+      "requested_settled_capture": true,
+      "sha256": "c8241c4971469c0e67cd684ed51b5c39e69dbfa275ab5661ac8235ef4aa31724",
+      "width": 2560,
       "window_bounds_points": null,
       "window_id": null
     },
@@ -1288,6 +2036,8 @@
       "expected_physical_edges": {
         "context_bottom": 292,
         "effective_pixels_per_point": 2.0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
         "panel_edges": [
           {
             "canvas_left": 336,
@@ -1311,7 +2061,7 @@
       "foreground_activated": false,
       "height": 1600,
       "includes_native_frame": false,
-      "layout_revision": 56,
+      "layout_revision": 39,
       "logical_layout": {
         "accessibility_scale": 1.0,
         "context_gutter": {
@@ -1477,10 +2227,11 @@
           "top": 62.0
         },
         "properties_expanded": true,
-        "recomputations": 55,
+        "properties_resize_active": false,
+        "recomputations": 38,
         "resolution_query_refresh_pending": false,
-        "revision": 56,
-        "settled_resize_query_refreshes": 29,
+        "revision": 39,
+        "settled_resize_query_refreshes": 23,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -1501,6 +2252,7 @@
         }
       },
       "name": "mixed-cytobands.png",
+      "requested_settled_capture": true,
       "sha256": "ba63c31f76c01f4bb0f03b1fee6c48c579e19eb2da41d06b81632f60bd3e5ede",
       "width": 2560,
       "window_bounds_points": null,
@@ -1508,13 +2260,114 @@
     }
   ],
   "display_scale": 2.0,
+  "interaction_probes": [
+    {
+      "activated_panel_ids": [
+        1,
+        2
+      ],
+      "adjusted_read_panels": 2,
+      "resized_track_id": 1,
+      "state": "default-expanded"
+    },
+    {
+      "activated_panel_ids": [
+        1,
+        2
+      ],
+      "adjusted_read_panels": 2,
+      "resized_track_id": 1,
+      "state": "collapsed"
+    },
+    {
+      "activated_panel_ids": [
+        1,
+        2
+      ],
+      "adjusted_read_panels": 2,
+      "resized_track_id": 1,
+      "state": "minimum-expanded"
+    },
+    {
+      "activated_panel_ids": [
+        1,
+        2
+      ],
+      "adjusted_read_panels": 2,
+      "resized_track_id": 1,
+      "state": "maximum-expanded"
+    },
+    {
+      "activated_panel_ids": [
+        1,
+        2
+      ],
+      "adjusted_read_panels": 2,
+      "resized_track_id": 1,
+      "state": "resize-start"
+    },
+    {
+      "activated_panel_ids": [
+        1,
+        2
+      ],
+      "adjusted_read_panels": 2,
+      "resized_track_id": 1,
+      "state": "resize-midpoint"
+    },
+    {
+      "activated_panel_ids": [
+        1,
+        2
+      ],
+      "adjusted_read_panels": 2,
+      "resized_track_id": 1,
+      "state": "resize-end"
+    },
+    {
+      "activated_panel_ids": [
+        1,
+        2
+      ],
+      "adjusted_read_panels": 2,
+      "resized_track_id": 1,
+      "state": "narrow-enlarged-text"
+    },
+    {
+      "activated_panel_ids": [
+        1
+      ],
+      "adjusted_read_panels": 1,
+      "resized_track_id": 1,
+      "state": "one-panel-collapsed"
+    },
+    {
+      "activated_panel_ids": [
+        1
+      ],
+      "adjusted_read_panels": 1,
+      "resized_track_id": 1,
+      "state": "one-panel-expanded"
+    },
+    {
+      "activated_panel_ids": [
+        1,
+        2
+      ],
+      "adjusted_read_panels": 0,
+      "resized_track_id": null,
+      "state": "mixed-cytobands"
+    }
+  ],
   "logical_capture_scale": 1.0,
   "logical_captures": [
     {
-      "bytes": 220754,
+      "bytes": 222738,
       "expected_logical_edges": {
-        "context_bottom": 133,
+        "context_bottom": 71,
         "effective_pixels_per_point": 1.0,
+        "origin_x": 0.0,
+        "origin_y": 62.0,
         "panel_edges": [
           {
             "canvas_left": 168,
@@ -1532,21 +2385,23 @@
           }
         ],
         "properties_left": 940,
-        "track_top": 133,
+        "track_top": 71,
         "workspace_right": 940
       },
-      "height": 800,
-      "layout_revision": 41,
+      "height": 714,
+      "layout_revision": 21,
       "name": "mf12-default-logical-1x.png",
       "scope": "visible_workspace",
-      "sha256": "f2839a90a40f9d463359b51e2ca072a2067387e58934d2f7a28686cc5c7bd6fd",
-      "width": 1280
+      "sha256": "deacb83f37e72c64f2d1ca37fffa632f080b77e0964b5c48cbd2cc5400d5c1c1",
+      "width": 940
     },
     {
-      "bytes": 22811,
+      "bytes": 16026,
       "expected_logical_edges": {
-        "context_bottom": 146,
+        "context_bottom": 84,
         "effective_pixels_per_point": 1.0,
+        "origin_x": 0.0,
+        "origin_y": 62.0,
         "panel_edges": [
           {
             "canvas_left": 168,
@@ -1564,19 +2419,19 @@
           }
         ],
         "properties_left": 940,
-        "track_top": 146,
+        "track_top": 84,
         "workspace_right": 940
       },
-      "height": 800,
-      "layout_revision": 56,
+      "height": 714,
+      "layout_revision": 39,
       "name": "mixed-cytobands-logical-1x.png",
       "scope": "visible_workspace",
-      "sha256": "ca71a47801a420f37bbb06a9b7654dbe70eef60838a491553e8310b3a53f24ab",
-      "width": 1280
+      "sha256": "a51f363564d9bd2d44424732531cbbced882e683b20ff7c681414c4922508f25",
+      "width": 940
     }
   ],
   "native_capture_effective_scale": 2.0,
-  "resize_query_refreshes": 0,
+  "resize_query_refreshes": 1,
   "result": "passed",
   "states": [
     {
@@ -1735,10 +2590,11 @@
           "top": 62.0
         },
         "properties_expanded": true,
-        "recomputations": 40,
+        "properties_resize_active": false,
+        "recomputations": 20,
         "resolution_query_refresh_pending": false,
-        "revision": 41,
-        "settled_resize_query_refreshes": 20,
+        "revision": 21,
+        "settled_resize_query_refreshes": 11,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -1916,10 +2772,11 @@
           "top": 62.0
         },
         "properties_expanded": false,
-        "recomputations": 41,
+        "properties_resize_active": false,
+        "recomputations": 21,
         "resolution_query_refresh_pending": false,
-        "revision": 42,
-        "settled_resize_query_refreshes": 21,
+        "revision": 22,
+        "settled_resize_query_refreshes": 12,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -2097,10 +2954,11 @@
           "top": 62.0
         },
         "properties_expanded": true,
-        "recomputations": 42,
+        "properties_resize_active": false,
+        "recomputations": 22,
         "resolution_query_refresh_pending": false,
-        "revision": 43,
-        "settled_resize_query_refreshes": 22,
+        "revision": 23,
+        "settled_resize_query_refreshes": 13,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -2278,10 +3136,11 @@
           "top": 62.0
         },
         "properties_expanded": true,
-        "recomputations": 43,
+        "properties_resize_active": false,
+        "recomputations": 23,
         "resolution_query_refresh_pending": false,
-        "revision": 44,
-        "settled_resize_query_refreshes": 23,
+        "revision": 24,
+        "settled_resize_query_refreshes": 14,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -2302,6 +3161,370 @@
         }
       },
       "name": "maximum-expanded"
+    },
+    {
+      "layout": {
+        "accessibility_scale": 1.0,
+        "context_gutter": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 62.0
+        },
+        "display_scale": 2.0,
+        "genome_context": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 760.0,
+          "top": 62.0
+        },
+        "has_cytoband_row": false,
+        "panels": [
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 442.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 464.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 464.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 442.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 442.0,
+              "right": 464.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 168.0,
+              "right": 442.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 176.0,
+              "right": 434.0,
+              "top": 79.0
+            },
+            "panel_id": 1,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 442.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 442.0,
+              "right": 464.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 168.0,
+              "right": 442.0,
+              "top": 92.0
+            }
+          },
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 464.0,
+              "right": 738.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 464.0,
+              "right": 760.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 464.0,
+              "right": 760.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 464.0,
+              "right": 738.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 738.0,
+              "right": 760.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 464.0,
+              "right": 738.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 472.0,
+              "right": 730.0,
+              "top": 79.0
+            },
+            "panel_id": 2,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 464.0,
+              "right": 738.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 738.0,
+              "right": 760.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 464.0,
+              "right": 738.0,
+              "top": 92.0
+            }
+          }
+        ],
+        "properties": {
+          "bottom": 776.0,
+          "left": 760.0,
+          "right": 1280.0,
+          "top": 62.0
+        },
+        "properties_expanded": true,
+        "properties_resize_active": true,
+        "recomputations": 23,
+        "resolution_query_refresh_pending": false,
+        "revision": 24,
+        "settled_resize_query_refreshes": 14,
+        "track_gutter": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 133.0
+        },
+        "track_viewport": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 760.0,
+          "top": 133.0
+        },
+        "workspace": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 760.0,
+          "top": 62.0
+        }
+      },
+      "name": "resize-start"
+    },
+    {
+      "layout": {
+        "accessibility_scale": 1.0,
+        "context_gutter": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 62.0
+        },
+        "display_scale": 2.0,
+        "genome_context": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 890.0,
+          "top": 62.0
+        },
+        "has_cytoband_row": false,
+        "panels": [
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 507.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 529.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 529.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 507.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 507.0,
+              "right": 529.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 168.0,
+              "right": 507.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 176.0,
+              "right": 499.0,
+              "top": 79.0
+            },
+            "panel_id": 1,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 507.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 507.0,
+              "right": 529.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 168.0,
+              "right": 507.0,
+              "top": 92.0
+            }
+          },
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 529.0,
+              "right": 868.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 529.0,
+              "right": 890.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 529.0,
+              "right": 890.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 529.0,
+              "right": 868.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 868.0,
+              "right": 890.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 529.0,
+              "right": 868.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 537.0,
+              "right": 860.0,
+              "top": 79.0
+            },
+            "panel_id": 2,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 529.0,
+              "right": 868.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 868.0,
+              "right": 890.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 529.0,
+              "right": 868.0,
+              "top": 92.0
+            }
+          }
+        ],
+        "properties": {
+          "bottom": 776.0,
+          "left": 890.0,
+          "right": 1280.0,
+          "top": 62.0
+        },
+        "properties_expanded": true,
+        "properties_resize_active": true,
+        "recomputations": 24,
+        "resolution_query_refresh_pending": false,
+        "revision": 25,
+        "settled_resize_query_refreshes": 14,
+        "track_gutter": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 133.0
+        },
+        "track_viewport": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 890.0,
+          "top": 133.0
+        },
+        "workspace": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 890.0,
+          "top": 62.0
+        }
+      },
+      "name": "resize-midpoint"
     },
     {
       "layout": {
@@ -2459,10 +3682,11 @@
           "top": 62.0
         },
         "properties_expanded": true,
-        "recomputations": 47,
+        "properties_resize_active": false,
+        "recomputations": 25,
         "resolution_query_refresh_pending": false,
-        "revision": 48,
-        "settled_resize_query_refreshes": 23,
+        "revision": 26,
+        "settled_resize_query_refreshes": 15,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,
@@ -2640,10 +3864,11 @@
           "top": 62.0
         },
         "properties_expanded": false,
-        "recomputations": 50,
+        "properties_resize_active": false,
+        "recomputations": 30,
         "resolution_query_refresh_pending": false,
-        "revision": 51,
-        "settled_resize_query_refreshes": 26,
+        "revision": 31,
+        "settled_resize_query_refreshes": 18,
         "track_gutter": {
           "bottom": 376.0,
           "left": 0.0,
@@ -2664,6 +3889,240 @@
         }
       },
       "name": "narrow-enlarged-text"
+    },
+    {
+      "layout": {
+        "accessibility_scale": 1.0,
+        "context_gutter": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 62.0
+        },
+        "display_scale": 2.0,
+        "genome_context": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 1250.0,
+          "top": 62.0
+        },
+        "has_cytoband_row": false,
+        "panels": [
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 1228.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 1250.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 1250.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 1228.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 1228.0,
+              "right": 1250.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 168.0,
+              "right": 1228.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 176.0,
+              "right": 1220.0,
+              "top": 79.0
+            },
+            "panel_id": 1,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 1228.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 1228.0,
+              "right": 1250.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 168.0,
+              "right": 1228.0,
+              "top": 92.0
+            }
+          }
+        ],
+        "properties": {
+          "bottom": 776.0,
+          "left": 1250.0,
+          "right": 1280.0,
+          "top": 62.0
+        },
+        "properties_expanded": false,
+        "properties_resize_active": false,
+        "recomputations": 35,
+        "resolution_query_refresh_pending": false,
+        "revision": 36,
+        "settled_resize_query_refreshes": 22,
+        "track_gutter": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 133.0
+        },
+        "track_viewport": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 1250.0,
+          "top": 133.0
+        },
+        "workspace": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 1250.0,
+          "top": 62.0
+        }
+      },
+      "name": "one-panel-collapsed"
+    },
+    {
+      "layout": {
+        "accessibility_scale": 1.0,
+        "context_gutter": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 62.0
+        },
+        "display_scale": 2.0,
+        "genome_context": {
+          "bottom": 133.0,
+          "left": 0.0,
+          "right": 940.0,
+          "top": 62.0
+        },
+        "has_cytoband_row": false,
+        "panels": [
+          {
+            "canvas": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 918.0,
+              "top": 133.0
+            },
+            "column": {
+              "bottom": 776.0,
+              "left": 168.0,
+              "right": 940.0,
+              "top": 62.0
+            },
+            "cytoband_row": null,
+            "cytobands": "absent",
+            "header": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 940.0,
+              "top": 62.0
+            },
+            "header_genomic": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 918.0,
+              "top": 62.0
+            },
+            "header_scrollbar": {
+              "bottom": 133.0,
+              "left": 918.0,
+              "right": 940.0,
+              "top": 62.0
+            },
+            "metadata_row": {
+              "bottom": 79.0,
+              "left": 168.0,
+              "right": 918.0,
+              "top": 62.0
+            },
+            "overview_row": {
+              "bottom": 89.0,
+              "left": 176.0,
+              "right": 910.0,
+              "top": 79.0
+            },
+            "panel_id": 1,
+            "ruler_row": {
+              "bottom": 133.0,
+              "left": 168.0,
+              "right": 918.0,
+              "top": 109.0
+            },
+            "scrollbar": {
+              "bottom": 776.0,
+              "left": 918.0,
+              "right": 940.0,
+              "top": 133.0
+            },
+            "span_row": {
+              "bottom": 109.0,
+              "left": 168.0,
+              "right": 918.0,
+              "top": 92.0
+            }
+          }
+        ],
+        "properties": {
+          "bottom": 776.0,
+          "left": 940.0,
+          "right": 1280.0,
+          "top": 62.0
+        },
+        "properties_expanded": true,
+        "properties_resize_active": false,
+        "recomputations": 36,
+        "resolution_query_refresh_pending": false,
+        "revision": 37,
+        "settled_resize_query_refreshes": 23,
+        "track_gutter": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 168.0,
+          "top": 133.0
+        },
+        "track_viewport": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 940.0,
+          "top": 133.0
+        },
+        "workspace": {
+          "bottom": 776.0,
+          "left": 0.0,
+          "right": 940.0,
+          "top": 62.0
+        }
+      },
+      "name": "one-panel-expanded"
     },
     {
       "layout": {
@@ -2831,10 +4290,11 @@
           "top": 62.0
         },
         "properties_expanded": true,
-        "recomputations": 55,
+        "properties_resize_active": false,
+        "recomputations": 38,
         "resolution_query_refresh_pending": false,
-        "revision": 56,
-        "settled_resize_query_refreshes": 29,
+        "revision": 39,
+        "settled_resize_query_refreshes": 23,
         "track_gutter": {
           "bottom": 776.0,
           "left": 0.0,

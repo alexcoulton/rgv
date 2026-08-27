@@ -1519,6 +1519,9 @@ pub enum ToolSetting {
         #[schemars(range(min = 280.0, max = 520.0))]
         value: f32,
     },
+    PropertiesPanelResizeActive {
+        value: bool,
+    },
     ShowReference {
         value: bool,
     },
@@ -1673,6 +1676,9 @@ impl ToolSetting {
             }
             Self::PropertiesPanelWidth { value } => {
                 AutomationSetting::PropertiesPanelWidth { value }
+            }
+            Self::PropertiesPanelResizeActive { value } => {
+                AutomationSetting::PropertiesPanelResizeActive { value }
             }
             Self::ShowReference { value } => AutomationSetting::ShowReference { value },
             Self::ShowCoverage { value } => AutomationSetting::ShowCoverage { value },
@@ -2673,6 +2679,7 @@ mod tests {
         assert!(configure_schema.contains("interface_scale_percent"));
         assert!(configure_schema.contains("properties_panel_expanded"));
         assert!(configure_schema.contains("properties_panel_width"));
+        assert!(configure_schema.contains("properties_panel_resize_active"));
         assert!(configure_schema.contains("vertical_scroll_points"));
         assert!(configure_schema.contains("presentation_node_visible"));
         assert!(configure_schema.contains("presentation_group_expanded"));

@@ -156,6 +156,66 @@ fn elided_text(painter: &egui::Painter, value: &str, font: &FontId, maximum_widt
     String::new()
 }
 
+#[derive(Clone, Debug)]
+struct MetadataTextLayout {
+    name: String,
+    name_rect: Rect,
+    length: Option<String>,
+    length_rect: Option<Rect>,
+}
+
+fn layout_metadata_text(
+    painter: &egui::Painter,
+    row: Rect,
+    contig_name: &str,
+    contig_length: u64,
+    font: &FontId,
+) -> MetadataTextLayout {
+    let left = row.left() + 8.0_f32.min(row.width() * 0.5);
+    let right = row.right() - 8.0_f32.min(row.width() * 0.5);
+    let length_label = format!("{} bp", format_genomic_position(contig_length));
+    let length_size = painter
+        .layout_no_wrap(length_label.clone(), font.clone(), Color32::from_gray(90))
+        .size();
+    let complete_name_width = painter
+        .layout_no_wrap(contig_name.to_owned(), font.clone(), Color32::from_gray(55))
+        .size()
+        .x;
+    let available_width = (right - left).max(0.0);
+    // The contig identity is the primary label. Suppress the total length
+    // before forcing the name through elision merely to retain a lower-priority
+    // value.
+    let show_length = complete_name_width + length_size.x + 12.0 <= available_width;
+    let name_available = if show_length {
+        available_width - length_size.x - 12.0
+    } else {
+        available_width
+    }
+    .max(0.0);
+    let name = elided_text(painter, contig_name, font, name_available);
+    let name_size = painter
+        .layout_no_wrap(name.clone(), font.clone(), Color32::from_gray(55))
+        .size();
+    let name_rect = Rect::from_min_size(pos2(left, row.center().y - name_size.y * 0.5), name_size);
+    let (length, length_rect) = if show_length {
+        (
+            Some(length_label),
+            Some(Rect::from_min_size(
+                pos2(right - length_size.x, row.center().y - length_size.y * 0.5),
+                length_size,
+            )),
+        )
+    } else {
+        (None, None)
+    };
+    MetadataTextLayout {
+        name,
+        name_rect,
+        length,
+        length_rect,
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn paint_genome_context(
     ui: &mut Ui,
@@ -178,56 +238,41 @@ pub fn paint_genome_context(
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, Color32::from_gray(250));
     let metadata_font = FontId::proportional(11.0);
-    let metadata_left = rows.metadata.left() + 8.0;
-    let metadata_right = rows.metadata.right() - 8.0;
     let length_label = format!("{} bp", format_genomic_position(contig_length));
-    let length_width = painter
-        .layout_no_wrap(
-            length_label.clone(),
-            metadata_font.clone(),
-            Color32::from_gray(90),
-        )
-        .size()
-        .x;
-    let available_width = (metadata_right - metadata_left).max(1.0);
-    let show_length = length_width + 36.0 <= available_width;
-    let name_available = if show_length {
-        available_width - length_width - 12.0
-    } else {
-        available_width
-    }
-    .max(1.0);
-    let display_name = elided_text(&painter, contig_name, &metadata_font, name_available);
-    painter.text(
-        pos2(metadata_left, rows.metadata.center().y),
-        Align2::LEFT_CENTER,
-        display_name,
-        metadata_font.clone(),
-        Color32::from_gray(55),
+    let metadata = layout_metadata_text(
+        &painter,
+        rows.metadata,
+        contig_name,
+        contig_length,
+        &metadata_font,
     );
-    if show_length {
+    if !metadata.name.is_empty() {
         painter.text(
-            pos2(metadata_right, rows.metadata.center().y),
+            metadata.name_rect.left_center(),
+            Align2::LEFT_CENTER,
+            &metadata.name,
+            metadata_font.clone(),
+            Color32::from_gray(55),
+        );
+    }
+    if let (Some(length), Some(rect)) = (&metadata.length, metadata.length_rect) {
+        painter.text(
+            rect.right_center(),
             Align2::RIGHT_CENTER,
-            &length_label,
+            length,
             metadata_font.clone(),
             Color32::from_gray(90),
         );
     }
     let metadata_id = egui::Id::new(("genome-context-metadata", id_salt));
-    let metadata_accessibility_label =
-        format!("Contig {contig_name}; total length {length_label}");
+    let metadata_accessibility_label = format!("Contig {contig_name}; total length {length_label}");
     let metadata_response = ui.interact(
         rows.metadata,
         metadata_id,
         egui::Sense::focusable_noninteractive(),
     );
     metadata_response.widget_info(|| {
-        egui::WidgetInfo::labeled(
-            egui::WidgetType::Label,
-            true,
-            &metadata_accessibility_label,
-        )
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &metadata_accessibility_label)
     });
     ui.ctx().accesskit_node_builder(metadata_id, |node| {
         node.set_role(egui::accesskit::Role::Label);
@@ -546,6 +591,217 @@ fn stain_color(stain: CytobandStain) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_panel_contig_length_is_measured_inside_metadata_and_clear_of_the_ruler() {
+        let context = egui::Context::default();
+        let metrics = super::super::GenomeContextMetrics::default();
+        let workspace = super::super::WorkspaceLayoutSnapshot::compute(
+            super::super::WorkspaceLayoutInput::new(
+                Rect::from_min_max(pos2(0.0, 62.0), pos2(940.0, 776.0)),
+                Rect::from_min_max(pos2(940.0, 62.0), pos2(1_280.0, 776.0)),
+                true,
+                vec![
+                    super::super::WorkspacePanelLayoutInput {
+                        panel_id: rgv_core::PanelId::new(1),
+                        contig_name: "chr1".to_owned(),
+                        contig_length: 3_000_000,
+                        cytobands: super::super::CytobandAvailability::Absent,
+                    },
+                    super::super::WorkspacePanelLayoutInput {
+                        panel_id: rgv_core::PanelId::new(2),
+                        contig_name: "chr2".to_owned(),
+                        contig_length: 3_000_000,
+                        cytobands: super::super::CytobandAvailability::Absent,
+                    },
+                ],
+                metrics,
+                2.0,
+                1.0,
+            ),
+            1,
+        );
+        let rows = workspace.panels[1].context_rows;
+        let mut measured = None;
+        let _ = context.run_ui(Default::default(), |ui| {
+            measured = Some(layout_metadata_text(
+                ui.painter(),
+                rows.metadata,
+                "chr2",
+                3_000_000,
+                &FontId::proportional(11.0),
+            ));
+        });
+        let measured = measured.expect("metadata was measured");
+        let length_rect = measured
+            .length_rect
+            .expect("3,000,000 bp fits in the second panel metadata row");
+        let ruler_baseline = rows.ruler.bottom() - 3.0;
+
+        assert_eq!(measured.length.as_deref(), Some("3,000,000 bp"));
+        assert!(rows.metadata.contains_rect(measured.name_rect));
+        assert!(rows.metadata.contains_rect(length_rect));
+        assert!(!measured.name_rect.intersects(length_rect));
+        assert!(length_rect.bottom() <= rows.metadata.bottom());
+        assert!(rows.metadata.bottom() <= rows.ruler.top());
+        assert!(length_rect.bottom() < ruler_baseline);
+    }
+
+    #[test]
+    fn constrained_metadata_suppresses_length_before_eliding_the_contig_name() {
+        let context = egui::Context::default();
+        let row = Rect::from_min_size(egui::Pos2::ZERO, vec2(100.0, 16.0));
+        let mut measured = None;
+        let _ = context.run_ui(Default::default(), |ui| {
+            measured = Some(layout_metadata_text(
+                ui.painter(),
+                row,
+                "chrVeryLongAlternateContigName",
+                3_000_000,
+                &FontId::proportional(11.0),
+            ));
+        });
+        let measured = measured.expect("metadata was measured");
+
+        assert!(measured.length.is_none());
+        assert!(measured.length_rect.is_none());
+        assert!(!measured.name.is_empty());
+        assert!(row.contains_rect(measured.name_rect));
+    }
+
+    #[test]
+    fn coverage_overview_click_uses_the_reflowed_snapshot_row() {
+        let dictionary = rgv_core::ReferenceDictionary::from_contigs([
+            ("chr1".to_owned(), 10_000),
+            ("chr2".to_owned(), 10_000),
+        ]);
+        let assembly = GenomeAssembly::from_dictionary("test", dictionary);
+        let interval =
+            rgv_core::GenomicInterval::new(rgv_core::ContigId::new(1), 100, 200).unwrap();
+        let viewport = Viewport::new(interval, 800.0).unwrap();
+        let metrics = super::super::GenomeContextMetrics::default();
+        let layout = |workspace_right: f32, revision| {
+            super::super::WorkspaceLayoutSnapshot::compute(
+                super::super::WorkspaceLayoutInput::new(
+                    Rect::from_min_max(pos2(0.0, 62.0), pos2(workspace_right, 776.0)),
+                    Rect::from_min_max(pos2(workspace_right, 62.0), pos2(1_280.0, 776.0)),
+                    true,
+                    vec![
+                        super::super::WorkspacePanelLayoutInput {
+                            panel_id: rgv_core::PanelId::new(1),
+                            contig_name: "chr1".to_owned(),
+                            contig_length: 10_000,
+                            cytobands: super::super::CytobandAvailability::Absent,
+                        },
+                        super::super::WorkspacePanelLayoutInput {
+                            panel_id: rgv_core::PanelId::new(2),
+                            contig_name: "chr2".to_owned(),
+                            contig_length: 10_000,
+                            cytobands: super::super::CytobandAvailability::Absent,
+                        },
+                    ],
+                    metrics,
+                    2.0,
+                    1.0,
+                ),
+                revision,
+            )
+        };
+        let previous = layout(1_250.0, 1);
+        let current = layout(760.0, 2);
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, vec2(1_280.0, 800.0));
+        fn paint_once(
+            context: &egui::Context,
+            input: egui::RawInput,
+            assembly: &GenomeAssembly,
+            viewport: Viewport,
+            panel: &WorkspacePanelLayout,
+        ) -> OverviewInteraction {
+            let mut interaction = OverviewInteraction::default();
+            let _ = context.run_ui(input, |ui| {
+                interaction = paint_genome_context(
+                    ui,
+                    &assembly,
+                    "chr2",
+                    10_000,
+                    viewport,
+                    &GenomeOverviewData::default(),
+                    2,
+                    panel,
+                );
+            });
+            interaction
+        }
+        let _ = paint_once(
+            &context,
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            &assembly,
+            viewport,
+            &previous.panels[1],
+        );
+        let overview = current.panels[1].context_rows.overview;
+        let pointer = pos2(
+            overview.left() + overview.width() * 0.75,
+            overview.center().y,
+        );
+        let _ = paint_once(
+            &context,
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerMoved(pointer)],
+                ..Default::default()
+            },
+            &assembly,
+            viewport,
+            &current.panels[1],
+        );
+        let interaction = paint_once(
+            &context,
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            &assembly,
+            viewport,
+            &current.panels[1],
+        );
+        assert!(interaction.pointer_down);
+        let interaction = paint_once(
+            &context,
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            &assembly,
+            viewport,
+            &current.panels[1],
+        );
+
+        assert!(
+            interaction
+                .clicked_position
+                .is_some_and(|position| { (7_450..=7_550).contains(&position) })
+        );
+    }
 
     #[test]
     fn ideogram_pointer_maps_across_the_full_contig() {

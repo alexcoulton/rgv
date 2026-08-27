@@ -261,13 +261,17 @@ impl Viewer {
         self.track_engine =
             (!specifications.is_empty()).then(|| TrackEngine::spawn(specifications, 8));
         let panel_count = session.panels.len().max(1);
-        let total_genomic_width =
-            self.workspace_layout.projected_canvas_width(panel_count) * panel_count as f32;
+        let panel_canvas_width = self.workspace_layout.projected_canvas_width(panel_count);
         self.panels = PanelWorkspace::from_session(
             session,
-            total_genomic_width,
-            self.canvas_geometry.viewport.top(),
+            panel_canvas_width,
+            self.canvas_geometry().viewport.top(),
         )?;
+        // Panel identity replacement and its geometry must be one state
+        // transition. Context refresh and display rebuilding call
+        // `active_panel_rect`, so they may not observe the previous session's
+        // panel list in the committed layout.
+        self.synchronize_panel_widths();
         self.reference_dictionary = None;
         self.reference_engine = if let Some(source) = &self.reference_source {
             let engine = ReferenceEngine::spawn(8);

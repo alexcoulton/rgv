@@ -1,5 +1,26 @@
 # Corpus validation
 
+## Adaptive workspace layout
+
+Build release binaries, launch `rgv-desktop` with authenticated local control rooted at the
+repository, then run the focused geometry qualification:
+
+```sh
+cargo build --release -p rgv-desktop -p rgv-mcp
+python3 validation/adaptive_layout_mcp_qualification.py \
+  --mcp-binary target/release/rgv-mcp \
+  --control-url http://127.0.0.1:60159 \
+  --secret-file /tmp/rgv-adaptive-layout.secret \
+  --control-root "$PWD"
+```
+
+The harness opens MF-12 and a mixed-cytoband project, drives the window/Properties/text-scale
+matrix through the public MCP protocol, and mechanically compares every reported header, canvas,
+scrollbar, row, and Properties edge. It also proves shell reflow preserves track and per-panel
+camera state, captures a continuous resize at start/midpoint/end, bounds settled resize queries,
+and verifies that logical `visible_workspace` PNGs are cropped to the committed workspace. The
+reviewable PNGs and path-free report are written to `adaptive-layout-evidence/`.
+
 ## Real ONT / IGV parity
 
 The state-matched parity gate uses the existing ONT demo BAM, never a generated BAM fixture. Build

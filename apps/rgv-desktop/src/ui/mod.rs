@@ -238,6 +238,48 @@ pub struct WorkspaceLayoutSnapshot {
     pub has_cytoband_row: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WorkspaceHorizontalMetrics {
+    gutter_width: f32,
+    column_width: f32,
+    scrollbar_width: f32,
+    canvas_width: f32,
+}
+
+fn workspace_horizontal_metrics(
+    workspace_width: f32,
+    panel_count: usize,
+    requested_gutter_width: f32,
+    minimum_gutter_width: f32,
+    requested_scrollbar_width: f32,
+    minimum_scrollbar_width: f32,
+) -> WorkspaceHorizontalMetrics {
+    let panel_count = panel_count.max(1);
+    let maximum_gutter_width =
+        (workspace_width - panel_count as f32 * (minimum_scrollbar_width.max(0.0) + 1.0)).max(0.0);
+    let gutter_width = requested_gutter_width
+        .max(0.0)
+        .min(maximum_gutter_width)
+        .max(minimum_gutter_width.max(0.0).min(maximum_gutter_width));
+    let available_panel_width = (workspace_width - gutter_width).max(0.0);
+    let column_width = available_panel_width / panel_count as f32;
+    let maximum_scrollbar_width = (column_width - 1.0).max(0.0);
+    let scrollbar_width = requested_scrollbar_width
+        .max(0.0)
+        .min(maximum_scrollbar_width)
+        .max(
+            minimum_scrollbar_width
+                .max(0.0)
+                .min(maximum_scrollbar_width),
+        );
+    WorkspaceHorizontalMetrics {
+        gutter_width,
+        column_width,
+        scrollbar_width,
+        canvas_width: (column_width - scrollbar_width).max(0.0),
+    }
+}
+
 impl WorkspaceLayoutSnapshot {
     pub fn compute(input: WorkspaceLayoutInput, revision: u64) -> Self {
         assert!(
@@ -272,21 +314,18 @@ impl WorkspaceLayoutSnapshot {
             workspace.max,
         );
         let panel_count = panel_inputs.len();
-        let maximum_gutter_width = (workspace.width()
-            - panel_count as f32 * (minimum_scrollbar_width.max(0.0) + 1.0))
-            .max(0.0);
-        let gutter_width = requested_track_gutter_width
-            .max(0.0)
-            .min(maximum_gutter_width)
-            .max(
-                minimum_track_gutter_width
-                    .max(0.0)
-                    .min(maximum_gutter_width),
-            );
+        let horizontal = workspace_horizontal_metrics(
+            workspace.width(),
+            panel_count,
+            requested_track_gutter_width,
+            minimum_track_gutter_width,
+            requested_scrollbar_width,
+            minimum_scrollbar_width,
+        );
         let track_gutter = egui::Rect::from_min_max(
             track_viewport.min,
             egui::pos2(
-                track_viewport.left() + gutter_width,
+                track_viewport.left() + horizontal.gutter_width,
                 track_viewport.bottom(),
             ),
         );
@@ -294,29 +333,17 @@ impl WorkspaceLayoutSnapshot {
             genome_context.min,
             egui::pos2(track_gutter.right(), genome_context.bottom()),
         );
-        let available_panel_width = (workspace.right() - track_gutter.right()).max(0.0);
-        let column_width = available_panel_width / panel_count as f32;
         let panels = panel_inputs
             .into_iter()
             .enumerate()
             .map(|(index, panel_input)| {
-                let column_left = track_gutter.right() + index as f32 * column_width;
+                let column_left = track_gutter.right() + index as f32 * horizontal.column_width;
                 let column_right = if index + 1 == panel_count {
                     workspace.right()
                 } else {
-                    column_left + column_width
+                    column_left + horizontal.column_width
                 };
-                let available_column_width = (column_right - column_left).max(0.0);
-                let maximum_scrollbar_width = (available_column_width - 1.0).max(0.0);
-                let scrollbar_width = requested_scrollbar_width
-                    .max(0.0)
-                    .min(maximum_scrollbar_width)
-                    .max(
-                        minimum_scrollbar_width
-                            .max(0.0)
-                            .min(maximum_scrollbar_width),
-                    );
-                let canvas_right = column_right - scrollbar_width;
+                let canvas_right = column_right - horizontal.scrollbar_width;
                 let canvas = egui::Rect::from_min_max(
                     egui::pos2(column_left, track_viewport.top()),
                     egui::pos2(canvas_right, track_viewport.bottom()),
@@ -407,20 +434,29 @@ impl WorkspaceLayoutSnapshot {
     }
 
     pub fn projected_canvas_width(&self, panel_count: usize) -> f32 {
-        let panel_count = panel_count.max(1);
-        let available = (self.workspace.right() - self.track_gutter.right()).max(0.0);
-        let column_width = available / panel_count as f32;
-        let maximum_scrollbar_width = (column_width - 1.0).max(0.0);
-        let scrollbar_width = self
-            .requested_scrollbar_width
-            .max(0.0)
-            .min(maximum_scrollbar_width)
-            .max(
-                self.minimum_scrollbar_width
-                    .max(0.0)
-                    .min(maximum_scrollbar_width),
-            );
-        (column_width - scrollbar_width).max(0.0)
+        workspace_horizontal_metrics(
+            self.workspace.width(),
+            panel_count,
+            self.requested_track_gutter_width,
+            self.minimum_track_gutter_width,
+            self.requested_scrollbar_width,
+            self.minimum_scrollbar_width,
+        )
+        .canvas_width
+    }
+
+    pub fn physical_genomic_scissor(
+        &self,
+        scale_factor: f32,
+        surface_width: u32,
+        surface_height: u32,
+    ) -> PhysicalScissor {
+        physical_scissor_for_rect(
+            self.canvas_geometry().genomic,
+            scale_factor,
+            surface_width,
+            surface_height,
+        )
     }
 
     #[cfg(test)]
@@ -504,15 +540,6 @@ impl CanvasGeometry {
         ]
         .into_iter()
         .all(|difference| difference.abs() < 0.5)
-    }
-
-    pub fn physical_scissor(
-        self,
-        scale_factor: f32,
-        surface_width: u32,
-        surface_height: u32,
-    ) -> PhysicalScissor {
-        physical_scissor_for_rect(self.genomic, scale_factor, surface_width, surface_height)
     }
 }
 
@@ -660,13 +687,29 @@ mod tests {
 
     #[test]
     fn physical_scissor_is_consistent_at_standard_and_retina_scale() {
-        let geometry = CanvasGeometry::initial(1_280.0, 800.0);
-        let standard = geometry.physical_scissor(1.0, 1_280, 800);
-        let retina = geometry.physical_scissor(2.0, 2_560, 1_600);
+        let layout = WorkspaceLayoutSnapshot::compute(
+            shell_layout_input(
+                1_280.0,
+                340.0,
+                true,
+                &[CytobandAvailability::Absent, CytobandAvailability::Absent],
+                GenomeContextMetrics::default(),
+                2.0,
+                1.0,
+            ),
+            1,
+        );
+        let standard = layout.physical_genomic_scissor(1.0, 1_280, 800);
+        let retina = layout.physical_genomic_scissor(2.0, 2_560, 1_600);
         assert_eq!(retina.x, standard.x * 2);
         assert_eq!(retina.y, standard.y * 2);
         assert_eq!(retina.width, standard.width * 2);
         assert_eq!(retina.height, standard.height * 2);
+        assert_eq!(standard.x, layout.panels[0].canvas.left().round() as u32);
+        assert_eq!(
+            standard.x + standard.width,
+            layout.panels.last().unwrap().canvas.right().round() as u32
+        );
     }
 
     #[test]

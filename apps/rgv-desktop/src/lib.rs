@@ -117,10 +117,9 @@ use runtime::*;
 use sha2::{Digest as _, Sha256};
 use sources::*;
 use ui::{
-    AlignmentSubtrack, CanvasGeometry, CytobandAvailability, GenomeContextMetrics, MENU_HEIGHT,
-    NAVIGATION_HEIGHT, SEARCHABLE_COMMANDS, STATUS_HEIGHT, TrackFrame, TrackFrameKey,
-    TrackSubtrack, TrackUiAction, UiCommand, WorkspaceLayoutInput, WorkspaceLayoutSnapshot,
-    WorkspacePanelLayoutInput,
+    AlignmentSubtrack, CytobandAvailability, GenomeContextMetrics, MENU_HEIGHT, NAVIGATION_HEIGHT,
+    SEARCHABLE_COMMANDS, STATUS_HEIGHT, TrackFrame, TrackFrameKey, TrackSubtrack, TrackUiAction,
+    UiCommand, WorkspaceLayoutInput, WorkspaceLayoutSnapshot, WorkspacePanelLayoutInput,
 };
 use ui::{alignment_settings::*, gestures::*, track_settings::*};
 use winit::{
@@ -623,7 +622,6 @@ struct Viewer {
     egui_renderer: egui_wgpu::Renderer,
     panels: PanelWorkspace,
     workspace_layout: WorkspaceLayoutSnapshot,
-    canvas_geometry: CanvasGeometry,
     genomic_canvas_layer_id: Option<egui::LayerId>,
     composite_display_list: DisplayList,
     shared_primary_alignment_height: Option<f32>,
@@ -683,6 +681,8 @@ struct Viewer {
     display_dirty: bool,
     display_upload_pending_metrics: bool,
     pending_resolution_query_refresh: Option<Instant>,
+    automation_properties_resize_active: bool,
+    properties_resize_gesture_active: bool,
     workspace_layout_recomputations: u64,
     resize_query_refreshes: u64,
     dragging: bool,

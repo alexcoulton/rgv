@@ -161,6 +161,32 @@ fn active_panel_snapshot_cropping_clips_and_rebases_semantic_primitives() {
 }
 
 #[test]
+fn visible_workspace_snapshot_crops_and_rebases_to_committed_layout_bounds() {
+    let committed_workspace =
+        egui::Rect::from_min_max(egui::pos2(0.0, 62.0), egui::pos2(940.0, 776.0));
+    let display = DisplayList {
+        rectangles: vec![RectPrimitive {
+            x: 168.0,
+            y: 133.0,
+            width: 20.0,
+            height: 12.0,
+            color: Rgba::new(0.1, 0.2, 0.3, 1.0),
+            object_id: 0,
+            shape: Default::default(),
+        }],
+        texts: Vec::new(),
+    };
+
+    let cropped = cropped_display_list(&display, committed_workspace);
+
+    assert_eq!(committed_workspace.width().ceil() as u32, 940);
+    assert_eq!(committed_workspace.height().ceil() as u32, 714);
+    assert_eq!(cropped.rectangles.len(), 1);
+    assert!((cropped.rectangles[0].x - 168.0).abs() < f32::EPSILON);
+    assert!((cropped.rectangles[0].y - 71.0).abs() < f32::EPSILON);
+}
+
+#[test]
 fn automation_svg_is_deterministic_bounded_and_xml_escaped() {
     let display = DisplayList {
         rectangles: vec![RectPrimitive {

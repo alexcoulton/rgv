@@ -503,7 +503,7 @@ impl Viewer {
                         let requested = ui::resized_read_pane_height(
                             current,
                             delta,
-                            self.canvas_geometry.viewport.height(),
+                            self.canvas_geometry().viewport.height(),
                         );
                         self.resizing_read_pane = Some(requested);
                         presentation_intents
@@ -518,7 +518,7 @@ impl Viewer {
                     let height = ui::resized_read_pane_height(
                         self.track_presentation.read_pane_height,
                         delta,
-                        self.canvas_geometry.viewport.height(),
+                        self.canvas_geometry().viewport.height(),
                     );
                     presentation_intents.push(TrackIntent::ResizeReadPane { height });
                     outcome.read_geometry_changed = true;

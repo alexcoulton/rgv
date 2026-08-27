@@ -79,6 +79,44 @@ struct WorkspaceScrollbarsDraft {
     read_panels: Vec<ReadPanelScrollbarDraft>,
 }
 
+/// Rebase semantic genomic text from the display list that was committed at
+/// the start of an egui pass onto the shell geometry computed during that
+/// pass. GPU rectangles are rebuilt before submission; this affine rebase
+/// keeps egui-rendered text on that same geometry revision without replaying
+/// pointer input through a second UI pass. Text belonging to a removed panel
+/// is deliberately omitted, and a newly added panel receives text on the next
+/// display-list rebuild.
+fn remap_genomic_texts_for_layout(
+    texts: &[rgv_layout::TextPrimitive],
+    previous: &ui::WorkspaceLayoutSnapshot,
+    current: &ui::WorkspaceLayoutSnapshot,
+) -> Vec<rgv_layout::TextPrimitive> {
+    if previous == current {
+        return texts.to_vec();
+    }
+    let vertical_delta = current.track_viewport.top() - previous.track_viewport.top();
+    texts
+        .iter()
+        .filter_map(|text| {
+            let previous_panel = previous
+                .panels
+                .iter()
+                .find(|panel| text.x >= panel.canvas.left() && text.x <= panel.canvas.right())?;
+            let current_panel = current.panel(previous_panel.panel_id)?;
+            let fraction = if previous_panel.canvas.width() > f32::EPSILON {
+                ((text.x - previous_panel.canvas.left()) / previous_panel.canvas.width())
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let mut remapped = text.clone();
+            remapped.x = current_panel.canvas.left() + fraction * current_panel.canvas.width();
+            remapped.y += vertical_delta;
+            Some(remapped)
+        })
+        .collect()
+}
+
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(super) fn render_shell_frame(
@@ -478,9 +516,11 @@ impl Viewer {
         let mut recent_alignment_requested = None;
         let mut recent_session_requested = None;
         let mut recent_locus_requested = None;
-        let mut new_canvas_geometry = self.canvas_geometry;
+        let committed_canvas_geometry = self.canvas_geometry();
+        let mut new_canvas_geometry = committed_canvas_geometry;
         let previous_workspace_layout = self.workspace_layout.clone();
         let mut new_workspace_layout = previous_workspace_layout.clone();
+        let mut native_properties_resize_active = false;
         let pane_layout = self.panels.active().pane_layout.clone();
         let track_frames = pane_layout.frames().cloned().collect::<Vec<_>>();
         let selected_annotation_track_ids = self
@@ -518,7 +558,7 @@ impl Viewer {
                 let annotation_clip_bottom = panel
                     .scroll_display_cache
                     .as_ref()
-                    .map_or(self.canvas_geometry.viewport.top(), |cache| {
+                    .map_or(committed_canvas_geometry.viewport.top(), |cache| {
                         cache.annotation_clip_bottom
                     });
                 let read_panels = panel
@@ -577,7 +617,7 @@ impl Viewer {
                     annotation_clip_bottom,
                     annotation_interaction: ui::ScrollbarInteraction::default(),
                     read_stack_maximum: (panel.read_stack_content_bottom_points
-                        - self.canvas_geometry.viewport.bottom())
+                        - committed_canvas_geometry.viewport.bottom())
                     .max(0.0),
                     read_stack_offset: panel.read_stack_scroll_points,
                     read_stack_interaction: ui::ScrollbarInteraction::default(),
@@ -590,7 +630,7 @@ impl Viewer {
             .active()
             .scroll_display_cache
             .as_ref()
-            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+            .map_or(committed_canvas_geometry.viewport.top(), |cache| {
                 cache.annotation_clip_top
             });
         let annotation_clip_bottom = self
@@ -598,7 +638,7 @@ impl Viewer {
             .active()
             .scroll_display_cache
             .as_ref()
-            .map_or(self.canvas_geometry.viewport.top(), |cache| {
+            .map_or(committed_canvas_geometry.viewport.top(), |cache| {
                 cache.annotation_clip_bottom
             });
         let genomic_texts = self.composite_display_list.texts.clone();
@@ -1443,6 +1483,11 @@ impl Viewer {
                     .response
                     .rect
             };
+            native_properties_resize_active = displayed_properties_expanded
+                && ui
+                    .ctx()
+                    .read_response(egui::Id::new("properties-panel").with("__resize"))
+                    .is_some_and(|response| response.dragged());
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 let panel_inputs = panel_contexts
                     .iter()
@@ -1546,7 +1591,12 @@ impl Viewer {
                     &track_groups,
                 );
                 track_ui_actions.extend(gutter.actions);
-                ui::paint_genomic_text(ui, geometry.genomic, &genomic_texts);
+                let frame_genomic_texts = remap_genomic_texts_for_layout(
+                    &genomic_texts,
+                    &previous_workspace_layout,
+                    &workspace_layout,
+                );
+                ui::paint_genomic_text(ui, geometry.genomic, &frame_genomic_texts);
                 for ((_, panel_id, locus), panel_layout) in
                     panel_controls.iter().zip(&workspace_layout.panels)
                 {
@@ -2557,28 +2607,38 @@ impl Viewer {
         self.command_search = command_search;
         self.diagnostics_open = diagnostics_open;
         self.recovery_open = recovery_open && !dismiss_recovery && recovery_requested.is_none();
+        let properties_resize_active =
+            native_properties_resize_active || self.automation_properties_resize_active;
+        let properties_resize_ended =
+            self.properties_resize_gesture_active && !properties_resize_active;
+        self.properties_resize_gesture_active = properties_resize_active;
+        if properties_resize_active {
+            self.pending_resolution_query_refresh = None;
+        }
         if self.workspace_layout.revision != new_workspace_layout.revision {
             self.workspace_layout_recomputations =
                 self.workspace_layout_recomputations.saturating_add(1);
         }
         self.workspace_layout = new_workspace_layout;
-        if !self
-            .canvas_geometry
-            .approximately_equals(new_canvas_geometry)
-        {
-            let width_changed =
-                (self.canvas_geometry.genomic.width() - new_canvas_geometry.genomic.width()).abs()
-                    >= 0.5;
-            self.canvas_geometry = new_canvas_geometry;
+        if !committed_canvas_geometry.approximately_equals(new_canvas_geometry) {
+            let width_changed = (committed_canvas_geometry.genomic.width()
+                - new_canvas_geometry.genomic.width())
+            .abs()
+                >= 0.5;
             if width_changed {
                 self.synchronize_panel_widths();
-                self.schedule_resolution_query_refresh();
+                if !properties_resize_active {
+                    self.schedule_resolution_query_refresh();
+                }
             } else if self.synthetic {
                 self.display_dirty = true;
             } else {
                 self.rebuild_all_panel_displays();
                 self.display_dirty = true;
             }
+        }
+        if properties_resize_ended {
+            self.schedule_resolution_query_refresh();
         }
         if overview_panel_id != self.panels.active().id {
             self.activate_view_panel(overview_panel_id);
@@ -3982,5 +4042,75 @@ impl Viewer {
             self.data_status = error.to_string();
         }
         (full_output, repaint_delay)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_layout(
+        workspace_right: f32,
+        cytobands: ui::CytobandAvailability,
+        revision: u64,
+    ) -> ui::WorkspaceLayoutSnapshot {
+        let workspace =
+            egui::Rect::from_min_max(egui::pos2(0.0, 62.0), egui::pos2(workspace_right, 776.0));
+        ui::WorkspaceLayoutSnapshot::compute(
+            ui::WorkspaceLayoutInput::new(
+                workspace,
+                egui::Rect::from_min_max(
+                    egui::pos2(workspace_right, 62.0),
+                    egui::pos2(1_280.0, 776.0),
+                ),
+                true,
+                vec![ui::WorkspacePanelLayoutInput {
+                    panel_id: PanelId::new(1),
+                    contig_name: "chr1".to_owned(),
+                    contig_length: 3_000_000,
+                    cytobands,
+                }],
+                ui::GenomeContextMetrics::default(),
+                2.0,
+                1.0,
+            ),
+            revision,
+        )
+    }
+
+    #[test]
+    fn same_frame_genomic_text_rebases_to_the_new_committed_layout() {
+        let previous = text_layout(1_250.0, ui::CytobandAvailability::Absent, 1);
+        let current = text_layout(940.0, ui::CytobandAvailability::Present, 2);
+        let old_canvas = previous.panels[0].canvas;
+        let new_canvas = current.panels[0].canvas;
+        let original = rgv_layout::TextPrimitive {
+            x: old_canvas.left() + old_canvas.width() * 0.25,
+            y: previous.track_viewport.top() + 40.0,
+            text: "A".to_owned(),
+            font_size: 12.0,
+            color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+        };
+
+        let remapped = remap_genomic_texts_for_layout(&[original], &previous, &current);
+
+        assert_eq!(remapped.len(), 1);
+        assert!((remapped[0].x - (new_canvas.left() + new_canvas.width() * 0.25)).abs() < 0.01);
+        assert!((remapped[0].y - (current.track_viewport.top() + 40.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn same_frame_text_for_a_non_panel_region_is_not_left_interactive_or_visible() {
+        let previous = text_layout(1_250.0, ui::CytobandAvailability::Absent, 1);
+        let current = text_layout(940.0, ui::CytobandAvailability::Absent, 2);
+        let outside = rgv_layout::TextPrimitive {
+            x: previous.track_gutter.center().x,
+            y: previous.track_viewport.top() + 20.0,
+            text: "stale".to_owned(),
+            font_size: 12.0,
+            color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+        };
+
+        assert!(remap_genomic_texts_for_layout(&[outside], &previous, &current).is_empty());
     }
 }
