@@ -2,6 +2,7 @@ pub(crate) mod alignment_settings;
 mod diagnostics;
 mod frame;
 pub(crate) mod gestures;
+pub(crate) mod icons;
 pub(crate) mod inspectors;
 pub(crate) mod interaction;
 mod menu;

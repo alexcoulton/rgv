@@ -868,13 +868,21 @@ impl Viewer {
         self.egui_context.data_mut(|data| {
             data.insert_temp(properties_revision_id, self.next_evidence_revision);
         });
+        let command_key = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        };
         let full_output = self.egui_context.run_ui(raw_input, |ui| {
             egui::Panel::top("application-menu")
                 .exact_size(MENU_HEIGHT)
                 .show(ui, |ui| {
                     egui::MenuBar::new().ui(ui, |ui| {
                         ui.menu_button("File", |ui| {
-                            if ui.button("Open BAM/CRAM…  ⌘O").clicked() {
+                            if ui
+                                .button(format!("Open BAM/CRAM…  {command_key}+O"))
+                                .clicked()
+                            {
                                 open_alignment_requested = true;
                                 ui.close();
                             }
@@ -887,9 +895,9 @@ impl Viewer {
                                 ui.close();
                             }
                             let save_label = if current_session_path.is_some() {
-                                "Save project  ⌘S"
+                                format!("Save project  {command_key}+S")
                             } else {
-                                "Save project as…  ⌘S"
+                                format!("Save project as…  {command_key}+S")
                             };
                             if ui.button(save_label).clicked() {
                                 save_session_requested = true;
@@ -925,7 +933,10 @@ impl Viewer {
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("Export PNG…  ⌘E").clicked() {
+                            if ui
+                                .button(format!("Export PNG…  {command_key}+E"))
+                                .clicked()
+                            {
                                 export_png_requested = true;
                                 ui.close();
                             }
@@ -984,7 +995,10 @@ impl Viewer {
                             ui.checkbox(&mut diagnostics_open, "Diagnostics");
                             ui.checkbox(&mut metadata_open, "Sample metadata");
                             ui.checkbox(&mut properties_expanded, "Properties panel");
-                            if ui.button("Settings…  ⌘,").clicked() {
+                            if ui
+                                .button(format!("Settings…  {command_key}+,"))
+                                .clicked()
+                            {
                                 settings_requested = true;
                                 ui.close();
                             }
@@ -1116,7 +1130,10 @@ impl Viewer {
                             }
                         });
                         ui.menu_button("Tools", |ui| {
-                            if ui.button("Command search…  ⌘K").clicked() {
+                            if ui
+                                .button(format!("Command search…  {command_key}+K"))
+                                .clicked()
+                            {
                                 command_palette_open = true;
                                 ui.close();
                             }
@@ -1128,13 +1145,19 @@ impl Viewer {
                         ui.menu_button("Help", |ui| {
                             ui.label("Drag to pan; wheel/trackpad to zoom");
                             ui.label("Shift+wheel or Page Up/Down scrolls tracks");
-                            ui.label("Chromosome overview: drag ↔ to pan and ↕ to zoom");
-                            ui.label("Right overview: drag ↕ to scroll and ↔ for density");
+                            ui.label(
+                                "Chromosome overview: drag horizontally to pan and vertically to zoom",
+                            );
+                            ui.label(
+                                "Right overview: drag vertically to scroll and horizontally for density",
+                            );
                             ui.label("N/P selects the next/previous visible read");
                             ui.label("]/[ selects the next/previous loaded item in the selected track");
                             ui.label("Enter opens settings for the selected track");
                             ui.label("V/C toggles a focused track's visibility/collapse");
-                            ui.label("Alt+↑/↓ reorders a focused track; Shift+Delete removes it");
+                            ui.label(
+                                "Alt+Up/Down reorders a focused track; Shift+Delete removes it",
+                            );
                         });
                     });
                 });
@@ -1227,7 +1250,11 @@ impl Viewer {
                                         let move_left = ui
                                             .add_enabled(
                                                 *index > 0,
-                                                egui::Button::new("←").small(),
+                                                ui::icons::IconButton::new(
+                                                    ui::icons::AppIcon::MoveLeft,
+                                                    "Move panel left",
+                                                )
+                                                .small(),
                                             )
                                             .on_hover_text("Move panel left");
                                         move_left.widget_info(|| {
@@ -1243,7 +1270,11 @@ impl Viewer {
                                         let move_right = ui
                                             .add_enabled(
                                                 index + 1 < panel_controls.len(),
-                                                egui::Button::new("→").small(),
+                                                ui::icons::IconButton::new(
+                                                    ui::icons::AppIcon::MoveRight,
+                                                    "Move panel right",
+                                                )
+                                                .small(),
                                             )
                                             .on_hover_text("Move panel right");
                                         move_right.widget_info(|| {
@@ -1259,7 +1290,11 @@ impl Viewer {
                                         let close = ui
                                             .add_enabled(
                                                 panel_controls.len() > 1,
-                                                egui::Button::new("×").small(),
+                                                ui::icons::IconButton::new(
+                                                    ui::icons::AppIcon::Close,
+                                                    "Close panel",
+                                                )
+                                                .small(),
                                             )
                                             .on_hover_text("Close panel");
                                         close.widget_info(|| {
@@ -1285,7 +1320,10 @@ impl Viewer {
                         let previous_locus = ui
                             .add_enabled(
                                 self.panels.active().navigation_history.can_go_back(),
-                                egui::Button::new("◀"),
+                                ui::icons::IconButton::new(
+                                    ui::icons::AppIcon::Previous,
+                                    "Previous locus",
+                                ),
                             )
                             .on_hover_text("Previous locus");
                         previous_locus.widget_info(|| {
@@ -1301,7 +1339,10 @@ impl Viewer {
                         let next_locus = ui
                             .add_enabled(
                                 self.panels.active().navigation_history.can_go_forward(),
-                                egui::Button::new("▶"),
+                                ui::icons::IconButton::new(
+                                    ui::icons::AppIcon::Next,
+                                    "Next locus",
+                                ),
                             )
                             .on_hover_text("Next locus");
                         next_locus.widget_info(|| {
@@ -1314,7 +1355,12 @@ impl Viewer {
                         if next_locus.clicked() {
                             navigate_forward_requested = true;
                         }
-                        let home_locus = ui.button("⌂").on_hover_text("Home locus");
+                        let home_locus = ui
+                            .add(ui::icons::IconButton::new(
+                                ui::icons::AppIcon::Home,
+                                "Home locus",
+                            ))
+                            .on_hover_text("Home locus");
                         home_locus.widget_info(|| {
                             egui::WidgetInfo::labeled(
                                 egui::WidgetType::Button,
@@ -1325,7 +1371,12 @@ impl Viewer {
                         if home_locus.clicked() {
                             navigate_home_requested = true;
                         }
-                        let zoom_out = ui.button("−").on_hover_text("Zoom out");
+                        let zoom_out = ui
+                            .add(ui::icons::IconButton::new(
+                                ui::icons::AppIcon::ZoomOut,
+                                "Zoom out",
+                            ))
+                            .on_hover_text("Zoom out");
                         zoom_out.widget_info(|| {
                             egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Zoom out")
                         });
@@ -1352,7 +1403,12 @@ impl Viewer {
                                     as u64,
                             );
                         }
-                        let zoom_in = ui.button("+").on_hover_text("Zoom in");
+                        let zoom_in = ui
+                            .add(ui::icons::IconButton::new(
+                                ui::icons::AppIcon::ZoomIn,
+                                "Zoom in",
+                            ))
+                            .on_hover_text("Zoom in");
                         zoom_in.widget_info(|| {
                             egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Zoom in")
                         });
@@ -1436,7 +1492,10 @@ impl Viewer {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .button("›")
+                                        .add(ui::icons::IconButton::new(
+                                            ui::icons::AppIcon::ChevronRight,
+                                            "Collapse Properties panel",
+                                        ))
                                         .on_hover_text("Collapse Properties panel")
                                         .clicked()
                                     {
@@ -1499,7 +1558,10 @@ impl Viewer {
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
                             if ui
-                                .button("‹")
+                                .add(ui::icons::IconButton::new(
+                                    ui::icons::AppIcon::ChevronLeft,
+                                    "Expand Properties panel",
+                                ))
                                 .on_hover_text("Expand Properties panel")
                                 .clicked()
                             {

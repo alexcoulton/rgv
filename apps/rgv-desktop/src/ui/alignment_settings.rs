@@ -351,11 +351,14 @@ pub(crate) fn alignment_style_controls(
             ui.label(format!("{} · ", smrt_kinetics_mode_label(mode)));
             ui.colored_label(egui::Color32::from_rgb(221, 37, 29), "0–100 red intensity");
             ui.label(" · ");
-            ui.colored_label(egui::Color32::from_rgb(239, 185, 20), "100–600 red→yellow");
+            ui.colored_label(
+                egui::Color32::from_rgb(239, 185, 20),
+                "100–600 red to yellow",
+            );
             ui.label(" · ");
             ui.colored_label(
                 egui::Color32::from_rgb(26, 204, 210),
-                "600–6000 yellow→cyan",
+                "600–6000 yellow to cyan",
             );
             if ui.button("Copy legend").clicked() {
                 ui.ctx().copy_text(smrt_kinetics_legend(mode));
@@ -368,9 +371,9 @@ pub(crate) fn alignment_style_controls(
     if let AlignmentColorMode::Ultima(mut options) = *color_mode {
         ui.horizontal_wrapped(|ui| {
             ui.colored_label(rgba_to_color32(ultima_quality_color(0.0)), "Q0 low");
-            ui.label(" → ");
+            ui.label(" to ");
             ui.colored_label(rgba_to_color32(ultima_quality_color(21.0)), "Q21");
-            ui.label(" → ");
+            ui.label(" to ");
             ui.colored_label(rgba_to_color32(ultima_quality_color(42.0)), "Q42 high");
             ui.label(" · position within the indel marker also shows quality");
             if ui.button("Copy legend").clicked() {

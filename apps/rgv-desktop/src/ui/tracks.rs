@@ -8,6 +8,7 @@ use rgv_core::{PanelId, PresentationNodeId, TrackChannel, TrackId, TrackKind};
 use rgv_layout::{DisplayList, TextPrimitive};
 
 use super::CanvasGeometry;
+use super::icons::{AppIcon, paint_icon};
 use crate::{MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2091,11 +2092,10 @@ pub fn paint_track_viewport_chrome_with_sections(
                     Color32::from_rgba_unmultiplied(45, 92, 175, 24),
                 );
             }
-            label_painter.text(
-                settings_rect.center(),
-                Align2::CENTER_CENTER,
-                "⚙",
-                FontId::proportional(13.0),
+            paint_icon(
+                &label_painter,
+                settings_rect.shrink(3.0),
+                AppIcon::Settings,
                 if settings.hovered() {
                     Color32::from_rgb(45, 92, 175)
                 } else {

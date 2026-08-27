@@ -953,11 +953,11 @@ pub(crate) fn show_properties(
                                         .map_or("?", String::as_str);
                                     ui.horizontal_wrapped(|ui| {
                                         let group = variant_genotype_group_label(genotype);
-                                        ui.colored_label(
+                                        super::icons::icon_swatch(
+                                            ui,
                                             variant_genotype_color(genotype),
-                                            "●",
-                                        )
-                                        .on_hover_text(group);
+                                            group,
+                                        );
                                         if inspector.settings.genotype_grouping
                                             == VariantGenotypeGrouping::Genotype
                                             && (row == 0

@@ -160,7 +160,7 @@ pub(crate) fn interaction_inspector_fields(
         (
             "Directionality".to_owned(),
             if record.directional {
-                "source → target"
+                "source to target"
             } else {
                 "undirected"
             }
