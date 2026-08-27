@@ -16,10 +16,42 @@ python3 validation/adaptive_layout_mcp_qualification.py \
 
 The harness opens MF-12 and a mixed-cytoband project, drives the window/Properties/text-scale
 matrix through the public MCP protocol, and mechanically compares every reported header, canvas,
-scrollbar, row, and Properties edge. It also proves shell reflow preserves track and per-panel
-camera state, captures a continuous resize at start/midpoint/end, bounds settled resize queries,
-and verifies that logical `visible_workspace` PNGs are cropped to the committed workspace. The
-reviewable PNGs and path-free report are written to `adaptive-layout-evidence/`.
+scrollbar, row, and Properties edge. After every reflow it verifies retained selections, performs
+reversible viewport pan/zoom, annotation-scrollbar and read-panel-scrollbar changes, activates each
+panel, and resizes a read track. It captures a continuous resize at start/midpoint/end, bounds
+settled resize queries, and verifies that logical `visible_workspace` PNGs are cropped to the
+committed workspace. The reviewable Retina PNGs and path-free report are written to
+`adaptive-layout-evidence/`.
+
+On a Retina-only Mac, the standard-scale native run uses macOS low-resolution app mode around the
+same release binary. Stage a temporary app, change only its launch metadata, start it on a separate
+control port, and point the same harness at it:
+
+```sh
+qualification_stage="$(mktemp -d /tmp/rgv-adaptive-1x.XXXXXX)"
+python3 packaging/stage_package.py \
+  --platform macos --architecture arm64 --version 0.1.0 --build-number 1 \
+  --binary target/release/rgv-desktop --mcp-binary target/release/rgv-mcp \
+  --destination "$qualification_stage/stage"
+plutil -replace NSHighResolutionCapable -bool NO \
+  "$qualification_stage/stage/RGV.app/Contents/Info.plist"
+plutil -replace CFBundleIdentifier -string org.rgv.viewer.lowresqualification \
+  "$qualification_stage/stage/RGV.app/Contents/Info.plist"
+open -n "$qualification_stage/stage/RGV.app" --args \
+  --session "$PWD/benchmark-data/manual-suite/projects/mf-12-workspaces.rgv.json" \
+  --control-port 60160 \
+  --control-secret-file /tmp/rgv-adaptive-layout.secret \
+  --control-root "$PWD"
+python3 validation/adaptive_layout_mcp_qualification.py \
+  --mcp-binary target/release/rgv-mcp \
+  --control-url http://127.0.0.1:60160 \
+  --secret-file /tmp/rgv-adaptive-layout.secret \
+  --control-root "$PWD" \
+  --evidence-directory validation/adaptive-layout-evidence-standard-1x
+```
+
+The standard evidence report must contain `display_scale: 1.0`; captures that merely downscale a
+Retina surface do not satisfy this gate.
 
 ## Real ONT / IGV parity
 

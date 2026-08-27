@@ -1,8 +1,13 @@
 # Adaptive workspace layout architecture plan
 
-Status: planned
+Status: implemented and qualified
 
 Plan date: 2026-08-27
+
+Completion date: 2026-08-27
+
+The “Current failures” section below is retained as the pre-implementation baseline. The completed
+architecture and requirement-by-requirement evidence are recorded near the end of this document.
 
 ## Purpose
 
@@ -363,6 +368,73 @@ The work is complete only when all of the following are true:
   pass.
 - MCP qualification at 1x and 2x produces reviewed captures with no gaps, overlaps, clipping errors,
   or one-frame stale geometry.
+
+## Implementation and qualification record
+
+### Delivered architecture
+
+| Planned area | Implemented authority and evidence |
+|---|---|
+| Pure layout stage | `WorkspaceLayoutInput`, `WorkspaceLayoutSnapshot::compute`, `WorkspacePanelLayout`, `GenomeContextMetrics`, and named `GenomeContextRows` live in `apps/rgv-desktop/src/ui/mod.rs`. The pure matrix test covers the supported panel, width, Properties, cytoband, text, metadata, and scale dimensions. |
+| Outer shell ordering | `render_shell_frame` allocates the expanded or collapsed Properties panel before the central workspace is passed to the pure layout stage. Collapsed, expanded, automation-driven, and native sash-drag states follow the same path. |
+| Adaptive navigation rows | `ui/navigation.rs` measures metadata, suppresses total length before eliding the contig name, collision-filters ruler labels, clips all glyphs to the panel, and paints cytobands only for `Present` panels. No fixed `GENOME_CONTEXT_HEIGHT` remains. |
+| Optional-row policy | `CytobandAvailability::{Loading, Present, Absent}` is explicit layout input. The workspace reserves one row for `Loading` or `Present`, omits it only when all panels are `Absent`, and paints data locally. Cytoband loading is currently synchronous, so production normally commits `Present` or `Absent`; loading-to-present and loading-to-absent stability are covered directly by geometry tests. |
+| Atomic frame geometry | `ui/shell.rs` rebuilds the genomic display after egui commits a changed shell layout and before submitting that same frame. Native GPU primitives, egui chrome, scissoring, and hit geometry therefore share one revision. Retained genomic text is affine-remapped during that same pass, with removed-panel text suppressed. |
+| One geometry authority | `Viewer` stores only `workspace_layout`. `CanvasGeometry` is a one-way compatibility projection returned by `WorkspaceLayoutSnapshot::canvas_geometry`; it is not stored or independently mutated. Horizontal division is centralized in `workspace_horizontal_metrics`. |
+| Migrated consumers | Track/group chrome, annotation/read panes, each panel's scrollbar, pointer routing, panel activation, wheel/resize actions, accessibility widgets, MCP rectangles, Metal scissoring, and visible-workspace PNG/SVG exports all consume the committed snapshot or its one-way projection. |
+| Invalidation separation | Shell width changes invalidate layout/rendering immediately. Resolution-dependent queries use bucket checks and a 150 ms coalesced release path; an active Properties resize suppresses intermediate refreshes and schedules at most one final refresh. |
+| Transient state | Workspace geometry and layout revisions are absent from project/session schemas. Sessions retain user choices and panel state, then recompute geometry for the current shell when restored. |
+
+### Regression-matrix evidence
+
+| Dimension | Evidence |
+|---|---|
+| Locus panels | `workspace_layout_matrix_never_overlaps_rows_or_columns` covers 1, 2, 3, and 4 panels (the supported maximum); native MCP evidence covers one and two panels. |
+| Properties | The geometry matrix covers collapsed, minimum, default, intermediate, and maximum widths. Both native-scale MCP runs cover collapsed/default/minimum/maximum plus a held start/midpoint/end resize. |
+| Cytobands | Pure tests cover all absent, all present, mixed, loading-to-absent, and loading-to-present. Both native-scale runs include the reviewed mixed present/absent fixture. |
+| Window width | Pure geometry covers 640, 800, 1,280, and 2,560 logical points. MCP covers the 800-point narrow window and the 1,280-point default window. |
+| Display scale | Pure physical-scissor tests exercise 1× and 2× rounding. Full native MCP runs execute at `display_scale: 1.0` and `display_scale: 2.0`. |
+| Text scale | Pure geometry covers default and 150% measured metrics. Native captures cover the narrow 150% interface state at both display scales. |
+| Contig metadata | The matrix covers long and short names plus 80-base and very large contigs; focused tests cover the literal `3,000,000 bp` case and the length-before-name suppression rule. |
+| Track layout | Display/UI tests cover short and overflowing annotation stacks, clipped and resized groups, and multiple independently scrolled read panels. MF-12 supplies four read panels and an overflowing annotation stack in the native runs. |
+
+The matrix asserts exact tiling, header/canvas edge equality, scrollbar reservation, shared viewport
+top, ordered/bounded rows, 1×/2× physical validity, and pointer-to-panel agreement. Focused tests add
+real overview-pointer input after a reflow, same-frame text remapping, hidden-geometry suppression,
+selection retention across query boundaries, pane-local accessible scrollbars, and cropped/rebased
+visible-workspace exports.
+
+### Acceptance audit
+
+| Acceptance requirement | Authoritative evidence | Result |
+|---|---|---|
+| Metadata never intersects the ruler | Measured metadata tests, ruler collision filtering, and reviewed narrow/default native captures at both scales | Complete |
+| Navigation and data boundaries always match | Pure matrix assertions and every state in both MCP reports compare header, canvas, scrollbar, workspace, and Properties edges | Complete |
+| All-absent cytobands create no row or white ideogram | `has_cytoband_row` tests plus MF-12 all-absent captures | Complete |
+| Mixed cytobands stay vertically aligned without a fake bar | Mixed policy test and reviewed `mixed-cytobands.png` at 1× and 2× | Complete |
+| Properties changes have no transient drift | Same-frame rebuild/remap tests and reviewed resize start/midpoint/end native captures at both scales | Complete |
+| Scrollbars align with and control only their panels | Per-panel layout/accessibility tests and 18 reversible annotation plus 18 reversible read-panel scrollbar probes in each native report | Complete |
+| Selection, resizing, scrolling, and overview/navigation remain correct after reflow | Each MF-12 reflow verifies retained selections, activates every panel, performs reversible pan/zoom, scrolls both pane classes, and resizes the read track; pointer-level overview and resize tests also pass | Complete |
+| Layout-only changes do not cause uncontrolled queries | `shell_resize_refreshes_only_after_crossing_a_query_resolution_boundary` and exactly one final refresh for each full native held-resize run | Complete |
+| Accessibility and MCP bounds match visible rectangles | Named metadata/canvas/overview/scrollbar accessibility tests, MCP schema-v4 rectangles, and native-pixel edge comparisons in both reports | Complete |
+| Full tests, formatting, all-target checks, and render goldens pass | Verification commands below, including reviewed render pixel hashes and the multi-panel composite golden | Complete |
+| Reviewed MCP captures at 1× and 2× are clean | `validation/adaptive-layout-evidence-standard-1x/` and `validation/adaptive-layout-evidence/`, each with 11 native captures and a passing report | Complete |
+
+### Verification record
+
+- `cargo test --workspace` passed every executed workspace and documentation test; the one ignored
+  test requires the public IGV data server and is unrelated to workspace geometry.
+- `cargo fmt --all -- --check`, `cargo check --all-targets`, and `git diff --check` passed.
+- The render suite passed all reviewed pixel-hash tests, and
+  `multi_panel_composite_export_matches_reviewed_golden_hash` passed in the desktop suite.
+- `validation/adaptive_layout_mcp_qualification.py` passed against the exact release binary at both
+  native scales. Each report contains 11 structural states and 11 reversible interaction probes,
+  with exactly one final resize-triggered resolution query.
+- The standard-scale evidence uses macOS low-resolution app mode around the same release binary;
+  `display_scale` is `1.0` in the application snapshot. It is not a downscaled Retina image.
+- Repository searches find no fixed `GENOME_CONTEXT_HEIGHT`, stored `canvas_geometry` field, or old
+  independent workspace-column helpers. Remaining `CanvasGeometry::from_viewport` uses are compiled
+  only for isolated UI-control tests.
 
 ## Non-goals
 

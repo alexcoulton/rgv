@@ -637,7 +637,7 @@ mod tests {
                     } else {
                         format!("chr{}", index + 1)
                     },
-                    contig_length: if index == 0 { u64::MAX / 2 } else { 3_000_000 },
+                    contig_length: if index == 0 { u64::MAX / 2 } else { 80 },
                     cytobands: *cytobands,
                 })
                 .collect(),
@@ -1004,5 +1004,6 @@ mod tests {
             "chrVeryLongAlternateContigNameForElision"
         );
         assert_eq!(layout.panels[0].contig_length, u64::MAX / 2);
+        assert_eq!(layout.panels[1].contig_length, 80);
     }
 }

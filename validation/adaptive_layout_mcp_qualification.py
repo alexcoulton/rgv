@@ -150,8 +150,38 @@ def stable_track_state(workspace: dict[str, Any]) -> dict[str, Any]:
             }
             for panel in workspace["panels"]
         ],
-        "selection": workspace.get("selection"),
     }
+
+
+def selection_signature(selection: dict[str, Any] | None) -> dict[str, Any] | None:
+    if selection is None:
+        return None
+    return {
+        "selection_id": selection.get("selection_id"),
+        "panel_id": selection.get("panel_id"),
+        "contig": selection.get("contig"),
+        "track_id": selection.get("track_id"),
+        "kind": selection.get("kind"),
+        "granularity": selection.get("granularity"),
+        "anchor_position": selection.get("anchor_position"),
+        "evidence_start": selection.get("evidence_start"),
+        "evidence_end": selection.get("evidence_end"),
+        "position": selection.get("position"),
+        "start": selection.get("start"),
+        "end": selection.get("end"),
+        "visible_in_active_view": selection.get("visible_in_active_view"),
+        "stale": selection.get("stale"),
+    }
+
+
+def alternate_scroll(current: float, maximum: float) -> float | None:
+    if maximum <= 0.0:
+        return None
+    if current + 1.0 <= maximum:
+        return current + 1.0
+    if current >= 1.0:
+        return current - 1.0
+    return maximum
 
 
 def physical_edges(
@@ -248,9 +278,15 @@ def main() -> int:
         current: dict[str, Any],
         expected_track_state: dict[str, Any] | None,
         resize_track_id: int | None,
+        selection_positions: dict[int, tuple[int, int]],
+        expected_selections: dict[int, dict[str, Any]],
     ) -> None:
         activated: list[int] = []
+        viewport_pan_zoom_panels = 0
+        adjusted_annotation_scrollbars = 0
+        adjusted_read_stacks = 0
         adjusted_read_panels = 0
+        verified_selection_panels = 0
         for panel in current["panels"]:
             panel_id = panel["id"]
             call(
@@ -258,27 +294,134 @@ def main() -> int:
                 {"selection": {"selection": "panel", "panel_id": panel_id}},
             )
             activated.append(panel_id)
+            selected = workspace()
+            if panel_id in expected_selections and selection_signature(
+                selected.get("selection")
+            ) != expected_selections[panel_id]:
+                raise RuntimeError(f"selection did not survive the {label} reflow")
+            if panel_id in expected_selections:
+                verified_selection_panels += 1
+
+            original_start = panel["start"]
+            original_end = panel["end"]
+            midpoint = original_start + (original_end - original_start) // 2
+            call(
+                "rgv_change_viewport",
+                {
+                    "panel_id": panel_id,
+                    "operation": {"operation": "pan_fraction", "fraction": 0.02},
+                    "wait_until_settled": False,
+                },
+            )
+            call(
+                "rgv_change_viewport",
+                {
+                    "panel_id": panel_id,
+                    "operation": {
+                        "operation": "zoom",
+                        "factor": 1.05,
+                        "anchor_position": midpoint,
+                    },
+                    "wait_until_settled": False,
+                },
+            )
+            call(
+                "rgv_change_viewport",
+                {
+                    "panel_id": panel_id,
+                    "operation": {
+                        "operation": "fit_interval",
+                        "start": original_start,
+                        "end": original_end,
+                    },
+                    "wait_until_settled": True,
+                },
+            )
+            viewport_pan_zoom_panels += 1
+
+            annotation_target = alternate_scroll(
+                panel["annotation_scroll_points"],
+                panel["maximum_annotation_scroll_points"],
+            )
+            if annotation_target is not None:
+                configure(
+                    {
+                        "setting": "annotation_scroll_points",
+                        "panel_id": panel_id,
+                        "value": annotation_target,
+                    }
+                )
+                configure(
+                    {
+                        "setting": "annotation_scroll_points",
+                        "panel_id": panel_id,
+                        "value": panel["annotation_scroll_points"],
+                    }
+                )
+                adjusted_annotation_scrollbars += 1
+
+            read_stack_target = alternate_scroll(
+                panel["read_stack_scroll_points"],
+                panel["maximum_read_stack_scroll_points"],
+            )
+            if read_stack_target is not None:
+                configure(
+                    {
+                        "setting": "read_stack_scroll_points",
+                        "panel_id": panel_id,
+                        "value": read_stack_target,
+                    }
+                )
+                configure(
+                    {
+                        "setting": "read_stack_scroll_points",
+                        "panel_id": panel_id,
+                        "value": panel["read_stack_scroll_points"],
+                    }
+                )
+                adjusted_read_stacks += 1
+
             if not panel["read_panel_states"]:
-                continue
-            read_state = panel["read_panel_states"][0]
-            original_scroll = read_state["scroll_points"]
-            configure(
-                {
-                    "setting": "read_panel_scroll_points",
-                    "panel_id": panel_id,
-                    "track_id": read_state["track_id"],
-                    "value": original_scroll + 1.0,
-                }
-            )
-            configure(
-                {
-                    "setting": "read_panel_scroll_points",
-                    "panel_id": panel_id,
-                    "track_id": read_state["track_id"],
-                    "value": original_scroll,
-                }
-            )
-            adjusted_read_panels += 1
+                pass
+            else:
+                read_state = panel["read_panel_states"][0]
+                original_scroll = read_state["scroll_points"]
+                configure(
+                    {
+                        "setting": "read_panel_scroll_points",
+                        "panel_id": panel_id,
+                        "track_id": read_state["track_id"],
+                        "value": original_scroll + 1.0,
+                    }
+                )
+                configure(
+                    {
+                        "setting": "read_panel_scroll_points",
+                        "panel_id": panel_id,
+                        "track_id": read_state["track_id"],
+                        "value": original_scroll,
+                    }
+                )
+                adjusted_read_panels += 1
+
+            if panel_id in selection_positions:
+                track_id, position = selection_positions[panel_id]
+                call(
+                    "rgv_select",
+                    {
+                        "selection": {
+                            "selection": "position",
+                            "panel_id": panel_id,
+                            "track_id": track_id,
+                            "position": position,
+                            "granularity": "visible_bin",
+                        }
+                    },
+                )
+                restored_selection = selection_signature(workspace().get("selection"))
+                if restored_selection is None:
+                    raise RuntimeError(f"selection could not be restored after {label}")
+                expected_selections[panel_id] = restored_selection
         if resize_track_id is not None:
             configure(
                 {
@@ -314,7 +457,11 @@ def main() -> int:
             {
                 "state": label,
                 "activated_panel_ids": activated,
+                "viewport_pan_zoom_panels": viewport_pan_zoom_panels,
+                "adjusted_annotation_scrollbars": adjusted_annotation_scrollbars,
+                "adjusted_read_stacks": adjusted_read_stacks,
                 "adjusted_read_panels": adjusted_read_panels,
+                "verified_selection_panels": verified_selection_panels,
                 "resized_track_id": resize_track_id,
             }
         )
@@ -458,6 +605,29 @@ def main() -> int:
                 }
             )
 
+        selection_positions: dict[int, tuple[int, int]] = {}
+        expected_selections: dict[int, dict[str, Any]] = {}
+        selected_workspace = workspace()
+        for panel in selected_workspace["panels"]:
+            position = panel["start"] + (panel["end"] - panel["start"]) // 2
+            selection_positions[panel["id"]] = (alignment_ids[0], position)
+            call(
+                "rgv_select",
+                {
+                    "selection": {
+                        "selection": "position",
+                        "panel_id": panel["id"],
+                        "track_id": alignment_ids[0],
+                        "position": position,
+                        "granularity": "visible_bin",
+                    }
+                },
+            )
+            selected = selection_signature(workspace().get("selection"))
+            if selected is None:
+                raise RuntimeError("MF-12 did not expose a selectable alignment position")
+            expected_selections[panel["id"]] = selected
+
         configure({"setting": "properties_panel_width", "value": 340.0})
         configure({"setting": "properties_panel_expanded", "value": True})
         default = workspace()
@@ -473,7 +643,12 @@ def main() -> int:
         capture_logical("mf12-default-logical-1x", default)
         states.append({"name": "default-expanded", "layout": layout_snapshot(default)})
         exercise_reflow_controls(
-            "default-expanded", default, preserved_state, alignment_ids[0]
+            "default-expanded",
+            default,
+            preserved_state,
+            alignment_ids[0],
+            selection_positions,
+            expected_selections,
         )
 
         for name, expanded, width in [
@@ -496,7 +671,14 @@ def main() -> int:
                 raise RuntimeError(f"track navigation/presentation state changed after {name}")
             capture(f"mf12-{name}", current)
             states.append({"name": name, "layout": layout_snapshot(current)})
-            exercise_reflow_controls(name, current, preserved_state, alignment_ids[0])
+            exercise_reflow_controls(
+                name,
+                current,
+                preserved_state,
+                alignment_ids[0],
+                selection_positions,
+                expected_selections,
+            )
 
         configure({"setting": "properties_panel_resize_active", "value": True})
         resize_start = workspace()
@@ -512,7 +694,12 @@ def main() -> int:
         capture("mf12-resize-start", resize_start)
         states.append({"name": "resize-start", "layout": layout_snapshot(resize_start)})
         exercise_reflow_controls(
-            "resize-start", resize_start, preserved_state, alignment_ids[0]
+            "resize-start",
+            resize_start,
+            preserved_state,
+            alignment_ids[0],
+            selection_positions,
+            expected_selections,
         )
         call(
             "rgv_configure",
@@ -539,7 +726,12 @@ def main() -> int:
         )
         states.append({"name": "resize-midpoint", "layout": midpoint_layout})
         exercise_reflow_controls(
-            "resize-midpoint", resize_midpoint, preserved_state, alignment_ids[0]
+            "resize-midpoint",
+            resize_midpoint,
+            preserved_state,
+            alignment_ids[0],
+            selection_positions,
+            expected_selections,
         )
         call(
             "rgv_configure",
@@ -584,7 +776,12 @@ def main() -> int:
         capture("mf12-resize-end", after_drag_state)
         states.append({"name": "resize-end", "layout": drag_layout})
         exercise_reflow_controls(
-            "resize-end", after_drag_state, preserved_state, alignment_ids[0]
+            "resize-end",
+            after_drag_state,
+            preserved_state,
+            alignment_ids[0],
+            selection_positions,
+            expected_selections,
         )
 
         configure({"setting": "properties_panel_expanded", "value": False})
@@ -603,7 +800,12 @@ def main() -> int:
         capture("mf12-narrow-enlarged-text", narrow)
         states.append({"name": "narrow-enlarged-text", "layout": layout_snapshot(narrow)})
         exercise_reflow_controls(
-            "narrow-enlarged-text", narrow, preserved_state, alignment_ids[0]
+            "narrow-enlarged-text",
+            narrow,
+            preserved_state,
+            alignment_ids[0],
+            selection_positions,
+            expected_selections,
         )
 
         configure({"setting": "window_size", "width": 1280, "height": 800})
@@ -652,7 +854,12 @@ def main() -> int:
             capture(f"mf12-{name}", current)
             states.append({"name": name, "layout": layout_snapshot(current)})
             exercise_reflow_controls(
-                name, current, expected_one_panel_state, alignment_ids[0]
+                name,
+                current,
+                expected_one_panel_state,
+                alignment_ids[0],
+                {panel_ids[0]: selection_positions[panel_ids[0]]},
+                expected_selections,
             )
 
         call(
@@ -674,7 +881,16 @@ def main() -> int:
         capture("mixed-cytobands", mixed)
         capture_logical("mixed-cytobands-logical-1x", mixed)
         states.append({"name": "mixed-cytobands", "layout": layout_snapshot(mixed)})
-        exercise_reflow_controls("mixed-cytobands", mixed, None, None)
+        exercise_reflow_controls(
+            "mixed-cytobands", mixed, None, None, {}, {}
+        )
+
+        if not all(probe["viewport_pan_zoom_panels"] for probe in interaction_probes):
+            raise RuntimeError("a reflow state skipped viewport navigation probes")
+        if not any(probe["adjusted_annotation_scrollbars"] for probe in interaction_probes):
+            raise RuntimeError("MF-12 never exposed an adjustable annotation scrollbar")
+        if not any(probe["adjusted_read_panels"] for probe in interaction_probes):
+            raise RuntimeError("MF-12 never exposed an adjustable read-panel scrollbar")
 
         report = {
             "result": "passed",
