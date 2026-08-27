@@ -479,6 +479,8 @@ impl Viewer {
         let mut recent_session_requested = None;
         let mut recent_locus_requested = None;
         let mut new_canvas_geometry = self.canvas_geometry;
+        let previous_workspace_layout = self.workspace_layout.clone();
+        let mut new_workspace_layout = previous_workspace_layout.clone();
         let pane_layout = self.panels.active().pane_layout.clone();
         let track_frames = pane_layout.frames().cloned().collect::<Vec<_>>();
         let selected_annotation_track_ids = self
@@ -1354,80 +1356,6 @@ impl Viewer {
                         }
                     });
             }
-            egui::Panel::top("genome-context")
-                .exact_size(GENOME_CONTEXT_HEIGHT)
-                .show(ui, |ui| {
-                    if panel_contexts.len() == 1 {
-                        overview_interaction = ui::paint_genome_context(
-                            ui,
-                            &assembly,
-                            &contig_name,
-                            self.panels.active().contig_length,
-                            self.panels.active().viewport,
-                            &panel_contexts[0].4,
-                            active_panel_id.get(),
-                            true,
-                        );
-                    } else {
-                        let rect = ui.max_rect();
-                        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(250));
-                        let gutter_width = ui::TRACK_GUTTER_WIDTH
-                            .min((rect.width() * 0.35).max(72.0));
-                        let content_left = rect.left() + gutter_width;
-                        let workspace_width =
-                            (rect.right() - content_left) / panel_contexts.len() as f32;
-                        for (index, (id, name, length, viewport, genome_overview)) in
-                            panel_contexts.iter().enumerate()
-                        {
-                            let left = content_left + index as f32 * workspace_width;
-                            let workspace_right = if index + 1 == panel_contexts.len() {
-                                rect.right()
-                            } else {
-                                left + workspace_width
-                            };
-                            let right = (workspace_right - ui::SCROLLBAR_WIDTH).max(left + 1.0);
-                            let panel_rect = egui::Rect::from_min_max(
-                                egui::pos2(left, rect.top()),
-                                egui::pos2(right, rect.bottom()),
-                            );
-                            let interaction = ui
-                                .scope_builder(
-                                    egui::UiBuilder::new().max_rect(panel_rect),
-                                    |ui| {
-                                        ui::paint_genome_context(
-                                            ui,
-                                            &assembly,
-                                            name,
-                                            *length,
-                                            *viewport,
-                                            genome_overview,
-                                            id.get(),
-                                            false,
-                                        )
-                                    },
-                                )
-                                .inner;
-                            if interaction.pointer_down
-                                || interaction.clicked_position.is_some()
-                                || interaction.show_all
-                                || interaction.keyboard_pan_fraction.is_some()
-                                || interaction.keyboard_zoom_factor.is_some()
-                            {
-                                overview_interaction = interaction;
-                                overview_panel_id = *id;
-                            }
-                            if index > 0 {
-                                ui.painter().line_segment(
-                                    [
-                                        egui::pos2(left, rect.top()),
-                                        egui::pos2(left, rect.bottom()),
-                                    ],
-                                    egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
-                                );
-                            }
-                        }
-                    }
-                });
             if properties_expanded {
                 egui::Panel::right("properties-panel")
                     .default_size(340.0)
@@ -1511,8 +1439,89 @@ impl Viewer {
                     });
             }
             egui::CentralPanel::no_frame().show(ui, |ui| {
-                let geometry = CanvasGeometry::from_viewport(ui.max_rect());
+                let panel_ids = panel_contexts
+                    .iter()
+                    .map(|(id, ..)| *id)
+                    .collect::<Vec<_>>();
+                let cytobands = panel_contexts
+                    .iter()
+                    .map(|(_, _, _, viewport, _)| {
+                        if assembly
+                            .cytobands_for(viewport.interval().contig())
+                            .next()
+                            .is_some()
+                        {
+                            ui::CytobandAvailability::Present
+                        } else {
+                            ui::CytobandAvailability::Absent
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let candidate_layout = ui::WorkspaceLayoutSnapshot::compute(
+                    ui.max_rect(),
+                    &panel_ids,
+                    &cytobands,
+                    ui::GenomeContextMetrics::measured(ui),
+                    previous_workspace_layout.revision,
+                );
+                let workspace_layout = if candidate_layout == previous_workspace_layout {
+                    candidate_layout
+                } else {
+                    ui::WorkspaceLayoutSnapshot::compute(
+                        ui.max_rect(),
+                        &panel_ids,
+                        &cytobands,
+                        ui::GenomeContextMetrics::measured(ui),
+                        previous_workspace_layout.revision.saturating_add(1),
+                    )
+                };
+                let geometry = workspace_layout.canvas_geometry();
                 new_canvas_geometry = geometry;
+                ui.painter().rect_filled(
+                    workspace_layout.genome_context,
+                    0.0,
+                    egui::Color32::from_gray(250),
+                );
+                ui.painter().line_segment(
+                    [
+                        workspace_layout.context_gutter.right_top(),
+                        workspace_layout.context_gutter.right_bottom(),
+                    ],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(190)),
+                );
+                for (index, ((id, name, length, viewport, genome_overview), panel_layout)) in
+                    panel_contexts.iter().zip(&workspace_layout.panels).enumerate()
+                {
+                    let interaction = ui::paint_genome_context(
+                        ui,
+                        &assembly,
+                        name,
+                        *length,
+                        *viewport,
+                        genome_overview,
+                        id.get(),
+                        panel_layout,
+                    );
+                    if interaction.pointer_down
+                        || interaction.clicked_position.is_some()
+                        || interaction.show_all
+                        || interaction.keyboard_pan_fraction.is_some()
+                        || interaction.keyboard_zoom_factor.is_some()
+                    {
+                        overview_interaction = interaction;
+                        overview_panel_id = *id;
+                    }
+                    if index > 0 {
+                        ui.painter().line_segment(
+                            [
+                                panel_layout.header.left_top(),
+                                panel_layout.header.left_bottom(),
+                            ],
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
+                        );
+                    }
+                }
+                new_workspace_layout = workspace_layout.clone();
                 let gutter = ui::paint_track_viewport_chrome_with_groups(
                     ui,
                     geometry,
@@ -1528,31 +1537,34 @@ impl Viewer {
                 );
                 track_ui_actions.extend(gutter.actions);
                 ui::paint_genomic_text(ui, geometry.genomic, &genomic_texts);
-                let canvas_accessibility = ui.interact(
-                    geometry.genomic,
-                    egui::Id::new(("genomic-canvas-accessibility", active_panel_id)),
-                    egui::Sense::focusable_noninteractive(),
-                );
-                genomic_canvas_layer_id = Some(canvas_accessibility.layer_id);
-                let canvas_label = selection_summary.as_ref().map_or_else(
-                    || format!("Genome tracks at {status_locus}; no evidence selected"),
-                    |selection| format!("Genome tracks at {status_locus}; {selection}"),
-                );
-                canvas_accessibility.widget_info(|| {
-                    egui::WidgetInfo::labeled(
-                        egui::WidgetType::Panel,
-                        true,
-                        &canvas_label,
-                    )
-                });
+                for ((_, panel_id, locus), panel_layout) in
+                    panel_controls.iter().zip(&workspace_layout.panels)
+                {
+                    let canvas_accessibility = ui.interact(
+                        panel_layout.canvas,
+                        egui::Id::new(("genomic-canvas-accessibility", panel_id)),
+                        egui::Sense::focusable_noninteractive(),
+                    );
+                    genomic_canvas_layer_id = Some(canvas_accessibility.layer_id);
+                    let canvas_label = if *panel_id == active_panel_id {
+                        selection_summary.as_ref().map_or_else(
+                            || format!("Genome tracks at {locus}; no evidence selected"),
+                            |selection| format!("Genome tracks at {locus}; {selection}"),
+                        )
+                    } else {
+                        format!("Genome tracks at {locus}; inactive locus panel")
+                    };
+                    canvas_accessibility.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Panel,
+                            true,
+                            &canvas_label,
+                        )
+                    });
+                }
                 if panel_controls.len() > 1 {
                     for index in 1..panel_controls.len() {
-                        let x = ui::workspace_column_rect(
-                            geometry,
-                            index,
-                            panel_controls.len(),
-                        )
-                        .left();
+                        let x = workspace_layout.panels[index].track_column.left();
                         ui.painter().line_segment(
                             [
                                 egui::pos2(x, geometry.viewport.top()),
@@ -1566,24 +1578,15 @@ impl Viewer {
                         .position(|(_, id, _)| *id == active_panel_id)
                     {
                         ui.painter().rect_stroke(
-                            ui::workspace_column_rect(
-                                geometry,
-                                active_index,
-                                panel_controls.len(),
-                            ),
+                            workspace_layout.panels[active_index].track_column,
                             0.0,
                             egui::Stroke::new(1.5, egui::Color32::from_rgb(45, 92, 175)),
                             egui::StrokeKind::Inside,
                         );
                     }
                 }
-                let workspace_count = workspace_scrollbars.len().max(1);
                 for workspace in &mut workspace_scrollbars {
-                    let full = ui::workspace_scrollbar_rect(
-                        geometry,
-                        workspace.index,
-                        workspace_count,
-                    );
+                    let full = workspace_layout.panels[workspace.index].scrollbar;
                     let split_y = workspace
                         .annotation_clip_bottom
                         .clamp(full.top() + 1.0, full.bottom() - 1.0);
@@ -2544,6 +2547,11 @@ impl Viewer {
         self.command_search = command_search;
         self.diagnostics_open = diagnostics_open;
         self.recovery_open = recovery_open && !dismiss_recovery && recovery_requested.is_none();
+        if self.workspace_layout.revision != new_workspace_layout.revision {
+            self.workspace_layout_recomputations =
+                self.workspace_layout_recomputations.saturating_add(1);
+        }
+        self.workspace_layout = new_workspace_layout;
         if !self
             .canvas_geometry
             .approximately_equals(new_canvas_geometry)
@@ -2554,7 +2562,7 @@ impl Viewer {
             self.canvas_geometry = new_canvas_geometry;
             if width_changed {
                 self.synchronize_panel_widths();
-                self.request_all_panel_queries();
+                self.schedule_resolution_query_refresh();
             } else if self.synthetic {
                 self.display_dirty = true;
             } else {

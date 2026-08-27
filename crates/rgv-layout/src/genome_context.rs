@@ -120,24 +120,15 @@ pub fn layout_ideogram(
     let length = contig_length.max(1) as f64;
     let bands = assembly.cytobands_for(contig).collect::<Vec<_>>();
     let has_cytobands = !bands.is_empty();
-    let segments = if has_cytobands {
-        bands
-            .into_iter()
-            .map(|band| IdeogramSegment {
-                x: (band.interval.start() as f64 / length * f64::from(width)) as f32,
-                width: ((band.interval.len() as f64 / length) * f64::from(width)).max(1.0) as f32,
-                name: band.name.clone(),
-                stain: band.stain,
-            })
-            .collect()
-    } else {
-        vec![IdeogramSegment {
-            x: 0.0,
-            width,
-            name: String::new(),
-            stain: CytobandStain::Negative,
-        }]
-    };
+    let segments = bands
+        .into_iter()
+        .map(|band| IdeogramSegment {
+            x: (band.interval.start() as f64 / length * f64::from(width)) as f32,
+            width: ((band.interval.len() as f64 / length) * f64::from(width)).max(1.0) as f32,
+            name: band.name.clone(),
+            stain: band.stain,
+        })
+        .collect();
     let visible_start = visible.start().min(contig_length);
     let visible_end = visible.end().min(contig_length);
     IdeogramLayout {
@@ -172,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn ideogram_uses_fallback_and_tracks_visible_span() {
+    fn ideogram_omits_missing_cytobands_and_tracks_visible_span() {
         let contig = ContigId::new(0);
         let assembly = GenomeAssembly::from_dictionary(
             "test",
@@ -181,7 +172,7 @@ mod tests {
         let visible = GenomicInterval::new(contig, 250, 500).unwrap();
         let layout = layout_ideogram(&assembly, contig, 1_000, visible, 400.0);
         assert!(!layout.has_cytobands);
-        assert_eq!(layout.segments.len(), 1);
+        assert!(layout.segments.is_empty());
         assert!((layout.visible_x - 100.0).abs() < f32::EPSILON);
         assert!((layout.visible_width - 100.0).abs() < f32::EPSILON);
     }

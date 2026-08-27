@@ -1,6 +1,46 @@
 use super::super::*;
 
 impl Viewer {
+    pub(crate) fn schedule_resolution_query_refresh(&mut self) {
+        self.pending_resolution_query_refresh = Some(Instant::now() + Duration::from_millis(150));
+    }
+
+    fn dispatch_due_resolution_query_refresh(&mut self, now: Instant) {
+        if !self
+            .pending_resolution_query_refresh
+            .is_some_and(|deadline| deadline <= now)
+        {
+            return;
+        }
+        self.pending_resolution_query_refresh = None;
+        self.resize_query_refreshes = self.resize_query_refreshes.saturating_add(1);
+        let active_id = self.panels.active().id;
+        let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        for id in ids {
+            self.panels.activate(id);
+            self.retain_active_read_selection_for_query_refresh();
+            self.advance_alignment_generations(id);
+            self.request_alignment_query();
+            let reference_missing = self.reference_engine.is_some()
+                && self.panels.active().viewport.bases_per_pixel()
+                    <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
+                && self
+                    .panels
+                    .active()
+                    .reference_slice
+                    .as_ref()
+                    .is_none_or(|slice| {
+                        !slice
+                            .interval
+                            .contains_interval(self.panels.active().viewport.interval())
+                    });
+            if reference_missing {
+                self.request_reference_query();
+            }
+        }
+        self.panels.activate(active_id);
+    }
+
     pub(crate) fn request_track_query(&mut self) {
         self.panels.active_mut().pending_queries.tracks = self.track_engine.is_some();
         self.dispatch_track_query();
@@ -159,6 +199,7 @@ impl Viewer {
     }
 
     pub(crate) fn poll_background_work(&mut self) {
+        self.dispatch_due_resolution_query_refresh(Instant::now());
         self.poll_reference_events();
         self.poll_alignment_events();
         self.poll_track_events();

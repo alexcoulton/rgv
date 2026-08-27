@@ -151,7 +151,10 @@ impl Viewer {
             alignment_tracks,
             layout: (rendered > 0 || hidden > 0).then(|| {
                 format!(
-                    "workspace layout {rendered} shown · {hidden} hidden · {primitives} primitives"
+                    "workspace layout rev {} · {} recomputes · {} settled resize queries · {rendered} shown · {hidden} hidden · {primitives} primitives",
+                    self.workspace_layout.revision,
+                    self.workspace_layout_recomputations,
+                    self.resize_query_refreshes,
                 )
             }),
             data_cache: (!self.alignment_tracks.is_empty()).then(|| {

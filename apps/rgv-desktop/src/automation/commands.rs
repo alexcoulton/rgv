@@ -153,6 +153,7 @@ impl Viewer {
     fn automation_data_is_settled(&self) -> bool {
         if !self.export_tasks.is_empty()
             || self.pending_native_window_capture.is_some()
+            || self.pending_resolution_query_refresh.is_some()
             || !self.session_save_tasks.is_empty()
             || !self.session_load_tasks.is_empty()
             || !self.workspace_list_import_tasks.is_empty()
@@ -1811,6 +1812,46 @@ impl Viewer {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        let workspace_layout = Some(AutomationWorkspaceLayoutSnapshot {
+            revision: self.workspace_layout.revision,
+            recomputations: self.workspace_layout_recomputations,
+            settled_resize_query_refreshes: self.resize_query_refreshes,
+            resolution_query_refresh_pending: self.pending_resolution_query_refresh.is_some(),
+            workspace: to_rect(self.workspace_layout.workspace),
+            genome_context: to_rect(self.workspace_layout.genome_context),
+            track_viewport: to_rect(self.workspace_layout.track_viewport),
+            context_gutter: to_rect(self.workspace_layout.context_gutter),
+            track_gutter: to_rect(self.workspace_layout.track_gutter),
+            has_cytoband_row: self.workspace_layout.has_cytoband_row,
+            panels: self
+                .workspace_layout
+                .panels
+                .iter()
+                .map(|panel| AutomationWorkspacePanelLayoutSnapshot {
+                    panel_id: panel.panel_id,
+                    cytobands: match panel.cytobands {
+                        ui::CytobandAvailability::Loading => {
+                            AutomationCytobandAvailability::Loading
+                        }
+                        ui::CytobandAvailability::Present => {
+                            AutomationCytobandAvailability::Present
+                        }
+                        ui::CytobandAvailability::Absent => AutomationCytobandAvailability::Absent,
+                    },
+                    column: to_rect(panel.column),
+                    header: to_rect(panel.header),
+                    header_genomic: to_rect(panel.header_genomic),
+                    header_scrollbar: to_rect(panel.header_scrollbar),
+                    canvas: to_rect(panel.canvas),
+                    scrollbar: to_rect(panel.scrollbar),
+                    metadata_row: to_rect(panel.context_rows.metadata),
+                    cytoband_row: panel.context_rows.cytoband.map(to_rect),
+                    overview_row: to_rect(panel.context_rows.overview),
+                    span_row: to_rect(panel.context_rows.span),
+                    ruler_row: to_rect(panel.context_rows.ruler),
+                })
+                .collect(),
+        });
         let active_track_gesture = self
             .resizing_annotation_track
             .and_then(|(key, _)| match key {
@@ -1937,6 +1978,7 @@ impl Viewer {
                 .collect(),
             presentation_nodes,
             pane_layouts,
+            workspace_layout,
             active_track_gesture,
             selection: self.automation_selection_snapshot(),
             // Free-form status strings can contain local paths. Typed lifecycle
@@ -3884,6 +3926,7 @@ impl Viewer {
 
     pub(crate) fn full_active_panel_export_display(&mut self) -> (DisplayList, u32, u32, String) {
         let original_geometry = self.canvas_geometry;
+        let original_workspace_layout = self.workspace_layout.clone();
         let original_scroll = self.panels.active().vertical_scroll_points;
         let original_content_origin = self.panels.active().vertical_content_origin_points;
         let original_read_panel_scrolls = self.panels.active().read_panel_scrolls.clone();
@@ -3893,14 +3936,31 @@ impl Viewer {
         .max(1.0);
         let export_height = content_height.min(MAX_AUTOMATION_FULL_PANEL_HEIGHT as f32) as u32;
         let truncated = content_height > MAX_AUTOMATION_FULL_PANEL_HEIGHT as f32;
-        let expanded_viewport = egui::Rect::from_min_max(
-            original_geometry.viewport.min,
+        let expanded_workspace = egui::Rect::from_min_max(
+            original_workspace_layout.workspace.min,
             egui::pos2(
-                original_geometry.viewport.right(),
-                original_geometry.viewport.top() + export_height as f32,
+                original_workspace_layout.workspace.right(),
+                original_workspace_layout.genome_context.bottom() + export_height as f32,
             ),
         );
-        self.canvas_geometry = CanvasGeometry::from_viewport(expanded_viewport);
+        let panel_ids = original_workspace_layout
+            .panels
+            .iter()
+            .map(|panel| panel.panel_id)
+            .collect::<Vec<_>>();
+        let cytobands = original_workspace_layout
+            .panels
+            .iter()
+            .map(|panel| panel.cytobands)
+            .collect::<Vec<_>>();
+        self.workspace_layout = WorkspaceLayoutSnapshot::compute(
+            expanded_workspace,
+            &panel_ids,
+            &cytobands,
+            original_workspace_layout.metrics,
+            original_workspace_layout.revision,
+        );
+        self.canvas_geometry = self.workspace_layout.canvas_geometry();
         self.panels.active_mut().vertical_scroll_points = 0.0;
         self.panels.active_mut().vertical_content_origin_points = 0.0;
         for state in self.panels.active_mut().read_panel_scrolls.values_mut() {
@@ -3913,6 +3973,7 @@ impl Viewer {
         let width = bounds.width().ceil().max(1.0) as u32;
 
         self.canvas_geometry = original_geometry;
+        self.workspace_layout = original_workspace_layout;
         self.panels.active_mut().vertical_scroll_points = original_scroll;
         self.panels.active_mut().vertical_content_origin_points = original_content_origin;
         self.panels.active_mut().read_panel_scrolls = original_read_panel_scrolls;

@@ -12,7 +12,7 @@ use crate::{
     ReadBaseDisplayMode, ReviewStatus, TrackId, TrackKind, TrackSource,
 };
 
-pub const AUTOMATION_SCHEMA_VERSION: u32 = 3;
+pub const AUTOMATION_SCHEMA_VERSION: u32 = 4;
 pub const MINIMUM_AUTOMATION_SCHEMA_VERSION: u32 = 1;
 pub const MAXIMUM_AUTOMATION_COMMANDS: usize = 10_000;
 pub const MAXIMUM_AUTOMATION_STRING_BYTES: usize = 16_384;
@@ -893,6 +893,8 @@ pub struct AutomationWorkspaceSnapshot {
     #[serde(default)]
     pub pane_layouts: Vec<AutomationPaneLayoutSnapshot>,
     #[serde(default)]
+    pub workspace_layout: Option<AutomationWorkspaceLayoutSnapshot>,
+    #[serde(default)]
     pub active_track_gesture: Option<AutomationTrackGestureSnapshot>,
     #[serde(default)]
     pub selection: Option<AutomationSelectionSnapshot>,
@@ -939,6 +941,51 @@ pub struct AutomationRectSnapshot {
     pub top: f32,
     pub right: f32,
     pub bottom: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationCytobandAvailability {
+    Loading,
+    Present,
+    #[default]
+    Absent,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationWorkspacePanelLayoutSnapshot {
+    pub panel_id: PanelId,
+    pub cytobands: AutomationCytobandAvailability,
+    pub column: AutomationRectSnapshot,
+    pub header: AutomationRectSnapshot,
+    pub header_genomic: AutomationRectSnapshot,
+    pub header_scrollbar: AutomationRectSnapshot,
+    pub canvas: AutomationRectSnapshot,
+    pub scrollbar: AutomationRectSnapshot,
+    pub metadata_row: AutomationRectSnapshot,
+    #[serde(default)]
+    pub cytoband_row: Option<AutomationRectSnapshot>,
+    pub overview_row: AutomationRectSnapshot,
+    pub span_row: AutomationRectSnapshot,
+    pub ruler_row: AutomationRectSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationWorkspaceLayoutSnapshot {
+    pub revision: u64,
+    #[serde(default)]
+    pub recomputations: u64,
+    #[serde(default)]
+    pub settled_resize_query_refreshes: u64,
+    #[serde(default)]
+    pub resolution_query_refresh_pending: bool,
+    pub workspace: AutomationRectSnapshot,
+    pub genome_context: AutomationRectSnapshot,
+    pub track_viewport: AutomationRectSnapshot,
+    pub context_gutter: AutomationRectSnapshot,
+    pub track_gutter: AutomationRectSnapshot,
+    pub has_cytoband_row: bool,
+    pub panels: Vec<AutomationWorkspacePanelLayoutSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1983,6 +2030,88 @@ mod tests {
             presentation_composites: Vec::new(),
             presentation_nodes: Vec::new(),
             pane_layouts: Vec::new(),
+            workspace_layout: Some(AutomationWorkspaceLayoutSnapshot {
+                revision: 3,
+                recomputations: 2,
+                settled_resize_query_refreshes: 1,
+                resolution_query_refresh_pending: false,
+                workspace: AutomationRectSnapshot {
+                    left: 0.0,
+                    top: 62.0,
+                    right: 1_280.0,
+                    bottom: 776.0,
+                },
+                genome_context: AutomationRectSnapshot {
+                    left: 0.0,
+                    top: 62.0,
+                    right: 1_280.0,
+                    bottom: 129.0,
+                },
+                track_viewport: AutomationRectSnapshot {
+                    left: 0.0,
+                    top: 129.0,
+                    right: 1_280.0,
+                    bottom: 776.0,
+                },
+                context_gutter: AutomationRectSnapshot {
+                    left: 0.0,
+                    top: 62.0,
+                    right: 168.0,
+                    bottom: 129.0,
+                },
+                track_gutter: AutomationRectSnapshot {
+                    left: 0.0,
+                    top: 129.0,
+                    right: 168.0,
+                    bottom: 776.0,
+                },
+                has_cytoband_row: false,
+                panels: vec![AutomationWorkspacePanelLayoutSnapshot {
+                    panel_id: PanelId::new(1),
+                    cytobands: AutomationCytobandAvailability::Absent,
+                    column: AutomationRectSnapshot {
+                        left: 168.0,
+                        top: 62.0,
+                        right: 1_280.0,
+                        bottom: 776.0,
+                    },
+                    header: AutomationRectSnapshot {
+                        left: 168.0,
+                        top: 62.0,
+                        right: 1_280.0,
+                        bottom: 129.0,
+                    },
+                    header_genomic: AutomationRectSnapshot {
+                        left: 168.0,
+                        top: 62.0,
+                        right: 1_258.0,
+                        bottom: 129.0,
+                    },
+                    header_scrollbar: AutomationRectSnapshot {
+                        left: 1_258.0,
+                        top: 62.0,
+                        right: 1_280.0,
+                        bottom: 129.0,
+                    },
+                    canvas: AutomationRectSnapshot {
+                        left: 168.0,
+                        top: 129.0,
+                        right: 1_258.0,
+                        bottom: 776.0,
+                    },
+                    scrollbar: AutomationRectSnapshot {
+                        left: 1_258.0,
+                        top: 129.0,
+                        right: 1_280.0,
+                        bottom: 776.0,
+                    },
+                    metadata_row: AutomationRectSnapshot::default(),
+                    cytoband_row: None,
+                    overview_row: AutomationRectSnapshot::default(),
+                    span_row: AutomationRectSnapshot::default(),
+                    ruler_row: AutomationRectSnapshot::default(),
+                }],
+            }),
             active_track_gesture: None,
             selection: Some(selection.clone()),
             status: Vec::new(),

@@ -4,44 +4,9 @@ use rgv_layout::{
     CoordinateRulerOptions, format_genomic_position, layout_coordinate_ruler, layout_ideogram,
 };
 
-use super::TRACK_GUTTER_WIDTH;
+use super::{CytobandAvailability, WorkspacePanelLayout};
 
-pub const GENOME_CONTEXT_HEIGHT: f32 = 79.0;
 pub const GENOME_OVERVIEW_BINS: usize = 256;
-const CONTIG_LABEL_ROW_HEIGHT: f32 = 14.0;
-const GENOME_CONTEXT_BAR_HEIGHT: f32 = 10.0;
-const GENOME_CONTEXT_BAR_GAP: f32 = 3.0;
-const GENOME_CONTEXT_SPAN_LABEL_Y: f32 = 44.0;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct GenomeContextRows {
-    label: Rect,
-    ideogram: Option<Rect>,
-    overview: Rect,
-    span_label_y: f32,
-}
-
-fn genome_context_rows(content: Rect, top: f32, has_cytobands: bool) -> GenomeContextRows {
-    let label = Rect::from_min_max(
-        pos2(content.left(), top),
-        pos2(content.right(), top + CONTIG_LABEL_ROW_HEIGHT),
-    );
-    let first_bar = Rect::from_min_size(
-        pos2(content.left() + 8.0, label.bottom()),
-        vec2((content.width() - 16.0).max(1.0), GENOME_CONTEXT_BAR_HEIGHT),
-    );
-    let ideogram = has_cytobands.then_some(first_bar);
-    let overview_top = ideogram.map_or(first_bar.top(), |rect| {
-        rect.bottom() + GENOME_CONTEXT_BAR_GAP
-    });
-    let overview = Rect::from_min_size(pos2(first_bar.left(), overview_top), first_bar.size());
-    GenomeContextRows {
-        label,
-        ideogram,
-        overview,
-        span_label_y: top + GENOME_CONTEXT_SPAN_LABEL_Y,
-    }
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenomeOverviewData {
@@ -166,6 +131,31 @@ pub struct OverviewInteraction {
     pub keyboard_zoom_factor: Option<f64>,
 }
 
+fn elided_text(painter: &egui::Painter, value: &str, font: &FontId, maximum_width: f32) -> String {
+    if painter
+        .layout_no_wrap(value.to_owned(), font.clone(), Color32::WHITE)
+        .size()
+        .x
+        <= maximum_width
+    {
+        return value.to_owned();
+    }
+    let mut characters = value.chars().collect::<Vec<_>>();
+    while !characters.is_empty() {
+        characters.pop();
+        let candidate = format!("{}…", characters.iter().collect::<String>());
+        if painter
+            .layout_no_wrap(candidate.clone(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+            <= maximum_width
+        {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn paint_genome_context(
     ui: &mut Ui,
@@ -175,36 +165,61 @@ pub fn paint_genome_context(
     viewport: Viewport,
     overview_data: &GenomeOverviewData,
     id_salt: u64,
-    show_gutter: bool,
+    layout: &WorkspacePanelLayout,
 ) -> OverviewInteraction {
-    let rect = ui.max_rect();
-    let gutter_width = if show_gutter {
-        TRACK_GUTTER_WIDTH.min((rect.width() * 0.35).max(72.0))
-    } else {
-        0.0
-    };
-    let content = Rect::from_min_max(pos2(rect.left() + gutter_width, rect.top()), rect.max);
+    let rect = layout.header_genomic;
+    let rows = layout.context_rows;
     let contig = viewport.interval().contig();
     let has_cytobands = assembly.cytobands_for(contig).next().is_some();
-    let rows = genome_context_rows(content, rect.top(), has_cytobands);
-    let painter = ui.painter();
+    debug_assert_eq!(
+        has_cytobands,
+        layout.cytobands == CytobandAvailability::Present
+    );
+    let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, Color32::from_gray(250));
-    if show_gutter {
-        painter.line_segment(
-            [
-                pos2(content.left(), rect.top()),
-                pos2(content.left(), rect.bottom()),
-            ],
-            Stroke::new(1.0, Color32::from_gray(190)),
-        );
+    let metadata_font = FontId::proportional(11.0);
+    let metadata_left = rows.metadata.left() + 8.0;
+    let metadata_right = rows.metadata.right() - 8.0;
+    let length_label = format!("{} bp", format_genomic_position(contig_length));
+    let length_width = painter
+        .layout_no_wrap(
+            length_label.clone(),
+            metadata_font.clone(),
+            Color32::from_gray(90),
+        )
+        .size()
+        .x;
+    let available_width = (metadata_right - metadata_left).max(1.0);
+    let show_length = length_width + 36.0 <= available_width;
+    let name_available = if show_length {
+        available_width - length_width - 12.0
+    } else {
+        available_width
     }
+    .max(1.0);
+    let display_name = elided_text(&painter, contig_name, &metadata_font, name_available);
     painter.text(
-        pos2(rect.left() + 8.0, rows.label.center().y),
+        pos2(metadata_left, rows.metadata.center().y),
         Align2::LEFT_CENTER,
-        contig_name,
-        FontId::proportional(11.0),
+        display_name,
+        metadata_font.clone(),
         Color32::from_gray(55),
     );
+    if show_length {
+        painter.text(
+            pos2(metadata_right, rows.metadata.center().y),
+            Align2::RIGHT_CENTER,
+            &length_label,
+            metadata_font.clone(),
+            Color32::from_gray(90),
+        );
+    }
+    ui.interact(
+        rows.metadata,
+        egui::Id::new(("genome-context-metadata", id_salt)),
+        egui::Sense::hover(),
+    )
+    .on_hover_text(format!("{contig_name} · {length_label}"));
 
     let overview_rect = rows.overview;
     let ideogram = layout_ideogram(
@@ -255,7 +270,9 @@ pub fn paint_genome_context(
             }
         });
     }
-    if let Some(ideogram_rect) = rows.ideogram {
+    if layout.cytobands == CytobandAvailability::Present
+        && let Some(ideogram_rect) = rows.cytoband
+    {
         for segment in &ideogram.segments {
             let segment_rect = Rect::from_min_size(
                 pos2(ideogram_rect.left() + segment.x, ideogram_rect.top()),
@@ -278,6 +295,16 @@ pub fn paint_genome_context(
                 );
             }
         }
+    } else if layout.cytobands == CytobandAvailability::Loading
+        && let Some(cytoband_rect) = rows.cytoband
+    {
+        painter.text(
+            cytoband_rect.left_center(),
+            Align2::LEFT_CENTER,
+            "Loading cytobands…",
+            FontId::proportional(9.0),
+            Color32::from_gray(105),
+        );
     }
     painter.rect_filled(overview_rect, 1.0, Color32::from_gray(238));
     painter.rect_stroke(
@@ -286,7 +313,7 @@ pub fn paint_genome_context(
         Stroke::new(0.75, Color32::from_gray(130)),
         StrokeKind::Inside,
     );
-    paint_genome_overview_data(painter, overview_rect, overview_data);
+    paint_genome_overview_data(&painter, overview_rect, overview_data);
     let visible = Rect::from_min_size(
         pos2(
             overview_rect.left() + ideogram.visible_x,
@@ -309,23 +336,43 @@ pub fn paint_genome_context(
         );
     }
 
-    let ruler = layout_coordinate_ruler(viewport, CoordinateRulerOptions::default());
-    let ruler_left = content.left();
-    let baseline_y = rect.bottom() - 7.0;
+    let ruler_viewport = viewport
+        .resized(rows.ruler.width().max(1.0) as f64)
+        .unwrap_or(viewport);
+    let largest_tick_label = format_genomic_position(viewport.interval().end().max(contig_length));
+    let ruler_font = FontId::proportional(10.0);
+    let tick_label_width = painter
+        .layout_no_wrap(
+            largest_tick_label,
+            ruler_font.clone(),
+            Color32::from_gray(55),
+        )
+        .size()
+        .x;
+    let ruler = layout_coordinate_ruler(
+        ruler_viewport,
+        CoordinateRulerOptions {
+            minimum_major_spacing: f64::from((tick_label_width + 12.0).max(48.0)),
+            ..CoordinateRulerOptions::default()
+        },
+    );
+    let ruler_left = rows.ruler.left();
+    let baseline_y = rows.ruler.bottom() - 3.0;
     painter.line_segment(
         [
             pos2(ruler_left, baseline_y),
-            pos2(content.right(), baseline_y),
+            pos2(rows.ruler.right(), baseline_y),
         ],
         Stroke::new(1.0, Color32::from_gray(95)),
     );
     painter.text(
-        pos2(content.center().x, rows.span_label_y),
+        rows.span.center(),
         Align2::CENTER_CENTER,
         &ruler.span_label,
         FontId::proportional(11.0),
         Color32::from_gray(45),
     );
+    let mut previous_label_right = f32::NEG_INFINITY;
     for tick in ruler.ticks {
         let x = ruler_left + tick.x;
         let height = if tick.major { 8.0 } else { 4.0 };
@@ -334,22 +381,20 @@ pub fn paint_genome_context(
             Stroke::new(1.0, Color32::from_gray(100)),
         );
         if let Some(label) = tick.label {
-            painter.text(
-                pos2(x + 3.0, baseline_y - 10.0),
-                Align2::LEFT_BOTTOM,
-                label,
-                FontId::proportional(10.0),
-                Color32::from_gray(55),
+            let galley = painter.layout_no_wrap(label, ruler_font.clone(), Color32::from_gray(55));
+            let label_rect = Rect::from_min_size(
+                pos2(x + 3.0, baseline_y - 10.0 - galley.size().y),
+                galley.size(),
             );
+            if label_rect.left() >= previous_label_right + 6.0
+                && label_rect.right() <= rows.ruler.right()
+                && rows.ruler.contains_rect(label_rect)
+            {
+                painter.galley(label_rect.min, galley, Color32::from_gray(55));
+                previous_label_right = label_rect.right();
+            }
         }
     }
-    painter.text(
-        pos2(rect.left() + 8.0, rect.bottom() - 10.0),
-        Align2::LEFT_CENTER,
-        format!("{} bp", format_genomic_position(contig_length)),
-        FontId::proportional(10.0),
-        Color32::from_gray(105),
-    );
 
     let pointer_position = overview_response.interact_pointer_pos();
     let drag_delta = overview_response.drag_delta();
@@ -491,25 +536,6 @@ mod tests {
     }
 
     #[test]
-    fn genome_context_omits_missing_cytobands_and_reserves_the_contig_label_row() {
-        let content = Rect::from_min_size(egui::Pos2::ZERO, vec2(900.0, GENOME_CONTEXT_HEIGHT));
-        let without_cytobands = genome_context_rows(content, content.top(), false);
-
-        assert!(without_cytobands.ideogram.is_none());
-        assert_eq!(
-            without_cytobands.overview.top(),
-            without_cytobands.label.bottom()
-        );
-        assert!(without_cytobands.overview.bottom() < without_cytobands.span_label_y);
-
-        let with_cytobands = genome_context_rows(content, content.top(), true);
-        let ideogram = with_cytobands.ideogram.unwrap();
-        assert_eq!(ideogram.top(), with_cytobands.label.bottom());
-        assert!(ideogram.bottom() < with_cytobands.overview.top());
-        assert!(with_cytobands.overview.bottom() < with_cytobands.span_label_y);
-    }
-
-    #[test]
     fn coverage_overview_exposes_a_named_accessibility_slider() {
         let dictionary = rgv_core::ReferenceDictionary::from_contigs([("chr1".to_owned(), 10_000)]);
         let assembly = GenomeAssembly::from_dictionary("test", dictionary);
@@ -518,11 +544,20 @@ mod tests {
         let viewport = Viewport::new(interval, 800.0).unwrap();
         let context = egui::Context::default();
         context.enable_accesskit();
+        let metrics = super::super::GenomeContextMetrics::default();
+        let context_height = metrics.context_height(false);
+        let workspace = super::super::WorkspaceLayoutSnapshot::compute(
+            Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, context_height + 400.0)),
+            &[rgv_core::PanelId::new(1)],
+            &[super::super::CytobandAvailability::Absent],
+            metrics,
+            1,
+        );
         let output = context.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(900.0, GENOME_CONTEXT_HEIGHT),
+                    egui::vec2(900.0, context_height + 400.0),
                 )),
                 ..egui::RawInput::default()
             },
@@ -535,7 +570,7 @@ mod tests {
                     viewport,
                     &GenomeOverviewData::default(),
                     1,
-                    true,
+                    &workspace.panels[0],
                 );
             },
         );

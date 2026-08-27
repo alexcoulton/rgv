@@ -423,7 +423,7 @@ impl Viewer {
     /// when a zoom changes the loaded query. The read name is stable across
     /// detail levels, so query completion can atomically rebind the selection
     /// to its new record index.
-    fn retain_active_read_selection_for_query_refresh(&mut self) {
+    pub(crate) fn retain_active_read_selection_for_query_refresh(&mut self) {
         let Some(track_id) = self.panels.active().selected_alignment_track else {
             return;
         };
@@ -1022,10 +1022,10 @@ impl Viewer {
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
         );
-        (0..self.panels.len()).any(|index| {
-            ui::workspace_genomic_rect(self.canvas_geometry, index, self.panels.len())
-                .contains(point)
-        })
+        self.workspace_layout
+            .panels
+            .iter()
+            .any(|panel| panel.canvas.contains(point))
     }
 
     pub(crate) fn cursor_over_unobstructed_genomic_canvas(&self) -> bool {
@@ -1045,15 +1045,27 @@ impl Viewer {
     }
 
     pub(crate) fn panel_column_rect_at(&self, index: usize) -> egui::Rect {
-        ui::workspace_genomic_rect(self.canvas_geometry, index, self.panels.len())
+        self.workspace_layout
+            .panels
+            .get(index)
+            .expect("committed workspace layout contains every locus panel")
+            .canvas
     }
 
     pub(crate) fn panel_workspace_rect_at(&self, index: usize) -> egui::Rect {
-        ui::workspace_column_rect(self.canvas_geometry, index, self.panels.len())
+        self.workspace_layout
+            .panels
+            .get(index)
+            .expect("committed workspace layout contains every locus panel")
+            .track_column
     }
 
     pub(crate) fn panel_scrollbar_rect_at(&self, index: usize) -> egui::Rect {
-        ui::workspace_scrollbar_rect(self.canvas_geometry, index, self.panels.len())
+        self.workspace_layout
+            .panels
+            .get(index)
+            .expect("committed workspace layout contains every locus panel")
+            .scrollbar
     }
 
     pub(crate) fn panel_column_rect(&self, id: PanelId) -> Option<egui::Rect> {
@@ -1082,23 +1094,59 @@ impl Viewer {
     }
 
     pub(crate) fn synchronize_panel_widths(&mut self) {
-        let width = f64::from(self.panel_column_rect_at(0).width().max(1.0));
+        let current_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let layout_ids = self
+            .workspace_layout
+            .panels
+            .iter()
+            .map(|panel| panel.panel_id)
+            .collect::<Vec<_>>();
+        if current_ids != layout_ids {
+            let cytobands = self
+                .panels
+                .iter()
+                .map(|panel| {
+                    if self
+                        .assembly
+                        .cytobands_for(panel.viewport.interval().contig())
+                        .next()
+                        .is_some()
+                    {
+                        ui::CytobandAvailability::Present
+                    } else {
+                        ui::CytobandAvailability::Absent
+                    }
+                })
+                .collect::<Vec<_>>();
+            self.workspace_layout = ui::WorkspaceLayoutSnapshot::compute(
+                self.workspace_layout.workspace,
+                &current_ids,
+                &cytobands,
+                self.workspace_layout.metrics,
+                self.workspace_layout.revision.saturating_add(1),
+            );
+            self.workspace_layout_recomputations =
+                self.workspace_layout_recomputations.saturating_add(1);
+            self.canvas_geometry = self.workspace_layout.canvas_geometry();
+        }
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in &ids {
+            let width = self
+                .workspace_layout
+                .panel(*id)
+                .expect("committed workspace layout contains every locus panel")
+                .canvas
+                .width()
+                .max(1.0);
             if let Some(panel) = self.panels.get_mut(*id)
-                && let Ok(viewport) = panel.viewport.resized(width)
+                && let Ok(viewport) = panel.viewport.resized(f64::from(width))
             {
                 panel.viewport = viewport;
-                panel.generation_clock.advance();
-                panel.pending_queries.tracks = self.track_engine.is_some();
             }
         }
         for track in &mut self.alignment_tracks {
-            let queryable = !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
             for id in &ids {
                 let projection = track.projection_mut(*id);
-                projection.clock.advance();
-                projection.pending_query = queryable;
                 projection.alignment_rows = None;
                 projection.cached_layout = None;
             }

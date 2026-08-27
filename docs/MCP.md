@@ -153,8 +153,12 @@ filter reports additionally expose `no_op`; an empty filter expression is the ex
 for clearing an alignment filter. This makes an applied clamp or idempotent call distinguishable
 from a mutation that changed the viewer.
 
-Automation schema version 3 exposes the normalized presentation model structurally. Workspace
-snapshots include ordered, channel-qualified presentation nodes and groups; desired and effective
+Automation schema version 4 exposes the normalized presentation model and committed workspace
+geometry structurally. The `workspace_layout` field reports one revision for the shared workspace,
+adaptive genome-context rows, track viewport, gutter, and each panel's header, canvas, and scrollbar
+rectangles together with cytoband availability. These are the same logical-point bounds used for
+native rendering and interaction. Workspace snapshots also include ordered, channel-qualified
+presentation nodes and groups; desired and effective
 visibility; preferred heights; the shared immutable pane-layout rectangles; pane and stack scroll
 offsets; every read panel's maximum/offset/effective density; the canonical pane selection; source
 availability; and the target of any active resize or annotation/read scrollbar gesture. The typed

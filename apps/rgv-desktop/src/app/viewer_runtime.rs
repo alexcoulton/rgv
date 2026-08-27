@@ -59,8 +59,23 @@ impl Viewer {
         let egui_renderer =
             egui_wgpu::Renderer::new(&device, surface_config.format, RendererOptions::default());
         let logical_size = size.to_logical::<f64>(window.scale_factor());
-        let canvas_geometry =
-            CanvasGeometry::initial(logical_size.width as f32, logical_size.height as f32);
+        let initial_properties_width = 340.0_f32.min((logical_size.width as f32 - 320.0).max(30.0));
+        let workspace_bounds = egui::Rect::from_min_max(
+            egui::pos2(0.0, MENU_HEIGHT + NAVIGATION_HEIGHT),
+            egui::pos2(
+                (logical_size.width as f32 - initial_properties_width).max(1.0),
+                (logical_size.height as f32 - STATUS_HEIGHT)
+                    .max(MENU_HEIGHT + NAVIGATION_HEIGHT + 1.0),
+            ),
+        );
+        let canvas_geometry = WorkspaceLayoutSnapshot::compute(
+            workspace_bounds,
+            &[INITIAL_PANEL_ID],
+            &[CytobandAvailability::Absent],
+            GenomeContextMetrics::default(),
+            0,
+        )
+        .canvas_geometry();
         let mut settings = options.loaded_settings.clone();
         apply_accessibility_preferences(&egui_context, &settings);
         if let Some(path) = options.session.as_ref().or(options.import_igv.as_ref()) {
@@ -130,7 +145,7 @@ impl Viewer {
             initial_contig_length,
         );
         panel.content_bottom_points = canvas_geometry.viewport.top();
-        let panels = options.loaded_session.as_ref().map_or_else(
+        let mut panels = options.loaded_session.as_ref().map_or_else(
             || Ok(PanelWorkspace::new(panel)),
             |session| {
                 let panel_count = session.panels.len().max(1);
@@ -144,6 +159,38 @@ impl Viewer {
                 )
             },
         )?;
+        let initial_panel_ids = panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let initial_cytobands = panels
+            .iter()
+            .map(|panel| {
+                if assembly
+                    .cytobands_for(panel.viewport.interval().contig())
+                    .next()
+                    .is_some()
+                {
+                    CytobandAvailability::Present
+                } else {
+                    CytobandAvailability::Absent
+                }
+            })
+            .collect::<Vec<_>>();
+        let workspace_layout = WorkspaceLayoutSnapshot::compute(
+            workspace_bounds,
+            &initial_panel_ids,
+            &initial_cytobands,
+            GenomeContextMetrics::default(),
+            1,
+        );
+        let canvas_geometry = workspace_layout.canvas_geometry();
+        for (panel, layout) in panels.iter_mut().zip(&workspace_layout.panels) {
+            if let Ok(viewport) = panel
+                .viewport
+                .resized(f64::from(layout.canvas.width().max(1.0)))
+            {
+                panel.viewport = viewport;
+            }
+            panel.content_bottom_points = canvas_geometry.viewport.top();
+        }
         let active_interval = panels.active().viewport.interval();
         let locus_editor = format!(
             "{}:{}-{}",
@@ -353,6 +400,7 @@ impl Viewer {
             egui_state,
             egui_renderer,
             panels,
+            workspace_layout,
             canvas_geometry,
             genomic_canvas_layer_id: None,
             composite_display_list: DisplayList::default(),
@@ -441,6 +489,9 @@ impl Viewer {
             workspace_alignment_limit,
             display_dirty: true,
             display_upload_pending_metrics: false,
+            pending_resolution_query_refresh: None,
+            workspace_layout_recomputations: 0,
+            resize_query_refreshes: 0,
             dragging: false,
             drag_origin_interval: None,
             cursor: PhysicalPosition::new(0.0, 0.0),
@@ -499,12 +550,12 @@ impl Viewer {
         self.surface_config.width = size.width;
         self.surface_config.height = size.height;
         self.reconfigure_surface();
-        let scale = self.window.scale_factor();
-        let logical_width = f64::from(size.width) / scale;
-        let logical_height = f64::from(size.height) / scale;
-        self.canvas_geometry = CanvasGeometry::initial(logical_width as f32, logical_height as f32);
-        self.synchronize_panel_widths();
-        self.request_all_panel_queries();
+        // The next egui frame owns the final shell rectangle, including its
+        // persisted Properties width. Keep the currently displayed geometry
+        // committed until that frame can replace the UI and genomic display
+        // list together.
+        self.display_dirty = true;
+        self.window.request_redraw();
     }
 
     pub(crate) fn reconfigure_surface(&self) {

@@ -199,6 +199,9 @@ impl ApplicationHandler for Application {
                 viewer.window.request_redraw();
             }
             let mut next_wake = viewer.next_egui_repaint;
+            if let Some(deadline) = viewer.pending_resolution_query_refresh {
+                next_wake = Some(next_wake.map_or(deadline, |wake| wake.min(deadline)));
+            }
             if viewer.settings.autosave_enabled {
                 next_wake = Some(
                     next_wake.map_or(viewer.next_autosave, |wake| wake.min(viewer.next_autosave)),
