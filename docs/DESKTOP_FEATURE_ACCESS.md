@@ -2,9 +2,9 @@
 
 Status date: 23 August 2026
 
-This audit checks that the major workflows in `RGV_IGV_PARITY_ROADMAP.md` are reachable from the
+This audit checks that the major workflows in `plans/RGV_IGV_PARITY_ROADMAP.md` are reachable from the
 native desktop application. It is intentionally about product access and wiring, not broad manual
-acceptance or performance tuning. `RGV_BETA_EXECUTION_PLAN.md` defines the current execution order.
+acceptance or performance tuning. `plans/RGV_BETA_EXECUTION_PLAN.md` defines the current execution order.
 
 ## Loading and workspace construction
 

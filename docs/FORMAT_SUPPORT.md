@@ -5,7 +5,7 @@ Status date: 23 August 2026
 This matrix records implemented semantics, not merely recognized filename extensions. **Complete**
 means that decoding, bounded query behavior, layout, interaction, inspection, and project restore
 are implemented where the format requires them. Broad release qualification is still scheduled for
-Phase 9 of `RGV_IGV_PARITY_ROADMAP.md`.
+Phase 9 of `plans/RGV_IGV_PARITY_ROADMAP.md`.
 
 | Data family | Formats | Implementation | Access and important limits |
 | --- | --- | --- | --- |

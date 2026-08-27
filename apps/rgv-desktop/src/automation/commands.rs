@@ -1958,6 +1958,8 @@ impl Viewer {
             panels,
             tracks,
             read_pane_height: self.track_presentation.read_pane_height,
+            annotation_section_expanded: self.track_presentation.annotation_section_expanded,
+            read_section_expanded: self.track_presentation.read_section_expanded,
             presentation_groups: self
                 .track_presentation
                 .groups
@@ -2811,6 +2813,13 @@ impl Viewer {
                     track.config.filters.alignment_color_mode = *value;
                 }
                 self.invalidate_automation_alignment_layouts(Some(track_ids), false);
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::PresentationSectionExpanded { channel, value } => {
+                self.apply_track_intents(&[TrackIntent::SetSectionExpanded {
+                    channel: *channel,
+                    expanded: *value,
+                }])?;
                 self.rebuild_all_panel_displays();
             }
             AutomationSetting::PresentationNodeVisible { target, value } => {

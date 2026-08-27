@@ -439,14 +439,29 @@ impl Viewer {
         let mut annotation_display = DisplayList::default();
         let mut pinned_display = DisplayList::default();
         let geometry = self.canvas_geometry();
-        let mut top = geometry.viewport.top();
+        let annotation_section_expanded = self.track_presentation.annotation_section_expanded;
+        let read_section_expanded = self.track_presentation.read_section_expanded;
+        let section_header_height = ui::TRACK_SECTION_HEADER_HEIGHT;
+        let annotation_clip_top =
+            (geometry.viewport.top() + section_header_height).min(geometry.viewport.bottom());
+        let mut top = annotation_clip_top;
         let viewport_height = geometry.viewport.height().max(1.0);
         let configured_read_height = self
             .track_presentation
             .read_pane_height
             .clamp(100.0, (viewport_height - 80.0).max(100.0));
-        let scroll_clip_top = (geometry.viewport.bottom() - configured_read_height)
-            .max(geometry.viewport.top() + 80.0);
+        let default_annotation_clip_bottom =
+            (geometry.viewport.bottom() - configured_read_height).max(annotation_clip_top + 54.0);
+        let annotation_clip_bottom = match (annotation_section_expanded, read_section_expanded) {
+            (false, _) => annotation_clip_top,
+            (true, false) => {
+                (geometry.viewport.bottom() - section_header_height).max(annotation_clip_top)
+            }
+            (true, true) => default_annotation_clip_bottom,
+        }
+        .clamp(annotation_clip_top, geometry.viewport.bottom());
+        let read_clip_top =
+            (annotation_clip_bottom + section_header_height).min(geometry.viewport.bottom());
         let scroll_clip_bottom = geometry.viewport.bottom();
         let alignment_track_groups = self.alignment_track_group_chrome();
         let annotation_track_groups = alignment_track_groups
@@ -494,12 +509,14 @@ impl Viewer {
             .track_presentation
             .pane_track_state(ui::TrackPane::Reads, primary_alignment_id)
             .is_some_and(|node| node.content_visible);
-        let primary_annotation_effective = primary_source_available
+        let primary_annotation_effective = annotation_section_expanded
+            && primary_source_available
             && self
                 .track_presentation
                 .track_content_exposed(ui::TrackPane::Annotation, primary_alignment_id)
                 .unwrap_or(false);
-        let primary_read_effective = primary_source_available
+        let primary_read_effective = read_section_expanded
+            && primary_source_available
             && self
                 .track_presentation
                 .track_content_exposed(ui::TrackPane::Reads, primary_alignment_id)
@@ -523,7 +540,7 @@ impl Viewer {
             .track_presentation
             .pane_tracks
             .iter()
-            .filter(|node| node.channel == ui::TrackPane::Reads)
+            .filter(|node| read_section_expanded && node.channel == ui::TrackPane::Reads)
             .map(|node| node.track_id)
             .collect::<Vec<_>>();
         let mut read_panel_specs = Vec::new();
@@ -573,17 +590,22 @@ impl Viewer {
             })
             .collect::<BTreeMap<_, _>>();
         let read_pane_layout =
-            alignment::read_pane_layout(&read_panel_specs, scroll_clip_top, scroll_clip_bottom);
+            alignment::read_pane_layout(&read_panel_specs, read_clip_top, scroll_clip_bottom);
         let read_stack_maximum = (read_pane_layout.content_bottom - scroll_clip_bottom).max(0.0);
-        let read_stack_scroll = self
-            .panels
-            .active()
-            .read_stack_scroll_points
-            .clamp(0.0, read_stack_maximum);
+        let read_stack_scroll = if read_section_expanded {
+            self.panels
+                .active()
+                .read_stack_scroll_points
+                .clamp(0.0, read_stack_maximum)
+        } else {
+            self.panels.active().read_stack_scroll_points
+        };
         {
             let panel = self.panels.active_mut();
             panel.read_stack_scroll_points = read_stack_scroll;
-            panel.read_stack_content_bottom_points = read_pane_layout.content_bottom;
+            if read_section_expanded {
+                panel.read_stack_content_bottom_points = read_pane_layout.content_bottom;
+            }
         }
         let read_panel_bounds = read_pane_layout
             .bounds
@@ -872,7 +894,8 @@ impl Viewer {
             let frame_top = top;
             let annotation_group_collapsed =
                 collapsed_annotation_group_members.contains(&primary_alignment_id);
-            let read_group_collapsed = collapsed_read_group_members.contains(&primary_alignment_id);
+            let read_group_collapsed = !read_section_expanded
+                || collapsed_read_group_members.contains(&primary_alignment_id);
             let primary_read_bounds = alignment::read_panel_bounds_for_track(
                 &read_panel_bounds,
                 primary_alignment_id,
@@ -881,7 +904,7 @@ impl Viewer {
             )
             .unwrap_or(alignment::ReadPanelBounds {
                 key: alignment::ReadPanelKey::Track(primary_alignment_id),
-                top: scroll_clip_top,
+                top: read_clip_top,
                 bottom: scroll_clip_bottom,
             });
             let content_top = frame_top + 22.0;
@@ -1105,7 +1128,7 @@ impl Viewer {
                 None,
             );
             if primary_read_effective
-                && primary_read_bounds.bottom > scroll_clip_top
+                && primary_read_bounds.bottom > read_clip_top
                 && primary_read_bounds.top < scroll_clip_bottom
             {
                 read_panel_displays.push(ReadPanelDisplayCache {
@@ -1113,7 +1136,7 @@ impl Viewer {
                     scrollable: primary_read_display,
                     overview: ui::ScrollbarOverview::default(),
                     actual_content_bottom: actual_read_content_bottom,
-                    clip_top: primary_read_bounds.top.max(scroll_clip_top),
+                    clip_top: primary_read_bounds.top.max(read_clip_top),
                     clip_bottom: primary_read_bounds.bottom.min(scroll_clip_bottom),
                 });
             }
@@ -1425,7 +1448,8 @@ impl Viewer {
         for track in self.alignment_tracks.iter_mut().skip(1) {
             let track_id = track.config.id;
             let annotation_group_collapsed = collapsed_annotation_group_members.contains(&track_id);
-            let read_group_collapsed = collapsed_read_group_members.contains(&track_id);
+            let read_group_collapsed =
+                !read_section_expanded || collapsed_read_group_members.contains(&track_id);
             let annotation_desired = self
                 .track_presentation
                 .pane_track_state(ui::TrackPane::Annotation, track_id)
@@ -1438,10 +1462,11 @@ impl Viewer {
                 .track_presentation
                 .track_content_exposed(ui::TrackPane::Annotation, track_id)
                 .unwrap_or(false);
-            let read_effective = self
-                .track_presentation
-                .track_content_exposed(ui::TrackPane::Reads, track_id)
-                .unwrap_or(false);
+            let read_effective = read_section_expanded
+                && self
+                    .track_presentation
+                    .track_content_exposed(ui::TrackPane::Reads, track_id)
+                    .unwrap_or(false);
             if let Some((group, members, _)) =
                 annotation_group_headers_by_anchor.get(&track_id).copied()
             {
@@ -1548,7 +1573,7 @@ impl Viewer {
                         .collect(),
                 };
                 if read_effective
-                    && read_bounds.bottom > scroll_clip_top
+                    && read_bounds.bottom > read_clip_top
                     && read_bounds.top < scroll_clip_bottom
                 {
                     let natural_bottom = read_display
@@ -1562,7 +1587,7 @@ impl Viewer {
                         scrollable: read_display,
                         overview: ui::ScrollbarOverview::default(),
                         actual_content_bottom: natural_bottom,
-                        clip_top: read_bounds.top.max(scroll_clip_top),
+                        clip_top: read_bounds.top.max(read_clip_top),
                         clip_bottom: read_bounds.bottom.min(scroll_clip_bottom),
                     });
                 }
@@ -1841,7 +1866,7 @@ impl Viewer {
                                 shared_range,
                                 self.panels.annotation_scroll_points
                                     + self.canvas_geometry().viewport.top(),
-                                self.panels.annotation_scroll_points + scroll_clip_top,
+                                self.panels.annotation_scroll_points + annotation_clip_bottom,
                             );
                             if effective_copy_number_settings.show_sample_names {
                                 subtracks.extend(layout.visible_rows.iter().filter_map(|row| {
@@ -1872,7 +1897,7 @@ impl Viewer {
                                 &effective_mutation_settings,
                                 self.panels.annotation_scroll_points
                                     + self.canvas_geometry().viewport.top(),
-                                self.panels.annotation_scroll_points + scroll_clip_top,
+                                self.panels.annotation_scroll_points + annotation_clip_bottom,
                             );
                             if effective_mutation_settings.show_sample_names {
                                 subtracks.extend(layout.visible_rows.iter().filter_map(|row| {
@@ -2009,21 +2034,33 @@ impl Viewer {
                 subtracks: Vec::new(),
             }
         }));
-        let _fallback_bottom = ensure_annotation_presentation_frames(
-            &self.track_presentation,
-            &mut self.panels.active_mut().track_frames,
-            &annotation_fallback_frames,
-            top,
-        );
-        let viewport_top = self.canvas_geometry().viewport.top();
-        let shared_annotation_frame_heights = self.shared_annotation_frame_heights.clone();
-        top = reflow_annotation_presentation_with_heights(
-            &self.track_presentation,
-            &mut self.panels.active_mut().track_frames,
-            &mut annotation_display,
-            viewport_top,
-            &shared_annotation_frame_heights,
-        );
+        if annotation_section_expanded {
+            let _fallback_bottom = ensure_annotation_presentation_frames(
+                &self.track_presentation,
+                &mut self.panels.active_mut().track_frames,
+                &annotation_fallback_frames,
+                top,
+            );
+            let shared_annotation_frame_heights = self.shared_annotation_frame_heights.clone();
+            top = reflow_annotation_presentation_with_heights(
+                &self.track_presentation,
+                &mut self.panels.active_mut().track_frames,
+                &mut annotation_display,
+                annotation_clip_top,
+                &shared_annotation_frame_heights,
+            );
+        } else {
+            // Folding the section is a presentation gate, not a mutation of
+            // child rows. Remove only this render revision's annotation
+            // frames and primitives; their state and shared camera survive.
+            self.panels
+                .active_mut()
+                .track_frames
+                .retain(|frame| frame.channel != ui::TrackPane::Annotation);
+            annotation_display = DisplayList::default();
+            pinned_display = DisplayList::default();
+            top = annotation_clip_top;
+        }
         self.panels
             .active_mut()
             .track_frames
@@ -2033,8 +2070,6 @@ impl Viewer {
                     .then_with(|| left.top.total_cmp(&right.top))
                     .then_with(|| left.bottom.total_cmp(&right.bottom))
             });
-        let annotation_clip_top = viewport_top;
-        let annotation_clip_bottom = scroll_clip_top;
         let annotation_content_bottom = annotation_display
             .rectangles
             .iter()
@@ -2059,7 +2094,7 @@ impl Viewer {
                     &self.track_presentation,
                     frames,
                     ui::TrackPane::Reads,
-                    scroll_clip_top,
+                    read_clip_top,
                     scroll_clip_bottom,
                     read_pane_layout.content_bottom,
                     0.0,
@@ -2190,11 +2225,19 @@ impl Viewer {
             })
             .collect::<Vec<_>>();
         let primary_track_id = self.primary_alignment_track_id();
-        let annotation_scroll = self.panels.annotation_scroll_points.clamp(
-            0.0,
-            (annotation_content_bottom - annotation_clip_bottom).max(0.0),
-        );
-        self.panels.annotation_scroll_points = annotation_scroll;
+        let annotation_scroll = if self.track_presentation.annotation_section_expanded {
+            self.panels.annotation_scroll_points.clamp(
+                0.0,
+                (annotation_content_bottom - annotation_clip_bottom).max(0.0),
+            )
+        } else {
+            // A folded section has no current scroll extent, but its camera is
+            // latent state and must be restored when the section is reopened.
+            self.panels.annotation_scroll_points
+        };
+        if self.track_presentation.annotation_section_expanded {
+            self.panels.annotation_scroll_points = annotation_scroll;
+        }
         let panel = self.panels.active_mut();
         panel
             .pane_layout
@@ -2285,7 +2328,7 @@ impl Viewer {
             );
             cache.pinned.append_scrolled_and_clipped_vertical(
                 0.0,
-                self.canvas_geometry().viewport.top(),
+                annotation_clip_top,
                 annotation_clip_bottom,
                 &mut display,
             );
@@ -2511,8 +2554,11 @@ impl Viewer {
         // Layout can reduce the legal range after tracks are hidden, grouped,
         // or collapsed. Clamp once against all panels, then reproject every
         // cache to the exact same workspace offset.
-        let shared_annotation_scroll =
-            requested_annotation_scroll.clamp(0.0, self.panels.maximum_annotation_scroll_points());
+        let shared_annotation_scroll = if self.track_presentation.annotation_section_expanded {
+            requested_annotation_scroll.clamp(0.0, self.panels.maximum_annotation_scroll_points())
+        } else {
+            requested_annotation_scroll
+        };
         let needs_scroll_reprojection = self.panels.iter().any(|panel| {
             (panel.pane_layout.annotation.scroll_points - shared_annotation_scroll).abs()
                 > f32::EPSILON

@@ -254,13 +254,13 @@ Parity work should not erase the architectural strengths already present:
 
 RGV repository evidence:
 
-- [`README.md`](README.md)
-- [`docs/FORMAT_SUPPORT.md`](docs/FORMAT_SUPPORT.md)
-- [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)
-- [`docs/DESKTOP_FEATURE_ACCESS.md`](docs/DESKTOP_FEATURE_ACCESS.md)
-- [`RGV_IGV_PARITY_ROADMAP.md`](RGV_IGV_PARITY_ROADMAP.md)
-- [`validation/MANUAL_QUALIFICATION.md`](validation/MANUAL_QUALIFICATION.md)
-- [`benchmark-results/PHASE9_QUALIFICATION_STATUS.md`](benchmark-results/PHASE9_QUALIFICATION_STATUS.md)
+- [`README.md`](../README.md)
+- [`docs/FORMAT_SUPPORT.md`](../docs/FORMAT_SUPPORT.md)
+- [`docs/USER_GUIDE.md`](../docs/USER_GUIDE.md)
+- [`docs/DESKTOP_FEATURE_ACCESS.md`](../docs/DESKTOP_FEATURE_ACCESS.md)
+- [`plans/RGV_IGV_PARITY_ROADMAP.md`](../plans/RGV_IGV_PARITY_ROADMAP.md)
+- [`validation/MANUAL_QUALIFICATION.md`](../validation/MANUAL_QUALIFICATION.md)
+- [`benchmark-results/PHASE9_QUALIFICATION_STATUS.md`](../benchmark-results/PHASE9_QUALIFICATION_STATUS.md)
 - source definitions in `crates/rgv-core`, format readers in `crates/rgv-hts`, layouts in
   `crates/rgv-layout`, and desktop wiring/tests in `apps/rgv-desktop`
 

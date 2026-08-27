@@ -765,6 +765,123 @@ fn presentation_reducer_is_atomic_and_channel_qualified() {
 }
 
 #[test]
+fn section_folding_is_a_nondestructive_workspace_gate() {
+    let mut presentation = three_track_presentation();
+    presentation.reference_content_visible = false;
+    presentation.reference_preferred_height = Some(91.0);
+    presentation
+        .pane_tracks
+        .iter_mut()
+        .find(|node| node.channel == TrackChannel::Annotation && node.track_id == TrackId::new(1))
+        .unwrap()
+        .preferred_height = Some(137.0);
+    presentation
+        .apply_intents(&[
+            TrackIntent::SetNodeVisibility {
+                target: PresentationNodeId::Track {
+                    channel: TrackChannel::Annotation,
+                    track_id: TrackId::new(2),
+                },
+                visible: false,
+            },
+            TrackIntent::GroupNodes {
+                channel: TrackChannel::Annotation,
+                members: vec![TrackId::new(1), TrackId::new(2)],
+            },
+        ])
+        .unwrap();
+    let reference_state = (
+        presentation.reference_content_visible,
+        presentation.reference_preferred_height,
+    );
+    let pane_tracks = presentation.pane_tracks.clone();
+    let groups = presentation.groups.clone();
+    let composites = presentation.composites.clone();
+
+    let changes = presentation
+        .apply_intents(&[TrackIntent::SetSectionExpanded {
+            channel: TrackChannel::Annotation,
+            expanded: false,
+        }])
+        .unwrap();
+
+    assert!(changes.presentation_changed);
+    assert!(!changes.selection_changed);
+    assert!(!presentation.annotation_section_expanded);
+    assert!(presentation.read_section_expanded);
+    assert_eq!(
+        (
+            presentation.reference_content_visible,
+            presentation.reference_preferred_height,
+        ),
+        reference_state
+    );
+    assert_eq!(presentation.pane_tracks, pane_tracks);
+    assert_eq!(presentation.groups, groups);
+    assert_eq!(presentation.composites, composites);
+
+    presentation
+        .apply_intents(&[TrackIntent::SetSectionExpanded {
+            channel: TrackChannel::Annotation,
+            expanded: true,
+        }])
+        .unwrap();
+    assert!(presentation.annotation_section_expanded);
+    assert_eq!(presentation.pane_tracks, pane_tracks);
+    assert_eq!(presentation.groups, groups);
+}
+
+#[test]
+fn pane_bulk_controls_are_channel_scoped_and_reset_only_row_heights() {
+    let mut presentation = three_track_presentation();
+    presentation.reference_preferred_height = Some(88.0);
+    for node in &mut presentation.pane_tracks {
+        node.preferred_height = Some(if node.channel == TrackChannel::Annotation {
+            120.0
+        } else {
+            240.0
+        });
+    }
+    let reads_before = presentation
+        .pane_tracks
+        .iter()
+        .filter(|node| node.channel == TrackChannel::Reads)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    presentation
+        .apply_intents(&[
+            TrackIntent::SetPaneRowsExpanded {
+                channel: TrackChannel::Annotation,
+                expanded: false,
+            },
+            TrackIntent::ResetPaneRowHeights {
+                channel: TrackChannel::Annotation,
+            },
+        ])
+        .unwrap();
+
+    assert!(!presentation.reference_content_visible);
+    assert_eq!(presentation.reference_preferred_height, None);
+    assert!(
+        presentation
+            .pane_tracks
+            .iter()
+            .filter(|node| node.channel == TrackChannel::Annotation)
+            .all(|node| !node.content_visible && node.preferred_height.is_none())
+    );
+    assert_eq!(
+        presentation
+            .pane_tracks
+            .iter()
+            .filter(|node| node.channel == TrackChannel::Reads)
+            .cloned()
+            .collect::<Vec<_>>(),
+        reads_before
+    );
+}
+
+#[test]
 fn presentation_reducer_moves_groups_atomically_and_rejects_member_escape() {
     let mut presentation = three_track_presentation();
     presentation

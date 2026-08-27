@@ -4,9 +4,20 @@ use rgv_layout::{
     CoordinateRulerOptions, format_genomic_position, layout_coordinate_ruler, layout_ideogram,
 };
 
-use super::{CytobandAvailability, WorkspacePanelLayout};
+use super::{
+    CytobandAvailability, RULER_BASELINE_BOTTOM_INSET, RULER_LABEL_BASELINE_GAP,
+    WorkspacePanelLayout,
+};
 
 pub const GENOME_OVERVIEW_BINS: usize = 256;
+
+fn ruler_tick_label_rect(ruler: Rect, x: f32, size: egui::Vec2) -> Rect {
+    let baseline_y = ruler.bottom() - RULER_BASELINE_BOTTOM_INSET;
+    Rect::from_min_size(
+        pos2(x + 3.0, baseline_y - RULER_LABEL_BASELINE_GAP - size.y),
+        size,
+    )
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenomeOverviewData {
@@ -422,7 +433,7 @@ pub fn paint_genome_context(
         },
     );
     let ruler_left = rows.ruler.left();
-    let baseline_y = rows.ruler.bottom() - 3.0;
+    let baseline_y = rows.ruler.bottom() - RULER_BASELINE_BOTTOM_INSET;
     painter.line_segment(
         [
             pos2(ruler_left, baseline_y),
@@ -447,10 +458,7 @@ pub fn paint_genome_context(
         );
         if let Some(label) = tick.label {
             let galley = painter.layout_no_wrap(label, ruler_font.clone(), Color32::from_gray(55));
-            let label_rect = Rect::from_min_size(
-                pos2(x + 3.0, baseline_y - 10.0 - galley.size().y),
-                galley.size(),
-            );
+            let label_rect = ruler_tick_label_rect(rows.ruler, x, galley.size());
             if label_rect.left() >= previous_label_right + 6.0
                 && label_rect.right() <= rows.ruler.right()
                 && rows.ruler.contains_rect(label_rect)
@@ -636,7 +644,7 @@ mod tests {
         let length_rect = measured
             .length_rect
             .expect("3,000,000 bp fits in the second panel metadata row");
-        let ruler_baseline = rows.ruler.bottom() - 3.0;
+        let ruler_baseline = rows.ruler.bottom() - RULER_BASELINE_BOTTOM_INSET;
 
         assert_eq!(measured.length.as_deref(), Some("3,000,000 bp"));
         assert!(rows.metadata.contains_rect(measured.name_rect));
@@ -645,6 +653,28 @@ mod tests {
         assert!(length_rect.bottom() <= rows.metadata.bottom());
         assert!(rows.metadata.bottom() <= rows.ruler.top());
         assert!(length_rect.bottom() < ruler_baseline);
+    }
+
+    #[test]
+    fn measured_ruler_row_contains_its_tick_labels() {
+        let context = egui::Context::default();
+        let mut geometry = None;
+        let _ = context.run_ui(Default::default(), |ui| {
+            let metrics = super::super::GenomeContextMetrics::measured(ui);
+            let panel =
+                Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, metrics.context_height(false)));
+            let ruler = metrics.rows(panel, false).ruler;
+            let galley = ui.painter().layout_no_wrap(
+                "1,000,000".to_owned(),
+                FontId::proportional(10.0),
+                Color32::from_gray(55),
+            );
+            let label = ruler_tick_label_rect(ruler, ruler.left() + 100.0, galley.size());
+            geometry = Some((ruler, label));
+        });
+        let (ruler, label) = geometry.expect("ruler geometry was measured");
+
+        assert!(ruler.contains_rect(label));
     }
 
     #[test]

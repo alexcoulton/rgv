@@ -620,7 +620,7 @@ Required gates include:
 - Signed, notarized, clean-machine-tested packages.
 
 No “faster than IGV” claim should be published until the matched benchmark described in
-[benchmarks/IGV_COMPARISON.md](benchmarks/IGV_COMPARISON.md) passes on the exact release candidate.
+[benchmarks/IGV_COMPARISON.md](../benchmarks/IGV_COMPARISON.md) passes on the exact release candidate.
 
 ## 20. Cross-cutting architecture requirements
 

@@ -675,6 +675,14 @@ pub struct SessionPresentationComposite {
 pub struct WorkspacePresentation {
     #[serde(default = "default_alignment_track_height")]
     pub read_pane_height: f32,
+    /// Non-destructive workspace gate for the complete annotation section.
+    /// Child visibility, grouping, heights, and cameras remain authoritative
+    /// while the section is folded.
+    #[serde(default = "default_true")]
+    pub annotation_section_expanded: bool,
+    /// Non-destructive workspace gate for the complete read-data section.
+    #[serde(default = "default_true")]
+    pub read_section_expanded: bool,
     #[serde(default = "default_true")]
     pub reference_content_visible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -718,6 +726,17 @@ impl PresentationNodeId {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TrackIntent {
+    SetSectionExpanded {
+        channel: TrackChannel,
+        expanded: bool,
+    },
+    SetPaneRowsExpanded {
+        channel: TrackChannel,
+        expanded: bool,
+    },
+    ResetPaneRowHeights {
+        channel: TrackChannel,
+    },
     SetNodeVisibility {
         target: PresentationNodeId,
         visible: bool,
@@ -784,6 +803,8 @@ impl Default for WorkspacePresentation {
     fn default() -> Self {
         Self {
             read_pane_height: default_alignment_track_height(),
+            annotation_section_expanded: true,
+            read_section_expanded: true,
             reference_content_visible: true,
             reference_preferred_height: None,
             pane_tracks: Vec::new(),
@@ -799,6 +820,14 @@ const fn default_next_presentation_group_id() -> u32 {
 }
 
 impl WorkspacePresentation {
+    #[must_use]
+    pub const fn section_expanded(&self, channel: TrackChannel) -> bool {
+        match channel {
+            TrackChannel::Annotation => self.annotation_section_expanded,
+            TrackChannel::Reads => self.read_section_expanded,
+        }
+    }
+
     fn repair_group_allocator(&mut self) {
         let minimum = self
             .groups
@@ -974,6 +1003,8 @@ impl WorkspacePresentation {
                 .map_or_else(default_alignment_track_height, |track| {
                     track.height.clamp(100.0, 1_200.0)
                 }),
+            annotation_section_expanded: true,
+            read_section_expanded: true,
             reference_content_visible: true,
             reference_preferred_height: None,
             pane_tracks,
@@ -1151,6 +1182,67 @@ impl WorkspacePresentation {
         changes: &mut TrackChangeSet,
     ) -> Result<(), TrackIntentError> {
         match intent {
+            TrackIntent::SetSectionExpanded { channel, expanded } => {
+                let current = match channel {
+                    TrackChannel::Annotation => &mut self.annotation_section_expanded,
+                    TrackChannel::Reads => &mut self.read_section_expanded,
+                };
+                changes.presentation_changed |= *current != *expanded;
+                *current = *expanded;
+            }
+            TrackIntent::SetPaneRowsExpanded { channel, expanded } => {
+                if *channel == TrackChannel::Annotation {
+                    changes.presentation_changed |= self.reference_content_visible != *expanded;
+                    self.reference_content_visible = *expanded;
+                }
+                for node in self
+                    .pane_tracks
+                    .iter_mut()
+                    .filter(|node| node.channel == *channel)
+                {
+                    changes.presentation_changed |= node.content_visible != *expanded;
+                    node.content_visible = *expanded;
+                }
+                for group in self
+                    .groups
+                    .iter_mut()
+                    .filter(|group| group.channel == *channel)
+                {
+                    // Every child header must be reachable after either bulk
+                    // command. Expanding also opens the group's content gate.
+                    changes.presentation_changed |= !group.expanded;
+                    group.expanded = true;
+                    if *expanded {
+                        changes.presentation_changed |= !group.content_visible;
+                        group.content_visible = true;
+                    }
+                }
+                if *expanded {
+                    for composite in self
+                        .composites
+                        .iter_mut()
+                        .filter(|composite| composite.channel == *channel)
+                    {
+                        changes.presentation_changed |= !composite.content_visible;
+                        composite.content_visible = true;
+                    }
+                }
+                changes.selection_changed |= !*expanded;
+            }
+            TrackIntent::ResetPaneRowHeights { channel } => {
+                if *channel == TrackChannel::Annotation {
+                    changes.presentation_changed |= self.reference_preferred_height.is_some();
+                    self.reference_preferred_height = None;
+                }
+                for node in self
+                    .pane_tracks
+                    .iter_mut()
+                    .filter(|node| node.channel == *channel)
+                {
+                    changes.presentation_changed |= node.preferred_height.is_some();
+                    node.preferred_height = None;
+                }
+            }
             TrackIntent::SetNodeVisibility { target, visible } => match *target {
                 PresentationNodeId::Reference => {
                     changes.presentation_changed |= self.reference_content_visible != *visible;

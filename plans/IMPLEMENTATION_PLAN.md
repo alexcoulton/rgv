@@ -4,7 +4,7 @@ RGV will be a native Rust desktop genome viewer designed to outperform IGV Deskt
 
 The first implementation target is a focused vertical slice: open an indexed local BAM plus FASTA, navigate to a locus, and render coverage and alignments smoothly on the GPU. The repository currently contains the alignment I/O benchmark but no application scaffold, so this slice comes before broader format support.
 
-The benchmark evidence supports `rust-htslib` as the initial alignment backend, with `noodles` retained for differential testing and potentially remote I/O later. See [`benchmark-results/RESULTS.md`](benchmark-results/RESULTS.md) and [`benchmarks/alignment-io/README.md`](benchmarks/alignment-io/README.md).
+The benchmark evidence supports `rust-htslib` as the initial alignment backend, with `noodles` retained for differential testing and potentially remote I/O later. See [`benchmark-results/RESULTS.md`](../benchmark-results/RESULTS.md) and [`benchmarks/alignment-io/README.md`](../benchmarks/alignment-io/README.md).
 
 ## 1. Product target
 

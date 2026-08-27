@@ -19,12 +19,13 @@ pub use navigation::{GenomeOverviewData, OverviewInteraction, paint_genome_conte
 pub use status::status_bar;
 pub use tracks::{
     AlignmentSubtrack, PaneItemLayout, PaneLayoutSnapshot, ScrollbarInteraction, ScrollbarOverview,
-    TRACK_HEADER_HEIGHT, TrackFrame, TrackFrameKey, TrackGroupChrome, TrackPane, TrackSubtrack,
-    TrackUiAction, WorkspacePaneLayout, frame_content_y_at_screen_y, paint_genomic_text,
-    paint_read_panel_scrollbar, paint_read_stack_scrollbar,
-    paint_track_viewport_chrome_with_groups, paint_workspace_annotation_scrollbar,
-    resized_annotation_track_height, resized_read_pane_height, resized_read_track_height,
-    scrollbar_fraction_at_grab, scrollbar_geometry_for_density_at_fraction_in_viewport,
+    TRACK_HEADER_HEIGHT, TRACK_SECTION_HEADER_HEIGHT, TrackFrame, TrackFrameKey, TrackGroupChrome,
+    TrackPane, TrackSectionChrome, TrackSubtrack, TrackUiAction, WorkspacePaneLayout,
+    frame_content_y_at_screen_y, paint_genomic_text, paint_read_panel_scrollbar,
+    paint_read_stack_scrollbar, paint_track_viewport_chrome_with_sections,
+    paint_workspace_annotation_scrollbar, resized_annotation_track_height,
+    resized_read_pane_height, resized_read_track_height, scrollbar_fraction_at_grab,
+    scrollbar_geometry_for_density_at_fraction_in_viewport,
     scrollbar_geometry_for_density_in_viewport, scrollbar_offset_at_grab, scrollbar_overview,
 };
 
@@ -33,6 +34,8 @@ pub const NAVIGATION_HEIGHT: f32 = 38.0;
 pub const STATUS_HEIGHT: f32 = 24.0;
 pub const TRACK_GUTTER_WIDTH: f32 = 168.0;
 pub const SCROLLBAR_WIDTH: f32 = 22.0;
+pub(crate) const RULER_BASELINE_BOTTOM_INSET: f32 = 3.0;
+pub(crate) const RULER_LABEL_BASELINE_GAP: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CytobandAvailability {
@@ -59,7 +62,7 @@ impl Default for GenomeContextMetrics {
             bar_height: 10.0,
             row_gap: 3.0,
             span_height: 16.0,
-            ruler_height: 22.0,
+            ruler_height: 25.0,
             horizontal_padding: 8.0,
         }
     }
@@ -78,7 +81,10 @@ impl GenomeContextMetrics {
         Self {
             metadata_height: (metadata_text_height + 4.0).ceil(),
             span_height: (metadata_text_height + 4.0).ceil(),
-            ruler_height: (ruler_text_height + 12.0).ceil(),
+            ruler_height: (ruler_text_height
+                + RULER_BASELINE_BOTTOM_INSET
+                + RULER_LABEL_BASELINE_GAP)
+                .ceil(),
             ..Self::default()
         }
     }

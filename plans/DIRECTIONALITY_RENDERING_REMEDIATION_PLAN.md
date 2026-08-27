@@ -300,7 +300,7 @@ This remediation is complete when:
 ## 16. Manual-qualification issue discovered
 
 The MF-10 qualification pass exposed an independent vertical-scroll gutter overlap defect. It is
-documented in `VERTICAL_SCROLL_GUTTER_OVERLAP_BUG.md`. Directionality implementation is not the
+documented in `../issues/VERTICAL_SCROLL_GUTTER_OVERLAP_BUG.md`. Directionality implementation is not the
 suspected cause, but final manual qualification must distinguish failures caused by that scroll
 transform bug from directionality geometry regressions.
 
@@ -370,4 +370,4 @@ paired, supplementary, long, clipped, and spliced categories that are not all pr
 that ONT window.
 
 The independent vertical-scroll gutter-overlap defect remains documented in
-`VERTICAL_SCROLL_GUTTER_OVERLAP_BUG.md`; it is not represented as fixed by this directionality work.
+`../issues/VERTICAL_SCROLL_GUTTER_OVERLAP_BUG.md`; it is not represented as fixed by this directionality work.

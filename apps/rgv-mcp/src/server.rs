@@ -1577,6 +1577,10 @@ pub enum ToolSetting {
     ModifiedBaseColorMode {
         value: ToolModifiedBaseColorMode,
     },
+    PresentationSectionExpanded {
+        channel: ToolTrackChannel,
+        value: bool,
+    },
     PresentationNodeVisible {
         target: ToolPresentationNode,
         value: bool,
@@ -1728,6 +1732,12 @@ impl ToolSetting {
             Self::ModifiedBaseColorMode { value } => AutomationSetting::ModifiedBaseColorMode {
                 value: value.into_core(),
             },
+            Self::PresentationSectionExpanded { channel, value } => {
+                AutomationSetting::PresentationSectionExpanded {
+                    channel: channel.into_core(),
+                    value,
+                }
+            }
             Self::PresentationNodeVisible { target, value } => {
                 AutomationSetting::PresentationNodeVisible {
                     target: target.into_core(),
@@ -2681,6 +2691,7 @@ mod tests {
         assert!(configure_schema.contains("properties_panel_width"));
         assert!(configure_schema.contains("properties_panel_resize_active"));
         assert!(configure_schema.contains("vertical_scroll_points"));
+        assert!(configure_schema.contains("presentation_section_expanded"));
         assert!(configure_schema.contains("presentation_node_visible"));
         assert!(configure_schema.contains("presentation_group_expanded"));
         assert!(configure_schema.contains("presentation_composite_visible"));

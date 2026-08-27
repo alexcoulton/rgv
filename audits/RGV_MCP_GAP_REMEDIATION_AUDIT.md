@@ -2,7 +2,7 @@
 
 ## Outcome
 
-The remediation described in `RGV_MCP_GAP_REMEDIATION_PLAN.md` is implemented and qualified at
+The remediation described in `plans/RGV_MCP_GAP_REMEDIATION_PLAN.md` is implemented and qualified at
 commit `5aa811efecfccfad3d19174f543855c12168adfc` with the working-tree changes under review.
 MF-01 was used as the acceptance fixture; the defects found and fixed were in the automation/MCP
 path and qualification setup, not in MF-01's biological truth or rendered display.

@@ -3,7 +3,7 @@
 Status date: 21 August 2026
 
 This plan records the GUI and information-display changes identified by comparing
-`igv_layout_gui.png` with `rgv_layout_gui.png`. The goal is not to copy IGV pixel for pixel, but to
+`assets/gui-redesign/igv_layout_gui.png` with `assets/gui-redesign/rgv_layout_gui.png`. The goal is not to copy IGV pixel for pixel, but to
 adopt the mature desktop-genome-browser structure that makes genomic context, tracks, navigation,
 and read evidence immediately understandable.
 
@@ -259,7 +259,7 @@ Validation should include:
 - Golden or hash-based rendering tests for each alignment event class.
 - UI-state tests for menu commands, track selection, resizing, reordering, and diagnostics
   visibility.
-- Manual comparison against `igv_layout_gui.png` at the same locus and window size.
+- Manual comparison against `assets/gui-redesign/igv_layout_gui.png` at the same locus and window size.
 - Manual testing on standard-density and Retina displays.
 - The full locked workspace test and strict Clippy gates.
 - The local interaction benchmark at the existing 16.7 ms median and p95 thresholds.

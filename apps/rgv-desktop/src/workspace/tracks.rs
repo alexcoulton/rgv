@@ -374,7 +374,37 @@ impl Viewer {
                     self.reconcile_suppressed_group_selection(*channel, &members);
                     changes.selection_changed = true;
                 }
-                TrackIntent::SetNodeVisibility { .. }
+                TrackIntent::SetPaneRowsExpanded {
+                    channel,
+                    expanded: false,
+                } => {
+                    let members = self
+                        .track_presentation
+                        .pane_tracks
+                        .iter()
+                        .filter(|node| node.channel == *channel)
+                        .map(|node| node.track_id)
+                        .collect::<Vec<_>>();
+                    self.reconcile_suppressed_group_selection(*channel, &members);
+                    if *channel == ui::TrackPane::Annotation {
+                        for panel in self.panels.iter_mut() {
+                            panel
+                                .selected_presentation_nodes
+                                .retain(|node| *node != PresentationNodeId::Reference);
+                            if panel.presentation_selection_anchor
+                                == Some(PresentationNodeId::Reference)
+                            {
+                                panel.presentation_selection_anchor =
+                                    panel.selected_presentation_nodes.last().copied();
+                            }
+                        }
+                    }
+                    changes.selection_changed = true;
+                }
+                TrackIntent::SetSectionExpanded { .. }
+                | TrackIntent::SetPaneRowsExpanded { .. }
+                | TrackIntent::ResetPaneRowHeights { .. }
+                | TrackIntent::SetNodeVisibility { .. }
                 | TrackIntent::SetGroupExpanded { .. }
                 | TrackIntent::SetGroupVisibility { .. }
                 | TrackIntent::SetCompositeVisibility { .. }

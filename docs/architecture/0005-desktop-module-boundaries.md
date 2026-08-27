@@ -37,4 +37,4 @@ special cases. Session JSON and existing crate APIs remain compatible because th
 internal ownership and file boundaries rather than the persisted schema.
 
 Module movement and state changes must pass formatting, Clippy, workspace tests, manual-fixture
-qualification, and the interaction benchmark described in `MODULARISATION_PLAN.md`.
+qualification, and the interaction benchmark described in `plans/MODULARISATION_PLAN.md`.

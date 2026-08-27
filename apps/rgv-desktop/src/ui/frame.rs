@@ -71,11 +71,13 @@ struct WorkspaceScrollbarsDraft {
     annotation_maximum: f32,
     annotation_offset: f32,
     annotation_overview: Option<ui::ScrollbarOverview>,
+    annotation_clip_top: f32,
     annotation_clip_bottom: f32,
     annotation_interaction: ui::ScrollbarInteraction,
     read_stack_maximum: f32,
     read_stack_offset: f32,
     read_stack_interaction: ui::ScrollbarInteraction,
+    read_clip_top: f32,
     read_panels: Vec<ReadPanelScrollbarDraft>,
 }
 
@@ -523,11 +525,27 @@ impl Viewer {
         let mut native_properties_resize_active = false;
         let pane_layout = self.panels.active().pane_layout.clone();
         let track_frames = pane_layout.frames().cloned().collect::<Vec<_>>();
+        let annotation_track_count = self
+            .track_presentation
+            .pane_tracks
+            .iter()
+            .filter(|node| node.channel == ui::TrackPane::Annotation)
+            .count()
+            + usize::from(self.reference_engine.is_some());
+        let read_track_count = self
+            .track_presentation
+            .pane_tracks
+            .iter()
+            .filter(|node| node.channel == ui::TrackPane::Reads)
+            .count();
         let shared_annotation_maximum = self.panels.maximum_annotation_scroll_points();
-        let shared_annotation_offset = self
-            .panels
-            .annotation_scroll_points
-            .clamp(0.0, shared_annotation_maximum);
+        let shared_annotation_offset = if self.track_presentation.annotation_section_expanded {
+            self.panels
+                .annotation_scroll_points
+                .clamp(0.0, shared_annotation_maximum)
+        } else {
+            self.panels.annotation_scroll_points
+        };
         let selected_annotation_track_ids = self
             .panels
             .active()
@@ -558,6 +576,12 @@ impl Viewer {
             .enumerate()
             .map(|(index, panel)| {
                 let annotation_maximum = shared_annotation_maximum;
+                let annotation_clip_top = panel
+                    .scroll_display_cache
+                    .as_ref()
+                    .map_or(committed_canvas_geometry.viewport.top(), |cache| {
+                        cache.annotation_clip_top
+                    });
                 let annotation_clip_bottom = panel
                     .scroll_display_cache
                     .as_ref()
@@ -615,6 +639,7 @@ impl Viewer {
                         .scroll_display_cache
                         .as_ref()
                         .map(|cache| cache.annotation_overview.clone()),
+                    annotation_clip_top,
                     annotation_clip_bottom,
                     annotation_interaction: ui::ScrollbarInteraction::default(),
                     read_stack_maximum: (panel.read_stack_content_bottom_points
@@ -622,6 +647,7 @@ impl Viewer {
                     .max(0.0),
                     read_stack_offset: panel.read_stack_scroll_points,
                     read_stack_interaction: ui::ScrollbarInteraction::default(),
+                    read_clip_top: panel.pane_layout.reads.pane_rect.top(),
                     read_panels,
                 }
             })
@@ -1578,7 +1604,7 @@ impl Viewer {
                     }
                 }
                 new_workspace_layout = workspace_layout.clone();
-                let gutter = ui::paint_track_viewport_chrome_with_groups(
+                let gutter = ui::paint_track_viewport_chrome_with_sections(
                     ui,
                     geometry,
                     &track_frames,
@@ -1590,6 +1616,16 @@ impl Viewer {
                     &selected_annotation_track_ids,
                     &self.panels.active().selected_read_tracks,
                     &track_groups,
+                    ui::TrackSectionChrome {
+                        annotation_expanded: self
+                            .track_presentation
+                            .annotation_section_expanded,
+                        reads_expanded: self.track_presentation.read_section_expanded,
+                        annotation_track_count,
+                        read_track_count,
+                        annotation_content_top: pane_layout.annotation.pane_rect.top(),
+                        read_content_top: pane_layout.reads.pane_rect.top(),
+                    },
                 );
                 track_ui_actions.extend(gutter.actions);
                 let frame_genomic_texts = remap_genomic_texts_for_layout(
@@ -1650,20 +1686,25 @@ impl Viewer {
                     let full = workspace_layout.panels[workspace.index].scrollbar;
                     let split_y = workspace
                         .annotation_clip_bottom
-                        .clamp(full.top() + 1.0, full.bottom() - 1.0);
+                        .clamp(full.top(), full.bottom());
+                    let annotation_top = workspace
+                        .annotation_clip_top
+                        .clamp(full.top(), split_y);
                     let annotation_rect = egui::Rect::from_min_max(
-                        full.min,
+                        egui::pos2(full.left(), annotation_top),
                         egui::pos2(full.right(), split_y),
                     );
-                    workspace.annotation_interaction =
-                        ui::paint_workspace_annotation_scrollbar(
-                            ui,
-                            annotation_rect,
-                            workspace.panel_id,
-                            workspace.annotation_maximum,
-                            &mut workspace.annotation_offset,
-                            workspace.annotation_overview.as_ref(),
-                        );
+                    if annotation_rect.height() > 1.0 {
+                        workspace.annotation_interaction =
+                            ui::paint_workspace_annotation_scrollbar(
+                                ui,
+                                annotation_rect,
+                                workspace.panel_id,
+                                workspace.annotation_maximum,
+                                &mut workspace.annotation_offset,
+                                workspace.annotation_overview.as_ref(),
+                            );
+                    }
                     ui.painter().line_segment(
                         [
                             egui::pos2(full.left(), split_y),
@@ -1671,9 +1712,12 @@ impl Viewer {
                         ],
                         egui::Stroke::new(1.0, egui::Color32::from_gray(125)),
                     );
-                    let read_scrollbar_left = if workspace.read_stack_maximum > f32::EPSILON {
+                    let read_top = workspace.read_clip_top.clamp(split_y, full.bottom());
+                    let read_scrollbar_left = if workspace.read_stack_maximum > f32::EPSILON
+                        && full.bottom() - read_top > 1.0
+                    {
                         let stack_rect = egui::Rect::from_min_max(
-                            egui::pos2(full.left(), split_y),
+                            egui::pos2(full.left(), read_top),
                             egui::pos2(full.center().x, full.bottom()),
                         );
                         workspace.read_stack_interaction = ui::paint_read_stack_scrollbar(
@@ -1685,7 +1729,7 @@ impl Viewer {
                         );
                         ui.painter().line_segment(
                             [
-                                egui::pos2(full.center().x, split_y),
+                                egui::pos2(full.center().x, read_top),
                                 egui::pos2(full.center().x, full.bottom()),
                             ],
                             egui::Stroke::new(0.75, egui::Color32::from_gray(150)),

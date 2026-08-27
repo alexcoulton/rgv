@@ -46,13 +46,13 @@ At the time of this audit, the largest Rust files are:
 
 | File | Total lines | Production lines | Assessment |
 |---|---:|---:|---|
-| [`apps/rgv-desktop/src/main.rs`](apps/rgv-desktop/src/main.rs) | 28,486 | 24,411 | Critical mixed-responsibility monolith |
-| [`crates/rgv-layout/src/alignment_layout.rs`](crates/rgv-layout/src/alignment_layout.rs) | 6,695 | 3,958 | Large but substantially cohesive |
-| [`crates/rgv-hts/src/tracks.rs`](crates/rgv-hts/src/tracks.rs) | 6,003 | 4,640 | Multiple independent format implementations |
-| [`validation/runner/src/bin/rgv-manual-fixtures.rs`](validation/runner/src/bin/rgv-manual-fixtures.rs) | 4,204 | 4,204 | Generation, truth, cataloguing, and qualification mixed |
-| [`crates/rgv-core/src/session.rs`](crates/rgv-core/src/session.rs) | 3,172 | 1,766 | Models, validation, migration, persistence, and IGV import mixed |
-| [`validation/runner/src/lib.rs`](validation/runner/src/lib.rs) | 2,688 | 2,652 | Several independent verification domains mixed |
-| [`crates/rgv-layout/src/track_layout.rs`](crates/rgv-layout/src/track_layout.rs) | 2,615 | 1,896 | Independent track-family layout algorithms mixed |
+| [`apps/rgv-desktop/src/main.rs`](../apps/rgv-desktop/src/main.rs) | 28,486 | 24,411 | Critical mixed-responsibility monolith |
+| [`crates/rgv-layout/src/alignment_layout.rs`](../crates/rgv-layout/src/alignment_layout.rs) | 6,695 | 3,958 | Large but substantially cohesive |
+| [`crates/rgv-hts/src/tracks.rs`](../crates/rgv-hts/src/tracks.rs) | 6,003 | 4,640 | Multiple independent format implementations |
+| [`validation/runner/src/bin/rgv-manual-fixtures.rs`](../validation/runner/src/bin/rgv-manual-fixtures.rs) | 4,204 | 4,204 | Generation, truth, cataloguing, and qualification mixed |
+| [`crates/rgv-core/src/session.rs`](../crates/rgv-core/src/session.rs) | 3,172 | 1,766 | Models, validation, migration, persistence, and IGV import mixed |
+| [`validation/runner/src/lib.rs`](../validation/runner/src/lib.rs) | 2,688 | 2,652 | Several independent verification domains mixed |
+| [`crates/rgv-layout/src/track_layout.rs`](../crates/rgv-layout/src/track_layout.rs) | 2,615 | 1,896 | Independent track-family layout algorithms mixed |
 
 `main.rs` accounts for approximately 34% of all Rust source and approximately 92% of the desktop
 crate. Its production section contains 68 top-level types, 223 top-level functions, and 110 tests.

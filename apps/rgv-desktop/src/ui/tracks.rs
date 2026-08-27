@@ -24,6 +24,7 @@ pub enum TrackFrameKey {
 pub type TrackPane = TrackChannel;
 
 pub const TRACK_HEADER_HEIGHT: f32 = 22.0;
+pub const TRACK_SECTION_HEADER_HEIGHT: f32 = 26.0;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AlignmentSubtrack {
@@ -340,6 +341,9 @@ impl TrackGroupChrome {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TrackUiAction {
+    ToggleSection(TrackPane),
+    SetPaneRowsExpanded(TrackPane, bool),
+    ResetPaneRowHeights(TrackPane),
     Select(TrackFrameKey, TrackPane),
     OpenSettings(TrackFrameKey),
     RenameTrack(TrackFrameKey, String),
@@ -374,6 +378,32 @@ pub enum TrackUiAction {
 #[derive(Default)]
 pub struct TrackGutterResult {
     pub actions: Vec<TrackUiAction>,
+}
+
+/// Fixed workspace section chrome. Content bounds are supplied by the display
+/// layout so the section headers, clipping, gutter controls, and scrollbars all
+/// consume the same geometry revision.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrackSectionChrome {
+    pub annotation_expanded: bool,
+    pub reads_expanded: bool,
+    pub annotation_track_count: usize,
+    pub read_track_count: usize,
+    pub annotation_content_top: f32,
+    pub read_content_top: f32,
+}
+
+impl Default for TrackSectionChrome {
+    fn default() -> Self {
+        Self {
+            annotation_expanded: true,
+            reads_expanded: true,
+            annotation_track_count: 0,
+            read_track_count: 0,
+            annotation_content_top: 0.0,
+            read_content_top: 0.0,
+        }
+    }
 }
 
 const GUTTER_TEXT_GAP: f32 = 6.0;
@@ -1210,6 +1240,104 @@ fn scrollbar_overview_color(kind: Option<TrackKind>, density: f32) -> Color32 {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn paint_track_section_header(
+    ui: &mut Ui,
+    painter: &egui::Painter,
+    gutter: Rect,
+    full_rect: Rect,
+    channel: TrackPane,
+    expanded: bool,
+    track_count: usize,
+    result: &mut TrackGutterResult,
+) {
+    if full_rect.height() <= f32::EPSILON {
+        return;
+    }
+    let gutter_rect = Rect::from_min_max(
+        pos2(gutter.left(), full_rect.top()),
+        pos2(gutter.right(), full_rect.bottom()),
+    );
+    let (label, fill) = match channel {
+        TrackPane::Annotation => ("Annotations", Color32::from_rgb(219, 230, 242)),
+        TrackPane::Reads => ("Read data", Color32::from_gray(236)),
+    };
+    painter.rect_filled(full_rect, 0.0, fill.gamma_multiply(0.72));
+    painter.rect_filled(gutter_rect, 0.0, fill);
+    painter.line_segment(
+        [full_rect.left_bottom(), full_rect.right_bottom()],
+        Stroke::new(1.0, Color32::from_gray(165)),
+    );
+    let response = ui
+        .interact(
+            full_rect,
+            egui::Id::new(("track-section-header", channel)),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let action_label = if expanded { "Minimize" } else { "Expand" };
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            true,
+            format!("{action_label} {label} section"),
+        )
+    });
+    if response.clicked() {
+        result.actions.push(TrackUiAction::ToggleSection(channel));
+    }
+    response.clone().on_hover_text(format!(
+        "{action_label} {label} without changing child track state"
+    ));
+    response.context_menu(|ui| {
+        if ui.button(format!("{action_label} section")).clicked() {
+            result.actions.push(TrackUiAction::ToggleSection(channel));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Collapse all rows").clicked() {
+            result
+                .actions
+                .push(TrackUiAction::SetPaneRowsExpanded(channel, false));
+            ui.close();
+        }
+        if ui.button("Expand all rows").clicked() {
+            result
+                .actions
+                .push(TrackUiAction::SetPaneRowsExpanded(channel, true));
+            ui.close();
+        }
+        if ui.button("Reset row heights").clicked() {
+            result
+                .actions
+                .push(TrackUiAction::ResetPaneRowHeights(channel));
+            ui.close();
+        }
+    });
+
+    let toggle_rect = Rect::from_center_size(
+        pos2(gutter_rect.left() + 14.0, gutter_rect.center().y),
+        egui::vec2(16.0, 16.0),
+    );
+    for segment in group_chevron_segments(toggle_rect, !expanded) {
+        painter.line_segment(segment, Stroke::new(1.5, Color32::from_gray(65)));
+    }
+    let count_label = if track_count == 1 {
+        "1 track".to_owned()
+    } else {
+        format!("{track_count} tracks")
+    };
+    paint_elided_text(
+        painter,
+        &format!("{label} · {count_label}"),
+        FontId::proportional(13.0),
+        Color32::from_gray(45),
+        (gutter_rect.width() - 34.0).max(0.0),
+        pos2(gutter_rect.left() + 28.0, gutter_rect.center().y),
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn paint_track_viewport_chrome(
     ui: &mut Ui,
@@ -1238,6 +1366,7 @@ fn paint_track_viewport_chrome(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn paint_track_viewport_chrome_with_groups(
     ui: &mut Ui,
     geometry: CanvasGeometry,
@@ -1250,6 +1379,41 @@ pub fn paint_track_viewport_chrome_with_groups(
     selected_alignments: &[TrackId],
     selected_read_tracks: &[TrackId],
     track_groups: &[TrackGroupChrome],
+) -> TrackGutterResult {
+    paint_track_viewport_chrome_with_sections(
+        ui,
+        geometry,
+        frames,
+        annotation_scroll,
+        read_scroll,
+        scroll_clip_top,
+        annotation_clip_bottom,
+        selected,
+        selected_alignments,
+        selected_read_tracks,
+        track_groups,
+        TrackSectionChrome {
+            annotation_content_top: scroll_clip_top,
+            read_content_top: annotation_clip_bottom,
+            ..TrackSectionChrome::default()
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn paint_track_viewport_chrome_with_sections(
+    ui: &mut Ui,
+    geometry: CanvasGeometry,
+    frames: &[TrackFrame],
+    annotation_scroll: f32,
+    read_scroll: f32,
+    scroll_clip_top: f32,
+    annotation_clip_bottom: f32,
+    selected: Option<TrackFrameKey>,
+    selected_alignments: &[TrackId],
+    selected_read_tracks: &[TrackId],
+    track_groups: &[TrackGroupChrome],
+    sections: TrackSectionChrome,
 ) -> TrackGutterResult {
     let mut result = TrackGutterResult::default();
     let rename_state_id = track_rename_state_id();
@@ -1271,6 +1435,48 @@ pub fn paint_track_viewport_chrome_with_groups(
     painter.line_segment(
         [geometry.gutter.right_top(), geometry.gutter.right_bottom()],
         Stroke::new(1.0, Color32::from_gray(175)),
+    );
+
+    let annotation_header = Rect::from_min_max(
+        pos2(geometry.viewport.left(), geometry.viewport.top()),
+        pos2(
+            geometry.viewport.right(),
+            sections
+                .annotation_content_top
+                .clamp(geometry.viewport.top(), geometry.viewport.bottom()),
+        ),
+    );
+    let read_header = Rect::from_min_max(
+        pos2(
+            geometry.viewport.left(),
+            annotation_clip_bottom.clamp(geometry.viewport.top(), geometry.viewport.bottom()),
+        ),
+        pos2(
+            geometry.viewport.right(),
+            sections
+                .read_content_top
+                .clamp(annotation_clip_bottom, geometry.viewport.bottom()),
+        ),
+    );
+    paint_track_section_header(
+        ui,
+        &painter,
+        geometry.gutter,
+        annotation_header,
+        TrackPane::Annotation,
+        sections.annotation_expanded,
+        sections.annotation_track_count,
+        &mut result,
+    );
+    paint_track_section_header(
+        ui,
+        &painter,
+        geometry.gutter,
+        read_header,
+        TrackPane::Reads,
+        sections.reads_expanded,
+        sections.read_track_count,
+        &mut result,
     );
 
     for frame in frames {
@@ -2395,7 +2601,9 @@ pub fn paint_track_viewport_chrome_with_groups(
             }
         }
     }
-    if annotation_clip_bottom > geometry.viewport.top()
+    if sections.annotation_expanded
+        && sections.reads_expanded
+        && annotation_clip_bottom > geometry.viewport.top()
         && annotation_clip_bottom < geometry.viewport.bottom()
     {
         let divider_handle = Rect::from_min_max(
@@ -4893,6 +5101,83 @@ mod tests {
         assert_close(
             geometry.thumb.height(),
             geometry.track.height() * expected_fraction,
+        );
+    }
+
+    #[test]
+    fn fixed_section_header_toggles_without_targeting_a_child_row() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome_with_sections(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &[],
+                0.0,
+                0.0,
+                26.0,
+                180.0,
+                None,
+                &[],
+                &[],
+                &[],
+                TrackSectionChrome {
+                    annotation_expanded: true,
+                    reads_expanded: true,
+                    annotation_track_count: 4,
+                    read_track_count: 2,
+                    annotation_content_top: 26.0,
+                    read_content_top: 206.0,
+                },
+            )
+        };
+        let pointer = pos2(300.0, 13.0);
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+
+        assert_eq!(
+            actions,
+            [TrackUiAction::ToggleSection(TrackPane::Annotation)]
         );
     }
 }

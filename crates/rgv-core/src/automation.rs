@@ -599,6 +599,10 @@ pub enum AutomationSetting {
     ModifiedBaseColorMode {
         value: ModifiedBaseColorMode,
     },
+    PresentationSectionExpanded {
+        channel: crate::TrackChannel,
+        value: bool,
+    },
     PresentationNodeVisible {
         target: crate::PresentationNodeId,
         value: bool,
@@ -919,6 +923,10 @@ pub struct AutomationWorkspaceSnapshot {
     pub tracks: Vec<AutomationTrackSnapshot>,
     #[serde(default)]
     pub read_pane_height: f32,
+    #[serde(default = "automation_default_true")]
+    pub annotation_section_expanded: bool,
+    #[serde(default = "automation_default_true")]
+    pub read_section_expanded: bool,
     #[serde(default)]
     pub presentation_groups: Vec<AutomationPresentationGroupSnapshot>,
     #[serde(default)]
@@ -2077,6 +2085,8 @@ mod tests {
             }],
             tracks: Vec::new(),
             read_pane_height: 360.0,
+            annotation_section_expanded: true,
+            read_section_expanded: true,
             presentation_groups: Vec::new(),
             presentation_composites: Vec::new(),
             presentation_nodes: Vec::new(),

@@ -56,12 +56,18 @@ The current native prototype supports:
 - Persistent recent files/loci, configurable cache preferences, keyboard command search, and
   diagnostics that remain disabled unless explicitly enabled.
 
-The current execution roadmap is in [RGV_IGV_PARITY_ROADMAP.md](RGV_IGV_PARITY_ROADMAP.md).
+The current execution roadmap is in
+[plans/RGV_IGV_PARITY_ROADMAP.md](plans/RGV_IGV_PARITY_ROADMAP.md); the complete planning index is
+[plans/README.md](plans/README.md).
 See [the user guide](docs/USER_GUIDE.md), [format support matrix](docs/FORMAT_SUPPORT.md),
 [session compatibility policy](docs/SESSION_COMPATIBILITY.md), [portable genome configuration](docs/GENOME_CONFIGURATION.md), and
 [validation guide](docs/VALIDATION.md) for operational details. To attach an agent to a visible,
 explicitly controlled window, see [the MCP setup and tool guide](docs/MCP.md). The complete deterministic manual
-fixture index is [validation/manual-suite/README.md](validation/manual-suite/README.md).
+fixture index is [validation/manual-suite/README.md](validation/manual-suite/README.md), with the
+full testing procedure in
+[validation/manual-suite/TEST_INSTRUCTIONS.md](validation/manual-suite/TEST_INSTRUCTIONS.md).
+Historical review material is grouped under [`audits/`](audits/), and resolved defect write-ups
+under [`issues/`](issues/).
 
 ## Run the desktop viewer
 

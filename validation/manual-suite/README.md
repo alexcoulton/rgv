@@ -2,6 +2,9 @@
 
 The suite is fixture-ready: its hashes, portable projects, exact semantic truth, production readers, relocation, coverage catalog, and controlled failure inputs pass mechanically. Manual scenario results remain `not run` until a tester records them; synthetic readiness does not replace real-data or platform qualification.
 
+See [the full test instructions](TEST_INSTRUCTIONS.md) for prerequisites, execution order, evidence
+capture, MCP-driven testing, and result recording.
+
 ## Generate and verify
 
 ```bash

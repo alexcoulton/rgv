@@ -99,6 +99,7 @@ def main() -> int:
         configure_schema = next(tool for tool in tools if tool["name"] == "rgv_configure")
         encoded_schema = json.dumps(configure_schema["inputSchema"], sort_keys=True)
         for required in [
+            "presentation_section_expanded",
             "presentation_node_visible",
             "presentation_group_expanded",
             "presentation_group_visible",

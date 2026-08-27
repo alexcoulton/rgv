@@ -44,6 +44,9 @@ fn toggle_track_visibility(visible: &mut bool, collapsed: &mut bool) {
 
 fn intent_channel(intent: &TrackIntent) -> ui::TrackPane {
     match intent {
+        TrackIntent::SetSectionExpanded { channel, .. }
+        | TrackIntent::SetPaneRowsExpanded { channel, .. }
+        | TrackIntent::ResetPaneRowHeights { channel } => *channel,
         TrackIntent::SetNodeVisibility { target, .. }
         | TrackIntent::SetGroupExpanded { target, .. }
         | TrackIntent::SetGroupVisibility { target, .. }
@@ -143,6 +146,31 @@ impl Viewer {
         let mut presentation_intents = Vec::new();
         for action in actions {
             match action {
+                TrackUiAction::ToggleSection(channel) => {
+                    presentation_intents.push(TrackIntent::SetSectionExpanded {
+                        channel,
+                        expanded: !self.track_presentation.section_expanded(channel),
+                    });
+                    match channel {
+                        ui::TrackPane::Annotation => outcome.annotation_geometry_changed = true,
+                        ui::TrackPane::Reads => outcome.read_geometry_changed = true,
+                    }
+                }
+                TrackUiAction::SetPaneRowsExpanded(channel, expanded) => {
+                    presentation_intents
+                        .push(TrackIntent::SetPaneRowsExpanded { channel, expanded });
+                    match channel {
+                        ui::TrackPane::Annotation => outcome.annotation_geometry_changed = true,
+                        ui::TrackPane::Reads => outcome.read_geometry_changed = true,
+                    }
+                }
+                TrackUiAction::ResetPaneRowHeights(channel) => {
+                    presentation_intents.push(TrackIntent::ResetPaneRowHeights { channel });
+                    match channel {
+                        ui::TrackPane::Annotation => outcome.annotation_geometry_changed = true,
+                        ui::TrackPane::Reads => outcome.read_geometry_changed = true,
+                    }
+                }
                 TrackUiAction::OpenSettings(TrackFrameKey::Group { .. }) => {}
                 TrackUiAction::OpenSettings(key) => outcome.settings_panel = Some(key),
                 TrackUiAction::RenameTrack(key, name) => {
