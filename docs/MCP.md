@@ -169,6 +169,10 @@ availability; and the target of any active resize or annotation/read scrollbar g
 `presentation_ungroup`, `read_pane_height`,
 `annotation_scroll_points`, `read_stack_scroll_points`, `read_panel_scroll_points`, and
 `read_panel_density` settings all execute through the same reducer used by the GUI.
+`annotation_scroll_points` addresses the workspace-wide annotation camera; its required
+`panel_id` identifies the scrollbar/controller used for the request but does not create a
+panel-local annotation offset. Workspace snapshots therefore report the same annotation offset
+and maximum for every locus. Read-stack and read-panel cameras remain panel-local.
 The qualification-only `window_size`, `interface_scale_percent`,
 `properties_panel_expanded`, and `properties_panel_width` settings make shell reflow reproducible;
 they affect the running window and do not persist calculated layout rectangles into a project.

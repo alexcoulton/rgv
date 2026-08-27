@@ -81,9 +81,11 @@ Version 4 replaces mirrored, source-level presentation fields with one normalize
 `presentation` object. It stores independent ordered `annotation` and `reads` nodes, first-class
 channel-qualified groups, separate desired content visibility and group expansion, literal
 preferred row heights, persisted parent gates for composite overlays, and the workspace-owned
-read-pane height. Every panel also persists its
-annotation camera, read-stack camera, and per-alignment read-panel scroll, content origin, latent
-fraction, content extent, and optional density override.
+read-pane height. Every panel persists the workspace annotation-camera value as a compatibility
+projection, plus its own read-stack camera and per-alignment read-panel scroll, content origin,
+latent fraction, content extent, and optional density override. When an older file contains
+different annotation offsets per panel, the active panel's value becomes the single workspace
+offset and the next save writes that value to every panel.
 
 The version-3 migration is deterministic:
 

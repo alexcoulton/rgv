@@ -7,8 +7,9 @@ use crate::display::{
     PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT, PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
     PINNED_ALIGNMENT_MODIFICATION_HEIGHT, PINNED_ALIGNMENT_REFERENCE_HEIGHT,
     READ_PANE_HEADER_HEIGHT, alignment_annotation_lane_heights, append_annotation_pane_background,
-    ensure_annotation_presentation_frames, pinned_gene_track_height, primary_pinned_gene_id,
-    reflow_annotation_presentation,
+    ensure_annotation_presentation_frames, pane_layout_snapshot, pinned_gene_track_height,
+    primary_pinned_gene_id, reflow_annotation_presentation,
+    reflow_annotation_presentation_with_heights,
 };
 
 #[test]
@@ -264,6 +265,96 @@ fn annotation_composition_follows_presentation_order_without_reordering_sources(
 }
 
 #[test]
+fn annotation_composition_applies_workspace_row_heights() {
+    let first = TrackId::new(11);
+    let second = TrackId::new(22);
+    let mut presentation = WorkspacePresentation::default();
+    presentation.pane_tracks = vec![
+        SessionPaneTrackState {
+            channel: ui::TrackPane::Annotation,
+            track_id: second,
+            content_visible: true,
+            preferred_height: None,
+        },
+        SessionPaneTrackState {
+            channel: ui::TrackPane::Annotation,
+            track_id: first,
+            content_visible: true,
+            preferred_height: None,
+        },
+    ];
+    let frame = |id, top| TrackFrame {
+        key: TrackFrameKey::Auxiliary(id),
+        channel: ui::TrackPane::Annotation,
+        name: format!("track-{}", id.get()),
+        kind: TrackKind::Feature,
+        source_label: None,
+        top,
+        bottom: top + 50.0,
+        visible: true,
+        collapsed: false,
+        frozen_bottom: None,
+        subtracks: Vec::new(),
+    };
+    let mut frames = vec![frame(first, 0.0), frame(second, 50.0)];
+    let mut display = DisplayList {
+        rectangles: vec![
+            RectPrimitive {
+                x: 0.0,
+                y: 10.0,
+                width: 10.0,
+                height: 2.0,
+                color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+                object_id: 1,
+                shape: Default::default(),
+            },
+            RectPrimitive {
+                x: 0.0,
+                y: 60.0,
+                width: 10.0,
+                height: 2.0,
+                color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+                object_id: 2,
+                shape: Default::default(),
+            },
+        ],
+        texts: Vec::new(),
+    };
+    let shared = BTreeMap::from([
+        (
+            PresentationNodeId::Track {
+                channel: ui::TrackPane::Annotation,
+                track_id: first,
+            },
+            70.0,
+        ),
+        (
+            PresentationNodeId::Track {
+                channel: ui::TrackPane::Annotation,
+                track_id: second,
+            },
+            80.0,
+        ),
+    ]);
+
+    let bottom = reflow_annotation_presentation_with_heights(
+        &presentation,
+        &mut frames,
+        &mut display,
+        0.0,
+        &shared,
+    );
+
+    assert_eq!(bottom, 150.0);
+    assert_eq!(frames[0].key, TrackFrameKey::Auxiliary(second));
+    assert_eq!((frames[0].top, frames[0].bottom), (0.0, 80.0));
+    assert_eq!(frames[1].key, TrackFrameKey::Auxiliary(first));
+    assert_eq!((frames[1].top, frames[1].bottom), (80.0, 150.0));
+    assert_eq!(display.rectangles[0].y, 90.0);
+    assert_eq!(display.rectangles[1].y, 10.0);
+}
+
+#[test]
 fn annotation_tree_retains_a_restore_header_when_a_renderer_omits_its_frame() {
     let rendered = TrackId::new(1);
     let omitted = TrackId::new(2);
@@ -306,6 +397,99 @@ fn annotation_tree_retains_a_restore_header_when_a_renderer_omits_its_frame() {
     assert_eq!(frames[1].key, TrackFrameKey::Auxiliary(omitted));
     assert_eq!((frames[1].top, frames[1].bottom), (50.0, 76.0));
     assert!(frames[1].collapsed);
+}
+
+#[test]
+fn overflowing_annotation_rows_remain_reachable_after_an_unrelated_track_is_hidden() {
+    let first = TrackId::new(1);
+    let hidden_unrelated = TrackId::new(2);
+    let below_viewport = TrackId::new(3);
+    let mut presentation = WorkspacePresentation::default();
+    presentation.pane_tracks = [
+        (first, true, 80.0),
+        (hidden_unrelated, false, 26.0),
+        (below_viewport, true, 80.0),
+    ]
+    .into_iter()
+    .map(
+        |(track_id, content_visible, preferred_height)| SessionPaneTrackState {
+            channel: ui::TrackPane::Annotation,
+            track_id,
+            content_visible,
+            preferred_height: Some(preferred_height),
+        },
+    )
+    .collect();
+    let frame = |id, top: f32, height: f32, collapsed| TrackFrame {
+        key: TrackFrameKey::Auxiliary(id),
+        channel: ui::TrackPane::Annotation,
+        name: format!("track-{}", id.get()),
+        kind: TrackKind::Feature,
+        source_label: None,
+        top,
+        bottom: top + height,
+        visible: true,
+        collapsed,
+        frozen_bottom: None,
+        subtracks: Vec::new(),
+    };
+    let frames = vec![
+        frame(first, 0.0, 80.0, false),
+        frame(hidden_unrelated, 80.0, 26.0, true),
+        frame(below_viewport, 106.0, 80.0, false),
+    ];
+
+    let mut layout = pane_layout_snapshot(
+        &presentation,
+        &frames,
+        ui::TrackPane::Annotation,
+        0.0,
+        100.0,
+        186.0,
+        0.0,
+        0.0,
+        300.0,
+    );
+
+    assert_eq!(layout.items.len(), 3);
+    let target = layout
+        .items
+        .iter()
+        .find(|item| {
+            item.id
+                == PresentationNodeId::Track {
+                    channel: ui::TrackPane::Annotation,
+                    track_id: below_viewport,
+                }
+        })
+        .unwrap();
+    assert_eq!(target.row_rect.height(), 0.0);
+    assert!(target.desired_content_visible);
+    assert!(target.effective_content_visible);
+
+    // This is the fast-scroll path: no renderer or presentation rebuild is
+    // needed for the previously clipped row to become sidebar-visible.
+    layout.reproject_scroll(86.0);
+    let target = layout
+        .items
+        .iter()
+        .find(|item| {
+            item.id
+                == PresentationNodeId::Track {
+                    channel: ui::TrackPane::Annotation,
+                    track_id: below_viewport,
+                }
+        })
+        .unwrap();
+    assert_eq!(
+        (target.row_rect.top(), target.row_rect.bottom()),
+        (20.0, 100.0)
+    );
+    assert_eq!(
+        (target.header_rect.top(), target.header_rect.bottom()),
+        (20.0, 42.0)
+    );
+    assert!(target.content_rect.is_some());
 }
 
 #[test]

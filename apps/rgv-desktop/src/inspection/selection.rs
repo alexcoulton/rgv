@@ -36,7 +36,7 @@ impl Viewer {
                                         .effective_scroll_points(),
                             ));
                         }
-                        Some((frame, screen_y + panel.annotation_scroll_points))
+                        Some((frame, screen_y + self.panels.annotation_scroll_points))
                     })
                     .flatten()
             })

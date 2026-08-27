@@ -19,8 +19,8 @@ pub use navigation::{GenomeOverviewData, OverviewInteraction, paint_genome_conte
 pub use status::status_bar;
 pub use tracks::{
     AlignmentSubtrack, PaneItemLayout, PaneLayoutSnapshot, ScrollbarInteraction, ScrollbarOverview,
-    TrackFrame, TrackFrameKey, TrackGroupChrome, TrackPane, TrackSubtrack, TrackUiAction,
-    WorkspacePaneLayout, frame_content_y_at_screen_y, paint_genomic_text,
+    TRACK_HEADER_HEIGHT, TrackFrame, TrackFrameKey, TrackGroupChrome, TrackPane, TrackSubtrack,
+    TrackUiAction, WorkspacePaneLayout, frame_content_y_at_screen_y, paint_genomic_text,
     paint_read_panel_scrollbar, paint_read_stack_scrollbar,
     paint_track_viewport_chrome_with_groups, paint_workspace_annotation_scrollbar,
     resized_annotation_track_height, resized_read_pane_height, resized_read_track_height,

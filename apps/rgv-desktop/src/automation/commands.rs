@@ -1400,6 +1400,8 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn automation_workspace_snapshot(&self) -> AutomationWorkspaceSnapshot {
+        let shared_annotation_scroll = self.panels.annotation_scroll_points;
+        let maximum_shared_annotation_scroll = self.panels.maximum_annotation_scroll_points();
         let mut panels: Vec<_> = self
             .panels
             .iter()
@@ -1408,10 +1410,7 @@ impl Viewer {
                 let maximum_scroll = (panel.content_bottom_points
                     - self.canvas_geometry().viewport.bottom())
                 .max(0.0);
-                let maximum_annotation_scroll =
-                    panel.scroll_display_cache.as_ref().map_or(0.0, |cache| {
-                        (cache.annotation_content_bottom - cache.annotation_clip_bottom).max(0.0)
-                    });
+                let maximum_annotation_scroll = maximum_shared_annotation_scroll;
                 let filters = self.primary_alignment_filters();
                 let query = self
                     .alignment_tracks
@@ -1518,7 +1517,7 @@ impl Viewer {
                     bases_per_pixel: panel.viewport.bases_per_pixel(),
                     vertical_scroll_points: panel.vertical_scroll_points,
                     maximum_vertical_scroll_points: maximum_scroll,
-                    annotation_scroll_points: panel.annotation_scroll_points,
+                    annotation_scroll_points: shared_annotation_scroll,
                     maximum_annotation_scroll_points: maximum_annotation_scroll,
                     read_stack_scroll_points: panel.read_stack_scroll_points,
                     maximum_read_stack_scroll_points: (panel.pane_layout.reads.content_bottom
@@ -2604,13 +2603,17 @@ impl Viewer {
             }
             AutomationOptionScope::Panel { panel_id } => {
                 let primary_track_id = self.primary_alignment_track_id();
-                let Some(panel) = self.panels.get_mut(panel_id) else {
+                if self.panels.get(panel_id).is_none() {
                     anyhow::bail!("panel {} was not found", panel_id.get());
-                };
+                }
                 match key {
                     "vertical_scroll_points" => {
                         let scroll = automation_f32(value, key)?;
                         anyhow::ensure!(scroll >= 0.0, "{key} must be non-negative");
+                        let panel = self
+                            .panels
+                            .get_mut(panel_id)
+                            .expect("panel existence was checked above");
                         let maximum = panel
                             .scroll_display_cache
                             .as_ref()
@@ -2638,11 +2641,8 @@ impl Viewer {
                     "annotation_scroll_points" => {
                         let scroll = automation_f32(value, key)?;
                         anyhow::ensure!(scroll >= 0.0, "{key} must be non-negative");
-                        let maximum = panel.scroll_display_cache.as_ref().map_or(0.0, |cache| {
-                            (cache.annotation_content_bottom - cache.annotation_clip_bottom)
-                                .max(0.0)
-                        });
-                        panel.annotation_scroll_points = scroll.min(maximum);
+                        self.panels.annotation_scroll_points =
+                            scroll.min(self.panels.maximum_annotation_scroll_points());
                     }
                     _ => anyhow::bail!("unknown panel option {key}"),
                 }

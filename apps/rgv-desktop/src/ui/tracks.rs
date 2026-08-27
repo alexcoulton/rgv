@@ -23,6 +23,8 @@ pub enum TrackFrameKey {
 /// alone cannot identify which row the user selected.
 pub type TrackPane = TrackChannel;
 
+pub const TRACK_HEADER_HEIGHT: f32 = 22.0;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AlignmentSubtrack {
     Reference,
@@ -127,6 +129,64 @@ impl PaneLayoutSnapshot {
             stack_scroll_points: 0.0,
             items: Vec::new(),
         }
+    }
+
+    /// Reprojects every canonical pane row into the current scrolled viewport.
+    ///
+    /// `items` deliberately retains rows that are fully clipped. Keeping the
+    /// complete ordered tree here means a fast scroll can expose a row without
+    /// requiring a renderer rebuild, while the zero-height projected rectangles
+    /// keep clipped rows out of hit testing and accessibility geometry.
+    pub fn reproject_scroll(&mut self, scroll_points: f32) {
+        self.scroll_points = scroll_points;
+        let offset = if self.channel == TrackPane::Annotation {
+            scroll_points
+        } else {
+            0.0
+        };
+        for item in &mut self.items {
+            let natural_row = Rect::from_min_max(
+                pos2(self.pane_rect.left(), item.frame.top - offset),
+                pos2(self.pane_rect.right(), item.frame.bottom - offset),
+            );
+            item.row_rect = clipped_or_empty_at_edge(natural_row, self.pane_rect);
+            item.clip_rect = item.row_rect;
+
+            let natural_header = Rect::from_min_max(
+                natural_row.min,
+                pos2(
+                    natural_row.right(),
+                    (natural_row.top() + TRACK_HEADER_HEIGHT).min(natural_row.bottom()),
+                ),
+            );
+            item.header_rect = clipped_or_empty_at_edge(natural_header, item.row_rect);
+            item.content_rect = (!matches!(item.id, PresentationNodeId::Group { .. })
+                && item.effective_content_visible)
+                .then(|| {
+                    let natural_content = Rect::from_min_max(
+                        pos2(natural_row.left(), natural_header.bottom()),
+                        natural_row.max,
+                    );
+                    clipped_or_empty_at_edge(natural_content, item.row_rect)
+                })
+                .filter(|rect| rect.height() > 0.0);
+        }
+    }
+}
+
+fn clipped_or_empty_at_edge(rect: Rect, clip: Rect) -> Rect {
+    if rect.bottom() <= clip.top() {
+        Rect::from_min_max(
+            pos2(clip.left(), clip.top()),
+            pos2(clip.right(), clip.top()),
+        )
+    } else if rect.top() >= clip.bottom() {
+        Rect::from_min_max(
+            pos2(clip.left(), clip.bottom()),
+            pos2(clip.right(), clip.bottom()),
+        )
+    } else {
+        rect.intersect(clip)
     }
 }
 

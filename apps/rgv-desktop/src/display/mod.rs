@@ -5,7 +5,7 @@ pub(crate) mod hit_test;
 use super::*;
 
 pub(super) const COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT: f32 = 20.0;
-pub(super) const READ_PANE_HEADER_HEIGHT: f32 = 22.0;
+pub(super) const READ_PANE_HEADER_HEIGHT: f32 = ui::TRACK_HEADER_HEIGHT;
 pub(super) const PINNED_ALIGNMENT_REFERENCE_HEIGHT: f32 = 28.0;
 pub(super) const PINNED_ALIGNMENT_COVERAGE_HEIGHT: f32 = 48.0;
 pub(super) const PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT: f32 = 52.0;
@@ -169,11 +169,31 @@ pub(crate) fn ensure_annotation_presentation_frames(
 /// changing controller/source order. Layout producers may emit their natural
 /// geometry independently; this composition boundary translates both their
 /// primitives and chrome as one immutable segment.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn reflow_annotation_presentation(
     presentation: &WorkspacePresentation,
     frames: &mut Vec<TrackFrame>,
     display: &mut DisplayList,
     pane_top: f32,
+) -> f32 {
+    reflow_annotation_presentation_with_heights(
+        presentation,
+        frames,
+        display,
+        pane_top,
+        &BTreeMap::new(),
+    )
+}
+
+/// Reflows annotation rows using the workspace-wide height allocated to each
+/// presentation node. A locus may render less content at its current LOD, but
+/// it still owns the same row geometry as every other locus.
+pub(crate) fn reflow_annotation_presentation_with_heights(
+    presentation: &WorkspacePresentation,
+    frames: &mut Vec<TrackFrame>,
+    display: &mut DisplayList,
+    pane_top: f32,
+    shared_heights: &BTreeMap<PresentationNodeId, f32>,
 ) -> f32 {
     let mut annotation = frames
         .iter()
@@ -211,9 +231,14 @@ pub(crate) fn reflow_annotation_presentation(
     for frame in &mut annotation {
         let old_top = frame.top;
         let old_bottom = frame.bottom;
-        let height = (old_bottom - old_top).max(0.0);
+        let natural_height = (old_bottom - old_top).max(0.0);
+        let height = shared_heights
+            .get(&pane_layout_item_id(frame))
+            .copied()
+            .map_or(natural_height, |shared| shared.max(natural_height));
         let delta = cursor - old_top;
         translate_track_frame(frame, delta);
+        frame.bottom = frame.top + height;
         translations.push((old_top, old_bottom, delta));
         cursor += height;
     }
@@ -236,7 +261,7 @@ pub(crate) fn reflow_annotation_presentation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pane_layout_snapshot(
+pub(crate) fn pane_layout_snapshot(
     presentation: &WorkspacePresentation,
     frames: &[TrackFrame],
     channel: ui::TrackPane,
@@ -254,33 +279,12 @@ fn pane_layout_snapshot(
     let items = frames
         .iter()
         .filter(|frame| frame.channel == channel)
-        .filter_map(|frame| {
+        .map(|frame| {
             let id = pane_layout_item_id(frame);
             let composite = frame
                 .subtracks
                 .iter()
                 .any(|subtrack| subtrack.composite_member.is_some());
-            let offset = if channel == ui::TrackPane::Annotation {
-                scroll_points
-            } else {
-                0.0
-            };
-            let natural_row = egui::Rect::from_min_max(
-                egui::pos2(0.0, frame.top - offset),
-                egui::pos2(width.max(1.0), frame.bottom - offset),
-            );
-            let row_rect = natural_row.intersect(pane_rect);
-            if row_rect.height() <= 0.0 {
-                return None;
-            }
-            let natural_header = egui::Rect::from_min_max(
-                natural_row.min,
-                egui::pos2(
-                    natural_row.right(),
-                    (natural_row.top() + READ_PANE_HEADER_HEIGHT).min(natural_row.bottom()),
-                ),
-            );
-            let header_rect = natural_header.intersect(row_rect);
             let (desired_content_visible, effective_content_visible) = match id {
                 PresentationNodeId::Reference => {
                     let desired = presentation.reference_content_visible;
@@ -308,36 +312,28 @@ fn pane_layout_snapshot(
                         (group.content_visible, group.content_visible)
                     }),
             };
-            let content_rect = (!matches!(id, PresentationNodeId::Group { .. })
-                && effective_content_visible)
-                .then(|| {
-                    egui::Rect::from_min_max(
-                        egui::pos2(row_rect.left(), natural_header.bottom()),
-                        row_rect.max,
-                    )
-                    .intersect(row_rect)
-                })
-                .filter(|rect| rect.height() > 0.0);
-            Some(ui::PaneItemLayout {
+            ui::PaneItemLayout {
                 id,
                 frame: frame.clone(),
-                row_rect,
-                header_rect,
-                content_rect,
-                clip_rect: row_rect,
+                row_rect: egui::Rect::ZERO,
+                header_rect: egui::Rect::ZERO,
+                content_rect: None,
+                clip_rect: egui::Rect::ZERO,
                 desired_content_visible,
                 effective_content_visible,
-            })
+            }
         })
         .collect();
-    ui::PaneLayoutSnapshot {
+    let mut snapshot = ui::PaneLayoutSnapshot {
         channel,
         pane_rect,
         content_bottom,
-        scroll_points,
+        scroll_points: 0.0,
         stack_scroll_points,
         items,
-    }
+    };
+    snapshot.reproject_scroll(scroll_points);
+    snapshot
 }
 
 impl Viewer {
@@ -1402,11 +1398,7 @@ impl Viewer {
             let visible = true;
             let collapsed = !primary_annotation_desired;
             let natural_bottom = top + 26.0;
-            let bottom = if !primary_annotation_effective {
-                natural_bottom
-            } else {
-                alignment_frame_bottom(top, natural_bottom, self.shared_primary_alignment_height)
-            };
+            let bottom = natural_bottom;
             self.panels.active_mut().track_frames.push(TrackFrame {
                 key: TrackFrameKey::Alignment(primary_alignment_id),
                 channel: ui::TrackPane::Annotation,
@@ -1847,9 +1839,9 @@ impl Viewer {
                                 &effective_copy_number_settings,
                                 &member.quantitative,
                                 shared_range,
-                                self.panels.active().annotation_scroll_points
+                                self.panels.annotation_scroll_points
                                     + self.canvas_geometry().viewport.top(),
-                                self.panels.active().annotation_scroll_points + scroll_clip_top,
+                                self.panels.annotation_scroll_points + scroll_clip_top,
                             );
                             if effective_copy_number_settings.show_sample_names {
                                 subtracks.extend(layout.visible_rows.iter().filter_map(|row| {
@@ -1878,9 +1870,9 @@ impl Viewer {
                                 self.panels.active().viewport,
                                 options,
                                 &effective_mutation_settings,
-                                self.panels.active().annotation_scroll_points
+                                self.panels.annotation_scroll_points
                                     + self.canvas_geometry().viewport.top(),
-                                self.panels.active().annotation_scroll_points + scroll_clip_top,
+                                self.panels.annotation_scroll_points + scroll_clip_top,
                             );
                             if effective_mutation_settings.show_sample_names {
                                 subtracks.extend(layout.visible_rows.iter().filter_map(|row| {
@@ -2024,11 +2016,13 @@ impl Viewer {
             top,
         );
         let viewport_top = self.canvas_geometry().viewport.top();
-        top = reflow_annotation_presentation(
+        let shared_annotation_frame_heights = self.shared_annotation_frame_heights.clone();
+        top = reflow_annotation_presentation_with_heights(
             &self.track_presentation,
             &mut self.panels.active_mut().track_frames,
             &mut annotation_display,
             viewport_top,
+            &shared_annotation_frame_heights,
         );
         self.panels
             .active_mut()
@@ -2057,7 +2051,7 @@ impl Viewer {
                     annotation_clip_top,
                     annotation_clip_bottom,
                     annotation_content_bottom,
-                    self.panels.active().annotation_scroll_points,
+                    self.panels.annotation_scroll_points,
                     0.0,
                     self.active_panel_rect().width(),
                 ),
@@ -2196,11 +2190,16 @@ impl Viewer {
             })
             .collect::<Vec<_>>();
         let primary_track_id = self.primary_alignment_track_id();
-        let panel = self.panels.active_mut();
-        panel.annotation_scroll_points = panel.annotation_scroll_points.clamp(
+        let annotation_scroll = self.panels.annotation_scroll_points.clamp(
             0.0,
             (annotation_content_bottom - annotation_clip_bottom).max(0.0),
         );
+        self.panels.annotation_scroll_points = annotation_scroll;
+        let panel = self.panels.active_mut();
+        panel
+            .pane_layout
+            .annotation
+            .reproject_scroll(annotation_scroll);
         let legacy_primary = ReadPanelScrollState {
             scroll_points: panel.vertical_scroll_points,
             content_origin_points: panel.vertical_content_origin_points,
@@ -2246,7 +2245,6 @@ impl Viewer {
             panel.latent_vertical_scroll_fraction = primary.latent_scroll_fraction;
             panel.content_bottom_points = primary.content_bottom_points;
         }
-        let annotation_scroll = self.panels.active().annotation_scroll_points;
         let mut display = std::mem::take(&mut self.panels.active_mut().display_list);
         let rectangle_capacity = display.rectangles.capacity();
         let text_capacity = display.texts.capacity();
@@ -2324,6 +2322,44 @@ impl Viewer {
         {
             return false;
         }
+        self.composite_display_list = composite_panel_display_lists(&self.panels);
+        self.prepare_rectangle_renderer();
+        true
+    }
+
+    /// Applies the one workspace annotation camera to every locus and refreshes
+    /// their cached annotation display lists as a single operation.
+    pub(crate) fn refresh_shared_annotation_scroll_display(
+        &mut self,
+        requested_scroll: f32,
+    ) -> bool {
+        let next = requested_scroll.clamp(0.0, self.panels.maximum_annotation_scroll_points());
+        self.panels.annotation_scroll_points = next;
+        for panel in self.panels.iter_mut() {
+            panel.pane_layout.annotation.reproject_scroll(next);
+        }
+        if self.synthetic
+            || self.display_dirty
+            || self.panels.iter().any(|panel| {
+                !panel
+                    .scroll_display_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.supports_fast_scroll)
+            })
+        {
+            return false;
+        }
+
+        let active_id = self.panels.active().id;
+        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        for panel_id in panel_ids {
+            self.panels.activate(panel_id);
+            if !self.rebuild_active_panel_from_scroll_cache() {
+                self.panels.activate(active_id);
+                return false;
+            }
+        }
+        self.panels.activate(active_id);
         self.composite_display_list = composite_panel_display_lists(&self.panels);
         self.prepare_rectangle_renderer();
         true
@@ -2456,19 +2492,36 @@ impl Viewer {
     pub(crate) fn rebuild_all_panel_displays(&mut self) {
         let active_id = self.panels.active().id;
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
-        self.shared_primary_alignment_height = None;
+        let requested_annotation_scroll = self.panels.annotation_scroll_points;
+        self.shared_annotation_frame_heights.clear();
         for panel_id in &panel_ids {
+            self.panels.annotation_scroll_points = requested_annotation_scroll;
             self.panels.activate(*panel_id);
             self.rebuild_genomic_display();
         }
-        if self.panels.len() > 1
-            && let Some(height) =
-                maximum_alignment_frame_height(&self.panels, self.primary_alignment_track_id())
-        {
-            self.shared_primary_alignment_height = Some(height);
+        if self.panels.len() > 1 {
+            self.shared_annotation_frame_heights = maximum_annotation_frame_heights(&self.panels);
             for panel_id in &panel_ids {
+                self.panels.annotation_scroll_points = requested_annotation_scroll;
                 self.panels.activate(*panel_id);
                 self.rebuild_genomic_display();
+            }
+        }
+
+        // Layout can reduce the legal range after tracks are hidden, grouped,
+        // or collapsed. Clamp once against all panels, then reproject every
+        // cache to the exact same workspace offset.
+        let shared_annotation_scroll =
+            requested_annotation_scroll.clamp(0.0, self.panels.maximum_annotation_scroll_points());
+        let needs_scroll_reprojection = self.panels.iter().any(|panel| {
+            (panel.pane_layout.annotation.scroll_points - shared_annotation_scroll).abs()
+                > f32::EPSILON
+        });
+        self.panels.annotation_scroll_points = shared_annotation_scroll;
+        if needs_scroll_reprojection {
+            for panel_id in &panel_ids {
+                self.panels.activate(*panel_id);
+                let _ = self.rebuild_active_panel_from_scroll_cache();
             }
         }
         self.panels.activate(active_id);

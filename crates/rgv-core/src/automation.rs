@@ -1122,6 +1122,8 @@ pub struct AutomationPanelSnapshot {
     pub vertical_scroll_points: f32,
     #[serde(default)]
     pub maximum_vertical_scroll_points: f32,
+    /// Workspace-wide annotation camera, repeated per panel so existing
+    /// automation consumers do not require a schema change.
     #[serde(default)]
     pub annotation_scroll_points: f32,
     #[serde(default)]

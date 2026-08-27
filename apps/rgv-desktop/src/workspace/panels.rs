@@ -92,9 +92,6 @@ pub(crate) struct ViewPanelController {
     pub(crate) track_snapshot_interval: Option<GenomicInterval>,
     pub(crate) track_settled_generation: Option<u64>,
     pub(crate) vertical_scroll_points: f32,
-    /// Conventional scroll offset for fixed-height annotation tracks above the
-    /// primary read pane. This is deliberately independent of read density.
-    pub(crate) annotation_scroll_points: f32,
     /// Position of the laid-out scrollable content inside the density-expanded
     /// vertical world. Rendering uses `vertical_scroll_points - origin`, while
     /// the scrollbar and overview use the real world-space camera position.
@@ -130,6 +127,10 @@ pub(crate) const INITIAL_PANEL_ID: PanelId = PanelId::new(1);
 pub(crate) struct PanelWorkspace {
     pub(crate) panels: Vec<ViewPanelController>,
     pub(crate) active: usize,
+    /// One annotation camera is shared by every genomic panel. The left gutter
+    /// describes workspace rows, so a per-panel offset would make that gutter
+    /// truthful for at most one locus at a time.
+    pub(crate) annotation_scroll_points: f32,
 }
 
 impl PanelWorkspace {
@@ -137,6 +138,7 @@ impl PanelWorkspace {
         Self {
             panels: vec![initial],
             active: 0,
+            annotation_scroll_points: 0.0,
         }
     }
 
@@ -156,7 +158,11 @@ impl PanelWorkspace {
             return None;
         }
         let active = panels.iter().position(|panel| panel.id == active_id)?;
-        Some(Self { panels, active })
+        Some(Self {
+            panels,
+            active,
+            annotation_scroll_points: 0.0,
+        })
     }
 
     pub(crate) fn from_session(
@@ -191,7 +197,6 @@ impl PanelWorkspace {
                     contig_length,
                 );
                 panel.vertical_scroll_points = saved.vertical_scroll_points;
-                panel.annotation_scroll_points = saved.annotation_scroll_points;
                 panel.vertical_content_origin_points = saved.vertical_content_origin_points;
                 panel.read_stack_scroll_points = saved.read_stack_scroll_points;
                 panel.read_panel_scrolls = saved
@@ -214,8 +219,18 @@ impl PanelWorkspace {
                 Ok(panel)
             })
             .collect::<Result<Vec<_>>>()?;
-        Self::from_ordered(panels, session.active_panel)
-            .context("session active view panel is unavailable")
+        let annotation_scroll_points = session
+            .panels
+            .iter()
+            .find(|panel| panel.id == session.active_panel)
+            .map_or(0.0, |panel| panel.annotation_scroll_points);
+        let mut workspace = Self::from_ordered(panels, session.active_panel)
+            .context("session active view panel is unavailable")?;
+        // Older sessions could persist different annotation offsets per locus.
+        // The active locus is the least surprising authority when migrating to
+        // the workspace-wide annotation camera.
+        workspace.annotation_scroll_points = annotation_scroll_points;
+        Ok(workspace)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -244,6 +259,22 @@ impl PanelWorkspace {
 
     pub(crate) fn get_mut(&mut self, id: PanelId) -> Option<&mut ViewPanelController> {
         self.panels.iter_mut().find(|panel| panel.id == id)
+    }
+
+    pub(crate) fn maximum_annotation_scroll_points(&self) -> f32 {
+        if self
+            .panels
+            .iter()
+            .any(|panel| panel.scroll_display_cache.is_none())
+        {
+            return 0.0;
+        }
+        self.panels
+            .iter()
+            .filter_map(|panel| panel.scroll_display_cache.as_ref())
+            .map(|cache| (cache.annotation_content_bottom - cache.annotation_clip_bottom).max(0.0))
+            .reduce(f32::min)
+            .unwrap_or(0.0)
     }
 
     pub(crate) fn next_id(&self) -> PanelId {
@@ -337,32 +368,21 @@ pub(crate) fn composite_panel_display_lists(panels: &PanelWorkspace) -> DisplayL
     composite
 }
 
-pub(crate) fn alignment_frame_bottom(
-    frame_top: f32,
-    natural_bottom: f32,
-    shared_height: Option<f32>,
-) -> f32 {
-    shared_height.map_or(natural_bottom, |height| {
-        natural_bottom.max(frame_top + height)
-    })
-}
-
-pub(crate) fn maximum_alignment_frame_height(
+pub(crate) fn maximum_annotation_frame_heights(
     panels: &PanelWorkspace,
-    track_id: TrackId,
-) -> Option<f32> {
-    panels
+) -> BTreeMap<PresentationNodeId, f32> {
+    let mut heights = BTreeMap::new();
+    for item in panels
         .iter()
-        .filter_map(|panel| {
-            panel
-                .pane_layout
-                .annotation
-                .items
-                .iter()
-                .find(|item| item.frame.key == TrackFrameKey::Alignment(track_id))
-                .map(|item| (item.frame.bottom - item.frame.top).max(0.0))
-        })
-        .reduce(f32::max)
+        .flat_map(|panel| panel.pane_layout.annotation.items.iter())
+    {
+        let height = (item.frame.bottom - item.frame.top).max(0.0);
+        heights
+            .entry(item.id)
+            .and_modify(|maximum: &mut f32| *maximum = maximum.max(height))
+            .or_insert(height);
+    }
+    heights
 }
 
 impl ViewPanelController {
@@ -414,7 +434,6 @@ impl ViewPanelController {
             track_snapshot_interval: None,
             track_settled_generation: None,
             vertical_scroll_points: 0.0,
-            annotation_scroll_points: 0.0,
             vertical_content_origin_points: 0.0,
             read_stack_scroll_points: 0.0,
             read_stack_content_bottom_points: 0.0,

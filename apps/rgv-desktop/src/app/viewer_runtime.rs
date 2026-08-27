@@ -427,7 +427,7 @@ impl Viewer {
             workspace_layout,
             genomic_canvas_layer_id: None,
             composite_display_list: DisplayList::default(),
-            shared_primary_alignment_height: None,
+            shared_annotation_frame_heights: BTreeMap::new(),
             alignment_tracks,
             empty_alignment: EmptyAlignmentState {
                 filters: session_filters.clone(),

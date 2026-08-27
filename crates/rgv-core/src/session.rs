@@ -43,6 +43,8 @@ pub struct SessionViewPanel {
     pub locus: SessionLocus,
     #[serde(default)]
     pub vertical_scroll_points: f32,
+    /// Compatibility projection of the workspace-wide annotation camera.
+    /// Current writers store the same value in every panel.
     #[serde(default)]
     pub annotation_scroll_points: f32,
     #[serde(default)]

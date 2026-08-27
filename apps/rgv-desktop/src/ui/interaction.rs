@@ -212,20 +212,12 @@ impl Viewer {
     }
 
     pub(crate) fn scroll_annotations_by(&mut self, points: f32) {
-        let maximum = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(0.0, |cache| {
-                (cache.annotation_content_bottom - cache.annotation_clip_bottom).max(0.0)
-            });
-        let next = (self.panels.active().annotation_scroll_points + points).clamp(0.0, maximum);
-        if (next - self.panels.active().annotation_scroll_points).abs() <= f32::EPSILON {
+        let maximum = self.panels.maximum_annotation_scroll_points();
+        let next = (self.panels.annotation_scroll_points + points).clamp(0.0, maximum);
+        if (next - self.panels.annotation_scroll_points).abs() <= f32::EPSILON {
             return;
         }
-        self.panels.active_mut().annotation_scroll_points = next;
-        if self.synthetic || !self.refresh_active_panel_scroll_display() {
+        if !self.refresh_shared_annotation_scroll_display(next) {
             self.display_dirty = true;
         }
         self.window.request_redraw();
@@ -1382,7 +1374,7 @@ impl Viewer {
                     if read_panel {
                         0.0
                     } else {
-                        panel.annotation_scroll_points
+                        self.panels.annotation_scroll_points
                     },
                     if read_panel {
                         frame.top

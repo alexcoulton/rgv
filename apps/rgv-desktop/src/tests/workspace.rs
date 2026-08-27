@@ -778,8 +778,7 @@ fn session_panel_workspace_restores_order_active_locus_and_width() {
     assert_eq!(workspace.active().id, PanelId::new(4));
     assert!((workspace.panels[0].vertical_scroll_points - 73.0).abs() < f32::EPSILON);
     assert!((workspace.panels[1].vertical_scroll_points - 145.0).abs() < f32::EPSILON);
-    assert!((workspace.panels[0].annotation_scroll_points - 19.0).abs() < f32::EPSILON);
-    assert!((workspace.panels[1].annotation_scroll_points - 81.0).abs() < f32::EPSILON);
+    assert!((workspace.annotation_scroll_points - 81.0).abs() < f32::EPSILON);
     assert!((workspace.panels[0].vertical_content_origin_points - 33.0).abs() < f32::EPSILON);
     assert!((workspace.panels[1].vertical_content_origin_points - 105.0).abs() < f32::EPSILON);
     assert!((workspace.panels[1].effective_vertical_scroll_points() - 40.0).abs() < f32::EPSILON);
@@ -883,35 +882,43 @@ fn multi_panel_composite_export_matches_reviewed_golden_hash() {
 }
 
 #[test]
-fn multi_panel_alignment_geometry_uses_the_tallest_primary_frame() {
-    let track_id = TrackId::new(5);
+fn multi_panel_annotation_geometry_uses_the_tallest_frame_for_every_row() {
+    let alignment_id = TrackId::new(5);
+    let auxiliary_id = TrackId::new(6);
     let add_layout = |panel: &mut ViewPanelController| {
-        let frame = panel.track_frames[0].clone();
-        let row_rect =
-            egui::Rect::from_min_max(egui::pos2(0.0, frame.top), egui::pos2(100.0, frame.bottom));
-        panel.pane_layout.annotation.items.push(ui::PaneItemLayout {
-            id: PresentationNodeId::Track {
-                channel: ui::TrackPane::Annotation,
-                track_id,
-            },
-            frame,
-            row_rect,
-            header_rect: egui::Rect::from_min_max(
-                row_rect.min,
-                egui::pos2(row_rect.right(), row_rect.top() + 22.0),
-            ),
-            content_rect: Some(egui::Rect::from_min_max(
-                egui::pos2(row_rect.left(), row_rect.top() + 22.0),
-                row_rect.max,
-            )),
-            clip_rect: row_rect,
-            desired_content_visible: true,
-            effective_content_visible: true,
-        });
+        for frame in panel.track_frames.clone() {
+            let track_id = match frame.key {
+                TrackFrameKey::Alignment(track_id) | TrackFrameKey::Auxiliary(track_id) => track_id,
+                TrackFrameKey::Reference | TrackFrameKey::Group { .. } => unreachable!(),
+            };
+            let row_rect = egui::Rect::from_min_max(
+                egui::pos2(0.0, frame.top),
+                egui::pos2(100.0, frame.bottom),
+            );
+            panel.pane_layout.annotation.items.push(ui::PaneItemLayout {
+                id: PresentationNodeId::Track {
+                    channel: ui::TrackPane::Annotation,
+                    track_id,
+                },
+                frame,
+                row_rect,
+                header_rect: egui::Rect::from_min_max(
+                    row_rect.min,
+                    egui::pos2(row_rect.right(), row_rect.top() + 22.0),
+                ),
+                content_rect: Some(egui::Rect::from_min_max(
+                    egui::pos2(row_rect.left(), row_rect.top() + 22.0),
+                    row_rect.max,
+                )),
+                clip_rect: row_rect,
+                desired_content_visible: true,
+                effective_content_visible: true,
+            });
+        }
     };
     let mut first = test_panel(7);
     first.track_frames.push(TrackFrame {
-        key: TrackFrameKey::Alignment(track_id),
+        key: TrackFrameKey::Alignment(alignment_id),
         channel: ui::TrackPane::Annotation,
         name: "Reads".to_owned(),
         kind: TrackKind::Alignment,
@@ -923,10 +930,23 @@ fn multi_panel_alignment_geometry_uses_the_tallest_primary_frame() {
         frozen_bottom: None,
         subtracks: Vec::new(),
     });
+    first.track_frames.push(TrackFrame {
+        key: TrackFrameKey::Auxiliary(auxiliary_id),
+        channel: ui::TrackPane::Annotation,
+        name: "Genes".to_owned(),
+        kind: TrackKind::GeneModel,
+        source_label: None,
+        top: 220.0,
+        bottom: 520.0,
+        visible: true,
+        collapsed: false,
+        frozen_bottom: None,
+        subtracks: Vec::new(),
+    });
     add_layout(&mut first);
     let mut second = test_panel(2);
     second.track_frames.push(TrackFrame {
-        key: TrackFrameKey::Alignment(track_id),
+        key: TrackFrameKey::Alignment(alignment_id),
         channel: ui::TrackPane::Annotation,
         name: "Reads".to_owned(),
         kind: TrackKind::Alignment,
@@ -938,14 +958,62 @@ fn multi_panel_alignment_geometry_uses_the_tallest_primary_frame() {
         frozen_bottom: None,
         subtracks: Vec::new(),
     });
+    second.track_frames.push(TrackFrame {
+        key: TrackFrameKey::Auxiliary(auxiliary_id),
+        channel: ui::TrackPane::Annotation,
+        name: "Genes".to_owned(),
+        kind: TrackKind::GeneModel,
+        source_label: None,
+        top: 460.0,
+        bottom: 540.0,
+        visible: true,
+        collapsed: false,
+        frozen_bottom: None,
+        subtracks: Vec::new(),
+    });
     add_layout(&mut second);
     let mut workspace = PanelWorkspace::new(first);
     assert!(workspace.push(second));
 
-    let shared = maximum_alignment_frame_height(&workspace, track_id);
-    assert_eq!(shared, Some(360.0));
-    assert!((alignment_frame_bottom(100.0, 220.0, shared) - 460.0).abs() < f32::EPSILON);
-    assert!((alignment_frame_bottom(100.0, 500.0, shared) - 500.0).abs() < f32::EPSILON);
+    let shared = maximum_annotation_frame_heights(&workspace);
+    assert_eq!(
+        shared.get(&PresentationNodeId::Track {
+            channel: ui::TrackPane::Annotation,
+            track_id: alignment_id,
+        }),
+        Some(&360.0)
+    );
+    assert_eq!(
+        shared.get(&PresentationNodeId::Track {
+            channel: ui::TrackPane::Annotation,
+            track_id: auxiliary_id,
+        }),
+        Some(&300.0)
+    );
+}
+
+#[test]
+fn workspace_annotation_camera_uses_the_range_available_to_every_panel() {
+    let cache = |content_bottom, clip_bottom| PanelScrollDisplayCache {
+        annotations: DisplayList::default(),
+        pinned: DisplayList::default(),
+        annotation_overview: ui::ScrollbarOverview::default(),
+        annotation_content_bottom: content_bottom,
+        annotation_clip_top: 0.0,
+        annotation_clip_bottom: clip_bottom,
+        supports_fast_scroll: true,
+        read_panels: Vec::new(),
+    };
+    let mut first = test_panel(7);
+    first.scroll_display_cache = Some(cache(500.0, 300.0));
+    let mut second = test_panel(2);
+    second.scroll_display_cache = Some(cache(420.0, 300.0));
+    let mut workspace = PanelWorkspace::new(first);
+    assert!(workspace.push(second));
+
+    assert_eq!(workspace.maximum_annotation_scroll_points(), 120.0);
+    workspace.annotation_scroll_points = 95.0;
+    assert_eq!(workspace.annotation_scroll_points, 95.0);
 }
 
 #[test]

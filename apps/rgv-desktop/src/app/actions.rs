@@ -95,7 +95,41 @@ fn presentation_keyboard_move(
     }
 }
 
+fn resize_stop_actions_on_pointer_release(
+    pointer_down: bool,
+    annotation: Option<TrackFrameKey>,
+    read_track: Option<TrackId>,
+    read_pane: bool,
+) -> Vec<TrackUiAction> {
+    if pointer_down {
+        return Vec::new();
+    }
+    annotation
+        .map(TrackUiAction::ResizeAnnotationStopped)
+        .into_iter()
+        .chain(read_track.map(TrackUiAction::ResizeReadTrackStopped))
+        .chain(read_pane.then_some(TrackUiAction::ResizeReadPaneStopped))
+        .collect()
+}
+
 impl Viewer {
+    pub(crate) fn append_pointer_release_resize_actions(
+        &self,
+        pointer_down: bool,
+        actions: &mut Vec<TrackUiAction>,
+    ) {
+        for action in resize_stop_actions_on_pointer_release(
+            pointer_down,
+            self.resizing_annotation_track.map(|(key, _)| key),
+            self.resizing_read_track.map(|(track_id, _)| track_id),
+            self.resizing_read_pane.is_some(),
+        ) {
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
+        }
+    }
+
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub(crate) fn dispatch_track_actions(
         &mut self,
@@ -670,5 +704,26 @@ mod tests {
 
         assert!(visible);
         assert!(!collapsed);
+    }
+
+    #[test]
+    fn pointer_release_stops_resize_gestures_even_when_their_rows_are_not_painted() {
+        let annotation = TrackFrameKey::Auxiliary(TrackId::new(7));
+        assert_eq!(
+            resize_stop_actions_on_pointer_release(
+                false,
+                Some(annotation),
+                Some(TrackId::new(8)),
+                true,
+            ),
+            vec![
+                TrackUiAction::ResizeAnnotationStopped(annotation),
+                TrackUiAction::ResizeReadTrackStopped(TrackId::new(8)),
+                TrackUiAction::ResizeReadPaneStopped,
+            ]
+        );
+        assert!(
+            resize_stop_actions_on_pointer_release(true, Some(annotation), None, false).is_empty()
+        );
     }
 }

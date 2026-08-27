@@ -523,6 +523,11 @@ impl Viewer {
         let mut native_properties_resize_active = false;
         let pane_layout = self.panels.active().pane_layout.clone();
         let track_frames = pane_layout.frames().cloned().collect::<Vec<_>>();
+        let shared_annotation_maximum = self.panels.maximum_annotation_scroll_points();
+        let shared_annotation_offset = self
+            .panels
+            .annotation_scroll_points
+            .clamp(0.0, shared_annotation_maximum);
         let selected_annotation_track_ids = self
             .panels
             .active()
@@ -552,9 +557,7 @@ impl Viewer {
             .iter()
             .enumerate()
             .map(|(index, panel)| {
-                let annotation_maximum = panel.scroll_display_cache.as_ref().map_or(0.0, |cache| {
-                    (cache.annotation_content_bottom - cache.annotation_clip_bottom).max(0.0)
-                });
+                let annotation_maximum = shared_annotation_maximum;
                 let annotation_clip_bottom = panel
                     .scroll_display_cache
                     .as_ref()
@@ -607,9 +610,7 @@ impl Viewer {
                     index,
                     panel_id: panel.id,
                     annotation_maximum,
-                    annotation_offset: panel
-                        .annotation_scroll_points
-                        .clamp(0.0, annotation_maximum),
+                    annotation_offset: shared_annotation_offset,
                     annotation_overview: panel
                         .scroll_display_cache
                         .as_ref()
@@ -1581,7 +1582,7 @@ impl Viewer {
                     ui,
                     geometry,
                     &track_frames,
-                    self.panels.active().annotation_scroll_points,
+                    self.panels.annotation_scroll_points,
                     0.0,
                     annotation_clip_top,
                     annotation_clip_bottom,
@@ -2646,20 +2647,14 @@ impl Viewer {
         self.handle_overview_interaction(overview_interaction);
         self.active_stack_scrollbar_gesture = None;
         for workspace in &mut workspace_scrollbars {
-            let current_annotation_offset = self
-                .panels
-                .get(workspace.panel_id)
-                .map_or(0.0, |panel| panel.annotation_scroll_points);
             if workspace.annotation_interaction.pointer_down
-                || (workspace.annotation_offset - current_annotation_offset).abs() > f32::EPSILON
+                || (workspace.annotation_offset - shared_annotation_offset).abs() > f32::EPSILON
             {
                 if workspace.annotation_interaction.pointer_down {
                     self.active_stack_scrollbar_gesture =
                         Some((workspace.panel_id, ui::TrackPane::Annotation));
                 }
-                self.activate_view_panel(workspace.panel_id);
-                self.panels.active_mut().annotation_scroll_points = workspace.annotation_offset;
-                if self.synthetic || !self.refresh_active_panel_scroll_display() {
+                if !self.refresh_shared_annotation_scroll_display(workspace.annotation_offset) {
                     self.display_dirty = true;
                 }
                 self.window.request_redraw();
@@ -2789,6 +2784,11 @@ impl Viewer {
                 )
             }));
         }
+        self.append_pointer_release_resize_actions(
+            self.egui_context
+                .input(|input| input.pointer.primary_down()),
+            &mut track_ui_actions,
+        );
         let track_effects = self.dispatch_track_actions(
             track_ui_actions,
             TrackActionDraft {

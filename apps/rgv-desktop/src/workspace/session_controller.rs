@@ -339,7 +339,9 @@ impl Viewer {
                     },
                 );
                 saved.vertical_scroll_points = panel.vertical_scroll_points;
-                saved.annotation_scroll_points = panel.annotation_scroll_points;
+                // Keep the existing per-panel session field as a compatibility
+                // projection of the single workspace annotation camera.
+                saved.annotation_scroll_points = self.panels.annotation_scroll_points;
                 saved.vertical_content_origin_points = panel.vertical_content_origin_points;
                 saved.read_stack_scroll_points = panel.read_stack_scroll_points;
                 saved.read_panel_states = panel

@@ -624,7 +624,9 @@ struct Viewer {
     workspace_layout: WorkspaceLayoutSnapshot,
     genomic_canvas_layer_id: Option<egui::LayerId>,
     composite_display_list: DisplayList,
-    shared_primary_alignment_height: Option<f32>,
+    /// Canonical workspace annotation row heights, keyed by presentation
+    /// identity. Every locus uses this table before its display is clipped.
+    shared_annotation_frame_heights: BTreeMap<PresentationNodeId, f32>,
     alignment_tracks: Vec<AlignmentTrackController>,
     empty_alignment: EmptyAlignmentState,
     alignment_retirement_tasks: Vec<JoinHandle<()>>,
