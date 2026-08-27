@@ -167,8 +167,11 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   When zooming beyond the loaded interval, overlapping retained reads and coverage remain visible
   while throttled background refinements expand the query; release commits one final query.
 - Drag horizontally to pan and use the wheel or trackpad to zoom around the pointer.
-- Annotation tracks occupy the upper pane and reads occupy the lower pane. Every annotation row has
-  an eye control for collapsing or expanding it. Configurable auxiliary annotations expose thin
+- Annotation tracks occupy the upper pane and reads occupy the lower pane. They are independent
+  presentation channels even when both rows refer to the same alignment source. Every row has an
+  eye that controls its content without removing its restore header. Groups have a separate eye
+  (parent visibility gate) and chevron (expand/minimize); changing either preserves each child's
+  individual eye state. Configurable auxiliary annotations expose thin
   horizontal resize boundaries in the left label gutter; the pointer changes to a vertical-resize
   cursor at a boundary. Drag the horizontal divider across the genomic canvas to allocate more
   height to either the annotation pane or the read pane. Annotation heights do not change with
@@ -177,8 +180,9 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   collapsing the complete alignment track.
 - The right edge contains two scrollbar segments on the same x-axis. The upper segment is a
   conventional annotation-stack scrollbar; the lower segment is the read-stack overview and
-  density control. Scrolling over either pane moves only that pane, and the two offsets are saved
-  independently in project sessions.
+  density control. Each alignment read panel also has its own data/density scrollbar. In split
+  workspaces each genomic panel owns a separate set of these controls. Scrolling over any pane or
+  read panel changes only its owning camera, and all offsets are saved independently in projects.
 - The lower read overview is an Ableton-style two-axis control: drag up/down to scroll and
   left/right to compact/expand read rows. Diagonal motion combines both actions,
   density changes retain the row beneath the exact grabbed point, and expansion creates a real
@@ -341,7 +345,9 @@ require an explicit track association so the provenance cannot be ambiguous.
 ### Multiple alignment tracks
 
 Every alignment track has a stable session identity and an independent source, engine, cancellation
-generation, filters, retained query, row layout, visibility, collapsed state, and height. The
+generation, filters, retained query, and row layout. Its annotation and read representations have
+separate ordered presentation nodes, visibility, grouping, and preferred heights. The workspace
+owns the annotation/read divider rather than whichever source happens to be first. The
 **Tracks** menu lists every alignment source, including hidden tracks. **Settings…** opens the same
 complete appearance, grouping, pairing, modification, junction, filtering, and record-cap surface
 for any selected alignment track; partially entered filter text and validation errors remain local
@@ -356,7 +362,7 @@ grouping, pairing, junction, and modification presentation. It deliberately pres
 MAPQ/base-quality filters, SAM-tag predicates, secondary/supplementary inclusion, and record cap.
 
 The decoded-alignment cache is divided when tracks are opened, and the workspace record ceiling is
-allocated fairly among visible tracks as a hard total. Consequently, adding samples does not
+allocated fairly among loaded, queryable tracks as a hard total. Consequently, adding samples does not
 multiply the declared cache or record cap. Read, CIGAR-event, pileup, junction, modification, and
 supplementary-chain inspection first resolves the owning track frame and then reads that track's
 query and dictionary. Alignment sources with a different header order therefore remain safe, and a
@@ -518,11 +524,12 @@ and divide transformations combine two loaded quantitative sources only where bo
 overlapping values; division by zero remains missing. Clicking a source interval opens exact value,
 coordinate, aggregation, scale, arithmetic, and query-cap provenance.
 
-Hiding an auxiliary track removes it from subsequent viewport queries rather than merely hiding
-its drawing. The one exception is a hidden quantitative track used as the operand of a visible
-add, subtract, multiply, or divide track; RGV continues loading that operand until the dependency
-is removed or the derived track is hidden. Hiding an alignment track similarly invalidates its
-unread panel results and stops scheduling new BAM/CRAM queries for it.
+Track eyes are presentation controls: hiding a loaded auxiliary or alignment node does not unload
+its source or erase its retained query. This keeps restoration instant and prevents an annotation
+eye from accidentally starving the corresponding read channel (or vice versa). Source removal is
+the explicit lifecycle operation that cancels future queries and deletes source-owned presentation
+and camera state. A quantitative arithmetic operand remains queryable while its source is loaded,
+regardless of whether its own row is currently painted.
 
 TDF versions 1 through 4 are read directly with `--tdf`, the file dialog, drag-and-drop, or project
 restore. Local files and HTTP/S URLs use indexed range reads: RGV reads the header and master index,
@@ -545,8 +552,9 @@ range. Changing linear versus signed-log scaling on one member updates the compl
 saved session cannot restore incompatible axes. Clear **Overlay with group** to separate a track;
 an optional scale group shares an axis without overlaying geometry. Overlay member labels are
 bounded to the available gutter space, with an explicit omitted-member count for large groups.
-The overlay header eye shows or hides every member atomically; each visible member row also has its
-own eye for independently showing or hiding that layer within the composite.
+The overlay header eye is a parent visibility gate and never rewrites member eyes; showing it again
+restores the previous mixture of member states. Each member row has its own eye for independently
+showing or hiding that layer within the composite.
 
 BEDPE and UCSC 18-column interact files render intra-chromosomal relationships as score-scaled arcs
 or endpoint blocks. Inter-chromosomal records use labelled partner markers. The inspector preserves
@@ -706,10 +714,11 @@ redacted source. Right-click a label to open settings, collapse or expand it, hi
 current view, or remove a track. Drag an alignment or auxiliary label to reorder it and drag its
 bottom separator to resize it. Hidden tracks remain discoverable in the **Tracks** menu.
 
-Version-3 JSON projects preserve ordered panel IDs, loci and read-stack scroll positions, the active
-panel, sources, genome/reference state, auxiliary-track visibility/collapse/height/order, alignment
-and reference custom remote-index URLs, pileup filters, grouping, scales, sample metadata, ROIs,
-review queues, and the workspace
+Version-4 JSON projects preserve ordered panel IDs, loci, annotation/read-stack offsets, every
+per-read-panel camera and density, the active panel, sources, genome/reference state, the normalized
+annotation and read presentation trees, first-class groups, independent eyes/chevrons/preferred
+heights, the workspace divider, alignment and reference custom remote-index URLs, pileup filters,
+scales, sample metadata, ROIs, review queues, and the workspace
 alignment cap. Saving is atomic and runs outside the UI thread. A successful save replaces the
 previous project only after a complete validated JSON file has been flushed; a failed or
 interrupted save leaves the last good project intact.
@@ -718,9 +727,9 @@ The directory containing the project JSON is its explicit project root. Local so
 directory are written as relative paths and move with the directory; sources outside it remain
 absolute. Opening resolves relative sources against the new project location. **File > Unresolved
 project sources** lists every missing reference, cytoband, alignment, or auxiliary source
-individually without hiding healthy tracks. Version-1 and version-2 fixtures migrate to one active
-version-3 panel without changing track order, and future schema versions are rejected rather than
-guessed.
+individually without hiding healthy tracks. Version-1 through version-3 fixtures migrate
+deterministically into the normalized version-4 presentation without changing source order, and
+future schema versions are rejected rather than guessed.
 
 IGV XML import resolves relative resources from the XML file's directory and imports the locus,
 resource names/paths, supported track names, visibility and heights, and alignment coverage or

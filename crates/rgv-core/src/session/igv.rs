@@ -281,6 +281,7 @@ impl SessionDocument {
             }
             report.ignored("Track configuration did not match a Resource and was ignored");
         }
+        document.normalize_presentation();
         document.validate()?;
         Ok(IgvSessionImport {
             document,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -14,7 +14,7 @@ use crate::{
     TrackSource, classify_genomic_source,
 };
 
-pub const SESSION_SCHEMA_VERSION: u32 = 3;
+pub const SESSION_SCHEMA_VERSION: u32 = 4;
 pub const MAXIMUM_ALIGNMENT_TRACKS: usize = 64;
 pub const MAXIMUM_VIEW_PANELS: usize = 16;
 pub const MAXIMUM_CONTIG_ALIASES: usize = 10_000;
@@ -24,6 +24,7 @@ pub const MAXIMUM_REVIEW_NOTE_BYTES: usize = 16_384;
 const MAXIMUM_REMOTE_INDEX_URL_BYTES: usize = 16_384;
 const LEGACY_SESSION_SCHEMA_VERSION: u32 = 1;
 const MULTI_TRACK_SESSION_SCHEMA_VERSION: u32 = 2;
+const MULTI_PANEL_SESSION_SCHEMA_VERSION: u32 = 3;
 
 mod igv;
 #[cfg(test)]
@@ -46,6 +47,28 @@ pub struct SessionViewPanel {
     pub annotation_scroll_points: f32,
     #[serde(default)]
     pub vertical_content_origin_points: f32,
+    /// Conventional parent camera used only when the stack of read-panel
+    /// headers/minimums is taller than the read pane. This is independent of
+    /// every panel's genomic-read density camera.
+    #[serde(default)]
+    pub read_stack_scroll_points: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_panel_states: Vec<SessionReadPanelState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionReadPanelState {
+    pub track_id: TrackId,
+    #[serde(default)]
+    pub scroll_points: f32,
+    #[serde(default)]
+    pub content_origin_points: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latent_scroll_fraction: Option<f32>,
+    #[serde(default)]
+    pub content_bottom_points: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub density: Option<f32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -192,6 +215,8 @@ impl SessionViewPanel {
             vertical_scroll_points: 0.0,
             annotation_scroll_points: 0.0,
             vertical_content_origin_points: 0.0,
+            read_stack_scroll_points: 0.0,
+            read_panel_states: Vec::new(),
         }
     }
 }
@@ -454,7 +479,10 @@ pub struct SessionFilters {
     pub sashimi_count_mode: SashimiCountMode,
     #[serde(default = "default_true")]
     pub show_junction_labels: bool,
-    #[serde(default = "default_true")]
+    /// Legacy read-channel visibility. Schema-four writers persist the
+    /// canonical Reads presentation node instead; this remains readable only
+    /// so older sessions can migrate without losing the eye state.
+    #[serde(default = "default_true", skip_serializing)]
     pub show_reads: bool,
     #[serde(default)]
     pub coverage_scale_maximum: Option<u32>,
@@ -562,40 +590,817 @@ pub struct SessionAlignmentTrack {
     pub remote_index_url: Option<String>,
     #[serde(default)]
     pub sample_key: Option<String>,
-    #[serde(default = "default_true")]
+    /// Legacy source/presentation visibility, consumed only while migrating
+    /// pre-schema-four sessions.
+    #[serde(default = "default_true", skip_serializing)]
     pub visible: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub collapsed: bool,
-    /// Optional presentation group for alignment tracks. Group membership is
-    /// independent of alignment read grouping and quantitative overlays.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy annotation-group membership, read only during migration.
+    #[serde(default, skip_serializing)]
     pub track_group: Option<u32>,
-    /// Whether the complete presentation group is minimized. The value is
-    /// mirrored across every member so projects remain self-contained when
-    /// tracks are reordered or removed.
-    #[serde(default)]
+    /// Legacy annotation-group expansion flag, read only during migration.
+    #[serde(default, skip_serializing)]
     pub track_group_collapsed: bool,
-    /// Optional presentation group for the read-data pane. This is deliberately
-    /// independent from `track_group`, which groups annotation summaries.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy read-group membership, read only during migration.
+    #[serde(default, skip_serializing)]
     pub read_track_group: Option<u32>,
-    /// Whether this track's read-data group is minimized.
-    #[serde(default)]
+    /// Legacy read-group expansion flag, read only during migration.
+    #[serde(default, skip_serializing)]
     pub read_track_group_collapsed: bool,
-    #[serde(default = "default_alignment_track_height")]
+    #[serde(default = "default_alignment_track_height", skip_serializing)]
     pub height: f32,
-    /// Optional independently resized height of this track's annotation
-    /// summary. The shared read-pane height remains in `height`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy annotation preferred height, read only during migration.
+    #[serde(default, skip_serializing)]
     pub annotation_height: Option<f32>,
-    /// Optional independently resized height of this sample's read group
-    /// inside the shared, scrollable read pane.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy read preferred height, read only during migration.
+    #[serde(default, skip_serializing)]
     pub read_group_height: Option<f32>,
     #[serde(default)]
     pub filters: SessionFilters,
     #[serde(default = "default_maximum_alignments")]
     pub maximum_alignments: usize,
+}
+
+/// The independent presentation channel in which a source track appears.
+/// A single alignment source normally has one node in each channel.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackChannel {
+    Annotation,
+    Reads,
+}
+
+/// Pane-local state for one loaded source. Vector order is the persisted order
+/// within the channel and is intentionally independent between channels.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionPaneTrackState {
+    pub channel: TrackChannel,
+    pub track_id: TrackId,
+    #[serde(default = "default_true")]
+    pub content_visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_height: Option<f32>,
+}
+
+/// A presentation group is stored once rather than mirrored on every member.
+/// Expansion controls whether member rows are shown; content visibility is the
+/// independent group-eye state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionPresentationGroup {
+    pub id: u32,
+    pub label: String,
+    pub channel: TrackChannel,
+    pub members: Vec<TrackId>,
+    #[serde(default = "default_true")]
+    pub expanded: bool,
+    #[serde(default = "default_true")]
+    pub content_visible: bool,
+}
+
+/// Parent visibility for a data-composition object such as a quantitative
+/// overlay. Member nodes retain their individual desired eye states; toggling
+/// this gate must never rewrite them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionPresentationComposite {
+    pub channel: TrackChannel,
+    pub id: u32,
+    #[serde(default = "default_true")]
+    pub content_visible: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkspacePresentation {
+    #[serde(default = "default_alignment_track_height")]
+    pub read_pane_height: f32,
+    #[serde(default = "default_true")]
+    pub reference_content_visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_preferred_height: Option<f32>,
+    #[serde(default)]
+    pub pane_tracks: Vec<SessionPaneTrackState>,
+    #[serde(default)]
+    pub groups: Vec<SessionPresentationGroup>,
+    #[serde(default)]
+    pub composites: Vec<SessionPresentationComposite>,
+    /// Monotonic allocator for presentation-group identities. IDs are never
+    /// recycled, so a stale UI or automation reference cannot silently target
+    /// a later, unrelated group.
+    #[serde(default = "default_next_presentation_group_id")]
+    pub next_group_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PresentationNodeId {
+    Reference,
+    Track {
+        channel: TrackChannel,
+        track_id: TrackId,
+    },
+    Group {
+        channel: TrackChannel,
+        group_id: u32,
+    },
+}
+
+impl PresentationNodeId {
+    #[must_use]
+    pub const fn channel(self) -> TrackChannel {
+        match self {
+            Self::Reference => TrackChannel::Annotation,
+            Self::Track { channel, .. } | Self::Group { channel, .. } => channel,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrackIntent {
+    SetNodeVisibility {
+        target: PresentationNodeId,
+        visible: bool,
+    },
+    SetGroupExpanded {
+        target: PresentationNodeId,
+        expanded: bool,
+    },
+    SetGroupVisibility {
+        target: PresentationNodeId,
+        visible: bool,
+    },
+    SetCompositeVisibility {
+        channel: TrackChannel,
+        composite_id: u32,
+        visible: bool,
+    },
+    ResizeNode {
+        target: PresentationNodeId,
+        preferred_height: f32,
+    },
+    ResizeReadPane {
+        height: f32,
+    },
+    GroupNodes {
+        channel: TrackChannel,
+        members: Vec<TrackId>,
+    },
+    Ungroup {
+        target: PresentationNodeId,
+    },
+    MoveNode {
+        target: PresentationNodeId,
+        before: Option<PresentationNodeId>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TrackChangeSet {
+    pub presentation_changed: bool,
+    pub layout_changed: bool,
+    pub query_demand_changed: BTreeSet<TrackId>,
+    pub selection_changed: bool,
+    pub persistence_changed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum TrackIntentError {
+    #[error("presentation node is unavailable")]
+    MissingNode,
+    #[error("track group members must form one contiguous range")]
+    NonContiguousGroup,
+    #[error("a grouped member must be explicitly ungrouped before it can move independently")]
+    GroupMemberMove,
+    #[error("a grouped track must be explicitly ungrouped before it can be regrouped")]
+    AlreadyGrouped,
+    #[error("presentation size is invalid")]
+    InvalidSize,
+    #[error("presentation move crosses channels")]
+    CrossChannelMove,
+}
+
+impl Default for WorkspacePresentation {
+    fn default() -> Self {
+        Self {
+            read_pane_height: default_alignment_track_height(),
+            reference_content_visible: true,
+            reference_preferred_height: None,
+            pane_tracks: Vec::new(),
+            groups: Vec::new(),
+            composites: Vec::new(),
+            next_group_id: default_next_presentation_group_id(),
+        }
+    }
+}
+
+const fn default_next_presentation_group_id() -> u32 {
+    1
+}
+
+impl WorkspacePresentation {
+    fn repair_group_allocator(&mut self) {
+        let minimum = self
+            .groups
+            .iter()
+            .map(|group| group.id)
+            .max()
+            .unwrap_or_default()
+            .saturating_add(1)
+            .max(default_next_presentation_group_id());
+        self.next_group_id = self.next_group_id.max(minimum);
+    }
+
+    /// Reconciles presentation-node lifetime with loaded source lifetime while
+    /// preserving every existing eye, size, order, and group decision. New
+    /// source nodes receive the supplied defaults; missing sources are the
+    /// only nodes removed. Runtime and session normalization share this path
+    /// so their repair semantics cannot drift.
+    pub fn reconcile_sources(
+        &mut self,
+        alignment_sources: &[(TrackId, Option<f32>, Option<f32>)],
+        auxiliary_sources: &[(TrackId, Option<f32>)],
+    ) {
+        let alignment = alignment_sources
+            .iter()
+            .map(|(track_id, annotation_height, read_height)| {
+                (*track_id, (*annotation_height, *read_height))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let auxiliary = auxiliary_sources
+            .iter()
+            .copied()
+            .collect::<BTreeMap<_, _>>();
+        self.pane_tracks.retain(|node| match node.channel {
+            TrackChannel::Annotation => {
+                alignment.contains_key(&node.track_id) || auxiliary.contains_key(&node.track_id)
+            }
+            TrackChannel::Reads => alignment.contains_key(&node.track_id),
+        });
+        for (track_id, annotation_height, read_height) in alignment_sources {
+            for (channel, preferred_height) in [
+                (TrackChannel::Annotation, *annotation_height),
+                (TrackChannel::Reads, *read_height),
+            ] {
+                if self.pane_track_state(channel, *track_id).is_none() {
+                    self.pane_tracks.push(SessionPaneTrackState {
+                        channel,
+                        track_id: *track_id,
+                        content_visible: true,
+                        preferred_height,
+                    });
+                }
+            }
+        }
+        for (track_id, preferred_height) in auxiliary_sources {
+            if self
+                .pane_track_state(TrackChannel::Annotation, *track_id)
+                .is_none()
+            {
+                self.pane_tracks.push(SessionPaneTrackState {
+                    channel: TrackChannel::Annotation,
+                    track_id: *track_id,
+                    content_visible: true,
+                    preferred_height: *preferred_height,
+                });
+            }
+        }
+        let mut claimed = BTreeSet::new();
+        for group in &mut self.groups {
+            group.members.retain(|member| {
+                let loaded = match group.channel {
+                    TrackChannel::Annotation => {
+                        alignment.contains_key(member) || auxiliary.contains_key(member)
+                    }
+                    TrackChannel::Reads => alignment.contains_key(member),
+                };
+                loaded && claimed.insert((group.channel, *member))
+            });
+        }
+        self.groups.retain(|group| group.members.len() >= 2);
+        self.repair_group_allocator();
+    }
+
+    /// Reconciles presentation-only parent gates for data-composition objects.
+    /// Existing values survive member reorder and ordinary eye changes.
+    pub fn reconcile_composites(&mut self, channel: TrackChannel, ids: &BTreeSet<u32>) {
+        self.composites
+            .retain(|composite| composite.channel != channel || ids.contains(&composite.id));
+        for id in ids {
+            if !self
+                .composites
+                .iter()
+                .any(|composite| composite.channel == channel && composite.id == *id)
+            {
+                self.composites.push(SessionPresentationComposite {
+                    channel,
+                    id: *id,
+                    content_visible: true,
+                });
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn composite_content_visible(&self, channel: TrackChannel, id: u32) -> bool {
+        self.composites
+            .iter()
+            .find(|composite| composite.channel == channel && composite.id == id)
+            .is_none_or(|composite| composite.content_visible)
+    }
+
+    #[must_use]
+    pub fn from_legacy(
+        alignment_tracks: &[SessionAlignmentTrack],
+        auxiliary_tracks: &[TrackConfig],
+    ) -> Self {
+        let mut pane_tracks =
+            Vec::with_capacity(alignment_tracks.len().saturating_mul(2) + auxiliary_tracks.len());
+        pane_tracks.extend(alignment_tracks.iter().map(|track| SessionPaneTrackState {
+            channel: TrackChannel::Annotation,
+            track_id: track.id,
+            content_visible: track.visible && !track.collapsed,
+            preferred_height: track.annotation_height,
+        }));
+        pane_tracks.extend(auxiliary_tracks.iter().map(|track| SessionPaneTrackState {
+            channel: TrackChannel::Annotation,
+            track_id: track.id,
+            content_visible: track.visible && !track.collapsed,
+            preferred_height: Some(track.height),
+        }));
+        pane_tracks.extend(alignment_tracks.iter().map(|track| {
+            SessionPaneTrackState {
+                channel: TrackChannel::Reads,
+                track_id: track.id,
+                content_visible: track.visible && track.filters.show_reads,
+                preferred_height: track
+                    .read_group_height
+                    .or(Some(track.height.clamp(40.0, 1_200.0))),
+            }
+        }));
+
+        let mut groups = Vec::new();
+        for channel in [TrackChannel::Annotation, TrackChannel::Reads] {
+            let mut members = std::collections::BTreeMap::<u32, Vec<TrackId>>::new();
+            let mut collapsed = BTreeSet::<u32>::new();
+            for track in alignment_tracks {
+                let (group, is_collapsed) = match channel {
+                    TrackChannel::Annotation => (track.track_group, track.track_group_collapsed),
+                    TrackChannel::Reads => {
+                        (track.read_track_group, track.read_track_group_collapsed)
+                    }
+                };
+                if let Some(group) = group {
+                    members.entry(group).or_default().push(track.id);
+                    if is_collapsed {
+                        collapsed.insert(group);
+                    }
+                }
+            }
+            groups.extend(members.into_iter().filter_map(|(id, members)| {
+                (members.len() > 1).then(|| SessionPresentationGroup {
+                    id,
+                    label: format!("Group {id}"),
+                    channel,
+                    members,
+                    expanded: !collapsed.contains(&id),
+                    content_visible: true,
+                })
+            }));
+        }
+        Self {
+            read_pane_height: alignment_tracks
+                .first()
+                .map_or_else(default_alignment_track_height, |track| {
+                    track.height.clamp(100.0, 1_200.0)
+                }),
+            reference_content_visible: true,
+            reference_preferred_height: None,
+            pane_tracks,
+            next_group_id: groups
+                .iter()
+                .map(|group| group.id)
+                .max()
+                .unwrap_or_default()
+                .saturating_add(1)
+                .max(default_next_presentation_group_id()),
+            groups,
+            composites: Vec::new(),
+        }
+    }
+
+    /// Returns the ordered root nodes for one pane. Group members occupy one
+    /// root slot represented by the group identity; ungrouped tracks remain
+    /// ordinary root nodes. This is the canonical ordering consumed by layout,
+    /// selection, drag/drop, and automation.
+    #[must_use]
+    pub fn pane_root_nodes(&self, channel: TrackChannel) -> Vec<PresentationNodeId> {
+        let groups_by_anchor = self
+            .groups
+            .iter()
+            .filter(|group| group.channel == channel)
+            .filter_map(|group| group.members.first().copied().map(|anchor| (anchor, group)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let grouped = self
+            .groups
+            .iter()
+            .filter(|group| group.channel == channel)
+            .flat_map(|group| group.members.iter().copied())
+            .collect::<BTreeSet<_>>();
+        self.pane_tracks
+            .iter()
+            .filter(|node| node.channel == channel)
+            .filter_map(|node| {
+                if let Some(group) = groups_by_anchor.get(&node.track_id) {
+                    Some(PresentationNodeId::Group {
+                        channel,
+                        group_id: group.id,
+                    })
+                } else if grouped.contains(&node.track_id) {
+                    None
+                } else {
+                    Some(PresentationNodeId::Track {
+                        channel,
+                        track_id: node.track_id,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    /// Returns the ordered interactive rows in a pane. Expanded groups retain
+    /// their header followed by their members; minimized groups retain only
+    /// their header.
+    #[must_use]
+    pub fn pane_interactive_nodes(&self, channel: TrackChannel) -> Vec<PresentationNodeId> {
+        let mut nodes = Vec::new();
+        for root in self.pane_root_nodes(channel) {
+            nodes.push(root);
+            if let PresentationNodeId::Group { group_id, .. } = root
+                && let Some(group) = self
+                    .groups
+                    .iter()
+                    .find(|group| group.channel == channel && group.id == group_id)
+                && group.expanded
+            {
+                nodes.extend(
+                    group
+                        .members
+                        .iter()
+                        .copied()
+                        .map(|track_id| PresentationNodeId::Track { channel, track_id }),
+                );
+            }
+        }
+        nodes
+    }
+
+    #[must_use]
+    pub fn pane_track_state(
+        &self,
+        channel: TrackChannel,
+        track_id: TrackId,
+    ) -> Option<&SessionPaneTrackState> {
+        self.pane_tracks
+            .iter()
+            .find(|node| node.channel == channel && node.track_id == track_id)
+    }
+
+    #[must_use]
+    pub fn group_for_track(
+        &self,
+        channel: TrackChannel,
+        track_id: TrackId,
+    ) -> Option<&SessionPresentationGroup> {
+        self.groups
+            .iter()
+            .find(|group| group.channel == channel && group.members.contains(&track_id))
+    }
+
+    /// Desired node visibility resolved through its parent gate. Expansion is
+    /// deliberately not part of this value: expansion controls whether a row
+    /// is exposed, while visibility controls whether its data content paints.
+    #[must_use]
+    pub fn effective_track_visibility(
+        &self,
+        channel: TrackChannel,
+        track_id: TrackId,
+    ) -> Option<bool> {
+        let desired = self.pane_track_state(channel, track_id)?.content_visible;
+        let parent_visible = self
+            .group_for_track(channel, track_id)
+            .is_none_or(|group| group.content_visible);
+        Some(desired && parent_visible)
+    }
+
+    /// Returns whether a track's content is currently exposed for layout and
+    /// painting. Unlike `effective_track_visibility`, this also applies the
+    /// parent group's expansion gate. Callers that decide rendering, shared
+    /// scales, exports, or hit testing should normally use this projection.
+    #[must_use]
+    pub fn track_content_exposed(&self, channel: TrackChannel, track_id: TrackId) -> Option<bool> {
+        let visible = self.effective_track_visibility(channel, track_id)?;
+        let expanded = self
+            .group_for_track(channel, track_id)
+            .is_none_or(|group| group.expanded);
+        Some(visible && expanded)
+    }
+
+    pub fn apply_intents(
+        &mut self,
+        intents: &[TrackIntent],
+    ) -> Result<TrackChangeSet, TrackIntentError> {
+        let mut next = self.clone();
+        let mut changes = TrackChangeSet::default();
+        for intent in intents {
+            next.apply_intent(intent, &mut changes)?;
+        }
+        if changes.presentation_changed {
+            changes.layout_changed = true;
+            changes.persistence_changed = true;
+            *self = next;
+        }
+        Ok(changes)
+    }
+
+    /// Removes every pane representation owned by one unloaded source and
+    /// repairs any affected groups. This is deliberately a lifecycle
+    /// operation rather than an eye/collapse intent; it is the only ordinary
+    /// path that destroys saved per-source presentation state.
+    pub fn remove_source(&mut self, track_id: TrackId) -> TrackChangeSet {
+        let before_nodes = self.pane_tracks.len();
+        self.pane_tracks.retain(|node| node.track_id != track_id);
+        let before_groups = self.groups.len();
+        for group in &mut self.groups {
+            group.members.retain(|member| *member != track_id);
+        }
+        self.groups.retain(|group| group.members.len() >= 2);
+        let changed = before_nodes != self.pane_tracks.len() || before_groups != self.groups.len();
+        TrackChangeSet {
+            presentation_changed: changed,
+            layout_changed: changed,
+            selection_changed: changed,
+            persistence_changed: changed,
+            ..TrackChangeSet::default()
+        }
+    }
+
+    fn apply_intent(
+        &mut self,
+        intent: &TrackIntent,
+        changes: &mut TrackChangeSet,
+    ) -> Result<(), TrackIntentError> {
+        match intent {
+            TrackIntent::SetNodeVisibility { target, visible } => match *target {
+                PresentationNodeId::Reference => {
+                    changes.presentation_changed |= self.reference_content_visible != *visible;
+                    changes.selection_changed |= !*visible;
+                    self.reference_content_visible = *visible;
+                }
+                PresentationNodeId::Track { channel, track_id } => {
+                    let node = self
+                        .pane_tracks
+                        .iter_mut()
+                        .find(|node| node.channel == channel && node.track_id == track_id)
+                        .ok_or(TrackIntentError::MissingNode)?;
+                    changes.presentation_changed |= node.content_visible != *visible;
+                    changes.selection_changed |= !*visible;
+                    node.content_visible = *visible;
+                }
+                PresentationNodeId::Group { .. } => {
+                    return Err(TrackIntentError::MissingNode);
+                }
+            },
+            TrackIntent::SetGroupExpanded { target, expanded } => {
+                let PresentationNodeId::Group { channel, group_id } = *target else {
+                    return Err(TrackIntentError::MissingNode);
+                };
+                let group = self
+                    .groups
+                    .iter_mut()
+                    .find(|group| group.channel == channel && group.id == group_id)
+                    .ok_or(TrackIntentError::MissingNode)?;
+                changes.presentation_changed |= group.expanded != *expanded;
+                changes.selection_changed |= !*expanded;
+                group.expanded = *expanded;
+            }
+            TrackIntent::SetGroupVisibility { target, visible } => {
+                let PresentationNodeId::Group { channel, group_id } = *target else {
+                    return Err(TrackIntentError::MissingNode);
+                };
+                let group = self
+                    .groups
+                    .iter_mut()
+                    .find(|group| group.channel == channel && group.id == group_id)
+                    .ok_or(TrackIntentError::MissingNode)?;
+                changes.presentation_changed |= group.content_visible != *visible;
+                changes.selection_changed |= !*visible;
+                group.content_visible = *visible;
+            }
+            TrackIntent::SetCompositeVisibility {
+                channel,
+                composite_id,
+                visible,
+            } => {
+                let composite = self
+                    .composites
+                    .iter_mut()
+                    .find(|composite| {
+                        composite.channel == *channel && composite.id == *composite_id
+                    })
+                    .ok_or(TrackIntentError::MissingNode)?;
+                changes.presentation_changed |= composite.content_visible != *visible;
+                changes.selection_changed |= !*visible;
+                composite.content_visible = *visible;
+            }
+            TrackIntent::ResizeNode {
+                target,
+                preferred_height,
+            } => {
+                let channel = target.channel();
+                let valid = preferred_height.is_finite()
+                    && match channel {
+                        TrackChannel::Annotation => (26.0..=1_200.0).contains(preferred_height),
+                        TrackChannel::Reads => (40.0..=1_200.0).contains(preferred_height),
+                    };
+                if !valid {
+                    return Err(TrackIntentError::InvalidSize);
+                }
+                if *target == PresentationNodeId::Reference {
+                    changes.presentation_changed |= self
+                        .reference_preferred_height
+                        .is_none_or(|height| (height - preferred_height).abs() > f32::EPSILON);
+                    self.reference_preferred_height = Some(*preferred_height);
+                    return Ok(());
+                }
+                let PresentationNodeId::Track { track_id, .. } = *target else {
+                    return Err(TrackIntentError::MissingNode);
+                };
+                let node = self
+                    .pane_tracks
+                    .iter_mut()
+                    .find(|node| node.channel == channel && node.track_id == track_id)
+                    .ok_or(TrackIntentError::MissingNode)?;
+                changes.presentation_changed |= node
+                    .preferred_height
+                    .is_none_or(|height| (height - preferred_height).abs() > f32::EPSILON);
+                node.preferred_height = Some(*preferred_height);
+            }
+            TrackIntent::ResizeReadPane { height } => {
+                if !height.is_finite() || !(100.0..=1_200.0).contains(height) {
+                    return Err(TrackIntentError::InvalidSize);
+                }
+                changes.presentation_changed |=
+                    (self.read_pane_height - height).abs() > f32::EPSILON;
+                self.read_pane_height = *height;
+            }
+            TrackIntent::GroupNodes { channel, members } => {
+                let unique = members.iter().copied().collect::<BTreeSet<_>>();
+                if unique.len() < 2 || unique.len() != members.len() {
+                    return Err(TrackIntentError::NonContiguousGroup);
+                }
+                if self.groups.iter().any(|group| {
+                    group.channel == *channel
+                        && group.members.iter().any(|member| unique.contains(member))
+                }) {
+                    return Err(TrackIntentError::AlreadyGrouped);
+                }
+                let positions = members
+                    .iter()
+                    .map(|member| {
+                        self.pane_tracks
+                            .iter()
+                            .filter(|node| node.channel == *channel)
+                            .position(|node| node.track_id == *member)
+                            .ok_or(TrackIntentError::MissingNode)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut sorted_positions = positions;
+                sorted_positions.sort_unstable();
+                if sorted_positions
+                    .windows(2)
+                    .any(|pair| pair[1] != pair[0] + 1)
+                {
+                    return Err(TrackIntentError::NonContiguousGroup);
+                }
+                let id = self.next_group_id;
+                self.next_group_id = self
+                    .next_group_id
+                    .checked_add(1)
+                    .ok_or(TrackIntentError::MissingNode)?;
+                let ordered_members = self
+                    .pane_tracks
+                    .iter()
+                    .filter(|node| node.channel == *channel && unique.contains(&node.track_id))
+                    .map(|node| node.track_id)
+                    .collect();
+                self.groups.push(SessionPresentationGroup {
+                    id,
+                    label: format!("Group {id}"),
+                    channel: *channel,
+                    members: ordered_members,
+                    expanded: true,
+                    content_visible: true,
+                });
+                changes.presentation_changed = true;
+            }
+            TrackIntent::Ungroup { target } => {
+                let PresentationNodeId::Group { channel, group_id } = *target else {
+                    return Err(TrackIntentError::MissingNode);
+                };
+                let before = self.groups.len();
+                self.groups
+                    .retain(|group| group.channel != channel || group.id != group_id);
+                if before == self.groups.len() {
+                    return Err(TrackIntentError::MissingNode);
+                }
+                changes.presentation_changed = true;
+            }
+            TrackIntent::MoveNode { target, before } => {
+                let channel = target.channel();
+                if before.is_some_and(|node| node.channel() != channel) {
+                    return Err(TrackIntentError::CrossChannelMove);
+                }
+                if *before == Some(*target) {
+                    return Ok(());
+                }
+                let moving = match *target {
+                    PresentationNodeId::Track { track_id, .. } => {
+                        if self.groups.iter().any(|group| {
+                            group.channel == channel && group.members.contains(&track_id)
+                        }) {
+                            return Err(TrackIntentError::GroupMemberMove);
+                        }
+                        vec![track_id]
+                    }
+                    PresentationNodeId::Group { group_id, .. } => self
+                        .groups
+                        .iter()
+                        .find(|group| group.channel == channel && group.id == group_id)
+                        .map(|group| group.members.clone())
+                        .ok_or(TrackIntentError::MissingNode)?,
+                    PresentationNodeId::Reference => return Err(TrackIntentError::MissingNode),
+                };
+                let before_track = match before {
+                    None => None,
+                    Some(PresentationNodeId::Track { track_id, .. }) => {
+                        if moving.contains(track_id) {
+                            return Ok(());
+                        }
+                        let node_exists = self.pane_track_state(channel, *track_id).is_some();
+                        if !node_exists {
+                            return Err(TrackIntentError::MissingNode);
+                        }
+                        Some(
+                            self.group_for_track(channel, *track_id)
+                                .and_then(|group| group.members.first().copied())
+                                .unwrap_or(*track_id),
+                        )
+                    }
+                    Some(PresentationNodeId::Group { group_id, .. }) => Some(
+                        self.groups
+                            .iter()
+                            .find(|group| group.channel == channel && group.id == *group_id)
+                            .and_then(|group| group.members.first().copied())
+                            .ok_or(TrackIntentError::MissingNode)?,
+                    ),
+                    Some(PresentationNodeId::Reference) => {
+                        return Err(TrackIntentError::MissingNode);
+                    }
+                };
+                let mut channel_nodes = self
+                    .pane_tracks
+                    .iter()
+                    .filter(|node| node.channel == channel)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let moving_set = moving.iter().copied().collect::<BTreeSet<_>>();
+                let moved = channel_nodes
+                    .iter()
+                    .filter(|node| moving_set.contains(&node.track_id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if moved.len() != moving.len() {
+                    return Err(TrackIntentError::MissingNode);
+                }
+                channel_nodes.retain(|node| !moving_set.contains(&node.track_id));
+                let insertion = match before_track {
+                    Some(track_id) => channel_nodes
+                        .iter()
+                        .position(|node| node.track_id == track_id)
+                        .ok_or(TrackIntentError::MissingNode)?,
+                    None => channel_nodes.len(),
+                };
+                channel_nodes.splice(insertion..insertion, moved);
+                self.pane_tracks.retain(|node| node.channel != channel);
+                let insertion = match channel {
+                    TrackChannel::Annotation => 0,
+                    TrackChannel::Reads => self.pane_tracks.len(),
+                };
+                self.pane_tracks.splice(insertion..insertion, channel_nodes);
+                changes.presentation_changed = true;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl SessionAlignmentTrack {
@@ -624,10 +1429,17 @@ impl SessionAlignmentTrack {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionDocument {
     pub schema_version: u32,
+    /// Bounded, non-persisted repairs reported while migrating an older
+    /// schema. The desktop surfaces these as project issues instead of
+    /// silently normalizing inconsistent mirrored presentation fields.
+    #[serde(skip, default)]
+    pub migration_notices: Vec<String>,
     pub locus: SessionLocus,
     pub panels: Vec<SessionViewPanel>,
     pub active_panel: PanelId,
     pub alignment_tracks: Vec<SessionAlignmentTrack>,
+    #[serde(default)]
+    pub presentation: WorkspacePresentation,
     pub reference: Option<TrackSource>,
     /// Optional non-conventional FAI URL for the reference source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -687,12 +1499,15 @@ impl MultiTrackSessionDocument {
     fn migrate(self) -> SessionDocument {
         debug_assert_eq!(self.schema_version, MULTI_TRACK_SESSION_SCHEMA_VERSION);
         let panel_id = PanelId::new(1);
+        let presentation = WorkspacePresentation::from_legacy(&self.alignment_tracks, &self.tracks);
         SessionDocument {
             schema_version: SESSION_SCHEMA_VERSION,
+            migration_notices: Vec::new(),
             locus: self.locus.clone(),
             panels: vec![SessionViewPanel::new(panel_id, self.locus)],
             active_panel: panel_id,
             alignment_tracks: self.alignment_tracks,
+            presentation,
             reference: self.reference,
             remote_reference_index_url: None,
             genome_name: None,
@@ -722,12 +1537,15 @@ impl LegacySessionDocument {
             track.maximum_alignments = self.maximum_alignments;
             vec![track]
         });
+        let presentation = WorkspacePresentation::from_legacy(&alignment_tracks, &self.tracks);
         SessionDocument {
             schema_version: SESSION_SCHEMA_VERSION,
+            migration_notices: Vec::new(),
             locus: self.locus.clone(),
             panels: vec![SessionViewPanel::new(PanelId::new(1), self.locus)],
             active_panel: PanelId::new(1),
             alignment_tracks,
+            presentation,
             reference: self.reference,
             remote_reference_index_url: None,
             genome_name: None,
@@ -751,10 +1569,12 @@ impl SessionDocument {
         let panel_id = PanelId::new(1);
         Self {
             schema_version: SESSION_SCHEMA_VERSION,
+            migration_notices: Vec::new(),
             locus: locus.clone(),
             panels: vec![SessionViewPanel::new(panel_id, locus)],
             active_panel: panel_id,
             alignment_tracks: Vec::new(),
+            presentation: WorkspacePresentation::default(),
             reference: None,
             remote_reference_index_url: None,
             genome_name: None,
@@ -774,8 +1594,17 @@ impl SessionDocument {
 
     pub fn from_json(json: &str) -> Result<Self, SessionError> {
         let probe: SessionVersionProbe = serde_json::from_str(json)?;
-        let document = match probe.schema_version {
+        let mut document = match probe.schema_version {
             SESSION_SCHEMA_VERSION => serde_json::from_str(json)?,
+            MULTI_PANEL_SESSION_SCHEMA_VERSION => {
+                let mut version_three: SessionDocument = serde_json::from_str(json)?;
+                version_three.schema_version = SESSION_SCHEMA_VERSION;
+                version_three.presentation = WorkspacePresentation::from_legacy(
+                    &version_three.alignment_tracks,
+                    &version_three.tracks,
+                );
+                version_three
+            }
             MULTI_TRACK_SESSION_SCHEMA_VERSION => {
                 let version_two: MultiTrackSessionDocument = serde_json::from_str(json)?;
                 version_two.migrate()
@@ -786,13 +1615,122 @@ impl SessionDocument {
             }
             version => return Err(SessionError::UnsupportedVersion(version)),
         };
+        if probe.schema_version < SESSION_SCHEMA_VERSION {
+            document.migration_notices = document.legacy_presentation_migration_notices();
+        }
+        document.normalize_presentation();
         document.validate()?;
         Ok(document)
     }
 
+    /// Populates and repairs the normalized presentation tree after a caller
+    /// has assembled sources through the low-level public vectors. Normal
+    /// application/session code maintains this state incrementally; importers
+    /// and programmatic document builders can call this once before validation
+    /// or comparison.
+    pub fn normalize_presentation(&mut self) {
+        if self.presentation.pane_tracks.is_empty()
+            && (!self.alignment_tracks.is_empty() || !self.tracks.is_empty())
+        {
+            self.presentation =
+                WorkspacePresentation::from_legacy(&self.alignment_tracks, &self.tracks);
+        }
+        let alignment_sources = self
+            .alignment_tracks
+            .iter()
+            .map(|track| {
+                (
+                    track.id,
+                    track.annotation_height,
+                    track
+                        .read_group_height
+                        .or(Some(track.height.clamp(40.0, 1_200.0))),
+                )
+            })
+            .collect::<Vec<_>>();
+        let auxiliary_sources = self
+            .tracks
+            .iter()
+            .map(|track| (track.id, Some(track.height.clamp(26.0, 1_200.0))))
+            .collect::<Vec<_>>();
+        self.presentation
+            .reconcile_sources(&alignment_sources, &auxiliary_sources);
+        let overlay_counts = self
+            .tracks
+            .iter()
+            .filter(|track| track.kind == TrackKind::Quantitative)
+            .filter_map(|track| track.quantitative.overlay_group)
+            .fold(BTreeMap::<u32, usize>::new(), |mut counts, id| {
+                *counts.entry(id).or_default() += 1;
+                counts
+            });
+        let overlay_ids = overlay_counts
+            .into_iter()
+            .filter_map(|(id, count)| (count >= 2).then_some(id))
+            .collect::<BTreeSet<_>>();
+        self.presentation
+            .reconcile_composites(TrackChannel::Annotation, &overlay_ids);
+        self.presentation
+            .reconcile_composites(TrackChannel::Reads, &BTreeSet::new());
+        // Schema four has one presentation source of truth. Clear the legacy
+        // mirrors after they have contributed to migration so in-memory
+        // round trips cannot retain a second, contradictory eye/group/size.
+        for track in &mut self.alignment_tracks {
+            track.visible = true;
+            track.collapsed = false;
+            track.track_group = None;
+            track.track_group_collapsed = false;
+            track.read_track_group = None;
+            track.read_track_group_collapsed = false;
+            track.height = default_alignment_track_height();
+            track.annotation_height = None;
+            track.read_group_height = None;
+            track.filters.show_reads = true;
+        }
+        for track in &mut self.tracks {
+            track.visible = true;
+            track.collapsed = false;
+            track.height = 120.0;
+        }
+    }
+
+    fn legacy_presentation_migration_notices(&self) -> Vec<String> {
+        let mut notices = Vec::new();
+        for channel in [TrackChannel::Annotation, TrackChannel::Reads] {
+            let mut groups = BTreeMap::<u32, (usize, bool, bool)>::new();
+            for track in &self.alignment_tracks {
+                let (group_id, collapsed) = match channel {
+                    TrackChannel::Annotation => (track.track_group, track.track_group_collapsed),
+                    TrackChannel::Reads => {
+                        (track.read_track_group, track.read_track_group_collapsed)
+                    }
+                };
+                if let Some(group_id) = group_id {
+                    let state = groups.entry(group_id).or_default();
+                    state.0 = state.0.saturating_add(1);
+                    state.1 |= collapsed;
+                    state.2 |= !collapsed;
+                }
+            }
+            for (group_id, (member_count, had_collapsed, had_expanded)) in groups {
+                if member_count < 2 {
+                    notices.push(format!(
+                        "Discarded legacy {channel:?} group {group_id}: groups require at least two members"
+                    ));
+                } else if had_collapsed && had_expanded {
+                    notices.push(format!(
+                        "Repaired inconsistent legacy {channel:?} group {group_id}: collapsed state was applied because at least one member was collapsed"
+                    ));
+                }
+            }
+        }
+        notices
+    }
+
     pub fn to_json(&self) -> Result<String, SessionError> {
-        self.validate()?;
         let mut persisted = self.clone();
+        persisted.normalize_presentation();
+        persisted.validate()?;
         for track in &mut persisted.alignment_tracks {
             track.source = track.source.redacted_for_persistence();
             track.remote_index_url = track.remote_index_url.as_deref().map(redact_remote_url);
@@ -938,6 +1876,7 @@ impl SessionDocument {
         }
         let mut panel_ids = HashSet::new();
         for panel in &self.panels {
+            let mut read_panel_ids = HashSet::new();
             if panel.id.get() == 0
                 || !panel_ids.insert(panel.id)
                 || panel.locus.contig.is_empty()
@@ -948,6 +1887,24 @@ impl SessionDocument {
                 || panel.annotation_scroll_points < 0.0
                 || !panel.vertical_content_origin_points.is_finite()
                 || panel.vertical_content_origin_points < 0.0
+                || !panel.read_stack_scroll_points.is_finite()
+                || panel.read_stack_scroll_points < 0.0
+                || panel.read_panel_states.iter().any(|state| {
+                    state.track_id.get() == 0
+                        || !read_panel_ids.insert(state.track_id)
+                        || !state.scroll_points.is_finite()
+                        || state.scroll_points < 0.0
+                        || !state.content_origin_points.is_finite()
+                        || state.content_origin_points < 0.0
+                        || state.latent_scroll_fraction.is_some_and(|fraction| {
+                            !fraction.is_finite() || !(0.0..=1.0).contains(&fraction)
+                        })
+                        || !state.content_bottom_points.is_finite()
+                        || state.content_bottom_points < 0.0
+                        || state
+                            .density
+                            .is_some_and(|density| !density.is_finite() || density <= 0.0)
+                })
             {
                 return Err(SessionError::InvalidPanels);
             }
@@ -1040,8 +1997,141 @@ impl SessionDocument {
         }) {
             return Err(SessionError::InvalidAuxiliaryTrack);
         }
+        validate_workspace_presentation(self, &ids)?;
         Ok(())
     }
+}
+
+fn validate_workspace_presentation(
+    document: &SessionDocument,
+    loaded_track_ids: &HashSet<TrackId>,
+) -> Result<(), SessionError> {
+    let presentation = &document.presentation;
+    if !presentation.read_pane_height.is_finite()
+        || !(100.0..=1_200.0).contains(&presentation.read_pane_height)
+        || presentation
+            .reference_preferred_height
+            .is_some_and(|height| !height.is_finite() || !(26.0..=1_200.0).contains(&height))
+    {
+        return Err(SessionError::InvalidAlignmentTrack);
+    }
+    let mut pane_nodes = HashSet::new();
+    for node in &presentation.pane_tracks {
+        if !loaded_track_ids.contains(&node.track_id)
+            || !pane_nodes.insert((node.channel, node.track_id))
+            || node.preferred_height.is_some_and(|height| {
+                !height.is_finite()
+                    || match node.channel {
+                        TrackChannel::Annotation => !(26.0..=1_200.0).contains(&height),
+                        TrackChannel::Reads => !(40.0..=1_200.0).contains(&height),
+                    }
+            })
+        {
+            return Err(SessionError::InvalidAlignmentTrack);
+        }
+    }
+    let alignment_ids = document
+        .alignment_tracks
+        .iter()
+        .map(|track| track.id)
+        .collect::<HashSet<_>>();
+    if document.panels.iter().any(|panel| {
+        panel
+            .read_panel_states
+            .iter()
+            .any(|state| !alignment_ids.contains(&state.track_id))
+    }) {
+        return Err(SessionError::InvalidAlignmentTrack);
+    }
+    let auxiliary_ids = document
+        .tracks
+        .iter()
+        .map(|track| track.id)
+        .collect::<HashSet<_>>();
+    let expected_count = alignment_ids
+        .len()
+        .saturating_mul(2)
+        .saturating_add(auxiliary_ids.len());
+    if pane_nodes.len() != expected_count
+        || alignment_ids.iter().any(|id| {
+            !pane_nodes.contains(&(TrackChannel::Annotation, *id))
+                || !pane_nodes.contains(&(TrackChannel::Reads, *id))
+        })
+        || auxiliary_ids.iter().any(|id| {
+            !pane_nodes.contains(&(TrackChannel::Annotation, *id))
+                || pane_nodes.contains(&(TrackChannel::Reads, *id))
+        })
+    {
+        return Err(SessionError::InvalidAlignmentTrack);
+    }
+    let mut group_ids = HashSet::new();
+    let mut grouped_members = HashSet::new();
+    for group in &presentation.groups {
+        let mut members = HashSet::new();
+        let positions = group
+            .members
+            .iter()
+            .filter_map(|member| {
+                presentation
+                    .pane_tracks
+                    .iter()
+                    .filter(|node| node.channel == group.channel)
+                    .position(|node| node.track_id == *member)
+            })
+            .collect::<Vec<_>>();
+        if group.id == 0
+            || group.label.trim().is_empty()
+            || !group_ids.insert((group.channel, group.id))
+            || group.members.len() < 2
+            || group.members.iter().any(|member| {
+                (match group.channel {
+                    TrackChannel::Annotation => !loaded_track_ids.contains(member),
+                    TrackChannel::Reads => !alignment_ids.contains(member),
+                }) || !members.insert(*member)
+                    || !grouped_members.insert((group.channel, *member))
+                    || !pane_nodes.contains(&(group.channel, *member))
+            })
+            || positions.len() != group.members.len()
+            || positions.windows(2).any(|pair| pair[1] != pair[0] + 1)
+        {
+            return Err(SessionError::InvalidAlignmentTrack);
+        }
+    }
+    if presentation.next_group_id == 0
+        || presentation
+            .groups
+            .iter()
+            .any(|group| group.id >= presentation.next_group_id)
+    {
+        return Err(SessionError::InvalidAlignmentTrack);
+    }
+    let expected_composites = document
+        .tracks
+        .iter()
+        .filter(|track| track.kind == TrackKind::Quantitative)
+        .filter_map(|track| track.quantitative.overlay_group)
+        .fold(BTreeMap::<u32, usize>::new(), |mut counts, id| {
+            *counts.entry(id).or_default() += 1;
+            counts
+        })
+        .into_iter()
+        .filter_map(|(id, count)| (count >= 2).then_some((TrackChannel::Annotation, id)))
+        .collect::<HashSet<_>>();
+    let actual_composites = presentation
+        .composites
+        .iter()
+        .map(|composite| (composite.channel, composite.id))
+        .collect::<HashSet<_>>();
+    if actual_composites.len() != presentation.composites.len()
+        || actual_composites != expected_composites
+        || presentation
+            .composites
+            .iter()
+            .any(|composite| composite.id == 0)
+    {
+        return Err(SessionError::InvalidAlignmentTrack);
+    }
+    Ok(())
 }
 
 fn validate_session_remote_indexes(document: &SessionDocument) -> Result<(), SessionError> {

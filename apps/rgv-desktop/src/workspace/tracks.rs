@@ -1,21 +1,48 @@
 use super::super::*;
 
-fn updated_track_pane_selection(
-    track_order: &[TrackId],
-    selected: &[TrackId],
-    anchor: Option<TrackId>,
-    target: TrackId,
+fn updated_track_pane_selection<T: Copy + Eq>(
+    track_order: &[T],
+    selected: &[T],
+    anchor: Option<T>,
+    target: T,
     shift_range: bool,
     toggle: bool,
-) -> (Vec<TrackId>, Option<TrackId>) {
+) -> (Vec<T>, Option<T>) {
     let anchor = anchor
         .filter(|anchor| selected.contains(anchor))
         .or_else(|| selected.first().copied())
         .unwrap_or(target);
     let next = if shift_range {
-        alignment_range_selection(track_order, anchor, target)
+        let Some(anchor_index) = track_order
+            .iter()
+            .position(|candidate| *candidate == anchor)
+        else {
+            return (vec![target], Some(target));
+        };
+        let Some(target_index) = track_order
+            .iter()
+            .position(|candidate| *candidate == target)
+        else {
+            return (vec![target], Some(target));
+        };
+        let (start, end) = if anchor_index <= target_index {
+            (anchor_index, target_index)
+        } else {
+            (target_index, anchor_index)
+        };
+        track_order[start..=end].to_vec()
     } else {
-        updated_alignment_selection(selected, target, toggle)
+        if toggle {
+            let mut next = selected.to_vec();
+            if let Some(index) = next.iter().position(|candidate| *candidate == target) {
+                next.remove(index);
+            } else {
+                next.push(target);
+            }
+            next
+        } else {
+            vec![target]
+        }
     };
     let next_anchor = if shift_range {
         Some(anchor)
@@ -27,95 +54,341 @@ fn updated_track_pane_selection(
     (next, next_anchor)
 }
 
-fn alignment_track_group(config: &SessionAlignmentTrack, pane: ui::TrackPane) -> Option<u32> {
-    match pane {
-        ui::TrackPane::Annotation => config.track_group,
-        ui::TrackPane::Reads => config.read_track_group,
-    }
-}
-
-fn alignment_track_group_collapsed(config: &SessionAlignmentTrack, pane: ui::TrackPane) -> bool {
-    match pane {
-        ui::TrackPane::Annotation => config.track_group_collapsed,
-        ui::TrackPane::Reads => config.read_track_group_collapsed,
-    }
-}
-
-fn set_alignment_track_group(
-    config: &mut SessionAlignmentTrack,
-    pane: ui::TrackPane,
-    group: Option<u32>,
-    collapsed: bool,
+pub(crate) fn replace_panel_track_selection(
+    panel: &mut ViewPanelController,
+    key: TrackFrameKey,
+    channel: ui::TrackPane,
 ) {
-    match pane {
-        ui::TrackPane::Annotation => {
-            config.track_group = group;
-            config.track_group_collapsed = collapsed;
+    let node = match key {
+        TrackFrameKey::Reference => PresentationNodeId::Reference,
+        TrackFrameKey::Alignment(track_id) | TrackFrameKey::Auxiliary(track_id) => {
+            PresentationNodeId::Track { channel, track_id }
         }
-        ui::TrackPane::Reads => {
-            config.read_track_group = group;
-            config.read_track_group_collapsed = collapsed;
+        TrackFrameKey::Group { channel, id } => PresentationNodeId::Group {
+            channel,
+            group_id: id,
+        },
+    };
+    panel.selected_presentation_nodes = vec![node];
+    panel.presentation_selection_anchor = Some(node);
+    panel.selected_alignment_tracks = match key {
+        TrackFrameKey::Alignment(track_id) => vec![track_id],
+        TrackFrameKey::Reference | TrackFrameKey::Group { .. } | TrackFrameKey::Auxiliary(_) => {
+            Vec::new()
         }
-    }
+    };
+    panel.selected_read_tracks = match (key, channel) {
+        (TrackFrameKey::Alignment(track_id), ui::TrackPane::Reads) => vec![track_id],
+        _ => Vec::new(),
+    };
+    panel.alignment_selection_anchor = match (key, channel) {
+        (TrackFrameKey::Alignment(track_id), ui::TrackPane::Annotation) => Some(track_id),
+        _ => None,
+    };
+    panel.read_selection_anchor = match (key, channel) {
+        (TrackFrameKey::Alignment(track_id), ui::TrackPane::Reads) => Some(track_id),
+        _ => None,
+    };
+    panel.selected_track = Some(key);
 }
 
-fn normalize_alignment_track_group_configs(
-    configs: &mut [&mut SessionAlignmentTrack],
-    pane: ui::TrackPane,
+fn synchronize_panel_track_selection(
+    panel: &mut ViewPanelController,
+    alignment_ids: &BTreeSet<TrackId>,
 ) {
-    let mut counts = BTreeMap::<u32, usize>::new();
-    let mut collapsed = BTreeSet::<u32>::new();
-    for config in configs.iter() {
-        if let Some(group) = alignment_track_group(config, pane) {
-            *counts.entry(group).or_default() += 1;
-            if alignment_track_group_collapsed(config, pane) {
-                collapsed.insert(group);
-            }
-        }
-    }
-    for config in configs {
-        let Some(group) = alignment_track_group(config, pane) else {
-            set_alignment_track_group(config, pane, None, false);
-            continue;
-        };
-        if counts.get(&group).copied().unwrap_or_default() < 2 {
-            set_alignment_track_group(config, pane, None, false);
-        } else {
-            set_alignment_track_group(config, pane, Some(group), collapsed.contains(&group));
-        }
-    }
-}
-
-fn assign_alignment_track_group(
-    configs: &mut [&mut SessionAlignmentTrack],
-    selected: &BTreeSet<TrackId>,
-    pane: ui::TrackPane,
-) -> Option<usize> {
-    let member_count = configs
+    panel.selected_alignment_tracks = panel
+        .selected_presentation_nodes
         .iter()
-        .filter(|config| selected.contains(&config.id))
-        .count();
-    if member_count < 2 {
-        return None;
-    }
-    let used = configs
+        .filter_map(|node| match node {
+            PresentationNodeId::Track {
+                channel: ui::TrackPane::Annotation,
+                track_id,
+            } if alignment_ids.contains(track_id) => Some(*track_id),
+            PresentationNodeId::Reference
+            | PresentationNodeId::Track { .. }
+            | PresentationNodeId::Group { .. } => None,
+        })
+        .collect();
+    panel.selected_read_tracks = panel
+        .selected_presentation_nodes
         .iter()
-        .filter_map(|config| alignment_track_group(config, pane))
-        .collect::<BTreeSet<_>>();
-    let mut group = 1_u32;
-    while used.contains(&group) {
-        group = group.checked_add(1)?;
-    }
-    for config in configs.iter_mut() {
-        if selected.contains(&config.id) {
-            set_alignment_track_group(config, pane, Some(group), false);
-        }
-    }
-    normalize_alignment_track_group_configs(configs, pane);
-    Some(member_count)
+        .filter_map(|node| match node {
+            PresentationNodeId::Track {
+                channel: ui::TrackPane::Reads,
+                track_id,
+            } if alignment_ids.contains(track_id) => Some(*track_id),
+            PresentationNodeId::Reference
+            | PresentationNodeId::Track { .. }
+            | PresentationNodeId::Group { .. } => None,
+        })
+        .collect();
+    panel.alignment_selection_anchor =
+        panel
+            .presentation_selection_anchor
+            .and_then(|node| match node {
+                PresentationNodeId::Track {
+                    channel: ui::TrackPane::Annotation,
+                    track_id,
+                } if alignment_ids.contains(&track_id) => Some(track_id),
+                PresentationNodeId::Reference
+                | PresentationNodeId::Track { .. }
+                | PresentationNodeId::Group { .. } => None,
+            });
+    panel.read_selection_anchor = panel
+        .presentation_selection_anchor
+        .and_then(|node| match node {
+            PresentationNodeId::Track {
+                channel: ui::TrackPane::Reads,
+                track_id,
+            } if alignment_ids.contains(&track_id) => Some(track_id),
+            PresentationNodeId::Reference
+            | PresentationNodeId::Track { .. }
+            | PresentationNodeId::Group { .. } => None,
+        });
+    panel.selected_track =
+        panel
+            .selected_presentation_nodes
+            .last()
+            .copied()
+            .map(|node| match node {
+                PresentationNodeId::Reference => TrackFrameKey::Reference,
+                PresentationNodeId::Track { track_id, .. } => {
+                    if alignment_ids.contains(&track_id) {
+                        TrackFrameKey::Alignment(track_id)
+                    } else {
+                        TrackFrameKey::Auxiliary(track_id)
+                    }
+                }
+                PresentationNodeId::Group { channel, group_id } => TrackFrameKey::Group {
+                    channel,
+                    id: group_id,
+                },
+            });
 }
 
 impl Viewer {
+    pub(crate) fn effective_auxiliary_presentation_configs(&self) -> Vec<TrackConfig> {
+        let by_id = self
+            .tracks
+            .tracks()
+            .iter()
+            .map(|track| (track.id, track))
+            .collect::<BTreeMap<_, _>>();
+        self.track_presentation
+            .pane_tracks
+            .iter()
+            .filter(|node| node.channel == ui::TrackPane::Annotation)
+            .filter_map(|node| {
+                let mut track = (*by_id.get(&node.track_id)?).clone();
+                let parent = self
+                    .track_presentation
+                    .group_for_track(ui::TrackPane::Annotation, node.track_id);
+                if parent.is_some_and(|group| !group.expanded) {
+                    return None;
+                }
+                track.visible =
+                    node.content_visible && parent.is_none_or(|group| group.content_visible);
+                track.collapsed = !track.visible;
+                if let Some(height) = node.preferred_height {
+                    track.height = height;
+                }
+                Some(track)
+            })
+            .collect()
+    }
+
+    pub(crate) fn workspace_presentation_snapshot(&self) -> WorkspacePresentation {
+        self.track_presentation.clone()
+    }
+
+    /// Reconciles source lifecycle only. Presentation choices are never read
+    /// back from legacy source/configuration booleans: existing node order,
+    /// visibility, preferred sizes, and groups remain authoritative.
+    pub(crate) fn reconcile_track_presentation(&mut self) {
+        let alignment_defaults = self
+            .alignment_tracks
+            .iter()
+            .map(|track| {
+                (
+                    track.config.id,
+                    track.config.annotation_height,
+                    track
+                        .config
+                        .read_group_height
+                        .or(Some(track.config.height.clamp(40.0, 1_200.0))),
+                )
+            })
+            .collect::<Vec<_>>();
+        let auxiliary_defaults = self
+            .tracks
+            .tracks()
+            .iter()
+            .map(|track| (track.id, Some(track.height.clamp(26.0, 1_200.0))))
+            .collect::<Vec<_>>();
+        self.track_presentation
+            .reconcile_sources(&alignment_defaults, &auxiliary_defaults);
+        let overlay_ids = self
+            .tracks
+            .tracks()
+            .iter()
+            .filter(|track| track.kind == TrackKind::Quantitative)
+            .filter_map(|track| track.quantitative.overlay_group)
+            .fold(BTreeMap::<u32, usize>::new(), |mut counts, id| {
+                *counts.entry(id).or_default() += 1;
+                counts
+            })
+            .into_iter()
+            .filter_map(|(id, count)| (count >= 2).then_some(id))
+            .collect::<BTreeSet<_>>();
+        self.track_presentation
+            .reconcile_composites(ui::TrackPane::Annotation, &overlay_ids);
+        self.track_presentation
+            .reconcile_composites(ui::TrackPane::Reads, &BTreeSet::new());
+        for track in &mut self.alignment_tracks {
+            track.config.visible = true;
+            track.config.collapsed = false;
+            track.config.height = 360.0;
+            track.config.annotation_height = None;
+            track.config.read_group_height = None;
+            track.config.filters.show_reads = true;
+        }
+        for track in self.tracks.tracks_mut() {
+            track.visible = true;
+            track.collapsed = false;
+            track.height = 120.0;
+        }
+        self.reconcile_presentation_interaction_state();
+    }
+
+    fn reconcile_presentation_interaction_state(&mut self) {
+        let alignment_ids = self
+            .alignment_tracks
+            .iter()
+            .map(|track| track.config.id)
+            .collect::<BTreeSet<_>>();
+        let mut valid_nodes = self
+            .track_presentation
+            .pane_interactive_nodes(ui::TrackPane::Annotation)
+            .into_iter()
+            .chain(
+                self.track_presentation
+                    .pane_interactive_nodes(ui::TrackPane::Reads),
+            )
+            .collect::<BTreeSet<_>>();
+        if self.reference_engine.is_some() {
+            valid_nodes.insert(PresentationNodeId::Reference);
+        }
+        for panel in self.panels.iter_mut() {
+            panel
+                .selected_presentation_nodes
+                .retain(|node| valid_nodes.contains(node));
+            panel.presentation_selection_anchor = panel
+                .presentation_selection_anchor
+                .filter(|node| valid_nodes.contains(node));
+            synchronize_panel_track_selection(panel, &alignment_ids);
+        }
+        if self.resizing_annotation_track.is_some_and(|(key, _)| {
+            let node = match key {
+                TrackFrameKey::Reference => PresentationNodeId::Reference,
+                TrackFrameKey::Alignment(track_id) | TrackFrameKey::Auxiliary(track_id) => {
+                    PresentationNodeId::Track {
+                        channel: ui::TrackPane::Annotation,
+                        track_id,
+                    }
+                }
+                TrackFrameKey::Group { channel, id } => PresentationNodeId::Group {
+                    channel,
+                    group_id: id,
+                },
+            };
+            !valid_nodes.contains(&node)
+        }) {
+            self.resizing_annotation_track = None;
+        }
+        if self.resizing_read_track.is_some_and(|(track_id, _)| {
+            !valid_nodes.contains(&PresentationNodeId::Track {
+                channel: ui::TrackPane::Reads,
+                track_id,
+            })
+        }) {
+            self.resizing_read_track = None;
+        }
+        if self.vertical_overview_drag.is_some_and(|drag| {
+            !valid_nodes.contains(&PresentationNodeId::Track {
+                channel: ui::TrackPane::Reads,
+                track_id: drag.track_id,
+            })
+        }) {
+            self.vertical_overview_drag = None;
+        }
+    }
+
+    pub(crate) fn apply_track_intents(
+        &mut self,
+        intents: &[TrackIntent],
+    ) -> Result<TrackChangeSet> {
+        let mut changes = self.track_presentation.apply_intents(intents)?;
+        for intent in intents {
+            match intent {
+                TrackIntent::SetNodeVisibility {
+                    target: PresentationNodeId::Track { channel, track_id },
+                    visible: false,
+                } => {
+                    self.reconcile_suppressed_group_selection(*channel, &[*track_id]);
+                    changes.selection_changed = true;
+                }
+                TrackIntent::SetGroupExpanded {
+                    target: PresentationNodeId::Group { channel, group_id },
+                    expanded: false,
+                }
+                | TrackIntent::SetGroupVisibility {
+                    target: PresentationNodeId::Group { channel, group_id },
+                    visible: false,
+                } => {
+                    if let Some(members) = self
+                        .track_presentation
+                        .groups
+                        .iter()
+                        .find(|group| group.channel == *channel && group.id == *group_id)
+                        .map(|group| group.members.clone())
+                    {
+                        self.reconcile_suppressed_group_selection(*channel, &members);
+                        changes.selection_changed = true;
+                    }
+                }
+                TrackIntent::SetCompositeVisibility {
+                    channel,
+                    composite_id,
+                    visible: false,
+                } => {
+                    let members = self
+                        .tracks
+                        .tracks()
+                        .iter()
+                        .filter(|track| {
+                            track.kind == TrackKind::Quantitative
+                                && track.quantitative.overlay_group == Some(*composite_id)
+                        })
+                        .map(|track| track.id)
+                        .collect::<Vec<_>>();
+                    self.reconcile_suppressed_group_selection(*channel, &members);
+                    changes.selection_changed = true;
+                }
+                TrackIntent::SetNodeVisibility { .. }
+                | TrackIntent::SetGroupExpanded { .. }
+                | TrackIntent::SetGroupVisibility { .. }
+                | TrackIntent::SetCompositeVisibility { .. }
+                | TrackIntent::ResizeNode { .. }
+                | TrackIntent::ResizeReadPane { .. }
+                | TrackIntent::GroupNodes { .. }
+                | TrackIntent::Ungroup { .. }
+                | TrackIntent::MoveNode { .. } => {}
+            }
+        }
+        self.reconcile_presentation_interaction_state();
+        Ok(changes)
+    }
+
     pub(crate) fn has_alignment_engine(&self) -> bool {
         !self.alignment_tracks.is_empty()
     }
@@ -165,120 +438,130 @@ impl Viewer {
     }
 
     pub(crate) fn alignment_track_group_chrome(&self) -> Vec<ui::TrackGroupChrome> {
-        [ui::TrackPane::Annotation, ui::TrackPane::Reads]
-            .into_iter()
-            .flat_map(|pane| {
-                let mut groups = BTreeMap::<u32, Vec<TrackId>>::new();
-                let mut collapsed = BTreeSet::<u32>::new();
-                for track in &self.alignment_tracks {
-                    if let Some(group) = alignment_track_group(&track.config, pane) {
-                        groups.entry(group).or_default().push(track.config.id);
-                        if alignment_track_group_collapsed(&track.config, pane) {
-                            collapsed.insert(group);
-                        }
-                    }
-                }
-                groups.into_iter().filter_map(move |(id, members)| {
-                    let anchor = members.first().copied()?;
-                    (members.len() > 1).then(|| ui::TrackGroupChrome {
-                        id,
-                        pane,
-                        anchor,
-                        members,
-                        collapsed: collapsed.contains(&id),
-                    })
+        self.track_presentation
+            .groups
+            .iter()
+            .filter_map(|group| {
+                let anchor = group.members.first().copied()?;
+                (group.members.len() > 1).then(|| ui::TrackGroupChrome {
+                    id: group.id,
+                    pane: group.channel,
+                    anchor,
+                    members: group.members.clone(),
+                    collapsed: !group.expanded,
+                    content_visible: group.content_visible,
                 })
             })
             .collect()
     }
 
-    pub(crate) fn group_selected_alignment_tracks(&mut self, pane: ui::TrackPane) -> bool {
-        let panel = self.panels.active();
-        let selected_tracks = match pane {
-            ui::TrackPane::Annotation => &panel.selected_alignment_tracks,
-            ui::TrackPane::Reads => &panel.selected_read_tracks,
-        };
-        let selected = selected_tracks.iter().copied().collect::<BTreeSet<_>>();
-        if selected.len() < 2 {
-            return false;
-        }
-        let selected_positions = self
+    pub(crate) fn reconcile_suppressed_group_selection(
+        &mut self,
+        pane: ui::TrackPane,
+        members: &[TrackId],
+    ) {
+        let alignment_ids = self
             .alignment_tracks
             .iter()
-            .enumerate()
-            .filter(|(_, track)| selected.contains(&track.config.id))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if selected_positions
-            .windows(2)
-            .any(|pair| pair[1] != pair[0] + 1)
-        {
-            self.data_status =
-                "Track groups must be contiguous; use Shift-click to select a range".to_owned();
-            return false;
-        }
-        let mut configs = self
-            .alignment_tracks
-            .iter_mut()
-            .map(|track| &mut track.config)
-            .collect::<Vec<_>>();
-        let Some(member_count) = assign_alignment_track_group(&mut configs, &selected, pane) else {
-            return false;
-        };
-        self.data_status = format!(
-            "Grouped {member_count} {} tracks",
+            .map(|track| track.config.id)
+            .collect::<BTreeSet<_>>();
+        for panel in self.panels.iter_mut() {
+            let suppressed_selected = panel.selected_presentation_nodes.iter().any(|node| {
+                matches!(
+                    node,
+                    PresentationNodeId::Track { channel, track_id }
+                        if *channel == pane && members.contains(track_id)
+                )
+            });
+            panel.selected_presentation_nodes.retain(|node| {
+                !matches!(
+                    node,
+                    PresentationNodeId::Track { channel, track_id }
+                        if *channel == pane && members.contains(track_id)
+                )
+            });
+            if panel.presentation_selection_anchor.is_some_and(|node| {
+                matches!(
+                    node,
+                    PresentationNodeId::Track { channel, track_id }
+                        if channel == pane && members.contains(&track_id)
+                )
+            }) {
+                panel.presentation_selection_anchor =
+                    panel.selected_presentation_nodes.last().copied();
+            }
             match pane {
-                ui::TrackPane::Annotation => "annotation",
-                ui::TrackPane::Reads => "read-data",
+                ui::TrackPane::Annotation => {
+                    panel
+                        .selected_alignment_tracks
+                        .retain(|id| !members.contains(id));
+                    if panel
+                        .alignment_selection_anchor
+                        .is_some_and(|id| members.contains(&id))
+                    {
+                        panel.alignment_selection_anchor =
+                            panel.selected_alignment_tracks.last().copied();
+                    }
+                    if suppressed_selected
+                        && panel
+                            .selected_alignment_track
+                            .is_some_and(|id| members.contains(&id))
+                    {
+                        panel.selected_alignment_track = None;
+                        panel.selected_pileup_position = None;
+                        panel.selected_modification_position = None;
+                        panel.selected_junction = None;
+                    }
+                    panel.selected_feature = panel
+                        .selected_feature
+                        .filter(|selection| !members.contains(&selection.track_id));
+                    panel.selected_variant = panel
+                        .selected_variant
+                        .filter(|selection| !members.contains(&selection.track_id));
+                    panel.selected_gwas = panel
+                        .selected_gwas
+                        .filter(|selection| !members.contains(&selection.track_id));
+                    panel.selected_quantitative = panel
+                        .selected_quantitative
+                        .filter(|selection| !members.contains(&selection.track_id));
+                    panel.selected_copy_number = panel
+                        .selected_copy_number
+                        .filter(|selection| !members.contains(&selection.track_id));
+                    panel.selected_mutation = panel
+                        .selected_mutation
+                        .filter(|selection| !members.contains(&selection.track_id));
+                    panel.selected_interaction = panel
+                        .selected_interaction
+                        .filter(|selection| !members.contains(&selection.track_id));
+                }
+                ui::TrackPane::Reads => {
+                    panel
+                        .selected_read_tracks
+                        .retain(|id| !members.contains(id));
+                    if panel
+                        .read_selection_anchor
+                        .is_some_and(|id| members.contains(&id))
+                    {
+                        panel.read_selection_anchor = panel.selected_read_tracks.last().copied();
+                    }
+                    if suppressed_selected
+                        && panel
+                            .selected_alignment_track
+                            .is_some_and(|id| members.contains(&id))
+                    {
+                        panel.selected_alignment_track = None;
+                        panel.selected_record = None;
+                        panel.selected_read_event = None;
+                        panel.selected_chain = None;
+                    }
+                }
             }
-        );
-        true
-    }
-
-    pub(crate) fn toggle_alignment_track_group(&mut self, pane: ui::TrackPane, group: u32) -> bool {
-        let collapsed = self.alignment_tracks.iter().any(|track| {
-            alignment_track_group(&track.config, pane) == Some(group)
-                && alignment_track_group_collapsed(&track.config, pane)
-        });
-        let mut changed = false;
-        for track in &mut self.alignment_tracks {
-            if alignment_track_group(&track.config, pane) == Some(group) {
-                set_alignment_track_group(&mut track.config, pane, Some(group), !collapsed);
-                changed = true;
-            }
+            synchronize_panel_track_selection(panel, &alignment_ids);
         }
-        if changed {
-            self.data_status = if collapsed {
-                format!("Expanded track group {group}")
-            } else {
-                format!("Minimized track group {group}")
-            };
-        }
-        changed
-    }
-
-    pub(crate) fn ungroup_alignment_tracks(&mut self, pane: ui::TrackPane, group: u32) -> bool {
-        let mut changed = false;
-        for track in &mut self.alignment_tracks {
-            if alignment_track_group(&track.config, pane) == Some(group) {
-                set_alignment_track_group(&mut track.config, pane, None, false);
-                changed = true;
-            }
-        }
-        if changed {
-            self.data_status = format!("Ungrouped track group {group}");
-        }
-        changed
     }
 
     pub(crate) fn normalize_alignment_track_groups(&mut self) {
-        let mut configs = self
-            .alignment_tracks
-            .iter_mut()
-            .map(|track| &mut track.config)
-            .collect::<Vec<_>>();
-        normalize_alignment_track_group_configs(&mut configs, ui::TrackPane::Annotation);
-        normalize_alignment_track_group_configs(&mut configs, ui::TrackPane::Reads);
+        self.reconcile_track_presentation();
     }
 
     pub(crate) fn alignment_filters_for_track(&self, id: TrackId) -> SessionFilters {
@@ -299,7 +582,10 @@ impl Viewer {
         let mut participant_count = 0_usize;
         let mut maximum = 0.0_f64;
         for track in self.alignment_tracks.iter().filter(|track| {
-            track.config.visible && (!use_selected || selected.contains(&track.config.id))
+            self.track_presentation
+                .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
+                .unwrap_or(false)
+                && (!use_selected || selected.contains(&track.config.id))
         }) {
             let filters = self.alignment_filters_for_track(track.config.id);
             if filters.sashimi_scale_mode != SashimiScaleMode::Shared
@@ -338,7 +624,10 @@ impl Viewer {
         let mut omitted_tracks = 0_usize;
         let mut tracks = Vec::new();
         for track in self.alignment_tracks.iter().filter(|track| {
-            track.config.visible && (!use_selected || selected.contains(&track.config.id))
+            self.track_presentation
+                .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
+                .unwrap_or(false)
+                && (!use_selected || selected.contains(&track.config.id))
         }) {
             let Some(query) = self.alignment_query_for_track(track.config.id) else {
                 continue;
@@ -371,89 +660,56 @@ impl Viewer {
     pub(crate) fn select_track_key(&mut self, key: TrackFrameKey, pane: ui::TrackPane) {
         let shift_range = self.modifiers.shift_key();
         let toggle = self.modifiers.control_key() || self.modifiers.super_key();
-        match (key, pane) {
-            (TrackFrameKey::Alignment(id), ui::TrackPane::Reads) => {
-                let panel = self.panels.active();
-                let selected = panel.selected_read_tracks.clone();
-                let track_order = panel
-                    .track_frames
-                    .iter()
-                    .filter(|frame| frame.frozen_bottom.is_some())
-                    .filter_map(|frame| match frame.key {
-                        TrackFrameKey::Alignment(track_id) => Some(track_id),
-                        TrackFrameKey::Reference
-                        | TrackFrameKey::Group(_)
-                        | TrackFrameKey::Auxiliary(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                let (next, next_anchor) = updated_track_pane_selection(
-                    &track_order,
-                    &selected,
-                    panel.read_selection_anchor,
-                    id,
-                    shift_range,
-                    toggle,
-                );
-                let panel = self.panels.active_mut();
-                panel.selected_alignment_tracks.clear();
-                panel.alignment_selection_anchor = None;
-                panel.selected_read_tracks = next;
-                panel.read_selection_anchor = next_anchor;
-                panel.selected_track = panel
-                    .selected_read_tracks
-                    .contains(&id)
-                    .then_some(TrackFrameKey::Alignment(id))
-                    .or_else(|| {
-                        panel
-                            .selected_read_tracks
-                            .last()
-                            .copied()
-                            .map(TrackFrameKey::Alignment)
-                    });
+        let target = match key {
+            TrackFrameKey::Reference if pane == ui::TrackPane::Annotation => {
+                PresentationNodeId::Reference
             }
-            (_, ui::TrackPane::Reads) => {}
-            (TrackFrameKey::Group(_), ui::TrackPane::Annotation) => {}
-            (TrackFrameKey::Alignment(id), ui::TrackPane::Annotation) => {
-                let selected = self.panels.active().selected_alignment_tracks.clone();
-                let track_order = self
-                    .alignment_tracks
-                    .iter()
-                    .map(|track| track.config.id)
-                    .collect::<Vec<_>>();
-                let (next, next_anchor) = updated_track_pane_selection(
-                    &track_order,
-                    &selected,
-                    self.panels.active().alignment_selection_anchor,
-                    id,
-                    shift_range,
-                    toggle,
-                );
-                let panel = self.panels.active_mut();
-                panel.selected_read_tracks.clear();
-                panel.read_selection_anchor = None;
-                panel.selected_alignment_tracks = next;
-                panel.alignment_selection_anchor = next_anchor;
-                panel.selected_track = panel
-                    .selected_alignment_tracks
-                    .contains(&id)
-                    .then_some(TrackFrameKey::Alignment(id))
-                    .or_else(|| {
-                        panel
-                            .selected_alignment_tracks
-                            .last()
-                            .copied()
-                            .map(TrackFrameKey::Alignment)
-                    });
+            TrackFrameKey::Alignment(track_id) => PresentationNodeId::Track {
+                channel: pane,
+                track_id,
+            },
+            TrackFrameKey::Auxiliary(track_id) if pane == ui::TrackPane::Annotation => {
+                PresentationNodeId::Track {
+                    channel: pane,
+                    track_id,
+                }
             }
-            (TrackFrameKey::Reference | TrackFrameKey::Auxiliary(_), ui::TrackPane::Annotation) => {
-                let panel = self.panels.active_mut();
-                panel.selected_alignment_tracks.clear();
-                panel.alignment_selection_anchor = None;
-                panel.selected_read_tracks.clear();
-                panel.read_selection_anchor = None;
-                panel.selected_track = Some(key);
-            }
+            TrackFrameKey::Group { channel, id } if channel == pane => PresentationNodeId::Group {
+                channel,
+                group_id: id,
+            },
+            TrackFrameKey::Reference
+            | TrackFrameKey::Auxiliary(_)
+            | TrackFrameKey::Group { .. } => return,
+        };
+        let mut order = self.track_presentation.pane_interactive_nodes(pane);
+        if pane == ui::TrackPane::Annotation && self.reference_engine.is_some() {
+            order.insert(0, PresentationNodeId::Reference);
         }
+        if !order.contains(&target) {
+            return;
+        }
+        let panel = self.panels.active();
+        let selected = panel
+            .selected_presentation_nodes
+            .iter()
+            .copied()
+            .filter(|node| node.channel() == pane && order.contains(node))
+            .collect::<Vec<_>>();
+        let anchor = panel
+            .presentation_selection_anchor
+            .filter(|node| node.channel() == pane);
+        let (next, next_anchor) =
+            updated_track_pane_selection(&order, &selected, anchor, target, shift_range, toggle);
+        let alignment_ids = self
+            .alignment_tracks
+            .iter()
+            .map(|track| track.config.id)
+            .collect::<BTreeSet<_>>();
+        let panel = self.panels.active_mut();
+        panel.selected_presentation_nodes = next;
+        panel.presentation_selection_anchor = next_anchor;
+        synchronize_panel_track_selection(panel, &alignment_ids);
         self.display_dirty = true;
     }
 
@@ -484,7 +740,9 @@ impl Viewer {
                 projection.alignment_rows = None;
                 projection.cached_layout = None;
             }
-            if collect_modifications_changed && track.config.visible {
+            if collect_modifications_changed
+                && !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_))
+            {
                 for projection in track.projections.values_mut() {
                     projection.clock.advance();
                     projection.pending_query = true;
@@ -504,41 +762,6 @@ impl Viewer {
         Ok(())
     }
 
-    pub(crate) fn apply_bulk_alignment_state(
-        &mut self,
-        selected_ids: &[TrackId],
-        visibility: Option<bool>,
-        collapsed: Option<bool>,
-    ) {
-        let mut query_membership_changed = Vec::new();
-        let mut changed = false;
-        for track in self
-            .alignment_tracks
-            .iter_mut()
-            .filter(|track| selected_ids.contains(&track.config.id))
-        {
-            if let Some(visible) = visibility {
-                if track.config.visible != visible {
-                    query_membership_changed.push(track.config.id);
-                }
-                changed |= track.config.visible != visible;
-                track.config.visible = visible;
-            }
-            if let Some(is_collapsed) = collapsed {
-                changed |= track.config.collapsed != is_collapsed;
-                track.config.collapsed = is_collapsed;
-            }
-        }
-        if !query_membership_changed.is_empty() {
-            self.invalidate_automation_alignment_layouts(Some(&query_membership_changed), true);
-            self.request_all_alignment_queries();
-        }
-        if changed {
-            self.rebuild_genomic_display();
-            self.display_dirty = true;
-        }
-    }
-
     pub(crate) fn apply_metadata_bulk_state(
         &mut self,
         selected: &BTreeSet<TrackId>,
@@ -556,8 +779,60 @@ impl Viewer {
             .filter(|track| selected.contains(&track.config.id))
             .map(|track| track.config.id)
             .collect::<Vec<_>>();
-        if visibility.is_some() || collapsed.is_some() {
-            self.apply_bulk_alignment_state(&alignment_ids, visibility, collapsed);
+        let requested_visibility = visibility.or_else(|| collapsed.map(|value| !value));
+        let mut presentation_intents = Vec::new();
+        if let Some(visible) = requested_visibility {
+            presentation_intents.extend(alignment_ids.iter().copied().map(|track_id| {
+                TrackIntent::SetNodeVisibility {
+                    target: PresentationNodeId::Track {
+                        channel: ui::TrackPane::Annotation,
+                        track_id,
+                    },
+                    visible,
+                }
+            }));
+            presentation_intents.extend(
+                self.tracks
+                    .tracks()
+                    .iter()
+                    .filter(|track| selected.contains(&track.id))
+                    .map(|track| TrackIntent::SetNodeVisibility {
+                        target: PresentationNodeId::Track {
+                            channel: ui::TrackPane::Annotation,
+                            track_id: track.id,
+                        },
+                        visible,
+                    }),
+            );
+        }
+        if let Some(height) = height {
+            presentation_intents.extend(selected.iter().copied().filter_map(|track_id| {
+                let is_alignment = self
+                    .alignment_tracks
+                    .iter()
+                    .any(|track| track.config.id == track_id);
+                let auxiliary = self
+                    .tracks
+                    .tracks()
+                    .iter()
+                    .find(|track| track.id == track_id);
+                (is_alignment
+                    || auxiliary.is_some_and(|track| {
+                        !matches!(track.kind, TrackKind::Mutation | TrackKind::CopyNumber)
+                    }))
+                .then_some(TrackIntent::ResizeNode {
+                    target: PresentationNodeId::Track {
+                        channel: ui::TrackPane::Annotation,
+                        track_id,
+                    },
+                    preferred_height: height.clamp(40.0, 1_200.0),
+                })
+            }));
+        }
+        if !presentation_intents.is_empty()
+            && let Err(error) = self.apply_track_intents(&presentation_intents)
+        {
+            self.data_status = error.to_string();
         }
         let mut changed = false;
         for track in self
@@ -565,11 +840,6 @@ impl Viewer {
             .iter_mut()
             .filter(|track| selected.contains(&track.config.id))
         {
-            if let Some(height) = height {
-                let height = height.clamp(40.0, 1_200.0);
-                changed |= (track.config.height - height).abs() > f32::EPSILON;
-                track.config.height = height;
-            }
             if rename_to_sample
                 && let Some(sample_key) = &track.config.sample_key
                 && track.config.name != *sample_key
@@ -584,21 +854,6 @@ impl Viewer {
             .iter_mut()
             .filter(|track| selected.contains(&track.id))
         {
-            if let Some(visible) = visibility {
-                changed |= track.visible != visible;
-                track.visible = visible;
-            }
-            if let Some(collapsed) = collapsed {
-                changed |= track.collapsed != collapsed;
-                track.collapsed = collapsed;
-            }
-            if let Some(height) = height
-                && !matches!(track.kind, TrackKind::Mutation | TrackKind::CopyNumber)
-            {
-                let height = height.clamp(40.0, 600.0);
-                changed |= (track.height - height).abs() > f32::EPSILON;
-                track.height = height;
-            }
             if rename_to_sample
                 && let Some(sample_key) = &track.sample_key
                 && track.name != *sample_key
@@ -607,13 +862,13 @@ impl Viewer {
                 changed = true;
             }
         }
-        let auxiliary_query_membership_changed = previous_auxiliary_query_membership
-            != auxiliary_query_track_ids(self.tracks.tracks())
+        debug_assert_eq!(
+            previous_auxiliary_query_membership,
+            auxiliary_query_track_ids(self.tracks.tracks())
                 .into_iter()
-                .collect::<HashSet<_>>();
-        if auxiliary_query_membership_changed {
-            self.invalidate_and_request_all_auxiliary_track_queries();
-        }
+                .collect::<HashSet<_>>(),
+            "presentation changes must not alter auxiliary query membership"
+        );
         if changed {
             self.rebuild_all_panel_displays();
             self.display_dirty = true;
@@ -638,12 +893,11 @@ impl Viewer {
             .filter(|track| selected.contains(&track.config.id) && track.config.id != source.id)
         {
             track.config.filters.clone_from(&source.filters);
-            track.config.collapsed = source.collapsed;
-            track.config.height = source.height;
             track.config.maximum_alignments = source.maximum_alignments;
             for projection in track.projections.values_mut() {
                 projection.clock.advance();
-                projection.pending_query = track.config.visible;
+                projection.pending_query =
+                    !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
                 projection.alignment_rows = None;
                 projection.cached_layout = None;
             }
@@ -690,9 +944,11 @@ impl Viewer {
         let removed = actual.iter().copied().collect::<HashSet<_>>();
         for id in &actual {
             let _ = self.tracks.remove(*id);
+            self.track_presentation.remove_source(*id);
             self.automation_auxiliary_open_state.remove(id);
             self.metadata_selected_tracks.remove(id);
         }
+        self.reconcile_track_presentation();
         clear_removed_quantitative_dependencies(self.tracks.tracks_mut(), &removed);
         self.annotation_search_results
             .hits
@@ -708,11 +964,10 @@ impl Viewer {
         ) {
             self.open_panel = None;
         }
-        if self
-            .resizing_track
-            .is_some_and(|(id, _)| removed.contains(&id))
-        {
-            self.resizing_track = None;
+        if self.resizing_annotation_track.is_some_and(
+            |(key, _)| matches!(key, TrackFrameKey::Auxiliary(id) if removed.contains(&id)),
+        ) {
+            self.resizing_annotation_track = None;
         }
 
         let has_engine = self.track_engine.is_some();
@@ -792,7 +1047,7 @@ impl Viewer {
                 projection.cached_layout = None;
             }
         }
-        if outcome.query_changed && track.config.visible {
+        if outcome.query_changed && !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_)) {
             for projection in track.projections.values_mut() {
                 projection.clock.advance();
                 projection.pending_query = true;
@@ -812,85 +1067,6 @@ impl Viewer {
 #[cfg(test)]
 mod track_group_tests {
     use super::*;
-
-    fn config(id: u64) -> SessionAlignmentTrack {
-        SessionAlignmentTrack::new(
-            TrackId::new(id),
-            format!("track-{id}"),
-            TrackSource::Local {
-                path: format!("track-{id}.bam"),
-            },
-        )
-    }
-
-    #[test]
-    fn grouping_selected_tracks_allocates_a_new_saved_group() {
-        let mut configs = [config(1), config(2), config(3)];
-        configs[0].track_group = Some(1);
-        configs[1].track_group = Some(1);
-        let selected = [TrackId::new(2), TrackId::new(3)]
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let mut refs = configs.iter_mut().collect::<Vec<_>>();
-
-        assert_eq!(
-            assign_alignment_track_group(&mut refs, &selected, ui::TrackPane::Annotation),
-            Some(2)
-        );
-        assert_eq!(configs[0].track_group, None, "orphaned groups are removed");
-        assert_eq!(configs[1].track_group, Some(2));
-        assert_eq!(configs[2].track_group, Some(2));
-        assert!(!configs[1].track_group_collapsed);
-    }
-
-    #[test]
-    fn normalization_synchronizes_group_minimization_and_clears_singletons() {
-        let mut configs = [config(1), config(2), config(3)];
-        configs[0].track_group = Some(4);
-        configs[0].track_group_collapsed = true;
-        configs[1].track_group = Some(4);
-        configs[2].track_group = Some(9);
-        configs[2].track_group_collapsed = true;
-        let mut refs = configs.iter_mut().collect::<Vec<_>>();
-
-        normalize_alignment_track_group_configs(&mut refs, ui::TrackPane::Annotation);
-
-        assert!(
-            configs[..2]
-                .iter()
-                .all(|config| config.track_group == Some(4))
-        );
-        assert!(
-            configs[..2]
-                .iter()
-                .all(|config| config.track_group_collapsed)
-        );
-        assert_eq!(configs[2].track_group, None);
-        assert!(!configs[2].track_group_collapsed);
-    }
-
-    #[test]
-    fn assigning_a_read_group_does_not_group_or_rewrite_annotations() {
-        let mut configs = [config(1), config(2), config(3)];
-        configs[0].track_group = Some(7);
-        configs[1].track_group = Some(7);
-        let selected = [TrackId::new(2), TrackId::new(3)]
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let mut refs = configs.iter_mut().collect::<Vec<_>>();
-
-        assert_eq!(
-            assign_alignment_track_group(&mut refs, &selected, ui::TrackPane::Reads),
-            Some(2)
-        );
-
-        assert_eq!(configs[0].track_group, Some(7));
-        assert_eq!(configs[1].track_group, Some(7));
-        assert_eq!(configs[2].track_group, None);
-        assert_eq!(configs[0].read_track_group, None);
-        assert_eq!(configs[1].read_track_group, Some(1));
-        assert_eq!(configs[2].read_track_group, Some(1));
-    }
 
     #[test]
     fn read_pane_selection_supports_range_and_additive_toggle_semantics() {

@@ -62,8 +62,11 @@ impl Viewer {
             .context("new mate panel is unavailable")?;
         panel.pending_read_selection = Some((track_id, read_name));
         panel.selected_alignment_track = Some(track_id);
-        panel.selected_alignment_tracks = vec![track_id];
-        panel.selected_track = Some(TrackFrameKey::Alignment(track_id));
+        replace_panel_track_selection(
+            panel,
+            TrackFrameKey::Alignment(track_id),
+            ui::TrackPane::Reads,
+        );
         self.display_dirty = true;
         Ok(id)
     }
@@ -132,8 +135,11 @@ impl Viewer {
             .context("new supplementary panel is unavailable")?;
         panel.pending_read_selection = Some((track_id, read_name));
         panel.selected_alignment_track = Some(track_id);
-        panel.selected_alignment_tracks = vec![track_id];
-        panel.selected_track = Some(TrackFrameKey::Alignment(track_id));
+        replace_panel_track_selection(
+            panel,
+            TrackFrameKey::Alignment(track_id),
+            ui::TrackPane::Reads,
+        );
         panel.selected_chain = Some(chain);
         self.display_dirty = true;
         Ok(id)
@@ -175,8 +181,11 @@ impl Viewer {
                 .context("new supplementary panel is unavailable")?;
             panel.pending_read_selection = Some((track_id, chain.read_name.clone()));
             panel.selected_alignment_track = Some(track_id);
-            panel.selected_alignment_tracks = vec![track_id];
-            panel.selected_track = Some(TrackFrameKey::Alignment(track_id));
+            replace_panel_track_selection(
+                panel,
+                TrackFrameKey::Alignment(track_id),
+                ui::TrackPane::Reads,
+            );
             panel.selected_chain = Some(destination_chain);
             opened += 1;
         }
@@ -226,8 +235,11 @@ impl Viewer {
             panel.pending_read_selection = None;
             panel.selected_record = Some(index);
             panel.selected_alignment_track = Some(track_id);
-            panel.selected_alignment_tracks = vec![track_id];
-            panel.selected_track = Some(TrackFrameKey::Alignment(track_id));
+            replace_panel_track_selection(
+                panel,
+                TrackFrameKey::Alignment(track_id),
+                ui::TrackPane::Reads,
+            );
             if selected_chain.is_some() {
                 panel.selected_chain = selected_chain;
             }

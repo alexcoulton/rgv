@@ -90,6 +90,7 @@ impl Viewer {
         config.format = format;
         let source_label = config.source.redacted_label();
         self.tracks.push(config);
+        self.reconcile_track_presentation();
         self.synthetic = false;
         self.data_status = format!("Opening track {source_label}…");
         Ok(())
@@ -151,6 +152,7 @@ impl Viewer {
             self.tracks
                 .move_track(parent_id, parent_position.saturating_add(selected_index));
         }
+        self.reconcile_track_presentation();
         self.data_status = format!(
             "Opened {} embedded TDF channels from {}",
             track_names.len(),
@@ -202,14 +204,22 @@ impl Viewer {
         self.reference_open_error = None;
         self.automation_auxiliary_open_state.clear();
         self.unresolved_session_sources = session.unresolved_local_sources();
+        self.session_migration_notices
+            .clone_from(&session.migration_notices);
         self.promoted_read = None;
         self.read_name_editor.clear();
         self.variant_sample_search.clear();
         self.variant_settings_sample_search.clear();
         let alignment = primary_alignment_track(session).cloned();
         self.apply_primary_alignment_config(alignment.as_ref(), session.maximum_alignments)?;
+        self.track_presentation = session.presentation.clone();
+        if self.track_presentation.pane_tracks.is_empty()
+            && (!session.alignment_tracks.is_empty() || !session.tracks.is_empty())
+        {
+            self.track_presentation =
+                WorkspacePresentation::from_legacy(&session.alignment_tracks, &session.tracks);
+        }
         self.reference_source.clone_from(&session.reference);
-        self.reference_annotation_height = None;
         self.remote_reference_index_url
             .clone_from(&session.remote_reference_index_url);
         self.reference_reverse_complement = session.reference_reverse_complement;
@@ -328,6 +338,19 @@ impl Viewer {
                 saved.vertical_scroll_points = panel.vertical_scroll_points;
                 saved.annotation_scroll_points = panel.annotation_scroll_points;
                 saved.vertical_content_origin_points = panel.vertical_content_origin_points;
+                saved.read_stack_scroll_points = panel.read_stack_scroll_points;
+                saved.read_panel_states = panel
+                    .read_panel_scrolls
+                    .iter()
+                    .map(|(track_id, state)| SessionReadPanelState {
+                        track_id: *track_id,
+                        scroll_points: state.scroll_points,
+                        content_origin_points: state.content_origin_points,
+                        latent_scroll_fraction: state.latent_scroll_fraction,
+                        content_bottom_points: state.content_bottom_points,
+                        density: state.density,
+                    })
+                    .collect();
                 saved
             })
             .collect();
@@ -341,10 +364,12 @@ impl Viewer {
         }
         SessionDocument {
             schema_version: rgv_core::SESSION_SCHEMA_VERSION,
+            migration_notices: Vec::new(),
             locus,
             panels,
             active_panel: self.panels.active().id,
             alignment_tracks,
+            presentation: self.workspace_presentation_snapshot(),
             reference: self.reference_source.clone(),
             remote_reference_index_url: self.remote_reference_index_url.clone(),
             genome_name: Some(self.assembly_name.clone()),

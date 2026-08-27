@@ -20,15 +20,14 @@ pub use navigation::{
 };
 pub use status::status_bar;
 pub use tracks::{
-    AlignmentSubtrack, ScrollbarInteraction, ScrollbarOverview, TrackFrame, TrackFrameKey,
-    TrackGroupChrome, TrackPane, TrackSubtrack, TrackUiAction, frame_content_y_at_screen_y,
-    keyboard_reorder_index, paint_genomic_text, paint_read_panel_scrollbar,
+    AlignmentSubtrack, PaneItemLayout, PaneLayoutSnapshot, ScrollbarInteraction, ScrollbarOverview,
+    TrackFrame, TrackFrameKey, TrackGroupChrome, TrackPane, TrackSubtrack, TrackUiAction,
+    WorkspacePaneLayout, frame_content_y_at_screen_y, paint_genomic_text,
+    paint_read_panel_scrollbar, paint_read_stack_scrollbar,
     paint_track_viewport_chrome_with_groups, paint_workspace_annotation_scrollbar,
     resized_annotation_track_height, resized_read_pane_height, resized_read_track_height,
-    resized_track_height, scrollbar_fraction_at_grab,
-    scrollbar_geometry_for_density_at_fraction_in_viewport,
+    scrollbar_fraction_at_grab, scrollbar_geometry_for_density_at_fraction_in_viewport,
     scrollbar_geometry_for_density_in_viewport, scrollbar_offset_at_grab, scrollbar_overview,
-    track_drop_index,
 };
 
 pub const MENU_HEIGHT: f32 = 24.0;

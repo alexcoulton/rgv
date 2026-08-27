@@ -1,11 +1,14 @@
 use super::super::*;
-use crate::display::alignment::{ReadPanelKey, read_panel_bounds, read_panel_bounds_for_track};
+use crate::display::alignment::{
+    ReadPanelKey, ReadPanelSpec, read_pane_layout, read_panel_bounds, read_panel_bounds_for_track,
+};
 use crate::display::{
-    ANNOTATION_PANE_BACKGROUND, COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT,
-    PINNED_ALIGNMENT_COVERAGE_HEIGHT, PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT,
-    PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT, PINNED_ALIGNMENT_MODIFICATION_HEIGHT,
-    PINNED_ALIGNMENT_REFERENCE_HEIGHT, alignment_annotation_lane_heights,
-    append_annotation_pane_background, pinned_gene_track_height, primary_pinned_gene_id,
+    ANNOTATION_PANE_BACKGROUND, PINNED_ALIGNMENT_COVERAGE_HEIGHT,
+    PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT, PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
+    PINNED_ALIGNMENT_MODIFICATION_HEIGHT, PINNED_ALIGNMENT_REFERENCE_HEIGHT,
+    READ_PANE_HEADER_HEIGHT, alignment_annotation_lane_heights, append_annotation_pane_background,
+    ensure_annotation_presentation_frames, pinned_gene_track_height, primary_pinned_gene_id,
+    reflow_annotation_presentation,
 };
 
 #[test]
@@ -14,8 +17,8 @@ fn read_panels_tile_the_read_pane_with_independent_viewport_heights() {
     let second = TrackId::new(202);
     let bounds = read_panel_bounds(
         &[
-            (ReadPanelKey::Track(first), true, Some(300.0)),
-            (ReadPanelKey::Track(second), true, Some(100.0)),
+            ReadPanelSpec::expanded(ReadPanelKey::Track(first), Some(300.0)),
+            ReadPanelSpec::expanded(ReadPanelKey::Track(second), Some(100.0)),
         ],
         200.0,
         600.0,
@@ -30,31 +33,67 @@ fn read_panels_tile_the_read_pane_with_independent_viewport_heights() {
 }
 
 #[test]
-fn resizing_one_read_panel_reallocates_its_own_scrollbar_segment() {
+fn explicit_read_panel_heights_remain_literal_until_the_pane_is_constrained() {
     let first = TrackId::new(101);
     let second = TrackId::new(202);
     let equal = read_panel_bounds(
         &[
-            (ReadPanelKey::Track(first), true, Some(100.0)),
-            (ReadPanelKey::Track(second), true, Some(100.0)),
+            ReadPanelSpec::expanded(ReadPanelKey::Track(first), Some(100.0)),
+            ReadPanelSpec::expanded(ReadPanelKey::Track(second), Some(100.0)),
         ],
         200.0,
         600.0,
     );
     let resized = read_panel_bounds(
         &[
-            (ReadPanelKey::Track(first), true, Some(300.0)),
-            (ReadPanelKey::Track(second), true, Some(100.0)),
+            ReadPanelSpec::expanded(ReadPanelKey::Track(first), Some(300.0)),
+            ReadPanelSpec::expanded(ReadPanelKey::Track(second), Some(100.0)),
         ],
         200.0,
         600.0,
     );
 
-    assert_eq!(equal[0].bottom - equal[0].top, 200.0);
-    assert_eq!(equal[1].bottom - equal[1].top, 200.0);
+    assert_eq!(equal[0].bottom - equal[0].top, 100.0);
+    assert_eq!(equal[1].bottom - equal[1].top, 100.0);
+    assert_eq!(equal.last().map(|panel| panel.bottom), Some(400.0));
     assert_eq!(resized[0].bottom - resized[0].top, 300.0);
     assert_eq!(resized[1].bottom - resized[1].top, 100.0);
     assert_eq!(resized.last().map(|panel| panel.bottom), Some(600.0));
+}
+
+#[test]
+fn a_group_after_an_expanded_sibling_does_not_get_pushed_to_the_pane_bottom() {
+    let sibling = TrackId::new(101);
+    let expanded = read_panel_bounds(
+        &[
+            ReadPanelSpec::expanded(ReadPanelKey::Track(sibling), Some(100.0)),
+            ReadPanelSpec::header(ReadPanelKey::Group(7)),
+        ],
+        200.0,
+        600.0,
+    );
+    let sibling_hidden = read_panel_bounds(
+        &[
+            ReadPanelSpec::header(ReadPanelKey::Track(sibling)),
+            ReadPanelSpec::header(ReadPanelKey::Group(7)),
+        ],
+        200.0,
+        600.0,
+    );
+
+    assert_eq!((expanded[0].top, expanded[0].bottom), (200.0, 300.0));
+    assert_eq!(
+        (expanded[1].top, expanded[1].bottom),
+        (300.0, 300.0 + READ_PANE_HEADER_HEIGHT)
+    );
+    assert!(expanded[1].bottom < 600.0);
+    assert_eq!(
+        (sibling_hidden[1].top, sibling_hidden[1].bottom),
+        (
+            200.0 + READ_PANE_HEADER_HEIGHT,
+            200.0 + READ_PANE_HEADER_HEIGHT * 2.0,
+        )
+    );
 }
 
 #[test]
@@ -63,24 +102,59 @@ fn read_group_header_reserves_only_read_pane_space() {
     let second = TrackId::new(202);
     let bounds = read_panel_bounds(
         &[
-            (ReadPanelKey::Group(7), false, None),
-            (ReadPanelKey::Track(first), true, Some(100.0)),
-            (ReadPanelKey::Track(second), true, Some(100.0)),
+            ReadPanelSpec::header(ReadPanelKey::Group(7)),
+            ReadPanelSpec::expanded(ReadPanelKey::Track(first), Some(100.0)),
+            ReadPanelSpec::expanded(ReadPanelKey::Track(second), Some(100.0)),
         ],
         200.0,
         600.0,
     );
 
     assert_eq!(bounds[0].key, ReadPanelKey::Group(7));
-    assert_eq!(
-        bounds[0].bottom - bounds[0].top,
-        COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT
-    );
+    assert_eq!(bounds[0].bottom - bounds[0].top, READ_PANE_HEADER_HEIGHT);
     assert_eq!(bounds[1].key, ReadPanelKey::Track(first));
     assert_eq!(bounds[2].key, ReadPanelKey::Track(second));
     assert_eq!(bounds[0].bottom, bounds[1].top);
     assert_eq!(bounds[1].bottom, bounds[2].top);
-    assert_eq!(bounds[2].bottom, 600.0);
+    assert_eq!(bounds[2].bottom, 422.0);
+    assert!(bounds[2].bottom < 600.0);
+}
+
+#[test]
+fn read_stack_overflow_preserves_every_header_and_reports_parent_extent() {
+    let specs = (1..=8)
+        .flat_map(|id| {
+            [
+                ReadPanelSpec::header(ReadPanelKey::Group(id)),
+                ReadPanelSpec::expanded(
+                    ReadPanelKey::Track(TrackId::new(u64::from(id))),
+                    Some(80.0),
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    let layout = read_pane_layout(&specs, 200.0, 500.0);
+
+    assert!(layout.content_bottom > 500.0);
+    assert_eq!(layout.bounds.len(), specs.len());
+    for (spec, bounds) in specs.iter().zip(&layout.bounds) {
+        assert!(bounds.bottom > bounds.top);
+        if matches!(
+            spec.content,
+            crate::display::alignment::ReadPanelContent::HeaderOnly
+        ) {
+            assert_eq!(bounds.bottom - bounds.top, READ_PANE_HEADER_HEIGHT);
+        } else {
+            assert!(bounds.bottom - bounds.top >= 40.0);
+        }
+    }
+    assert!(
+        layout
+            .bounds
+            .windows(2)
+            .all(|rows| (rows[0].bottom - rows[1].top).abs() < f32::EPSILON)
+    );
 }
 
 #[test]
@@ -119,6 +193,166 @@ fn annotation_pane_background_is_bounded_and_precedes_track_geometry() {
 
     append_annotation_pane_background(&mut display, 300.0, 90.0, 90.0);
     assert_eq!(display.rectangles.len(), 2);
+}
+
+#[test]
+fn annotation_composition_follows_presentation_order_without_reordering_sources() {
+    let first = TrackId::new(1);
+    let second = TrackId::new(2);
+    let mut presentation = WorkspacePresentation::default();
+    presentation.pane_tracks = vec![
+        SessionPaneTrackState {
+            channel: ui::TrackPane::Annotation,
+            track_id: second,
+            content_visible: true,
+            preferred_height: Some(50.0),
+        },
+        SessionPaneTrackState {
+            channel: ui::TrackPane::Annotation,
+            track_id: first,
+            content_visible: true,
+            preferred_height: Some(50.0),
+        },
+    ];
+    let frame = |id, top| TrackFrame {
+        key: TrackFrameKey::Auxiliary(id),
+        channel: ui::TrackPane::Annotation,
+        name: format!("track-{}", id.get()),
+        kind: TrackKind::Feature,
+        source_label: None,
+        top,
+        bottom: top + 50.0,
+        visible: true,
+        collapsed: false,
+        frozen_bottom: None,
+        subtracks: Vec::new(),
+    };
+    let mut frames = vec![frame(first, 0.0), frame(second, 50.0)];
+    let mut display = DisplayList {
+        rectangles: vec![
+            RectPrimitive {
+                x: 0.0,
+                y: 10.0,
+                width: 10.0,
+                height: 2.0,
+                color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+                object_id: 1,
+                shape: Default::default(),
+            },
+            RectPrimitive {
+                x: 0.0,
+                y: 60.0,
+                width: 10.0,
+                height: 2.0,
+                color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+                object_id: 2,
+                shape: Default::default(),
+            },
+        ],
+        texts: Vec::new(),
+    };
+
+    let bottom = reflow_annotation_presentation(&presentation, &mut frames, &mut display, 0.0);
+
+    assert_eq!(bottom, 100.0);
+    assert_eq!(frames[0].key, TrackFrameKey::Auxiliary(second));
+    assert_eq!((frames[0].top, frames[0].bottom), (0.0, 50.0));
+    assert_eq!(frames[1].key, TrackFrameKey::Auxiliary(first));
+    assert_eq!((frames[1].top, frames[1].bottom), (50.0, 100.0));
+    assert_eq!(display.rectangles[0].y, 60.0);
+    assert_eq!(display.rectangles[1].y, 10.0);
+}
+
+#[test]
+fn annotation_tree_retains_a_restore_header_when_a_renderer_omits_its_frame() {
+    let rendered = TrackId::new(1);
+    let omitted = TrackId::new(2);
+    let mut presentation = WorkspacePresentation::default();
+    presentation.pane_tracks = vec![
+        SessionPaneTrackState {
+            channel: ui::TrackPane::Annotation,
+            track_id: rendered,
+            content_visible: true,
+            preferred_height: None,
+        },
+        SessionPaneTrackState {
+            channel: ui::TrackPane::Annotation,
+            track_id: omitted,
+            content_visible: false,
+            preferred_height: None,
+        },
+    ];
+    let frame = |id, collapsed| TrackFrame {
+        key: TrackFrameKey::Auxiliary(id),
+        channel: ui::TrackPane::Annotation,
+        name: format!("track-{}", id.get()),
+        kind: TrackKind::Feature,
+        source_label: None,
+        top: 0.0,
+        bottom: 50.0,
+        visible: true,
+        collapsed,
+        frozen_bottom: None,
+        subtracks: Vec::new(),
+    };
+    let mut frames = vec![frame(rendered, false)];
+    let fallbacks = [frame(rendered, false), frame(omitted, true)];
+
+    let bottom =
+        ensure_annotation_presentation_frames(&presentation, &mut frames, &fallbacks, 50.0);
+
+    assert_eq!(bottom, 76.0);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[1].key, TrackFrameKey::Auxiliary(omitted));
+    assert_eq!((frames[1].top, frames[1].bottom), (50.0, 76.0));
+    assert!(frames[1].collapsed);
+}
+
+#[test]
+fn annotation_tree_does_not_duplicate_a_composite_member_row() {
+    let anchor = TrackId::new(1);
+    let member = TrackId::new(2);
+    let mut presentation = WorkspacePresentation::default();
+    presentation.pane_tracks = [anchor, member]
+        .into_iter()
+        .map(|track_id| SessionPaneTrackState {
+            channel: ui::TrackPane::Annotation,
+            track_id,
+            content_visible: true,
+            preferred_height: None,
+        })
+        .collect();
+    let mut overlay = TrackFrame {
+        key: TrackFrameKey::Auxiliary(anchor),
+        channel: ui::TrackPane::Annotation,
+        name: "Overlay 1 · 2 tracks".to_owned(),
+        kind: TrackKind::Quantitative,
+        source_label: None,
+        top: 0.0,
+        bottom: 80.0,
+        visible: true,
+        collapsed: false,
+        frozen_bottom: None,
+        subtracks: Vec::new(),
+    };
+    overlay.subtracks.push(TrackSubtrack {
+        label: "member".to_owned(),
+        detail: None,
+        top: 22.0,
+        bottom: 42.0,
+        collapsed: false,
+        composite_member: Some(member),
+    });
+    let mut frames = vec![overlay.clone()];
+    let mut member_fallback = overlay;
+    member_fallback.key = TrackFrameKey::Auxiliary(member);
+    member_fallback.name = "member".to_owned();
+
+    let bottom =
+        ensure_annotation_presentation_frames(&presentation, &mut frames, &[member_fallback], 80.0);
+
+    assert_eq!(bottom, 80.0);
+    assert_eq!(frames.len(), 1);
 }
 
 #[test]
@@ -479,6 +713,7 @@ fn alignment_picking_routes_by_stable_track_frame_before_record_id() {
     let frames = vec![
         TrackFrame {
             key: TrackFrameKey::Alignment(TrackId::new(10)),
+            channel: ui::TrackPane::Annotation,
             name: "Tumour".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -491,6 +726,7 @@ fn alignment_picking_routes_by_stable_track_frame_before_record_id() {
         },
         TrackFrame {
             key: TrackFrameKey::Alignment(TrackId::new(11)),
+            channel: ui::TrackPane::Annotation,
             name: "Normal".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -528,6 +764,7 @@ fn alignment_lane_picking_distinguishes_scrolled_read_groups() {
     let frames = vec![
         TrackFrame {
             key: TrackFrameKey::Alignment(TrackId::new(10)),
+            channel: ui::TrackPane::Reads,
             name: "Tumour".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -547,6 +784,7 @@ fn alignment_lane_picking_distinguishes_scrolled_read_groups() {
         },
         TrackFrame {
             key: TrackFrameKey::Alignment(TrackId::new(11)),
+            channel: ui::TrackPane::Reads,
             name: "Normal".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -591,6 +829,7 @@ fn alignment_lane_picking_distinguishes_scrolled_read_groups() {
 fn collapsed_alignment_lanes_are_not_pickable() {
     let frames = vec![TrackFrame {
         key: TrackFrameKey::Alignment(TrackId::new(10)),
+        channel: ui::TrackPane::Annotation,
         name: "Tumour".to_owned(),
         kind: TrackKind::Alignment,
         source_label: None,

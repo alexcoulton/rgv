@@ -1,0 +1,502 @@
+{
+  "schema_version": 4,
+  "locus": {
+    "contig": "chr2",
+    "start": 0,
+    "end": 200000
+  },
+  "panels": [
+    {
+      "id": 1,
+      "locus": {
+        "contig": "chr1",
+        "start": 900000,
+        "end": 920000
+      },
+      "vertical_scroll_points": 40.0,
+      "annotation_scroll_points": 0.0,
+      "vertical_content_origin_points": 0.0,
+      "read_stack_scroll_points": 0.0,
+      "read_panel_states": [
+        {
+          "track_id": 1,
+          "scroll_points": 40.0,
+          "content_origin_points": 0.0,
+          "latent_scroll_fraction": 0.04642102,
+          "content_bottom_points": 1394.1786,
+          "density": 1.25
+        },
+        {
+          "track_id": 2,
+          "scroll_points": 0.0,
+          "content_origin_points": 0.0,
+          "latent_scroll_fraction": 0.0,
+          "content_bottom_points": 1318.1428
+        },
+        {
+          "track_id": 3,
+          "scroll_points": 0.0,
+          "content_origin_points": 0.0,
+          "latent_scroll_fraction": 0.0,
+          "content_bottom_points": 1432.6428
+        },
+        {
+          "track_id": 4,
+          "scroll_points": 0.0,
+          "content_origin_points": 0.0,
+          "latent_scroll_fraction": 0.0,
+          "content_bottom_points": 1547.1428
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "locus": {
+        "contig": "chr2",
+        "start": 0,
+        "end": 200000
+      },
+      "vertical_scroll_points": 80.0,
+      "annotation_scroll_points": 0.0,
+      "vertical_content_origin_points": 0.0,
+      "read_stack_scroll_points": 0.0,
+      "read_panel_states": [
+        {
+          "track_id": 1,
+          "scroll_points": 80.0,
+          "content_origin_points": 0.0,
+          "latent_scroll_fraction": 0.11881396,
+          "content_bottom_points": 1205.8215,
+          "density": 2.25
+        },
+        {
+          "track_id": 2,
+          "scroll_points": 0.0,
+          "content_origin_points": 0.0,
+          "latent_scroll_fraction": 0.0,
+          "content_bottom_points": 857.1429
+        },
+        {
+          "track_id": 3,
+          "scroll_points": 0.0,
+          "content_origin_points": 0.0,
+          "latent_scroll_fraction": 0.0,
+          "content_bottom_points": 971.6429
+        },
+        {
+          "track_id": 4,
+          "scroll_points": 0.0,
+          "content_origin_points": 0.0,
+          "latent_scroll_fraction": 0.0,
+          "content_bottom_points": 1086.1428
+        }
+      ]
+    }
+  ],
+  "active_panel": 2,
+  "alignment_tracks": [
+    {
+      "id": 1,
+      "name": "Tumour paired",
+      "source": {
+        "Local": {
+          "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/mixed.bam"
+        }
+      },
+      "sample_key": "tumour",
+      "filters": {
+        "alignment_color_mode": "pair_orientation",
+        "alignment_group_mode": "none",
+        "alignment_group_order": "natural",
+        "alignment_sort_mode": "start",
+        "alignment_sort_order": "natural",
+        "view_as_pairs": false,
+        "minimum_template_length": null,
+        "maximum_template_length": null,
+        "overlapping_mate_policy": "count_once",
+        "minimum_mapping_quality": null,
+        "minimum_base_quality": 0,
+        "minimum_allele_fraction": 0.2,
+        "quality_weighted_alleles": true,
+        "show_reference": true,
+        "show_coverage": true,
+        "show_junctions": true,
+        "minimum_junction_depth": 1,
+        "minimum_junction_flank": 0,
+        "junction_display_mode": "collapsed",
+        "sashimi_scale_mode": "automatic",
+        "sashimi_fixed_scale_maximum": 100,
+        "sashimi_count_mode": "raw",
+        "show_junction_labels": true,
+        "coverage_scale_maximum": null,
+        "coverage_scale_transform": "linear",
+        "show_coverage_center_line": true,
+        "alignment_density": 1.0,
+        "inspector_activation": "click",
+        "read_base_display_mode": "mismatches",
+        "shade_read_bases_by_quality": true,
+        "minimum_indel_size": 1,
+        "minimum_event_label_size": 10,
+        "show_modified_bases": true,
+        "show_modification_frequency": true,
+        "minimum_modification_probability": 0,
+        "modified_base_color_mode": "by_type",
+        "hidden_modification_codes": [],
+        "include_secondary": false,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    },
+    {
+      "id": 2,
+      "name": "Normal strand",
+      "source": {
+        "Local": {
+          "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/mixed.bam"
+        }
+      },
+      "sample_key": "normal",
+      "filters": {
+        "alignment_color_mode": "strand",
+        "alignment_group_mode": "none",
+        "alignment_group_order": "natural",
+        "alignment_sort_mode": "start",
+        "alignment_sort_order": "natural",
+        "view_as_pairs": false,
+        "minimum_template_length": null,
+        "maximum_template_length": null,
+        "overlapping_mate_policy": "count_once",
+        "minimum_mapping_quality": null,
+        "minimum_base_quality": 0,
+        "minimum_allele_fraction": 0.2,
+        "quality_weighted_alleles": true,
+        "show_reference": true,
+        "show_coverage": true,
+        "show_junctions": true,
+        "minimum_junction_depth": 1,
+        "minimum_junction_flank": 0,
+        "junction_display_mode": "collapsed",
+        "sashimi_scale_mode": "automatic",
+        "sashimi_fixed_scale_maximum": 100,
+        "sashimi_count_mode": "raw",
+        "show_junction_labels": true,
+        "coverage_scale_maximum": null,
+        "coverage_scale_transform": "linear",
+        "show_coverage_center_line": true,
+        "alignment_density": 1.0,
+        "inspector_activation": "click",
+        "read_base_display_mode": "mismatches",
+        "shade_read_bases_by_quality": true,
+        "minimum_indel_size": 1,
+        "minimum_event_label_size": 10,
+        "show_modified_bases": true,
+        "show_modification_frequency": true,
+        "minimum_modification_probability": 0,
+        "modified_base_color_mode": "by_type",
+        "hidden_modification_codes": [],
+        "include_secondary": false,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    },
+    {
+      "id": 3,
+      "name": "Long reads",
+      "source": {
+        "Local": {
+          "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/mixed.bam"
+        }
+      },
+      "sample_key": "tumour",
+      "filters": {
+        "alignment_color_mode": "mapping_quality",
+        "alignment_group_mode": "none",
+        "alignment_group_order": "natural",
+        "alignment_sort_mode": "start",
+        "alignment_sort_order": "natural",
+        "view_as_pairs": false,
+        "minimum_template_length": null,
+        "maximum_template_length": null,
+        "overlapping_mate_policy": "count_once",
+        "minimum_mapping_quality": null,
+        "minimum_base_quality": 0,
+        "minimum_allele_fraction": 0.2,
+        "quality_weighted_alleles": true,
+        "show_reference": true,
+        "show_coverage": true,
+        "show_junctions": true,
+        "minimum_junction_depth": 1,
+        "minimum_junction_flank": 0,
+        "junction_display_mode": "collapsed",
+        "sashimi_scale_mode": "automatic",
+        "sashimi_fixed_scale_maximum": 100,
+        "sashimi_count_mode": "raw",
+        "show_junction_labels": true,
+        "coverage_scale_maximum": null,
+        "coverage_scale_transform": "linear",
+        "show_coverage_center_line": true,
+        "alignment_density": 1.0,
+        "inspector_activation": "click",
+        "read_base_display_mode": "mismatches",
+        "shade_read_bases_by_quality": true,
+        "minimum_indel_size": 1,
+        "minimum_event_label_size": 10,
+        "show_modified_bases": true,
+        "show_modification_frequency": true,
+        "minimum_modification_probability": 0,
+        "modified_base_color_mode": "by_type",
+        "hidden_modification_codes": [],
+        "include_secondary": false,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    },
+    {
+      "id": 4,
+      "name": "Read groups",
+      "source": {
+        "Local": {
+          "path": "/Users/alexcoulton/work/external.repos/rgv/benchmark-data/mixed.bam"
+        }
+      },
+      "sample_key": "normal",
+      "filters": {
+        "alignment_color_mode": "read_group",
+        "alignment_group_mode": "none",
+        "alignment_group_order": "natural",
+        "alignment_sort_mode": "start",
+        "alignment_sort_order": "natural",
+        "view_as_pairs": false,
+        "minimum_template_length": null,
+        "maximum_template_length": null,
+        "overlapping_mate_policy": "count_once",
+        "minimum_mapping_quality": null,
+        "minimum_base_quality": 0,
+        "minimum_allele_fraction": 0.2,
+        "quality_weighted_alleles": true,
+        "show_reference": true,
+        "show_coverage": true,
+        "show_junctions": true,
+        "minimum_junction_depth": 1,
+        "minimum_junction_flank": 0,
+        "junction_display_mode": "collapsed",
+        "sashimi_scale_mode": "automatic",
+        "sashimi_fixed_scale_maximum": 100,
+        "sashimi_count_mode": "raw",
+        "show_junction_labels": true,
+        "coverage_scale_maximum": null,
+        "coverage_scale_transform": "linear",
+        "show_coverage_center_line": true,
+        "alignment_density": 1.0,
+        "inspector_activation": "click",
+        "read_base_display_mode": "mismatches",
+        "shade_read_bases_by_quality": true,
+        "minimum_indel_size": 1,
+        "minimum_event_label_size": 10,
+        "show_modified_bases": true,
+        "show_modification_frequency": true,
+        "minimum_modification_probability": 0,
+        "modified_base_color_mode": "by_type",
+        "hidden_modification_codes": [],
+        "include_secondary": false,
+        "include_supplementary": true,
+        "auxiliary_predicates": []
+      },
+      "maximum_alignments": 50000
+    }
+  ],
+  "presentation": {
+    "read_pane_height": 480.0,
+    "reference_content_visible": true,
+    "pane_tracks": [
+      {
+        "channel": "annotation",
+        "track_id": 1,
+        "content_visible": true
+      },
+      {
+        "channel": "annotation",
+        "track_id": 2,
+        "content_visible": true
+      },
+      {
+        "channel": "annotation",
+        "track_id": 3,
+        "content_visible": true
+      },
+      {
+        "channel": "annotation",
+        "track_id": 4,
+        "content_visible": true
+      },
+      {
+        "channel": "reads",
+        "track_id": 1,
+        "content_visible": true,
+        "preferred_height": 420.0
+      },
+      {
+        "channel": "reads",
+        "track_id": 2,
+        "content_visible": true,
+        "preferred_height": 420.0
+      },
+      {
+        "channel": "reads",
+        "track_id": 3,
+        "content_visible": true,
+        "preferred_height": 420.0
+      },
+      {
+        "channel": "reads",
+        "track_id": 4,
+        "content_visible": true,
+        "preferred_height": 420.0
+      }
+    ],
+    "groups": [
+      {
+        "id": 1,
+        "label": "Group 1",
+        "channel": "reads",
+        "members": [
+          2,
+          3,
+          4
+        ],
+        "expanded": true,
+        "content_visible": true
+      },
+      {
+        "id": 2,
+        "label": "Group 2",
+        "channel": "annotation",
+        "members": [
+          1,
+          2,
+          3
+        ],
+        "expanded": true,
+        "content_visible": true
+      }
+    ],
+    "composites": [],
+    "next_group_id": 3
+  },
+  "reference": null,
+  "genome_name": "RGV multi-track workspace truth",
+  "assembly_identity": null,
+  "cytobands": null,
+  "reference_reverse_complement": false,
+  "reference_translation_frames": [],
+  "reference_genetic_code": "Standard",
+  "regions_of_interest": [],
+  "review_items": [],
+  "sample_metadata": {
+    "key_column": "sample",
+    "columns": [
+      "condition",
+      "batch",
+      "family_id",
+      "father",
+      "mother",
+      "affected"
+    ],
+    "rows": [
+      {
+        "sample_key": "tumour",
+        "values": [
+          "case",
+          "B",
+          "FAM1",
+          "normal-father",
+          "normal-mother",
+          "yes"
+        ]
+      },
+      {
+        "sample_key": "normal",
+        "values": [
+          "control",
+          "A",
+          "FAM1",
+          "0",
+          "0",
+          "no"
+        ]
+      },
+      {
+        "sample_key": "normal-father",
+        "values": [
+          "control",
+          "A",
+          "FAM1",
+          "0",
+          "0",
+          "no"
+        ]
+      },
+      {
+        "sample_key": "normal-mother",
+        "values": [
+          "control",
+          "A",
+          "FAM1",
+          "0",
+          "0",
+          "no"
+        ]
+      },
+      {
+        "sample_key": "child",
+        "values": [
+          "case",
+          "C",
+          "PED1",
+          "father",
+          "mother",
+          "yes"
+        ]
+      },
+      {
+        "sample_key": "father",
+        "values": [
+          "control",
+          "C",
+          "PED1",
+          "0",
+          "0",
+          "no"
+        ]
+      },
+      {
+        "sample_key": "mother",
+        "values": [
+          "control",
+          "C",
+          "PED1",
+          "0",
+          "0",
+          "no"
+        ]
+      },
+      {
+        "sample_key": "single-cell",
+        "values": [
+          "case",
+          "SC",
+          ".",
+          "0",
+          "0",
+          "unknown"
+        ]
+      }
+    ]
+  },
+  "contig_aliases": {},
+  "tracks": [],
+  "maximum_alignments": 50000
+}

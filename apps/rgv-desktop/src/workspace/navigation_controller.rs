@@ -97,8 +97,11 @@ impl Viewer {
         let locus = annotation_search_hit_locus(hit);
         match self.navigate_to_locus(&locus) {
             Ok(()) => {
-                self.panels.active_mut().selected_track =
-                    Some(TrackFrameKey::Auxiliary(hit.track_id));
+                replace_panel_track_selection(
+                    self.panels.active_mut(),
+                    TrackFrameKey::Auxiliary(hit.track_id),
+                    ui::TrackPane::Annotation,
+                );
                 self.locus_editor = locus;
                 self.data_status = format!(
                     "{} · {} · {}",

@@ -153,6 +153,17 @@ filter reports additionally expose `no_op`; an empty filter expression is the ex
 for clearing an alignment filter. This makes an applied clamp or idempotent call distinguishable
 from a mutation that changed the viewer.
 
+Automation schema version 3 exposes the normalized presentation model structurally. Workspace
+snapshots include ordered, channel-qualified presentation nodes and groups; desired and effective
+visibility; preferred heights; the shared immutable pane-layout rectangles; pane and stack scroll
+offsets; every read panel's maximum/offset/effective density; the canonical pane selection; source
+availability; and the target of any active resize or annotation/read scrollbar gesture. The typed
+`presentation_node_visible`, `presentation_node_height`, `presentation_group_expanded`,
+`presentation_group_visible`, `presentation_composite_visible`, `presentation_group`,
+`presentation_ungroup`, `read_pane_height`,
+`annotation_scroll_points`, `read_stack_scroll_points`, `read_panel_scroll_points`, and
+`read_panel_density` settings all execute through the same reducer used by the GUI.
+
 `rgv_get_interaction_trace` is observational. Drag the vertical scrollbar in the live window, then
 call the tool to inspect the first 500 ms of the gesture. The trace separates pointer receipt,
 egui handling, display clipping, renderer preparation, CPU/GPU capacity growth, upload volume,

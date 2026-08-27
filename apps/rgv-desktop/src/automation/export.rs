@@ -65,6 +65,7 @@ pub(crate) fn automation_snapshot_metadata(
     panels: &PanelWorkspace,
     alignment_tracks: &[AlignmentTrackController],
     tracks: &TrackCollection,
+    presentation: &WorkspacePresentation,
     scope: &str,
 ) -> String {
     let mut metadata = format!(
@@ -90,13 +91,24 @@ pub(crate) fn automation_snapshot_metadata(
     let mut first = true;
     for (id, name) in alignment_tracks
         .iter()
-        .filter(|track| track.config.visible)
+        .filter(|track| {
+            presentation
+                .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
+                .unwrap_or(false)
+                || presentation
+                    .track_content_exposed(ui::TrackPane::Reads, track.config.id)
+                    .unwrap_or(false)
+        })
         .map(|track| (track.config.id, track.config.name.as_str()))
         .chain(
             tracks
                 .tracks()
                 .iter()
-                .filter(|track| track.visible)
+                .filter(|track| {
+                    presentation
+                        .track_content_exposed(ui::TrackPane::Annotation, track.id)
+                        .unwrap_or(false)
+                })
                 .map(|track| (track.id, track.name.as_str())),
         )
     {
@@ -257,6 +269,7 @@ pub(crate) fn automation_track_names_export(
     panels: &PanelWorkspace,
     alignment_tracks: &[AlignmentTrackController],
     tracks: &TrackCollection,
+    presentation: &WorkspacePresentation,
 ) -> String {
     let mut output = format!(
         "# RGV {} track-name export\n# genome\t{}\n# panel_count\t{}\ntrack_id\tkind\tname\tsample_key\tvisible\n",
@@ -275,7 +288,9 @@ pub(crate) fn automation_track_names_export(
                 .sample_key
                 .as_deref()
                 .map_or_else(String::new, |value| sanitized_tsv_field(value, 4_096)),
-            track.config.visible,
+            presentation
+                .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
+                .unwrap_or(false),
         );
     }
     for track in tracks.tracks() {
@@ -289,7 +304,9 @@ pub(crate) fn automation_track_names_export(
                 .sample_key
                 .as_deref()
                 .map_or_else(String::new, |value| sanitized_tsv_field(value, 4_096)),
-            track.visible,
+            presentation
+                .track_content_exposed(ui::TrackPane::Annotation, track.id)
+                .unwrap_or(false),
         );
     }
     output

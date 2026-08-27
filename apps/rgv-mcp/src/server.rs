@@ -10,8 +10,8 @@ use rgv_core::{
     AutomationRunReport, AutomationSelection, AutomationSelectionGranularity, AutomationSetting,
     AutomationSnapshotFormat, AutomationSnapshotScope, AutomationUnsavedChangesPolicy,
     AutomationViewportOperation, AutomationWorkspaceSnapshot, CoverageScaleTransform,
-    ModifiedBaseColorMode, OverlappingMatePolicy, PanelId, ReadBaseDisplayMode, TrackId, TrackKind,
-    TrackSource,
+    ModifiedBaseColorMode, OverlappingMatePolicy, PanelId, PresentationNodeId, ReadBaseDisplayMode,
+    TrackChannel, TrackId, TrackKind, TrackSource,
 };
 use rmcp::schemars;
 use rmcp::{
@@ -1451,6 +1451,54 @@ pub struct ConfigureArgs {
     pub timeout_millis: u64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolTrackChannel {
+    Annotation,
+    Reads,
+}
+
+impl ToolTrackChannel {
+    const fn into_core(self) -> TrackChannel {
+        match self {
+            Self::Annotation => TrackChannel::Annotation,
+            Self::Reads => TrackChannel::Reads,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolPresentationNode {
+    Reference,
+    Track {
+        channel: ToolTrackChannel,
+        #[schemars(range(min = 1))]
+        track_id: u64,
+    },
+    Group {
+        channel: ToolTrackChannel,
+        #[schemars(range(min = 1))]
+        group_id: u32,
+    },
+}
+
+impl ToolPresentationNode {
+    const fn into_core(self) -> PresentationNodeId {
+        match self {
+            Self::Reference => PresentationNodeId::Reference,
+            Self::Track { channel, track_id } => PresentationNodeId::Track {
+                channel: channel.into_core(),
+                track_id: TrackId::new(track_id),
+            },
+            Self::Group { channel, group_id } => PresentationNodeId::Group {
+                channel: channel.into_core(),
+                group_id,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "setting", rename_all = "snake_case")]
 pub enum ToolSetting {
@@ -1509,6 +1557,41 @@ pub enum ToolSetting {
     ModifiedBaseColorMode {
         value: ToolModifiedBaseColorMode,
     },
+    PresentationNodeVisible {
+        target: ToolPresentationNode,
+        value: bool,
+    },
+    PresentationNodeHeight {
+        target: ToolPresentationNode,
+        #[schemars(range(min = 26.0, max = 1200.0))]
+        value: f32,
+    },
+    PresentationGroupExpanded {
+        target: ToolPresentationNode,
+        value: bool,
+    },
+    PresentationGroupVisible {
+        target: ToolPresentationNode,
+        value: bool,
+    },
+    PresentationCompositeVisible {
+        channel: ToolTrackChannel,
+        #[schemars(range(min = 1))]
+        composite_id: u32,
+        value: bool,
+    },
+    PresentationGroup {
+        channel: ToolTrackChannel,
+        #[schemars(length(min = 2, max = 1024))]
+        track_ids: Vec<u64>,
+    },
+    PresentationUngroup {
+        target: ToolPresentationNode,
+    },
+    ReadPaneHeight {
+        #[schemars(range(min = 100.0, max = 1200.0))]
+        value: f32,
+    },
     TrackHeight {
         #[schemars(range(min = 1))]
         track_id: u64,
@@ -1535,6 +1618,28 @@ pub enum ToolSetting {
         #[schemars(range(min = 1))]
         panel_id: u64,
         #[schemars(range(min = 0.0))]
+        value: f32,
+    },
+    ReadStackScrollPoints {
+        #[schemars(range(min = 1))]
+        panel_id: u64,
+        #[schemars(range(min = 0.0))]
+        value: f32,
+    },
+    ReadPanelScrollPoints {
+        #[schemars(range(min = 1))]
+        panel_id: u64,
+        #[schemars(range(min = 1))]
+        track_id: u64,
+        #[schemars(range(min = 0.0))]
+        value: f32,
+    },
+    ReadPanelDensity {
+        #[schemars(range(min = 1))]
+        panel_id: u64,
+        #[schemars(range(min = 1))]
+        track_id: u64,
+        #[schemars(range(min = 0.25, max = 4.0))]
         value: f32,
     },
 }
@@ -1590,6 +1695,49 @@ impl ToolSetting {
             Self::ModifiedBaseColorMode { value } => AutomationSetting::ModifiedBaseColorMode {
                 value: value.into_core(),
             },
+            Self::PresentationNodeVisible { target, value } => {
+                AutomationSetting::PresentationNodeVisible {
+                    target: target.into_core(),
+                    value,
+                }
+            }
+            Self::PresentationNodeHeight { target, value } => {
+                AutomationSetting::PresentationNodeHeight {
+                    target: target.into_core(),
+                    value,
+                }
+            }
+            Self::PresentationGroupExpanded { target, value } => {
+                AutomationSetting::PresentationGroupExpanded {
+                    target: target.into_core(),
+                    value,
+                }
+            }
+            Self::PresentationGroupVisible { target, value } => {
+                AutomationSetting::PresentationGroupVisible {
+                    target: target.into_core(),
+                    value,
+                }
+            }
+            Self::PresentationCompositeVisible {
+                channel,
+                composite_id,
+                value,
+            } => AutomationSetting::PresentationCompositeVisible {
+                channel: channel.into_core(),
+                composite_id,
+                value,
+            },
+            Self::PresentationGroup { channel, track_ids } => {
+                AutomationSetting::PresentationGroup {
+                    channel: channel.into_core(),
+                    track_ids: track_ids.into_iter().map(TrackId::new).collect(),
+                }
+            }
+            Self::PresentationUngroup { target } => AutomationSetting::PresentationUngroup {
+                target: target.into_core(),
+            },
+            Self::ReadPaneHeight { value } => AutomationSetting::ReadPaneHeight { value },
             Self::TrackHeight { track_id, value } => AutomationSetting::TrackHeight {
                 track_id: TrackId::new(track_id),
                 value,
@@ -1614,6 +1762,30 @@ impl ToolSetting {
                     value,
                 }
             }
+            Self::ReadStackScrollPoints { panel_id, value } => {
+                AutomationSetting::ReadStackScrollPoints {
+                    panel_id: PanelId::new(panel_id),
+                    value,
+                }
+            }
+            Self::ReadPanelScrollPoints {
+                panel_id,
+                track_id,
+                value,
+            } => AutomationSetting::ReadPanelScrollPoints {
+                panel_id: PanelId::new(panel_id),
+                track_id: TrackId::new(track_id),
+                value,
+            },
+            Self::ReadPanelDensity {
+                panel_id,
+                track_id,
+                value,
+            } => AutomationSetting::ReadPanelDensity {
+                panel_id: PanelId::new(panel_id),
+                track_id: TrackId::new(track_id),
+                value,
+            },
         }
     }
 }
@@ -2471,6 +2643,11 @@ mod tests {
         .unwrap();
         assert!(configure_schema.contains("show_reference"));
         assert!(configure_schema.contains("vertical_scroll_points"));
+        assert!(configure_schema.contains("presentation_node_visible"));
+        assert!(configure_schema.contains("presentation_group_expanded"));
+        assert!(configure_schema.contains("presentation_composite_visible"));
+        assert!(configure_schema.contains("read_panel_scroll_points"));
+        assert!(configure_schema.contains("read_panel_density"));
         assert!(configure_schema.contains("alignment_color_mode"));
         assert!(configure_schema.contains("read_base_display_mode"));
         assert!(configure_schema.contains("^[A-Za-z][A-Za-z0-9]$"));

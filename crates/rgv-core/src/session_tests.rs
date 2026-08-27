@@ -24,10 +24,6 @@ fn json_round_trip_preserves_schema_and_sources() {
     };
     alignment.remote_index_url = Some("https://indexes.example.org/sample.custom.bai".to_owned());
     alignment.sample_key = Some("tumour".to_owned());
-    alignment.track_group = Some(3);
-    alignment.track_group_collapsed = true;
-    alignment.read_track_group = Some(4);
-    alignment.read_track_group_collapsed = true;
     let filters = &mut alignment.filters;
     filters.alignment_color_mode = AlignmentColorMode::Tag(*b"YC");
     filters.alignment_group_mode = AlignmentGroupMode::Chimeric;
@@ -82,6 +78,7 @@ fn json_round_trip_preserves_schema_and_sources() {
         Some("https://indexes.example.org/reference.custom.fai".to_owned());
     document.sample_metadata =
         Some(SampleMetadataTable::from_tsv("sample\tcondition\ntumour\tcase\n").unwrap());
+    document.normalize_presentation();
     assert_eq!(
         SessionDocument::from_json(&document.to_json().unwrap()).unwrap(),
         document
@@ -103,37 +100,26 @@ fn invalid_track_sample_associations_are_rejected() {
 }
 
 #[test]
-fn invalid_alignment_track_group_state_is_rejected() {
+fn legacy_alignment_group_mirrors_are_consumed_and_cleared_during_normalization() {
     let mut document = SessionDocument::new(SessionLocus {
         contig: "chr1".to_owned(),
         start: 100,
         end: 200,
     });
-    add_test_alignment(&mut document).track_group_collapsed = true;
-    assert!(matches!(
-        document.to_json(),
-        Err(SessionError::InvalidAlignmentTrack)
-    ));
+    let track = add_test_alignment(&mut document);
+    track.track_group = Some(7);
+    track.track_group_collapsed = true;
+    track.read_track_group = Some(8);
+    track.read_track_group_collapsed = true;
 
-    document.alignment_tracks[0].track_group = Some(0);
-    assert!(matches!(
-        document.to_json(),
-        Err(SessionError::InvalidAlignmentTrack)
-    ));
+    document.normalize_presentation();
 
-    document.alignment_tracks[0].track_group = None;
-    document.alignment_tracks[0].track_group_collapsed = false;
-    document.alignment_tracks[0].read_track_group_collapsed = true;
-    assert!(matches!(
-        document.to_json(),
-        Err(SessionError::InvalidAlignmentTrack)
-    ));
-
-    document.alignment_tracks[0].read_track_group = Some(0);
-    assert!(matches!(
-        document.to_json(),
-        Err(SessionError::InvalidAlignmentTrack)
-    ));
+    let track = &document.alignment_tracks[0];
+    assert_eq!(track.track_group, None);
+    assert!(!track.track_group_collapsed);
+    assert_eq!(track.read_track_group, None);
+    assert!(!track.read_track_group_collapsed);
+    assert!(document.to_json().is_ok());
 }
 
 #[test]
@@ -265,6 +251,7 @@ fn variant_track_review_state_round_trips_and_is_validated() {
         ..crate::VariantTrackSettings::default()
     };
     document.tracks.push(track);
+    document.normalize_presentation();
     let restored = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
     assert_eq!(restored.tracks[0].variant, document.tracks[0].variant);
 
@@ -460,6 +447,7 @@ fn interaction_track_state_round_trips_and_is_validated() {
         show_labels: false,
     };
     document.tracks.push(track);
+    document.normalize_presentation();
     let restored = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
     assert_eq!(restored, document);
 
@@ -494,6 +482,7 @@ fn gwas_track_state_round_trips_and_is_validated() {
         alternating_color_two: [7, 8, 9, 255],
     };
     document.tracks.push(track);
+    document.normalize_presentation();
     let restored = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
     assert_eq!(restored, document);
     assert_eq!(infer_track_kind("study.assoc.gz"), TrackKind::Gwas);
@@ -533,6 +522,7 @@ fn copy_number_track_state_round_trips_and_is_validated() {
         show_values: true,
     };
     document.tracks.push(track);
+    document.normalize_presentation();
     let restored = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
     assert_eq!(restored, document);
 
@@ -565,6 +555,7 @@ fn mutation_track_state_round_trips_and_is_validated() {
         show_gene_labels: false,
     };
     document.tracks.push(track);
+    document.normalize_presentation();
 
     let restored = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
     assert_eq!(restored, document);
@@ -596,6 +587,7 @@ fn version_three_round_trip_preserves_ordered_panels_and_active_locus() {
     ];
     document.active_panel = PanelId::new(3);
     add_test_alignment(&mut document);
+    document.normalize_presentation();
 
     let restored = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
 
@@ -612,6 +604,710 @@ fn version_three_round_trip_preserves_ordered_panels_and_active_locus() {
 }
 
 #[test]
+fn channel_presentation_and_read_cameras_round_trip_independently() {
+    let mut document = SessionDocument::new(SessionLocus {
+        contig: "chr1".to_owned(),
+        start: 100,
+        end: 200,
+    });
+    add_test_alignment(&mut document);
+    document.alignment_tracks.push(SessionAlignmentTrack::new(
+        TrackId::new(2),
+        "normal.bam".to_owned(),
+        TrackSource::Local {
+            path: "normal.bam".to_owned(),
+        },
+    ));
+    document.presentation =
+        WorkspacePresentation::from_legacy(&document.alignment_tracks, &document.tracks);
+    document.presentation.read_pane_height = 420.0;
+    document.presentation.groups = vec![
+        SessionPresentationGroup {
+            id: 1,
+            label: "Annotation comparison".to_owned(),
+            channel: TrackChannel::Annotation,
+            members: vec![TrackId::new(1), TrackId::new(2)],
+            expanded: false,
+            content_visible: true,
+        },
+        SessionPresentationGroup {
+            id: 1,
+            label: "Read comparison".to_owned(),
+            channel: TrackChannel::Reads,
+            members: vec![TrackId::new(1), TrackId::new(2)],
+            expanded: true,
+            content_visible: false,
+        },
+    ];
+    document.presentation.next_group_id = 2;
+    document.panels[0].read_panel_states = vec![SessionReadPanelState {
+        track_id: TrackId::new(2),
+        scroll_points: 120.0,
+        content_origin_points: 20.0,
+        latent_scroll_fraction: Some(0.4),
+        content_bottom_points: 900.0,
+        density: Some(2.5),
+    }];
+
+    let restored = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
+
+    assert_eq!(restored.presentation, document.presentation);
+    assert_eq!(
+        restored.panels[0].read_panel_states,
+        document.panels[0].read_panel_states
+    );
+    assert_ne!(
+        restored.presentation.groups[0].channel,
+        restored.presentation.groups[1].channel
+    );
+}
+
+#[test]
+fn schema_four_writes_only_normalized_presentation_state() {
+    let mut document = SessionDocument::new(SessionLocus {
+        contig: "chr1".to_owned(),
+        start: 100,
+        end: 200,
+    });
+    add_test_alignment(&mut document);
+    document.tracks.push(TrackConfig::new(
+        TrackId::new(2),
+        "features".to_owned(),
+        TrackKind::Feature,
+        TrackSource::Local {
+            path: "features.bed".to_owned(),
+        },
+    ));
+    document.normalize_presentation();
+
+    let json = serde_json::from_str::<serde_json::Value>(&document.to_json().unwrap()).unwrap();
+    let alignment = &json["alignment_tracks"][0];
+    for legacy in [
+        "visible",
+        "collapsed",
+        "track_group",
+        "track_group_collapsed",
+        "read_track_group",
+        "read_track_group_collapsed",
+        "height",
+        "annotation_height",
+        "read_group_height",
+    ] {
+        assert!(
+            alignment.get(legacy).is_none(),
+            "legacy field {legacy} leaked"
+        );
+    }
+    assert!(alignment["filters"].get("show_reads").is_none());
+    let auxiliary = &json["tracks"][0];
+    for legacy in ["visible", "collapsed", "height"] {
+        assert!(
+            auxiliary.get(legacy).is_none(),
+            "legacy field {legacy} leaked"
+        );
+    }
+    assert!(json["presentation"]["pane_tracks"].is_array());
+}
+
+fn three_track_presentation() -> WorkspacePresentation {
+    let tracks = (1..=3)
+        .map(|id| {
+            SessionAlignmentTrack::new(
+                TrackId::new(id),
+                format!("sample-{id}"),
+                TrackSource::Local {
+                    path: format!("sample-{id}.bam"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    WorkspacePresentation::from_legacy(&tracks, &[])
+}
+
+#[test]
+fn presentation_reducer_is_atomic_and_channel_qualified() {
+    let mut presentation = three_track_presentation();
+    let original = presentation.clone();
+    let invalid = presentation.apply_intents(&[
+        TrackIntent::SetNodeVisibility {
+            target: PresentationNodeId::Track {
+                channel: TrackChannel::Reads,
+                track_id: TrackId::new(1),
+            },
+            visible: false,
+        },
+        TrackIntent::ResizeReadPane { height: f32::NAN },
+    ]);
+    assert_eq!(invalid, Err(TrackIntentError::InvalidSize));
+    assert_eq!(
+        presentation, original,
+        "a failed batch must not partially commit"
+    );
+
+    presentation
+        .apply_intents(&[
+            TrackIntent::GroupNodes {
+                channel: TrackChannel::Annotation,
+                members: vec![TrackId::new(1), TrackId::new(2)],
+            },
+            TrackIntent::GroupNodes {
+                channel: TrackChannel::Reads,
+                members: vec![TrackId::new(1), TrackId::new(2)],
+            },
+        ])
+        .unwrap();
+    assert_eq!(presentation.groups.len(), 2);
+    assert_ne!(presentation.groups[0].id, presentation.groups[1].id);
+    assert_ne!(
+        presentation.groups[0].channel,
+        presentation.groups[1].channel
+    );
+}
+
+#[test]
+fn presentation_reducer_moves_groups_atomically_and_rejects_member_escape() {
+    let mut presentation = three_track_presentation();
+    presentation
+        .apply_intents(&[TrackIntent::GroupNodes {
+            channel: TrackChannel::Reads,
+            members: vec![TrackId::new(1), TrackId::new(2)],
+        }])
+        .unwrap();
+    let before = presentation.clone();
+    assert_eq!(
+        presentation.apply_intents(&[TrackIntent::MoveNode {
+            target: PresentationNodeId::Track {
+                channel: TrackChannel::Reads,
+                track_id: TrackId::new(1),
+            },
+            before: None,
+        }]),
+        Err(TrackIntentError::GroupMemberMove)
+    );
+    assert_eq!(presentation, before);
+
+    presentation
+        .apply_intents(&[TrackIntent::MoveNode {
+            target: PresentationNodeId::Group {
+                channel: TrackChannel::Reads,
+                group_id: 1,
+            },
+            before: None,
+        }])
+        .unwrap();
+    let read_order = presentation
+        .pane_tracks
+        .iter()
+        .filter(|node| node.channel == TrackChannel::Reads)
+        .map(|node| node.track_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read_order,
+        vec![TrackId::new(3), TrackId::new(1), TrackId::new(2)]
+    );
+}
+
+#[test]
+fn move_before_a_group_member_targets_the_complete_group_anchor() {
+    let mut presentation = six_track_presentation();
+    presentation
+        .apply_intents(&[TrackIntent::GroupNodes {
+            channel: TrackChannel::Reads,
+            members: vec![TrackId::new(3), TrackId::new(4)],
+        }])
+        .unwrap();
+
+    presentation
+        .apply_intents(&[TrackIntent::MoveNode {
+            target: PresentationNodeId::Track {
+                channel: TrackChannel::Reads,
+                track_id: TrackId::new(1),
+            },
+            before: Some(PresentationNodeId::Track {
+                channel: TrackChannel::Reads,
+                track_id: TrackId::new(4),
+            }),
+        }])
+        .unwrap();
+
+    let order = presentation
+        .pane_tracks
+        .iter()
+        .filter(|node| node.channel == TrackChannel::Reads)
+        .map(|node| node.track_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order,
+        (vec![2, 1, 3, 4, 5, 6])
+            .into_iter()
+            .map(TrackId::new)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        presentation.groups[0].members,
+        vec![TrackId::new(3), TrackId::new(4)]
+    );
+}
+
+fn six_track_presentation() -> WorkspacePresentation {
+    let tracks = (1..=6)
+        .map(|id| {
+            SessionAlignmentTrack::new(
+                TrackId::new(id),
+                format!("sample-{id}"),
+                TrackSource::Local {
+                    path: format!("sample-{id}.bam"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    WorkspacePresentation::from_legacy(&tracks, &[])
+}
+
+#[test]
+fn hiding_the_ungrouped_read_does_not_resurrect_or_mutate_the_hidden_group() {
+    let mut presentation = six_track_presentation();
+    presentation
+        .apply_intents(&[TrackIntent::GroupNodes {
+            channel: TrackChannel::Reads,
+            members: (2..=6).map(TrackId::new).collect(),
+        }])
+        .unwrap();
+    let group_id = presentation.groups[0].id;
+    let group = PresentationNodeId::Group {
+        channel: TrackChannel::Reads,
+        group_id,
+    };
+    presentation
+        .apply_intents(&[
+            TrackIntent::SetGroupExpanded {
+                target: group,
+                expanded: false,
+            },
+            TrackIntent::SetGroupVisibility {
+                target: group,
+                visible: false,
+            },
+        ])
+        .unwrap();
+    let before = presentation.groups[0].clone();
+
+    presentation
+        .apply_intents(&[TrackIntent::SetNodeVisibility {
+            target: PresentationNodeId::Track {
+                channel: TrackChannel::Reads,
+                track_id: TrackId::new(1),
+            },
+            visible: false,
+        }])
+        .unwrap();
+
+    assert_eq!(presentation.groups[0], before);
+    assert!(!presentation.groups[0].expanded);
+    assert!(!presentation.groups[0].content_visible);
+    assert_eq!(
+        presentation.pane_root_nodes(TrackChannel::Reads),
+        vec![
+            PresentationNodeId::Track {
+                channel: TrackChannel::Reads,
+                track_id: TrackId::new(1),
+            },
+            group,
+        ]
+    );
+}
+
+#[test]
+fn group_visibility_is_a_parent_gate_and_preserves_mixed_child_eye_states() {
+    let mut presentation = three_track_presentation();
+    presentation
+        .apply_intents(&[
+            TrackIntent::SetNodeVisibility {
+                target: PresentationNodeId::Track {
+                    channel: TrackChannel::Reads,
+                    track_id: TrackId::new(2),
+                },
+                visible: false,
+            },
+            TrackIntent::GroupNodes {
+                channel: TrackChannel::Reads,
+                members: vec![TrackId::new(1), TrackId::new(2)],
+            },
+        ])
+        .unwrap();
+    let group = PresentationNodeId::Group {
+        channel: TrackChannel::Reads,
+        group_id: presentation.groups[0].id,
+    };
+
+    presentation
+        .apply_intents(&[TrackIntent::SetGroupVisibility {
+            target: group,
+            visible: false,
+        }])
+        .unwrap();
+    assert_eq!(
+        presentation.effective_track_visibility(TrackChannel::Reads, TrackId::new(1)),
+        Some(false)
+    );
+    presentation
+        .apply_intents(&[TrackIntent::SetGroupVisibility {
+            target: group,
+            visible: true,
+        }])
+        .unwrap();
+
+    assert_eq!(
+        presentation.effective_track_visibility(TrackChannel::Reads, TrackId::new(1)),
+        Some(true)
+    );
+    assert_eq!(
+        presentation.effective_track_visibility(TrackChannel::Reads, TrackId::new(2)),
+        Some(false)
+    );
+    assert!(
+        presentation
+            .pane_track_state(TrackChannel::Reads, TrackId::new(1))
+            .unwrap()
+            .content_visible
+    );
+    assert!(
+        !presentation
+            .pane_track_state(TrackChannel::Reads, TrackId::new(2))
+            .unwrap()
+            .content_visible
+    );
+}
+
+#[test]
+fn composite_visibility_is_a_parent_gate_and_preserves_member_eyes() {
+    let mut members = [
+        TrackConfig::new(
+            TrackId::new(1),
+            "signal-a".to_owned(),
+            TrackKind::Quantitative,
+            TrackSource::Local {
+                path: "a.bw".to_owned(),
+            },
+        ),
+        TrackConfig::new(
+            TrackId::new(2),
+            "signal-b".to_owned(),
+            TrackKind::Quantitative,
+            TrackSource::Local {
+                path: "b.bw".to_owned(),
+            },
+        ),
+    ];
+    for member in &mut members {
+        member.quantitative.overlay_group = Some(9);
+        member.quantitative.scale_group = Some(9);
+        member.quantitative.scale_mode = crate::QuantitativeScaleMode::Shared;
+    }
+    let mut presentation = WorkspacePresentation::from_legacy(&[], &members);
+    presentation.reconcile_composites(TrackChannel::Annotation, &BTreeSet::from([9]));
+    presentation
+        .apply_intents(&[TrackIntent::SetNodeVisibility {
+            target: PresentationNodeId::Track {
+                channel: TrackChannel::Annotation,
+                track_id: TrackId::new(2),
+            },
+            visible: false,
+        }])
+        .unwrap();
+
+    presentation
+        .apply_intents(&[TrackIntent::SetCompositeVisibility {
+            channel: TrackChannel::Annotation,
+            composite_id: 9,
+            visible: false,
+        }])
+        .unwrap();
+    presentation
+        .apply_intents(&[TrackIntent::SetCompositeVisibility {
+            channel: TrackChannel::Annotation,
+            composite_id: 9,
+            visible: true,
+        }])
+        .unwrap();
+
+    assert!(
+        presentation
+            .pane_track_state(TrackChannel::Annotation, TrackId::new(1))
+            .unwrap()
+            .content_visible
+    );
+    assert!(
+        !presentation
+            .pane_track_state(TrackChannel::Annotation, TrackId::new(2))
+            .unwrap()
+            .content_visible
+    );
+}
+
+#[test]
+fn presentation_group_ids_are_monotonic_and_never_reused() {
+    let mut presentation = three_track_presentation();
+    presentation
+        .apply_intents(&[TrackIntent::GroupNodes {
+            channel: TrackChannel::Reads,
+            members: vec![TrackId::new(1), TrackId::new(2)],
+        }])
+        .unwrap();
+    let first_id = presentation.groups[0].id;
+    presentation
+        .apply_intents(&[TrackIntent::Ungroup {
+            target: PresentationNodeId::Group {
+                channel: TrackChannel::Reads,
+                group_id: first_id,
+            },
+        }])
+        .unwrap();
+    presentation
+        .apply_intents(&[TrackIntent::GroupNodes {
+            channel: TrackChannel::Reads,
+            members: vec![TrackId::new(1), TrackId::new(2)],
+        }])
+        .unwrap();
+
+    assert!(presentation.groups[0].id > first_id);
+}
+
+fn assert_presentation_invariants(presentation: &WorkspacePresentation) {
+    let mut qualified_group_ids = BTreeSet::new();
+    for channel in [TrackChannel::Annotation, TrackChannel::Reads] {
+        let pane_tracks = presentation
+            .pane_tracks
+            .iter()
+            .filter(|node| node.channel == channel)
+            .collect::<Vec<_>>();
+        let pane_ids = pane_tracks
+            .iter()
+            .map(|node| node.track_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(pane_ids.len(), pane_tracks.len());
+
+        let mut grouped = BTreeSet::new();
+        for group in presentation
+            .groups
+            .iter()
+            .filter(|group| group.channel == channel)
+        {
+            assert!(qualified_group_ids.insert((channel, group.id)));
+            assert!(group.members.len() >= 2);
+            let members = group.members.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(members.len(), group.members.len());
+            assert!(members.iter().all(|member| pane_ids.contains(member)));
+            assert!(members.iter().all(|member| grouped.insert(*member)));
+            let positions = group
+                .members
+                .iter()
+                .map(|member| {
+                    pane_tracks
+                        .iter()
+                        .position(|node| node.track_id == *member)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(positions.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        }
+
+        let roots = presentation.pane_root_nodes(channel);
+        assert_eq!(
+            roots.iter().copied().collect::<BTreeSet<_>>().len(),
+            roots.len()
+        );
+        assert!(roots.iter().all(|root| {
+            match root {
+                PresentationNodeId::Track { track_id, .. } => !grouped.contains(track_id),
+                PresentationNodeId::Group { group_id, .. } => presentation
+                    .groups
+                    .iter()
+                    .any(|group| group.channel == channel && group.id == *group_id),
+                PresentationNodeId::Reference => false,
+            }
+        }));
+        let interactive = presentation.pane_interactive_nodes(channel);
+        assert_eq!(
+            interactive.iter().copied().collect::<BTreeSet<_>>().len(),
+            interactive.len()
+        );
+        for node in pane_tracks {
+            let effective = presentation
+                .effective_track_visibility(channel, node.track_id)
+                .unwrap();
+            let exposed = presentation
+                .track_content_exposed(channel, node.track_id)
+                .unwrap();
+            assert!(!exposed || effective);
+        }
+    }
+    assert!(
+        presentation
+            .groups
+            .iter()
+            .all(|group| group.id < presentation.next_group_id)
+    );
+}
+
+#[test]
+fn presentation_reducer_preserves_invariants_across_deterministic_random_sequences() {
+    for seed in 1..=24_u64 {
+        let mut state = six_track_presentation();
+        let mut random = seed;
+        for _ in 0..160 {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let channel = if random & 1 == 0 {
+                TrackChannel::Annotation
+            } else {
+                TrackChannel::Reads
+            };
+            let pane_ids = state
+                .pane_tracks
+                .iter()
+                .filter(|node| node.channel == channel)
+                .map(|node| node.track_id)
+                .collect::<Vec<_>>();
+            if pane_ids.is_empty() {
+                break;
+            }
+            let pick = pane_ids[(random as usize >> 8) % pane_ids.len()];
+            match (random >> 2) % 8 {
+                0 => {
+                    state
+                        .apply_intents(&[TrackIntent::SetNodeVisibility {
+                            target: PresentationNodeId::Track {
+                                channel,
+                                track_id: pick,
+                            },
+                            visible: random & 0x20 == 0,
+                        }])
+                        .unwrap();
+                }
+                1 => {
+                    state
+                        .apply_intents(&[TrackIntent::ResizeNode {
+                            target: PresentationNodeId::Track {
+                                channel,
+                                track_id: pick,
+                            },
+                            preferred_height: match channel {
+                                TrackChannel::Annotation => 80.0 + (random % 300) as f32,
+                                TrackChannel::Reads => 40.0 + (random % 500) as f32,
+                            },
+                        }])
+                        .unwrap();
+                }
+                2 => {
+                    let ungrouped = pane_ids
+                        .windows(2)
+                        .find(|pair| {
+                            pair.iter()
+                                .all(|track_id| state.group_for_track(channel, *track_id).is_none())
+                        })
+                        .map(|pair| pair.to_vec());
+                    if let Some(members) = ungrouped {
+                        state
+                            .apply_intents(&[TrackIntent::GroupNodes { channel, members }])
+                            .unwrap();
+                    }
+                }
+                3 | 4 => {
+                    if let Some(group) = state
+                        .groups
+                        .iter()
+                        .find(|group| group.channel == channel)
+                        .cloned()
+                    {
+                        let target = PresentationNodeId::Group {
+                            channel,
+                            group_id: group.id,
+                        };
+                        let intent = if (random >> 2) % 8 == 3 {
+                            TrackIntent::SetGroupExpanded {
+                                target,
+                                expanded: !group.expanded,
+                            }
+                        } else {
+                            TrackIntent::SetGroupVisibility {
+                                target,
+                                visible: !group.content_visible,
+                            }
+                        };
+                        state.apply_intents(&[intent]).unwrap();
+                    }
+                }
+                5 => {
+                    if let Some(group) = state
+                        .groups
+                        .iter()
+                        .find(|group| group.channel == channel)
+                        .cloned()
+                    {
+                        state
+                            .apply_intents(&[TrackIntent::Ungroup {
+                                target: PresentationNodeId::Group {
+                                    channel,
+                                    group_id: group.id,
+                                },
+                            }])
+                            .unwrap();
+                    }
+                }
+                6 => {
+                    let roots = state.pane_root_nodes(channel);
+                    if roots.len() > 1 {
+                        let target = roots[(random as usize >> 12) % roots.len()];
+                        let before = roots.iter().copied().find(|candidate| *candidate != target);
+                        state
+                            .apply_intents(&[TrackIntent::MoveNode { target, before }])
+                            .unwrap();
+                    }
+                }
+                _ => {
+                    let loaded = state
+                        .pane_tracks
+                        .iter()
+                        .map(|node| node.track_id)
+                        .collect::<BTreeSet<_>>();
+                    if loaded.len() > 3 {
+                        state.remove_source(pick);
+                    }
+                }
+            }
+            assert_presentation_invariants(&state);
+        }
+    }
+}
+
+#[test]
+fn schema_four_serializes_only_normalized_presentation_fields() {
+    let mut document = SessionDocument::new(SessionLocus {
+        contig: "chr1".to_owned(),
+        start: 0,
+        end: 100,
+    });
+    add_test_alignment(&mut document);
+    document.alignment_tracks[0].collapsed = true;
+    document.alignment_tracks[0].track_group = Some(7);
+    document.alignment_tracks[0].read_track_group = Some(8);
+    document.alignment_tracks[0].annotation_height = Some(222.0);
+    document.alignment_tracks[0].read_group_height = Some(333.0);
+    document.normalize_presentation();
+
+    let json = document.to_json().unwrap();
+
+    assert!(json.contains("\"presentation\""));
+    assert!(!json.contains("\"track_group\""));
+    assert!(!json.contains("\"read_track_group\""));
+    assert!(!json.contains("\"annotation_height\""));
+    assert!(!json.contains("\"read_group_height\""));
+    assert!(!json.contains("\"collapsed\":"));
+}
+
+#[test]
 fn version_two_migrates_to_one_active_version_three_panel() {
     let document = SessionDocument::from_json(include_str!(
         "../../../validation/four-track-session-v2.json"
@@ -623,6 +1319,45 @@ fn version_two_migrates_to_one_active_version_three_panel() {
     assert_eq!(document.panels[0].id, PanelId::new(1));
     assert_eq!(document.panels[0].locus, document.locus);
     assert_eq!(document.active_panel, PanelId::new(1));
+}
+
+#[test]
+fn version_three_migration_qualifies_equal_group_ids_by_channel() {
+    let mut legacy = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../validation/multi-panel-four-track-session-v3.json"
+    ))
+    .unwrap();
+    for track in legacy["alignment_tracks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .take(2)
+    {
+        track["track_group"] = serde_json::json!(7);
+        track["read_track_group"] = serde_json::json!(7);
+    }
+    legacy["alignment_tracks"][0]["track_group_collapsed"] = serde_json::json!(false);
+    legacy["alignment_tracks"][1]["track_group_collapsed"] = serde_json::json!(true);
+
+    let document = SessionDocument::from_json(&serde_json::to_string(&legacy).unwrap()).unwrap();
+    let annotation = document
+        .presentation
+        .groups
+        .iter()
+        .find(|group| group.channel == TrackChannel::Annotation && group.id == 7)
+        .unwrap();
+    let reads = document
+        .presentation
+        .groups
+        .iter()
+        .find(|group| group.channel == TrackChannel::Reads && group.id == 7)
+        .unwrap();
+
+    assert_eq!(annotation.members, reads.members);
+    assert!(!annotation.expanded, "any collapsed legacy member wins");
+    assert!(reads.expanded);
+    assert_eq!(document.migration_notices.len(), 1);
+    assert!(document.migration_notices[0].contains("inconsistent legacy Annotation group 7"));
 }
 
 #[test]
@@ -1015,6 +1750,9 @@ fn multi_panel_four_track_fixture_is_a_valid_v3_session() {
     assert_eq!(document.panels[1].id, PanelId::new(3));
     assert_eq!(document.active_panel, PanelId::new(3));
     assert_eq!(document.locus, document.panels[1].locus);
+    assert_eq!(document.presentation.pane_tracks.len(), 8);
+    assert_eq!(document.presentation.read_pane_height, 300.0);
+    assert_eq!(document.alignment_tracks[0].height, 360.0);
 }
 
 #[test]
@@ -1085,8 +1823,26 @@ fn igv_import_applies_supported_track_state_and_reports_every_semantic_category(
     let track = &imported.document.alignment_tracks[0];
     assert_eq!(imported.document.genome_name.as_deref(), Some("hg38"));
     assert_eq!(track.name, "Tumour reads");
-    assert!(!track.visible);
-    assert!((track.height - 26.0).abs() < f32::EPSILON);
+    assert!(
+        track.visible,
+        "loaded source availability is independent of its eye"
+    );
+    assert!(
+        !imported
+            .document
+            .presentation
+            .pane_track_state(TrackChannel::Annotation, track.id)
+            .unwrap()
+            .content_visible
+    );
+    assert!((track.height - 360.0).abs() < f32::EPSILON);
+    assert!((imported.document.presentation.read_pane_height - 100.0).abs() < f32::EPSILON);
+    let read_node = imported
+        .document
+        .presentation
+        .pane_track_state(TrackChannel::Reads, track.id)
+        .unwrap();
+    assert_eq!(read_node.preferred_height, Some(40.0));
     assert!(!track.filters.show_coverage);
     assert!(
         imported
@@ -1169,6 +1925,7 @@ fn project_sessions_store_inside_sources_relatively_and_resolve_them_on_read() {
     ));
     let session_path = project.path().join("analysis.json");
 
+    document.normalize_presentation();
     document.write(&session_path).unwrap();
 
     let canonical_reads = reads.canonicalize().unwrap();

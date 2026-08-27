@@ -37,6 +37,8 @@ use egui_wgpu::{RendererOptions, ScreenDescriptor};
 use inspection::{auxiliary::*, model::*, read::*, rna::*, variant::*};
 use interaction_trace::{InteractionTraceRecorder, InteractionTraceStage};
 use launch::*;
+#[cfg(test)]
+use rgv_core::SessionPaneTrackState;
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,
     AutomationAlignmentSelector, AutomationAlignmentState, AutomationAlignmentTrackSnapshot,
@@ -44,15 +46,19 @@ use rgv_core::{
     AutomationEnvironmentTelemetry, AutomationErrorCode, AutomationEvidenceField,
     AutomationExportKind, AutomationFrameTelemetry, AutomationGenomeSnapshot,
     AutomationGpuTelemetry, AutomationHistoryNavigation, AutomationNavigationDestination,
-    AutomationOptionScope, AutomationPanelSnapshot, AutomationRenderLaneSnapshot,
+    AutomationOptionScope, AutomationPaneItemLayoutSnapshot, AutomationPaneLayoutSnapshot,
+    AutomationPanelSnapshot, AutomationPresentationCompositeSnapshot,
+    AutomationPresentationGroupSnapshot, AutomationPresentationNodeSnapshot,
+    AutomationReadPanelStateSnapshot, AutomationRectSnapshot, AutomationRenderLaneSnapshot,
     AutomationRenderOmissionReason, AutomationReviewNavigation, AutomationRunReport,
     AutomationRunTelemetry, AutomationSelection, AutomationSelectionGranularity,
     AutomationSelectionKind, AutomationSelectionSnapshot, AutomationSetting,
-    AutomationSnapshotFormat, AutomationSnapshotScope, AutomationTrackLifecycle,
-    AutomationTrackSnapshot, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
-    AutomationWorkspaceSnapshot, BisulfiteContext, ContigAliases, ContigId, CopyNumberSortLocus,
-    CopyNumberSortMode, CopyNumberTrackSettings, CopyNumberValueMode, CoverageScaleTransform,
-    DesktopSettings, DetailLevel, FeatureDisplayMode, GenerationClock, GeneticCode, GenomeAssembly,
+    AutomationSnapshotFormat, AutomationSnapshotScope, AutomationTrackGestureKind,
+    AutomationTrackGestureSnapshot, AutomationTrackLifecycle, AutomationTrackSnapshot,
+    AutomationUnsavedChangesPolicy, AutomationViewportOperation, AutomationWorkspaceSnapshot,
+    BisulfiteContext, ContigAliases, ContigId, CopyNumberSortLocus, CopyNumberSortMode,
+    CopyNumberTrackSettings, CopyNumberValueMode, CoverageScaleTransform, DesktopSettings,
+    DetailLevel, FeatureDisplayMode, GenerationClock, GeneticCode, GenomeAssembly,
     GenomeAssemblyIdentity, GenomeConfiguration, GenomicInterval, GenomicSourceFormat,
     GwasColorMode, GwasTrackSettings, IgvImportReport, InspectorActivation, InteractionDisplayMode,
     InteractionTrackSettings, JunctionDisplayMode, MAXIMUM_ALIGNMENT_TRACKS,
@@ -63,18 +69,19 @@ use rgv_core::{
     MAXIMUM_REVIEW_NOTE_BYTES, MAXIMUM_VIEW_PANELS, MINIMUM_AUTOSAVE_INTERVAL_SECONDS,
     MINIMUM_AUTOSAVE_RETENTION, MINIMUM_CACHE_BUDGET_MIB, MINIMUM_INTERFACE_SCALE_PERCENT,
     ModifiedBaseColorMode, MutationColorMode, MutationTrackSettings, NavigationHistory,
-    OverlappingMatePolicy, PanelGeneration, PanelId, PanelTrackId, QuantitativeArithmetic,
-    QuantitativeDisplayMode, QuantitativeMissingMode, QuantitativeScaleMode,
-    QuantitativeScaleTransform, QuantitativeTrackSettings, QuantitativeWindowFunction,
-    ReadBaseDisplayMode, ReferenceDictionary, ReferenceTranslationFrame, RegionOfInterest,
-    ReviewItem, ReviewStatus, SampleMetadataTable, SashimiCountMode, SashimiScaleMode,
-    SbxDisplayOptions, SbxSimplexTailMode, SessionAlignmentTrack, SessionDocument, SessionFilters,
-    SessionLocus, SessionViewPanel, SmrtKineticsMode, TrackCollection, TrackConfig, TrackFormat,
-    TrackId, TrackKind, TrackSource, UltimaDisplayOptions, UltimaQualityMode,
+    OverlappingMatePolicy, PanelGeneration, PanelId, PanelTrackId, PresentationNodeId,
+    QuantitativeArithmetic, QuantitativeDisplayMode, QuantitativeMissingMode,
+    QuantitativeScaleMode, QuantitativeScaleTransform, QuantitativeTrackSettings,
+    QuantitativeWindowFunction, ReadBaseDisplayMode, ReferenceDictionary,
+    ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus, SampleMetadataTable,
+    SashimiCountMode, SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode,
+    SessionAlignmentTrack, SessionDocument, SessionFilters, SessionLocus, SessionReadPanelState,
+    SessionViewPanel, SmrtKineticsMode, TrackChangeSet, TrackCollection, TrackConfig, TrackFormat,
+    TrackId, TrackIntent, TrackKind, TrackSource, UltimaDisplayOptions, UltimaQualityMode,
     UnresolvedSessionSource, VariantColorMode, VariantFieldComparison, VariantFieldPredicate,
     VariantFieldScope, VariantGenotypeFilter, VariantGenotypeGrouping, VariantMissingValueRule,
-    VariantTrackSettings, VariantTypeGroup, Viewport, classify_genomic_source,
-    parse_ucsc_cytobands, resolve_contig_alias,
+    VariantTrackSettings, VariantTypeGroup, Viewport, WorkspacePresentation,
+    classify_genomic_source, parse_ucsc_cytobands, resolve_contig_alias,
 };
 use rgv_engine::{
     AlignmentEngine, AlignmentEngineEvent, CacheBudgets, CacheStats, EngineQueueError,
@@ -122,7 +129,9 @@ use winit::{
     keyboard::{Key, ModifiersState, NamedKey},
     window::{CursorGrabMode, Theme, Window, WindowAttributes, WindowId},
 };
-use workspace::{alignments::*, lists::*, navigation::*, panels::*};
+use workspace::{
+    alignments::*, lists::*, navigation::*, panels::*, tracks::replace_panel_track_selection,
+};
 use workspace_lists::{
     WorkspaceListImport, WorkspaceListKind, import_workspace_list, region_bed_export,
     review_tsv_export,
@@ -427,6 +436,12 @@ fn clear_removed_alignment_panel_state(
     removed: TrackId,
     removed_was_primary: bool,
 ) {
+    panel.selected_presentation_nodes.retain(
+        |node| !matches!(node, PresentationNodeId::Track { track_id, .. } if *track_id == removed),
+    );
+    panel.presentation_selection_anchor = panel.presentation_selection_anchor.filter(
+        |node| !matches!(node, PresentationNodeId::Track { track_id, .. } if *track_id == removed),
+    );
     panel.read_panel_scrolls.remove(&removed);
     if let Some(cache) = panel.scroll_display_cache.as_mut() {
         cache
@@ -493,6 +508,12 @@ fn clear_removed_auxiliary_panel_state(
     panel: &mut ViewPanelController,
     removed: &HashSet<TrackId>,
 ) {
+    panel.selected_presentation_nodes.retain(|node| {
+        !matches!(node, PresentationNodeId::Track { track_id, .. } if removed.contains(track_id))
+    });
+    panel.presentation_selection_anchor = panel.presentation_selection_anchor.filter(|node| {
+        !matches!(node, PresentationNodeId::Track { track_id, .. } if removed.contains(track_id))
+    });
     panel
         .track_snapshots
         .retain(|snapshot| !removed.contains(&snapshot.id));
@@ -555,32 +576,10 @@ fn clear_removed_quantitative_dependencies(
 }
 
 fn auxiliary_query_track_ids(tracks: &[TrackConfig]) -> Vec<TrackId> {
-    let quantitative_ids = tracks
-        .iter()
-        .filter(|track| track.kind == TrackKind::Quantitative)
-        .map(|track| track.id)
-        .collect::<HashSet<_>>();
-    let mut required = tracks
-        .iter()
-        .filter(|track| track.visible)
-        .map(|track| track.id)
-        .collect::<HashSet<_>>();
-    for track in tracks.iter().filter(|track| {
-        track.visible
-            && track.kind == TrackKind::Quantitative
-            && track.quantitative.arithmetic != QuantitativeArithmetic::None
-    }) {
-        if let Some(operand) = track.quantitative.operand_track
-            && quantitative_ids.contains(&operand)
-        {
-            required.insert(operand);
-        }
-    }
-    tracks
-        .iter()
-        .filter(|track| required.contains(&track.id))
-        .map(|track| track.id)
-        .collect()
+    // Query demand is source lifecycle state, not presentation state. Keeping
+    // loaded auxiliary sources warm makes either pane eye instant to restore
+    // and prevents a hidden arithmetic operand from being dropped.
+    tracks.iter().map(|track| track.id).collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -633,6 +632,7 @@ struct Viewer {
     track_engine: Option<TrackEngine>,
     automation_auxiliary_open_state: HashMap<TrackId, AutomationAuxiliaryOpenState>,
     tracks: TrackCollection,
+    track_presentation: WorkspacePresentation,
     reference_source: Option<TrackSource>,
     remote_reference_index_url: Option<String>,
     reference_remote_io_stats: Option<RemoteIoStats>,
@@ -701,6 +701,7 @@ struct Viewer {
     settings_path: PathBuf,
     current_session_path: Option<PathBuf>,
     unresolved_session_sources: Vec<UnresolvedSessionSource>,
+    session_migration_notices: Vec<String>,
     igv_import_report: Option<IgvImportReport>,
     next_autosave: Instant,
     recovery_candidates: Vec<PathBuf>,
@@ -710,11 +711,10 @@ struct Viewer {
     automation_exit_requested: bool,
     cache_budgets: CacheBudgets,
     locus_editor: String,
-    resizing_track: Option<(TrackId, f32)>,
     resizing_annotation_track: Option<(TrackFrameKey, f32)>,
     resizing_read_track: Option<(TrackId, f32)>,
-    reference_annotation_height: Option<f32>,
     resizing_read_pane: Option<f32>,
+    active_stack_scrollbar_gesture: Option<(PanelId, ui::TrackPane)>,
     horizontal_overview_drag: Option<HorizontalOverviewDrag>,
     vertical_overview_drag: Option<VerticalOverviewDrag>,
     overview_capture: Option<OverviewCapture>,

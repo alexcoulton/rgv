@@ -261,7 +261,6 @@ impl Viewer {
                                     panel.vertical_scroll_points = 0.0;
                                     panel.vertical_content_origin_points = 0.0;
                                     panel.latent_vertical_scroll_fraction = None;
-                                    panel.read_panel_scrolls.clear();
                                     panel.reference_slice = None;
                                 }
                                 Err(error) if id == active_panel_id => {
@@ -372,7 +371,7 @@ impl Viewer {
                         track.dictionary = Some(dictionary.clone());
                         track.index_overview.clone_from(index_overview);
                         for projection in track.projections.values_mut() {
-                            projection.pending_query = track.config.visible;
+                            projection.pending_query = true;
                         }
                     }
                     AlignmentEngineEvent::QueryCompleted {
@@ -486,7 +485,6 @@ impl Viewer {
                                 panel.vertical_scroll_points = 0.0;
                                 panel.vertical_content_origin_points = 0.0;
                                 panel.latent_vertical_scroll_fraction = None;
-                                panel.read_panel_scrolls.clear();
                             }
                             Err(error) if id == active_panel_id => {
                                 self.data_status = error.to_string();

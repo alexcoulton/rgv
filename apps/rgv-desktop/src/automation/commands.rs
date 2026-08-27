@@ -185,11 +185,7 @@ impl Viewer {
             {
                 return false;
             }
-            for track in self
-                .alignment_tracks
-                .iter()
-                .filter(|track| track.config.visible)
-            {
+            for track in &self.alignment_tracks {
                 match track.lifecycle {
                     AlignmentTrackLifecycle::Opening => return false,
                     AlignmentTrackLifecycle::Ready => {
@@ -1426,13 +1422,20 @@ impl Viewer {
                     .and_then(|track| track.projection(panel.id))
                     .and_then(|projection| projection.cached_layout.as_ref())
                     .map(|(_, layout)| layout.stats);
-                let reads_rendered = filters.show_reads
+                let read_content_visible = self
+                    .track_presentation
+                    .effective_track_visibility(
+                        ui::TrackPane::Reads,
+                        self.primary_alignment_track_id(),
+                    )
+                    .unwrap_or(false);
+                let reads_rendered = read_content_visible
                     && panel.viewport.detail_level() != DetailLevel::Overview
                     && query.is_some();
                 let render_lanes = [
                     ("reference", filters.show_reference),
                     ("coverage", filters.show_coverage),
-                    ("reads", filters.show_reads),
+                    ("reads", read_content_visible),
                     ("modifications", filters.show_modified_bases),
                 ]
                 .into_iter()
@@ -1515,11 +1518,50 @@ impl Viewer {
                     maximum_vertical_scroll_points: maximum_scroll,
                     annotation_scroll_points: panel.annotation_scroll_points,
                     maximum_annotation_scroll_points: maximum_annotation_scroll,
+                    read_stack_scroll_points: panel.read_stack_scroll_points,
+                    maximum_read_stack_scroll_points: (panel.pane_layout.reads.content_bottom
+                        - panel.pane_layout.reads.pane_rect.bottom())
+                    .max(0.0),
                     render_generation: panel.generation_clock.current().get(),
                     settled: !panel.pending_queries.alignment
                         && !panel.pending_queries.reference
                         && !panel.pending_queries.tracks,
                     render_lanes,
+                    read_panel_states: self
+                        .alignment_tracks
+                        .iter()
+                        .map(|track| {
+                            let track_id = track.config.id;
+                            let state = panel.read_panel_scroll_state(track_id);
+                            let clip_bottom = panel
+                                .scroll_display_cache
+                                .as_ref()
+                                .and_then(|cache| {
+                                    cache
+                                        .read_panels
+                                        .iter()
+                                        .find(|read_panel| read_panel.track_id == track_id)
+                                })
+                                .map_or(panel.pane_layout.reads.pane_rect.bottom(), |read_panel| {
+                                    read_panel.clip_bottom
+                                });
+                            AutomationReadPanelStateSnapshot {
+                                track_id,
+                                scroll_points: state.scroll_points,
+                                maximum_scroll_points: (state.content_bottom_points - clip_bottom)
+                                    .max(0.0),
+                                content_origin_points: state.content_origin_points,
+                                latent_scroll_fraction: state.latent_scroll_fraction,
+                                content_bottom_points: state.content_bottom_points,
+                                density: state.density,
+                                effective_density: state
+                                    .density
+                                    .unwrap_or(track.config.filters.alignment_density),
+                            }
+                        })
+                        .collect(),
+                    selected_presentation_nodes: panel.selected_presentation_nodes.clone(),
+                    presentation_selection_anchor: panel.presentation_selection_anchor,
                 }
             })
             .collect();
@@ -1535,13 +1577,24 @@ impl Viewer {
                         Some("alignment track failed to open".to_owned()),
                     ),
                 };
+                let annotation = self
+                    .track_presentation
+                    .pane_track_state(ui::TrackPane::Annotation, track.config.id);
+                let annotation_visible = annotation.is_none_or(|node| node.content_visible);
+                let read_visible = self
+                    .track_presentation
+                    .pane_track_state(ui::TrackPane::Reads, track.config.id)
+                    .is_none_or(|node| node.content_visible);
                 AutomationTrackSnapshot {
                     id: track.config.id,
                     name: track.config.name.clone(),
                     kind: TrackKind::Alignment,
-                    visible: track.config.visible,
-                    collapsed: track.config.collapsed,
-                    height: track.config.height,
+                    visible: annotation_visible,
+                    collapsed: !annotation_visible,
+                    height: annotation
+                        .and_then(|node| node.preferred_height)
+                        .unwrap_or(track.config.height),
+                    source_available: lifecycle != AutomationTrackLifecycle::Failed,
                     lifecycle,
                     failure,
                     alignment: Some(AutomationAlignmentTrackSnapshot {
@@ -1564,7 +1617,7 @@ impl Viewer {
                         show_reference: track.config.filters.show_reference,
                         show_coverage: track.config.filters.show_coverage,
                         coverage_scale_transform: track.config.filters.coverage_scale_transform,
-                        show_reads: track.config.filters.show_reads,
+                        show_reads: read_visible,
                         include_secondary: track.config.filters.include_secondary,
                         include_supplementary: track.config.filters.include_supplementary,
                     }),
@@ -1584,18 +1637,243 @@ impl Viewer {
                     (AutomationTrackLifecycle::Ready, None)
                 }
             };
+            let annotation = self
+                .track_presentation
+                .pane_track_state(ui::TrackPane::Annotation, track.id);
+            let annotation_visible = annotation.is_none_or(|node| node.content_visible);
             AutomationTrackSnapshot {
                 id: track.id,
                 name: track.name.clone(),
                 kind: track.kind,
-                visible: track.visible,
-                collapsed: track.collapsed,
-                height: track.height,
+                visible: annotation_visible,
+                collapsed: !annotation_visible,
+                height: annotation
+                    .and_then(|node| node.preferred_height)
+                    .unwrap_or(track.height),
+                source_available: lifecycle != AutomationTrackLifecycle::Failed,
                 lifecycle,
                 failure,
                 alignment: None,
             }
         }));
+        let source_available = |track_id: TrackId| {
+            self.alignment_tracks
+                .iter()
+                .find(|track| track.config.id == track_id)
+                .is_some_and(|track| !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_)))
+                || self.tracks.tracks().iter().any(|track| {
+                    track.id == track_id
+                        && !matches!(
+                            self.automation_auxiliary_open_state.get(&track_id),
+                            Some(AutomationAuxiliaryOpenState::Failed(_))
+                        )
+                })
+        };
+        let parent_composite = |track_id: TrackId| {
+            self.tracks
+                .tracks()
+                .iter()
+                .find(|track| track.id == track_id)
+                .and_then(|track| track.quantitative.overlay_group)
+                .filter(|id| {
+                    self.track_presentation.composites.iter().any(|composite| {
+                        composite.channel == ui::TrackPane::Annotation && composite.id == *id
+                    })
+                })
+        };
+        let composite_visible = |track_id: TrackId| {
+            parent_composite(track_id).is_none_or(|id| {
+                self.track_presentation
+                    .composite_content_visible(ui::TrackPane::Annotation, id)
+            })
+        };
+        let mut presentation_nodes = Vec::new();
+        for channel in [ui::TrackPane::Annotation, ui::TrackPane::Reads] {
+            let mut order_index = 0_usize;
+            if channel == ui::TrackPane::Annotation && self.reference_engine.is_some() {
+                presentation_nodes.push(AutomationPresentationNodeSnapshot {
+                    id: PresentationNodeId::Reference,
+                    order_index,
+                    desired_content_visible: self.track_presentation.reference_content_visible,
+                    effective_content_visible: self.track_presentation.reference_content_visible,
+                    preferred_height: self.track_presentation.reference_preferred_height,
+                    parent_group_id: None,
+                    parent_composite_id: None,
+                });
+                order_index += 1;
+            }
+            for root in self.track_presentation.pane_root_nodes(channel) {
+                match root {
+                    PresentationNodeId::Group { group_id, .. } => {
+                        if let Some(group) = self
+                            .track_presentation
+                            .groups
+                            .iter()
+                            .find(|group| group.channel == channel && group.id == group_id)
+                        {
+                            presentation_nodes.push(AutomationPresentationNodeSnapshot {
+                                id: root,
+                                order_index,
+                                desired_content_visible: group.content_visible,
+                                effective_content_visible: group.content_visible,
+                                preferred_height: None,
+                                parent_group_id: None,
+                                parent_composite_id: None,
+                            });
+                            order_index += 1;
+                            for track_id in &group.members {
+                                let node =
+                                    self.track_presentation.pane_track_state(channel, *track_id);
+                                let desired = node.is_some_and(|node| node.content_visible);
+                                let source_available = source_available(*track_id);
+                                presentation_nodes.push(AutomationPresentationNodeSnapshot {
+                                    id: PresentationNodeId::Track {
+                                        channel,
+                                        track_id: *track_id,
+                                    },
+                                    order_index,
+                                    desired_content_visible: desired,
+                                    effective_content_visible: desired
+                                        && source_available
+                                        && group.content_visible
+                                        && group.expanded
+                                        && composite_visible(*track_id),
+                                    preferred_height: node.and_then(|node| node.preferred_height),
+                                    parent_group_id: Some(group_id),
+                                    parent_composite_id: parent_composite(*track_id),
+                                });
+                                order_index += 1;
+                            }
+                        }
+                    }
+                    PresentationNodeId::Track { track_id, .. } => {
+                        let node = self.track_presentation.pane_track_state(channel, track_id);
+                        let desired = node.is_some_and(|node| node.content_visible);
+                        let source_available = source_available(track_id);
+                        presentation_nodes.push(AutomationPresentationNodeSnapshot {
+                            id: root,
+                            order_index,
+                            desired_content_visible: desired,
+                            effective_content_visible: desired
+                                && source_available
+                                && composite_visible(track_id),
+                            preferred_height: node.and_then(|node| node.preferred_height),
+                            parent_group_id: None,
+                            parent_composite_id: parent_composite(track_id),
+                        });
+                        order_index += 1;
+                    }
+                    PresentationNodeId::Reference => {}
+                }
+            }
+        }
+        let to_rect = |rect: egui::Rect| AutomationRectSnapshot {
+            left: rect.left(),
+            top: rect.top(),
+            right: rect.right(),
+            bottom: rect.bottom(),
+        };
+        let pane_layouts = self
+            .panels
+            .iter()
+            .flat_map(|panel| {
+                [&panel.pane_layout.annotation, &panel.pane_layout.reads]
+                    .into_iter()
+                    .map(|layout| AutomationPaneLayoutSnapshot {
+                        panel_id: panel.id,
+                        channel: layout.channel,
+                        pane: to_rect(layout.pane_rect),
+                        content_bottom: layout.content_bottom,
+                        scroll_points: layout.scroll_points,
+                        stack_scroll_points: layout.stack_scroll_points,
+                        items: layout
+                            .items
+                            .iter()
+                            .map(|item| AutomationPaneItemLayoutSnapshot {
+                                id: item.id,
+                                row: to_rect(item.row_rect),
+                                header: to_rect(item.header_rect),
+                                content: item.content_rect.map(to_rect),
+                                clip: to_rect(item.clip_rect),
+                                desired_content_visible: item.desired_content_visible,
+                                effective_content_visible: item.effective_content_visible,
+                                composite_id: match item.frame.key {
+                                    TrackFrameKey::Auxiliary(track_id) => {
+                                        parent_composite(track_id)
+                                    }
+                                    TrackFrameKey::Reference
+                                    | TrackFrameKey::Alignment(_)
+                                    | TrackFrameKey::Group { .. } => None,
+                                },
+                            })
+                            .collect(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let active_track_gesture = self
+            .resizing_annotation_track
+            .and_then(|(key, _)| match key {
+                TrackFrameKey::Reference => Some(PresentationNodeId::Reference),
+                TrackFrameKey::Alignment(track_id) | TrackFrameKey::Auxiliary(track_id) => {
+                    Some(PresentationNodeId::Track {
+                        channel: ui::TrackPane::Annotation,
+                        track_id,
+                    })
+                }
+                TrackFrameKey::Group { channel, id } => Some(PresentationNodeId::Group {
+                    channel,
+                    group_id: id,
+                }),
+            })
+            .map(|target| AutomationTrackGestureSnapshot {
+                kind: AutomationTrackGestureKind::ResizeNode,
+                panel_id: self.panels.active().id,
+                target: Some(target),
+            })
+            .or_else(|| {
+                self.resizing_read_track
+                    .map(|(track_id, _)| AutomationTrackGestureSnapshot {
+                        kind: AutomationTrackGestureKind::ResizeNode,
+                        panel_id: self.panels.active().id,
+                        target: Some(PresentationNodeId::Track {
+                            channel: ui::TrackPane::Reads,
+                            track_id,
+                        }),
+                    })
+            })
+            .or_else(|| {
+                self.resizing_read_pane
+                    .map(|_| AutomationTrackGestureSnapshot {
+                        kind: AutomationTrackGestureKind::ResizeReadPane,
+                        panel_id: self.panels.active().id,
+                        target: None,
+                    })
+            })
+            .or_else(|| {
+                self.active_stack_scrollbar_gesture
+                    .map(|(panel_id, channel)| AutomationTrackGestureSnapshot {
+                        kind: match channel {
+                            ui::TrackPane::Annotation => {
+                                AutomationTrackGestureKind::AnnotationScrollbar
+                            }
+                            ui::TrackPane::Reads => AutomationTrackGestureKind::ReadStackScrollbar,
+                        },
+                        panel_id,
+                        target: None,
+                    })
+            })
+            .or_else(|| {
+                self.vertical_overview_drag
+                    .map(|drag| AutomationTrackGestureSnapshot {
+                        kind: AutomationTrackGestureKind::ReadScrollbar,
+                        panel_id: drag.panel_id,
+                        target: Some(PresentationNodeId::Track {
+                            channel: ui::TrackPane::Reads,
+                            track_id: drag.track_id,
+                        }),
+                    })
+            });
         let truncated = panels.len() > MAXIMUM_AUTOMATION_LOCI
             || tracks.len() > MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS;
         panels.truncate(MAXIMUM_AUTOMATION_LOCI);
@@ -1633,6 +1911,33 @@ impl Viewer {
             active_panel_id: self.panels.active().id,
             panels,
             tracks,
+            read_pane_height: self.track_presentation.read_pane_height,
+            presentation_groups: self
+                .track_presentation
+                .groups
+                .iter()
+                .map(|group| AutomationPresentationGroupSnapshot {
+                    channel: group.channel,
+                    id: group.id,
+                    label: group.label.clone(),
+                    members: group.members.clone(),
+                    expanded: group.expanded,
+                    content_visible: group.content_visible,
+                })
+                .collect(),
+            presentation_composites: self
+                .track_presentation
+                .composites
+                .iter()
+                .map(|composite| AutomationPresentationCompositeSnapshot {
+                    channel: composite.channel,
+                    id: composite.id,
+                    content_visible: composite.content_visible,
+                })
+                .collect(),
+            presentation_nodes,
+            pane_layouts,
+            active_track_gesture,
             selection: self.automation_selection_snapshot(),
             // Free-form status strings can contain local paths. Typed lifecycle
             // and readiness fields above provide safe status instead.
@@ -1906,7 +2211,7 @@ impl Viewer {
                 None,
                 Vec::new(),
             )),
-            Some(TrackFrameKey::Group(_)) => None,
+            Some(TrackFrameKey::Group { .. }) => None,
             None => None,
         }
     }
@@ -2044,8 +2349,14 @@ impl Viewer {
                             automation_bool(value, key)?;
                     }
                     "show_reads" => {
-                        self.primary_alignment_filters_mut().show_reads =
-                            automation_bool(value, key)?;
+                        let visible = automation_bool(value, key)?;
+                        self.apply_track_intents(&[TrackIntent::SetNodeVisibility {
+                            target: PresentationNodeId::Track {
+                                channel: ui::TrackPane::Reads,
+                                track_id: self.primary_alignment_track_id(),
+                            },
+                            visible,
+                        }])?;
                     }
                     "show_junctions" => {
                         self.primary_alignment_filters_mut().show_junctions =
@@ -2170,28 +2481,53 @@ impl Viewer {
                 self.rebuild_all_panel_displays();
             }
             AutomationOptionScope::Track { track_id } => {
+                let source_exists = self
+                    .alignment_tracks
+                    .iter()
+                    .any(|track| track.config.id == track_id)
+                    || self
+                        .tracks
+                        .tracks()
+                        .iter()
+                        .any(|track| track.id == track_id);
+                anyhow::ensure!(source_exists, "track {} was not found", track_id.get());
+                let presentation_intent = match key {
+                    "visible" => Some(TrackIntent::SetNodeVisibility {
+                        target: PresentationNodeId::Track {
+                            channel: ui::TrackPane::Annotation,
+                            track_id,
+                        },
+                        visible: automation_bool(value, key)?,
+                    }),
+                    "collapsed" => Some(TrackIntent::SetNodeVisibility {
+                        target: PresentationNodeId::Track {
+                            channel: ui::TrackPane::Annotation,
+                            track_id,
+                        },
+                        visible: !automation_bool(value, key)?,
+                    }),
+                    "height" => Some(TrackIntent::ResizeNode {
+                        target: PresentationNodeId::Track {
+                            channel: ui::TrackPane::Annotation,
+                            track_id,
+                        },
+                        preferred_height: automation_f32(value, key)?,
+                    }),
+                    _ => None,
+                };
+                if let Some(intent) = presentation_intent {
+                    self.apply_track_intents(&[intent])?;
+                    self.rebuild_all_panel_displays();
+                    self.display_dirty = true;
+                    return Ok(());
+                }
                 let primary_id = self.primary_alignment_track_id();
-                let mut query_changed = false;
                 if let Some(track) = self
                     .alignment_tracks
                     .iter_mut()
                     .find(|track| track.config.id == track_id)
                 {
                     match key {
-                        "visible" => {
-                            let requested = automation_bool(value, key)?;
-                            query_changed = requested != track.config.visible;
-                            track.config.visible = requested;
-                        }
-                        "collapsed" => track.config.collapsed = automation_bool(value, key)?,
-                        "height" => {
-                            let height = automation_f32(value, key)?;
-                            anyhow::ensure!(
-                                (40.0..=1_200.0).contains(&height),
-                                "alignment-track height must be between 40 and 1200"
-                            );
-                            track.config.height = height;
-                        }
                         "name" => track.config.name = automation_name(value, key)?,
                         "sample_key" => {
                             track.config.sample_key = automation_optional_name(value, key)?;
@@ -2201,10 +2537,6 @@ impl Viewer {
                     if track_id == primary_id {
                         self.activate_first_alignment_track()?;
                     }
-                    self.invalidate_automation_alignment_layouts(Some(&[track_id]), query_changed);
-                    if query_changed {
-                        self.request_all_alignment_queries();
-                    }
                     self.rebuild_all_panel_displays();
                 } else if let Some(track) = self
                     .tracks
@@ -2213,32 +2545,13 @@ impl Viewer {
                     .find(|track| track.id == track_id)
                 {
                     match key {
-                        "visible" => {
-                            let requested = automation_bool(value, key)?;
-                            query_changed = requested != track.visible;
-                            track.visible = requested;
-                        }
-                        "collapsed" => track.collapsed = automation_bool(value, key)?,
-                        "height" => {
-                            let height = automation_f32(value, key)?;
-                            anyhow::ensure!(
-                                (40.0..=600.0).contains(&height),
-                                "track height must be between 40 and 600"
-                            );
-                            track.height = height;
-                        }
                         "name" => track.name = automation_name(value, key)?,
                         "sample_key" => {
                             track.sample_key = automation_optional_name(value, key)?;
                         }
                         _ => anyhow::bail!("unknown auxiliary-track option {key}"),
                     }
-                    if query_changed {
-                        self.invalidate_and_request_all_auxiliary_track_queries();
-                    }
                     self.rebuild_all_panel_displays();
-                } else {
-                    anyhow::bail!("track {} was not found", track_id.get());
                 }
             }
             AutomationOptionScope::Panel { panel_id } => {
@@ -2387,6 +2700,61 @@ impl Viewer {
                 self.invalidate_automation_alignment_layouts(Some(track_ids), false);
                 self.rebuild_all_panel_displays();
             }
+            AutomationSetting::PresentationNodeVisible { target, value } => {
+                self.apply_track_intents(&[TrackIntent::SetNodeVisibility {
+                    target: *target,
+                    visible: *value,
+                }])?;
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::PresentationNodeHeight { target, value } => {
+                self.apply_track_intents(&[TrackIntent::ResizeNode {
+                    target: *target,
+                    preferred_height: *value,
+                }])?;
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::PresentationGroupExpanded { target, value } => {
+                self.apply_track_intents(&[TrackIntent::SetGroupExpanded {
+                    target: *target,
+                    expanded: *value,
+                }])?;
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::PresentationGroupVisible { target, value } => {
+                self.apply_track_intents(&[TrackIntent::SetGroupVisibility {
+                    target: *target,
+                    visible: *value,
+                }])?;
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::PresentationCompositeVisible {
+                channel,
+                composite_id,
+                value,
+            } => {
+                self.apply_track_intents(&[TrackIntent::SetCompositeVisibility {
+                    channel: *channel,
+                    composite_id: *composite_id,
+                    visible: *value,
+                }])?;
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::PresentationGroup { channel, track_ids } => {
+                self.apply_track_intents(&[TrackIntent::GroupNodes {
+                    channel: *channel,
+                    members: track_ids.clone(),
+                }])?;
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::PresentationUngroup { target } => {
+                self.apply_track_intents(&[TrackIntent::Ungroup { target: *target }])?;
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::ReadPaneHeight { value } => {
+                self.apply_track_intents(&[TrackIntent::ResizeReadPane { height: *value }])?;
+                self.rebuild_all_panel_displays();
+            }
             AutomationSetting::TrackHeight { track_id, value } => self.apply_automation_option(
                 &AutomationOptionScope::Track {
                     track_id: *track_id,
@@ -2424,6 +2792,63 @@ impl Viewer {
                     "annotation_scroll_points",
                     &serde_json::json!(value),
                 )?,
+            AutomationSetting::ReadStackScrollPoints { panel_id, value } => {
+                let Some(panel) = self.panels.get_mut(*panel_id) else {
+                    anyhow::bail!("panel {} was not found", panel_id.get());
+                };
+                let maximum = (panel.pane_layout.reads.content_bottom
+                    - panel.pane_layout.reads.pane_rect.bottom())
+                .max(0.0);
+                panel.read_stack_scroll_points = value.clamp(0.0, maximum);
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::ReadPanelScrollPoints {
+                panel_id,
+                track_id,
+                value,
+            } => {
+                self.ensure_automation_alignment_tracks(&[*track_id])?;
+                let Some(panel) = self.panels.get_mut(*panel_id) else {
+                    anyhow::bail!("panel {} was not found", panel_id.get());
+                };
+                let maximum = panel
+                    .scroll_display_cache
+                    .as_ref()
+                    .and_then(|cache| {
+                        cache
+                            .read_panels
+                            .iter()
+                            .find(|read_panel| read_panel.track_id == *track_id)
+                    })
+                    .map_or(0.0, |read_panel| {
+                        (panel
+                            .read_panel_scroll_state(*track_id)
+                            .content_bottom_points
+                            - read_panel.clip_bottom)
+                            .max(0.0)
+                    });
+                panel
+                    .read_panel_scrolls
+                    .entry(*track_id)
+                    .or_default()
+                    .scroll_points = value.clamp(0.0, maximum);
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::ReadPanelDensity {
+                panel_id,
+                track_id,
+                value,
+            } => {
+                self.ensure_automation_alignment_tracks(&[*track_id])?;
+                anyhow::ensure!(
+                    self.panels.get(*panel_id).is_some(),
+                    "panel {} was not found",
+                    panel_id.get()
+                );
+                self.set_read_panel_density(*panel_id, *track_id, *value);
+                self.invalidate_automation_alignment_layouts(Some(&[*track_id]), false);
+                self.rebuild_all_panel_displays();
+            }
         }
         self.bump_workspace_revision();
         let workspace = self.automation_workspace_snapshot();
@@ -2439,6 +2864,37 @@ impl Viewer {
                 .iter()
                 .find(|panel| panel.id == *panel_id)
                 .map(|panel| serde_json::json!(panel.annotation_scroll_points)),
+            AutomationSetting::ReadStackScrollPoints { panel_id, .. } => workspace
+                .panels
+                .iter()
+                .find(|panel| panel.id == *panel_id)
+                .map(|panel| serde_json::json!(panel.read_stack_scroll_points)),
+            AutomationSetting::ReadPanelScrollPoints {
+                panel_id, track_id, ..
+            } => workspace
+                .panels
+                .iter()
+                .find(|panel| panel.id == *panel_id)
+                .and_then(|panel| {
+                    panel
+                        .read_panel_states
+                        .iter()
+                        .find(|state| state.track_id == *track_id)
+                })
+                .map(|state| serde_json::json!(state.scroll_points)),
+            AutomationSetting::ReadPanelDensity {
+                panel_id, track_id, ..
+            } => workspace
+                .panels
+                .iter()
+                .find(|panel| panel.id == *panel_id)
+                .and_then(|panel| {
+                    panel
+                        .read_panel_states
+                        .iter()
+                        .find(|state| state.track_id == *track_id)
+                })
+                .map(|state| serde_json::json!(state.effective_density)),
             AutomationSetting::TrackHeight { track_id, .. } => workspace
                 .tracks
                 .iter()
@@ -2819,8 +3275,11 @@ impl Viewer {
         let chain = automation_query_supplementary_chain(&query, &record, &contig_name)?;
         self.panels.active_mut().clear_selection();
         self.panels.active_mut().selected_alignment_track = Some(target.track_id);
-        self.panels.active_mut().selected_alignment_tracks = vec![target.track_id];
-        self.panels.active_mut().selected_track = Some(TrackFrameKey::Alignment(target.track_id));
+        replace_panel_track_selection(
+            self.panels.active_mut(),
+            TrackFrameKey::Alignment(target.track_id),
+            ui::TrackPane::Reads,
+        );
         self.panels.active_mut().selected_record = Some(target.record_index);
         self.panels.active_mut().selected_chain = chain;
         self.bump_workspace_revision();
@@ -3117,7 +3576,8 @@ impl Viewer {
                 projection.cached_layout = None;
                 if query_changed {
                     projection.clock.advance();
-                    projection.pending_query = track.config.visible;
+                    projection.pending_query =
+                        !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
                 }
             }
         }
@@ -3225,12 +3685,20 @@ impl Viewer {
                     None
                 };
                 self.panels.active_mut().clear_selection();
-                self.panels.active_mut().selected_track = Some(key);
                 if matches!(key, TrackFrameKey::Alignment(_)) {
                     self.panels.active_mut().selected_alignment_track = Some(track_id);
-                    self.panels.active_mut().selected_alignment_tracks = vec![track_id];
+                    replace_panel_track_selection(
+                        self.panels.active_mut(),
+                        key,
+                        ui::TrackPane::Annotation,
+                    );
                     self.panels.active_mut().selected_pileup_position = Some(position);
                 } else if let Some((variant, quantitative)) = auxiliary_selection {
+                    replace_panel_track_selection(
+                        self.panels.active_mut(),
+                        key,
+                        ui::TrackPane::Annotation,
+                    );
                     self.panels.active_mut().selected_variant =
                         variant.map(|record_index| VariantSelection {
                             track_id,
@@ -3372,6 +3840,7 @@ impl Viewer {
             &self.panels,
             &self.alignment_tracks,
             &self.tracks,
+            &self.track_presentation,
             &scope_label,
         );
         let _ = write!(
@@ -3484,6 +3953,7 @@ impl Viewer {
                     &self.panels,
                     &self.alignment_tracks,
                     &self.tracks,
+                    &self.track_presentation,
                 );
                 self.start_automation_export_job(command_index, path, move |path| {
                     std::fs::write(path, contents)
@@ -3496,7 +3966,15 @@ impl Viewer {
                 let tracks = self
                     .alignment_tracks
                     .iter()
-                    .filter(|track| track.config.visible)
+                    .filter(|track| {
+                        self.track_presentation
+                            .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
+                            .unwrap_or(false)
+                            || self
+                                .track_presentation
+                                .track_content_exposed(ui::TrackPane::Reads, track.config.id)
+                                .unwrap_or(false)
+                    })
                     .filter_map(|track| {
                         self.alignment_query_for_track(track.config.id)
                             .map(|query| AutomationAlignmentExportTrack {
@@ -3534,7 +4012,11 @@ impl Viewer {
                     .tracks
                     .tracks()
                     .iter()
-                    .filter(|track| track.visible)
+                    .filter(|track| {
+                        self.track_presentation
+                            .track_content_exposed(ui::TrackPane::Annotation, track.id)
+                            .unwrap_or(false)
+                    })
                     .map(|track| track.id)
                     .collect::<BTreeSet<_>>();
                 let snapshots = self

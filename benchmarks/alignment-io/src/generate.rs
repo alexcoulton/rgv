@@ -589,6 +589,10 @@ fn make_ultima_truth_record(
     record.set_pos(position as i64);
     record.set_bin(bai_bin(position as u64, reference_end));
     record.set_mapq(60);
+    // `Record::new` carries FLAG 0x4 until explicitly replaced. These truth
+    // records are aligned and indexed, so leaving the default would make the
+    // production query correctly filter every one as unmapped.
+    record.set_flags(0);
     record.push_aux(b"RG", Aux::String("variant-truth"))?;
     record.push_aux(b"EV", Aux::String(name))?;
     record.push_aux(b"tp", Aux::ArrayI8((&tp[..]).into()))?;
@@ -1189,6 +1193,7 @@ mod tests {
                 .iter()
                 .all(|record| matches!(record.aux(b"RG"), Ok(Aux::String("variant-truth"))))
         );
+        assert!(records.iter().all(|record| !record.is_unmapped()));
     }
 
     #[test]

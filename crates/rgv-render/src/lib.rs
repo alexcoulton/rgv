@@ -892,7 +892,7 @@ mod tests {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
         assert_eq!(
-            hash, 15_646_548_694_303_010_464,
+            hash, 3_876_064_690_168_404_792,
             "update only after reviewing the Ultima insertion/deletion confidence raster"
         );
     }
@@ -995,7 +995,7 @@ mod tests {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
         assert_eq!(
-            hash, 9_294_248_250_143_442_532,
+            hash, 14_681_773_654_668_215_052,
             "update only after reviewing the short-, long-, spliced-, supplementary-, paired-, and deep-read fixture"
         );
     }

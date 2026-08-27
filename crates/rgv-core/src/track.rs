@@ -684,9 +684,15 @@ pub struct TrackConfig {
     pub format: Option<TrackFormat>,
     #[serde(default)]
     pub sample_key: Option<String>,
+    /// Legacy annotation visibility, consumed into `WorkspacePresentation`
+    /// while loading pre-schema-four sessions.
+    #[serde(default = "default_true", skip_serializing)]
     pub visible: bool,
-    #[serde(default)]
+    /// Legacy annotation collapse state, consumed during migration.
+    #[serde(default, skip_serializing)]
     pub collapsed: bool,
+    /// Legacy annotation height, consumed during migration.
+    #[serde(default = "default_track_height", skip_serializing)]
     pub height: f32,
     #[serde(default)]
     pub variant: VariantTrackSettings,
@@ -702,6 +708,10 @@ pub struct TrackConfig {
     pub interaction: InteractionTrackSettings,
     #[serde(default)]
     pub feature: FeatureTrackSettings,
+}
+
+const fn default_track_height() -> f32 {
+    120.0
 }
 
 impl TrackConfig {

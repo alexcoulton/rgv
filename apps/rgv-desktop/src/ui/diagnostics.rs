@@ -110,7 +110,21 @@ impl Viewer {
                     self.alignment_tracks.len(),
                     self.alignment_tracks
                         .iter()
-                        .filter(|track| track.config.visible)
+                        .filter(|track| {
+                            self.track_presentation
+                                .track_content_exposed(
+                                    ui::TrackPane::Annotation,
+                                    track.config.id,
+                                )
+                                .unwrap_or(false)
+                                || self
+                                    .track_presentation
+                                    .track_content_exposed(
+                                        ui::TrackPane::Reads,
+                                        track.config.id,
+                                    )
+                                    .unwrap_or(false)
+                        })
                         .count(),
                     self.workspace_alignment_limit
                 )

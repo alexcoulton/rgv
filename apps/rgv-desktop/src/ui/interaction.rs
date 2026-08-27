@@ -1094,11 +1094,11 @@ impl Viewer {
             }
         }
         for track in &mut self.alignment_tracks {
+            let queryable = !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
             for id in &ids {
-                let visible = track.config.visible;
                 let projection = track.projection_mut(*id);
                 projection.clock.advance();
-                projection.pending_query = visible;
+                projection.pending_query = queryable;
                 projection.alignment_rows = None;
                 projection.cached_layout = None;
             }
@@ -1169,7 +1169,8 @@ impl Viewer {
         panel.content_bottom_points = self.canvas_geometry.viewport.top();
         anyhow::ensure!(self.panels.push(panel), "view panel identity collision");
         for track in &mut self.alignment_tracks {
-            track.projection_mut(id).pending_query = track.config.visible;
+            track.projection_mut(id).pending_query =
+                !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
         }
         self.synchronize_panel_widths();
         self.activate_view_panel(id);
@@ -1298,32 +1299,43 @@ impl Viewer {
             .map_or(self.canvas_geometry.viewport.top(), |cache| {
                 cache.annotation_clip_bottom
             });
-        let alignment_track = panel.track_frames.iter().find_map(|frame| {
-            let TrackFrameKey::Alignment(id) = frame.key else {
-                return None;
-            };
-            ui::frame_content_y_at_screen_y(
-                frame,
-                cursor_y,
-                if frame.frozen_bottom.is_some() {
-                    0.0
-                } else {
-                    panel.annotation_scroll_points
-                },
-                if frame.frozen_bottom.is_some() {
-                    frame.top
-                } else {
-                    annotation_clip_top
-                },
-                self.canvas_geometry.viewport.top(),
-                if frame.frozen_bottom.is_some() {
-                    frame.bottom
-                } else {
-                    annotation_clip_bottom
-                },
-            )
-            .map(|_| id)
-        });
+        let alignment_track = panel
+            .pane_layout
+            .annotation
+            .items
+            .iter()
+            .chain(panel.pane_layout.reads.items.iter())
+            .find_map(|item| {
+                let frame = &item.frame;
+                let TrackFrameKey::Alignment(id) = frame.key else {
+                    return None;
+                };
+                if cursor_y < item.row_rect.top() || cursor_y >= item.row_rect.bottom() {
+                    return None;
+                }
+                let read_panel = frame.channel == ui::TrackPane::Reads;
+                ui::frame_content_y_at_screen_y(
+                    frame,
+                    cursor_y,
+                    if read_panel {
+                        0.0
+                    } else {
+                        panel.annotation_scroll_points
+                    },
+                    if read_panel {
+                        frame.top
+                    } else {
+                        annotation_clip_top
+                    },
+                    self.canvas_geometry.viewport.top(),
+                    if read_panel {
+                        frame.bottom
+                    } else {
+                        annotation_clip_bottom
+                    },
+                )
+                .map(|_| id)
+            });
         alignment_track.map_or(
             self.primary_alignment_filters().inspector_activation,
             |id| {

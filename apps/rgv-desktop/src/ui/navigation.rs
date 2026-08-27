@@ -8,6 +8,40 @@ use super::TRACK_GUTTER_WIDTH;
 
 pub const GENOME_CONTEXT_HEIGHT: f32 = 79.0;
 pub const GENOME_OVERVIEW_BINS: usize = 256;
+const CONTIG_LABEL_ROW_HEIGHT: f32 = 14.0;
+const GENOME_CONTEXT_BAR_HEIGHT: f32 = 10.0;
+const GENOME_CONTEXT_BAR_GAP: f32 = 3.0;
+const GENOME_CONTEXT_SPAN_LABEL_Y: f32 = 44.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GenomeContextRows {
+    label: Rect,
+    ideogram: Option<Rect>,
+    overview: Rect,
+    span_label_y: f32,
+}
+
+fn genome_context_rows(content: Rect, top: f32, has_cytobands: bool) -> GenomeContextRows {
+    let label = Rect::from_min_max(
+        pos2(content.left(), top),
+        pos2(content.right(), top + CONTIG_LABEL_ROW_HEIGHT),
+    );
+    let first_bar = Rect::from_min_size(
+        pos2(content.left() + 8.0, label.bottom()),
+        vec2((content.width() - 16.0).max(1.0), GENOME_CONTEXT_BAR_HEIGHT),
+    );
+    let ideogram = has_cytobands.then_some(first_bar);
+    let overview_top = ideogram.map_or(first_bar.top(), |rect| {
+        rect.bottom() + GENOME_CONTEXT_BAR_GAP
+    });
+    let overview = Rect::from_min_size(pos2(first_bar.left(), overview_top), first_bar.size());
+    GenomeContextRows {
+        label,
+        ideogram,
+        overview,
+        span_label_y: top + GENOME_CONTEXT_SPAN_LABEL_Y,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenomeOverviewData {
@@ -150,6 +184,9 @@ pub fn paint_genome_context(
         0.0
     };
     let content = Rect::from_min_max(pos2(rect.left() + gutter_width, rect.top()), rect.max);
+    let contig = viewport.interval().contig();
+    let has_cytobands = assembly.cytobands_for(contig).next().is_some();
+    let rows = genome_context_rows(content, rect.top(), has_cytobands);
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, Color32::from_gray(250));
     if show_gutter {
@@ -162,31 +199,22 @@ pub fn paint_genome_context(
         );
     }
     painter.text(
-        pos2(rect.left() + 8.0, rect.top() + 11.0),
+        pos2(rect.left() + 8.0, rows.label.center().y),
         Align2::LEFT_CENTER,
         contig_name,
-        FontId::proportional(12.0),
+        FontId::proportional(11.0),
         Color32::from_gray(55),
     );
 
-    let ideogram_rect = Rect::from_min_size(
-        pos2(
-            content.left() + 8.0,
-            rect.top() + if show_gutter { 4.0 } else { 10.0 },
-        ),
-        vec2((content.width() - 16.0).max(1.0), 13.0),
-    );
-    let overview_rect = Rect::from_min_size(
-        pos2(ideogram_rect.left(), ideogram_rect.bottom() + 5.0),
-        ideogram_rect.size(),
-    );
+    let overview_rect = rows.overview;
     let ideogram = layout_ideogram(
         assembly,
-        viewport.interval().contig(),
+        contig,
         contig_length,
         viewport.interval(),
-        ideogram_rect.width(),
+        overview_rect.width(),
     );
+    debug_assert_eq!(ideogram.has_cytobands, has_cytobands);
     let overview_response = ui
         .interact(
             overview_rect,
@@ -227,26 +255,28 @@ pub fn paint_genome_context(
             }
         });
     }
-    for segment in &ideogram.segments {
-        let segment_rect = Rect::from_min_size(
-            pos2(ideogram_rect.left() + segment.x, ideogram_rect.top()),
-            vec2(segment.width, ideogram_rect.height()),
-        );
-        painter.rect_filled(segment_rect, 0.0, stain_color(segment.stain));
-        painter.rect_stroke(
-            segment_rect,
-            0.0,
-            Stroke::new(0.75, Color32::from_gray(95)),
-            StrokeKind::Inside,
-        );
-        if segment.width >= 38.0 && !segment.name.is_empty() {
-            painter.text(
-                segment_rect.center(),
-                Align2::CENTER_CENTER,
-                &segment.name,
-                FontId::proportional(9.0),
-                Color32::from_gray(35),
+    if let Some(ideogram_rect) = rows.ideogram {
+        for segment in &ideogram.segments {
+            let segment_rect = Rect::from_min_size(
+                pos2(ideogram_rect.left() + segment.x, ideogram_rect.top()),
+                vec2(segment.width, ideogram_rect.height()),
             );
+            painter.rect_filled(segment_rect, 0.0, stain_color(segment.stain));
+            painter.rect_stroke(
+                segment_rect,
+                0.0,
+                Stroke::new(0.75, Color32::from_gray(95)),
+                StrokeKind::Inside,
+            );
+            if segment.width >= 38.0 && !segment.name.is_empty() {
+                painter.text(
+                    segment_rect.center(),
+                    Align2::CENTER_CENTER,
+                    &segment.name,
+                    FontId::proportional(9.0),
+                    Color32::from_gray(35),
+                );
+            }
         }
     }
     painter.rect_filled(overview_rect, 1.0, Color32::from_gray(238));
@@ -290,7 +320,7 @@ pub fn paint_genome_context(
         Stroke::new(1.0, Color32::from_gray(95)),
     );
     painter.text(
-        pos2(content.center().x, rect.top() + 42.0),
+        pos2(content.center().x, rows.span_label_y),
         Align2::CENTER_CENTER,
         &ruler.span_label,
         FontId::proportional(11.0),
@@ -458,6 +488,25 @@ mod tests {
         assert_eq!(ideogram_position_at_pointer(rect, 100.0, 10_000), 0);
         assert_eq!(ideogram_position_at_pointer(rect, 600.0, 10_000), 5_000);
         assert_eq!(ideogram_position_at_pointer(rect, 1_100.0, 10_000), 9_999);
+    }
+
+    #[test]
+    fn genome_context_omits_missing_cytobands_and_reserves_the_contig_label_row() {
+        let content = Rect::from_min_size(egui::Pos2::ZERO, vec2(900.0, GENOME_CONTEXT_HEIGHT));
+        let without_cytobands = genome_context_rows(content, content.top(), false);
+
+        assert!(without_cytobands.ideogram.is_none());
+        assert_eq!(
+            without_cytobands.overview.top(),
+            without_cytobands.label.bottom()
+        );
+        assert!(without_cytobands.overview.bottom() < without_cytobands.span_label_y);
+
+        let with_cytobands = genome_context_rows(content, content.top(), true);
+        let ideogram = with_cytobands.ideogram.unwrap();
+        assert_eq!(ideogram.top(), with_cytobands.label.bottom());
+        assert!(ideogram.bottom() < with_cytobands.overview.top());
+        assert!(with_cytobands.overview.bottom() < with_cytobands.span_label_y);
     }
 
     #[test]

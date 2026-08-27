@@ -4,8 +4,8 @@ impl Viewer {
     pub(crate) fn request_alignment_query(&mut self) {
         let panel_id = self.panels.active().id;
         for track in &mut self.alignment_tracks {
-            let visible = track.config.visible;
-            track.projection_mut(panel_id).pending_query = visible;
+            track.projection_mut(panel_id).pending_query =
+                !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
         }
         self.panels.active_mut().pending_queries.alignment =
             self.alignment_tracks.iter().any(|track| {
@@ -28,7 +28,7 @@ impl Viewer {
             .alignment_tracks
             .iter()
             .map(|track| {
-                if track.config.visible {
+                if !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_)) {
                     track.config.maximum_alignments
                 } else {
                     0
@@ -242,6 +242,7 @@ impl Viewer {
                 } else {
                     self.alignment_tracks[0] = controller;
                 }
+                self.reconcile_track_presentation();
                 self.panels.active_mut().pending_queries.alignment = false;
                 self.panels.active_mut().selected_chain = None;
                 self.panels.active_mut().display_list = DisplayList::default();
@@ -379,6 +380,7 @@ impl Viewer {
         for controller in replaced {
             self.retire_alignment_track_controller(controller);
         }
+        self.reconcile_track_presentation();
         Ok(())
     }
 
@@ -419,31 +421,6 @@ impl Viewer {
         Ok(())
     }
 
-    pub(crate) fn move_alignment_track(
-        &mut self,
-        id: TrackId,
-        target_index: usize,
-    ) -> Result<bool> {
-        let Some(old_index) = self
-            .alignment_tracks
-            .iter()
-            .position(|track| track.config.id == id)
-        else {
-            return Ok(false);
-        };
-        let new_index = target_index.min(self.alignment_tracks.len().saturating_sub(1));
-        if old_index == new_index {
-            return Ok(false);
-        }
-        move_ordered_item(&mut self.alignment_tracks, old_index, new_index);
-        if old_index == 0 || new_index == 0 {
-            self.activate_first_alignment_track()?;
-        }
-        self.rebuild_genomic_display();
-        self.display_dirty = true;
-        Ok(true)
-    }
-
     pub(crate) fn remove_alignment_track(&mut self, id: TrackId) -> Result<bool> {
         if id == SYNTHETIC_ALIGNMENT_TRACK_ID {
             return Ok(false);
@@ -458,6 +435,7 @@ impl Viewer {
         let removed_was_primary = index == 0;
         let removed_track = self.alignment_tracks.remove(index);
         self.retire_alignment_track_controller(removed_track);
+        self.track_presentation.remove_source(id);
         self.normalize_alignment_track_groups();
         if self
             .promoted_read
@@ -472,11 +450,22 @@ impl Viewer {
         ) {
             self.open_panel = None;
         }
+        if self.resizing_annotation_track.is_some_and(
+            |(key, _)| matches!(key, TrackFrameKey::Alignment(track_id) if track_id == id),
+        ) {
+            self.resizing_annotation_track = None;
+        }
         if self
-            .resizing_track
+            .resizing_read_track
             .is_some_and(|(track_id, _)| track_id == id)
         {
-            self.resizing_track = None;
+            self.resizing_read_track = None;
+        }
+        if self
+            .vertical_overview_drag
+            .is_some_and(|drag| drag.track_id == id)
+        {
+            self.vertical_overview_drag = None;
         }
         if removed_was_primary {
             self.activate_first_alignment_track()?;
@@ -487,7 +476,8 @@ impl Viewer {
         for track in &mut self.alignment_tracks {
             for projection in track.projections.values_mut() {
                 projection.clock.advance();
-                projection.pending_query = track.config.visible;
+                projection.pending_query =
+                    !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
             }
         }
         self.request_all_alignment_queries();

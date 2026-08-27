@@ -1,7 +1,7 @@
 # Session compatibility and migration policy
 
 RGV JSON sessions have an explicit integer `schema_version`. Version 1 is the first stable schema;
-version 3 is the current canonical development schema. Readers probe and validate the version,
+version 4 is the current canonical development schema. Readers probe and validate the version,
 locus, ordered view panels, stable panel and track identities, active panel, per-track state, and
 workspace alignment ceiling before mutating viewer state.
 
@@ -75,7 +75,34 @@ not migrated: it now means exact maximum concurrent aligned-base depth within ea
 Likewise, changing the new-track secondary-alignment default to off does not reinterpret saved
 `include_secondary` values. Optional assembly-identity fields mean unidentified/custom when absent.
 
-Saving always emits version 3. Remote credentials, query parameters, and fragments are redacted for
+## Version 3 to version 4
+
+Version 4 replaces mirrored, source-level presentation fields with one normalized
+`presentation` object. It stores independent ordered `annotation` and `reads` nodes, first-class
+channel-qualified groups, separate desired content visibility and group expansion, literal
+preferred row heights, persisted parent gates for composite overlays, and the workspace-owned
+read-pane height. Every panel also persists its
+annotation camera, read-stack camera, and per-alignment read-panel scroll, content origin, latent
+fraction, content extent, and optional density override.
+
+The version-3 migration is deterministic:
+
+- each alignment source becomes one annotation node and one read node;
+- each auxiliary source becomes one annotation node;
+- legacy group members are collected separately by `(channel, group_id)` in source order;
+- singleton legacy groups are discarded and conflicting collapse flags resolve to collapsed if any
+  member was collapsed;
+- equal numeric group IDs in Annotation and Reads remain distinct channel-qualified identities;
+- the former first alignment height becomes the workspace read-pane height; and
+- legacy visibility, collapse, group, and pane-height mirrors are cleared after normalization and
+  are never emitted by a version-4 save.
+
+Version-4 validation rejects missing or duplicate pane nodes, cross-channel/unknown group members,
+duplicate group membership, non-contiguous groups, groups smaller than two members, non-monotonic
+group allocation state, invalid preferred sizes, and read-panel cameras owned by unknown alignment
+sources.
+
+Saving always emits version 4. Remote credentials, query parameters, and fragments are redacted for
 every alignment, reference, and auxiliary source. Unknown future schemas are rejected before full
 deserialization and are never overwritten automatically. A session is limited to 64 alignment
 tracks and 16 view panels so loading untrusted input cannot instantiate unbounded engines or

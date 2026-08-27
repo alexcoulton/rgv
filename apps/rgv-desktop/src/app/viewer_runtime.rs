@@ -183,6 +183,16 @@ impl Viewer {
                 .remote_index_url
                 .clone_from(&options.remote_index_url);
         }
+        let mut track_presentation = options.loaded_session.as_ref().map_or_else(
+            || WorkspacePresentation::from_legacy(&alignment_track_configs, tracks.tracks()),
+            |session| session.presentation.clone(),
+        );
+        if track_presentation.pane_tracks.is_empty()
+            && (!alignment_track_configs.is_empty() || !tracks.tracks().is_empty())
+        {
+            track_presentation =
+                WorkspacePresentation::from_legacy(&alignment_track_configs, tracks.tracks());
+        }
         let primary_alignment = alignment_track_configs.first();
         let alignment_name = if synthetic {
             "Synthetic reads".to_owned()
@@ -363,6 +373,7 @@ impl Viewer {
             track_engine,
             automation_auxiliary_open_state,
             tracks,
+            track_presentation,
             reference_source,
             remote_reference_index_url,
             reference_remote_io_stats: None,
@@ -455,6 +466,10 @@ impl Viewer {
                 .loaded_session
                 .as_ref()
                 .map_or_else(Vec::new, SessionDocument::unresolved_local_sources),
+            session_migration_notices: options
+                .loaded_session
+                .as_ref()
+                .map_or_else(Vec::new, |session| session.migration_notices.clone()),
             igv_import_report: options.loaded_igv_report,
             next_autosave,
             recovery_candidates: options.recovery_candidates,
@@ -464,11 +479,10 @@ impl Viewer {
             automation_exit_requested: false,
             cache_budgets,
             locus_editor,
-            resizing_track: None,
             resizing_annotation_track: None,
             resizing_read_track: None,
-            reference_annotation_height: None,
             resizing_read_pane: None,
+            active_stack_scrollbar_gesture: None,
             horizontal_overview_drag: None,
             vertical_overview_drag: None,
             overview_capture: None,

@@ -21,6 +21,7 @@ fn alignment_subtrack_menu(
     ui: &mut egui::Ui,
     track_id: TrackId,
     filters: &SessionFilters,
+    read_content_visible: bool,
     include_reference: bool,
     actions: &mut Vec<TrackUiAction>,
 ) {
@@ -29,9 +30,23 @@ fn alignment_subtrack_menu(
         if subtrack == AlignmentSubtrack::Reference && !include_reference {
             continue;
         }
-        let mut visible = alignment_subtrack_visible(filters, subtrack);
+        let mut visible = if subtrack == AlignmentSubtrack::Reads {
+            read_content_visible
+        } else {
+            alignment_subtrack_visible(filters, subtrack)
+        };
         if ui.checkbox(&mut visible, subtrack.label()).changed() {
-            actions.push(TrackUiAction::ToggleAlignmentSubtrack(track_id, subtrack));
+            if subtrack == AlignmentSubtrack::Reads {
+                actions.push(TrackUiAction::SetNodeVisibility(
+                    PresentationNodeId::Track {
+                        channel: ui::TrackPane::Reads,
+                        track_id,
+                    },
+                    visible,
+                ));
+            } else {
+                actions.push(TrackUiAction::ToggleAlignmentSubtrack(track_id, subtrack));
+            }
         }
     }
 }
@@ -58,6 +73,9 @@ struct WorkspaceScrollbarsDraft {
     annotation_overview: Option<ui::ScrollbarOverview>,
     annotation_clip_bottom: f32,
     annotation_interaction: ui::ScrollbarInteraction,
+    read_stack_maximum: f32,
+    read_stack_offset: f32,
+    read_stack_interaction: ui::ScrollbarInteraction,
     read_panels: Vec<ReadPanelScrollbarDraft>,
 }
 
@@ -178,7 +196,11 @@ impl Viewer {
         let mut sashimi_fixed_scale_maximum = settings_filters.sashimi_fixed_scale_maximum;
         let mut sashimi_count_mode = settings_filters.sashimi_count_mode;
         let mut show_junction_labels = settings_filters.show_junction_labels;
-        let mut show_reads = settings_filters.show_reads;
+        let initial_show_reads = self
+            .track_presentation
+            .pane_track_state(ui::TrackPane::Reads, settings_alignment_id)
+            .is_none_or(|node| node.content_visible);
+        let mut show_reads = initial_show_reads;
         let mut use_fixed_coverage_scale = settings_filters.coverage_scale_maximum.is_some();
         let mut coverage_scale_maximum = settings_filters.coverage_scale_maximum.unwrap_or(100);
         let mut coverage_scale_transform = settings_filters.coverage_scale_transform;
@@ -241,22 +263,26 @@ impl Viewer {
             .alignment_tracks
             .iter()
             .map(|track| {
-                if track.config.id == primary_alignment_id {
-                    (
-                        track.config.id,
-                        self.primary_alignment_name().to_owned(),
-                        self.primary_alignment_visible(),
-                        self.primary_alignment_collapsed(),
-                        track.config.height,
-                    )
-                } else {
-                    (
-                        track.config.id,
-                        track.config.name.clone(),
-                        track.config.visible,
-                        track.config.collapsed,
-                        track.config.height,
-                    )
+                let state = self
+                    .track_presentation
+                    .pane_track_state(ui::TrackPane::Annotation, track.config.id);
+                let visible = state.is_none_or(|state| state.content_visible);
+                let height = state
+                    .and_then(|state| state.preferred_height)
+                    .or(track.config.annotation_height)
+                    .unwrap_or(120.0);
+                TrackControl {
+                    id: track.config.id,
+                    name: if track.config.id == primary_alignment_id {
+                        self.primary_alignment_name().to_owned()
+                    } else {
+                        track.config.name.clone()
+                    },
+                    visible,
+                    collapsed: !visible,
+                    height,
+                    initial_visible: visible,
+                    initial_height: height,
                 }
             })
             .collect::<Vec<_>>();
@@ -275,13 +301,22 @@ impl Viewer {
             .tracks()
             .iter()
             .map(|track| {
-                (
-                    track.id,
-                    track.name.clone(),
-                    track.visible,
-                    track.collapsed,
-                    track.height,
-                )
+                let state = self
+                    .track_presentation
+                    .pane_track_state(ui::TrackPane::Annotation, track.id);
+                let visible = state.is_none_or(|state| state.content_visible);
+                let height = state
+                    .and_then(|state| state.preferred_height)
+                    .unwrap_or(track.height);
+                TrackControl {
+                    id: track.id,
+                    name: track.name.clone(),
+                    visible,
+                    collapsed: !visible,
+                    height,
+                    initial_visible: visible,
+                    initial_height: height,
+                }
             })
             .collect::<Vec<_>>();
         let mut feature_settings_controls = self
@@ -423,6 +458,7 @@ impl Viewer {
         let mut settings_open = self.open_panel == Some(UiPanel::Settings);
         let mut project_issues_open = self.open_panel == Some(UiPanel::ProjectIssues);
         let unresolved_session_sources = self.unresolved_session_sources.clone();
+        let session_migration_notices = self.session_migration_notices.clone();
         let mut igv_report_open = self.open_panel == Some(UiPanel::IgvImportReport);
         let igv_import_report = self.igv_import_report.clone();
         let mut recovery_open = self.recovery_open;
@@ -443,7 +479,23 @@ impl Viewer {
         let mut recent_session_requested = None;
         let mut recent_locus_requested = None;
         let mut new_canvas_geometry = self.canvas_geometry;
-        let track_frames = self.panels.active().track_frames.clone();
+        let pane_layout = self.panels.active().pane_layout.clone();
+        let track_frames = pane_layout.frames().cloned().collect::<Vec<_>>();
+        let selected_annotation_track_ids = self
+            .panels
+            .active()
+            .selected_presentation_nodes
+            .iter()
+            .filter_map(|node| match node {
+                PresentationNodeId::Track {
+                    channel: ui::TrackPane::Annotation,
+                    track_id,
+                } => Some(*track_id),
+                PresentationNodeId::Reference
+                | PresentationNodeId::Track { .. }
+                | PresentationNodeId::Group { .. } => None,
+            })
+            .collect::<Vec<_>>();
         let track_groups = self.alignment_track_group_chrome();
         let bulk_alignment_group = track_groups.iter().find(|group| {
             bulk_alignment_pane == Some(group.pane)
@@ -522,6 +574,11 @@ impl Viewer {
                         .map(|cache| cache.annotation_overview.clone()),
                     annotation_clip_bottom,
                     annotation_interaction: ui::ScrollbarInteraction::default(),
+                    read_stack_maximum: (panel.read_stack_content_bottom_points
+                        - self.canvas_geometry.viewport.bottom())
+                    .max(0.0),
+                    read_stack_offset: panel.read_stack_scroll_points,
+                    read_stack_interaction: ui::ScrollbarInteraction::default(),
                     read_panels,
                 }
             })
@@ -587,11 +644,7 @@ impl Viewer {
             .map(|panel| {
                 let mut genome_overview = ui::GenomeOverviewData::default();
                 let mut query_fallback_overview = ui::GenomeOverviewData::default();
-                for track in self
-                    .alignment_tracks
-                    .iter()
-                    .filter(|track| track.config.visible)
-                {
+                for track in &self.alignment_tracks {
                     let index_bins = track
                         .dictionary
                         .as_ref()
@@ -699,19 +752,19 @@ impl Viewer {
                 )
             }))
             .collect::<Vec<_>>();
-        let mut alignment_visible = settings_controller
-            .map_or(self.primary_alignment_visible(), |track| {
-                track.config.visible
-            });
-        let mut alignment_collapsed = settings_controller
-            .map_or(self.primary_alignment_collapsed(), |track| {
-                track.config.collapsed
-            });
+        let annotation_presentation_state = self
+            .track_presentation
+            .pane_track_state(ui::TrackPane::Annotation, settings_alignment_id);
+        let mut alignment_visible =
+            annotation_presentation_state.is_none_or(|state| state.content_visible);
+        let mut alignment_collapsed = !alignment_visible;
         let mut alignment_name = settings_controller.map_or_else(
             || self.primary_alignment_name().to_owned(),
             |track| track.config.name.clone(),
         );
-        let mut alignment_height = settings_controller.map_or(360.0, |track| track.config.height);
+        let mut alignment_height = annotation_presentation_state
+            .and_then(|state| state.preferred_height)
+            .unwrap_or(120.0);
         let mut track_ui_actions = Vec::new();
         let rendered_track_settings_panel = match self.open_panel {
             Some(UiPanel::TrackSettings(key)) => Some(key),
@@ -779,12 +832,16 @@ impl Viewer {
                                 save_session_as_requested = true;
                                 ui.close();
                             }
-                            if !unresolved_session_sources.is_empty() {
+                            if !unresolved_session_sources.is_empty()
+                                || !session_migration_notices.is_empty()
+                            {
                                 ui.separator();
                                 if ui
                                     .button(format!(
-                                        "Unresolved project sources ({})…",
-                                        unresolved_session_sources.len()
+                                        "Project issues ({})…",
+                                        unresolved_session_sources
+                                            .len()
+                                            .saturating_add(session_migration_notices.len())
                                     ))
                                     .clicked()
                                 {
@@ -878,12 +935,21 @@ impl Viewer {
                                 let id = self.primary_alignment_track_id();
                                 let filters = self.live_session_filters();
                                 ui.menu_button(self.alignment_track_name(), |ui| {
-                                    ui.checkbox(&mut alignment_visible, "Show track");
+                                    if ui
+                                        .checkbox(
+                                            &mut alignment_visible,
+                                            "Show annotation content",
+                                        )
+                                        .changed()
+                                    {
+                                        alignment_collapsed = !alignment_visible;
+                                    }
                                     ui.separator();
                                     alignment_subtrack_menu(
                                         ui,
                                         id,
                                         &filters,
+                                        show_reads,
                                         true,
                                         &mut track_ui_actions,
                                     );
@@ -895,33 +961,52 @@ impl Viewer {
                                     }
                                 });
                             }
-                            for (id, name, visible, _, _) in &mut alignment_track_controls {
+                            for control in &mut alignment_track_controls {
                                 let filters = alignment_subtrack_controls
                                     .iter()
-                                    .find(|(candidate, _)| candidate == id)
+                                    .find(|(candidate, _)| *candidate == control.id)
                                     .map(|(_, filters)| filters)
                                     .cloned()
                                     .unwrap_or_default();
-                                ui.menu_button(name.as_str(), |ui| {
-                                    ui.checkbox(visible, "Show track");
+                                ui.menu_button(control.name.as_str(), |ui| {
+                                    if ui
+                                        .checkbox(
+                                            &mut control.visible,
+                                            "Show annotation content",
+                                        )
+                                        .changed()
+                                    {
+                                        control.collapsed = !control.visible;
+                                    }
                                     ui.separator();
                                     alignment_subtrack_menu(
                                         ui,
-                                        *id,
+                                        control.id,
                                         &filters,
-                                        *id == primary_alignment_id,
+                                        self.track_presentation
+                                            .pane_track_state(
+                                                ui::TrackPane::Reads,
+                                                control.id,
+                                            )
+                                            .is_none_or(|node| node.content_visible),
+                                        control.id == primary_alignment_id,
                                         &mut track_ui_actions,
                                     );
                                     ui.separator();
                                     if ui.button("Alignment settings…").clicked() {
                                         track_settings_panel =
-                                            Some(TrackFrameKey::Alignment(*id));
+                                            Some(TrackFrameKey::Alignment(control.id));
                                         ui.close();
                                     }
                                 });
                             }
-                            for (_, name, visible, _, _) in &mut track_controls {
-                                ui.checkbox(visible, name.as_str());
+                            for control in &mut track_controls {
+                                if ui
+                                    .checkbox(&mut control.visible, control.name.as_str())
+                                    .changed()
+                                {
+                                    control.collapsed = !control.visible;
+                                }
                             }
                         });
                         ui.menu_button("Regions", |ui| {
@@ -1437,7 +1522,7 @@ impl Viewer {
                     annotation_clip_top,
                     annotation_clip_bottom,
                     selected_track,
-                    &self.panels.active().selected_alignment_tracks,
+                    &selected_annotation_track_ids,
                     &self.panels.active().selected_read_tracks,
                     &track_groups,
                 );
@@ -1522,11 +1607,34 @@ impl Viewer {
                         ],
                         egui::Stroke::new(1.0, egui::Color32::from_gray(125)),
                     );
+                    let read_scrollbar_left = if workspace.read_stack_maximum > f32::EPSILON {
+                        let stack_rect = egui::Rect::from_min_max(
+                            egui::pos2(full.left(), split_y),
+                            egui::pos2(full.center().x, full.bottom()),
+                        );
+                        workspace.read_stack_interaction = ui::paint_read_stack_scrollbar(
+                            ui,
+                            stack_rect,
+                            workspace.panel_id,
+                            workspace.read_stack_maximum,
+                            &mut workspace.read_stack_offset,
+                        );
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(full.center().x, split_y),
+                                egui::pos2(full.center().x, full.bottom()),
+                            ],
+                            egui::Stroke::new(0.75, egui::Color32::from_gray(150)),
+                        );
+                        full.center().x
+                    } else {
+                        full.left()
+                    };
                     for scrollbar in &mut workspace.read_panels {
                         let top = scrollbar.top.clamp(full.top(), full.bottom());
                         let bottom = scrollbar.bottom.clamp(top, full.bottom());
                         let rect = egui::Rect::from_min_max(
-                            egui::pos2(full.left(), top),
+                            egui::pos2(read_scrollbar_left, top),
                             egui::pos2(full.right(), bottom),
                         );
                         scrollbar.interaction = ui::paint_read_panel_scrollbar(
@@ -1558,8 +1666,8 @@ impl Viewer {
                     .default_width(460.0)
                     .vscroll(true)
                     .show(ui.ctx(), |ui| match key {
-                        TrackFrameKey::Group(group) => {
-                            ui.heading(format!("Track group {group}"));
+                        TrackFrameKey::Group { channel, id } => {
+                            ui.heading(format!("{channel:?} track group {id}"));
                             ui.label("Use the group eye to minimize or expand it, or right-click the group header to ungroup its tracks.");
                         }
                         TrackFrameKey::Reference => {
@@ -1693,8 +1801,12 @@ impl Viewer {
                             ui.small(
                                 "Searches the bounded records loaded at this panel's current locus; names are not saved in sessions.",
                             );
-                            ui.checkbox(&mut alignment_visible, "Visible");
-                            ui.checkbox(&mut alignment_collapsed, "Collapsed");
+                            if ui
+                                .checkbox(&mut alignment_visible, "Show annotation content")
+                                .changed()
+                            {
+                                alignment_collapsed = !alignment_visible;
+                            }
                             ui.add(
                                 egui::Slider::new(&mut alignment_height, 40.0..=1_200.0)
                                     .text("Height"),
@@ -2122,11 +2234,11 @@ impl Viewer {
                         }
                         TrackFrameKey::Alignment(_) => {}
                         TrackFrameKey::Auxiliary(id) => {
-                            if let Some((index, (_, name, visible, collapsed, height))) =
-                                track_controls
-                                    .iter_mut()
-                                    .enumerate()
-                                    .find(|(_, (candidate, _, _, _, _))| *candidate == id)
+                            let track_control_count = track_controls.len();
+                            if let Some((index, control)) = track_controls
+                                .iter_mut()
+                                .enumerate()
+                                .find(|(_, control)| control.id == id)
                             {
                                 ui.heading("Track");
                                 sample_association_ui(
@@ -2136,13 +2248,18 @@ impl Viewer {
                                 );
                                 ui.horizontal(|ui| {
                                     ui.label("Name");
-                                    ui.text_edit_singleline(name);
+                                    ui.text_edit_singleline(&mut control.name);
                                 });
-                                ui.checkbox(visible, "Visible");
-                                ui.checkbox(collapsed, "Collapsed");
+                                if ui
+                                    .checkbox(&mut control.visible, "Show annotation content")
+                                    .changed()
+                                {
+                                    control.collapsed = !control.visible;
+                                }
                                 ui.add_enabled(
                                     !natural_row_height_tracks.contains(&id),
-                                    egui::Slider::new(height, 40.0..=600.0).text("Height"),
+                                    egui::Slider::new(&mut control.height, 40.0..=600.0)
+                                        .text("Height"),
                                 )
                                 .on_disabled_hover_text(
                                     "This matrix height follows its sample count and row height",
@@ -2264,7 +2381,7 @@ impl Viewer {
                                     }
                                     if ui
                                         .add_enabled(
-                                            index + 1 < track_controls.len(),
+                                            index + 1 < track_control_count,
                                             egui::Button::new("Move down"),
                                         )
                                         .clicked()
@@ -2449,6 +2566,7 @@ impl Viewer {
             self.activate_view_panel(overview_panel_id);
         }
         self.handle_overview_interaction(overview_interaction);
+        self.active_stack_scrollbar_gesture = None;
         for workspace in &mut workspace_scrollbars {
             let current_annotation_offset = self
                 .panels
@@ -2457,11 +2575,32 @@ impl Viewer {
             if workspace.annotation_interaction.pointer_down
                 || (workspace.annotation_offset - current_annotation_offset).abs() > f32::EPSILON
             {
+                if workspace.annotation_interaction.pointer_down {
+                    self.active_stack_scrollbar_gesture =
+                        Some((workspace.panel_id, ui::TrackPane::Annotation));
+                }
                 self.activate_view_panel(workspace.panel_id);
                 self.panels.active_mut().annotation_scroll_points = workspace.annotation_offset;
                 if self.synthetic || !self.refresh_active_panel_scroll_display() {
                     self.display_dirty = true;
                 }
+                self.window.request_redraw();
+            }
+            let current_read_stack_offset = self
+                .panels
+                .get(workspace.panel_id)
+                .map_or(0.0, |panel| panel.read_stack_scroll_points);
+            if workspace.read_stack_interaction.pointer_down
+                || (workspace.read_stack_offset - current_read_stack_offset).abs() > f32::EPSILON
+            {
+                if workspace.read_stack_interaction.pointer_down {
+                    self.active_stack_scrollbar_gesture =
+                        Some((workspace.panel_id, ui::TrackPane::Reads));
+                }
+                self.activate_view_panel(workspace.panel_id);
+                self.panels.active_mut().read_stack_scroll_points = workspace.read_stack_offset;
+                self.rebuild_genomic_display();
+                self.display_dirty = true;
                 self.window.request_redraw();
             }
             for scrollbar in &mut workspace.read_panels {
@@ -2488,16 +2627,16 @@ impl Viewer {
             }
         }
         if let Some(id) = editing_alignment_id
-            && let Some((_, name, visible, collapsed, height)) = alignment_track_controls
+            && let Some(control) = alignment_track_controls
                 .iter_mut()
-                .find(|(candidate, _, _, _, _)| *candidate == id)
+                .find(|control| control.id == id)
         {
             if !alignment_name.trim().is_empty() {
-                name.clone_from(&alignment_name);
+                control.name.clone_from(&alignment_name);
             }
-            *visible = alignment_visible;
-            *collapsed = alignment_collapsed;
-            *height = alignment_height;
+            control.visible = alignment_visible;
+            control.collapsed = alignment_collapsed;
+            control.height = alignment_height;
         }
         if let Some(command) = palette_command {
             match command {
@@ -2549,10 +2688,33 @@ impl Viewer {
                 UiCommand::ReviewQueue => review_open = true,
             }
         }
+        if show_reads != initial_show_reads {
+            track_ui_actions.push(TrackUiAction::SetNodeVisibility(
+                PresentationNodeId::Track {
+                    channel: ui::TrackPane::Reads,
+                    track_id: settings_alignment_id,
+                },
+                show_reads,
+            ));
+        }
+        if !bulk_alignment_ids.is_empty()
+            && (bulk_alignment_visibility.is_some() || bulk_alignment_collapsed.is_some())
+        {
+            let visible = bulk_alignment_visibility
+                .or_else(|| bulk_alignment_collapsed.map(|collapsed| !collapsed))
+                .expect("bulk presentation action has a requested state");
+            let channel = bulk_alignment_pane.unwrap_or(ui::TrackPane::Annotation);
+            track_ui_actions.extend(bulk_alignment_ids.iter().copied().map(|track_id| {
+                TrackUiAction::SetNodeVisibility(
+                    PresentationNodeId::Track { channel, track_id },
+                    visible,
+                )
+            }));
+        }
         let track_effects = self.dispatch_track_actions(
             track_ui_actions,
             TrackActionDraft {
-                track_frames: &track_frames,
+                pane_layout: &pane_layout,
                 alignment_controls: &mut alignment_track_controls,
                 auxiliary_controls: &mut track_controls,
                 primary_alignment_id,
@@ -2566,29 +2728,17 @@ impl Viewer {
         track_settings_panel = track_effects.settings_panel;
         export_png_requested |= track_effects.export_requested;
         let alignment_track_to_remove = track_effects.alignment_to_remove;
-        let alignment_track_move = track_effects.alignment_move;
         let alignment_subtracks_to_toggle = track_effects.alignment_subtracks_to_toggle;
-        track_move = track_effects.auxiliary_move.or(track_move);
         let mut alignment_configuration_changed =
             track_effects.annotation_geometry_changed || track_effects.read_geometry_changed;
-        let mut alignment_query_membership_changed = Vec::new();
-        for (id, name, visible, collapsed, height) in alignment_track_controls {
+        for control in alignment_track_controls {
             if let Some(track) = self
                 .alignment_tracks
                 .iter_mut()
-                .find(|track| track.config.id == id)
+                .find(|track| track.config.id == control.id)
             {
-                if track.config.visible != visible {
-                    alignment_query_membership_changed.push(id);
-                }
-                alignment_configuration_changed |= track.config.name != name
-                    || track.config.visible != visible
-                    || track.config.collapsed != collapsed
-                    || (track.config.height - height).abs() > f32::EPSILON;
-                track.config.name = name;
-                track.config.visible = visible;
-                track.config.collapsed = collapsed;
-                track.config.height = height;
+                alignment_configuration_changed |= track.config.name != control.name;
+                track.config.name = control.name;
             }
         }
         normalize_sample_association(&mut edited_track_sample_key);
@@ -2601,13 +2751,6 @@ impl Viewer {
         {
             track.config.sample_key.clone_from(&edited_track_sample_key);
             alignment_configuration_changed = true;
-        }
-        if !alignment_query_membership_changed.is_empty() {
-            self.invalidate_automation_alignment_layouts(
-                Some(&alignment_query_membership_changed),
-                true,
-            );
-            self.request_all_alignment_queries();
         }
         if alignment_configuration_changed {
             self.rebuild_genomic_display();
@@ -2977,12 +3120,52 @@ impl Viewer {
         self.metadata_filter_value = metadata_filter_value;
         self.metadata_selected_tracks = metadata_selected_tracks;
         if metadata_selection_changed {
-            self.panels.active_mut().selected_alignment_tracks = self
+            let selected_alignment_tracks = self
                 .alignment_tracks
                 .iter()
                 .filter(|track| self.metadata_selected_tracks.contains(&track.config.id))
                 .map(|track| track.config.id)
-                .collect();
+                .collect::<Vec<_>>();
+            let selected_auxiliary_tracks = self
+                .tracks
+                .tracks()
+                .iter()
+                .filter(|track| self.metadata_selected_tracks.contains(&track.id))
+                .map(|track| track.id)
+                .collect::<BTreeSet<_>>();
+            let selected_nodes = self
+                .track_presentation
+                .pane_root_nodes(ui::TrackPane::Annotation)
+                .into_iter()
+                .filter(|node| match node {
+                    PresentationNodeId::Track { track_id, .. } => {
+                        selected_alignment_tracks.contains(track_id)
+                            || selected_auxiliary_tracks.contains(track_id)
+                    }
+                    PresentationNodeId::Reference | PresentationNodeId::Group { .. } => false,
+                })
+                .collect::<Vec<_>>();
+            let panel = self.panels.active_mut();
+            panel.selected_alignment_tracks = selected_alignment_tracks;
+            panel.selected_read_tracks.clear();
+            panel.read_selection_anchor = None;
+            panel.selected_presentation_nodes = selected_nodes;
+            panel.presentation_selection_anchor = panel.selected_presentation_nodes.last().copied();
+            panel.selected_track =
+                panel
+                    .selected_presentation_nodes
+                    .last()
+                    .and_then(|node| match node {
+                        PresentationNodeId::Track { track_id, .. } => {
+                            if selected_auxiliary_tracks.contains(track_id) {
+                                Some(TrackFrameKey::Auxiliary(*track_id))
+                            } else {
+                                Some(TrackFrameKey::Alignment(*track_id))
+                            }
+                        }
+                        PresentationNodeId::Reference | PresentationNodeId::Group { .. } => None,
+                    });
+            panel.alignment_selection_anchor = panel.selected_alignment_tracks.last().copied();
         }
         if metadata_import_requested
             && let Some(path) = rfd::FileDialog::new()
@@ -3326,7 +3509,6 @@ impl Viewer {
                     != self.primary_alignment_filters().sashimi_fixed_scale_maximum
                 || sashimi_count_mode != self.primary_alignment_filters().sashimi_count_mode
                 || show_junction_labels != self.primary_alignment_filters().show_junction_labels
-                || show_reads != self.primary_alignment_filters().show_reads
                 || requested_coverage_scale
                     != self.primary_alignment_filters().coverage_scale_maximum
                 || coverage_scale_transform
@@ -3371,13 +3553,6 @@ impl Viewer {
                 .sashimi_fixed_scale_maximum = sashimi_fixed_scale_maximum.max(1);
             self.primary_alignment_filters_mut().sashimi_count_mode = sashimi_count_mode;
             self.primary_alignment_filters_mut().show_junction_labels = show_junction_labels;
-            if !show_reads {
-                self.panels.active_mut().selected_record = None;
-                self.panels.active_mut().selected_alignment_track = None;
-                self.panels.active_mut().selected_read_event = None;
-                self.panels.active_mut().selected_chain = None;
-            }
-            self.primary_alignment_filters_mut().show_reads = show_reads;
             self.primary_alignment_filters_mut().coverage_scale_maximum = requested_coverage_scale;
             self.primary_alignment_filters_mut()
                 .coverage_scale_transform = coverage_scale_transform;
@@ -3420,21 +3595,15 @@ impl Viewer {
             track.sample_key.clone_from(&edited_track_sample_key);
             track_configuration_changed = true;
         }
-        for (id, name, visible, collapsed, height) in track_controls {
+        for control in track_controls {
             if let Some(track) = self
                 .tracks
                 .tracks_mut()
                 .iter_mut()
-                .find(|track| track.id == id)
-                && (track.name != name
-                    || track.visible != visible
-                    || track.collapsed != collapsed
-                    || (track.height - height).abs() > f32::EPSILON)
+                .find(|track| track.id == control.id)
+                && track.name != control.name
             {
-                track.name = name;
-                track.visible = visible;
-                track.collapsed = collapsed;
-                track.height = height;
+                track.name = control.name;
                 track_configuration_changed = true;
             }
         }
@@ -3557,6 +3726,7 @@ impl Viewer {
                 .into_iter()
                 .collect::<HashSet<_>>();
         if track_configuration_changed {
+            self.reconcile_track_presentation();
             self.rebuild_genomic_display();
             self.display_dirty = true;
         }
@@ -3693,7 +3863,6 @@ impl Viewer {
             filters.sashimi_fixed_scale_maximum = sashimi_fixed_scale_maximum.max(1);
             filters.sashimi_count_mode = sashimi_count_mode;
             filters.show_junction_labels = show_junction_labels;
-            filters.show_reads = show_reads;
             filters.coverage_scale_maximum = requested_coverage_scale;
             filters.coverage_scale_transform = coverage_scale_transform;
             filters.show_coverage_center_line = show_coverage_center_line;
@@ -3727,15 +3896,6 @@ impl Viewer {
                     maximum_alignments: primitive_limit as usize,
                     apply_filter,
                 },
-            );
-        }
-        if !bulk_alignment_ids.is_empty()
-            && (bulk_alignment_visibility.is_some() || bulk_alignment_collapsed.is_some())
-        {
-            self.apply_bulk_alignment_state(
-                &bulk_alignment_ids,
-                bulk_alignment_visibility,
-                bulk_alignment_collapsed,
             );
         }
         if apply_bulk_alignment_appearance
@@ -3797,11 +3957,6 @@ impl Viewer {
                 }
                 Err(error) => self.data_status = error.to_string(),
             }
-        }
-        if let Some((id, target_index)) = alignment_track_move
-            && let Err(error) = self.move_alignment_track(id, target_index)
-        {
-            self.data_status = error.to_string();
         }
         if let Some(id) = alignment_track_to_remove
             && let Err(error) = self.remove_alignment_track(id)

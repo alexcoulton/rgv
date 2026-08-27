@@ -1,0 +1,138 @@
+{
+  "automation_schema_version": 3,
+  "captures": [
+    {
+      "bytes": 289962,
+      "foreground_activated": false,
+      "height": 1844,
+      "includes_native_frame": false,
+      "name": "mf04-hidden-read-group.png",
+      "sha256": "a182f999e124b7176d5488223462ee7a54228f896c8405ae03797aa0b56bb553",
+      "width": 3024,
+      "window_bounds_points": null,
+      "window_id": null
+    },
+    {
+      "bytes": 390735,
+      "foreground_activated": false,
+      "height": 1844,
+      "includes_native_frame": false,
+      "name": "mf04-restored-independent-channels.png",
+      "sha256": "622d817433e983bbb1d1cab4c02899cce6340d7f877b78669ccbe4b3d76f09a9",
+      "width": 3024,
+      "window_bounds_points": null,
+      "window_id": null
+    },
+    {
+      "bytes": 835873,
+      "foreground_activated": false,
+      "height": 1844,
+      "includes_native_frame": false,
+      "name": "mf12-split-panel-cameras.png",
+      "sha256": "6157f6149d4b2b11d6569527c04c4c475d7f5c528ae6122d74f385821a2ff27d",
+      "width": 3024,
+      "window_bounds_points": null,
+      "window_id": null
+    },
+    {
+      "bytes": 835873,
+      "foreground_activated": false,
+      "height": 1844,
+      "includes_native_frame": false,
+      "name": "mf12-save-reopen.png",
+      "sha256": "6157f6149d4b2b11d6569527c04c4c475d7f5c528ae6122d74f385821a2ff27d",
+      "width": 3024,
+      "window_bounds_points": null,
+      "window_id": null
+    }
+  ],
+  "mf04": {
+    "alignment_ids": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "pane_layout_count": 2,
+    "read_group": {
+      "channel": "reads",
+      "content_visible": false,
+      "expanded": false,
+      "id": 1,
+      "label": "Group 1",
+      "members": [
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    }
+  },
+  "mf04_application_instance_id": "7c9e135e-28dc-4ee9-91cf-d2a98439daa1",
+  "mf12": {
+    "alignment_ids": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "panel_ids": [
+      1,
+      2
+    ],
+    "presentation_groups": [
+      {
+        "channel": "reads",
+        "content_visible": true,
+        "expanded": true,
+        "id": 1,
+        "label": "Group 1",
+        "members": [
+          2,
+          3,
+          4
+        ]
+      },
+      {
+        "channel": "annotation",
+        "content_visible": true,
+        "expanded": true,
+        "id": 2,
+        "label": "Group 2",
+        "members": [
+          1,
+          2,
+          3
+        ]
+      }
+    ],
+    "read_pane_height": 480.0,
+    "read_panel_states": [
+      {
+        "content_bottom_points": 1394.1785888671875,
+        "content_origin_points": 0.0,
+        "density": 1.25,
+        "effective_density": 1.25,
+        "latent_scroll_fraction": 0.04642102122306824,
+        "maximum_scroll_points": 861.6785888671875,
+        "scroll_points": 40.0,
+        "track_id": 1
+      },
+      {
+        "content_bottom_points": 1205.821533203125,
+        "content_origin_points": 0.0,
+        "density": 2.25,
+        "effective_density": 2.25,
+        "latent_scroll_fraction": 0.11881396174430847,
+        "maximum_scroll_points": 673.321533203125,
+        "scroll_points": 80.0,
+        "track_id": 1
+      }
+    ]
+  },
+  "mf12_application_instance_id": "7c9e135e-28dc-4ee9-91cf-d2a98439daa1",
+  "result": "passed"
+}

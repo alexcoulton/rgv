@@ -139,6 +139,7 @@ fn auxiliary_removal_clears_every_track_owned_panel_reference() {
     for id in [removed_id, surviving_id] {
         panel.track_frames.push(TrackFrame {
             key: TrackFrameKey::Auxiliary(id),
+            channel: ui::TrackPane::Annotation,
             name: format!("track-{id:?}"),
             kind: TrackKind::Feature,
             source_label: None,
@@ -255,7 +256,7 @@ fn auxiliary_removal_disables_arithmetic_that_depended_on_the_track() {
 }
 
 #[test]
-fn auxiliary_queries_skip_hidden_tracks_but_keep_required_quantitative_operands() {
+fn auxiliary_queries_follow_source_lifecycle_not_presentation_eyes() {
     let quantitative = |id| {
         TrackConfig::new(
             TrackId::new(id),
@@ -293,17 +294,35 @@ fn auxiliary_queries_skip_hidden_tracks_but_keep_required_quantitative_operands(
 
     assert_eq!(
         auxiliary_query_track_ids(&tracks),
-        [TrackId::new(2), TrackId::new(1), TrackId::new(4)]
+        [
+            TrackId::new(2),
+            TrackId::new(1),
+            TrackId::new(3),
+            TrackId::new(4)
+        ]
     );
 
     tracks[1].quantitative.arithmetic = QuantitativeArithmetic::None;
     assert_eq!(
         auxiliary_query_track_ids(&tracks),
-        [TrackId::new(1), TrackId::new(4)]
+        [
+            TrackId::new(2),
+            TrackId::new(1),
+            TrackId::new(3),
+            TrackId::new(4)
+        ]
     );
 
     tracks[1].visible = false;
-    assert_eq!(auxiliary_query_track_ids(&tracks), [TrackId::new(4)]);
+    assert_eq!(
+        auxiliary_query_track_ids(&tracks),
+        [
+            TrackId::new(2),
+            TrackId::new(1),
+            TrackId::new(3),
+            TrackId::new(4)
+        ]
+    );
 }
 
 #[test]
@@ -349,6 +368,7 @@ fn alignment_removal_clears_deleted_identity_from_every_panel() {
         for id in [removed, surviving] {
             panel.track_frames.push(TrackFrame {
                 key: TrackFrameKey::Alignment(id),
+                channel: ui::TrackPane::Annotation,
                 name: format!("reads-{id:?}"),
                 kind: TrackKind::Alignment,
                 source_label: None,
@@ -718,6 +738,14 @@ fn session_panel_workspace_restores_order_active_locus_and_width() {
     session.panels[1].annotation_scroll_points = 81.0;
     session.panels[0].vertical_content_origin_points = 33.0;
     session.panels[1].vertical_content_origin_points = 105.0;
+    session.panels[1].read_panel_states = vec![SessionReadPanelState {
+        track_id: TrackId::new(12),
+        scroll_points: 210.0,
+        content_origin_points: 40.0,
+        latent_scroll_fraction: Some(0.6),
+        content_bottom_points: 900.0,
+        density: Some(3.0),
+    }];
     session.active_panel = PanelId::new(4);
 
     let workspace = PanelWorkspace::from_session(&session, 800.0, 120.0).unwrap();
@@ -734,6 +762,18 @@ fn session_panel_workspace_restores_order_active_locus_and_width() {
     assert!((workspace.panels[0].vertical_content_origin_points - 33.0).abs() < f32::EPSILON);
     assert!((workspace.panels[1].vertical_content_origin_points - 105.0).abs() < f32::EPSILON);
     assert!((workspace.panels[1].effective_vertical_scroll_points() - 40.0).abs() < f32::EPSILON);
+    assert_eq!(
+        workspace.panels[1]
+            .read_panel_scrolls
+            .get(&TrackId::new(12)),
+        Some(&ReadPanelScrollState {
+            scroll_points: 210.0,
+            content_origin_points: 40.0,
+            latent_scroll_fraction: Some(0.6),
+            content_bottom_points: 900.0,
+            density: Some(3.0),
+        })
+    );
     assert_eq!(workspace.active().contig_name, "chr2");
     assert_eq!(workspace.active().viewport.interval().start(), 500);
     assert_eq!(workspace.active().viewport.interval().end(), 800);
@@ -824,9 +864,34 @@ fn multi_panel_composite_export_matches_reviewed_golden_hash() {
 #[test]
 fn multi_panel_alignment_geometry_uses_the_tallest_primary_frame() {
     let track_id = TrackId::new(5);
+    let add_layout = |panel: &mut ViewPanelController| {
+        let frame = panel.track_frames[0].clone();
+        let row_rect =
+            egui::Rect::from_min_max(egui::pos2(0.0, frame.top), egui::pos2(100.0, frame.bottom));
+        panel.pane_layout.annotation.items.push(ui::PaneItemLayout {
+            id: PresentationNodeId::Track {
+                channel: ui::TrackPane::Annotation,
+                track_id,
+            },
+            frame,
+            row_rect,
+            header_rect: egui::Rect::from_min_max(
+                row_rect.min,
+                egui::pos2(row_rect.right(), row_rect.top() + 22.0),
+            ),
+            content_rect: Some(egui::Rect::from_min_max(
+                egui::pos2(row_rect.left(), row_rect.top() + 22.0),
+                row_rect.max,
+            )),
+            clip_rect: row_rect,
+            desired_content_visible: true,
+            effective_content_visible: true,
+        });
+    };
     let mut first = test_panel(7);
     first.track_frames.push(TrackFrame {
         key: TrackFrameKey::Alignment(track_id),
+        channel: ui::TrackPane::Annotation,
         name: "Reads".to_owned(),
         kind: TrackKind::Alignment,
         source_label: None,
@@ -837,9 +902,11 @@ fn multi_panel_alignment_geometry_uses_the_tallest_primary_frame() {
         frozen_bottom: None,
         subtracks: Vec::new(),
     });
+    add_layout(&mut first);
     let mut second = test_panel(2);
     second.track_frames.push(TrackFrame {
         key: TrackFrameKey::Alignment(track_id),
+        channel: ui::TrackPane::Annotation,
         name: "Reads".to_owned(),
         kind: TrackKind::Alignment,
         source_label: None,
@@ -850,6 +917,7 @@ fn multi_panel_alignment_geometry_uses_the_tallest_primary_frame() {
         frozen_bottom: None,
         subtracks: Vec::new(),
     });
+    add_layout(&mut second);
     let mut workspace = PanelWorkspace::new(first);
     assert!(workspace.push(second));
 

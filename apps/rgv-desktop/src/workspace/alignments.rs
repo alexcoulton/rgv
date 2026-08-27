@@ -453,23 +453,7 @@ pub(crate) fn allocate_workspace_records(total_records: usize, requests: &[usize
     allocations
 }
 
-pub(crate) fn move_ordered_item<T>(
-    items: &mut Vec<T>,
-    old_index: usize,
-    target_index: usize,
-) -> bool {
-    if old_index >= items.len() {
-        return false;
-    }
-    let new_index = target_index.min(items.len().saturating_sub(1));
-    if old_index == new_index {
-        return false;
-    }
-    let item = items.remove(old_index);
-    items.insert(new_index, item);
-    true
-}
-
+#[cfg(test)]
 pub(crate) fn updated_alignment_selection(
     selected: &[TrackId],
     id: TrackId,
@@ -487,6 +471,7 @@ pub(crate) fn updated_alignment_selection(
     next
 }
 
+#[cfg(test)]
 pub(crate) fn alignment_range_selection(
     track_order: &[TrackId],
     anchor: TrackId,
@@ -504,6 +489,24 @@ pub(crate) fn alignment_range_selection(
         (clicked_index, anchor_index)
     };
     track_order[start..=end].to_vec()
+}
+
+#[cfg(test)]
+pub(crate) fn move_ordered_item<T>(
+    items: &mut Vec<T>,
+    old_index: usize,
+    target_index: usize,
+) -> bool {
+    if old_index >= items.len() {
+        return false;
+    }
+    let new_index = target_index.min(items.len().saturating_sub(1));
+    if old_index == new_index {
+        return false;
+    }
+    let item = items.remove(old_index);
+    items.insert(new_index, item);
+    true
 }
 
 pub(crate) fn interval_for_track(

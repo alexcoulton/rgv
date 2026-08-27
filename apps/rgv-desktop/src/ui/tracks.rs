@@ -4,7 +4,7 @@ use egui::{
     Align2, Color32, FontId, Galley, Rect, Sense, Stroke, Ui, pos2,
     text::{LayoutJob, TextFormat, TextWrapping},
 };
-use rgv_core::{PanelId, TrackId, TrackKind};
+use rgv_core::{PanelId, PresentationNodeId, TrackChannel, TrackId, TrackKind};
 use rgv_layout::{DisplayList, TextPrimitive};
 
 use super::CanvasGeometry;
@@ -13,7 +13,7 @@ use crate::{MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TrackFrameKey {
     Reference,
-    Group(u32),
+    Group { channel: TrackChannel, id: u32 },
     Alignment(TrackId),
     Auxiliary(TrackId),
 }
@@ -21,11 +21,7 @@ pub enum TrackFrameKey {
 /// The visual section that owns a track-frame interaction. Alignment
 /// annotation and read frames intentionally share a track key, so the key
 /// alone cannot identify which row the user selected.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum TrackPane {
-    Annotation,
-    Reads,
-}
+pub type TrackPane = TrackChannel;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AlignmentSubtrack {
@@ -79,6 +75,9 @@ pub struct TrackSubtrack {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrackFrame {
     pub key: TrackFrameKey,
+    /// Stable presentation identity. This must never be recovered from frame
+    /// geometry such as `frozen_bottom`.
+    pub channel: TrackPane,
     pub name: String,
     pub kind: TrackKind,
     pub source_label: Option<String>,
@@ -92,6 +91,175 @@ pub struct TrackFrame {
     pub subtracks: Vec<TrackSubtrack>,
 }
 
+/// Immutable geometry and visibility resolved for one presentation node. The
+/// same item is consumed by canvas clipping, gutter chrome, hit testing, and
+/// automation; those consumers must not reconstruct pane identity or parent
+/// visibility from render primitives.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneItemLayout {
+    pub id: PresentationNodeId,
+    pub frame: TrackFrame,
+    pub row_rect: Rect,
+    pub header_rect: Rect,
+    pub content_rect: Option<Rect>,
+    pub clip_rect: Rect,
+    pub desired_content_visible: bool,
+    pub effective_content_visible: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneLayoutSnapshot {
+    pub channel: TrackPane,
+    pub pane_rect: Rect,
+    pub content_bottom: f32,
+    pub scroll_points: f32,
+    pub stack_scroll_points: f32,
+    pub items: Vec<PaneItemLayout>,
+}
+
+impl PaneLayoutSnapshot {
+    pub fn empty(channel: TrackPane) -> Self {
+        Self {
+            channel,
+            pane_rect: Rect::NOTHING,
+            content_bottom: 0.0,
+            scroll_points: 0.0,
+            stack_scroll_points: 0.0,
+            items: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkspacePaneLayout {
+    pub annotation: PaneLayoutSnapshot,
+    pub reads: PaneLayoutSnapshot,
+}
+
+impl Default for WorkspacePaneLayout {
+    fn default() -> Self {
+        Self {
+            annotation: PaneLayoutSnapshot::empty(TrackPane::Annotation),
+            reads: PaneLayoutSnapshot::empty(TrackPane::Reads),
+        }
+    }
+}
+
+impl WorkspacePaneLayout {
+    pub fn for_channel(&self, channel: TrackPane) -> &PaneLayoutSnapshot {
+        match channel {
+            TrackPane::Annotation => &self.annotation,
+            TrackPane::Reads => &self.reads,
+        }
+    }
+
+    pub fn frames(&self) -> impl Iterator<Item = &TrackFrame> {
+        self.annotation
+            .items
+            .iter()
+            .chain(self.reads.items.iter())
+            .map(|item| &item.frame)
+    }
+}
+
+fn presentation_node_for_frame(frame: &TrackFrame) -> Option<PresentationNodeId> {
+    match frame.key {
+        TrackFrameKey::Reference => None,
+        TrackFrameKey::Group { channel, id } => Some(PresentationNodeId::Group {
+            channel,
+            group_id: id,
+        }),
+        TrackFrameKey::Alignment(id) if id.get() == 0 => None,
+        TrackFrameKey::Alignment(track_id) | TrackFrameKey::Auxiliary(track_id) => {
+            Some(PresentationNodeId::Track {
+                channel: frame.channel,
+                track_id,
+            })
+        }
+    }
+}
+
+fn group_chevron_segments(rect: Rect, collapsed: bool) -> [[egui::Pos2; 2]; 2] {
+    let center = rect.center();
+    if collapsed {
+        let left_top = pos2(center.x - 2.5, center.y - 4.0);
+        let tip = pos2(center.x + 2.5, center.y);
+        let left_bottom = pos2(center.x - 2.5, center.y + 4.0);
+        [[left_top, tip], [tip, left_bottom]]
+    } else {
+        let left_top = pos2(center.x - 4.0, center.y - 2.5);
+        let tip = pos2(center.x, center.y + 2.5);
+        let right_top = pos2(center.x + 4.0, center.y - 2.5);
+        [[left_top, tip], [tip, right_top]]
+    }
+}
+
+fn track_header_label_geometry(
+    label_rect: Rect,
+    header_top: f32,
+    group_header: bool,
+) -> (egui::Pos2, f32) {
+    let left_offset = if group_header { 40.0 } else { 22.0 };
+    let right_padding = if group_header { 4.0 } else { 31.0 };
+    (
+        pos2(label_rect.left() + left_offset, header_top + 11.0),
+        (label_rect.width() - left_offset - right_padding).max(0.0),
+    )
+}
+
+const READ_TRACK_NAME_PREFIX: &str = "Reads · ";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrackRenameState {
+    key: TrackFrameKey,
+    pane: TrackPane,
+    draft: String,
+    request_focus: bool,
+}
+
+fn track_rename_state_id() -> egui::Id {
+    egui::Id::new("track-inline-rename-state")
+}
+
+fn track_rename_editor_id(key: TrackFrameKey, pane: TrackPane) -> egui::Id {
+    egui::Id::new(("track-inline-rename-editor", key, pane))
+}
+
+fn editable_track_name(frame: &TrackFrame) -> Option<&str> {
+    match frame.key {
+        TrackFrameKey::Alignment(_) | TrackFrameKey::Auxiliary(_) => {
+            Some(if frame.channel == TrackPane::Reads {
+                frame
+                    .name
+                    .strip_prefix(READ_TRACK_NAME_PREFIX)
+                    .unwrap_or(&frame.name)
+            } else {
+                &frame.name
+            })
+        }
+        TrackFrameKey::Reference | TrackFrameKey::Group { .. } => None,
+    }
+}
+
+fn begin_track_rename(frame: &TrackFrame) -> Option<TrackRenameState> {
+    Some(TrackRenameState {
+        key: frame.key,
+        pane: frame.channel,
+        draft: editable_track_name(frame)?.to_owned(),
+        request_focus: true,
+    })
+}
+
+fn alignment_subtrack_has_independent_visibility(
+    frame: &TrackFrame,
+    subtrack: AlignmentSubtrack,
+) -> bool {
+    // A read-pane frame is already the independently visible Reads node. Its
+    // sole subtrack is status/content for that node, not another visibility
+    // owner. Annotation subtracks remain independently toggleable.
+    !(frame.channel == TrackPane::Reads && subtrack == AlignmentSubtrack::Reads)
+}
+
 /// Presentation metadata for an alignment-track group. Groups deliberately
 /// remain separate from read grouping and quantitative overlay composition.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +269,7 @@ pub struct TrackGroupChrome {
     pub anchor: TrackId,
     pub members: Vec<TrackId>,
     pub collapsed: bool,
+    pub content_visible: bool,
 }
 
 impl TrackGroupChrome {
@@ -109,25 +278,25 @@ impl TrackGroupChrome {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TrackUiAction {
     Select(TrackFrameKey, TrackPane),
     OpenSettings(TrackFrameKey),
+    RenameTrack(TrackFrameKey, String),
     ToggleVisibility(TrackFrameKey),
+    SetNodeVisibility(PresentationNodeId, bool),
     ToggleCollapsed(TrackFrameKey),
+    ToggleCompositeVisibility(TrackFrameKey),
     ToggleAlignmentSubtrack(TrackId, AlignmentSubtrack),
     ToggleCompositeMember(TrackId),
     GroupSelectedTracks(TrackPane),
     ToggleTrackGroup(TrackPane, u32),
+    ToggleTrackGroupVisibility(TrackPane, u32),
     UngroupTracks(TrackPane, u32),
     Export(TrackFrameKey),
     Remove(TrackFrameKey),
-    ReorderDropped(TrackId, f32),
-    ReorderKeyboard(TrackId, i32),
-    ResizeStarted(TrackId),
-    ResizeDragged(TrackId, f32),
-    ResizeStopped(TrackId),
-    ResizeKeyboard(TrackId, f32),
+    ReorderDropped(PresentationNodeId, f32),
+    ReorderKeyboard(PresentationNodeId, i32),
     ResizeAnnotationStarted(TrackFrameKey, f32),
     ResizeAnnotationDragged(TrackFrameKey, f32),
     ResizeAnnotationStopped(TrackFrameKey),
@@ -201,6 +370,7 @@ fn paint_elided_text(
     painter.galley(pos2(left, anchor.y - galley.size().y * 0.5), galley, color);
 }
 
+#[cfg(test)]
 pub fn track_drop_index(
     frames: &[TrackFrame],
     track_order: &[TrackId],
@@ -211,7 +381,7 @@ pub fn track_drop_index(
     let target = frames
         .iter()
         .filter_map(|frame| {
-            if matches!(frame.key, TrackFrameKey::Group(_)) {
+            if matches!(frame.key, TrackFrameKey::Group { .. }) {
                 return None;
             }
             let bounds = clipped_frame_screen_bounds(
@@ -225,7 +395,7 @@ pub fn track_drop_index(
         })
         .next();
     match target {
-        Some(TrackFrameKey::Group(_)) => unreachable!("group headers are not reorder targets"),
+        Some(TrackFrameKey::Group { .. }) => unreachable!("group headers are not reorder targets"),
         Some(TrackFrameKey::Reference) => 0,
         Some(TrackFrameKey::Auxiliary(target)) => track_order
             .iter()
@@ -239,6 +409,7 @@ pub fn track_drop_index(
     }
 }
 
+#[cfg(test)]
 pub fn keyboard_reorder_index(current: usize, count: usize, direction: i32) -> usize {
     match direction.cmp(&0) {
         std::cmp::Ordering::Less => current.saturating_sub(1),
@@ -247,6 +418,7 @@ pub fn keyboard_reorder_index(current: usize, count: usize, direction: i32) -> u
     }
 }
 
+#[cfg(test)]
 pub fn resized_track_height(origin: f32, drag_delta: f32) -> f32 {
     (origin + drag_delta).clamp(40.0, 600.0)
 }
@@ -418,6 +590,8 @@ pub fn paint_annotation_scrollbar(
         maximum,
         offset,
         overview,
+        "Annotation tracks · drag up/down to scroll",
+        "Annotation track scrollbar; arrow up and down scroll, Page Up and Page Down scroll by a page, Home and End reach the stack boundaries",
     )
 }
 
@@ -437,6 +611,28 @@ pub fn paint_workspace_annotation_scrollbar(
         maximum,
         offset,
         overview,
+        "Annotation tracks · drag up/down to scroll",
+        "Annotation track scrollbar; arrow up and down scroll, Page Up and Page Down scroll by a page, Home and End reach the stack boundaries",
+    )
+}
+
+pub fn paint_read_stack_scrollbar(
+    ui: &mut Ui,
+    rect: Rect,
+    panel_id: PanelId,
+    maximum: f32,
+    offset: &mut f32,
+) -> ScrollbarInteraction {
+    paint_annotation_scrollbar_with_id(
+        ui,
+        rect,
+        egui::Id::new(("read-stack-scrollbar", panel_id.get())),
+        egui::Id::new(("read-stack-scrollbar-drag-state", panel_id.get())),
+        maximum,
+        offset,
+        None,
+        "Read-panel stack · drag up/down to scroll panels",
+        "Read-panel stack scrollbar; arrow up and down scroll, Page Up and Page Down scroll by a page, Home and End reach the panel boundaries",
     )
 }
 
@@ -448,25 +644,21 @@ fn paint_annotation_scrollbar_with_id(
     maximum: f32,
     offset: &mut f32,
     overview: Option<&ScrollbarOverview>,
+    hover_text: &str,
+    accessibility_label: &str,
 ) -> ScrollbarInteraction {
     let maximum = maximum.max(0.0);
     *offset = offset.clamp(0.0, maximum);
     let response = ui
         .interact(rect, id, Sense::click_and_drag())
         .on_hover_cursor(egui::CursorIcon::ResizeVertical)
-        .on_hover_text("Annotation tracks · drag up/down to scroll");
+        .on_hover_text(hover_text);
     let scroll_percent = if maximum <= f32::EPSILON {
         0.0
     } else {
         f64::from(*offset / maximum * 100.0)
     };
-    response.widget_info(|| {
-        egui::WidgetInfo::slider(
-            true,
-            scroll_percent,
-            "Annotation track scrollbar; arrow up and down scroll, Page Up and Page Down scroll by a page, Home and End reach the stack boundaries",
-        )
-    });
+    response.widget_info(|| egui::WidgetInfo::slider(true, scroll_percent, accessibility_label));
     if response.has_focus() {
         ui.input_mut(|input| {
             if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
@@ -673,7 +865,7 @@ fn scrollbar_geometry_with_visible_fraction(
     scale_visible_fraction: f32,
     scroll_fraction: f32,
 ) -> ScrollbarGeometry {
-    let track = rect.shrink2(egui::vec2(6.0, 5.0));
+    let track = rect.shrink2(egui::vec2((rect.width() * 0.25).min(6.0), 5.0));
     let maximum = maximum.max(0.0);
     let viewport_height = camera_viewport_height.max(1.0);
     let content_height = viewport_height + maximum;
@@ -1000,7 +1192,11 @@ pub fn paint_track_viewport_chrome_with_groups(
     track_groups: &[TrackGroupChrome],
 ) -> TrackGutterResult {
     let mut result = TrackGutterResult::default();
-    let painter = ui.painter();
+    let rename_state_id = track_rename_state_id();
+    let mut rename_state = ui
+        .ctx()
+        .data(|data| data.get_temp::<TrackRenameState>(rename_state_id));
+    let painter = ui.painter().clone();
     painter.rect_filled(geometry.gutter, 0.0, READ_PANE_GUTTER_COLOR);
     let annotation_gutter = Rect::from_min_max(
         geometry.gutter.min,
@@ -1022,17 +1218,17 @@ pub fn paint_track_viewport_chrome_with_groups(
         // pane and another in the read pane. Keep every egui widget scoped to
         // its pane: reusing the track key alone gives both headers the same ID,
         // which makes popups and clicks fight each other between frames.
-        let read_pane_frame = frame.frozen_bottom.is_some();
-        let frame_pane = if read_pane_frame {
-            TrackPane::Reads
-        } else {
-            TrackPane::Annotation
-        };
-        let group_header = matches!(frame.key, TrackFrameKey::Group(_));
-        let track_group = if let TrackFrameKey::Group(group_id) = frame.key {
+        let frame_pane = frame.channel;
+        let read_pane_frame = frame_pane == TrackPane::Reads;
+        let group_header = matches!(frame.key, TrackFrameKey::Group { .. });
+        let track_group = if let TrackFrameKey::Group {
+            channel,
+            id: group_id,
+        } = frame.key
+        {
             track_groups
                 .iter()
-                .find(|group| group.id == group_id && group.pane == frame_pane)
+                .find(|group| group.id == group_id && group.pane == channel)
         } else if let TrackFrameKey::Alignment(track_id) = frame.key {
             track_groups
                 .iter()
@@ -1099,19 +1295,21 @@ pub fn paint_track_viewport_chrome_with_groups(
             }
         }
         let selected_as_part_of_group = match frame.key {
-            TrackFrameKey::Alignment(id) if !read_pane_frame => selected_alignments.contains(&id),
-            TrackFrameKey::Reference | TrackFrameKey::Group(_) | TrackFrameKey::Auxiliary(_) => {
-                false
+            TrackFrameKey::Alignment(id) | TrackFrameKey::Auxiliary(id) if !read_pane_frame => {
+                selected_alignments.contains(&id)
             }
+            TrackFrameKey::Reference | TrackFrameKey::Group { .. } => false,
             TrackFrameKey::Alignment(_) => false,
+            TrackFrameKey::Auxiliary(_) => false,
         };
         let selection_highlighted = if read_pane_frame {
             matches!(frame.key, TrackFrameKey::Alignment(id) if selected_read_tracks.contains(&id))
         } else {
             match frame.key {
-                TrackFrameKey::Alignment(_) => selected_as_part_of_group,
-                TrackFrameKey::Group(_) => false,
-                TrackFrameKey::Reference | TrackFrameKey::Auxiliary(_) => {
+                TrackFrameKey::Alignment(_) | TrackFrameKey::Auxiliary(_) => {
+                    selected_as_part_of_group
+                }
+                TrackFrameKey::Group { .. } | TrackFrameKey::Reference => {
                     selected == Some(frame.key)
                 }
             }
@@ -1133,6 +1331,9 @@ pub fn paint_track_viewport_chrome_with_groups(
             pos2(label_rect.right(), (header_top + 22.0).min(bottom)),
         );
         let header_rect = raw_header_rect.intersect(label_rect);
+        let renaming_this_header = rename_state
+            .as_ref()
+            .is_some_and(|state| state.key == frame.key && state.pane == frame_pane);
         let eye_rect = Rect::from_center_size(
             pos2(raw_header_rect.left() + 11.0, raw_header_rect.center().y),
             egui::vec2(16.0, 16.0),
@@ -1141,20 +1342,38 @@ pub fn paint_track_viewport_chrome_with_groups(
             pos2(raw_header_rect.right() - 11.0, raw_header_rect.center().y),
             egui::vec2(18.0, 18.0),
         );
+        let group_toggle_rect = Rect::from_center_size(
+            pos2(raw_header_rect.left() + 30.0, raw_header_rect.center().y),
+            egui::vec2(16.0, 16.0),
+        );
         let response = ui.interact(
             Rect::from_min_max(
-                pos2(raw_header_rect.left() + 22.0, raw_header_rect.top()),
+                pos2(
+                    raw_header_rect.left() + if group_header { 40.0 } else { 22.0 },
+                    raw_header_rect.top(),
+                ),
                 pos2(settings_rect.left(), label_rect.bottom()),
             )
             .intersect(label_rect),
             egui::Id::new(("track-label", frame.key, read_pane_frame)),
-            Sense::click_and_drag(),
+            if renaming_this_header {
+                Sense::hover()
+            } else {
+                Sense::click_and_drag()
+            },
         );
         let eye = ui.interact(
             eye_rect.intersect(header_rect),
             egui::Id::new(("track-collapse", frame.key, read_pane_frame)),
             Sense::click(),
         );
+        let group_toggle = group_header.then(|| {
+            ui.interact(
+                group_toggle_rect.intersect(header_rect),
+                egui::Id::new(("track-group-toggle", frame.key, read_pane_frame)),
+                Sense::click(),
+            )
+        });
         let settings = ui.interact(
             settings_rect.intersect(header_rect),
             egui::Id::new(("track-settings", frame.key, read_pane_frame)),
@@ -1165,20 +1384,28 @@ pub fn paint_track_viewport_chrome_with_groups(
             .iter()
             .any(|subtrack| subtrack.composite_member.is_some());
         let content_hidden = if group_header {
-            track_group.is_some_and(|group| group.collapsed)
+            track_group.is_some_and(|group| !group.content_visible)
+        } else if is_composite {
+            !frame.visible
         } else {
             !frame.visible || frame.collapsed
         };
         let frame_eye_action = if let Some(group) = track_group.filter(|_| group_header) {
-            TrackUiAction::ToggleTrackGroup(frame_pane, group.id)
+            TrackUiAction::ToggleTrackGroupVisibility(frame_pane, group.id)
+        } else if is_composite {
+            TrackUiAction::ToggleCompositeVisibility(frame.key)
         } else {
-            match (frame.visible, frame.key, read_pane_frame) {
-                (false, _, _) => TrackUiAction::ToggleVisibility(frame.key),
-                (true, TrackFrameKey::Alignment(track_id), true) => {
-                    TrackUiAction::ToggleAlignmentSubtrack(track_id, AlignmentSubtrack::Reads)
+            let target = match frame.key {
+                TrackFrameKey::Reference => PresentationNodeId::Reference,
+                TrackFrameKey::Alignment(track_id) | TrackFrameKey::Auxiliary(track_id) => {
+                    PresentationNodeId::Track {
+                        channel: frame_pane,
+                        track_id,
+                    }
                 }
-                (true, _, _) => TrackUiAction::ToggleCollapsed(frame.key),
-            }
+                TrackFrameKey::Group { .. } => unreachable!("group handled above"),
+            };
+            TrackUiAction::SetNodeVisibility(target, content_hidden)
         };
         eye.widget_info(|| {
             egui::WidgetInfo::selected(
@@ -1207,14 +1434,37 @@ pub fn paint_track_viewport_chrome_with_groups(
             )
         });
         if eye.clicked() {
-            result.actions.push(frame_eye_action);
+            result.actions.push(frame_eye_action.clone());
+        }
+        if let (Some(toggle), Some(group)) = (&group_toggle, track_group.filter(|_| group_header)) {
+            toggle.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    true,
+                    if group.collapsed {
+                        format!("Expand group {}", group.id)
+                    } else {
+                        format!("Minimize group {}", group.id)
+                    },
+                )
+            });
+            if toggle.clicked() {
+                result
+                    .actions
+                    .push(TrackUiAction::ToggleTrackGroup(frame_pane, group.id));
+            }
+            toggle.clone().on_hover_text(if group.collapsed {
+                format!("Expand group {}", group.id)
+            } else {
+                format!("Minimize group {}", group.id)
+            });
         }
         eye.clone()
             .on_hover_text(if let Some(group) = track_group.filter(|_| group_header) {
-                if group.collapsed {
-                    format!("Expand group {}", group.id)
+                if group.content_visible {
+                    format!("Hide all content in group {}", group.id)
                 } else {
-                    format!("Minimize group {}", group.id)
+                    format!("Show all content in group {}", group.id)
                 }
             } else if !frame.visible {
                 format!("Show {display_name}")
@@ -1253,19 +1503,40 @@ pub fn paint_track_viewport_chrome_with_groups(
         if !group_header {
             settings.clone().on_hover_text("Track settings");
         }
-        if response.clicked() && !group_header {
+        let (label_position, label_width) =
+            track_header_label_geometry(label_rect, header_top, group_header);
+        let rename_hit_rect = Rect::from_min_max(
+            pos2(label_position.x, raw_header_rect.top()),
+            pos2(
+                (label_position.x + label_width).min(settings_rect.left()),
+                raw_header_rect.bottom(),
+            ),
+        )
+        .intersect(header_rect);
+        let rename_requested_by_double_click = editable_track_name(frame).is_some()
+            && response.double_clicked()
+            && response
+                .interact_pointer_pos()
+                .is_some_and(|pointer| rename_hit_rect.contains(pointer));
+        if rename_requested_by_double_click {
+            rename_state = begin_track_rename(frame);
+            ui.ctx().request_repaint();
+        }
+        if response.clicked() {
             result
                 .actions
                 .push(TrackUiAction::Select(frame.key, frame_pane));
         }
-        if response.has_focus() {
+        if response.has_focus() && !renaming_this_header {
             let mut open_settings = false;
+            let mut begin_rename = false;
             let mut toggle_visibility = false;
             let mut toggle_collapsed = false;
             let mut reorder = 0;
             let mut remove = false;
             ui.input_mut(|input| {
                 open_settings = input.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                begin_rename = input.consume_key(egui::Modifiers::NONE, egui::Key::F2);
                 toggle_visibility = input.consume_key(egui::Modifiers::NONE, egui::Key::V);
                 toggle_collapsed = input.consume_key(egui::Modifiers::NONE, egui::Key::C);
                 if input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowUp) {
@@ -1281,49 +1552,58 @@ pub fn paint_track_viewport_chrome_with_groups(
                     .push(TrackUiAction::Select(frame.key, frame_pane));
                 result.actions.push(TrackUiAction::OpenSettings(frame.key));
             }
+            if begin_rename && editable_track_name(frame).is_some() {
+                rename_state = begin_track_rename(frame);
+                ui.ctx().request_repaint();
+            }
             if toggle_visibility && !group_header {
-                result
-                    .actions
-                    .push(TrackUiAction::ToggleVisibility(frame.key));
+                result.actions.push(frame_eye_action.clone());
             }
             if toggle_collapsed && frame.visible && !matches!(frame.key, TrackFrameKey::Reference) {
-                result.actions.push(frame_eye_action);
+                if let Some(group) = track_group.filter(|_| group_header) {
+                    result
+                        .actions
+                        .push(TrackUiAction::ToggleTrackGroup(frame_pane, group.id));
+                } else {
+                    result.actions.push(frame_eye_action.clone());
+                }
             }
-            if let Some(id) = match frame.key {
-                TrackFrameKey::Reference | TrackFrameKey::Group(_) => None,
-                TrackFrameKey::Alignment(id) if id.get() == 0 => None,
-                TrackFrameKey::Alignment(id) | TrackFrameKey::Auxiliary(id) => Some(id),
-            } {
+            if let Some(target) = presentation_node_for_frame(frame) {
                 if reorder != 0 {
                     result
                         .actions
-                        .push(TrackUiAction::ReorderKeyboard(id, reorder));
+                        .push(TrackUiAction::ReorderKeyboard(target, reorder));
                 }
-                if remove {
+                if remove && !group_header {
                     result.actions.push(TrackUiAction::Remove(frame.key));
                 }
             }
         }
-        if response.drag_stopped()
-            && let Some(id) = match frame.key {
-                TrackFrameKey::Reference | TrackFrameKey::Group(_) => None,
-                TrackFrameKey::Alignment(id) if id.get() == 0 => None,
-                TrackFrameKey::Alignment(id) | TrackFrameKey::Auxiliary(id) => Some(id),
-            }
+        if !renaming_this_header
+            && response.drag_stopped()
+            && let Some(target) = presentation_node_for_frame(frame)
             && let Some(pointer) = response.interact_pointer_pos()
         {
             result
                 .actions
-                .push(TrackUiAction::ReorderDropped(id, pointer.y));
+                .push(TrackUiAction::ReorderDropped(target, pointer.y));
         }
         response.widget_info(|| {
+            let interaction_help = if group_header {
+                "use the eye to toggle group content and the chevron to minimize or expand"
+                    .to_owned()
+            } else if editable_track_name(frame).is_some() {
+                "double-click or F2 renames, Enter opens settings, V toggles visibility, C toggles collapse, Alt plus arrow up or down reorders, Shift plus Delete removes".to_owned()
+            } else {
+                "Enter opens settings, V toggles visibility, C toggles collapse, Alt plus arrow up or down reorders, Shift plus Delete removes".to_owned()
+            };
             egui::WidgetInfo::selected(
                 egui::WidgetType::SelectableLabel,
                 true,
                 selection_highlighted,
                 format!(
-                    "{} {:?} track; Enter opens settings, V toggles visibility, C toggles collapse, Alt plus arrow up or down reorders, Shift plus Delete removes",
-                    display_name, frame.kind
+                    "{} {:?} track; {interaction_help}",
+                    display_name, frame.kind,
                 ),
             )
         });
@@ -1369,6 +1649,11 @@ pub fn paint_track_viewport_chrome_with_groups(
         ui.ctx()
             .style_mut_of(theme, |style| style.animation_time = 0.0);
         response.context_menu(|ui| {
+            if editable_track_name(frame).is_some() && ui.button("Rename…").clicked() {
+                rename_state = begin_track_rename(frame);
+                ui.ctx().request_repaint();
+                ui.close();
+            }
             if !group_header && ui.button("Track settings…").clicked() {
                 result.actions.push(TrackUiAction::OpenSettings(frame.key));
                 ui.close();
@@ -1376,38 +1661,51 @@ pub fn paint_track_viewport_chrome_with_groups(
             if read_pane_frame
                 && let TrackFrameKey::Alignment(track_id) = frame.key
                 && ui
-                    .button(if frame.collapsed {
+                    .button(if content_hidden {
                         "Show reads"
                     } else {
                         "Hide reads"
                     })
                     .clicked()
             {
-                result.actions.push(TrackUiAction::ToggleAlignmentSubtrack(
-                    track_id,
-                    AlignmentSubtrack::Reads,
+                result.actions.push(TrackUiAction::SetNodeVisibility(
+                    PresentationNodeId::Track {
+                        channel: TrackPane::Reads,
+                        track_id,
+                    },
+                    content_hidden,
                 ));
                 ui.close();
             }
             if !read_pane_frame
                 && !matches!(
                     frame.key,
-                    TrackFrameKey::Reference | TrackFrameKey::Group(_)
+                    TrackFrameKey::Reference | TrackFrameKey::Group { .. }
                 )
                 && ui
-                    .button(if frame.visible {
-                        "Hide track"
-                    } else {
+                    .button(if content_hidden {
                         "Show track"
+                    } else {
+                        "Hide track"
                     })
                     .clicked()
             {
+                let target = match frame.key {
+                    TrackFrameKey::Alignment(track_id) | TrackFrameKey::Auxiliary(track_id) => {
+                        PresentationNodeId::Track {
+                            channel: frame_pane,
+                            track_id,
+                        }
+                    }
+                    TrackFrameKey::Reference | TrackFrameKey::Group { .. } => unreachable!(),
+                };
                 result
                     .actions
-                    .push(TrackUiAction::ToggleVisibility(frame.key));
+                    .push(TrackUiAction::SetNodeVisibility(target, content_hidden));
                 ui.close();
             }
-            if let TrackFrameKey::Alignment(track_id) = frame.key
+            if let TrackFrameKey::Alignment(track_id) | TrackFrameKey::Auxiliary(track_id) =
+                frame.key
                 && pane_selection.len() > 1
                 && pane_selection.contains(&track_id)
                 && ui
@@ -1419,8 +1717,7 @@ pub fn paint_track_viewport_chrome_with_groups(
                     .push(TrackUiAction::GroupSelectedTracks(frame_pane));
                 ui.close();
             }
-            if !read_pane_frame
-                && let Some(group) = track_group
+            if let Some(group) = track_group
                 && group_header
                 && ui
                     .button(if group.collapsed {
@@ -1444,14 +1741,14 @@ pub fn paint_track_viewport_chrome_with_groups(
                 ui.close();
             }
             if !read_pane_frame
-                && frame.visible
+                && (frame.visible || is_composite)
                 && !group_header
                 && ui
                     .button(if is_composite {
-                        if frame.collapsed {
-                            "Show all overlay layers"
+                        if content_hidden {
+                            "Show overlay content"
                         } else {
-                            "Hide all overlay layers"
+                            "Hide overlay content"
                         }
                     } else if frame.collapsed {
                         "Expand track"
@@ -1460,9 +1757,11 @@ pub fn paint_track_viewport_chrome_with_groups(
                     })
                     .clicked()
             {
-                result
-                    .actions
-                    .push(TrackUiAction::ToggleCollapsed(frame.key));
+                result.actions.push(if is_composite {
+                    TrackUiAction::ToggleCompositeVisibility(frame.key)
+                } else {
+                    TrackUiAction::ToggleCollapsed(frame.key)
+                });
                 ui.close();
             }
             if !group_header && ui.button("Export current view…").clicked() {
@@ -1471,7 +1770,7 @@ pub fn paint_track_viewport_chrome_with_groups(
             }
             if !matches!(
                 frame.key,
-                TrackFrameKey::Reference | TrackFrameKey::Group(_)
+                TrackFrameKey::Reference | TrackFrameKey::Group { .. }
             ) && !matches!(frame.key, TrackFrameKey::Alignment(id) if id.get() == 0)
                 && ui.button("Remove track").clicked()
             {
@@ -1508,6 +1807,16 @@ pub fn paint_track_viewport_chrome_with_groups(
         } else {
             label_painter.circle_filled(eye_rect.center(), 1.6, eye_color);
         }
+        if let (Some(toggle), Some(group)) = (&group_toggle, track_group.filter(|_| group_header)) {
+            let chevron_color = if toggle.hovered() {
+                Color32::from_rgb(45, 92, 175)
+            } else {
+                Color32::from_gray(90)
+            };
+            for segment in group_chevron_segments(group_toggle_rect, group.collapsed) {
+                label_painter.line_segment(segment, Stroke::new(1.5, chevron_color));
+            }
+        }
         if !group_header {
             if settings.hovered() {
                 label_painter.rect_filled(
@@ -1528,15 +1837,94 @@ pub fn paint_track_viewport_chrome_with_groups(
                 },
             );
         }
-        paint_elided_text(
-            &label_painter,
-            &display_name,
-            FontId::proportional(11.0),
-            text_color,
-            (label_rect.width() - 53.0).max(0.0),
-            pos2(label_rect.left() + 22.0, header_top + 11.0),
-            false,
-        );
+        let mut rename_resolution = None;
+        if let Some(state) = rename_state
+            .as_mut()
+            .filter(|state| state.key == frame.key && state.pane == frame_pane)
+        {
+            let font_id = FontId::proportional(11.0);
+            let prefix = (frame_pane == TrackPane::Reads
+                && matches!(frame.key, TrackFrameKey::Alignment(_)))
+            .then_some(READ_TRACK_NAME_PREFIX);
+            let prefix_width = prefix.map_or(0.0, |prefix| {
+                let width = label_painter
+                    .layout_no_wrap(prefix.to_owned(), font_id.clone(), text_color)
+                    .size()
+                    .x;
+                paint_elided_text(
+                    &label_painter,
+                    prefix,
+                    font_id.clone(),
+                    text_color,
+                    width.min(label_width),
+                    label_position,
+                    false,
+                );
+                width
+            });
+            let editor_left = label_position.x + prefix_width;
+            let editor_right = (label_position.x + label_width).min(settings_rect.left());
+            if editor_right - editor_left >= 8.0 {
+                let editor_id = track_rename_editor_id(frame.key, frame_pane);
+                let editor_rect = Rect::from_min_max(
+                    pos2(editor_left, raw_header_rect.top() + 2.0),
+                    pos2(editor_right, raw_header_rect.bottom() - 2.0),
+                )
+                .intersect(header_rect);
+                let editor = ui.put(
+                    editor_rect,
+                    egui::TextEdit::singleline(&mut state.draft)
+                        .id(editor_id)
+                        .font(font_id)
+                        .desired_width(editor_rect.width())
+                        .cursor_at_end(true),
+                );
+                if state.request_focus {
+                    editor.request_focus();
+                    state.request_focus = false;
+                }
+                // Egui clears widget focus for Escape before TextEdit renders,
+                // so cancellation must be keyed to the active rename state,
+                // not to `editor.has_focus()` after event processing.
+                let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+                let commit =
+                    editor.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if escape {
+                    rename_resolution = Some(None);
+                } else if commit || editor.lost_focus() {
+                    let name = state.draft.trim();
+                    rename_resolution = Some((!name.is_empty()).then(|| name.to_owned()));
+                }
+            } else {
+                paint_elided_text(
+                    &label_painter,
+                    &display_name,
+                    font_id,
+                    text_color,
+                    label_width,
+                    label_position,
+                    false,
+                );
+            }
+        } else {
+            paint_elided_text(
+                &label_painter,
+                &display_name,
+                FontId::proportional(11.0),
+                text_color,
+                label_width,
+                label_position,
+                false,
+            );
+        }
+        if let Some(committed_name) = rename_resolution {
+            rename_state = None;
+            if let Some(name) = committed_name {
+                result
+                    .actions
+                    .push(TrackUiAction::RenameTrack(frame.key, name));
+            }
+        }
         for subtrack in &frame.subtracks {
             let (raw_subtrack_top, raw_subtrack_bottom) =
                 subtrack_screen_bounds(frame, subtrack, frame_scroll);
@@ -1576,11 +1964,12 @@ pub fn paint_track_viewport_chrome_with_groups(
             let alignment_subtrack = match frame.key {
                 TrackFrameKey::Alignment(_) => AlignmentSubtrack::from_label(&subtrack.label),
                 TrackFrameKey::Reference
-                | TrackFrameKey::Group(_)
+                | TrackFrameKey::Group { .. }
                 | TrackFrameKey::Auxiliary(_) => None,
             };
             if let (TrackFrameKey::Alignment(track_id), Some(alignment_subtrack)) =
                 (frame.key, alignment_subtrack)
+                && alignment_subtrack_has_independent_visibility(frame, alignment_subtrack)
             {
                 if subtrack.collapsed {
                     painter.rect_filled(
@@ -1863,19 +2252,16 @@ pub fn paint_track_viewport_chrome_with_groups(
                     ));
                 } else {
                     match frame.key {
-                        TrackFrameKey::Auxiliary(id) => {
-                            result
-                                .actions
-                                .push(TrackUiAction::ResizeKeyboard(id, delta));
-                        }
-                        TrackFrameKey::Reference | TrackFrameKey::Alignment(_) => {
+                        TrackFrameKey::Reference
+                        | TrackFrameKey::Alignment(_)
+                        | TrackFrameKey::Auxiliary(_) => {
                             result.actions.push(TrackUiAction::ResizeAnnotationKeyboard(
                                 frame.key,
                                 frame.bottom - frame.top,
                                 delta,
                             ));
                         }
-                        TrackFrameKey::Group(_) => {}
+                        TrackFrameKey::Group { .. } => {}
                     }
                 }
             }
@@ -1895,16 +2281,15 @@ pub fn paint_track_viewport_chrome_with_groups(
                 ));
             } else {
                 match frame.key {
-                    TrackFrameKey::Auxiliary(id) => {
-                        result.actions.push(TrackUiAction::ResizeStarted(id));
-                    }
-                    TrackFrameKey::Reference | TrackFrameKey::Alignment(_) => {
+                    TrackFrameKey::Reference
+                    | TrackFrameKey::Alignment(_)
+                    | TrackFrameKey::Auxiliary(_) => {
                         result.actions.push(TrackUiAction::ResizeAnnotationStarted(
                             frame.key,
                             frame.bottom - frame.top,
                         ));
                     }
-                    TrackFrameKey::Group(_) => {}
+                    TrackFrameKey::Group { .. } => {}
                 }
             }
         }
@@ -1921,13 +2306,12 @@ pub fn paint_track_viewport_chrome_with_groups(
                 }
             } else {
                 match frame.key {
-                    TrackFrameKey::Auxiliary(id) => result
-                        .actions
-                        .push(TrackUiAction::ResizeDragged(id, resize.drag_delta().y)),
-                    TrackFrameKey::Reference | TrackFrameKey::Alignment(_) => result.actions.push(
+                    TrackFrameKey::Reference
+                    | TrackFrameKey::Alignment(_)
+                    | TrackFrameKey::Auxiliary(_) => result.actions.push(
                         TrackUiAction::ResizeAnnotationDragged(frame.key, resize.drag_delta().y),
                     ),
-                    TrackFrameKey::Group(_) => {}
+                    TrackFrameKey::Group { .. } => {}
                 }
             }
         }
@@ -1941,13 +2325,12 @@ pub fn paint_track_viewport_chrome_with_groups(
                     .push(TrackUiAction::ResizeReadTrackStopped(id));
             } else {
                 match frame.key {
-                    TrackFrameKey::Auxiliary(id) => {
-                        result.actions.push(TrackUiAction::ResizeStopped(id));
-                    }
-                    TrackFrameKey::Reference | TrackFrameKey::Alignment(_) => result
+                    TrackFrameKey::Reference
+                    | TrackFrameKey::Alignment(_)
+                    | TrackFrameKey::Auxiliary(_) => result
                         .actions
                         .push(TrackUiAction::ResizeAnnotationStopped(frame.key)),
-                    TrackFrameKey::Group(_) => {}
+                    TrackFrameKey::Group { .. } => {}
                 }
             }
         }
@@ -2012,6 +2395,20 @@ pub fn paint_track_viewport_chrome_with_groups(
             Stroke::new(1.5, Color32::from_gray(165)),
         );
     }
+    if rename_state.as_ref().is_some_and(|state| {
+        !frames
+            .iter()
+            .any(|frame| frame.key == state.key && frame.channel == state.pane)
+    }) {
+        rename_state = None;
+    }
+    ui.ctx().data_mut(|data| {
+        if let Some(state) = rename_state {
+            data.insert_temp(rename_state_id, state);
+        } else {
+            data.remove::<TrackRenameState>(rename_state_id);
+        }
+    });
     result
 }
 
@@ -2024,11 +2421,13 @@ fn frame_screen_bounds(frame: &TrackFrame, vertical_scroll: f32) -> (f32, f32) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg(test)]
 struct VerticalScreenBounds {
     top: f32,
     bottom: f32,
 }
 
+#[cfg(test)]
 fn clipped_frame_screen_bounds(
     frame: &TrackFrame,
     vertical_scroll: f32,
@@ -2153,9 +2552,355 @@ mod tests {
         assert_eq!(AlignmentSubtrack::from_label("Genes"), None);
     }
 
+    fn read_frame_with_status(track_id: TrackId) -> TrackFrame {
+        TrackFrame {
+            key: TrackFrameKey::Alignment(track_id),
+            channel: TrackPane::Reads,
+            name: "Reads · Tumour paired".to_owned(),
+            kind: TrackKind::Alignment,
+            source_label: Some("tumour-paired.bam".to_owned()),
+            top: 20.0,
+            bottom: 180.0,
+            visible: true,
+            collapsed: false,
+            frozen_bottom: Some(42.0),
+            subtracks: vec![TrackSubtrack {
+                label: "Reads".to_owned(),
+                detail: Some("159 visible · 211 loaded".to_owned()),
+                top: 42.0,
+                bottom: 180.0,
+                collapsed: false,
+                composite_member: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn read_status_row_does_not_own_a_second_visibility_control() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let frame = read_frame_with_status(TrackId::new(9));
+        assert!(!alignment_subtrack_has_independent_visibility(
+            &frame,
+            AlignmentSubtrack::Reads,
+        ));
+
+        let output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 240.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let geometry = CanvasGeometry::from_viewport(ui.max_rect());
+                let _ = paint_track_viewport_chrome(
+                    ui,
+                    geometry,
+                    std::slice::from_ref(&frame),
+                    0.0,
+                    0.0,
+                    0.0,
+                    geometry.viewport.top(),
+                    None,
+                    &[],
+                );
+            },
+        );
+        let update = output.platform_output.accesskit_update.unwrap();
+        let visibility_labels = update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::CheckBox)
+                    .then(|| node.label())
+                    .flatten()
+            })
+            .filter(|label| label.contains("read content") || label.contains("Reads subtrack"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visibility_labels,
+            vec!["Reads · Tumour paired read content visible"]
+        );
+    }
+
+    #[test]
+    fn read_status_eye_column_is_non_interactive() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 240.0));
+        let frame = read_frame_with_status(TrackId::new(9));
+        let pointer = pos2(11.0, 51.0);
+        let render = |ui: &mut Ui| {
+            let geometry = CanvasGeometry::from_viewport(ui.max_rect());
+            paint_track_viewport_chrome(
+                ui,
+                geometry,
+                std::slice::from_ref(&frame),
+                0.0,
+                0.0,
+                0.0,
+                geometry.viewport.top(),
+                None,
+                &[],
+            )
+        };
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn read_track_inline_rename_edits_the_shared_source_name() {
+        let frame = read_frame_with_status(TrackId::new(9));
+        let state = begin_track_rename(&frame).unwrap();
+
+        assert_eq!(state.key, TrackFrameKey::Alignment(TrackId::new(9)));
+        assert_eq!(state.pane, TrackPane::Reads);
+        assert_eq!(state.draft, "Tumour paired");
+        assert!(
+            editable_track_name(&TrackFrame {
+                key: TrackFrameKey::Reference,
+                channel: TrackPane::Annotation,
+                name: "Reference sequence".to_owned(),
+                ..frame
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn double_clicking_read_track_name_begins_inline_rename() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 240.0));
+        let frame = read_frame_with_status(TrackId::new(9));
+        let pointer = pos2(80.0, 31.0);
+        let render = |input: egui::RawInput| {
+            context.run_ui(input, |ui| {
+                let geometry = CanvasGeometry::from_viewport(ui.max_rect());
+                let _ = paint_track_viewport_chrome(
+                    ui,
+                    geometry,
+                    std::slice::from_ref(&frame),
+                    0.0,
+                    0.0,
+                    0.0,
+                    geometry.viewport.top(),
+                    None,
+                    &[],
+                );
+            })
+        };
+        let input = |time, events| egui::RawInput {
+            screen_rect: Some(screen_rect),
+            time: Some(time),
+            events,
+            ..egui::RawInput::default()
+        };
+
+        let _ = render(input(0.0, vec![egui::Event::PointerMoved(pointer)]));
+        for (time, pressed) in [(0.10, true), (0.11, false), (0.20, true), (0.21, false)] {
+            let _ = render(input(
+                time,
+                vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ));
+        }
+
+        let state = context
+            .data(|data| data.get_temp::<TrackRenameState>(track_rename_state_id()))
+            .unwrap();
+        assert_eq!(state.key, TrackFrameKey::Alignment(TrackId::new(9)));
+        assert_eq!(state.pane, TrackPane::Reads);
+        assert_eq!(state.draft, "Tumour paired");
+    }
+
+    #[test]
+    fn enter_commits_inline_rename_as_one_canonical_action() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 240.0));
+        let frame = read_frame_with_status(TrackId::new(9));
+        context.data_mut(|data| {
+            data.insert_temp(
+                track_rename_state_id(),
+                TrackRenameState {
+                    key: frame.key,
+                    pane: frame.channel,
+                    draft: "  Relapse tumour  ".to_owned(),
+                    request_focus: true,
+                },
+            );
+        });
+        let render = |input: egui::RawInput, actions: &mut Vec<TrackUiAction>| {
+            context.run_ui(input, |ui| {
+                let geometry = CanvasGeometry::from_viewport(ui.max_rect());
+                *actions = paint_track_viewport_chrome(
+                    ui,
+                    geometry,
+                    std::slice::from_ref(&frame),
+                    0.0,
+                    0.0,
+                    0.0,
+                    geometry.viewport.top(),
+                    None,
+                    &[],
+                )
+                .actions;
+            })
+        };
+
+        let mut actions = Vec::new();
+        let _ = render(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            &mut actions,
+        );
+        let _ = render(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            &mut actions,
+        );
+
+        assert_eq!(
+            actions,
+            vec![TrackUiAction::RenameTrack(
+                TrackFrameKey::Alignment(TrackId::new(9)),
+                "Relapse tumour".to_owned(),
+            )]
+        );
+        assert!(
+            context
+                .data(|data| data.get_temp::<TrackRenameState>(track_rename_state_id()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn escape_cancels_inline_rename_without_an_action() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 240.0));
+        let frame = read_frame_with_status(TrackId::new(9));
+        context.data_mut(|data| {
+            data.insert_temp(
+                track_rename_state_id(),
+                TrackRenameState {
+                    key: frame.key,
+                    pane: frame.channel,
+                    draft: "Uncommitted name".to_owned(),
+                    request_focus: true,
+                },
+            );
+        });
+        let render = |input: egui::RawInput, actions: &mut Vec<TrackUiAction>| {
+            context.run_ui(input, |ui| {
+                let geometry = CanvasGeometry::from_viewport(ui.max_rect());
+                *actions = paint_track_viewport_chrome(
+                    ui,
+                    geometry,
+                    std::slice::from_ref(&frame),
+                    0.0,
+                    0.0,
+                    0.0,
+                    geometry.viewport.top(),
+                    None,
+                    &[],
+                )
+                .actions;
+            })
+        };
+
+        let mut actions = Vec::new();
+        let _ = render(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            &mut actions,
+        );
+        let _ = render(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..egui::RawInput::default()
+            },
+            &mut actions,
+        );
+
+        assert!(actions.is_empty());
+        assert!(
+            context
+                .data(|data| data.get_temp::<TrackRenameState>(track_rename_state_id()))
+                .is_none()
+        );
+    }
+
     fn frame(id: u64, top: f32) -> TrackFrame {
         TrackFrame {
             key: TrackFrameKey::Auxiliary(TrackId::new(id)),
+            channel: TrackPane::Annotation,
             name: format!("track-{id}"),
             kind: TrackKind::Feature,
             source_label: Some(format!("track-{id}.bed")),
@@ -2226,6 +2971,7 @@ mod tests {
     fn scrollbar_overview_preserves_empty_and_dense_content_regions() {
         let frames = [TrackFrame {
             key: TrackFrameKey::Alignment(TrackId::new(1)),
+            channel: TrackPane::Reads,
             name: "reads".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -2268,6 +3014,7 @@ mod tests {
     fn scrollbar_overview_places_activity_in_the_density_camera_world() {
         let frames = [TrackFrame {
             key: TrackFrameKey::Alignment(TrackId::new(1)),
+            channel: TrackPane::Reads,
             name: "reads".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -2496,7 +3243,7 @@ mod tests {
                     geometry.viewport.top(),
                     geometry.viewport.bottom(),
                     Some(TrackFrameKey::Auxiliary(TrackId::new(7))),
-                    &[],
+                    &[TrackId::new(7)],
                 );
             },
         );
@@ -2546,6 +3293,7 @@ mod tests {
                 let frames = [
                     TrackFrame {
                         key: TrackFrameKey::Alignment(track_id),
+                        channel: TrackPane::Annotation,
                         name: "exact-bases.bam".to_owned(),
                         kind: TrackKind::Alignment,
                         source_label: None,
@@ -2558,6 +3306,7 @@ mod tests {
                     },
                     TrackFrame {
                         key: TrackFrameKey::Alignment(track_id),
+                        channel: TrackPane::Reads,
                         name: "Reads · exact-bases.bam".to_owned(),
                         kind: TrackKind::Alignment,
                         source_label: None,
@@ -2617,6 +3366,7 @@ mod tests {
         let frames = [
             TrackFrame {
                 key: TrackFrameKey::Alignment(track_id),
+                channel: TrackPane::Annotation,
                 name: "exact-bases.bam".to_owned(),
                 kind: TrackKind::Alignment,
                 source_label: None,
@@ -2629,6 +3379,7 @@ mod tests {
             },
             TrackFrame {
                 key: TrackFrameKey::Alignment(track_id),
+                channel: TrackPane::Reads,
                 name: "Reads · exact-bases.bam".to_owned(),
                 kind: TrackKind::Alignment,
                 source_label: None,
@@ -2714,6 +3465,7 @@ mod tests {
         let frames = [
             TrackFrame {
                 key: TrackFrameKey::Alignment(track_id),
+                channel: TrackPane::Annotation,
                 name: "Annotation · exact-bases.bam".to_owned(),
                 kind: TrackKind::Alignment,
                 source_label: None,
@@ -2726,6 +3478,7 @@ mod tests {
             },
             TrackFrame {
                 key: TrackFrameKey::Alignment(track_id),
+                channel: TrackPane::Reads,
                 name: "Reads · exact-bases.bam".to_owned(),
                 kind: TrackKind::Alignment,
                 source_label: None,
@@ -2805,6 +3558,7 @@ mod tests {
         let frames = [
             TrackFrame {
                 key: TrackFrameKey::Alignment(track_id),
+                channel: TrackPane::Annotation,
                 name: "exact-bases.bam".to_owned(),
                 kind: TrackKind::Alignment,
                 source_label: None,
@@ -2817,6 +3571,7 @@ mod tests {
             },
             TrackFrame {
                 key: TrackFrameKey::Alignment(track_id),
+                channel: TrackPane::Reads,
                 name: "Reads · exact-bases.bam".to_owned(),
                 kind: TrackKind::Alignment,
                 source_label: None,
@@ -2918,6 +3673,7 @@ mod tests {
         let track_id = TrackId::new(9);
         let frames = [TrackFrame {
             key: TrackFrameKey::Alignment(track_id),
+            channel: TrackPane::Reads,
             name: "Reads · exact-bases.bam".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -3139,18 +3895,26 @@ mod tests {
 
         assert_eq!(
             actions,
-            vec![TrackUiAction::ToggleCollapsed(TrackFrameKey::Auxiliary(
-                TrackId::new(7),
-            ))]
+            vec![TrackUiAction::SetNodeVisibility(
+                PresentationNodeId::Track {
+                    channel: TrackChannel::Annotation,
+                    track_id: TrackId::new(7),
+                },
+                false,
+            )]
         );
     }
 
     #[test]
-    fn group_header_eye_minimizes_the_group_without_targeting_a_member_track() {
+    fn group_header_eye_toggles_group_content_without_changing_expansion() {
         let context = egui::Context::default();
         let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
         let frames = [TrackFrame {
-            key: TrackFrameKey::Group(4),
+            key: TrackFrameKey::Group {
+                channel: TrackPane::Annotation,
+                id: 4,
+            },
+            channel: TrackPane::Annotation,
             name: "Group 4 · 2 tracks".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -3167,6 +3931,7 @@ mod tests {
             anchor: TrackId::new(7),
             members: vec![TrackId::new(7), TrackId::new(8)],
             collapsed: false,
+            content_visible: true,
         }];
         let pointer = pos2(11.0, 31.0);
         let render = |ui: &mut Ui| {
@@ -3231,8 +3996,45 @@ mod tests {
 
         assert_eq!(
             actions,
-            vec![TrackUiAction::ToggleTrackGroup(TrackPane::Annotation, 4)]
+            vec![TrackUiAction::ToggleTrackGroupVisibility(
+                TrackPane::Annotation,
+                4
+            )]
         );
+    }
+
+    #[test]
+    fn group_chevrons_are_vector_geometry_and_labels_start_after_the_toggle() {
+        let label_rect = Rect::from_min_size(pos2(10.0, 20.0), egui::vec2(168.0, 22.0));
+        let toggle_rect = Rect::from_center_size(pos2(40.0, 31.0), egui::vec2(16.0, 16.0));
+        let collapsed = group_chevron_segments(toggle_rect, true);
+        let expanded = group_chevron_segments(toggle_rect, false);
+
+        assert!(collapsed[0][1].x > collapsed[0][0].x);
+        assert_eq!(collapsed[0][1], collapsed[1][0]);
+        assert!(expanded[0][1].y > expanded[0][0].y);
+        assert_eq!(expanded[0][1], expanded[1][0]);
+        assert!(
+            collapsed
+                .into_iter()
+                .flatten()
+                .all(|point| toggle_rect.contains(point))
+        );
+        assert!(
+            expanded
+                .into_iter()
+                .flatten()
+                .all(|point| toggle_rect.contains(point))
+        );
+
+        let (group_position, group_width) =
+            track_header_label_geometry(label_rect, label_rect.top(), true);
+        let (track_position, track_width) =
+            track_header_label_geometry(label_rect, label_rect.top(), false);
+        assert!(group_position.x >= toggle_rect.right() + 2.0);
+        assert_eq!(track_position.x, label_rect.left() + 22.0);
+        assert_eq!(group_width, 124.0);
+        assert_eq!(track_width, 115.0);
     }
 
     #[test]
@@ -3304,9 +4106,13 @@ mod tests {
 
         assert_eq!(
             actions,
-            vec![TrackUiAction::ToggleVisibility(TrackFrameKey::Auxiliary(
-                TrackId::new(7),
-            ))]
+            vec![TrackUiAction::SetNodeVisibility(
+                PresentationNodeId::Track {
+                    channel: TrackChannel::Annotation,
+                    track_id: TrackId::new(7),
+                },
+                true,
+            )]
         );
     }
 
@@ -3317,6 +4123,7 @@ mod tests {
         let track_id = TrackId::new(9);
         let frames = [TrackFrame {
             key: TrackFrameKey::Alignment(track_id),
+            channel: TrackPane::Reads,
             name: "Reads · exact-bases.bam".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -3388,9 +4195,12 @@ mod tests {
 
         assert_eq!(
             actions,
-            vec![TrackUiAction::ToggleAlignmentSubtrack(
-                track_id,
-                AlignmentSubtrack::Reads,
+            vec![TrackUiAction::SetNodeVisibility(
+                PresentationNodeId::Track {
+                    channel: TrackChannel::Reads,
+                    track_id,
+                },
+                true,
             )]
         );
     }
@@ -3412,6 +4222,7 @@ mod tests {
                 let geometry = CanvasGeometry::from_viewport(ui.max_rect());
                 let frames = [TrackFrame {
                     key: TrackFrameKey::Alignment(track_id),
+                    channel: TrackPane::Annotation,
                     name: "reads.bam".to_owned(),
                     kind: TrackKind::Alignment,
                     source_label: None,
@@ -3459,6 +4270,7 @@ mod tests {
         let track_id = TrackId::new(9);
         let frames = [TrackFrame {
             key: TrackFrameKey::Alignment(track_id),
+            channel: TrackPane::Annotation,
             name: "reads.bam".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -3551,6 +4363,7 @@ mod tests {
         let member_id = TrackId::new(9);
         let frames = [TrackFrame {
             key: TrackFrameKey::Auxiliary(TrackId::new(7)),
+            channel: TrackPane::Annotation,
             name: "Overlay 1 · 3 tracks".to_owned(),
             kind: TrackKind::Quantitative,
             source_label: None,
@@ -3648,6 +4461,7 @@ mod tests {
         let track_id = TrackId::new(9);
         let frames = [TrackFrame {
             key: TrackFrameKey::Alignment(track_id),
+            channel: TrackPane::Reads,
             name: "Reads · sample A".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,
@@ -3799,6 +4613,7 @@ mod tests {
     fn alignment_read_content_supports_a_panel_local_scroll_offset() {
         let frame = TrackFrame {
             key: TrackFrameKey::Alignment(TrackId::new(1)),
+            channel: TrackPane::Reads,
             name: "reads.bam".to_owned(),
             kind: TrackKind::Alignment,
             source_label: None,

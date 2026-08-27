@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -9,7 +12,7 @@ use crate::{
     ReadBaseDisplayMode, ReviewStatus, TrackId, TrackKind, TrackSource,
 };
 
-pub const AUTOMATION_SCHEMA_VERSION: u32 = 2;
+pub const AUTOMATION_SCHEMA_VERSION: u32 = 3;
 pub const MINIMUM_AUTOMATION_SCHEMA_VERSION: u32 = 1;
 pub const MAXIMUM_AUTOMATION_COMMANDS: usize = 10_000;
 pub const MAXIMUM_AUTOMATION_STRING_BYTES: usize = 16_384;
@@ -527,7 +530,7 @@ pub enum AutomationUnsavedChangesPolicy {
     Discard,
 }
 
-/// Typed configuration accepted by automation schema v2. Each variant owns
+/// Typed configuration accepted by automation schema v3. Each variant owns
 /// its valid scope, preventing key/scope mismatches at the protocol boundary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "setting", rename_all = "snake_case")]
@@ -578,6 +581,37 @@ pub enum AutomationSetting {
     ModifiedBaseColorMode {
         value: ModifiedBaseColorMode,
     },
+    PresentationNodeVisible {
+        target: crate::PresentationNodeId,
+        value: bool,
+    },
+    PresentationNodeHeight {
+        target: crate::PresentationNodeId,
+        value: f32,
+    },
+    PresentationGroupExpanded {
+        target: crate::PresentationNodeId,
+        value: bool,
+    },
+    PresentationGroupVisible {
+        target: crate::PresentationNodeId,
+        value: bool,
+    },
+    PresentationCompositeVisible {
+        channel: crate::TrackChannel,
+        composite_id: u32,
+        value: bool,
+    },
+    PresentationGroup {
+        channel: crate::TrackChannel,
+        track_ids: Vec<TrackId>,
+    },
+    PresentationUngroup {
+        target: crate::PresentationNodeId,
+    },
+    ReadPaneHeight {
+        value: f32,
+    },
     TrackHeight {
         track_id: TrackId,
         value: f32,
@@ -596,6 +630,20 @@ pub enum AutomationSetting {
     },
     AnnotationScrollPoints {
         panel_id: PanelId,
+        value: f32,
+    },
+    ReadStackScrollPoints {
+        panel_id: PanelId,
+        value: f32,
+    },
+    ReadPanelScrollPoints {
+        panel_id: PanelId,
+        track_id: TrackId,
+        value: f32,
+    },
+    ReadPanelDensity {
+        panel_id: PanelId,
+        track_id: TrackId,
         value: f32,
     },
 }
@@ -629,14 +677,90 @@ impl AutomationSetting {
             Self::TrackCollapsed { track_id, .. } | Self::TrackVisible { track_id, .. } => {
                 validate_track_id(*track_id)
             }
+            Self::PresentationNodeVisible { target, .. } => match target {
+                crate::PresentationNodeId::Reference | crate::PresentationNodeId::Track { .. } => {
+                    Ok(())
+                }
+                crate::PresentationNodeId::Group { .. } => Err(
+                    "presentation group visibility must use presentation_group_visible".to_owned(),
+                ),
+            },
+            Self::PresentationNodeHeight { target, value } => {
+                if matches!(target, crate::PresentationNodeId::Group { .. }) {
+                    return Err(
+                        "presentation groups do not have a resizable content row".to_owned()
+                    );
+                }
+                let valid = value.is_finite()
+                    && match target.channel() {
+                        crate::TrackChannel::Annotation => (26.0..=1_200.0).contains(value),
+                        crate::TrackChannel::Reads => (40.0..=1_200.0).contains(value),
+                    };
+                valid.then_some(()).ok_or_else(|| {
+                    "presentation node height is outside the valid range for its channel".to_owned()
+                })
+            }
+            Self::PresentationGroupExpanded { target, .. }
+            | Self::PresentationGroupVisible { target, .. }
+            | Self::PresentationUngroup { target } => {
+                matches!(target, crate::PresentationNodeId::Group { .. })
+                    .then_some(())
+                    .ok_or_else(|| "the setting target must be a presentation group".to_owned())
+            }
+            Self::PresentationCompositeVisible {
+                channel,
+                composite_id,
+                ..
+            } => (*channel == crate::TrackChannel::Annotation && *composite_id > 0)
+                .then_some(())
+                .ok_or_else(|| {
+                    "presentation composite must be a positive Annotation composite ID".to_owned()
+                }),
+            Self::PresentationGroup { track_ids, .. } => {
+                validate_track_selection(track_ids)?;
+                if track_ids.len() < 2 {
+                    return Err("presentation groups require at least two tracks".to_owned());
+                }
+                let unique = track_ids.iter().copied().collect::<BTreeSet<_>>();
+                (unique.len() == track_ids.len())
+                    .then_some(())
+                    .ok_or_else(|| "presentation group track_ids must be unique".to_owned())
+            }
+            Self::ReadPaneHeight { value } => (value.is_finite()
+                && (100.0..=1_200.0).contains(value))
+            .then_some(())
+            .ok_or_else(|| "read pane height must be finite and between 100 and 1200".to_owned()),
             Self::VerticalScrollPoints { panel_id, value }
-            | Self::AnnotationScrollPoints { panel_id, value } => {
+            | Self::AnnotationScrollPoints { panel_id, value }
+            | Self::ReadStackScrollPoints { panel_id, value } => {
                 validate_panel_id(*panel_id)?;
                 if value.is_finite() && *value >= 0.0 {
                     Ok(())
                 } else {
                     Err("vertical scroll must be finite and non-negative".to_owned())
                 }
+            }
+            Self::ReadPanelScrollPoints {
+                panel_id,
+                track_id,
+                value,
+            } => {
+                validate_panel_id(*panel_id)?;
+                validate_track_id(*track_id)?;
+                (value.is_finite() && *value >= 0.0)
+                    .then_some(())
+                    .ok_or_else(|| "read-panel scroll must be finite and non-negative".to_owned())
+            }
+            Self::ReadPanelDensity {
+                panel_id,
+                track_id,
+                value,
+            } => {
+                validate_panel_id(*panel_id)?;
+                validate_track_id(*track_id)?;
+                (value.is_finite() && (0.25..=4.0).contains(value))
+                    .then_some(())
+                    .ok_or_else(|| "read-panel density must be between 0.25 and 4".to_owned())
             }
             _ => Ok(()),
         }
@@ -759,11 +883,105 @@ pub struct AutomationWorkspaceSnapshot {
     pub panels: Vec<AutomationPanelSnapshot>,
     pub tracks: Vec<AutomationTrackSnapshot>,
     #[serde(default)]
+    pub read_pane_height: f32,
+    #[serde(default)]
+    pub presentation_groups: Vec<AutomationPresentationGroupSnapshot>,
+    #[serde(default)]
+    pub presentation_composites: Vec<AutomationPresentationCompositeSnapshot>,
+    #[serde(default)]
+    pub presentation_nodes: Vec<AutomationPresentationNodeSnapshot>,
+    #[serde(default)]
+    pub pane_layouts: Vec<AutomationPaneLayoutSnapshot>,
+    #[serde(default)]
+    pub active_track_gesture: Option<AutomationTrackGestureSnapshot>,
+    #[serde(default)]
     pub selection: Option<AutomationSelectionSnapshot>,
     #[serde(default)]
     pub status: Vec<String>,
     #[serde(default)]
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPresentationGroupSnapshot {
+    pub channel: crate::TrackChannel,
+    pub id: u32,
+    pub label: String,
+    pub members: Vec<TrackId>,
+    pub expanded: bool,
+    pub content_visible: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPresentationCompositeSnapshot {
+    pub channel: crate::TrackChannel,
+    pub id: u32,
+    pub content_visible: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPresentationNodeSnapshot {
+    pub id: crate::PresentationNodeId,
+    pub order_index: usize,
+    pub desired_content_visible: bool,
+    pub effective_content_visible: bool,
+    #[serde(default)]
+    pub preferred_height: Option<f32>,
+    #[serde(default)]
+    pub parent_group_id: Option<u32>,
+    #[serde(default)]
+    pub parent_composite_id: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AutomationRectSnapshot {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPaneItemLayoutSnapshot {
+    pub id: crate::PresentationNodeId,
+    pub row: AutomationRectSnapshot,
+    pub header: AutomationRectSnapshot,
+    #[serde(default)]
+    pub content: Option<AutomationRectSnapshot>,
+    pub clip: AutomationRectSnapshot,
+    pub desired_content_visible: bool,
+    pub effective_content_visible: bool,
+    #[serde(default)]
+    pub composite_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationPaneLayoutSnapshot {
+    pub panel_id: PanelId,
+    pub channel: crate::TrackChannel,
+    pub pane: AutomationRectSnapshot,
+    pub content_bottom: f32,
+    pub scroll_points: f32,
+    pub stack_scroll_points: f32,
+    pub items: Vec<AutomationPaneItemLayoutSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationTrackGestureKind {
+    ResizeNode,
+    ResizeReadPane,
+    AnnotationScrollbar,
+    ReadStackScrollbar,
+    ReadScrollbar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationTrackGestureSnapshot {
+    pub kind: AutomationTrackGestureKind,
+    pub panel_id: PanelId,
+    #[serde(default)]
+    pub target: Option<crate::PresentationNodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -813,11 +1031,37 @@ pub struct AutomationPanelSnapshot {
     #[serde(default)]
     pub maximum_annotation_scroll_points: f32,
     #[serde(default)]
+    pub read_stack_scroll_points: f32,
+    #[serde(default)]
+    pub maximum_read_stack_scroll_points: f32,
+    #[serde(default)]
     pub render_generation: u64,
     #[serde(default)]
     pub settled: bool,
     #[serde(default)]
     pub render_lanes: Vec<AutomationRenderLaneSnapshot>,
+    #[serde(default)]
+    pub read_panel_states: Vec<AutomationReadPanelStateSnapshot>,
+    #[serde(default)]
+    pub selected_presentation_nodes: Vec<crate::PresentationNodeId>,
+    #[serde(default)]
+    pub presentation_selection_anchor: Option<crate::PresentationNodeId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutomationReadPanelStateSnapshot {
+    pub track_id: TrackId,
+    pub scroll_points: f32,
+    #[serde(default)]
+    pub maximum_scroll_points: f32,
+    pub content_origin_points: f32,
+    #[serde(default)]
+    pub latent_scroll_fraction: Option<f32>,
+    pub content_bottom_points: f32,
+    #[serde(default)]
+    pub density: Option<f32>,
+    #[serde(default)]
+    pub effective_density: f32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -887,11 +1131,17 @@ pub struct AutomationTrackSnapshot {
     pub visible: bool,
     pub collapsed: bool,
     pub height: f32,
+    #[serde(default = "automation_default_true")]
+    pub source_available: bool,
     pub lifecycle: AutomationTrackLifecycle,
     #[serde(default)]
     pub failure: Option<String>,
     #[serde(default)]
     pub alignment: Option<AutomationAlignmentTrackSnapshot>,
+}
+
+const fn automation_default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1718,11 +1968,22 @@ mod tests {
                 maximum_vertical_scroll_points: 0.0,
                 annotation_scroll_points: 0.0,
                 maximum_annotation_scroll_points: 0.0,
+                read_stack_scroll_points: 0.0,
+                maximum_read_stack_scroll_points: 0.0,
                 render_generation: 1,
                 settled: true,
                 render_lanes: Vec::new(),
+                read_panel_states: Vec::new(),
+                selected_presentation_nodes: Vec::new(),
+                presentation_selection_anchor: None,
             }],
             tracks: Vec::new(),
+            read_pane_height: 360.0,
+            presentation_groups: Vec::new(),
+            presentation_composites: Vec::new(),
+            presentation_nodes: Vec::new(),
+            pane_layouts: Vec::new(),
+            active_track_gesture: None,
             selection: Some(selection.clone()),
             status: Vec::new(),
             truncated: false,

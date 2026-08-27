@@ -28,6 +28,13 @@ cargo run --release -p rgv-desktop -- --session benchmark-data/manual-suite/proj
 3. Compare forward and reverse reads, then inspect the low-quality and missing-evidence controls.
 4. Toggle pairing, grouping, and zoom thresholds without falling back to ordinary mismatch colouring.
 5. Save and reopen; confirm every track retains its distinct bisulfite context.
+6. In the Reads channel, select tracks B through F, group them, set mixed child-eye states, hide the
+   group with its eye, and minimize it with its chevron. Hide and restore track A's read content;
+   confirm the group header never disappears, moves to an unrelated edge, or changes either gate.
+7. Scroll and change density independently in all five grouped read panels before minimizing them.
+   Expand/show the group and confirm every offset, density, and preferred height is restored.
+8. Repeat grouping and visibility in Annotation and confirm no Reads selection, eye, height, or
+   camera changes.
 
 ## Common failure signatures
 

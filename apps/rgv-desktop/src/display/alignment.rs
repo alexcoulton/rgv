@@ -40,101 +40,160 @@ pub(crate) struct ReadPanelBounds {
     pub(crate) bottom: f32,
 }
 
-/// Partitions the lower read area into stable per-sample viewports. Requested
-/// read-group heights act as relative preferences, while the resulting panels
-/// always fit the available pane and therefore always retain their own visible
-/// navigator.
-pub(crate) fn read_panel_bounds(
-    tracks: &[(ReadPanelKey, bool, Option<f32>)],
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ReadPanelContent {
+    HeaderOnly,
+    Expanded { preferred_height: Option<f32> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReadPanelSpec {
+    pub(crate) key: ReadPanelKey,
+    pub(crate) content: ReadPanelContent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReadPaneLayout {
+    pub(crate) bounds: Vec<ReadPanelBounds>,
+    pub(crate) content_bottom: f32,
+}
+
+impl ReadPanelSpec {
+    pub(crate) const fn header(key: ReadPanelKey) -> Self {
+        Self {
+            key,
+            content: ReadPanelContent::HeaderOnly,
+        }
+    }
+
+    pub(crate) const fn expanded(key: ReadPanelKey, preferred_height: Option<f32>) -> Self {
+        Self {
+            key,
+            content: ReadPanelContent::Expanded { preferred_height },
+        }
+    }
+}
+
+/// Pure lower-pane layout. Preferred heights are literal pixel sizes and
+/// unused space remains bottom slack. If headers plus minimum content cannot
+/// fit, rows retain their interaction minimum and `content_bottom` extends
+/// beyond the pane; the caller owns the conventional parent overflow camera.
+pub(crate) fn read_pane_layout(
+    tracks: &[ReadPanelSpec],
     pane_top: f32,
     pane_bottom: f32,
-) -> Vec<ReadPanelBounds> {
+) -> ReadPaneLayout {
     if tracks.is_empty() || pane_bottom <= pane_top {
-        return Vec::new();
+        return ReadPaneLayout {
+            bounds: Vec::new(),
+            content_bottom: pane_top,
+        };
     }
+    const MINIMUM_EXPANDED_PANEL_HEIGHT: f32 = 40.0;
+
     let total = pane_bottom - pane_top;
-    let collapsed_total = tracks
+    let header_total = tracks
         .iter()
-        .filter(|(_, reads_visible, _)| !reads_visible)
+        .filter(|spec| matches!(spec.content, ReadPanelContent::HeaderOnly))
         .count() as f32
-        * COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
-    let expanded = tracks
+        * READ_PANE_HEADER_HEIGHT;
+    let expanded_count = tracks
         .iter()
-        .filter(|(_, reads_visible, _)| *reads_visible)
-        .collect::<Vec<_>>();
-    let expanded_available = (total - collapsed_total).max(0.0);
-    let default_weight = if expanded.is_empty() {
-        0.0
-    } else {
-        expanded_available / expanded.len() as f32
-    };
-    let weights = expanded
+        .filter(|spec| matches!(spec.content, ReadPanelContent::Expanded { .. }))
+        .count();
+    let explicit_total = tracks
         .iter()
-        .map(|(_, _, requested)| requested.unwrap_or(default_weight).max(1.0))
-        .collect::<Vec<_>>();
-    let weight_sum = weights.iter().sum::<f32>().max(f32::EPSILON);
-    let mut expanded_heights = weights
+        .filter_map(|spec| match spec.content {
+            ReadPanelContent::Expanded {
+                preferred_height: Some(height),
+            } => Some(height.max(MINIMUM_EXPANDED_PANEL_HEIGHT)),
+            ReadPanelContent::HeaderOnly
+            | ReadPanelContent::Expanded {
+                preferred_height: None,
+            } => None,
+        })
+        .sum::<f32>();
+    let flexible_count = tracks
         .iter()
-        .map(|weight| expanded_available * *weight / weight_sum)
-        .collect::<Vec<_>>();
-    if expanded_available >= expanded_heights.len() as f32 * 40.0 {
-        let mut fixed = vec![false; expanded_heights.len()];
-        loop {
-            let newly_fixed = expanded_heights
-                .iter()
-                .enumerate()
-                .filter(|(index, height)| !fixed[*index] && **height < 40.0)
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            if newly_fixed.is_empty() {
-                break;
-            }
-            for index in newly_fixed {
-                fixed[index] = true;
-                expanded_heights[index] = 40.0;
-            }
-            let remaining = expanded_available
-                - expanded_heights
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| fixed[*index])
-                    .map(|(_, height)| *height)
-                    .sum::<f32>();
-            let remaining_weight = weights
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !fixed[*index])
-                .map(|(_, weight)| *weight)
-                .sum::<f32>();
-            for (index, height) in expanded_heights.iter_mut().enumerate() {
-                if !fixed[index] {
-                    *height = remaining * weights[index] / remaining_weight.max(f32::EPSILON);
+        .filter(|spec| {
+            matches!(
+                spec.content,
+                ReadPanelContent::Expanded {
+                    preferred_height: None
                 }
+            )
+        })
+        .count();
+    let flexible_default = if flexible_count == 0 {
+        MINIMUM_EXPANDED_PANEL_HEIGHT
+    } else {
+        ((total - header_total - explicit_total).max(0.0) / flexible_count as f32)
+            .max(MINIMUM_EXPANDED_PANEL_HEIGHT)
+    };
+    let mut desired_expanded_heights = tracks
+        .iter()
+        .filter_map(|spec| match spec.content {
+            ReadPanelContent::HeaderOnly => None,
+            ReadPanelContent::Expanded { preferred_height } => Some(
+                preferred_height
+                    .unwrap_or(flexible_default)
+                    .max(MINIMUM_EXPANDED_PANEL_HEIGHT),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let minimum_total = header_total + expanded_count as f32 * MINIMUM_EXPANDED_PANEL_HEIGHT;
+    let desired_total = header_total + desired_expanded_heights.iter().sum::<f32>();
+    if desired_total > total && total >= minimum_total {
+        let desired_extra = desired_expanded_heights
+            .iter()
+            .map(|height| height - MINIMUM_EXPANDED_PANEL_HEIGHT)
+            .sum::<f32>();
+        let available_extra = (total - minimum_total).max(0.0);
+        if desired_extra > f32::EPSILON {
+            for height in &mut desired_expanded_heights {
+                *height = MINIMUM_EXPANDED_PANEL_HEIGHT
+                    + (*height - MINIMUM_EXPANDED_PANEL_HEIGHT) * available_extra / desired_extra;
             }
         }
     }
     let mut expanded_index = 0_usize;
     let mut top = pane_top;
-    tracks
+    let bounds = tracks
         .iter()
-        .map(|(key, reads_visible, _)| {
-            let height = if *reads_visible {
-                let height = expanded_heights.get(expanded_index).copied().unwrap_or(0.0);
+        .map(|spec| {
+            let height = if matches!(spec.content, ReadPanelContent::Expanded { .. }) {
+                let height = desired_expanded_heights
+                    .get(expanded_index)
+                    .copied()
+                    .unwrap_or(0.0);
                 expanded_index += 1;
                 height
             } else {
-                COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT.min((pane_bottom - top).max(0.0))
+                READ_PANE_HEADER_HEIGHT
             };
-            let bottom = (top + height).min(pane_bottom);
+            let bottom = top + height;
             let bounds = ReadPanelBounds {
-                key: *key,
+                key: spec.key,
                 top,
                 bottom,
             };
             top = bottom;
             bounds
         })
-        .collect()
+        .collect();
+    ReadPaneLayout {
+        bounds,
+        content_bottom: top,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn read_panel_bounds(
+    tracks: &[ReadPanelSpec],
+    pane_top: f32,
+    pane_bottom: f32,
+) -> Vec<ReadPanelBounds> {
+    read_pane_layout(tracks, pane_top, pane_bottom).bounds
 }
 
 /// Returns the allocated read-panel bounds for an expanded alignment track.
@@ -179,6 +238,8 @@ pub(crate) fn secondary_alignment_track_layout(
     read_frame_top: f32,
     read_frame_bottom: f32,
     read_density: f32,
+    annotation_preferred_height: Option<f32>,
+    read_content_visible: bool,
     selected_read_name_hash: Option<u64>,
     promoted_read_name_hash: Option<u64>,
     shared_sashimi_raw: Option<f64>,
@@ -190,24 +251,10 @@ pub(crate) fn secondary_alignment_track_layout(
     let active_filters = track.active_filters.clone();
     let mut frame_bottom = frame_top + 26.0;
     let source_label = Some(config.source.redacted_label());
-    if config.collapsed {
-        return (
-            None,
-            TrackFrame {
-                key: TrackFrameKey::Alignment(config.id),
-                name: config.name,
-                kind: TrackKind::Alignment,
-                source_label,
-                top: frame_top,
-                bottom: frame_bottom,
-                visible: true,
-                collapsed: true,
-                frozen_bottom: None,
-                subtracks: Vec::new(),
-            },
-            None,
-        );
-    }
+    // Pane visibility is presentation state, not a source/configuration
+    // property. The caller decides independently whether annotation and read
+    // content paint; this projection remains available when either channel is
+    // hidden so one channel can never suppress the other.
     let expected_interval = track
         .dictionary
         .as_ref()
@@ -229,6 +276,7 @@ pub(crate) fn secondary_alignment_track_layout(
             None,
             TrackFrame {
                 key: TrackFrameKey::Alignment(config.id),
+                channel: ui::TrackPane::Annotation,
                 name: config.name,
                 kind: TrackKind::Alignment,
                 source_label,
@@ -305,15 +353,15 @@ pub(crate) fn secondary_alignment_track_layout(
         lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
     }
     let annotation_context_bottom = lane_top.max(frame_top + 22.0);
-    options.show_reads = filters.show_reads;
-    options.reads_top = read_frame_top + if filters.show_reads { 22.0 } else { 0.0 };
+    options.show_reads = read_content_visible;
+    options.reads_top = read_frame_top + if read_content_visible { 22.0 } else { 0.0 };
     options.row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
     options.read_height = (5.0 * density).clamp(1.5, (options.row_height - 1.0).max(1.5));
     frame_bottom = apply_alignment_annotation_height(
         &mut options,
         frame_top,
         annotation_context_bottom,
-        config.annotation_height,
+        annotation_preferred_height,
     );
     options.color_mode = filters.alignment_color_mode;
     options.group_mode = filters.alignment_group_mode;
@@ -603,6 +651,7 @@ pub(crate) fn secondary_alignment_track_layout(
         };
         let annotation_frame = TrackFrame {
             key: TrackFrameKey::Alignment(config.id),
+            channel: ui::TrackPane::Annotation,
             name: config.name.clone(),
             kind: TrackKind::Alignment,
             source_label: source_label.clone(),
@@ -615,6 +664,7 @@ pub(crate) fn secondary_alignment_track_layout(
         };
         let read_frame = TrackFrame {
             key: TrackFrameKey::Alignment(config.id),
+            channel: ui::TrackPane::Reads,
             name: format!("Reads · {}", config.name),
             kind: TrackKind::Alignment,
             source_label,
@@ -631,6 +681,7 @@ pub(crate) fn secondary_alignment_track_layout(
             read_frame_bottom.max(read_frame_top + COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT);
         let annotation_frame = TrackFrame {
             key: TrackFrameKey::Alignment(config.id),
+            channel: ui::TrackPane::Annotation,
             name: config.name.clone(),
             kind: TrackKind::Alignment,
             source_label: source_label.clone(),
@@ -643,6 +694,7 @@ pub(crate) fn secondary_alignment_track_layout(
         };
         let read_frame = TrackFrame {
             key: TrackFrameKey::Alignment(config.id),
+            channel: ui::TrackPane::Reads,
             name: format!("Reads · {}", config.name),
             kind: TrackKind::Alignment,
             source_label,

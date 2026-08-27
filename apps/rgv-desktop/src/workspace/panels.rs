@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::ui::ScrollbarOverview;
+use crate::ui::{ScrollbarOverview, WorkspacePaneLayout};
 
 #[derive(Default)]
 pub(crate) struct PendingQueries {
@@ -12,7 +12,6 @@ pub(crate) struct PanelScrollDisplayCache {
     pub(crate) annotations: DisplayList,
     pub(crate) pinned: DisplayList,
     pub(crate) annotation_overview: ScrollbarOverview,
-    pub(crate) scroll_clip_top: f32,
     pub(crate) annotation_content_bottom: f32,
     pub(crate) annotation_clip_top: f32,
     pub(crate) annotation_clip_bottom: f32,
@@ -100,6 +99,10 @@ pub(crate) struct ViewPanelController {
     /// vertical world. Rendering uses `vertical_scroll_points - origin`, while
     /// the scrollbar and overview use the real world-space camera position.
     pub(crate) vertical_content_origin_points: f32,
+    /// Conventional parent scroll for an overflowing stack of read panels.
+    /// Per-panel read/data scroll remains in `read_panel_scrolls`.
+    pub(crate) read_stack_scroll_points: f32,
+    pub(crate) read_stack_content_bottom_points: f32,
     /// Normalized vertical camera retained while the content has no scroll
     /// range, so a density gesture does not snap its thumb back to the top.
     pub(crate) latent_vertical_scroll_fraction: Option<f32>,
@@ -109,7 +112,12 @@ pub(crate) struct ViewPanelController {
     pub(crate) read_panel_scrolls: BTreeMap<TrackId, ReadPanelScrollState>,
     pub(crate) content_bottom_points: f32,
     pub(crate) track_frames: Vec<TrackFrame>,
+    pub(crate) pane_layout: WorkspacePaneLayout,
     pub(crate) selected_track: Option<TrackFrameKey>,
+    /// Canonical pane-qualified selection. Legacy per-channel TrackId vectors
+    /// remain projections used by alignment settings and evidence code.
+    pub(crate) selected_presentation_nodes: Vec<PresentationNodeId>,
+    pub(crate) presentation_selection_anchor: Option<PresentationNodeId>,
     pub(crate) last_gesture_query_at: Option<Instant>,
 }
 
@@ -185,6 +193,23 @@ impl PanelWorkspace {
                 panel.vertical_scroll_points = saved.vertical_scroll_points;
                 panel.annotation_scroll_points = saved.annotation_scroll_points;
                 panel.vertical_content_origin_points = saved.vertical_content_origin_points;
+                panel.read_stack_scroll_points = saved.read_stack_scroll_points;
+                panel.read_panel_scrolls = saved
+                    .read_panel_states
+                    .iter()
+                    .map(|state| {
+                        (
+                            state.track_id,
+                            ReadPanelScrollState {
+                                scroll_points: state.scroll_points,
+                                content_origin_points: state.content_origin_points,
+                                latent_scroll_fraction: state.latent_scroll_fraction,
+                                content_bottom_points: state.content_bottom_points,
+                                density: state.density,
+                            },
+                        )
+                    })
+                    .collect();
                 panel.content_bottom_points = content_top;
                 Ok(panel)
             })
@@ -330,10 +355,12 @@ pub(crate) fn maximum_alignment_frame_height(
         .iter()
         .filter_map(|panel| {
             panel
-                .track_frames
+                .pane_layout
+                .annotation
+                .items
                 .iter()
-                .find(|frame| frame.key == TrackFrameKey::Alignment(track_id))
-                .map(|frame| (frame.bottom - frame.top).max(0.0))
+                .find(|item| item.frame.key == TrackFrameKey::Alignment(track_id))
+                .map(|item| (item.frame.bottom - item.frame.top).max(0.0))
         })
         .reduce(f32::max)
 }
@@ -389,11 +416,16 @@ impl ViewPanelController {
             vertical_scroll_points: 0.0,
             annotation_scroll_points: 0.0,
             vertical_content_origin_points: 0.0,
+            read_stack_scroll_points: 0.0,
+            read_stack_content_bottom_points: 0.0,
             latent_vertical_scroll_fraction: None,
             read_panel_scrolls: BTreeMap::new(),
             content_bottom_points: 0.0,
             track_frames: Vec::new(),
+            pane_layout: WorkspacePaneLayout::default(),
             selected_track: None,
+            selected_presentation_nodes: Vec::new(),
+            presentation_selection_anchor: None,
             last_gesture_query_at: None,
         }
     }
@@ -411,6 +443,9 @@ impl ViewPanelController {
     }
 
     pub(crate) fn clear_selection(&mut self) {
+        self.selected_track = None;
+        self.selected_presentation_nodes.clear();
+        self.presentation_selection_anchor = None;
         self.selected_record = None;
         self.selected_alignment_track = None;
         self.selected_alignment_tracks.clear();

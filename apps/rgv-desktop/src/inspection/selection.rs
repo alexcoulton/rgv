@@ -1,77 +1,45 @@
 use super::super::*;
 
 impl Viewer {
-    fn active_scroll_clip_top(&self) -> f32 {
-        self.panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(self.canvas_geometry.viewport.top(), |cache| {
-                cache.scroll_clip_top
-            })
-    }
-
-    fn active_annotation_clip_top(&self) -> f32 {
-        self.panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(self.canvas_geometry.viewport.top(), |cache| {
-                cache.annotation_clip_top
-            })
-    }
-
-    fn active_annotation_clip_bottom(&self) -> f32 {
-        self.panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(self.canvas_geometry.viewport.top(), |cache| {
-                cache.annotation_clip_bottom
-            })
-    }
-
     fn visible_track_frame_at_screen_y(
         &self,
         screen_y: f32,
         predicate: impl Fn(&TrackFrame) -> bool,
     ) -> Option<(&TrackFrame, f32)> {
         let panel = self.panels.active();
-        let annotation_clip_top = self.active_annotation_clip_top();
-        panel.track_frames.iter().find_map(|frame| {
-            let read_panel = frame.frozen_bottom.is_some();
-            predicate(frame)
-                .then(|| {
-                    if read_panel {
-                        if screen_y < frame.top || screen_y >= frame.bottom {
+        panel
+            .pane_layout
+            .annotation
+            .items
+            .iter()
+            .chain(panel.pane_layout.reads.items.iter())
+            .find_map(|item| {
+                let frame = &item.frame;
+                let read_panel = frame.channel == ui::TrackPane::Reads;
+                (item.effective_content_visible && predicate(frame))
+                    .then(|| {
+                        if screen_y < item.row_rect.top() || screen_y >= item.row_rect.bottom() {
                             return None;
                         }
-                        let track_id = match frame.key {
-                            TrackFrameKey::Alignment(track_id) => track_id,
-                            TrackFrameKey::Reference
-                            | TrackFrameKey::Group(_)
-                            | TrackFrameKey::Auxiliary(_) => return None,
-                        };
-                        return Some((
-                            frame,
-                            screen_y
-                                + panel
-                                    .read_panel_scroll_state(track_id)
-                                    .effective_scroll_points(),
-                        ));
-                    }
-                    ui::frame_content_y_at_screen_y(
-                        frame,
-                        screen_y,
-                        panel.annotation_scroll_points,
-                        annotation_clip_top,
-                        self.canvas_geometry.viewport.top(),
-                        self.active_annotation_clip_bottom(),
-                    )
-                    .map(|content_y| (frame, content_y))
-                })
-                .flatten()
-        })
+                        if read_panel {
+                            let track_id = match frame.key {
+                                TrackFrameKey::Alignment(track_id) => track_id,
+                                TrackFrameKey::Reference
+                                | TrackFrameKey::Group { .. }
+                                | TrackFrameKey::Auxiliary(_) => return None,
+                            };
+                            return Some((
+                                frame,
+                                screen_y
+                                    + panel
+                                        .read_panel_scroll_state(track_id)
+                                        .effective_scroll_points(),
+                            ));
+                        }
+                        Some((frame, screen_y + panel.annotation_scroll_points))
+                    })
+                    .flatten()
+            })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -197,11 +165,15 @@ impl Viewer {
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
         let selected_track = self
             .visible_track_frame_at_screen_y(cursor_y, |_| true)
-            .map(|(frame, _)| frame.key);
-        self.panels.active_mut().selected_track = selected_track;
-        self.panels.active_mut().selected_alignment_tracks.clear();
-        if let Some(TrackFrameKey::Alignment(id)) = self.panels.active_mut().selected_track {
-            self.panels.active_mut().selected_alignment_tracks.push(id);
+            .map(|(frame, _)| (frame.key, frame.channel));
+        if let Some((key, channel)) = selected_track {
+            replace_panel_track_selection(self.panels.active_mut(), key, channel);
+        } else {
+            self.panels.active_mut().selected_track = None;
+            self.panels.active_mut().selected_presentation_nodes.clear();
+            self.panels.active_mut().presentation_selection_anchor = None;
+            self.panels.active_mut().selected_alignment_tracks.clear();
+            self.panels.active_mut().selected_read_tracks.clear();
         }
         self.bump_workspace_revision();
         let granularity = self
@@ -408,20 +380,15 @@ impl Viewer {
             .genomic_at_pixel(local_x)
             .floor()
             .max(0.0) as u64;
-        let anchor = self
-            .tracks
-            .tracks()
-            .iter()
-            .find(|track| track.id == track_id)?;
+        let effective_tracks = self.effective_auxiliary_presentation_configs();
+        let anchor = effective_tracks.iter().find(|track| track.id == track_id)?;
         let candidates = anchor.quantitative.overlay_group.map_or_else(
             || vec![anchor],
             |group| {
-                self.tracks
-                    .tracks()
+                effective_tracks
                     .iter()
                     .filter(|track| {
                         track.visible
-                            && !track.collapsed
                             && track.kind == TrackKind::Quantitative
                             && track.quantitative.overlay_group == Some(group)
                     })
@@ -449,7 +416,7 @@ impl Viewer {
                 let record_index = quantitative_record_index_at_position(&query.records, position)?;
                 let distance = quantitative_track_y_at_position(
                     track,
-                    self.tracks.tracks(),
+                    &effective_tracks,
                     &self.panels.active().track_snapshots,
                     self.panels.active().viewport,
                     position,
@@ -963,8 +930,11 @@ impl Viewer {
         modification: bool,
     ) {
         self.panels.active_mut().selected_alignment_track = Some(track_id);
-        self.panels.active_mut().selected_alignment_tracks = vec![track_id];
-        self.panels.active_mut().selected_track = Some(TrackFrameKey::Alignment(track_id));
+        replace_panel_track_selection(
+            self.panels.active_mut(),
+            TrackFrameKey::Alignment(track_id),
+            ui::TrackPane::Annotation,
+        );
         self.panels.active_mut().selected_record = None;
         self.panels.active_mut().selected_read_event = None;
         self.panels.active_mut().selected_junction = None;
@@ -983,16 +953,10 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let track_id = alignment_lane_at_screen_y(
-            &self.panels.active().track_frames,
+        let track_id = alignment_lane_in_pane_layout(
+            &self.panels.active().pane_layout.annotation,
             "Modifications",
             y,
-            self.panels.active().effective_vertical_scroll_points(),
-            self.panels.active().annotation_scroll_points,
-            self.active_scroll_clip_top(),
-            self.active_annotation_clip_top(),
-            self.canvas_geometry.viewport.top(),
-            self.canvas_geometry.viewport.bottom(),
         )?;
         let query = self.alignment_query_for_track(track_id)?;
         modification_position_from_pointer(
@@ -1012,16 +976,10 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let track_id = alignment_lane_at_screen_y(
-            &self.panels.active().track_frames,
+        let track_id = alignment_lane_in_pane_layout(
+            &self.panels.active().pane_layout.annotation,
             "Coverage",
             y,
-            self.panels.active().effective_vertical_scroll_points(),
-            self.panels.active().annotation_scroll_points,
-            self.active_scroll_clip_top(),
-            self.active_annotation_clip_top(),
-            self.canvas_geometry.viewport.top(),
-            self.canvas_geometry.viewport.bottom(),
         )?;
         let query = self.alignment_query_for_track(track_id)?;
         pileup_position_from_pointer(
@@ -1041,16 +999,10 @@ impl Viewer {
         if x < panel_rect.left() || x >= panel_rect.right() {
             return None;
         }
-        let track_id = alignment_lane_at_screen_y(
-            &self.panels.active().track_frames,
+        let track_id = alignment_lane_in_pane_layout(
+            &self.panels.active().pane_layout.annotation,
             "Sashimi",
             y,
-            self.panels.active().effective_vertical_scroll_points(),
-            self.panels.active().annotation_scroll_points,
-            self.active_scroll_clip_top(),
-            self.active_annotation_clip_top(),
-            self.canvas_geometry.viewport.top(),
-            self.canvas_geometry.viewport.bottom(),
         )?;
         let query = self.alignment_query_for_track(track_id)?;
         let local_x = f64::from(x - panel_rect.left());
@@ -1178,8 +1130,12 @@ impl Viewer {
             selected_supplementary_chain(&record, &self.panels.active().contig_name)
         });
         self.panels.active_mut().selected_chain = selected_chain;
-        self.panels.active_mut().selected_track =
-            Some(TrackFrameKey::Alignment(self.primary_alignment_track_id()));
+        let primary_track_id = self.primary_alignment_track_id();
+        replace_panel_track_selection(
+            self.panels.active_mut(),
+            TrackFrameKey::Alignment(primary_track_id),
+            ui::TrackPane::Reads,
+        );
         self.display_dirty = true;
     }
 
@@ -1207,8 +1163,9 @@ impl Viewer {
             return;
         };
         match track_key {
-            TrackFrameKey::Group(group) => {
-                self.data_status = format!("Track group {group} has no discrete evidence records");
+            TrackFrameKey::Group { channel, id } => {
+                self.data_status =
+                    format!("{channel:?} track group {id} has no discrete evidence records");
             }
             TrackFrameKey::Reference => {
                 "The reference track has no discrete evidence records"
@@ -1236,6 +1193,11 @@ impl Viewer {
                 self.panels.active_mut().selected_record = Some(index);
                 self.panels.active_mut().selected_alignment_track = Some(track_id);
                 self.panels.active_mut().selected_chain = chain;
+                replace_panel_track_selection(
+                    self.panels.active_mut(),
+                    TrackFrameKey::Alignment(track_id),
+                    ui::TrackPane::Reads,
+                );
                 self.data_status = format!(
                     "Selected loaded read {} of {} in track {}",
                     index + 1,
@@ -1442,13 +1404,16 @@ impl Viewer {
         self.panels.active_mut().pending_read_selection = None;
         self.panels.active_mut().selected_record = Some(index);
         self.panels.active_mut().selected_alignment_track = Some(track_id);
-        self.panels.active_mut().selected_alignment_tracks = vec![track_id];
+        replace_panel_track_selection(
+            self.panels.active_mut(),
+            TrackFrameKey::Alignment(track_id),
+            ui::TrackPane::Reads,
+        );
         self.panels.active_mut().selected_read_event = None;
         self.panels.active_mut().selected_pileup_position = None;
         self.panels.active_mut().selected_modification_position = None;
         self.panels.active_mut().selected_junction = None;
         self.panels.active_mut().selected_chain = chain;
-        self.panels.active_mut().selected_track = Some(TrackFrameKey::Alignment(track_id));
         self.display_dirty = true;
         true
     }

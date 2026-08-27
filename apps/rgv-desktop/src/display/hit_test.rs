@@ -18,12 +18,13 @@ pub(crate) fn alignment_track_at_content_y(
             .and_then(|key| match key {
                 TrackFrameKey::Alignment(id) => Some(id),
                 TrackFrameKey::Reference
-                | TrackFrameKey::Group(_)
+                | TrackFrameKey::Group { .. }
                 | TrackFrameKey::Auxiliary(_) => None,
             })
     })
 }
 
+#[cfg(test)]
 pub(crate) fn alignment_lane_at_screen_y(
     frames: &[TrackFrame],
     label: &str,
@@ -42,7 +43,7 @@ pub(crate) fn alignment_lane_at_screen_y(
         let TrackFrameKey::Alignment(id) = frame.key else {
             return None;
         };
-        let annotation_frame = frame.frozen_bottom.is_none();
+        let annotation_frame = frame.channel == ui::TrackPane::Annotation;
         if annotation_frame && screen_y >= scroll_clip_top {
             return None;
         }
@@ -71,6 +72,39 @@ pub(crate) fn alignment_lane_at_screen_y(
             }
             let y = screen_y + scroll;
             (y >= subtrack.top && y < subtrack.bottom).then_some(id)
+        })
+    })
+}
+
+/// Resolves an alignment sublane from the canonical pane layout used by the
+/// gutter and canvas. This avoids reconstructing pane identity and clipping
+/// from the renderer's raw frame cache.
+pub(crate) fn alignment_lane_in_pane_layout(
+    layout: &ui::PaneLayoutSnapshot,
+    label: &str,
+    screen_y: f32,
+) -> Option<TrackId> {
+    if screen_y < layout.pane_rect.top() || screen_y >= layout.pane_rect.bottom() {
+        return None;
+    }
+    layout.items.iter().find_map(|item| {
+        let TrackFrameKey::Alignment(track_id) = item.frame.key else {
+            return None;
+        };
+        if !item.effective_content_visible || !item.clip_rect.contains(egui::pos2(0.0, screen_y)) {
+            return None;
+        }
+        item.frame.subtracks.iter().find_map(|subtrack| {
+            if subtrack.label != label || subtrack.collapsed {
+                return None;
+            }
+            let top = subtrack.top - layout.scroll_points;
+            let bottom = subtrack.bottom - layout.scroll_points;
+            (screen_y >= top
+                && screen_y < bottom
+                && screen_y >= item.clip_rect.top()
+                && screen_y < item.clip_rect.bottom())
+            .then_some(track_id)
         })
     })
 }

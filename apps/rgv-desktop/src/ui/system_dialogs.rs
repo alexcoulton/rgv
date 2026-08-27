@@ -40,6 +40,7 @@ pub(crate) fn show_system_dialogs(
     let recent_loci = viewer.settings.recent_loci.clone();
     let settings_path = viewer.settings_path.display().to_string();
     let unresolved_session_sources = viewer.unresolved_session_sources.clone();
+    let session_migration_notices = viewer.session_migration_notices.clone();
     let igv_import_report = viewer.igv_import_report.clone();
     let recovery_candidates = viewer.recovery_candidates.clone();
 
@@ -302,16 +303,28 @@ pub(crate) fn show_system_dialogs(
     }
     if draft.project_issues_open {
         let context = ui.ctx().clone();
-        egui::Window::new("Unresolved project sources")
+        egui::Window::new("Project issues")
             .default_pos([260.0, 100.0])
             .default_width(640.0)
             .open(&mut draft.project_issues_open)
             .show(&context, |ui| {
-                ui.label(
-                    "These local files could not be found. Other project tracks remain available.",
-                );
+                ui.label("Repairs and unresolved resources found while opening this project.");
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    if !session_migration_notices.is_empty() {
+                        ui.strong("Session migration repairs");
+                        for notice in &session_migration_notices {
+                            ui.label(format!("• {notice}"));
+                        }
+                        ui.add_space(10.0);
+                    }
+                    if !unresolved_session_sources.is_empty() {
+                        ui.strong("Unresolved local sources");
+                        ui.label(
+                            "These files could not be found. Other project tracks remain available.",
+                        );
+                        ui.add_space(6.0);
+                    }
                     for issue in &unresolved_session_sources {
                         ui.strong(&issue.label);
                         ui.monospace(issue.path.display().to_string());
