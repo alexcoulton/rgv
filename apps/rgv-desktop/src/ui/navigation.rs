@@ -214,12 +214,32 @@ pub fn paint_genome_context(
             Color32::from_gray(90),
         );
     }
-    ui.interact(
+    let metadata_id = egui::Id::new(("genome-context-metadata", id_salt));
+    let metadata_accessibility_label =
+        format!("Contig {contig_name}; total length {length_label}");
+    let metadata_response = ui.interact(
         rows.metadata,
-        egui::Id::new(("genome-context-metadata", id_salt)),
-        egui::Sense::hover(),
-    )
-    .on_hover_text(format!("{contig_name} · {length_label}"));
+        metadata_id,
+        egui::Sense::focusable_noninteractive(),
+    );
+    metadata_response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            true,
+            &metadata_accessibility_label,
+        )
+    });
+    ui.ctx().accesskit_node_builder(metadata_id, |node| {
+        node.set_role(egui::accesskit::Role::Label);
+        node.set_label(metadata_accessibility_label.clone());
+        node.set_bounds(egui::accesskit::Rect {
+            x0: f64::from(rows.metadata.left()),
+            y0: f64::from(rows.metadata.top()),
+            x1: f64::from(rows.metadata.right()),
+            y1: f64::from(rows.metadata.bottom()),
+        });
+    });
+    metadata_response.on_hover_text(format!("{contig_name} · {length_label}"));
 
     let overview_rect = rows.overview;
     let ideogram = layout_ideogram(
@@ -547,10 +567,23 @@ mod tests {
         let metrics = super::super::GenomeContextMetrics::default();
         let context_height = metrics.context_height(false);
         let workspace = super::super::WorkspaceLayoutSnapshot::compute(
-            Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, context_height + 400.0)),
-            &[rgv_core::PanelId::new(1)],
-            &[super::super::CytobandAvailability::Absent],
-            metrics,
+            super::super::WorkspaceLayoutInput::new(
+                Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, context_height + 400.0)),
+                Rect::from_min_size(
+                    egui::pos2(900.0, 0.0),
+                    egui::vec2(340.0, context_height + 400.0),
+                ),
+                true,
+                vec![super::super::WorkspacePanelLayoutInput {
+                    panel_id: rgv_core::PanelId::new(1),
+                    contig_name: "chr1".to_owned(),
+                    contig_length: 10_000,
+                    cytobands: super::super::CytobandAvailability::Absent,
+                }],
+                metrics,
+                1.0,
+                1.0,
+            ),
             1,
         );
         let output = context.run_ui(
@@ -575,13 +608,32 @@ mod tests {
             },
         );
         let update = output.platform_output.accesskit_update.unwrap();
-        assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Slider
+        let slider = update.nodes.iter().find_map(|(_, node)| {
+            (node.role() == egui::accesskit::Role::Slider
                 && node
                     .label()
                     .is_some_and(|label| label.contains("Coverage overview for chr1"))
-                && node.numeric_value() == Some(100.0)
-        }));
+                && node.numeric_value() == Some(100.0))
+            .then_some(node)
+        });
+        let slider = slider.expect("coverage overview is present in the accessibility tree");
+        let bounds = slider.bounds().expect("coverage overview has exact bounds");
+        let overview = workspace.panels[0].context_rows.overview;
+        assert!((bounds.x0 - f64::from(overview.left())).abs() < 0.01);
+        assert!((bounds.y0 - f64::from(overview.top())).abs() < 0.01);
+        assert!((bounds.x1 - f64::from(overview.right())).abs() < 0.01);
+        assert!((bounds.y1 - f64::from(overview.bottom())).abs() < 0.01);
+        let labels = update
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label())
+            .collect::<Vec<_>>();
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Contig chr1; total length 10,000 bp")),
+            "accessibility labels: {labels:?}"
+        );
     }
 
     #[test]

@@ -1818,6 +1818,10 @@ impl Viewer {
             settled_resize_query_refreshes: self.resize_query_refreshes,
             resolution_query_refresh_pending: self.pending_resolution_query_refresh.is_some(),
             workspace: to_rect(self.workspace_layout.workspace),
+            properties: to_rect(self.workspace_layout.properties),
+            properties_expanded: self.workspace_layout.properties_expanded,
+            display_scale: self.workspace_layout.display_scale,
+            accessibility_scale: self.workspace_layout.accessibility_scale,
             genome_context: to_rect(self.workspace_layout.genome_context),
             track_viewport: to_rect(self.workspace_layout.track_viewport),
             context_gutter: to_rect(self.workspace_layout.context_gutter),
@@ -2654,7 +2658,55 @@ impl Viewer {
     ) -> Result<serde_json::Value> {
         let requested = serde_json::to_value(setting)?;
         let before = serde_json::to_value(self.automation_workspace_snapshot())?;
+        let mut deferred_shell_change = false;
         match setting {
+            AutomationSetting::WindowSize { width, height } => {
+                let current = self.window.inner_size().to_logical::<f64>(self.window.scale_factor());
+                deferred_shell_change = (current.width - f64::from(*width)).abs() >= 0.5
+                    || (current.height - f64::from(*height)).abs() >= 0.5;
+                let _ = self.window.request_inner_size(winit::dpi::LogicalSize::new(
+                    f64::from(*width),
+                    f64::from(*height),
+                ));
+                self.window.request_redraw();
+            }
+            AutomationSetting::InterfaceScalePercent { value } => {
+                let scale = f32::from(*value) / 100.0;
+                deferred_shell_change = (self.egui_context.zoom_factor() - scale).abs() > 0.001;
+                self.egui_context.set_zoom_factor(scale);
+                self.egui_context.request_repaint();
+                self.window.request_redraw();
+            }
+            AutomationSetting::PropertiesPanelExpanded { value } => {
+                let id = egui::Id::new("properties-panel-expanded");
+                let current = self
+                    .egui_context
+                    .data(|data| data.get_temp::<bool>(id))
+                    .unwrap_or(true);
+                deferred_shell_change = current != *value;
+                self.egui_context
+                    .data_mut(|data| data.insert_temp(id, *value));
+                self.egui_context.request_repaint();
+                self.window.request_redraw();
+            }
+            AutomationSetting::PropertiesPanelWidth { value } => {
+                let id = egui::Id::new("properties-panel");
+                let current = egui::containers::panel::PanelState::load(&self.egui_context, id)
+                    .map_or(340.0, |state| state.outer_rect.width());
+                deferred_shell_change = (current - value).abs() >= 0.5;
+                let rect = egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(*value, self.workspace_layout.properties.height().max(1.0)),
+                );
+                self.egui_context.data_mut(|data| {
+                    data.insert_persisted(
+                        id,
+                        egui::containers::panel::PanelState { outer_rect: rect },
+                    );
+                });
+                self.egui_context.request_repaint();
+                self.window.request_redraw();
+            }
             AutomationSetting::ShowReference { value } => self.apply_automation_option(
                 &AutomationOptionScope::Workspace,
                 "show_reference",
@@ -2959,7 +3011,7 @@ impl Viewer {
             "setting": requested.get("setting").cloned().unwrap_or(serde_json::Value::Null),
             "requested": requested_value,
             "effective": effective,
-            "changed": before != after,
+            "changed": before != after || deferred_shell_change,
             "clamped": clamped,
             "reason": clamped.then_some("requested value was constrained by the rendered layout"),
             "application_instance_id": self.application_instance_id,
@@ -3943,21 +3995,31 @@ impl Viewer {
                 original_workspace_layout.genome_context.bottom() + export_height as f32,
             ),
         );
-        let panel_ids = original_workspace_layout
+        let panel_inputs = original_workspace_layout
             .panels
             .iter()
-            .map(|panel| panel.panel_id)
-            .collect::<Vec<_>>();
-        let cytobands = original_workspace_layout
-            .panels
-            .iter()
-            .map(|panel| panel.cytobands)
+            .map(|panel| WorkspacePanelLayoutInput {
+                panel_id: panel.panel_id,
+                contig_name: panel.contig_name.clone(),
+                contig_length: panel.contig_length,
+                cytobands: panel.cytobands,
+            })
             .collect::<Vec<_>>();
         self.workspace_layout = WorkspaceLayoutSnapshot::compute(
-            expanded_workspace,
-            &panel_ids,
-            &cytobands,
-            original_workspace_layout.metrics,
+            WorkspaceLayoutInput {
+                workspace: expanded_workspace,
+                properties: original_workspace_layout.properties,
+                properties_expanded: original_workspace_layout.properties_expanded,
+                panels: panel_inputs,
+                metrics: original_workspace_layout.metrics,
+                requested_track_gutter_width: original_workspace_layout
+                    .requested_track_gutter_width,
+                minimum_track_gutter_width: original_workspace_layout.minimum_track_gutter_width,
+                requested_scrollbar_width: original_workspace_layout.requested_scrollbar_width,
+                minimum_scrollbar_width: original_workspace_layout.minimum_scrollbar_width,
+                display_scale: original_workspace_layout.display_scale,
+                accessibility_scale: original_workspace_layout.accessibility_scale,
+            },
             original_workspace_layout.revision,
         );
         self.canvas_geometry = self.workspace_layout.canvas_geometry();

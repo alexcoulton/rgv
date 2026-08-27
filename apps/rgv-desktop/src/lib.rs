@@ -119,7 +119,8 @@ use sources::*;
 use ui::{
     AlignmentSubtrack, CanvasGeometry, CytobandAvailability, GenomeContextMetrics, MENU_HEIGHT,
     NAVIGATION_HEIGHT, SEARCHABLE_COMMANDS, STATUS_HEIGHT, TrackFrame, TrackFrameKey,
-    TrackSubtrack, TrackUiAction, UiCommand, WorkspaceLayoutSnapshot,
+    TrackSubtrack, TrackUiAction, UiCommand, WorkspaceLayoutInput, WorkspaceLayoutSnapshot,
+    WorkspacePanelLayoutInput,
 };
 use ui::{alignment_settings::*, gestures::*, track_settings::*};
 use winit::{

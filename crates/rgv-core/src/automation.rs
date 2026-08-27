@@ -530,11 +530,24 @@ pub enum AutomationUnsavedChangesPolicy {
     Discard,
 }
 
-/// Typed configuration accepted by automation schema v3. Each variant owns
+/// Typed configuration accepted by automation schema v4. Each variant owns
 /// its valid scope, preventing key/scope mismatches at the protocol boundary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "setting", rename_all = "snake_case")]
 pub enum AutomationSetting {
+    WindowSize {
+        width: u32,
+        height: u32,
+    },
+    InterfaceScalePercent {
+        value: u16,
+    },
+    PropertiesPanelExpanded {
+        value: bool,
+    },
+    PropertiesPanelWidth {
+        value: f32,
+    },
     ShowReference {
         value: bool,
     },
@@ -651,6 +664,23 @@ pub enum AutomationSetting {
 impl AutomationSetting {
     fn validate(&self) -> Result<(), String> {
         match self {
+            Self::WindowSize { width, height } => ((640..=3_840).contains(width)
+                && (400..=2_160).contains(height))
+            .then_some(())
+            .ok_or_else(|| {
+                "window size must be between 640x400 and 3840x2160 logical points".to_owned()
+            }),
+            Self::InterfaceScalePercent { value } =>
+                (crate::MINIMUM_INTERFACE_SCALE_PERCENT..=crate::MAXIMUM_INTERFACE_SCALE_PERCENT)
+                    .contains(value)
+                    .then_some(())
+                    .ok_or_else(|| "interface scale must be between 75 and 200 percent".to_owned()),
+            Self::PropertiesPanelWidth { value } => (value.is_finite()
+                && (280.0..=520.0).contains(value))
+            .then_some(())
+            .ok_or_else(|| {
+                "Properties panel width must be finite and between 280 and 520".to_owned()
+            }),
             Self::AlignmentColorMode { track_ids, value } => {
                 validate_track_selection(track_ids)?;
                 if let AlignmentColorMode::Tag(tag) = value {
@@ -980,12 +1010,24 @@ pub struct AutomationWorkspaceLayoutSnapshot {
     #[serde(default)]
     pub resolution_query_refresh_pending: bool,
     pub workspace: AutomationRectSnapshot,
+    #[serde(default)]
+    pub properties: AutomationRectSnapshot,
+    #[serde(default)]
+    pub properties_expanded: bool,
+    #[serde(default = "default_automation_scale")]
+    pub display_scale: f32,
+    #[serde(default = "default_automation_scale")]
+    pub accessibility_scale: f32,
     pub genome_context: AutomationRectSnapshot,
     pub track_viewport: AutomationRectSnapshot,
     pub context_gutter: AutomationRectSnapshot,
     pub track_gutter: AutomationRectSnapshot,
     pub has_cytoband_row: bool,
     pub panels: Vec<AutomationWorkspacePanelLayoutSnapshot>,
+}
+
+const fn default_automation_scale() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2041,6 +2083,15 @@ mod tests {
                     right: 1_280.0,
                     bottom: 776.0,
                 },
+                properties: AutomationRectSnapshot {
+                    left: 1_280.0,
+                    top: 62.0,
+                    right: 1_620.0,
+                    bottom: 776.0,
+                },
+                properties_expanded: true,
+                display_scale: 2.0,
+                accessibility_scale: 1.0,
                 genome_context: AutomationRectSnapshot {
                     left: 0.0,
                     top: 62.0,
@@ -2188,6 +2239,42 @@ mod tests {
             invalid.to_json(),
             Err(AutomationError::InvalidCommand { index: 0, .. })
         ));
+    }
+
+    #[test]
+    fn properties_panel_automation_width_is_bounded() {
+        let invalid = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::Configure {
+                setting: AutomationSetting::PropertiesPanelWidth { value: 279.0 },
+            }],
+        };
+        assert!(matches!(
+            invalid.to_json(),
+            Err(AutomationError::InvalidCommand { index: 0, .. })
+        ));
+
+        let valid = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::WindowSize {
+                        width: 800,
+                        height: 600,
+                    },
+                },
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::InterfaceScalePercent { value: 150 },
+                },
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::PropertiesPanelExpanded { value: false },
+                },
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::PropertiesPanelWidth { value: 520.0 },
+                },
+            ],
+        };
+        assert!(valid.to_json().is_ok());
     }
 
     #[test]

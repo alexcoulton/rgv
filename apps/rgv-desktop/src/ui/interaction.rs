@@ -1052,14 +1052,6 @@ impl Viewer {
             .canvas
     }
 
-    pub(crate) fn panel_workspace_rect_at(&self, index: usize) -> egui::Rect {
-        self.workspace_layout
-            .panels
-            .get(index)
-            .expect("committed workspace layout contains every locus panel")
-            .track_column
-    }
-
     pub(crate) fn panel_scrollbar_rect_at(&self, index: usize) -> egui::Rect {
         self.workspace_layout
             .panels
@@ -1086,11 +1078,9 @@ impl Viewer {
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
         );
-        self.panels.iter().enumerate().find_map(|(index, panel)| {
-            self.panel_workspace_rect_at(index)
-                .contains(point)
-                .then_some(panel.id)
-        })
+        self.workspace_layout
+            .panel_at(point)
+            .map(|panel| panel.panel_id)
     }
 
     pub(crate) fn synchronize_panel_widths(&mut self) {
@@ -1102,11 +1092,11 @@ impl Viewer {
             .map(|panel| panel.panel_id)
             .collect::<Vec<_>>();
         if current_ids != layout_ids {
-            let cytobands = self
+            let panel_inputs = self
                 .panels
                 .iter()
                 .map(|panel| {
-                    if self
+                    let cytobands = if self
                         .assembly
                         .cytobands_for(panel.viewport.interval().contig())
                         .next()
@@ -1115,14 +1105,31 @@ impl Viewer {
                         ui::CytobandAvailability::Present
                     } else {
                         ui::CytobandAvailability::Absent
+                    };
+                    ui::WorkspacePanelLayoutInput {
+                        panel_id: panel.id,
+                        contig_name: panel.contig_name.clone(),
+                        contig_length: panel.contig_length,
+                        cytobands,
                     }
                 })
                 .collect::<Vec<_>>();
             self.workspace_layout = ui::WorkspaceLayoutSnapshot::compute(
-                self.workspace_layout.workspace,
-                &current_ids,
-                &cytobands,
-                self.workspace_layout.metrics,
+                ui::WorkspaceLayoutInput {
+                    workspace: self.workspace_layout.workspace,
+                    properties: self.workspace_layout.properties,
+                    properties_expanded: self.workspace_layout.properties_expanded,
+                    panels: panel_inputs,
+                    metrics: self.workspace_layout.metrics,
+                    requested_track_gutter_width: self
+                        .workspace_layout
+                        .requested_track_gutter_width,
+                    minimum_track_gutter_width: self.workspace_layout.minimum_track_gutter_width,
+                    requested_scrollbar_width: self.workspace_layout.requested_scrollbar_width,
+                    minimum_scrollbar_width: self.workspace_layout.minimum_scrollbar_width,
+                    display_scale: self.workspace_layout.display_scale,
+                    accessibility_scale: self.workspace_layout.accessibility_scale,
+                },
                 self.workspace_layout.revision.saturating_add(1),
             );
             self.workspace_layout_recomputations =
@@ -1186,7 +1193,8 @@ impl Viewer {
             "a workspace supports at most {MAXIMUM_VIEW_PANELS} view panels"
         );
         anyhow::ensure!(
-            ui::workspace_genomic_rect(self.canvas_geometry, 0, self.panels.len() + 1,).width()
+            self.workspace_layout
+                .projected_canvas_width(self.panels.len() + 1)
                 >= 140.0,
             "the window is too narrow to add another readable panel"
         );
@@ -1202,8 +1210,8 @@ impl Viewer {
             resolve_initial_locus(dictionary, &self.contig_aliases, Some(locus))?;
         let id = self.panels.next_id();
         let width = f64::from(
-            ui::workspace_genomic_rect(self.canvas_geometry, 0, self.panels.len() + 1)
-                .width()
+            self.workspace_layout
+                .projected_canvas_width(self.panels.len() + 1)
                 .max(1.0),
         );
         let viewport = Viewport::new(interval, width)?;

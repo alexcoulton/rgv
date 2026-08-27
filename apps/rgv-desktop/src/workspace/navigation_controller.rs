@@ -117,7 +117,7 @@ impl Viewer {
     pub(crate) fn navigate_to_loci(&mut self, expression: &str) -> Result<()> {
         let loci = split_locus_expression(expression)?;
         anyhow::ensure!(
-            ui::workspace_genomic_rect(self.canvas_geometry, 0, loci.len()).width() >= 140.0,
+            self.workspace_layout.projected_canvas_width(loci.len()) >= 140.0,
             "the window is too narrow to display {} readable panels",
             loci.len()
         );

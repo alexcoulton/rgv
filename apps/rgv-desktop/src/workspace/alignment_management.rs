@@ -41,13 +41,7 @@ impl Viewer {
         let viewport_interval = self.panels.active().viewport.interval();
         let contig_name = self.panels.active().contig_name.clone();
         let viewport = self.panels.active().viewport;
-        let detail_level = viewport.detail_level();
-        let visible_bases = usize::try_from(viewport_interval.len()).unwrap_or(usize::MAX);
-        let (coverage_bins, collect_alleles) = alignment_coverage_query_plan(
-            visible_bases,
-            viewport.pixel_width(),
-            viewport.bases_per_pixel(),
-        );
+        let resolution = AlignmentQueryResolution::for_viewport(viewport);
         let mut sent = 0_usize;
         let panel_id = self.panels.active().id;
         for (track, record_allocation) in self.alignment_tracks.iter_mut().zip(record_allocations) {
@@ -61,11 +55,11 @@ impl Viewer {
             };
             let options = alignment_query_options(
                 track,
-                detail_level,
+                resolution.detail,
                 viewport.bases_per_pixel(),
                 record_allocation,
-                coverage_bins,
-                collect_alleles,
+                resolution.coverage_bins,
+                resolution.collect_alleles,
             );
             let (request, clock) = {
                 let projection = track.projection_mut(panel_id);
@@ -76,7 +70,9 @@ impl Viewer {
             };
             match track.engine.try_query(request, clock, interval, options) {
                 Ok(()) => {
-                    track.projection_mut(panel_id).pending_query = false;
+                    let projection = track.projection_mut(panel_id);
+                    projection.pending_query = false;
+                    projection.last_query_resolution = Some(resolution);
                     sent = sent.saturating_add(1);
                 }
                 Err(EngineQueueError::Full) => {}

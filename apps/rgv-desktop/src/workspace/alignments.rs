@@ -59,6 +59,42 @@ pub(crate) struct AlignmentPanelProjection {
     pub(crate) query_stats: Option<QueryStats>,
     pub(crate) alignment_rows: Option<CachedAlignmentRows>,
     pub(crate) cached_layout: Option<(LayoutTileKey, Arc<AlignmentLayout>)>,
+    pub(crate) last_query_resolution: Option<AlignmentQueryResolution>,
+}
+
+const RESIZE_COVERAGE_BIN_STEP: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AlignmentQueryResolution {
+    pub(crate) detail: DetailLevel,
+    pub(crate) coverage_bins: usize,
+    pub(crate) collect_alleles: bool,
+}
+
+impl AlignmentQueryResolution {
+    pub(crate) fn for_viewport(viewport: Viewport) -> Self {
+        let visible_bases = usize::try_from(viewport.interval().len()).unwrap_or(usize::MAX);
+        let (coverage_bins, collect_alleles) = alignment_coverage_query_plan(
+            visible_bases,
+            viewport.pixel_width(),
+            viewport.bases_per_pixel(),
+        );
+        Self {
+            detail: viewport.detail_level(),
+            coverage_bins,
+            collect_alleles,
+        }
+    }
+
+    pub(crate) fn requires_refresh_from(self, previous: Self) -> bool {
+        self.detail != previous.detail
+            || self.collect_alleles != previous.collect_alleles
+            || self.coverage_bucket() != previous.coverage_bucket()
+    }
+
+    const fn coverage_bucket(self) -> usize {
+        self.coverage_bins / RESIZE_COVERAGE_BIN_STEP
+    }
 }
 
 pub(crate) struct AlignmentTrackController {

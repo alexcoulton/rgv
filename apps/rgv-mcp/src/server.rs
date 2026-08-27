@@ -1502,6 +1502,23 @@ impl ToolPresentationNode {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "setting", rename_all = "snake_case")]
 pub enum ToolSetting {
+    WindowSize {
+        #[schemars(range(min = 640, max = 3840))]
+        width: u32,
+        #[schemars(range(min = 400, max = 2160))]
+        height: u32,
+    },
+    InterfaceScalePercent {
+        #[schemars(range(min = 75, max = 200))]
+        value: u16,
+    },
+    PropertiesPanelExpanded {
+        value: bool,
+    },
+    PropertiesPanelWidth {
+        #[schemars(range(min = 280.0, max = 520.0))]
+        value: f32,
+    },
     ShowReference {
         value: bool,
     },
@@ -1647,6 +1664,16 @@ pub enum ToolSetting {
 impl ToolSetting {
     fn into_core(self) -> AutomationSetting {
         match self {
+            Self::WindowSize { width, height } => AutomationSetting::WindowSize { width, height },
+            Self::InterfaceScalePercent { value } => {
+                AutomationSetting::InterfaceScalePercent { value }
+            }
+            Self::PropertiesPanelExpanded { value } => {
+                AutomationSetting::PropertiesPanelExpanded { value }
+            }
+            Self::PropertiesPanelWidth { value } => {
+                AutomationSetting::PropertiesPanelWidth { value }
+            }
             Self::ShowReference { value } => AutomationSetting::ShowReference { value },
             Self::ShowCoverage { value } => AutomationSetting::ShowCoverage { value },
             Self::ShowReads { value } => AutomationSetting::ShowReads { value },
@@ -2642,6 +2669,10 @@ mod tests {
         )
         .unwrap();
         assert!(configure_schema.contains("show_reference"));
+        assert!(configure_schema.contains("window_size"));
+        assert!(configure_schema.contains("interface_scale_percent"));
+        assert!(configure_schema.contains("properties_panel_expanded"));
+        assert!(configure_schema.contains("properties_panel_width"));
         assert!(configure_schema.contains("vertical_scroll_points"));
         assert!(configure_schema.contains("presentation_node_visible"));
         assert!(configure_schema.contains("presentation_group_expanded"));

@@ -68,14 +68,30 @@ impl Viewer {
                     .max(MENU_HEIGHT + NAVIGATION_HEIGHT + 1.0),
             ),
         );
-        let canvas_geometry = WorkspaceLayoutSnapshot::compute(
-            workspace_bounds,
-            &[INITIAL_PANEL_ID],
-            &[CytobandAvailability::Absent],
-            GenomeContextMetrics::default(),
+        let shell_bottom =
+            (logical_size.height as f32 - STATUS_HEIGHT).max(MENU_HEIGHT + NAVIGATION_HEIGHT + 1.0);
+        let initial_properties = egui::Rect::from_min_max(
+            egui::pos2(workspace_bounds.right(), MENU_HEIGHT + NAVIGATION_HEIGHT),
+            egui::pos2(logical_size.width as f32, shell_bottom),
+        );
+        let bootstrap_layout = WorkspaceLayoutSnapshot::compute(
+            WorkspaceLayoutInput::new(
+                workspace_bounds,
+                initial_properties,
+                true,
+                vec![WorkspacePanelLayoutInput {
+                    panel_id: INITIAL_PANEL_ID,
+                    contig_name: "chrSynthetic".to_owned(),
+                    contig_length: SYNTHETIC_CONTIG_LENGTH,
+                    cytobands: CytobandAvailability::Absent,
+                }],
+                GenomeContextMetrics::default(),
+                window.scale_factor() as f32,
+                egui_context.zoom_factor(),
+            ),
             0,
-        )
-        .canvas_geometry();
+        );
+        let canvas_geometry = bootstrap_layout.canvas_geometry();
         let mut settings = options.loaded_settings.clone();
         apply_accessibility_preferences(&egui_context, &settings);
         if let Some(path) = options.session.as_ref().or(options.import_igv.as_ref()) {
@@ -150,8 +166,7 @@ impl Viewer {
             |session| {
                 let panel_count = session.panels.len().max(1);
                 let total_genomic_width =
-                    ui::workspace_genomic_rect(canvas_geometry, 0, panel_count).width()
-                        * panel_count as f32;
+                    bootstrap_layout.projected_canvas_width(panel_count) * panel_count as f32;
                 PanelWorkspace::from_session(
                     session,
                     total_genomic_width,
@@ -159,11 +174,10 @@ impl Viewer {
                 )
             },
         )?;
-        let initial_panel_ids = panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
-        let initial_cytobands = panels
+        let initial_panel_inputs = panels
             .iter()
             .map(|panel| {
-                if assembly
+                let cytobands = if assembly
                     .cytobands_for(panel.viewport.interval().contig())
                     .next()
                     .is_some()
@@ -171,14 +185,25 @@ impl Viewer {
                     CytobandAvailability::Present
                 } else {
                     CytobandAvailability::Absent
+                };
+                WorkspacePanelLayoutInput {
+                    panel_id: panel.id,
+                    contig_name: panel.contig_name.clone(),
+                    contig_length: panel.contig_length,
+                    cytobands,
                 }
             })
             .collect::<Vec<_>>();
         let workspace_layout = WorkspaceLayoutSnapshot::compute(
-            workspace_bounds,
-            &initial_panel_ids,
-            &initial_cytobands,
-            GenomeContextMetrics::default(),
+            WorkspaceLayoutInput::new(
+                workspace_bounds,
+                initial_properties,
+                true,
+                initial_panel_inputs,
+                GenomeContextMetrics::default(),
+                window.scale_factor() as f32,
+                egui_context.zoom_factor(),
+            ),
             1,
         );
         let canvas_geometry = workspace_layout.canvas_geometry();

@@ -99,8 +99,9 @@ impl GenomeContextMetrics {
     pub fn rows(self, panel: egui::Rect, has_cytoband_row: bool) -> GenomeContextRows {
         let metadata =
             egui::Rect::from_min_size(panel.min, egui::vec2(panel.width(), self.metadata_height));
-        let bar_left = panel.left() + self.horizontal_padding;
-        let bar_width = (panel.width() - self.horizontal_padding * 2.0).max(1.0);
+        let horizontal_padding = self.horizontal_padding.min(panel.width() * 0.5).max(0.0);
+        let bar_left = panel.left() + horizontal_padding;
+        let bar_width = (panel.width() - horizontal_padding * 2.0).max(0.0);
         let mut top = metadata.bottom();
         let cytoband = has_cytoband_row.then(|| {
             let rect = egui::Rect::from_min_size(
@@ -144,8 +145,67 @@ pub struct GenomeContextRows {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct WorkspacePanelLayoutInput {
+    pub panel_id: rgv_core::PanelId,
+    pub contig_name: String,
+    pub contig_length: u64,
+    pub cytobands: CytobandAvailability,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkspaceLayoutInput {
+    /// Final shell rectangle after the menu, toolbar, status bar, and
+    /// Properties panel have all been reserved.
+    pub workspace: egui::Rect,
+    /// Exact Properties rectangle used to produce `workspace`. Keeping this
+    /// boundary in the immutable input makes shell/header agreement auditable.
+    pub properties: egui::Rect,
+    pub properties_expanded: bool,
+    pub panels: Vec<WorkspacePanelLayoutInput>,
+    pub metrics: GenomeContextMetrics,
+    pub requested_track_gutter_width: f32,
+    pub minimum_track_gutter_width: f32,
+    pub requested_scrollbar_width: f32,
+    pub minimum_scrollbar_width: f32,
+    /// Native pixels per platform point. Logical geometry stays in points,
+    /// but the committed scale is needed to audit physical clipping.
+    pub display_scale: f32,
+    /// The active egui zoom/accessibility scale used when measuring `metrics`.
+    pub accessibility_scale: f32,
+}
+
+impl WorkspaceLayoutInput {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        workspace: egui::Rect,
+        properties: egui::Rect,
+        properties_expanded: bool,
+        panels: Vec<WorkspacePanelLayoutInput>,
+        metrics: GenomeContextMetrics,
+        display_scale: f32,
+        accessibility_scale: f32,
+    ) -> Self {
+        Self {
+            workspace,
+            properties,
+            properties_expanded,
+            panels,
+            metrics,
+            requested_track_gutter_width: TRACK_GUTTER_WIDTH,
+            minimum_track_gutter_width: 72.0,
+            requested_scrollbar_width: SCROLLBAR_WIDTH,
+            minimum_scrollbar_width: 14.0,
+            display_scale,
+            accessibility_scale,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct WorkspacePanelLayout {
     pub panel_id: rgv_core::PanelId,
+    pub contig_name: String,
+    pub contig_length: u64,
     pub column: egui::Rect,
     pub header: egui::Rect,
     pub track_column: egui::Rect,
@@ -162,6 +222,14 @@ pub struct WorkspaceLayoutSnapshot {
     pub revision: u64,
     pub metrics: GenomeContextMetrics,
     pub workspace: egui::Rect,
+    pub properties: egui::Rect,
+    pub properties_expanded: bool,
+    pub display_scale: f32,
+    pub accessibility_scale: f32,
+    pub requested_track_gutter_width: f32,
+    pub minimum_track_gutter_width: f32,
+    pub requested_scrollbar_width: f32,
+    pub minimum_scrollbar_width: f32,
     pub genome_context: egui::Rect,
     pub track_viewport: egui::Rect,
     pub context_gutter: egui::Rect,
@@ -171,25 +239,27 @@ pub struct WorkspaceLayoutSnapshot {
 }
 
 impl WorkspaceLayoutSnapshot {
-    pub fn compute(
-        workspace: egui::Rect,
-        panel_ids: &[rgv_core::PanelId],
-        cytobands: &[CytobandAvailability],
-        metrics: GenomeContextMetrics,
-        revision: u64,
-    ) -> Self {
+    pub fn compute(input: WorkspaceLayoutInput, revision: u64) -> Self {
         assert!(
-            !panel_ids.is_empty(),
+            !input.panels.is_empty(),
             "a workspace must contain a locus panel"
         );
-        assert_eq!(
-            panel_ids.len(),
-            cytobands.len(),
-            "cytoband state must be supplied for every locus panel"
-        );
-        let has_cytoband_row = cytobands
+        let WorkspaceLayoutInput {
+            workspace,
+            properties,
+            properties_expanded,
+            panels: panel_inputs,
+            metrics,
+            requested_track_gutter_width,
+            minimum_track_gutter_width,
+            requested_scrollbar_width,
+            minimum_scrollbar_width,
+            display_scale,
+            accessibility_scale,
+        } = input;
+        let has_cytoband_row = panel_inputs
             .iter()
-            .any(|state| *state != CytobandAvailability::Absent);
+            .any(|panel| panel.cytobands != CytobandAvailability::Absent);
         let context_height = metrics
             .context_height(has_cytoband_row)
             .min((workspace.height() - 1.0).max(1.0));
@@ -201,18 +271,60 @@ impl WorkspaceLayoutSnapshot {
             egui::pos2(workspace.left(), genome_context.bottom()),
             workspace.max,
         );
-        let canvas_geometry = CanvasGeometry::from_viewport(track_viewport);
+        let panel_count = panel_inputs.len();
+        let maximum_gutter_width = (workspace.width()
+            - panel_count as f32 * (minimum_scrollbar_width.max(0.0) + 1.0))
+            .max(0.0);
+        let gutter_width = requested_track_gutter_width
+            .max(0.0)
+            .min(maximum_gutter_width)
+            .max(
+                minimum_track_gutter_width
+                    .max(0.0)
+                    .min(maximum_gutter_width),
+            );
+        let track_gutter = egui::Rect::from_min_max(
+            track_viewport.min,
+            egui::pos2(
+                track_viewport.left() + gutter_width,
+                track_viewport.bottom(),
+            ),
+        );
         let context_gutter = egui::Rect::from_min_max(
             genome_context.min,
-            egui::pos2(canvas_geometry.gutter.right(), genome_context.bottom()),
+            egui::pos2(track_gutter.right(), genome_context.bottom()),
         );
-        let panels = panel_ids
-            .iter()
-            .zip(cytobands)
+        let available_panel_width = (workspace.right() - track_gutter.right()).max(0.0);
+        let column_width = available_panel_width / panel_count as f32;
+        let panels = panel_inputs
+            .into_iter()
             .enumerate()
-            .map(|(index, (panel_id, cytobands))| {
-                let canvas = workspace_genomic_rect(canvas_geometry, index, panel_ids.len());
-                let scrollbar = workspace_scrollbar_rect(canvas_geometry, index, panel_ids.len());
+            .map(|(index, panel_input)| {
+                let column_left = track_gutter.right() + index as f32 * column_width;
+                let column_right = if index + 1 == panel_count {
+                    workspace.right()
+                } else {
+                    column_left + column_width
+                };
+                let available_column_width = (column_right - column_left).max(0.0);
+                let maximum_scrollbar_width = (available_column_width - 1.0).max(0.0);
+                let scrollbar_width = requested_scrollbar_width
+                    .max(0.0)
+                    .min(maximum_scrollbar_width)
+                    .max(
+                        minimum_scrollbar_width
+                            .max(0.0)
+                            .min(maximum_scrollbar_width),
+                    );
+                let canvas_right = column_right - scrollbar_width;
+                let canvas = egui::Rect::from_min_max(
+                    egui::pos2(column_left, track_viewport.top()),
+                    egui::pos2(canvas_right, track_viewport.bottom()),
+                );
+                let scrollbar = egui::Rect::from_min_max(
+                    egui::pos2(canvas_right, track_viewport.top()),
+                    egui::pos2(column_right, track_viewport.bottom()),
+                );
                 let track_column = egui::Rect::from_min_max(
                     canvas.min,
                     egui::pos2(scrollbar.right(), canvas.bottom()),
@@ -231,7 +343,9 @@ impl WorkspaceLayoutSnapshot {
                     header.max,
                 );
                 WorkspacePanelLayout {
-                    panel_id: *panel_id,
+                    panel_id: panel_input.panel_id,
+                    contig_name: panel_input.contig_name,
+                    contig_length: panel_input.contig_length,
                     column,
                     header,
                     track_column,
@@ -240,7 +354,7 @@ impl WorkspaceLayoutSnapshot {
                     canvas,
                     scrollbar,
                     context_rows: metrics.rows(header_genomic, has_cytoband_row),
-                    cytobands: *cytobands,
+                    cytobands: panel_input.cytobands,
                 }
             })
             .collect();
@@ -248,61 +362,79 @@ impl WorkspaceLayoutSnapshot {
             revision,
             metrics,
             workspace,
+            properties,
+            properties_expanded,
+            display_scale,
+            accessibility_scale,
+            requested_track_gutter_width,
+            minimum_track_gutter_width,
+            requested_scrollbar_width,
+            minimum_scrollbar_width,
             genome_context,
             track_viewport,
             context_gutter,
-            track_gutter: canvas_geometry.gutter,
+            track_gutter,
             panels,
             has_cytoband_row,
         }
     }
 
     pub fn canvas_geometry(&self) -> CanvasGeometry {
-        CanvasGeometry::from_viewport(self.track_viewport)
+        let last_panel = self
+            .panels
+            .last()
+            .expect("a committed workspace contains a locus panel");
+        CanvasGeometry {
+            viewport: self.track_viewport,
+            gutter: self.track_gutter,
+            genomic: egui::Rect::from_min_max(
+                egui::pos2(self.track_gutter.right(), self.track_viewport.top()),
+                egui::pos2(last_panel.canvas.right(), self.track_viewport.bottom()),
+            ),
+            annotation_scrollbar: last_panel.scrollbar,
+            scrollbar: last_panel.scrollbar,
+        }
     }
 
     pub fn panel(&self, panel_id: rgv_core::PanelId) -> Option<&WorkspacePanelLayout> {
         self.panels.iter().find(|panel| panel.panel_id == panel_id)
     }
-}
 
-/// Full horizontal cell owned by one workspace, including its scrollbar.
-pub fn workspace_column_rect(geometry: CanvasGeometry, index: usize, count: usize) -> egui::Rect {
-    let count = count.max(1);
-    let left_edge = geometry.gutter.right();
-    let right_edge = geometry.viewport.right();
-    let width = (right_edge - left_edge) / count as f32;
-    let left = left_edge + index.min(count - 1) as f32 * width;
-    let right = if index + 1 >= count {
-        right_edge
-    } else {
-        left + width
-    };
-    egui::Rect::from_min_max(
-        egui::pos2(left, geometry.viewport.top()),
-        egui::pos2(right, geometry.viewport.bottom()),
-    )
-}
+    pub fn panel_at(&self, point: egui::Pos2) -> Option<&WorkspacePanelLayout> {
+        self.panels
+            .iter()
+            .find(|panel| panel.track_column.contains(point))
+    }
 
-pub fn workspace_genomic_rect(geometry: CanvasGeometry, index: usize, count: usize) -> egui::Rect {
-    let column = workspace_column_rect(geometry, index, count);
-    egui::Rect::from_min_max(
-        column.min,
-        egui::pos2(
-            (column.right() - SCROLLBAR_WIDTH).max(column.left() + 1.0),
-            column.bottom(),
-        ),
-    )
-}
+    pub fn projected_canvas_width(&self, panel_count: usize) -> f32 {
+        let panel_count = panel_count.max(1);
+        let available = (self.workspace.right() - self.track_gutter.right()).max(0.0);
+        let column_width = available / panel_count as f32;
+        let maximum_scrollbar_width = (column_width - 1.0).max(0.0);
+        let scrollbar_width = self
+            .requested_scrollbar_width
+            .max(0.0)
+            .min(maximum_scrollbar_width)
+            .max(
+                self.minimum_scrollbar_width
+                    .max(0.0)
+                    .min(maximum_scrollbar_width),
+            );
+        (column_width - scrollbar_width).max(0.0)
+    }
 
-pub fn workspace_scrollbar_rect(
-    geometry: CanvasGeometry,
-    index: usize,
-    count: usize,
-) -> egui::Rect {
-    let column = workspace_column_rect(geometry, index, count);
-    let genomic = workspace_genomic_rect(geometry, index, count);
-    egui::Rect::from_min_max(egui::pos2(genomic.right(), column.top()), column.max)
+    #[cfg(test)]
+    pub fn physical_canvas_scissor(
+        &self,
+        panel_id: rgv_core::PanelId,
+        scale_factor: f32,
+        surface_width: u32,
+        surface_height: u32,
+    ) -> Option<PhysicalScissor> {
+        self.panel(panel_id).map(|panel| {
+            physical_scissor_for_rect(panel.canvas, scale_factor, surface_width, surface_height)
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -323,6 +455,7 @@ pub struct PhysicalScissor {
 }
 
 impl CanvasGeometry {
+    #[cfg(test)]
     pub fn from_viewport(viewport: egui::Rect) -> Self {
         let gutter_width = TRACK_GUTTER_WIDTH.min((viewport.width() * 0.35).max(72.0));
         let scrollbar_width = SCROLLBAR_WIDTH.min((viewport.width() * 0.1).max(14.0));
@@ -379,31 +512,115 @@ impl CanvasGeometry {
         surface_width: u32,
         surface_height: u32,
     ) -> PhysicalScissor {
-        let scale = scale_factor.max(f32::EPSILON);
-        let left = (self.genomic.left() * scale)
-            .round()
-            .clamp(0.0, surface_width as f32) as u32;
-        let top = (self.genomic.top() * scale)
-            .round()
-            .clamp(0.0, surface_height as f32) as u32;
-        let right = (self.genomic.right() * scale)
-            .round()
-            .clamp(left as f32, surface_width as f32) as u32;
-        let bottom = (self.genomic.bottom() * scale)
-            .round()
-            .clamp(top as f32, surface_height as f32) as u32;
-        PhysicalScissor {
-            x: left,
-            y: top,
-            width: right.saturating_sub(left),
-            height: bottom.saturating_sub(top),
-        }
+        physical_scissor_for_rect(self.genomic, scale_factor, surface_width, surface_height)
+    }
+}
+
+fn physical_scissor_for_rect(
+    rect: egui::Rect,
+    scale_factor: f32,
+    surface_width: u32,
+    surface_height: u32,
+) -> PhysicalScissor {
+    let scale = scale_factor.max(f32::EPSILON);
+    let left = (rect.left() * scale)
+        .round()
+        .clamp(0.0, surface_width as f32) as u32;
+    let top = (rect.top() * scale)
+        .round()
+        .clamp(0.0, surface_height as f32) as u32;
+    let right = (rect.right() * scale)
+        .round()
+        .clamp(left as f32, surface_width as f32) as u32;
+    let bottom = (rect.bottom() * scale)
+        .round()
+        .clamp(top as f32, surface_height as f32) as u32;
+    PhysicalScissor {
+        x: left,
+        y: top,
+        width: right.saturating_sub(left),
+        height: bottom.saturating_sub(top),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout_input(
+        workspace: egui::Rect,
+        cytobands: &[CytobandAvailability],
+        metrics: GenomeContextMetrics,
+    ) -> WorkspaceLayoutInput {
+        let properties = egui::Rect::from_min_max(
+            egui::pos2(workspace.right(), workspace.top()),
+            egui::pos2(workspace.right() + 340.0, workspace.bottom()),
+        );
+        WorkspaceLayoutInput::new(
+            workspace,
+            properties,
+            true,
+            cytobands
+                .iter()
+                .enumerate()
+                .map(|(index, cytobands)| WorkspacePanelLayoutInput {
+                    panel_id: rgv_core::PanelId::new(index as u64 + 1),
+                    contig_name: format!("chr{}", index + 1),
+                    contig_length: 3_000_000,
+                    cytobands: *cytobands,
+                })
+                .collect(),
+            metrics,
+            2.0,
+            1.0,
+        )
+    }
+
+    fn shell_layout_input(
+        window_width: f32,
+        properties_width: f32,
+        properties_expanded: bool,
+        cytobands: &[CytobandAvailability],
+        metrics: GenomeContextMetrics,
+        display_scale: f32,
+        accessibility_scale: f32,
+    ) -> WorkspaceLayoutInput {
+        let shell_top = 62.0;
+        let shell_bottom = 776.0;
+        let workspace_right = (window_width - properties_width).max(1.0);
+        let workspace = egui::Rect::from_min_max(
+            egui::pos2(0.0, shell_top),
+            egui::pos2(workspace_right, shell_bottom),
+        );
+        let properties = egui::Rect::from_min_max(
+            egui::pos2(workspace_right, shell_top),
+            egui::pos2(window_width, shell_bottom),
+        );
+        let mut input = WorkspaceLayoutInput::new(
+            workspace,
+            properties,
+            properties_expanded,
+            cytobands
+                .iter()
+                .enumerate()
+                .map(|(index, cytobands)| WorkspacePanelLayoutInput {
+                    panel_id: rgv_core::PanelId::new(index as u64 + 1),
+                    contig_name: if index == 0 {
+                        "chrVeryLongAlternateContigNameForElision".to_owned()
+                    } else {
+                        format!("chr{}", index + 1)
+                    },
+                    contig_length: if index == 0 { u64::MAX / 2 } else { 3_000_000 },
+                    cytobands: *cytobands,
+                })
+                .collect(),
+            metrics,
+            display_scale,
+            accessibility_scale,
+        );
+        input.minimum_track_gutter_width = 72.0;
+        input
+    }
 
     #[test]
     fn canvas_geometry_reserves_gutter_and_scrollbar() {
@@ -418,16 +635,24 @@ mod tests {
 
     #[test]
     fn split_workspaces_each_reserve_their_own_scrollbar() {
-        let geometry = CanvasGeometry::initial(1_280.0, 800.0);
-        let first = workspace_genomic_rect(geometry, 0, 2);
-        let first_scrollbar = workspace_scrollbar_rect(geometry, 0, 2);
-        let second = workspace_genomic_rect(geometry, 1, 2);
-        let second_scrollbar = workspace_scrollbar_rect(geometry, 1, 2);
+        let workspace = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_280.0, 800.0));
+        let layout = WorkspaceLayoutSnapshot::compute(
+            layout_input(
+                workspace,
+                &[CytobandAvailability::Absent, CytobandAvailability::Absent],
+                GenomeContextMetrics::default(),
+            ),
+            1,
+        );
+        let first = layout.panels[0].canvas;
+        let first_scrollbar = layout.panels[0].scrollbar;
+        let second = layout.panels[1].canvas;
+        let second_scrollbar = layout.panels[1].scrollbar;
 
         assert_eq!(first.right(), first_scrollbar.left());
         assert_eq!(first_scrollbar.right(), second.left());
         assert_eq!(second.right(), second_scrollbar.left());
-        assert_eq!(second_scrollbar.right(), geometry.viewport.right());
+        assert_eq!(second_scrollbar.right(), workspace.right());
         assert_eq!(first_scrollbar.width(), SCROLLBAR_WIDTH);
         assert_eq!(second_scrollbar.width(), SCROLLBAR_WIDTH);
         assert_eq!(first.width(), second.width());
@@ -447,12 +672,12 @@ mod tests {
     #[test]
     fn workspace_layout_uses_identical_header_and_canvas_columns() {
         let workspace = egui::Rect::from_min_max(egui::pos2(0.0, 62.0), egui::pos2(1_250.0, 776.0));
-        let panel_ids = [rgv_core::PanelId::new(1), rgv_core::PanelId::new(2)];
         let layout = WorkspaceLayoutSnapshot::compute(
-            workspace,
-            &panel_ids,
-            &[CytobandAvailability::Absent, CytobandAvailability::Absent],
-            GenomeContextMetrics::default(),
+            layout_input(
+                workspace,
+                &[CytobandAvailability::Absent, CytobandAvailability::Absent],
+                GenomeContextMetrics::default(),
+            ),
             4,
         );
 
@@ -485,20 +710,21 @@ mod tests {
     #[test]
     fn workspace_layout_adds_one_shared_cytoband_row_for_mixed_panels() {
         let workspace = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1_280.0, 800.0));
-        let panel_ids = [rgv_core::PanelId::new(1), rgv_core::PanelId::new(2)];
         let metrics = GenomeContextMetrics::default();
         let absent = WorkspaceLayoutSnapshot::compute(
-            workspace,
-            &panel_ids,
-            &[CytobandAvailability::Absent, CytobandAvailability::Absent],
-            metrics,
+            layout_input(
+                workspace,
+                &[CytobandAvailability::Absent, CytobandAvailability::Absent],
+                metrics,
+            ),
             1,
         );
         let mixed = WorkspaceLayoutSnapshot::compute(
-            workspace,
-            &panel_ids,
-            &[CytobandAvailability::Present, CytobandAvailability::Absent],
-            metrics,
+            layout_input(
+                workspace,
+                &[CytobandAvailability::Present, CytobandAvailability::Absent],
+                metrics,
+            ),
             2,
         );
 
@@ -523,46 +749,217 @@ mod tests {
 
     #[test]
     fn workspace_layout_matrix_never_overlaps_rows_or_columns() {
-        let metrics = GenomeContextMetrics::default();
-        for width in [640.0, 960.0, 1_280.0, 2_560.0] {
+        let default_metrics = GenomeContextMetrics::default();
+        let enlarged_metrics = GenomeContextMetrics {
+            metadata_height: default_metrics.metadata_height * 1.5,
+            span_height: default_metrics.span_height * 1.5,
+            ruler_height: default_metrics.ruler_height * 1.5,
+            bar_height: default_metrics.bar_height * 1.25,
+            row_gap: default_metrics.row_gap * 1.5,
+            ..default_metrics
+        };
+        for window_width in [640.0, 800.0, 1_280.0, 2_560.0] {
             for panel_count in 1..=4 {
-                let panel_ids = (1..=panel_count)
-                    .map(|id| rgv_core::PanelId::new(id as u64))
-                    .collect::<Vec<_>>();
+                let mut mixed = vec![CytobandAvailability::Absent; panel_count];
+                mixed[0] = CytobandAvailability::Present;
+                let mut loading = vec![CytobandAvailability::Absent; panel_count];
+                loading[0] = CytobandAvailability::Loading;
                 for cytobands in [
                     vec![CytobandAvailability::Absent; panel_count],
                     vec![CytobandAvailability::Present; panel_count],
+                    mixed,
+                    loading,
                 ] {
-                    let workspace =
-                        egui::Rect::from_min_size(egui::pos2(0.0, 62.0), egui::vec2(width, 700.0));
-                    let layout = WorkspaceLayoutSnapshot::compute(
-                        workspace, &panel_ids, &cytobands, metrics, 1,
-                    );
-                    assert!(
-                        layout.panels.windows(2).all(|pair| (pair[0].column.right()
-                            - pair[1].column.left())
-                        .abs()
-                            < 0.01)
-                    );
-                    for panel in &layout.panels {
-                        let mut rows = vec![panel.context_rows.metadata];
-                        rows.extend(panel.context_rows.cytoband);
-                        rows.extend([
-                            panel.context_rows.overview,
-                            panel.context_rows.span,
-                            panel.context_rows.ruler,
-                        ]);
-                        assert!(
-                            rows.windows(2)
-                                .all(|pair| pair[0].bottom() <= pair[1].top())
-                        );
-                        assert!(
-                            rows.iter()
-                                .all(|row| layout.genome_context.contains_rect(*row))
-                        );
+                    for (properties_width, properties_expanded) in [
+                        (30.0, false),
+                        (280.0, true),
+                        (340.0, true),
+                        (400.0, true),
+                        (520.0, true),
+                    ] {
+                        for (metrics, accessibility_scale) in
+                            [(default_metrics, 1.0), (enlarged_metrics, 1.5)]
+                        {
+                            let input = shell_layout_input(
+                                window_width,
+                                properties_width,
+                                properties_expanded,
+                                &cytobands,
+                                metrics,
+                                2.0,
+                                accessibility_scale,
+                            );
+                            let layout = WorkspaceLayoutSnapshot::compute(input, 1);
+                            assert_eq!(layout.workspace.right(), layout.properties.left());
+                            assert_eq!(
+                                layout.properties.width(),
+                                properties_width.min(window_width - 1.0)
+                            );
+                            assert_eq!(layout.properties_expanded, properties_expanded);
+                            assert_eq!(layout.accessibility_scale, accessibility_scale);
+                            assert_eq!(layout.genome_context.bottom(), layout.track_viewport.top());
+                            assert!(layout.panels.windows(2).all(|pair| {
+                                (pair[0].column.right() - pair[1].column.left()).abs() < 0.01
+                            }));
+                            assert_eq!(layout.panels[0].column.left(), layout.track_gutter.right());
+                            assert_eq!(
+                                layout.panels.last().unwrap().column.right(),
+                                layout.workspace.right()
+                            );
+                            assert!(
+                                (layout.projected_canvas_width(panel_count)
+                                    - layout.panels[0].canvas.width())
+                                .abs()
+                                    < 0.01
+                            );
+                            for panel in &layout.panels {
+                                assert_eq!(panel.header_genomic.left(), panel.canvas.left());
+                                assert_eq!(panel.header_genomic.right(), panel.canvas.right());
+                                assert_eq!(panel.header_scrollbar.left(), panel.scrollbar.left());
+                                assert_eq!(panel.header_scrollbar.right(), panel.scrollbar.right());
+                                assert_eq!(panel.canvas.top(), layout.track_viewport.top());
+                                assert_eq!(panel.canvas.bottom(), layout.track_viewport.bottom());
+                                let mut rows = vec![panel.context_rows.metadata];
+                                rows.extend(panel.context_rows.cytoband);
+                                rows.extend([
+                                    panel.context_rows.overview,
+                                    panel.context_rows.span,
+                                    panel.context_rows.ruler,
+                                ]);
+                                assert!(
+                                    rows.windows(2)
+                                        .all(|pair| { pair[0].bottom() <= pair[1].top() })
+                                );
+                                assert!(
+                                    rows.iter()
+                                        .all(|row| { layout.genome_context.contains_rect(*row) })
+                                );
+                                assert!(
+                                    panel.context_rows.metadata.bottom()
+                                        <= panel.context_rows.ruler.top()
+                                );
+                                assert_eq!(
+                                    layout
+                                        .panel_at(panel.canvas.center())
+                                        .map(|hit| hit.panel_id),
+                                    Some(panel.panel_id)
+                                );
+                                assert!(layout.panel_at(panel.header.center()).is_none());
+                                for scale in [1.0, 2.0] {
+                                    let scissor = layout
+                                        .physical_canvas_scissor(
+                                            panel.panel_id,
+                                            scale,
+                                            (window_width * scale).ceil() as u32,
+                                            (800.0 * scale).ceil() as u32,
+                                        )
+                                        .unwrap();
+                                    assert!(scissor.width > 0);
+                                    assert!(scissor.height > 0);
+                                    assert!(
+                                        scissor.x + scissor.width
+                                            <= (window_width * scale).ceil() as u32
+                                    );
+                                    assert!(
+                                        scissor.y + scissor.height <= (800.0 * scale).ceil() as u32
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn cytoband_loading_transitions_reflow_once_to_each_stable_state() {
+        let metrics = GenomeContextMetrics::default();
+        let loading = WorkspaceLayoutSnapshot::compute(
+            shell_layout_input(
+                1_280.0,
+                340.0,
+                true,
+                &[CytobandAvailability::Loading, CytobandAvailability::Absent],
+                metrics,
+                2.0,
+                1.0,
+            ),
+            1,
+        );
+        let present = WorkspaceLayoutSnapshot::compute(
+            shell_layout_input(
+                1_280.0,
+                340.0,
+                true,
+                &[CytobandAvailability::Present, CytobandAvailability::Absent],
+                metrics,
+                2.0,
+                1.0,
+            ),
+            2,
+        );
+        let absent = WorkspaceLayoutSnapshot::compute(
+            shell_layout_input(
+                1_280.0,
+                340.0,
+                true,
+                &[CytobandAvailability::Absent, CytobandAvailability::Absent],
+                metrics,
+                2.0,
+                1.0,
+            ),
+            3,
+        );
+
+        assert_eq!(
+            loading.genome_context.height(),
+            present.genome_context.height()
+        );
+        assert_eq!(loading.track_viewport.top(), present.track_viewport.top());
+        assert_eq!(
+            loading.panels[1].context_rows.cytoband,
+            present.panels[1].context_rows.cytoband
+        );
+        assert_eq!(
+            loading.genome_context.height() - absent.genome_context.height(),
+            metrics.bar_height + metrics.row_gap
+        );
+        assert!(
+            absent
+                .panels
+                .iter()
+                .all(|panel| panel.context_rows.cytoband.is_none())
+        );
+    }
+
+    #[test]
+    fn compatibility_geometry_is_a_one_way_projection_of_the_snapshot() {
+        let layout = WorkspaceLayoutSnapshot::compute(
+            shell_layout_input(
+                1_280.0,
+                340.0,
+                true,
+                &[CytobandAvailability::Absent, CytobandAvailability::Absent],
+                GenomeContextMetrics::default(),
+                2.0,
+                1.0,
+            ),
+            7,
+        );
+        let geometry = layout.canvas_geometry();
+        assert_eq!(geometry.viewport, layout.track_viewport);
+        assert_eq!(geometry.gutter, layout.track_gutter);
+        assert_eq!(geometry.scrollbar, layout.panels.last().unwrap().scrollbar);
+        assert_eq!(geometry.genomic.left(), layout.panels[0].canvas.left());
+        assert_eq!(
+            geometry.genomic.right(),
+            layout.panels.last().unwrap().canvas.right()
+        );
+        assert_eq!(
+            layout.panels[0].contig_name,
+            "chrVeryLongAlternateContigNameForElision"
+        );
+        assert_eq!(layout.panels[0].contig_length, u64::MAX / 2);
     }
 }

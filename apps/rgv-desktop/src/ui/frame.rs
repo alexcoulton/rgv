@@ -1356,7 +1356,8 @@ impl Viewer {
                         }
                     });
             }
-            if properties_expanded {
+            let displayed_properties_expanded = properties_expanded;
+            let properties_rect = if displayed_properties_expanded {
                 egui::Panel::right("properties-panel")
                     .default_size(340.0)
                     .size_range(280.0..=520.0)
@@ -1421,7 +1422,9 @@ impl Viewer {
                                 review_open |= inspector_actions.review_open;
                                 variant_sample_search = inspector_actions.variant_sample_search;
                             });
-                    });
+                    })
+                    .response
+                    .rect
             } else {
                 egui::Panel::right("properties-panel-collapsed")
                     .exact_size(30.0)
@@ -1436,17 +1439,15 @@ impl Viewer {
                                 properties_expanded = true;
                             }
                         });
-                    });
-            }
+                    })
+                    .response
+                    .rect
+            };
             egui::CentralPanel::no_frame().show(ui, |ui| {
-                let panel_ids = panel_contexts
+                let panel_inputs = panel_contexts
                     .iter()
-                    .map(|(id, ..)| *id)
-                    .collect::<Vec<_>>();
-                let cytobands = panel_contexts
-                    .iter()
-                    .map(|(_, _, _, viewport, _)| {
-                        if assembly
+                    .map(|(id, name, length, viewport, _)| {
+                        let cytobands = if assembly
                             .cytobands_for(viewport.interval().contig())
                             .next()
                             .is_some()
@@ -1454,24 +1455,33 @@ impl Viewer {
                             ui::CytobandAvailability::Present
                         } else {
                             ui::CytobandAvailability::Absent
+                        };
+                        ui::WorkspacePanelLayoutInput {
+                            panel_id: *id,
+                            contig_name: name.clone(),
+                            contig_length: *length,
+                            cytobands,
                         }
                     })
                     .collect::<Vec<_>>();
-                let candidate_layout = ui::WorkspaceLayoutSnapshot::compute(
+                let layout_input = ui::WorkspaceLayoutInput::new(
                     ui.max_rect(),
-                    &panel_ids,
-                    &cytobands,
+                    properties_rect,
+                    displayed_properties_expanded,
+                    panel_inputs,
                     ui::GenomeContextMetrics::measured(ui),
+                    self.window.scale_factor() as f32,
+                    self.egui_context.zoom_factor(),
+                );
+                let candidate_layout = ui::WorkspaceLayoutSnapshot::compute(
+                    layout_input.clone(),
                     previous_workspace_layout.revision,
                 );
                 let workspace_layout = if candidate_layout == previous_workspace_layout {
                     candidate_layout
                 } else {
                     ui::WorkspaceLayoutSnapshot::compute(
-                        ui.max_rect(),
-                        &panel_ids,
-                        &cytobands,
-                        ui::GenomeContextMetrics::measured(ui),
+                        layout_input,
                         previous_workspace_layout.revision.saturating_add(1),
                     )
                 };

@@ -1,6 +1,27 @@
 use super::super::*;
 
 #[test]
+fn shell_resize_refreshes_only_after_crossing_a_query_resolution_boundary() {
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 20_000).unwrap();
+    let previous =
+        AlignmentQueryResolution::for_viewport(Viewport::new(interval, 1_000.0).unwrap());
+    let same_bucket =
+        AlignmentQueryResolution::for_viewport(Viewport::new(interval, 1_020.0).unwrap());
+    let next_bucket =
+        AlignmentQueryResolution::for_viewport(Viewport::new(interval, 1_090.0).unwrap());
+
+    assert!(!same_bucket.requires_refresh_from(previous));
+    assert!(next_bucket.requires_refresh_from(previous));
+
+    let read_interval = GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap();
+    let allele_exact =
+        AlignmentQueryResolution::for_viewport(Viewport::new(read_interval, 600.0).unwrap());
+    let aggregated =
+        AlignmentQueryResolution::for_viewport(Viewport::new(read_interval, 400.0).unwrap());
+    assert!(aggregated.requires_refresh_from(allele_exact));
+}
+
+#[test]
 fn coverage_alleles_are_collected_at_read_detail_with_exact_bounded_bins() {
     let (bins, collect_alleles) = alignment_coverage_query_plan(1_060, 1_390.0, 0.763);
     assert_eq!(bins, 1_060);

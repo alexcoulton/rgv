@@ -13,14 +13,26 @@ impl Viewer {
             return;
         }
         self.pending_resolution_query_refresh = None;
-        self.resize_query_refreshes = self.resize_query_refreshes.saturating_add(1);
+        let mut source_refresh_requested = false;
         let active_id = self.panels.active().id;
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
             self.panels.activate(id);
-            self.retain_active_read_selection_for_query_refresh();
-            self.advance_alignment_generations(id);
-            self.request_alignment_query();
+            let resolution = AlignmentQueryResolution::for_viewport(self.panels.active().viewport);
+            let alignment_refresh_required = self.alignment_tracks.iter().any(|track| {
+                matches!(track.lifecycle, AlignmentTrackLifecycle::Ready)
+                    && track.projection(id).is_none_or(|projection| {
+                        projection
+                            .last_query_resolution
+                            .is_none_or(|previous| resolution.requires_refresh_from(previous))
+                    })
+            });
+            if alignment_refresh_required {
+                self.retain_active_read_selection_for_query_refresh();
+                self.advance_alignment_generations(id);
+                self.request_alignment_query();
+                source_refresh_requested = true;
+            }
             let reference_missing = self.reference_engine.is_some()
                 && self.panels.active().viewport.bases_per_pixel()
                     <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
@@ -36,9 +48,13 @@ impl Viewer {
                     });
             if reference_missing {
                 self.request_reference_query();
+                source_refresh_requested = true;
             }
         }
         self.panels.activate(active_id);
+        if source_refresh_requested {
+            self.resize_query_refreshes = self.resize_query_refreshes.saturating_add(1);
+        }
     }
 
     pub(crate) fn request_track_query(&mut self) {

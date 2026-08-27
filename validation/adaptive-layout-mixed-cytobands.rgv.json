@@ -1,0 +1,41 @@
+{
+  "schema_version": 3,
+  "locus": {
+    "contig": "chrPresent",
+    "start": 5,
+    "end": 70
+  },
+  "panels": [
+    {
+      "id": 1,
+      "locus": {
+        "contig": "chrPresent",
+        "start": 5,
+        "end": 70
+      }
+    },
+    {
+      "id": 2,
+      "locus": {
+        "contig": "chrAbsent",
+        "start": 5,
+        "end": 70
+      }
+    }
+  ],
+  "active_panel": 1,
+  "alignment_tracks": [],
+  "reference": {
+    "Local": {
+      "path": "adaptive-layout-reference.fa"
+    }
+  },
+  "genome_name": "RGV adaptive layout mixed-cytoband qualification",
+  "cytobands": {
+    "Local": {
+      "path": "adaptive-layout-cytobands.txt"
+    }
+  },
+  "tracks": [],
+  "maximum_alignments": 50000
+}
