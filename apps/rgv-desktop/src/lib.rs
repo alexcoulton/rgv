@@ -665,9 +665,15 @@ fn clear_removed_alignment_panel_state(
     if panel
         .pending_read_selection
         .as_ref()
-        .is_some_and(|(track_id, _)| *track_id == removed)
+        .is_some_and(|pending| pending.track_id == removed)
     {
         panel.pending_read_selection = None;
+    }
+    if panel
+        .pending_read_reveal
+        .is_some_and(|(track_id, _)| track_id == removed)
+    {
+        panel.pending_read_reveal = None;
     }
     panel.hovered_record = panel
         .hovered_record

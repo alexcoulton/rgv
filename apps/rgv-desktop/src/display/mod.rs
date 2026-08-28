@@ -1441,6 +1441,7 @@ impl Viewer {
                     track_id: primary_alignment_id,
                     scrollable: primary_read_display,
                     density_camera: true,
+                    row_origin: Some(options.reads_top),
                     row_height: Some(options.row_height),
                     row_layout_revision: self
                         .alignment_tracks
@@ -1966,6 +1967,7 @@ impl Viewer {
                         track_id,
                         scrollable: read_display,
                         density_camera: true,
+                        row_origin: Some(read_bounds.top + READ_PANE_HEADER_HEIGHT),
                         row_height: Some(row_height),
                         row_layout_revision: row_revision,
                         overview: ui::ScrollbarOverview::default(),
@@ -2101,6 +2103,7 @@ impl Viewer {
                             })
                     },
                     density_camera: false,
+                    row_origin: None,
                     row_height: None,
                     row_layout_revision: None,
                     overview: ui::ScrollbarOverview::default(),
@@ -2706,6 +2709,7 @@ impl Viewer {
                     read_panel.clip_top,
                     read_panel.clip_bottom,
                     read_panel.density_camera,
+                    read_panel.row_origin,
                     read_panel.row_height,
                     read_panel.row_layout_revision,
                     self.alignment_density_for_panel_track(
@@ -2716,6 +2720,22 @@ impl Viewer {
             })
             .collect::<Vec<_>>();
         let primary_track_id = self.primary_alignment_track_id();
+        let pending_read_reveal =
+            self.panels
+                .active()
+                .pending_read_reveal
+                .and_then(|(track_id, record_index)| {
+                    let row = self
+                        .alignment_tracks
+                        .iter()
+                        .find(|track| track.config.id == track_id)?
+                        .projection(active_panel_id)?
+                        .alignment_rows
+                        .as_ref()?
+                        .layout
+                        .row(record_index)?;
+                    Some((track_id, row))
+                });
         let annotation_scroll = if self.track_presentation.annotation_section_expanded {
             self.panels.annotation_scroll_points.clamp(
                 0.0,
@@ -2748,6 +2768,7 @@ impl Viewer {
             clip_top,
             clip_bottom,
             density_camera,
+            row_origin,
             row_height,
             row_layout_revision,
             density,
@@ -2792,6 +2813,24 @@ impl Viewer {
                 density_drag_fraction,
             );
             state.content_bottom_points = clip_bottom + maximum_scroll;
+            if let (Some((reveal_track, row)), Some(row_origin), Some(row_height)) =
+                (pending_read_reveal, *row_origin, *row_height)
+                && reveal_track == *track_id
+            {
+                let maximum_effective = (maximum_scroll - state.content_origin_points).max(0.0);
+                let effective_scroll = center_read_row_scroll(
+                    row_origin,
+                    row_height,
+                    row,
+                    *clip_top,
+                    *clip_bottom,
+                    maximum_effective,
+                );
+                state.scroll_points = state.content_origin_points + effective_scroll;
+                state.latent_scroll_fraction = (maximum_scroll > f32::EPSILON)
+                    .then_some((state.scroll_points / maximum_scroll).clamp(0.0, 1.0));
+                panel.pending_read_reveal = None;
+            }
             if let (Some(row_height), Some(layout_revision)) = (*row_height, *row_layout_revision)
                 && row_height > f32::EPSILON
             {
@@ -3386,6 +3425,8 @@ impl Viewer {
         let logical_height = self.surface_config.height as f32 / self.window.scale_factor() as f32;
         let logical_width = self.surface_config.width as f32 / self.window.scale_factor() as f32;
         let mut render_display = DisplayList::default();
+        let primary_track_id = self.primary_alignment_track_id();
+        let active_panel_id = self.panels.active().id;
         for panel in self.panels.iter() {
             let source = if matches!(
                 panel.navigation_presentation.preview_kind,
@@ -3397,9 +3438,28 @@ impl Viewer {
                 Some(&panel.display_list)
             };
             if let Some(source) = source {
+                let selected_object_id = (panel.navigation_presentation.is_interactive()
+                    && panel.selected_alignment_track == Some(primary_track_id))
+                .then_some(panel.selected_record)
+                .flatten()
+                .and_then(|index| u32::try_from(index + 1).ok());
+                let hovered_object_id = (panel.id == active_panel_id
+                    && panel.navigation_presentation.is_interactive())
+                .then_some(panel.hovered_record)
+                .flatten()
+                .filter(|(track_id, _)| *track_id == primary_track_id)
+                .and_then(|(_, index)| u32::try_from(index + 1).ok());
                 render_display
                     .rectangles
-                    .extend(source.rectangles.iter().copied());
+                    .extend(source.rectangles.iter().copied().map(|mut rectangle| {
+                        let selected = selected_object_id
+                            .is_some_and(|object_id| rectangle.object_id == object_id);
+                        let hovered = hovered_object_id
+                            .is_some_and(|object_id| rectangle.object_id == object_id);
+                        rectangle.color =
+                            read_interaction_highlight_color(rectangle.color, selected, hovered);
+                        rectangle
+                    }));
             }
         }
         self.rectangle_renderer.prepare(
@@ -3407,24 +3467,8 @@ impl Viewer {
             &self.queue,
             [logical_width, logical_height],
             &render_display,
-            (self
-                .panels
-                .active()
-                .navigation_presentation
-                .is_interactive()
-                && self.panels.active().selected_alignment_track
-                    == Some(self.primary_alignment_track_id()))
-            .then_some(self.panels.active().selected_record)
-            .flatten()
-            .and_then(|index| u32::try_from(index + 1).ok()),
-            self.panels
-                .active()
-                .navigation_presentation
-                .is_interactive()
-                .then_some(self.panels.active().hovered_record)
-                .flatten()
-                .filter(|(track_id, _)| *track_id == self.primary_alignment_track_id())
-                .and_then(|(_, index)| u32::try_from(index + 1).ok()),
+            None,
+            None,
         );
         if let Some(started) = trace_started {
             let stats = self.rectangle_renderer.last_prepare_stats();
@@ -3438,4 +3482,20 @@ impl Viewer {
         }
         self.display_upload_pending_metrics = true;
     }
+}
+
+pub(crate) fn read_interaction_highlight_color(color: Rgba, selected: bool, hovered: bool) -> Rgba {
+    let (target, amount) = if selected {
+        ([0.16, 0.42, 0.92], 0.58)
+    } else if hovered {
+        ([0.28, 0.52, 0.94], 0.26)
+    } else {
+        return color;
+    };
+    Rgba::new(
+        color.red * (1.0 - amount) + target[0] * amount,
+        color.green * (1.0 - amount) + target[1] * amount,
+        color.blue * (1.0 - amount) + target[2] * amount,
+        1.0,
+    )
 }

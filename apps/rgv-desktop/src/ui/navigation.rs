@@ -125,6 +125,7 @@ impl GenomeOverviewData {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct OverviewInteraction {
+    pub activate_requested: bool,
     pub clicked_position: Option<u64>,
     pub pointer_position: Option<u64>,
     pub pointer_x: Option<f64>,
@@ -249,10 +250,36 @@ pub fn paint_genome_context(
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, Color32::from_gray(250));
     let metadata_font = FontId::proportional(11.0);
+    let panel_label = format!("Panel {id_salt}");
+    let panel_font = FontId::proportional(10.0);
+    let panel_size = painter
+        .layout_no_wrap(panel_label.clone(), panel_font.clone(), Color32::WHITE)
+        .size();
+    let panel_label_rect = Rect::from_min_size(
+        pos2(
+            rows.metadata.left(),
+            rows.metadata.center().y - panel_size.y * 0.5,
+        ),
+        panel_size,
+    );
+    painter.text(
+        panel_label_rect.left_center(),
+        Align2::LEFT_CENTER,
+        &panel_label,
+        panel_font,
+        Color32::from_rgb(45, 92, 175),
+    );
+    let metadata_text_row = Rect::from_min_max(
+        pos2(
+            (panel_label_rect.right() + 9.0).min(rows.metadata.right()),
+            rows.metadata.top(),
+        ),
+        rows.metadata.max,
+    );
     let length_label = format!("{} bp", format_genomic_position(contig_length));
     let metadata = layout_metadata_text(
         &painter,
-        rows.metadata,
+        metadata_text_row,
         contig_name,
         contig_length,
         &metadata_font,
@@ -276,17 +303,18 @@ pub fn paint_genome_context(
         );
     }
     let metadata_id = egui::Id::new(("genome-context-metadata", id_salt));
-    let metadata_accessibility_label = format!("Contig {contig_name}; total length {length_label}");
-    let metadata_response = ui.interact(
-        rows.metadata,
-        metadata_id,
-        egui::Sense::focusable_noninteractive(),
-    );
+    let metadata_accessibility_label =
+        format!("{panel_label}; Contig {contig_name}; total length {length_label}");
+    let metadata_response = ui.interact(rows.metadata, metadata_id, egui::Sense::click());
     metadata_response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &metadata_accessibility_label)
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            true,
+            &metadata_accessibility_label,
+        )
     });
     ui.ctx().accesskit_node_builder(metadata_id, |node| {
-        node.set_role(egui::accesskit::Role::Label);
+        node.set_role(egui::accesskit::Role::Button);
         node.set_label(metadata_accessibility_label.clone());
         node.set_bounds(egui::accesskit::Rect {
             x0: f64::from(rows.metadata.left()),
@@ -295,7 +323,10 @@ pub fn paint_genome_context(
             y1: f64::from(rows.metadata.bottom()),
         });
     });
-    metadata_response.on_hover_text(format!("{contig_name} · {length_label}"));
+    let activate_requested = metadata_response.clicked();
+    metadata_response.on_hover_text(format!(
+        "Activate {panel_label} · {contig_name} · {length_label}"
+    ));
 
     let overview_rect = rows.overview;
     let ideogram = layout_ideogram(
@@ -488,6 +519,7 @@ pub fn paint_genome_context(
     let clicked_on_handle = overview_response.clicked()
         && pointer_position.is_some_and(|pointer| handle_hit_rect.contains(pointer));
     OverviewInteraction {
+        activate_requested,
         clicked_position: (overview_response.clicked()
             && !overview_response.double_clicked()
             && !clicked_on_handle)

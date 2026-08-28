@@ -34,13 +34,10 @@ fn read_selection_for_query_refresh(
     selected_record: Option<usize>,
     query_track: TrackId,
     query: &AlignmentQuery,
-) -> Option<(TrackId, Vec<u8>)> {
+) -> Option<PendingReadSelection> {
     let track_id = selected_track.filter(|selected| *selected == query_track)?;
-    let read_name = query
-        .batch
-        .read_name(selected_record?)
-        .filter(|name| !name.is_empty())?;
-    Some((track_id, read_name.to_vec()))
+    let record = query.materialize_record(selected_record?).ok()?;
+    PendingReadSelection::for_record(track_id, &record)
 }
 
 fn pointer_targets_unobstructed_canvas(
@@ -403,16 +400,20 @@ impl Viewer {
     /// Alignment object IDs are query-local record indexes. Keeping the index
     /// alone would either drop the highlight or select an unrelated record
     /// when a zoom changes the loaded query. The read name is stable across
-    /// detail levels, so query completion can atomically rebind the selection
-    /// to its new record index.
+    /// detail levels. Contig/start and template-end identity disambiguate
+    /// paired or supplementary records which legitimately share that name.
     pub(crate) fn retain_active_read_selection_for_query_refresh(&mut self) {
         let Some(track_id) = self.panels.active().selected_alignment_track else {
             return;
         };
+        if self.panels.active().pending_read_selection.is_some() {
+            // The semantic identity is the authority once it has been
+            // captured. A record index may already belong to a replacement
+            // query, so never use it to overwrite that identity during a
+            // later refresh.
+            return;
+        }
         if self.panels.active().selected_record.is_none() {
-            // A selection that is temporarily outside the loaded interval is
-            // already represented by pending_read_selection. Leave it intact
-            // so a later query can bind it again.
             return;
         }
         let Some(pending) = self
@@ -1165,6 +1166,9 @@ impl Viewer {
         self.refresh_active_panel_context();
         self.display_dirty = true;
         if changed && !self.synthetic {
+            // A panel switch must not turn its semantic selection back into an
+            // unsafe query-local record index when activation refreshes data.
+            self.retain_active_read_selection_for_query_refresh();
             self.request_alignment_query();
             self.request_reference_query();
             self.request_track_query();
@@ -1465,7 +1469,7 @@ mod tests {
 
         assert_eq!(
             read_selection_for_query_refresh(Some(track_id), Some(0), track_id, &query),
-            Some((track_id, b"selected-read".to_vec()))
+            PendingReadSelection::for_record(track_id, &query.materialize_record(0).unwrap())
         );
         assert_eq!(
             read_selection_for_query_refresh(Some(track_id), Some(1), track_id, &query),
@@ -1475,6 +1479,151 @@ mod tests {
             read_selection_for_query_refresh(Some(TrackId::new(8)), Some(0), track_id, &query),
             None
         );
+    }
+
+    #[test]
+    fn mate_selection_targets_the_exact_opposite_template_end() {
+        let contig = ContigId::new(0);
+        let interval = GenomicInterval::new(contig, 50, 260).unwrap();
+        let mut query = gesture_query(interval);
+        let record = |start, flags, mate_start| AlignmentRecord {
+            contig,
+            start,
+            end: start + 40,
+            flags: rgv_hts::AlignmentFlags::from_bits(flags),
+            mapping_quality: Some(60),
+            mate_contig: Some(contig),
+            mate_start: Some(mate_start),
+            template_length: 140,
+            read_name: b"paired-read".to_vec(),
+            cigar: Vec::new(),
+            sequence: rgv_hts::SequenceData::NotLoaded,
+            auxiliary_fields: Vec::new(),
+        };
+        let first = record(100, 0x41, 200);
+        let last = record(200, 0x81, 100);
+        query.batch.push(&first).unwrap();
+        query.batch.push(&last).unwrap();
+        let track_id = TrackId::new(7);
+
+        assert_eq!(
+            PendingReadSelection::for_record(track_id, &first)
+                .unwrap()
+                .matching_index(&query),
+            Some(0)
+        );
+        assert_eq!(
+            PendingReadSelection::for_mate(track_id, &first)
+                .unwrap()
+                .matching_index(&query),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn resolved_read_identity_rebinds_when_zoom_out_changes_its_index() {
+        let contig = ContigId::new(0);
+        let interval = GenomicInterval::new(contig, 50, 300).unwrap();
+        let record = |name: &[u8], start| AlignmentRecord {
+            contig,
+            start,
+            end: start + 25,
+            flags: rgv_hts::AlignmentFlags::from_bits(0),
+            mapping_quality: Some(60),
+            mate_contig: None,
+            mate_start: None,
+            template_length: 0,
+            read_name: name.to_vec(),
+            cigar: Vec::new(),
+            sequence: rgv_hts::SequenceData::NotLoaded,
+            auxiliary_fields: Vec::new(),
+        };
+        let selected = record(b"selected-read", 150);
+        let track_id = TrackId::new(7);
+        let identity = PendingReadSelection::for_record(track_id, &selected).unwrap();
+
+        let mut wider_query = gesture_query(interval);
+        wider_query
+            .batch
+            .push(&record(b"newly-fetched-read", 75))
+            .unwrap();
+        wider_query.batch.push(&selected).unwrap();
+        assert_eq!(identity.matching_index(&wider_query), Some(1));
+
+        let rebound_record = wider_query.materialize_record(1).unwrap();
+        let (retained, reveal) = identity.retained_after_resolution(Some(&rebound_record));
+        assert!(!reveal);
+        assert_eq!(retained.matching_index(&wider_query), Some(1));
+
+        let mut widest_query = gesture_query(interval);
+        widest_query
+            .batch
+            .push(&record(b"another-new-read", 55))
+            .unwrap();
+        widest_query
+            .batch
+            .push(&record(b"newly-fetched-read", 75))
+            .unwrap();
+        widest_query.batch.push(&selected).unwrap();
+        assert_eq!(retained.matching_index(&widest_query), Some(2));
+    }
+
+    #[test]
+    fn mate_panel_identities_rebind_independently_after_zoom_out() {
+        let contig = ContigId::new(0);
+        let interval = GenomicInterval::new(contig, 50, 350).unwrap();
+        let paired_record = |start, flags, mate_start| AlignmentRecord {
+            contig,
+            start,
+            end: start + 40,
+            flags: rgv_hts::AlignmentFlags::from_bits(flags),
+            mapping_quality: Some(60),
+            mate_contig: Some(contig),
+            mate_start: Some(mate_start),
+            template_length: 140,
+            read_name: b"paired-read".to_vec(),
+            cigar: Vec::new(),
+            sequence: rgv_hts::SequenceData::NotLoaded,
+            auxiliary_fields: Vec::new(),
+        };
+        let unrelated = |name: &[u8], start| AlignmentRecord {
+            read_name: name.to_vec(),
+            ..paired_record(start, 0, start)
+        };
+        let first = paired_record(100, 0x41, 200);
+        let last = paired_record(200, 0x81, 100);
+        let track_id = TrackId::new(7);
+        let source_identity = PendingReadSelection::for_record(track_id, &first).unwrap();
+        let mate_identity = PendingReadSelection::for_mate(track_id, &first).unwrap();
+
+        let mut source_query = gesture_query(interval);
+        source_query
+            .batch
+            .push(&unrelated(b"source-prefix", 60))
+            .unwrap();
+        source_query.batch.push(&first).unwrap();
+        source_query.batch.push(&last).unwrap();
+
+        let mut mate_query = gesture_query(interval);
+        mate_query
+            .batch
+            .push(&unrelated(b"mate-prefix-a", 150))
+            .unwrap();
+        mate_query
+            .batch
+            .push(&unrelated(b"mate-prefix-b", 175))
+            .unwrap();
+        mate_query.batch.push(&last).unwrap();
+
+        assert_eq!(source_identity.matching_index(&source_query), Some(1));
+        assert_eq!(mate_identity.matching_index(&mate_query), Some(2));
+
+        let mate_record = mate_query.materialize_record(2).unwrap();
+        let (retained_mate, reveal) = mate_identity.retained_after_resolution(Some(&mate_record));
+        assert!(reveal);
+        assert_eq!(retained_mate.matching_index(&mate_query), Some(2));
+        let (_, reveal_again) = retained_mate.retained_after_resolution(Some(&mate_record));
+        assert!(!reveal_again);
     }
 
     #[test]

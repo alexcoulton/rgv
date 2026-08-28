@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::display::alignment;
 
 impl Viewer {
     pub(crate) fn visible_consensus(&self) -> Option<BoundedSequenceCopy> {
@@ -36,7 +37,7 @@ impl Viewer {
         ))
     }
 
-    pub(crate) fn selected_mate_target(&self) -> Option<(TrackId, Vec<u8>, String)> {
+    pub(crate) fn selected_mate_target(&self) -> Option<(PendingReadSelection, String)> {
         let track_id = self.panels.active().selected_alignment_track?;
         let index = self.panels.active().selected_record?;
         let record = self
@@ -48,19 +49,24 @@ impl Viewer {
             self.alignment_dictionary_for_track(track_id)?,
             self.panels.active().viewport.interval().len(),
         )?;
-        Some((track_id, record.read_name, locus))
+        Some((PendingReadSelection::for_mate(track_id, &record)?, locus))
     }
 
     pub(crate) fn open_selected_mate_in_new_panel(&mut self) -> Result<PanelId> {
-        let (track_id, read_name, locus) = self
+        let (pending_selection, locus) = self
             .selected_mate_target()
             .context("the selected read has no mapped mate location")?;
+        let track_id = pending_selection.track_id;
+        // Adding a panel resizes and refreshes every viewport. Capture the
+        // source identity before any of those transitions can invalidate its
+        // query-local record index.
+        self.retain_active_read_selection_for_query_refresh();
         let id = self.add_view_panel(&locus)?;
         let panel = self
             .panels
             .get_mut(id)
             .context("new mate panel is unavailable")?;
-        panel.pending_read_selection = Some((track_id, read_name));
+        panel.pending_read_selection = Some(pending_selection);
         panel.selected_alignment_track = Some(track_id);
         replace_panel_track_selection(
             panel,
@@ -133,7 +139,7 @@ impl Viewer {
             .panels
             .get_mut(id)
             .context("new supplementary panel is unavailable")?;
-        panel.pending_read_selection = Some((track_id, read_name));
+        panel.pending_read_selection = PendingReadSelection::by_name(track_id, read_name);
         panel.selected_alignment_track = Some(track_id);
         replace_panel_track_selection(
             panel,
@@ -179,7 +185,8 @@ impl Viewer {
                 .panels
                 .get_mut(id)
                 .context("new supplementary panel is unavailable")?;
-            panel.pending_read_selection = Some((track_id, chain.read_name.clone()));
+            panel.pending_read_selection =
+                PendingReadSelection::by_name(track_id, chain.read_name.clone());
             panel.selected_alignment_track = Some(track_id);
             replace_panel_track_selection(
                 panel,
@@ -200,20 +207,34 @@ impl Viewer {
         track_id: TrackId,
         query: &AlignmentQuery,
     ) {
-        let Some((pending_track, read_name)) = self
+        let Some(pending_selection) = self
             .panels
             .get(panel_id)
             .and_then(|panel| panel.pending_read_selection.clone())
         else {
             return;
         };
-        if pending_track != track_id {
+        if pending_selection.track_id != track_id {
             return;
         }
-        if self
-            .complete_read_query_for_track_in_panel(track_id, panel_id)
-            .is_none()
-        {
+        let complete = self
+            .alignment_tracks
+            .iter()
+            .find(|track| track.config.id == track_id)
+            .and_then(|track| {
+                let projection = track.projection(panel_id)?;
+                let layout_query = projection.layout_query.as_deref().unwrap_or(query);
+                Some(
+                    alignment::individual_read_refusal(
+                        query,
+                        layout_query,
+                        track.config.filters.read_stacking_mode,
+                    )
+                    .is_none(),
+                )
+            })
+            .unwrap_or(false);
+        if !complete {
             if let Some(panel) = self.panels.get_mut(panel_id) {
                 panel.selected_record = None;
                 panel.selected_read_event = None;
@@ -221,9 +242,7 @@ impl Viewer {
             }
             return;
         }
-        let Some(index) = (0..query.batch.len())
-            .find(|index| query.batch.read_name(*index) == Some(read_name.as_slice()))
-        else {
+        let Some(index) = pending_selection.matching_index(query) else {
             // The selected read may be outside this query's interval. Its old
             // numeric index is unsafe against the new batch, but retain the
             // stable pending identity so it can reappear after navigation.
@@ -238,12 +257,20 @@ impl Viewer {
             .get(panel_id)
             .map(|panel| panel.contig_name.clone())
             .unwrap_or_default();
-        let selected_chain = query
-            .materialize_record(index)
-            .ok()
-            .and_then(|record| selected_supplementary_chain(&record, &contig_name));
+        let selected_record = query.materialize_record(index).ok();
+        let selected_chain = selected_record
+            .as_ref()
+            .and_then(|record| selected_supplementary_chain(record, &contig_name));
+        let (retained_selection, reveal) =
+            pending_selection.retained_after_resolution(selected_record.as_ref());
         if let Some(panel) = self.panels.get_mut(panel_id) {
-            panel.pending_read_selection = None;
+            if reveal {
+                panel.pending_read_reveal = Some((track_id, index));
+            }
+            // Record indexes belong to one query batch. Keep the exact read
+            // identity as the panel's durable selection so every later zoom,
+            // pan, or workspace refresh can bind it again.
+            panel.pending_read_selection = Some(retained_selection);
             panel.selected_record = Some(index);
             panel.selected_alignment_track = Some(track_id);
             replace_panel_track_selection(
@@ -251,9 +278,7 @@ impl Viewer {
                 TrackFrameKey::Alignment(track_id),
                 ui::TrackPane::Reads,
             );
-            if selected_chain.is_some() {
-                panel.selected_chain = selected_chain;
-            }
+            panel.selected_chain = selected_chain;
         }
     }
 }

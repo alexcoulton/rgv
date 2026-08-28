@@ -173,6 +173,7 @@ impl Viewer {
             self.panels.active_mut().selected_junction = None;
             self.panels.active_mut().selected_chain = selected_chain;
         }
+        self.retain_active_read_selection_for_query_refresh();
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
         let selected_track = self
             .visible_track_frame_at_screen_y(cursor_y, |_| true)
@@ -1004,6 +1005,8 @@ impl Viewer {
             TrackFrameKey::Alignment(track_id),
             ui::TrackPane::Annotation,
         );
+        self.panels.active_mut().pending_read_selection = None;
+        self.panels.active_mut().pending_read_reveal = None;
         self.panels.active_mut().selected_record = None;
         self.panels.active_mut().selected_read_event = None;
         self.panels.active_mut().selected_junction = None;
@@ -1246,6 +1249,7 @@ impl Viewer {
                 selected_supplementary_chain(&record, &self.panels.active().contig_name)
             });
         self.panels.active_mut().selected_chain = selected_chain;
+        self.retain_active_read_selection_for_query_refresh();
         let primary_track_id = self.primary_alignment_track_id();
         replace_panel_track_selection(
             self.panels.active_mut(),
@@ -1256,6 +1260,8 @@ impl Viewer {
     }
 
     pub(crate) fn clear_semantic_evidence_selection(&mut self) {
+        self.panels.active_mut().pending_read_selection = None;
+        self.panels.active_mut().pending_read_reveal = None;
         self.panels.active_mut().selected_record = None;
         self.panels.active_mut().selected_alignment_track = None;
         self.panels.active_mut().selected_read_event = None;
@@ -1481,6 +1487,7 @@ impl Viewer {
                 );
             }
         }
+        self.retain_active_read_selection_for_query_refresh();
         self.display_dirty = true;
     }
 
@@ -1543,6 +1550,7 @@ impl Viewer {
         self.panels.active_mut().selected_junction = None;
         self.panels.active_mut().selected_junction_component = None;
         self.panels.active_mut().selected_chain = chain;
+        self.retain_active_read_selection_for_query_refresh();
         self.display_dirty = true;
         true
     }

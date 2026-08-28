@@ -730,6 +730,8 @@ impl Viewer {
                     self.panels.active_mut().selected_modification_position = None;
                 }
                 AlignmentSubtrack::Reads => {
+                    self.panels.active_mut().pending_read_selection = None;
+                    self.panels.active_mut().pending_read_reveal = None;
                     self.panels.active_mut().selected_record = None;
                     self.panels.active_mut().selected_read_event = None;
                     self.panels.active_mut().selected_chain = None;

@@ -384,6 +384,7 @@ impl Viewer {
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
             self.panels.activate(id);
+            self.retain_active_read_selection_for_query_refresh();
             self.request_alignment_query();
             self.request_reference_query();
             self.request_track_query();
@@ -396,6 +397,7 @@ impl Viewer {
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
             self.panels.activate(id);
+            self.retain_active_read_selection_for_query_refresh();
             self.request_alignment_query();
         }
         self.panels.activate(active_id);
@@ -930,7 +932,7 @@ impl Viewer {
                         let has_pending_selection = panel
                             .pending_read_selection
                             .as_ref()
-                            .is_some_and(|(pending_track, _)| *pending_track == track_id);
+                            .is_some_and(|pending| pending.track_id == track_id);
                         panel.selected_record = None;
                         panel.selected_read_event = None;
                         if !has_pending_selection {

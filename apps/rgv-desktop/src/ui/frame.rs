@@ -1534,6 +1534,11 @@ impl Viewer {
                             );
                         });
                         ui.separator();
+                        if let Some(panel_id) =
+                            ui::inspectors::show_inspected_item_switcher(self, ui)
+                        {
+                            panel_to_activate = Some(panel_id);
+                        }
                         egui::ScrollArea::vertical()
                             .id_salt("properties-panel-scroll")
                             .auto_shrink([false, false])
@@ -1676,6 +1681,7 @@ impl Viewer {
                         panel_layout,
                     );
                     if interaction.pointer_down
+                        || interaction.activate_requested
                         || interaction.clicked_position.is_some()
                         || interaction.show_all
                         || interaction.keyboard_pan_fraction.is_some()

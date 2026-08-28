@@ -1087,7 +1087,8 @@ fn alignment_removal_clears_deleted_identity_from_every_panel() {
         truncated: false,
         invalid_tag_type: false,
     });
-    selected.pending_read_selection = Some((removed, b"pending-read".to_vec()));
+    selected.pending_read_selection =
+        PendingReadSelection::by_name(removed, b"pending-read".to_vec());
     selected.hovered_record = Some((removed, 3));
     selected.hover_inspector_target = Some(HoverInspectorTarget::Pileup(removed, 120));
     selected.selected_track = Some(TrackFrameKey::Alignment(removed));

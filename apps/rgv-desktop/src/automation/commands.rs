@@ -3745,6 +3745,8 @@ impl Viewer {
         );
         self.panels.active_mut().selected_record = Some(target.record_index);
         self.panels.active_mut().selected_chain = chain;
+        self.panels.active_mut().pending_read_selection =
+            PendingReadSelection::for_record(target.track_id, &record);
         self.bump_workspace_revision();
         self.retain_active_selection(None);
         self.rebuild_genomic_display();
@@ -3768,7 +3770,7 @@ impl Viewer {
             };
             self.apply_automation_viewport_operation(target.panel_id, operation)?;
             self.panels.active_mut().pending_read_selection =
-                Some((target.track_id, record.read_name.clone()));
+                PendingReadSelection::for_record(target.track_id, &record);
             navigated = true;
         }
         let interval = self.panels.active().viewport.interval();
@@ -3857,12 +3859,13 @@ impl Viewer {
                 AutomationAlignmentRelationship::Mate,
                 AutomationNavigationDestination::CurrentPanel,
             ) => {
-                let (track_id, read_name, locus) = self
+                let (pending_selection, locus) = self
                     .selected_mate_target()
                     .context("the selected alignment has no mapped mate")?;
+                let track_id = pending_selection.track_id;
                 self.navigate_to_locus(&locus)?;
                 let panel = self.panels.active_mut();
-                panel.pending_read_selection = Some((track_id, read_name));
+                panel.pending_read_selection = Some(pending_selection);
                 panel.selected_alignment_track = Some(track_id);
                 panel.id
             }

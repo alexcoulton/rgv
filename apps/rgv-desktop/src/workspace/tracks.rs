@@ -629,6 +629,8 @@ impl Viewer {
                             .is_some_and(|id| members.contains(&id))
                     {
                         panel.selected_alignment_track = None;
+                        panel.pending_read_selection = None;
+                        panel.pending_read_reveal = None;
                         panel.selected_record = None;
                         panel.selected_read_event = None;
                         panel.selected_chain = None;

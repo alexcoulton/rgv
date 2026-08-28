@@ -24,6 +24,8 @@ pub(crate) struct ReadPanelDisplayCache {
     pub(crate) track_id: TrackId,
     pub(crate) scrollable: DisplayList,
     pub(crate) density_camera: bool,
+    /// World-space y coordinate of stable read row zero.
+    pub(crate) row_origin: Option<f32>,
     pub(crate) row_height: Option<f32>,
     pub(crate) row_layout_revision: Option<u64>,
     pub(crate) overview: ScrollbarOverview,
@@ -52,6 +54,106 @@ pub(crate) struct ReadPanelScrollState {
     /// Stable row at the top of the viewport plus the fractional offset into
     /// it. This survives changes in total stack height and row density.
     pub(crate) stable_row_anchor: Option<StableRowCameraAnchor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TemplateReadEnd {
+    First,
+    Last,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingReadSelection {
+    pub(crate) track_id: TrackId,
+    pub(crate) read_name: Vec<u8>,
+    pub(crate) target_contig: Option<ContigId>,
+    pub(crate) target_start: Option<u64>,
+    pub(crate) template_end: Option<TemplateReadEnd>,
+    /// Center the resolved record in its read pane without changing its row.
+    pub(crate) reveal_when_resolved: bool,
+}
+
+impl PendingReadSelection {
+    pub(crate) fn by_name(track_id: TrackId, read_name: Vec<u8>) -> Option<Self> {
+        (!read_name.is_empty()).then_some(Self {
+            track_id,
+            read_name,
+            target_contig: None,
+            target_start: None,
+            template_end: None,
+            reveal_when_resolved: false,
+        })
+    }
+
+    pub(crate) fn for_record(track_id: TrackId, record: &AlignmentRecord) -> Option<Self> {
+        let mut selection = Self::by_name(track_id, record.read_name.clone())?;
+        selection.target_contig = Some(record.contig);
+        selection.target_start = Some(record.start);
+        selection.template_end = template_read_end(record.flags);
+        Some(selection)
+    }
+
+    pub(crate) fn for_mate(track_id: TrackId, record: &AlignmentRecord) -> Option<Self> {
+        if !record.flags.is_paired() || record.flags.is_mate_unmapped() {
+            return None;
+        }
+        let mut selection = Self::by_name(track_id, record.read_name.clone())?;
+        selection.target_contig = record.mate_contig;
+        selection.target_start = record.mate_start;
+        if selection.target_contig.is_none() || selection.target_start.is_none() {
+            return None;
+        }
+        selection.template_end = match template_read_end(record.flags) {
+            Some(TemplateReadEnd::First) => Some(TemplateReadEnd::Last),
+            Some(TemplateReadEnd::Last) => Some(TemplateReadEnd::First),
+            None => None,
+        };
+        selection.reveal_when_resolved = true;
+        Some(selection)
+    }
+
+    pub(crate) fn matching_index(&self, query: &AlignmentQuery) -> Option<usize> {
+        (0..query.batch.len()).find(|index| {
+            query.batch.read_name(*index) == Some(self.read_name.as_slice())
+                && self
+                    .target_contig
+                    .is_none_or(|contig| query.batch.contigs.get(*index) == Some(&contig))
+                && self
+                    .target_start
+                    .is_none_or(|start| query.batch.starts.get(*index) == Some(&start))
+                && self.template_end.is_none_or(|read_end| {
+                    query
+                        .batch
+                        .flags
+                        .get(*index)
+                        .is_some_and(|flags| template_read_end(*flags) == Some(read_end))
+                })
+        })
+    }
+
+    /// Keeps the exact semantic identity after binding it to one query-local
+    /// record index. Reveal is a one-shot navigation request; identity is not.
+    pub(crate) fn retained_after_resolution(
+        mut self,
+        record: Option<&AlignmentRecord>,
+    ) -> (Self, bool) {
+        let reveal = self.reveal_when_resolved;
+        if let Some(record) = record
+            && let Some(exact) = Self::for_record(self.track_id, record)
+        {
+            self = exact;
+        }
+        self.reveal_when_resolved = false;
+        (self, reveal)
+    }
+}
+
+fn template_read_end(flags: rgv_hts::AlignmentFlags) -> Option<TemplateReadEnd> {
+    match (flags.is_first_in_template(), flags.is_last_in_template()) {
+        (true, false) => Some(TemplateReadEnd::First),
+        (false, true) => Some(TemplateReadEnd::Last),
+        _ => None,
+    }
 }
 
 impl ReadPanelScrollState {
@@ -96,7 +198,10 @@ pub(crate) struct ViewPanelController {
     pub(crate) selected_interaction: Option<InteractionSelection>,
     pub(crate) selected_chain: Option<SelectedSupplementaryChain>,
     pub(crate) retained_evidence: Option<RetainedEvidenceSnapshot>,
-    pub(crate) pending_read_selection: Option<(TrackId, Vec<u8>)>,
+    /// Durable semantic identity of the selected read. `selected_record` is
+    /// merely this identity's index in the current alignment query.
+    pub(crate) pending_read_selection: Option<PendingReadSelection>,
+    pub(crate) pending_read_reveal: Option<(TrackId, usize)>,
     pub(crate) hovered_record: Option<(TrackId, usize)>,
     pub(crate) hover_inspector_target: Option<HoverInspectorTarget>,
     pub(crate) hovered_junction_arc: Option<JunctionArcHover>,
@@ -449,6 +554,7 @@ impl ViewPanelController {
             selected_chain: None,
             retained_evidence: None,
             pending_read_selection: None,
+            pending_read_reveal: None,
             hovered_record: None,
             hover_inspector_target: None,
             hovered_junction_arc: None,
@@ -522,6 +628,7 @@ impl ViewPanelController {
         self.selected_chain = None;
         self.retained_evidence = None;
         self.pending_read_selection = None;
+        self.pending_read_reveal = None;
         self.hovered_record = None;
         self.hover_inspector_target = None;
         self.hovered_junction_arc = None;

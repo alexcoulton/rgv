@@ -172,6 +172,28 @@ pub(crate) fn reconcile_vertical_scroll(
     (scroll, retained_fraction)
 }
 
+/// Centers a stable read row in its pane without changing the row assignment.
+pub(crate) fn center_read_row_scroll(
+    row_origin: f32,
+    row_height: f32,
+    row: usize,
+    clip_top: f32,
+    clip_bottom: f32,
+    maximum_scroll: f32,
+) -> f32 {
+    if !row_origin.is_finite()
+        || !row_height.is_finite()
+        || row_height <= f32::EPSILON
+        || !clip_top.is_finite()
+        || !clip_bottom.is_finite()
+    {
+        return 0.0;
+    }
+    let row_center = row_origin + (row as f32 + 0.5) * row_height;
+    let viewport_center = (clip_top + clip_bottom) * 0.5;
+    (row_center - viewport_center).clamp(0.0, maximum_scroll.max(0.0))
+}
+
 pub(crate) fn capture_stable_row_camera(
     effective_scroll: f32,
     row_height: f32,

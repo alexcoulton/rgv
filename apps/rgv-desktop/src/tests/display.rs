@@ -12,7 +12,7 @@ use crate::display::{
     READ_PANE_HEADER_HEIGHT, SYNTHETIC_READ_ROW_STRIDE, alignment_annotation_lane_heights,
     annotation_frame_content_height, append_annotation_pane_background,
     ensure_annotation_presentation_frames, pane_layout_snapshot, pinned_gene_track_height,
-    primary_pinned_gene_id, reflow_annotation_presentation,
+    primary_pinned_gene_id, read_interaction_highlight_color, reflow_annotation_presentation,
     reflow_annotation_presentation_with_heights, synthetic_read_rows_for_bounds,
     synthetic_section_display, track_section_geometry,
 };
@@ -1282,6 +1282,38 @@ fn vertical_overview_retains_its_camera_while_content_fits() {
         reconcile_vertical_scroll(300.0, 400.0, 600.0, retained, None);
     assert!((ordinary_scroll - 300.0).abs() < f32::EPSILON);
     assert_eq!(ordinary_fraction, Some(0.5));
+}
+
+#[test]
+fn mate_reveal_centers_the_stable_row_without_repacking_it() {
+    assert_eq!(
+        center_read_row_scroll(222.0, 7.0, 0, 200.0, 600.0, 800.0),
+        0.0
+    );
+    assert_eq!(
+        center_read_row_scroll(222.0, 7.0, 80, 200.0, 600.0, 800.0),
+        385.5
+    );
+    assert_eq!(
+        center_read_row_scroll(222.0, 7.0, 800, 200.0, 600.0, 800.0),
+        800.0
+    );
+}
+
+#[test]
+fn read_highlights_are_baked_per_panel_without_object_id_collisions() {
+    let original = Rgba::new(0.9, 0.3, 0.2, 0.8);
+    let selected = read_interaction_highlight_color(original, true, false);
+    let hovered = read_interaction_highlight_color(original, false, true);
+
+    assert_eq!(
+        read_interaction_highlight_color(original, false, false),
+        original
+    );
+    assert_eq!(selected.alpha, 1.0);
+    assert_eq!(hovered.alpha, 1.0);
+    assert!(selected.blue > hovered.blue);
+    assert!(selected.red < hovered.red);
 }
 
 #[test]

@@ -24,6 +24,238 @@ pub(crate) struct InspectorUiActions {
     pub(crate) variant_sample_search: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InspectedPanelItem {
+    panel_id: PanelId,
+    kind: String,
+    subject: Option<String>,
+    locus: String,
+    read_name: Option<Vec<u8>>,
+    template_end: Option<TemplateReadEnd>,
+}
+
+fn bounded_selection_subject(value: &[u8]) -> String {
+    const MAXIMUM_CHARACTERS: usize = 32;
+    let value = String::from_utf8_lossy(value);
+    let mut characters = value.chars();
+    let display = characters
+        .by_ref()
+        .take(MAXIMUM_CHARACTERS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        format!("{display}…")
+    } else {
+        display
+    }
+}
+
+fn panel_view_locus(panel: &ViewPanelController) -> String {
+    format!(
+        "{}:{}-{}",
+        panel.contig_name,
+        panel.viewport.interval().start().saturating_add(1),
+        panel.viewport.interval().end()
+    )
+}
+
+fn inspected_read_item(viewer: &Viewer, panel: &ViewPanelController) -> Option<InspectedPanelItem> {
+    let track_id = panel.selected_alignment_track.or_else(|| {
+        panel
+            .pending_read_selection
+            .as_ref()
+            .map(|pending| pending.track_id)
+    })?;
+    let resolved = panel.selected_record.and_then(|index| {
+        viewer
+            .complete_read_query_for_track_in_panel(track_id, panel.id)?
+            .materialize_record(index)
+            .ok()
+    });
+    let (read_name, template_end, locus) = if let Some(record) = resolved {
+        let template_end = match (
+            record.flags.is_first_in_template(),
+            record.flags.is_last_in_template(),
+        ) {
+            (true, false) => Some(TemplateReadEnd::First),
+            (false, true) => Some(TemplateReadEnd::Last),
+            _ => None,
+        };
+        (
+            record.read_name,
+            template_end,
+            format!(
+                "{}:{}-{}",
+                panel.contig_name,
+                record.start.saturating_add(1),
+                record.end
+            ),
+        )
+    } else {
+        let pending = panel.pending_read_selection.as_ref()?;
+        (
+            pending.read_name.clone(),
+            pending.template_end,
+            panel_view_locus(panel),
+        )
+    };
+    let kind = match template_end {
+        Some(TemplateReadEnd::First) => "Read 1/2",
+        Some(TemplateReadEnd::Last) => "Read 2/2",
+        None => "Read",
+    }
+    .to_owned();
+    Some(InspectedPanelItem {
+        panel_id: panel.id,
+        kind,
+        subject: (!read_name.is_empty()).then(|| bounded_selection_subject(&read_name)),
+        locus,
+        read_name: Some(read_name),
+        template_end,
+    })
+}
+
+fn inspected_panel_item(
+    viewer: &Viewer,
+    panel: &ViewPanelController,
+) -> Option<InspectedPanelItem> {
+    if panel.selected_record.is_some() || panel.pending_read_selection.is_some() {
+        return inspected_read_item(viewer, panel);
+    }
+    let (kind, subject) = if let Some(position) = panel.selected_pileup_position {
+        (
+            "Pileup",
+            Some(format!("{}:{}", panel.contig_name, position + 1)),
+        )
+    } else if let Some(position) = panel.selected_modification_position {
+        (
+            "Modification",
+            Some(format!("{}:{}", panel.contig_name, position + 1)),
+        )
+    } else if let Some((start, end)) = panel.selected_junction {
+        (
+            "Splice junction",
+            Some(format!("{}:{}-{}", panel.contig_name, start + 1, end)),
+        )
+    } else if panel.selected_feature.is_some() {
+        ("Feature", None)
+    } else if panel.selected_variant.is_some() {
+        ("Variant", None)
+    } else if panel.selected_gwas.is_some() {
+        ("Association", None)
+    } else if panel.selected_quantitative.is_some() {
+        ("Quantitative value", None)
+    } else if panel.selected_copy_number.is_some() {
+        ("Copy-number segment", None)
+    } else if panel.selected_mutation.is_some() {
+        ("Mutation", None)
+    } else if panel.selected_interaction.is_some() {
+        ("Interaction", None)
+    } else if panel.selected_chain.is_some() {
+        ("Supplementary chain", None)
+    } else {
+        return None;
+    };
+    Some(InspectedPanelItem {
+        panel_id: panel.id,
+        kind: kind.to_owned(),
+        subject,
+        locus: panel_view_locus(panel),
+        read_name: None,
+        template_end: None,
+    })
+}
+
+fn inspected_panel_items(viewer: &Viewer) -> Vec<InspectedPanelItem> {
+    viewer
+        .panels
+        .iter()
+        .filter_map(|panel| inspected_panel_item(viewer, panel))
+        .collect()
+}
+
+fn inspected_items_relationship(items: &[InspectedPanelItem]) -> Option<&'static str> {
+    let [first, second] = items else {
+        return None;
+    };
+    (first.read_name.is_some()
+        && first.read_name == second.read_name
+        && matches!(
+            (first.template_end, second.template_end),
+            (Some(TemplateReadEnd::First), Some(TemplateReadEnd::Last))
+                | (Some(TemplateReadEnd::Last), Some(TemplateReadEnd::First))
+        ))
+    .then_some("Mate pair")
+}
+
+/// Fixed navigation shown above the scrollable Properties document.
+pub(crate) fn show_inspected_item_switcher(viewer: &Viewer, ui: &mut egui::Ui) -> Option<PanelId> {
+    if viewer.panels.len() <= 1 {
+        return None;
+    }
+    let items = inspected_panel_items(viewer);
+    if items.is_empty() {
+        return None;
+    }
+    let relationship = inspected_items_relationship(&items);
+    ui.horizontal(|ui| {
+        ui.strong("Inspected items");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(relationship.map_or_else(
+                    || format!("{} selected", items.len()),
+                    |relationship| format!("{relationship} · {} selected", items.len()),
+                ))
+                .small()
+                .color(ui.visuals().weak_text_color()),
+            );
+        });
+    });
+    let mut requested = None;
+    for item in items {
+        let active = item.panel_id == viewer.panels.active().id;
+        let label = if active {
+            format!("Panel {} · {} · Viewing", item.panel_id.get(), item.kind)
+        } else {
+            format!("Panel {} · {}", item.panel_id.get(), item.kind)
+        };
+        let response = ui.add_sized(
+            [ui.available_width(), 24.0],
+            egui::Button::selectable(active, label),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                true,
+                active,
+                format!(
+                    "Inspect {} from Panel {} at {}",
+                    item.kind,
+                    item.panel_id.get(),
+                    item.locus
+                ),
+            )
+        });
+        if response.clicked() && !active {
+            requested = Some(item.panel_id);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(8.0);
+            if let Some(subject) = &item.subject {
+                ui.monospace(subject);
+                ui.label("·");
+            }
+            ui.label(
+                egui::RichText::new(&item.locus)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        });
+        ui.add_space(3.0);
+    }
+    ui.separator();
+    requested
+}
+
 fn break_long_monospace_runs(value: &str) -> String {
     const MAXIMUM_UNBROKEN_CHARACTERS: usize = 24;
     let mut display = String::with_capacity(value.len());
@@ -760,12 +992,51 @@ pub(crate) fn show_properties(
 #[cfg(test)]
 mod tests {
     use super::{
-        break_long_monospace_runs, inspector_table_matching_rows, show_inspector_document,
+        InspectedPanelItem, bounded_selection_subject, break_long_monospace_runs,
+        inspected_items_relationship, inspector_table_matching_rows, show_inspector_document,
         wrapped_monospace,
     };
     use crate::{
         InspectorDocument, InspectorField, InspectorSection, InspectorTable, InspectorValue,
+        PanelId, TemplateReadEnd,
     };
+
+    fn read_item(panel: u64, name: &[u8], template_end: TemplateReadEnd) -> InspectedPanelItem {
+        InspectedPanelItem {
+            panel_id: PanelId::new(panel),
+            kind: match template_end {
+                TemplateReadEnd::First => "Read 1/2",
+                TemplateReadEnd::Last => "Read 2/2",
+            }
+            .to_owned(),
+            subject: Some(bounded_selection_subject(name)),
+            locus: format!("chr1:{panel}-{panel}"),
+            read_name: Some(name.to_vec()),
+            template_end: Some(template_end),
+        }
+    }
+
+    #[test]
+    fn opposite_template_ends_are_presented_as_one_mate_pair() {
+        let items = [
+            read_item(1, b"shared-template", TemplateReadEnd::First),
+            read_item(2, b"shared-template", TemplateReadEnd::Last),
+        ];
+        assert_eq!(inspected_items_relationship(&items), Some("Mate pair"));
+
+        let unrelated = [
+            read_item(1, b"first-template", TemplateReadEnd::First),
+            read_item(2, b"second-template", TemplateReadEnd::Last),
+        ];
+        assert_eq!(inspected_items_relationship(&unrelated), None);
+    }
+
+    #[test]
+    fn inspected_read_names_are_bounded_without_losing_utf8_boundaries() {
+        let subject = bounded_selection_subject("é".repeat(40).as_bytes());
+        assert_eq!(subject.chars().count(), 33);
+        assert!(subject.ends_with('…'));
+    }
 
     #[test]
     fn wrapped_monospace_stays_inside_a_narrow_property_row() {
