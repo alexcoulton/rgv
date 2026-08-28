@@ -26,6 +26,7 @@ pub const MAXIMUM_AUTOMATION_ALIGNMENT_RESULTS: usize = 128;
 pub const MAXIMUM_AUTOMATION_HISTORY_ENTRIES: usize = 256;
 pub const MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS: u64 = 100;
 pub const MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS: u64 = 600_000;
+pub const MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT: usize = 10_000_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationBatch {
@@ -716,10 +717,14 @@ impl AutomationSetting {
             Self::ReadStackingMode { track_ids, .. } => validate_track_selection(track_ids),
             Self::CompleteReadLimit { track_ids, value } => {
                 validate_track_selection(track_ids)?;
-                (1_000..=250_000)
+                (1_000..=MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT)
                     .contains(value)
                     .then_some(())
-                    .ok_or_else(|| "complete read limit must be between 1000 and 250000".to_owned())
+                    .ok_or_else(|| {
+                        format!(
+                            "complete read limit must be between 1000 and {MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT}"
+                        )
+                    })
             }
             Self::RebuildStableReadArchitecture {
                 panel_id,
@@ -2526,7 +2531,7 @@ mod tests {
             commands: vec![AutomationCommand::Configure {
                 setting: AutomationSetting::CompleteReadLimit {
                     track_ids: vec![TrackId::new(2)],
-                    value: 50_000,
+                    value: MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT,
                 },
             }],
         };
@@ -2534,7 +2539,7 @@ mod tests {
         assert!(json.contains("complete_read_limit"));
         assert_eq!(AutomationBatch::from_json(&json).unwrap(), valid);
 
-        for value in [999, 250_001] {
+        for value in [999, MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT + 1] {
             let invalid = AutomationBatch {
                 schema_version: AUTOMATION_SCHEMA_VERSION,
                 commands: vec![AutomationCommand::Configure {

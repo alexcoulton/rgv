@@ -1985,8 +1985,8 @@ fn explicit_complete_read_limit_can_raise_the_default_workspace_budget() {
         (100_000, 25_000)
     );
     assert_eq!(
-        expanded_workspace_alignment_limit(50_000, 300_000),
-        (250_000, 250_000)
+        expanded_workspace_alignment_limit(50_000, 10_000_001),
+        (10_000_000, 10_000_000)
     );
 }
 

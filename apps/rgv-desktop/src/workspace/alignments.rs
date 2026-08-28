@@ -1,13 +1,11 @@
 use super::super::*;
 
-pub(crate) const MAX_CONFIGURABLE_COMPLETE_READ_LIMIT: usize = 250_000;
-
 pub(crate) fn expanded_workspace_alignment_limit(
     current_workspace_limit: usize,
     requested_track_limit: usize,
 ) -> (usize, usize) {
     let requested_track_limit =
-        requested_track_limit.clamp(1, MAX_CONFIGURABLE_COMPLETE_READ_LIMIT);
+        requested_track_limit.clamp(1, rgv_core::MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT);
     (
         current_workspace_limit.max(requested_track_limit),
         requested_track_limit,

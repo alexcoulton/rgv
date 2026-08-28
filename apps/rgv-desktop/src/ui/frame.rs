@@ -327,7 +327,7 @@ impl Viewer {
             }),
         )
         .unwrap_or(u32::MAX)
-        .clamp(1, MAX_CONFIGURABLE_COMPLETE_READ_LIMIT as u32);
+        .clamp(1, rgv_core::MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT as u32);
         let mut alignment_track_controls = self
             .alignment_tracks
             .iter()
@@ -2562,12 +2562,14 @@ impl Viewer {
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Complete read limit").on_hover_text(
-                                    "At or below the effective limit, every eligible viewport read is shown. Above it, RGV shows no individual reads and asks you to zoom in or raise the limit. The default is 50,000; raising it can increase memory, query/layout time, and GPU work. Multi-panel or multi-track workspace allocation can make the effective limit lower than this requested value.",
+                                    "At or below the effective limit, every eligible viewport read is shown. Above it, RGV shows no individual reads and asks you to zoom in or raise the limit. The default is 50,000; raising it can increase memory, query/layout time, and GPU work. Values in the millions are experimental and can exhaust available memory. Multi-panel or multi-track workspace allocation can make the effective limit lower than this requested value.",
                                 );
                                 ui.add(
                                     egui::Slider::new(
                                         &mut complete_read_limit,
-                                        1_000..=MAX_CONFIGURABLE_COMPLETE_READ_LIMIT as u32,
+                                        1_000
+                                            ..=rgv_core::MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT
+                                                as u32,
                                     )
                                     .logarithmic(true),
                                 );
