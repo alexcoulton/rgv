@@ -4005,9 +4005,23 @@ dependencies = [
  "quick-xml",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.20",
  "url",
+]
+
+[[package]]
+name = "rgv-dense-layout-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rgv-core",
+ "rgv-hts",
+ "rgv-layout",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4019,6 +4033,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "flate2",
  "image",
  "pollster",
  "rfd",

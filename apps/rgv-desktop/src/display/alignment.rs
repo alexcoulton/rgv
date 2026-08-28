@@ -337,6 +337,30 @@ pub(crate) fn read_panel_bounds_for_group(
         .copied()
 }
 
+pub(crate) const MATERIALIZED_ALIGNMENT_ROW_OVERSCAN: usize = 32;
+
+pub(crate) fn materialized_alignment_row_range(
+    reads_top: f32,
+    row_height: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    effective_scroll: f32,
+    total_rows: usize,
+    overscan: usize,
+) -> (usize, usize) {
+    if total_rows == 0 || row_height <= f32::EPSILON || clip_bottom <= clip_top {
+        return (0, 0);
+    }
+    let world_top = clip_top + effective_scroll;
+    let world_bottom = clip_bottom + effective_scroll;
+    let first = (((world_top - reads_top) / row_height).floor().max(0.0) as usize).min(total_rows);
+    let end = (((world_bottom - reads_top) / row_height).ceil().max(0.0) as usize).min(total_rows);
+    (
+        first.saturating_sub(overscan),
+        end.saturating_add(overscan).min(total_rows),
+    )
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn secondary_alignment_track_layout(
     panel_id: PanelId,
@@ -346,6 +370,10 @@ pub(crate) fn secondary_alignment_track_layout(
     frame_top: f32,
     read_frame_top: f32,
     read_frame_bottom: f32,
+    read_clip_top: f32,
+    read_clip_bottom: f32,
+    read_effective_scroll: f32,
+    pending_read_reveal_index: Option<usize>,
     read_density: f32,
     annotation_preferred_height: Option<f32>,
     read_content_visible: bool,
@@ -563,45 +591,79 @@ pub(crate) fn secondary_alignment_track_layout(
                 || cached.pair_length_bounds == options.pair_length_bounds)
     });
     if !rows_match || projection.pending_row_repack {
-        let repack = std::mem::take(&mut projection.pending_row_repack)
-            && filters.read_stacking_mode == ReadStackingMode::Stable;
-        let (layout, reconciliation) = if read_refusal.is_some() {
-            (
-                assign_alignment_rows(&query, options, None),
-                AlignmentRowReconciliationStats::default(),
-            )
-        } else {
-            reconcile_alignment_rows_with_horizon(
-                &query,
-                &layout_query,
-                options,
-                &mut projection.row_history,
-                filters.read_stacking_mode,
-                repack,
-            )
-        };
-        projection.alignment_rows = Some(CachedAlignmentRows {
-            query: Arc::clone(&query),
-            layout_query: Arc::clone(&layout_query),
-            layout: Arc::new(layout),
-            group_mode: options.group_mode,
-            group_order: options.group_order,
-            sort_mode: options.sort_mode,
-            sort_order: options.sort_order,
-            sort_position: options.sort_position,
-            promoted_read_name_hash: options.promoted_read_name_hash,
-            max_rows: options.max_rows,
-            view_as_pairs: options.view_as_pairs,
-            pair_length_bounds: options.pair_length_bounds,
-            stacking_mode: filters.read_stacking_mode,
-            reconciliation,
-        });
+        // Row reconciliation is owned by the per-track background scheduler.
+        // This guard keeps a direct or unexpectedly interleaved caller from
+        // exposing geometry tied to an older query revision.
+        projection.alignment_rows = None;
         projection.cached_layout = None;
+        return (
+            None,
+            TrackFrame {
+                key: TrackFrameKey::Alignment(config.id),
+                channel: ui::TrackPane::Annotation,
+                name: config.name,
+                kind: TrackKind::Alignment,
+                source_label,
+                top: frame_top,
+                bottom: frame_bottom,
+                visible: true,
+                collapsed: false,
+                frozen_bottom: None,
+                subtracks: vec![TrackSubtrack {
+                    label: "Laying out complete reads…".to_owned(),
+                    detail: None,
+                    top: frame_top + 22.0,
+                    bottom: frame_bottom,
+                    collapsed: false,
+                    composite_member: None,
+                }],
+            },
+            None,
+        );
     }
     options.row_layout_revision = projection
         .alignment_rows
         .as_ref()
         .map_or(0, |cached| cached.reconciliation.revision);
+    let total_rows = projection
+        .alignment_rows
+        .as_ref()
+        .map_or(options.max_rows, |cached| {
+            if cached.stacking_mode == ReadStackingMode::Stable {
+                cached.layout.row_capacity()
+            } else {
+                cached.layout.used_row_count()
+            }
+        });
+    options.materialized_row_range = Some(materialized_alignment_row_range(
+        options.reads_top,
+        options.row_height,
+        read_clip_top,
+        read_clip_bottom,
+        read_effective_scroll,
+        total_rows,
+        MATERIALIZED_ALIGNMENT_ROW_OVERSCAN,
+    ));
+    if let Some(row) = pending_read_reveal_index.and_then(|index| {
+        projection
+            .alignment_rows
+            .as_ref()
+            .and_then(|cached| cached.layout.row(index))
+    }) {
+        let visible_rows = ((read_clip_bottom - read_clip_top) / options.row_height)
+            .ceil()
+            .max(1.0) as usize;
+        let start = row
+            .saturating_sub(visible_rows / 2)
+            .saturating_sub(MATERIALIZED_ALIGNMENT_ROW_OVERSCAN);
+        options.materialized_row_range = Some((
+            start,
+            start
+                .saturating_add(visible_rows)
+                .saturating_add(MATERIALIZED_ALIGNMENT_ROW_OVERSCAN.saturating_mul(2))
+                .min(total_rows),
+        ));
+    }
     let key = alignment_layout_key(
         PanelTrackId::new(panel_id, config.id),
         Some(&config.source),
@@ -873,8 +935,8 @@ pub(crate) fn secondary_alignment_track_layout(
 
 pub(crate) fn individual_read_refusal(
     query: &AlignmentQuery,
-    layout_query: &AlignmentQuery,
-    stacking_mode: ReadStackingMode,
+    _layout_query: &AlignmentQuery,
+    _stacking_mode: ReadStackingMode,
 ) -> Option<IndividualReadRefusal> {
     if let IndividualReadStatus::TooDense { limit } = query.stats.individual_reads {
         return Some(IndividualReadRefusal {
@@ -883,15 +945,12 @@ pub(crate) fn individual_read_refusal(
             scope: IndividualReadRefusalScope::Foreground,
         });
     }
-    if stacking_mode == ReadStackingMode::Stable
-        && let IndividualReadStatus::TooDense { limit } = layout_query.stats.individual_reads
-    {
-        return Some(IndividualReadRefusal {
-            eligible_records: layout_query.stats.records_eligible,
-            limit,
-            scope: IndividualReadRefusalScope::LayoutHorizon,
-        });
-    }
+    // A canonical layout horizon is intentionally wider than the viewport. If
+    // that compact row-architecture query exceeds the complete-read limit but
+    // the foreground query is complete, seed/extend row history from the
+    // foreground records instead of refusing reads that are actually present
+    // and bounded in the visible interval. The horizon may remain truncated;
+    // later navigation extends its history generation by generation.
     None
 }
 
@@ -1038,6 +1097,13 @@ pub(crate) fn alignment_layout_key(
     }
     layout_bytes.extend_from_slice(&options.max_rows.to_le_bytes());
     layout_bytes.extend_from_slice(&options.row_layout_revision.to_le_bytes());
+    if let Some((start, end)) = options.materialized_row_range {
+        layout_bytes.push(1);
+        layout_bytes.extend_from_slice(&start.to_le_bytes());
+        layout_bytes.extend_from_slice(&end.to_le_bytes());
+    } else {
+        layout_bytes.push(0);
+    }
     if let Some(refusal) = options.read_refusal {
         layout_bytes.push(1);
         layout_bytes.extend_from_slice(&refusal.eligible_records.to_le_bytes());

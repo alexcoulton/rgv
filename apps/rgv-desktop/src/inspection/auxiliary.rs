@@ -198,6 +198,14 @@ pub(crate) fn feature_inspector_document(
         ));
     }
     if !record.blocks.is_empty() {
+        overview.fields.push(InspectorField::new(
+            "exon-count",
+            "Exon count",
+            InspectorValue::Number {
+                display: record.blocks.len().to_string(),
+                value: Some(record.blocks.len() as f64),
+            },
+        ));
         let blocks = record
             .blocks
             .iter()
@@ -223,6 +231,33 @@ pub(crate) fn feature_inspector_document(
             } else {
                 InspectorProvenance::Source
             }),
+        );
+    }
+    if feature_type == "transcript" {
+        let model_status =
+            record
+                .coding_interval
+                .map_or("Non-coding model", |(coding_start, coding_end)| {
+                    if record
+                        .blocks
+                        .iter()
+                        .any(|(start, end)| *start < coding_start || *end > coding_end)
+                    {
+                        "Coding model with UTR segments"
+                    } else {
+                        "Coding model"
+                    }
+                });
+        overview.fields.push(
+            InspectorField::new(
+                "coding-status",
+                "CDS / UTR status",
+                InspectorValue::Status {
+                    label: model_status.to_owned(),
+                    tone: InspectorTone::Informative,
+                },
+            )
+            .with_provenance(InspectorProvenance::Parsed),
         );
     }
     document.sections.push(overview);
@@ -281,6 +316,14 @@ pub(crate) fn feature_inspector_document(
                     label: value.to_owned(),
                     tone: InspectorTone::Positive,
                 },
+            )
+            .with_provenance(InspectorProvenance::Parsed)
+        }),
+        feature_attribute(record, &["landmark_selection_policy"]).map(|value| {
+            InspectorField::new(
+                "representative-selection",
+                "Representative selection",
+                InspectorValue::Text(value.to_owned()),
             )
             .with_provenance(InspectorProvenance::Parsed)
         }),
@@ -355,6 +398,46 @@ pub(crate) fn feature_inspector_document(
                 InspectorField::new("tags", "Tags", InspectorValue::Tags(tags))
                     .with_provenance(InspectorProvenance::Parsed),
             ]));
+    }
+
+    let source_fields = [
+        ("source-assembly", "Assembly", "landmark_assembly"),
+        (
+            "source-provider",
+            "Annotation provider",
+            "landmark_provider",
+        ),
+        ("source-release", "Release", "landmark_release"),
+        ("source-bundle", "Bundle", "landmark_bundle_id"),
+        (
+            "source-bundle-version",
+            "Resource version",
+            "landmark_bundle_version",
+        ),
+        ("source-format", "Asset format", "landmark_asset_format"),
+        ("source-checksum", "Asset SHA-256", "landmark_asset_sha256"),
+        ("source-citation", "Citation", "landmark_citation"),
+        ("source-license", "Licence", "landmark_license"),
+        (
+            "source-license-url",
+            "Citation / licence link",
+            "landmark_license_url",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(id, label, key)| {
+        feature_attribute(record, &[key]).map(|value| {
+            InspectorField::new(id, label, InspectorValue::Text(value.to_owned()))
+                .with_copy_value(value)
+                .with_provenance(InspectorProvenance::Parsed)
+        })
+    })
+    .collect::<Vec<_>>();
+    if !source_fields.is_empty() {
+        document.sections.push(
+            InspectorSection::new("landmark-source", "Source and provenance", 50)
+                .with_fields(source_fields),
+        );
     }
 
     if let Some(peak) = record.peak {
@@ -446,6 +529,17 @@ pub(crate) fn feature_inspector_document(
         ),
         InspectorAction::new(InspectorActionId::ClearSelection, "Clear selection").low_emphasis(),
     ];
+    if feature_attribute(record, &["landmark_asset_role"]) == Some("representative_genes")
+        && let Some(bundle_id) = feature_attribute(record, &["landmark_bundle_id"])
+    {
+        document.actions.insert(
+            1,
+            InspectorAction::new(
+                InspectorActionId::ShowAllTranscriptsForGene(bundle_id.to_owned()),
+                "Show all transcripts for this gene",
+            ),
+        );
+    }
     document.preserve_automation_fields(&legacy_fields);
     if record.blocks.len() > MAX_FEATURE_INSPECTOR_BLOCKS
         || record.attributes.len() > MAX_FEATURE_INSPECTOR_ATTRIBUTES

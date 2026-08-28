@@ -238,29 +238,31 @@ impl Viewer {
                 | TrackSnapshotData::Interactions(_)
                 | TrackSnapshotData::Gwas(_) => None,
             })?;
-        let position = self
-            .panels
-            .active()
-            .viewport
-            .genomic_at_pixel(f64::from(x - panel_rect.left()))
-            .floor()
-            .max(0.0) as u64;
         let layout_maximum_rows = if is_pinned_gene {
             pinned_gene_layout_maximum_rows(frame.bottom - frame.top)
         } else {
             TrackLayoutOptions::default().maximum_rows
         };
-        let maximum_rows = feature_layout_row_count(layout_maximum_rows, display_mode);
-        let row_height = (frame.bottom - frame.top) / maximum_rows as f32;
-        let selected_row =
-            ((content_y - frame.top) / row_height.max(f32::EPSILON)).floor() as usize;
-        feature_record_index_at_position_and_row(
+        let object_id_base = 1_u32;
+        let display = layout_features(
             records,
             self.panels.active().viewport,
-            position,
-            selected_row,
-            maximum_rows,
-            display_mode,
+            TrackLayoutOptions {
+                top: frame.top,
+                height: frame.bottom - frame.top,
+                maximum_rows: layout_maximum_rows,
+                object_id_base,
+                feature_display_mode: display_mode,
+                ..TrackLayoutOptions::default()
+            },
+        )
+        .0;
+        feature_record_index_at_display_point(
+            &display,
+            records,
+            x - panel_rect.left(),
+            content_y,
+            object_id_base,
         )
         .map(|record_index| FeatureSelection {
             track_id,
@@ -646,9 +648,11 @@ impl Viewer {
             .find(|snapshot| snapshot.id == selection.track_id)
             .and_then(|snapshot| match &snapshot.data {
                 TrackSnapshotData::Features(records) if selection.record_index < records.len() => {
+                    let mut record = records[selection.record_index].clone();
+                    self.enrich_builtin_feature_record(selection.track_id, &mut record);
                     Some(FeatureInspectorSnapshot {
                         track_name: snapshot.name.clone(),
-                        record: records[selection.record_index].clone(),
+                        record,
                     })
                 }
                 TrackSnapshotData::Features(_)

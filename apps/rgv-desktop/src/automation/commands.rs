@@ -1826,6 +1826,16 @@ impl Viewer {
                         row_layout_revision: reconciliation.revision,
                         row_layout_architecture_version: reconciliation.architecture_version,
                         row_layout_reconciliation_micros: reconciliation.reconciliation_micros,
+                        row_layout_incumbent_projection_micros: reconciliation
+                            .incumbent_projection_micros,
+                        row_layout_history_index_micros: reconciliation.history_index_micros,
+                        row_layout_allocation_micros: reconciliation.row_allocation_micros,
+                        row_layout_history_commit_micros: reconciliation.history_commit_micros,
+                        row_layout_canonical_metrics_micros: reconciliation
+                            .canonical_metrics_micros,
+                        row_layout_compatibility_probes: reconciliation.compatibility_probes,
+                        row_layout_rows_reused: reconciliation.rows_reused,
+                        row_layout_rows_appended: reconciliation.rows_appended,
                         row_layout_retained: reconciliation.retained,
                         row_layout_restored: reconciliation.restored,
                         row_layout_added: reconciliation.added,
@@ -2203,6 +2213,7 @@ impl Viewer {
                     .filter(|track| track.kind == TrackKind::GeneModel)
                     .count(),
                 contig_alias_count: self.contig_aliases.len(),
+                landmarks: self.automation_landmark_snapshot(),
             },
             settled: self.automation_data_is_settled(),
             active_panel_id: self.panels.active().id,
@@ -4056,7 +4067,7 @@ impl Viewer {
                 projection.alignment_rows = None;
                 projection.cached_layout = None;
                 if query_changed {
-                    projection.clock.advance();
+                    projection.advance_query_generation();
                     projection.pending_query =
                         !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
                 }
@@ -4140,6 +4151,16 @@ impl Viewer {
                         .iter()
                         .find(|snapshot| snapshot.id == track_id)
                         .and_then(|snapshot| match &snapshot.data {
+                            TrackSnapshotData::Features(records) => records
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, record)| {
+                                    record.start <= position && position < record.end
+                                })
+                                .min_by_key(|(index, record)| {
+                                    (record.end.saturating_sub(record.start), *index)
+                                })
+                                .map(|(index, _)| (Some(index), None, None)),
                             TrackSnapshotData::Variants(query) => query
                                 .records
                                 .iter()
@@ -4151,13 +4172,12 @@ impl Viewer {
                                 .min_by_key(|(index, record)| {
                                     (record.end.saturating_sub(record.start), *index)
                                 })
-                                .map(|(index, _)| (Some(index), None)),
+                                .map(|(index, _)| (None, Some(index), None)),
                             TrackSnapshotData::Quantitative(query) => {
                                 quantitative_record_index_at_position(&query.records, position)
-                                    .map(|index| (None, Some(index)))
+                                    .map(|index| (None, None, Some(index)))
                             }
-                            TrackSnapshotData::Features(_)
-                            | TrackSnapshotData::CopyNumber(_)
+                            TrackSnapshotData::CopyNumber(_)
                             | TrackSnapshotData::Mutations(_)
                             | TrackSnapshotData::Interactions(_)
                             | TrackSnapshotData::Gwas(_) => None,
@@ -4174,12 +4194,17 @@ impl Viewer {
                         ui::TrackPane::Annotation,
                     );
                     self.panels.active_mut().selected_pileup_position = Some(position);
-                } else if let Some((variant, quantitative)) = auxiliary_selection {
+                } else if let Some((feature, variant, quantitative)) = auxiliary_selection {
                     replace_panel_track_selection(
                         self.panels.active_mut(),
                         key,
                         ui::TrackPane::Annotation,
                     );
+                    self.panels.active_mut().selected_feature =
+                        feature.map(|record_index| FeatureSelection {
+                            track_id,
+                            record_index,
+                        });
                     self.panels.active_mut().selected_variant =
                         variant.map(|record_index| VariantSelection {
                             track_id,

@@ -311,37 +311,30 @@ pub(crate) fn alignment_header_metadata_from_sam(bytes: &[u8]) -> AlignmentHeade
     metadata
 }
 
-pub fn recognize_assembly_from_header(
+pub fn resolve_assembly_from_header(
+    catalogue: &rgv_core::GenomeLandmarkCatalogue,
     metadata: &AlignmentHeaderMetadata,
-) -> Option<rgv_core::GenomeAssemblyIdentity> {
-    const GRCH38: [(&str, u64, &str); 3] = [
-        ("chr6", 170_805_979, "5691468a67c7e7a7b5f2a3a683792c29"),
-        ("chr20", 64_444_167, "b18e6c531b0bd70e949a7fc20859cb01"),
-        ("chrM", 16_569, "c68f52674c9fb33aef52dcf399755519"),
-    ];
-    let mut matched = 0;
-    for (name, expected_length, expected_md5) in GRCH38 {
-        let sequence = metadata
+) -> rgv_core::AssemblyResolution {
+    let dictionary = rgv_core::ReferenceDictionary::from_contigs(
+        metadata
             .reference_sequences
             .iter()
-            .find(|sequence| sequence.name == name)?;
-        if sequence.length != expected_length
-            || !sequence
+            .map(|sequence| (sequence.name.clone(), sequence.length)),
+    );
+    let sequence_md5 = metadata
+        .reference_sequences
+        .iter()
+        .filter_map(|sequence| {
+            sequence
                 .md5
-                .as_deref()
-                .is_some_and(|md5| md5.eq_ignore_ascii_case(expected_md5))
-        {
-            return None;
-        }
-        matched += 1;
-    }
-    Some(rgv_core::GenomeAssemblyIdentity {
-        stable_id: "GRCh38.no_alt_analysis_set".to_owned(),
-        display_name: "GRCh38".to_owned(),
-        confidence: rgv_core::AssemblyIdentityConfidence::Fingerprint,
-        provenance: "BAM @SQ length and M5 agreement for chr6, chr20, and chrM; UR used only as supporting context".to_owned(),
-        matched_fingerprints: matched,
-        expected_primary_contigs: 25,
+                .as_ref()
+                .map(|md5| (sequence.name.clone(), md5.clone()))
+        })
+        .collect();
+    catalogue.resolve(&rgv_core::AssemblyResolutionInput {
+        explicit_stable_id: None,
+        dictionary: &dictionary,
+        sequence_md5: &sequence_md5,
     })
 }
 
@@ -1164,12 +1157,48 @@ mod tests {
     }
 
     #[test]
-    fn grch38_recognition_requires_length_and_md5_fingerprints() {
+    fn catalogue_assembly_resolution_requires_length_and_md5_fingerprints() {
         let header = b"@SQ\tSN:chr6\tLN:170805979\tM5:5691468a67c7e7a7b5f2a3a683792c29\n@SQ\tSN:chr20\tLN:64444167\tM5:b18e6c531b0bd70e949a7fc20859cb01\n@SQ\tSN:chrM\tLN:16569\tM5:c68f52674c9fb33aef52dcf399755519\n";
+        let catalogue = rgv_core::GenomeLandmarkCatalogue {
+            schema_version: rgv_core::LANDMARK_CATALOGUE_SCHEMA_VERSION,
+            bundles: vec![rgv_core::GenomeLandmarkBundle {
+                id: "hg38-test".to_owned(),
+                version: "1".to_owned(),
+                display_name: "GRCh38 test".to_owned(),
+                provider: "test".to_owned(),
+                release: "test".to_owned(),
+                selection_policy: "test".to_owned(),
+                assembly: rgv_core::LandmarkAssemblyIdentity {
+                    stable_id: "GRCh38.no_alt_analysis_set".to_owned(),
+                    display_name: "GRCh38".to_owned(),
+                    compatible_ids: vec!["hg38".to_owned()],
+                    primary_contig_count: 3,
+                    dictionary_sha256: "0".repeat(64),
+                    compatible_dictionary_sha256: Vec::new(),
+                    contigs: vec![
+                        ("chr6", 170_805_979, "5691468a67c7e7a7b5f2a3a683792c29"),
+                        ("chr20", 64_444_167, "b18e6c531b0bd70e949a7fc20859cb01"),
+                        ("chrM", 16_569, "c68f52674c9fb33aef52dcf399755519"),
+                    ]
+                    .into_iter()
+                    .map(|(name, length, md5)| rgv_core::LandmarkContigFingerprint {
+                        name: name.to_owned(),
+                        length,
+                        md5: Some(md5.to_owned()),
+                        primary: true,
+                    })
+                    .collect(),
+                },
+                assets: Vec::new(),
+            }],
+        };
         let metadata = alignment_header_metadata_from_sam(header);
-        let identity = recognize_assembly_from_header(&metadata).unwrap();
-        assert_eq!(identity.stable_id, "GRCh38.no_alt_analysis_set");
-        assert_eq!(identity.matched_fingerprints, 3);
+        let resolution = resolve_assembly_from_header(&catalogue, &metadata);
+        assert_eq!(
+            resolution.status,
+            rgv_core::AssemblyResolutionStatus::Matched
+        );
+        assert_eq!(resolution.matched_contigs, 3);
 
         let mismatched = header
             .windows(1)
@@ -1182,9 +1211,13 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        assert!(
-            recognize_assembly_from_header(&alignment_header_metadata_from_sam(&mismatched))
-                .is_none()
+        assert_ne!(
+            resolve_assembly_from_header(
+                &catalogue,
+                &alignment_header_metadata_from_sam(&mismatched),
+            )
+            .status,
+            rgv_core::AssemblyResolutionStatus::Matched,
         );
     }
 }

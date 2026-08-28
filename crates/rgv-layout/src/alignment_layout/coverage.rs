@@ -768,6 +768,10 @@ pub(crate) fn add_spans(
             stats.hidden += 1;
             continue;
         };
+        if !options.materializes_row(row) {
+            stats.virtualized += 1;
+            continue;
+        }
         let representative = rows.representative(index);
         let read_fill = alignment_color(
             query,

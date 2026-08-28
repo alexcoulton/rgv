@@ -441,6 +441,17 @@ impl Viewer {
         } else {
             None
         };
+        let alignment_row_layout_scheduler_clock = GenerationClock::default();
+        let alignment_row_layout_worker_count = std::thread::available_parallelism()
+            .map_or(2, NonZeroUsize::get)
+            .clamp(1, 4);
+        let alignment_row_layout_scheduler = Scheduler::new(
+            NonZeroUsize::new(alignment_row_layout_worker_count)
+                .expect("read-layout worker count is nonzero"),
+            NonZeroUsize::new(32).expect("read-layout queue capacity is nonzero"),
+            &alignment_row_layout_scheduler_clock,
+            process_alignment_row_layout_work,
+        );
 
         Ok(Self {
             application_instance_id,
@@ -458,6 +469,7 @@ impl Viewer {
             navigation_texture_revisions: HashMap::new(),
             navigation_horizon_preview_stats: NavigationHorizonPreviewStats::default(),
             navigation_stale_result_rejections: 0,
+            alignment_row_layout_cancellations: 0,
             egui_context,
             egui_state,
             egui_renderer,
@@ -478,6 +490,9 @@ impl Viewer {
                 maximum_alignments: workspace_alignment_limit,
             },
             alignment_retirement_tasks: Vec::new(),
+            alignment_row_layout_tasks: Vec::new(),
+            alignment_row_layout_scheduler_clock,
+            alignment_row_layout_scheduler,
             reference_engine,
             reference_open_error: None,
             track_engine,
@@ -492,6 +507,17 @@ impl Viewer {
             assembly,
             assembly_identity,
             suggested_assembly_identity: None,
+            landmark_resource_root: options.landmark_resource_root.clone(),
+            landmark_catalogue: options.loaded_landmark_catalogue.clone(),
+            landmark_catalogue_error: options.landmark_catalogue_error.clone(),
+            landmark_resolution: None,
+            landmark_search_index: None,
+            suppressed_builtin_gene_bundles: options
+                .loaded_session
+                .as_ref()
+                .map_or_else(BTreeSet::new, |session| {
+                    session.suppressed_builtin_gene_bundles.clone()
+                }),
             assembly_name: options.genome_name,
             cytoband_path: options.cytobands,
             data_status,

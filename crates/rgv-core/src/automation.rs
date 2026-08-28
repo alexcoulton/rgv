@@ -1119,6 +1119,63 @@ pub struct AutomationTrackGestureSnapshot {
     pub target: Option<crate::PresentationNodeId>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationLandmarkIntegrityState {
+    #[default]
+    Unavailable,
+    Unchecked,
+    Verified,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationLandmarkTrackState {
+    #[default]
+    Unconfigured,
+    Configured,
+    Matched,
+    Loaded,
+    Visible,
+    Suppressed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationLandmarkSnapshot {
+    #[serde(default)]
+    pub catalogue_schema_version: Option<u32>,
+    #[serde(default)]
+    pub resource_configured: bool,
+    #[serde(default)]
+    pub resolution_status: Option<crate::AssemblyResolutionStatus>,
+    #[serde(default)]
+    pub evidence: Option<crate::AssemblyMatchEvidence>,
+    #[serde(default)]
+    pub subset: bool,
+    #[serde(default)]
+    pub matched_bundle_id: Option<String>,
+    #[serde(default)]
+    pub matched_bundle_version: Option<String>,
+    #[serde(default)]
+    pub integrity: AutomationLandmarkIntegrityState,
+    #[serde(default)]
+    pub automatic_track_state: AutomationLandmarkTrackState,
+    #[serde(default)]
+    pub automatic_track_loaded: bool,
+    #[serde(default)]
+    pub automatic_track_visible: bool,
+    #[serde(default)]
+    pub suppressed: bool,
+    #[serde(default)]
+    pub gene_asset_format: Option<crate::LandmarkAssetFormat>,
+    #[serde(default)]
+    pub gene_asset_sha256: Option<String>,
+    #[serde(default)]
+    pub search_ready: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationGenomeSnapshot {
     pub name: String,
@@ -1144,6 +1201,8 @@ pub struct AutomationGenomeSnapshot {
     pub gene_model_track_count: usize,
     #[serde(default)]
     pub contig_alias_count: usize,
+    #[serde(default)]
+    pub landmarks: AutomationLandmarkSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1353,6 +1412,22 @@ pub struct AutomationAlignmentTrackSnapshot {
     pub row_layout_architecture_version: u16,
     #[serde(default)]
     pub row_layout_reconciliation_micros: u64,
+    #[serde(default)]
+    pub row_layout_incumbent_projection_micros: u64,
+    #[serde(default)]
+    pub row_layout_history_index_micros: u64,
+    #[serde(default)]
+    pub row_layout_allocation_micros: u64,
+    #[serde(default)]
+    pub row_layout_history_commit_micros: u64,
+    #[serde(default)]
+    pub row_layout_canonical_metrics_micros: u64,
+    #[serde(default)]
+    pub row_layout_compatibility_probes: usize,
+    #[serde(default)]
+    pub row_layout_rows_reused: usize,
+    #[serde(default)]
+    pub row_layout_rows_appended: usize,
     #[serde(default)]
     pub row_layout_retained: usize,
     #[serde(default)]
@@ -2200,6 +2275,7 @@ mod tests {
                 default_annotation_count: 0,
                 gene_model_track_count: 0,
                 contig_alias_count: 0,
+                landmarks: AutomationLandmarkSnapshot::default(),
             },
             settled: true,
             active_panel_id: PanelId::new(1),

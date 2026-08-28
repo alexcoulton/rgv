@@ -15,11 +15,18 @@ import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
+from itertools import chain
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator, Optional, Sequence
+
+try:
+    import pyBigWig  # type: ignore[import-not-found]
+except ImportError:  # The error is made actionable only when BigBed decoding is needed.
+    pyBigWig = None
 
 
 SCHEMA_VERSION = 1
+SEARCH_SCHEMA_VERSION = "rgv_gene_names_v1"
 IGV_DATA_ROOT = "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/json"
 DEFAULT_OUTPUT = (
     Path(__file__).resolve().parents[2]
@@ -29,6 +36,15 @@ DEFAULT_OUTPUT = (
     / "igv"
 )
 BIGBED_MAGIC = 0x8789F2EB
+REQUIRED_RUNTIME_ROLES = {
+    "representative_genes",
+    "detailed_transcripts",
+    "gene_search",
+    "cytobands",
+    "contig_aliases",
+    "chromosome_sizes",
+    "notice",
+}
 
 
 @dataclass(frozen=True)
@@ -36,18 +52,80 @@ class BuildSpec:
     identifier: str
     landmark_mode: str
     landmark_url: Optional[str] = None
+    bundle_version: str = "1.0-rgv1"
+    assembly_stable_id: str = ""
+    assembly_display_name: str = ""
+    compatible_ids: tuple[str, ...] = ()
+    provider: str = "NCBI RefSeq"
+    release: str = "IGV curated snapshot"
+    compatible_dictionary_sha256: tuple[str, ...] = ()
 
 
 BUILD_SPECS = {
-    "hg38": BuildSpec("hg38", "igv_mane"),
-    "hg19": BuildSpec("hg19", "igv_mane"),
-    "mm10": BuildSpec("mm10", "representative_refgene"),
-    "mm39": BuildSpec("mm39", "representative_refgene"),
+    "hg38": BuildSpec(
+        "hg38",
+        "igv_mane",
+        assembly_stable_id="GRCh38.no_alt_analysis_set",
+        assembly_display_name="GRCh38",
+        compatible_ids=("GRCh38", "GRCh38.p14", "hg38"),
+        provider="MANE (NCBI RefSeq and Ensembl/GENCODE)",
+        release="MANE 1.0",
+        # GENCODE v29 UCSC-named GRCh38 plus the ERCC and phiX sequences used
+        # by the qualified ENCODE RNA-seq fixture. This is exact dictionary
+        # evidence, not a primary-length heuristic.
+        compatible_dictionary_sha256=(
+            "36bda445209ba362bb534c9acf5f453f1adeacd3707586a346257f8f69a53fae",
+        ),
+    ),
+    "hg19": BuildSpec(
+        "hg19",
+        "igv_mane",
+        assembly_stable_id="GRCh37.p13",
+        assembly_display_name="GRCh37 / hg19",
+        compatible_ids=("GRCh37", "hg19"),
+        release="RefSeq Select snapshot used by IGV hg19",
+    ),
+    "mm10": BuildSpec(
+        "mm10",
+        "representative_refgene",
+        assembly_stable_id="GRCm38.p6",
+        assembly_display_name="GRCm38 / mm10",
+        compatible_ids=("GRCm38", "mm10"),
+    ),
+    "mm39": BuildSpec(
+        "mm39",
+        "representative_refgene",
+        assembly_stable_id="GRCm39",
+        assembly_display_name="GRCm39 / mm39",
+        compatible_ids=("GRCm39", "mm39"),
+    ),
     "hs1": BuildSpec(
         "hs1",
         "curated_biggenepred",
         "https://hgdownload.soe.ucsc.edu/gbdb/hs1/ncbiRefSeq/ncbiRefSeqCurated.bb",
+        assembly_stable_id="T2T-CHM13v2.0",
+        assembly_display_name="T2T CHM13 v2.0 / hs1",
+        compatible_ids=("CHM13v2.0", "hs1"),
+        release="NCBI RefSeq Curated snapshot used by UCSC hs1",
     ),
+}
+
+
+PRIMARY_CONTIGS = {
+    "hg38": {*(f"chr{value}" for value in range(1, 23)), "chrX", "chrY", "chrM"},
+    "hg19": {*(f"chr{value}" for value in range(1, 23)), "chrX", "chrY", "chrM"},
+    "mm10": {*(f"chr{value}" for value in range(1, 20)), "chrX", "chrY", "chrM"},
+    "mm39": {*(f"chr{value}" for value in range(1, 20)), "chrX", "chrY", "chrM"},
+    "hs1": {*(f"chr{value}" for value in range(1, 23)), "chrX", "chrY", "chrM"},
+}
+
+
+SEQUENCE_MD5 = {
+    "hg38": {
+        "chr6": "5691468a67c7e7a7b5f2a3a683792c29",
+        "chr20": "b18e6c531b0bd70e949a7fc20859cb01",
+        "chrM": "c68f52674c9fb33aef52dcf399755519",
+    }
 }
 
 
@@ -107,16 +185,129 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def asset(path: Path, root: Path, role: str, source: str, format_name: str) -> dict[str, Any]:
+def asset(
+    path: Path,
+    root: Path,
+    role: str,
+    source: str,
+    format_name: str,
+    *,
+    project: str,
+    version: str,
+    derivation: str,
+    citation: str,
+    license_name: str,
+    license_url: str,
+    required_notice: str = "",
+) -> dict[str, Any]:
     path.chmod(0o644)
     return {
         "role": role,
         "path": path.relative_to(root).as_posix(),
         "format": format_name,
-        "source": source,
         "bytes": path.stat().st_size,
         "sha256": sha256(path),
+        "source_url": source,
+        "upstream_project": project,
+        "upstream_version": version,
+        "derivation": derivation,
+        "citation": citation,
+        "license": license_name,
+        "license_url": license_url,
+        "required_notice": required_notice,
     }
+
+
+def validate_runtime_bundle(bundle: dict[str, Any]) -> None:
+    assembly = bundle.get("assembly")
+    if not isinstance(assembly, dict):
+        raise ValueError("bundle assembly identity is not an object")
+    dictionary_hashes = [assembly.get("dictionary_sha256"), *assembly.get("compatible_dictionary_sha256", [])]
+    if any(
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest.lower())
+        for digest in dictionary_hashes
+    ) or len(set(dictionary_hashes)) != len(dictionary_hashes):
+        raise ValueError("bundle assembly has invalid or duplicate dictionary SHA-256 claims")
+    assets = bundle.get("assets")
+    if not isinstance(assets, list):
+        raise ValueError("bundle assets are not a list")
+    roles: set[str] = set()
+    for entry in assets:
+        if not isinstance(entry, dict):
+            raise ValueError("bundle asset is not an object")
+        role = entry.get("role")
+        path_value = entry.get("path")
+        if not isinstance(role, str) or role in roles:
+            raise ValueError(f"duplicate or invalid bundle asset role {role!r}")
+        roles.add(role)
+        if not isinstance(path_value, str):
+            raise ValueError(f"bundle asset {role} has no relative path")
+        path = PurePosixPath(path_value)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError(f"bundle asset {role} has unsafe path {path_value!r}")
+        if not isinstance(entry.get("bytes"), int) or entry["bytes"] <= 0:
+            raise ValueError(f"bundle asset {role} has no byte size")
+        digest = entry.get("sha256")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest.lower())
+        ):
+            raise ValueError(f"bundle asset {role} has invalid SHA-256")
+        for key in (
+            "source_url",
+            "upstream_project",
+            "upstream_version",
+            "derivation",
+            "citation",
+            "license",
+            "license_url",
+        ):
+            if not isinstance(entry.get(key), str) or not entry[key].strip():
+                raise ValueError(f"bundle asset {role} has incomplete {key}")
+    missing = REQUIRED_RUNTIME_ROLES.difference(roles)
+    if missing:
+        raise ValueError(f"bundle is missing runtime roles: {sorted(missing)}")
+
+
+def immutable_asset_fingerprints(bundle: dict[str, Any]) -> dict[str, tuple[str, str, int]]:
+    return {
+        entry["role"]: (entry["path"], entry["sha256"], entry["bytes"])
+        for entry in bundle.get("assets", [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("role"), str)
+        and isinstance(entry.get("path"), str)
+        and isinstance(entry.get("sha256"), str)
+        and isinstance(entry.get("bytes"), int)
+    }
+
+
+def igv_asset(
+    path: Path,
+    root: Path,
+    role: str,
+    source: str,
+    format_name: str,
+    *,
+    version: str,
+    derivation: str,
+) -> dict[str, Any]:
+    return asset(
+        path,
+        root,
+        role,
+        source,
+        format_name,
+        project="IGV data repository and named upstream provider",
+        version=version,
+        derivation=derivation,
+        citation="Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        license_name="Source-specific; see NOTICE.md",
+        license_url="https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        required_notice="Retain bundle NOTICE.md and source URLs when redistributing.",
+    )
 
 
 def first_track(configuration: dict[str, Any]) -> dict[str, Any]:
@@ -184,6 +375,138 @@ def chromosome_sizes(path: Path) -> tuple[dict[str, int], list[str]]:
     if not sizes:
         raise ValueError(f"empty chromosome-size file {path}")
     return sizes, order
+
+
+def dictionary_sha256(sizes: dict[str, int], order: Sequence[str]) -> str:
+    digest = hashlib.sha256()
+    for chrom in order:
+        digest.update(f"{chrom}\t{sizes[chrom]}\n".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def normalize_aliases(source: Path, destination: Path, sizes: dict[str, int]) -> int:
+    aliases: dict[str, str] = {}
+    with source.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = [value for value in line.rstrip("\r\n").split("\t") if value]
+            canonical = next((value for value in fields if value in sizes), None)
+            if canonical is None:
+                # Upstream alias tables may include an alternative mitochondrial
+                # assembly or retired scaffold absent from this bundle. It has
+                # no valid target and therefore contributes no normalized alias.
+                continue
+            for alias_name in fields:
+                if alias_name == canonical:
+                    continue
+                if alias_name in sizes and alias_name != canonical:
+                    raise ValueError(
+                        f"alias {alias_name!r} collides with canonical contig {canonical!r}"
+                    )
+                previous = aliases.get(alias_name)
+                if previous is not None and previous != canonical:
+                    raise ValueError(
+                        f"alias {alias_name!r} targets both {previous!r} and {canonical!r}"
+                    )
+                aliases[alias_name] = canonical
+    rows = (f"{alias_name}\t{aliases[alias_name]}\n" for alias_name in sorted(aliases))
+    write_text_lines(destination, rows)
+    return len(aliases)
+
+
+def valid_cytoband_stain(value: str) -> bool:
+    return value in {
+        "gneg",
+        "gpos25",
+        "gpos33",
+        "gpos50",
+        "gpos66",
+        "gpos75",
+        "gpos100",
+        "acen",
+        "gvar",
+        "stalk",
+    }
+
+
+def validate_cytoband_row(
+    chrom: str, start: int, end: int, name: str, stain: str, sizes: dict[str, int]
+) -> Optional[str]:
+    if chrom not in sizes:
+        return None
+    if not (0 <= start < end <= sizes[chrom]):
+        raise ValueError(f"cytoband interval {chrom}:{start}-{end} is outside the assembly")
+    if not valid_cytoband_stain(stain):
+        raise ValueError(f"unsupported cytoband stain {stain!r}")
+    return f"{chrom}\t{start}\t{end}\t{name}\t{stain}\n"
+
+
+def normalize_text_cytobands(source: Path, destination: Path, sizes: dict[str, int]) -> int:
+    rows: list[str] = []
+    opener = gzip.open if source.suffix == ".gz" else open
+    with opener(source, "rt", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) < 5:
+                raise ValueError(f"cytoband row {line_number} has fewer than five columns")
+            row = validate_cytoband_row(
+                fields[0], int(fields[1]), int(fields[2]), fields[3], fields[4], sizes
+            )
+            if row is not None:
+                rows.append(row)
+    rows.sort(key=lambda row: (row.split("\t", 1)[0], int(row.split("\t")[1])))
+    write_text_lines(destination, rows)
+    return len(rows)
+
+
+def require_pybigwig() -> Any:
+    if pyBigWig is None:
+        raise ValueError(
+            "BigBed normalization requires pyBigWig; run "
+            "`uv venv tools/landmarks/.venv && "
+            "uv pip install --python tools/landmarks/.venv/bin/python pyBigWig numpy`"
+        )
+    return pyBigWig
+
+
+def normalize_bigbed_cytobands(source: Path, destination: Path, sizes: dict[str, int]) -> int:
+    module = require_pybigwig()
+    bigbed = module.open(str(source))
+    rows: list[str] = []
+    try:
+        for chrom, length in bigbed.chroms().items():
+            for start, end, rest in bigbed.entries(chrom, 0, length) or []:
+                fields = rest.split("\t")
+                if len(fields) < 2:
+                    raise ValueError(f"BigBed cytoband at {chrom}:{start} has no name/stain")
+                row = validate_cytoband_row(
+                    chrom, int(start), int(end), fields[0], fields[1], sizes
+                )
+                if row is not None:
+                    rows.append(row)
+    finally:
+        bigbed.close()
+    rows.sort(key=lambda row: (row.split("\t", 1)[0], int(row.split("\t")[1])))
+    write_text_lines(destination, rows)
+    return len(rows)
+
+
+def write_text_lines(path: Path, lines: Iterable[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{path.name}.", mode="w", encoding="utf-8", dir=path.parent, delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.writelines(lines)
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            path.chmod(0o644)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
 
 def refgene_rows(path: Path) -> Iterator[list[str]]:
@@ -267,11 +590,16 @@ def curate_refgene(
         ),
     )
     write_gzip_lines(representatives, ("\t".join(fields) + "\n" for fields in rows))
+    search_rows = [
+        (fields[11].casefold(), fields[11], fields[11], fields[0], fields[1], fields[3], fields[4], fields[2], "")
+        for fields in rows
+    ]
+    search_rows.sort(key=lambda row: (row[0], order.get(row[4], len(order)), int(row[5]), int(row[6]), row[2]))
     write_gzip_lines(
         names,
-        (
-            f"{fields[11]}\t{fields[0]}\t{fields[1]}\t{fields[3]}\t{fields[4]}\n"
-            for fields in rows
+        chain(
+            [SEARCH_SCHEMA_VERSION + "\n"],
+            ("\t".join(row) + "\n" for row in search_rows),
         ),
     )
     return {
@@ -280,6 +608,159 @@ def curate_refgene(
         "transcripts": transcript_count,
         "off_reference_transcripts_excluded": excluded_transcript_count,
         "exons": exon_count,
+    }
+
+
+def biggenepred_gene_identity(fields: Sequence[str]) -> tuple[str, str]:
+    transcript = fields[0]
+    stable_gene = fields[14] if len(fields) > 14 else ""
+    symbol = (
+        (fields[15] if len(fields) > 15 else "")
+        or stable_gene
+        or (fields[9] if len(fields) > 9 else "")
+        or transcript
+    )
+    transcript_like = stable_gene.startswith(("NM_", "NR_", "XM_", "XR_", "ENST"))
+    gene_id = symbol if not stable_gene or transcript_like else stable_gene
+    return gene_id, symbol
+
+
+def biggenepred_rank(record: dict[str, Any]) -> tuple[int, int, int, int, int, str]:
+    fields = record["fields"]
+    mane_status = fields[21] if len(fields) > 21 else ""
+    mane_priority = 0 if mane_status == "MANE Select" else 1 if mane_status else 2
+    cds_start, cds_end = int(fields[3]), int(fields[4])
+    block_sizes = comma_integers(fields[7])
+    return (
+        mane_priority,
+        accession_priority(fields[0]),
+        -(cds_end - cds_start),
+        -sum(block_sizes),
+        -(record["end"] - record["start"]),
+        fields[0],
+    )
+
+
+def biggenepred_to_refgene(record: dict[str, Any], symbol: str) -> list[str]:
+    chrom = record["chrom"]
+    start = int(record["start"])
+    end = int(record["end"])
+    fields = record["fields"]
+    if len(fields) < 17:
+        raise ValueError(f"BigGenePred {chrom}:{start}-{end} has fewer than 20 total fields")
+    block_count = int(fields[6])
+    block_sizes = comma_integers(fields[7])
+    relative_starts = comma_integers(fields[8])
+    if block_count != len(block_sizes) or block_count != len(relative_starts):
+        raise ValueError(f"BigGenePred exon arrays disagree for {fields[0]}")
+    exon_starts = [start + value for value in relative_starts]
+    exon_ends = [block_start + size for block_start, size in zip(exon_starts, block_sizes)]
+    normalized = [
+        fields[0],
+        chrom,
+        fields[2],
+        str(start),
+        str(end),
+        fields[3],
+        fields[4],
+        str(block_count),
+        ",".join(map(str, exon_starts)) + ",",
+        ",".join(map(str, exon_ends)) + ",",
+        fields[1],
+        symbol,
+        fields[10],
+        fields[11],
+        fields[12] if fields[12].endswith(",") else fields[12] + ",",
+    ]
+    return normalized
+
+
+def curate_biggenepred(
+    source: Path,
+    representatives: Path,
+    names: Path,
+    sizes: dict[str, int],
+    chromosome_order: Sequence[str],
+) -> dict[str, int]:
+    module = require_pybigwig()
+    bigbed = module.open(str(source))
+    selected: dict[str, dict[str, Any]] = {}
+    source_transcript_count = 0
+    excluded_transcript_count = 0
+    try:
+        for chrom, length in bigbed.chroms().items():
+            for start, end, rest in bigbed.entries(chrom, 0, length) or []:
+                source_transcript_count += 1
+                if chrom not in sizes:
+                    excluded_transcript_count += 1
+                    continue
+                fields = rest.split("\t")
+                gene_id, symbol = biggenepred_gene_identity(fields)
+                record = {
+                    "chrom": chrom,
+                    "start": int(start),
+                    "end": int(end),
+                    "fields": fields,
+                    "gene_id": gene_id,
+                    "symbol": symbol,
+                }
+                previous = selected.get(gene_id)
+                if previous is None or biggenepred_rank(record) < biggenepred_rank(previous):
+                    selected[gene_id] = record
+    finally:
+        bigbed.close()
+
+    order = {chrom: index for index, chrom in enumerate(chromosome_order)}
+    records = sorted(
+        selected.values(),
+        key=lambda record: (
+            order.get(record["chrom"], len(order)),
+            record["start"],
+            record["end"],
+            record["fields"][0],
+        ),
+    )
+    normalized = [biggenepred_to_refgene(record, record["symbol"]) for record in records]
+    for fields in normalized:
+        validate_refgene(fields, sizes)
+    write_gzip_lines(representatives, ("\t".join(fields) + "\n" for fields in normalized))
+
+    search_rows = [
+        (
+            record["symbol"].casefold(),
+            record["symbol"],
+            record["gene_id"],
+            record["fields"][0],
+            record["chrom"],
+            str(record["start"]),
+            str(record["end"]),
+            record["fields"][2],
+            "",
+        )
+        for record in records
+    ]
+    search_rows.sort(
+        key=lambda row: (
+            row[0],
+            order.get(row[4], len(order)),
+            int(row[5]),
+            int(row[6]),
+            row[2],
+        )
+    )
+    write_gzip_lines(
+        names,
+        chain(
+            [SEARCH_SCHEMA_VERSION + "\n"],
+            ("\t".join(row) + "\n" for row in search_rows),
+        ),
+    )
+    return {
+        "genes": len(records),
+        "source_transcripts": source_transcript_count,
+        "transcripts": source_transcript_count - excluded_transcript_count,
+        "off_reference_transcripts_excluded": excluded_transcript_count,
+        "exons": sum(int(fields[7]) for fields in normalized),
     }
 
 
@@ -293,18 +774,12 @@ def validate_bigbed(path: Path) -> None:
         raise ValueError(f"{path} is not a BigBed file")
 
 
-def download_trix(url: str, directory: Path, force: bool) -> list[dict[str, Any]]:
-    assets = []
-    for suffix in ("", "x"):
-        source = url + suffix
-        destination = directory / ("genes.ix" + suffix)
-        download(source, destination, force)
-        assets.append(asset(destination, directory, "gene_search", source, "trix"))
-    return assets
-
-
 def supporting_assets(
-    configuration: dict[str, Any], directory: Path, force: bool
+    spec: BuildSpec,
+    configuration: dict[str, Any],
+    directory: Path,
+    output_root: Path,
+    force: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, int], list[str]]:
     assets: list[dict[str, Any]] = []
     chrom_sizes_url = configuration.get("chromSizesURL")
@@ -313,33 +788,136 @@ def supporting_assets(
     chrom_sizes_path = directory / "chrom.sizes"
     download(chrom_sizes_url, chrom_sizes_path, force)
     sizes, order = chromosome_sizes(chrom_sizes_path)
-    assets.append(asset(chrom_sizes_path, directory, "chromosome_sizes", chrom_sizes_url, "tsv"))
+    assets.append(
+        igv_asset(
+            chrom_sizes_path,
+            output_root,
+            "chromosome_sizes",
+            chrom_sizes_url,
+            "chrom_sizes_tsv",
+            version=spec.release,
+            derivation="Copied and validated as an ordered contig dictionary.",
+        )
+    )
 
-    for key, role, filename, format_name in (
-        ("aliasURL", "contig_aliases", "aliases.tsv", "tsv"),
-        ("cytobandURL", "cytobands", "cytobands.txt.gz", "ucsc_cytoband"),
-        ("cytobandBbURL", "cytobands", "cytobands.bb", "bigBed"),
-    ):
-        url = configuration.get(key)
-        if isinstance(url, str):
-            destination = directory / filename
-            download(url, destination, force)
-            assets.append(asset(destination, directory, role, url, format_name))
+    alias_url = configuration.get("aliasURL")
+    if not isinstance(alias_url, str):
+        raise ValueError(f"IGV configuration {spec.identifier} has no contig aliases")
+    raw_aliases = directory / "aliases.tsv"
+    download(alias_url, raw_aliases, force)
+    normalized_aliases = directory / "aliases.normalized.tsv"
+    normalize_aliases(raw_aliases, normalized_aliases, sizes)
+    assets.append(
+        igv_asset(
+            normalized_aliases,
+            output_root,
+            "contig_aliases",
+            alias_url,
+            "alias_tsv",
+            version=spec.release,
+            derivation="Normalized to one alias<TAB>canonical pair per row; conflicts rejected.",
+        )
+    )
+
+    cytoband_url = configuration.get("cytobandURL")
+    cytoband_bigbed_url = configuration.get("cytobandBbURL")
+    normalized_cytobands = directory / "cytobands.txt"
+    if isinstance(cytoband_url, str):
+        raw_cytobands = directory / "cytobands.txt.gz"
+        download(cytoband_url, raw_cytobands, force)
+        normalize_text_cytobands(raw_cytobands, normalized_cytobands, sizes)
+        source_url = cytoband_url
+        derivation = "Decompressed and coordinate/stain validated as UCSC cytoband text."
+    elif isinstance(cytoband_bigbed_url, str):
+        raw_cytobands = directory / "cytobands.bb"
+        download(cytoband_bigbed_url, raw_cytobands, force)
+        validate_bigbed(raw_cytobands)
+        normalize_bigbed_cytobands(raw_cytobands, normalized_cytobands, sizes)
+        source_url = cytoband_bigbed_url
+        derivation = "Decoded from BigBed and coordinate/stain validated as UCSC cytoband text."
+    else:
+        raise ValueError(f"IGV configuration {spec.identifier} has no cytobands")
+    assets.append(
+        igv_asset(
+            normalized_cytobands,
+            output_root,
+            "cytobands",
+            source_url,
+            "ucsc_cytoband",
+            version=spec.release,
+            derivation=derivation,
+        )
+    )
     return assets, sizes, order
+
+
+def notice_text(spec: BuildSpec, configuration_url: str) -> str:
+    return f"""# {spec.identifier} landmark bundle notice
+
+Bundle: `{spec.identifier}-{spec.bundle_version}`
+
+This local RGV curation bundle was derived from the genome preset metadata and source URLs used by
+the Integrative Genomics Viewer (IGV). IGV configuration metadata is distributed under the IGV
+project's MIT licence. The normalized output remains subject to the terms and attribution
+requirements of each named upstream data provider.
+
+- IGV data/configuration: {configuration_url}
+- IGV licence: https://github.com/igvteam/igv-data/blob/main/LICENSE
+- NCBI data policies and disclaimer: https://www.ncbi.nlm.nih.gov/home/about/policies/
+- NCBI RefSeq: https://www.ncbi.nlm.nih.gov/refseq/
+- UCSC Genome Browser credits and conditions: https://genome.ucsc.edu/goldenPath/credits.html
+- MANE project: https://www.ncbi.nlm.nih.gov/refseq/MANE/
+- GENCODE project: https://www.gencodegenes.org/pages/data_format.html
+
+The reference sequence itself is not included. Restricted clinical tracks and liftOver chains are
+not included. This notice records provenance for local qualification; distribution still requires
+the project's explicit legal/release review.
+"""
+
+
+def write_notice(spec: BuildSpec, directory: Path, configuration_url: str) -> Path:
+    path = directory / "NOTICE.md"
+    write_text_lines(path, [notice_text(spec, configuration_url)])
+    return path
+
+
+def bundle_contigs(
+    spec: BuildSpec, sizes: dict[str, int], order: Sequence[str]
+) -> list[dict[str, Any]]:
+    primary = PRIMARY_CONTIGS[spec.identifier]
+    missing = primary.difference(sizes)
+    if missing:
+        raise ValueError(f"{spec.identifier} is missing primary contigs: {sorted(missing)}")
+    md5 = SEQUENCE_MD5.get(spec.identifier, {})
+    return [
+        {
+            "name": chrom,
+            "length": sizes[chrom],
+            "md5": md5.get(chrom),
+            "primary": chrom in primary,
+        }
+        for chrom in order
+    ]
 
 
 def build_bundle(spec: BuildSpec, output_root: Path, force: bool) -> dict[str, Any]:
     directory = output_root / spec.identifier
     directory.mkdir(parents=True, exist_ok=True)
+    manifest_path = directory / "manifest.json"
+    previous_bundle: Optional[dict[str, Any]] = None
+    if manifest_path.is_file():
+        with manifest_path.open(encoding="utf-8") as stream:
+            previous_manifest = json.load(stream)
+        candidate = previous_manifest.get("bundle")
+        if isinstance(candidate, dict):
+            previous_bundle = candidate
     config_url = f"{IGV_DATA_ROOT}/{spec.identifier}.json"
     configuration_path = directory / "igv.json"
     configuration = load_json_url(config_url, configuration_path, force)
     if configuration.get("id") != spec.identifier:
         raise ValueError(f"IGV configuration ID does not match {spec.identifier}")
     track = first_track(configuration)
-    assets = [asset(configuration_path, directory, "igv_configuration", config_url, "json")]
-    support, sizes, order = supporting_assets(configuration, directory, force)
-    assets.extend(support)
+    assets, sizes, order = supporting_assets(spec, configuration, directory, output_root, force)
 
     track_url = track["url"]
     track_format = str(track.get("format", "")).lower()
@@ -348,23 +926,30 @@ def build_bundle(spec: BuildSpec, output_root: Path, force: bool) -> dict[str, A
         transcripts = directory / "transcripts.genePred.gz"
         download(track_url, transcripts, force)
         assets.append(
-            asset(transcripts, directory, "detailed_transcripts", track_url, "genePredExt")
-        )
-        genes = directory / "genes.genePred.gz"
-        names = directory / "names.tsv.gz"
-        counts = curate_refgene(transcripts, genes, names, sizes, order)
-        assets.extend(
-            [
-                asset(genes, directory, "derived_gene_landmarks", track_url, "genePredExt"),
-                asset(names, directory, "derived_gene_search", track_url, "rgv_landmark_names_v1"),
-            ]
+            igv_asset(
+                transcripts,
+                output_root,
+                "detailed_transcripts",
+                track_url,
+                "gene_pred_ext_gzip",
+                version=spec.release,
+                derivation="Copied as the optional all-transcript source; coordinates validated during curation.",
+            )
         )
     elif track_format == "biggenepred":
         transcripts = directory / "transcripts.bigGenePred"
         download(track_url, transcripts, force)
         validate_bigbed(transcripts)
         assets.append(
-            asset(transcripts, directory, "detailed_transcripts", track_url, "bigGenePred")
+            igv_asset(
+                transcripts,
+                output_root,
+                "detailed_transcripts",
+                track_url,
+                "big_gene_pred",
+                version=spec.release,
+                derivation="Copied as the indexed optional all-transcript source; BigBed signature validated.",
+            )
         )
     else:
         raise ValueError(f"unsupported IGV gene format {track_format!r} for {spec.identifier}")
@@ -373,60 +958,121 @@ def build_bundle(spec: BuildSpec, output_root: Path, force: bool) -> dict[str, A
         landmark_url = configuration.get("maneBbURL")
         if not isinstance(landmark_url, str):
             raise ValueError(f"IGV configuration {spec.identifier} has no MANE BigBed")
-        genes = directory / "genes.bigGenePred"
-        download(landmark_url, genes, force)
-        validate_bigbed(genes)
-        assets.append(asset(genes, directory, "gene_landmarks", landmark_url, "bigGenePred"))
-        trix_url = configuration.get("maneTrixURL")
-        if isinstance(trix_url, str):
-            assets.extend(download_trix(trix_url, directory, force))
+        landmark_source = directory / "genes.bigGenePred"
+        download(landmark_url, landmark_source, force)
+        validate_bigbed(landmark_source)
     elif spec.landmark_mode == "curated_biggenepred":
         if spec.landmark_url is None:
             raise ValueError(f"missing curated landmark URL for {spec.identifier}")
-        genes = directory / "genes.bigGenePred"
-        download(spec.landmark_url, genes, force)
-        validate_bigbed(genes)
-        assets.append(asset(genes, directory, "gene_landmarks", spec.landmark_url, "bigGenePred"))
-    elif spec.landmark_mode != "representative_refgene":
+        landmark_url = spec.landmark_url
+        landmark_source = directory / "genes.bigGenePred"
+        download(landmark_url, landmark_source, force)
+        validate_bigbed(landmark_source)
+    elif spec.landmark_mode == "representative_refgene":
+        landmark_url = track_url
+        landmark_source = directory / "transcripts.genePred.gz"
+    else:
         raise ValueError(f"unknown landmark mode {spec.landmark_mode}")
 
-    trix_url = track.get("trixURL")
-    if isinstance(trix_url, str):
-        assets.extend(download_trix(trix_url, directory, force))
+    genes = directory / "genes.representative.genePred.gz"
+    names = directory / "names.rgv.tsv.gz"
+    if spec.landmark_mode == "representative_refgene":
+        counts = curate_refgene(landmark_source, genes, names, sizes, order)
+    else:
+        counts = curate_biggenepred(landmark_source, genes, names, sizes, order)
+    assets.extend(
+        [
+            igv_asset(
+                genes,
+                output_root,
+                "representative_genes",
+                landmark_url,
+                "gene_pred_ext_gzip",
+                version=spec.release,
+                derivation=(
+                    "Selected exactly one model per stable gene: MANE Select first, then NM/NR/XM/XR, "
+                    "coding length, spliced length, genomic span, and stable accession."
+                ),
+            ),
+            igv_asset(
+                names,
+                output_root,
+                "gene_search",
+                landmark_url,
+                "rgv_gene_names_v1_gzip",
+                version=spec.release,
+                derivation="Derived deterministically from the representative records.",
+            ),
+        ]
+    )
+
+    notice = write_notice(spec, directory, config_url)
+    assets.append(
+        asset(
+            notice,
+            output_root,
+            "notice",
+            config_url,
+            "markdown",
+            project="RGV landmark curation with IGV/NCBI/UCSC/MANE/GENCODE sources",
+            version=spec.bundle_version,
+            derivation="Generated bundle-level attribution and release-gate notice.",
+            citation="See NOTICE.md",
+            license_name="Multiple source-specific terms; see NOTICE.md",
+            license_url="https://github.com/igvteam/igv-data/blob/main/LICENSE",
+            required_notice="NOTICE.md must accompany redistribution.",
+        )
+    )
 
     reference_url = configuration.get("fastaURL") or configuration.get("twoBitURL")
+    selection_policy = (
+        "one representative transcript per gene: MANE Select first, then NM, NR, XM, XR; "
+        "then coding length, spliced length, genomic span, and stable accession"
+    )
+    bundle = {
+        "id": spec.identifier,
+        "version": spec.bundle_version,
+        "display_name": configuration.get("name", spec.identifier),
+        "provider": spec.provider,
+        "release": spec.release,
+        "selection_policy": selection_policy,
+        "assembly": {
+            "stable_id": spec.assembly_stable_id,
+            "display_name": spec.assembly_display_name,
+            "compatible_ids": list(spec.compatible_ids),
+            "primary_contig_count": len(PRIMARY_CONTIGS[spec.identifier]),
+            "dictionary_sha256": dictionary_sha256(sizes, order),
+            "compatible_dictionary_sha256": list(spec.compatible_dictionary_sha256),
+            "contigs": bundle_contigs(spec, sizes, order),
+        },
+        "assets": sorted(assets, key=lambda item: (item["role"], item["path"])),
+    }
+    validate_runtime_bundle(bundle)
+    if (
+        previous_bundle is not None
+        and previous_bundle.get("id") == bundle["id"]
+        and previous_bundle.get("version") == bundle["version"]
+        and immutable_asset_fingerprints(previous_bundle)
+        != immutable_asset_fingerprints(bundle)
+    ):
+        raise ValueError(
+            f"immutable landmark release {bundle['id']} {bundle['version']} changed; "
+            "bump bundle_version before rebuilding"
+        )
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        "id": spec.identifier,
-        "name": configuration.get("name", spec.identifier),
+        "bundle": bundle,
         "source_configuration": config_url,
         "reference": {
-            "source": reference_url,
+            "source_url": reference_url,
             "downloaded": False,
-            "note": (
-                "Reference sequence is deliberately not part of the lightweight landmark bundle."
-            ),
+            "note": "Reference sequence is deliberately not part of the lightweight landmark bundle.",
         },
-        "selection": (
-            "IGV-provided MANE/curated BigGenePred"
-            if spec.landmark_mode != "representative_refgene"
-            else "one transcript per gene: NM, NR, XM, XR; then coding, spliced, and genomic length"
-        ),
         "counts": counts,
-        "assets": assets,
+        "distribution_status": "local_qualification_only_pending_release_review",
     }
-    manifest_path = directory / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    landmark = next((item for item in assets if item["role"] == "gene_landmarks"), None)
-    if landmark is None:
-        landmark = next(item for item in assets if item["role"] == "derived_gene_landmarks")
-    return {
-        "id": spec.identifier,
-        "name": manifest["name"],
-        "manifest": manifest_path.relative_to(output_root).as_posix(),
-        "landmarks": f"{spec.identifier}/{landmark['path']}",
-        "landmark_format": landmark["format"],
-    }
+    write_text_lines(manifest_path, [json.dumps(manifest, indent=2, sort_keys=True) + "\n"])
+    return bundle
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -451,9 +1097,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for identifier in BUILD_SPECS
         if identifier in catalog_by_id
     ]
-    catalog_path.write_text(
-        json.dumps({"schema_version": SCHEMA_VERSION, "bundles": catalog}, indent=2) + "\n",
-        encoding="utf-8",
+    write_text_lines(
+        catalog_path,
+        [json.dumps({"schema_version": SCHEMA_VERSION, "bundles": catalog}, indent=2) + "\n"],
     )
     print(f"Built {len(catalog)} bundles in {args.output_root}")
     return 0

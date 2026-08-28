@@ -627,6 +627,7 @@ pub(crate) enum InspectorActionId {
     InspectVariantModifications(TrackId, u64),
     ExportVariantGenotypes,
     ExportVariantEvidence,
+    ShowAllTranscriptsForGene(String),
     ClearSelection,
 }
 

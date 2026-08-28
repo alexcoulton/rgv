@@ -16,6 +16,7 @@ pub struct DiagnosticsSnapshot {
     pub gpu_upload: String,
     pub navigation: String,
     pub interaction: Option<String>,
+    pub landmarks: Option<String>,
 }
 
 impl Viewer {
@@ -337,7 +338,7 @@ impl Viewer {
                 self.navigation_horizon_preview_stats.last_rectangle_count,
             ),
             navigation: format!(
-                "navigation {} inputs / {} coalesced / {} dispatched / {} release-dispatched / {} cancelled / {} committed · {} preview frames / {} neutral-after-commit · last {} frames / {:.2} ms · {} stale results rejected",
+                "navigation {} inputs / {} coalesced / {} dispatched / {} release-dispatched / {} cancelled / {} committed · {} preview frames / {} neutral-after-commit · last {} frames / {:.2} ms · {} stale results rejected · row layout {} active / {} cancelled",
                 navigation_counters[0],
                 navigation_counters[1],
                 navigation_counters[2],
@@ -349,6 +350,8 @@ impl Viewer {
                 navigation_counters[8],
                 navigation_counters[9] as f64 / 1_000.0,
                 self.navigation_stale_result_rejections,
+                self.alignment_row_layout_tasks.len(),
+                self.alignment_row_layout_cancellations,
             ),
             interaction: Some(self.interaction_trace.snapshot().map_or(
                 sashimi_interaction.clone(),
@@ -367,7 +370,54 @@ impl Viewer {
                     )
                 },
             )),
+            landmarks: self.landmark_diagnostics_text(),
         }
+    }
+
+    fn landmark_diagnostics_text(&self) -> Option<String> {
+        let snapshot = self.automation_landmark_snapshot();
+        if !snapshot.resource_configured
+            && snapshot.catalogue_schema_version.is_none()
+            && self.landmark_catalogue_error.is_none()
+        {
+            return None;
+        }
+        let root = self.landmark_resource_root.as_ref().map_or_else(
+            || "unavailable".to_owned(),
+            |path| path.display().to_string(),
+        );
+        let resolution = self.landmark_resolution.as_ref();
+        let bundle = snapshot
+            .matched_bundle_id
+            .as_deref()
+            .map_or("none", |value| value);
+        let version = snapshot
+            .matched_bundle_version
+            .as_deref()
+            .map_or("none", |value| value);
+        let checksum = snapshot
+            .gene_asset_sha256
+            .as_deref()
+            .map_or("none", |value| value);
+        let error = self
+            .landmark_catalogue_error
+            .as_deref()
+            .map_or("none", |value| value);
+        Some(format!(
+            "root {root}\nschema {:?} · resolution {:?} · evidence {:?} · subset {}\nbundle {bundle} · version {version} · integrity {:?}\nautomatic {:?} · loaded {} · visible {} · suppressed {} · search {}\ngene format {:?} · SHA-256 {checksum}\nreason {}\nerror {error}",
+            snapshot.catalogue_schema_version,
+            snapshot.resolution_status,
+            snapshot.evidence,
+            snapshot.subset,
+            snapshot.integrity,
+            snapshot.automatic_track_state,
+            snapshot.automatic_track_loaded,
+            snapshot.automatic_track_visible,
+            snapshot.suppressed,
+            snapshot.search_ready,
+            snapshot.gene_asset_format,
+            resolution.map_or("not resolved", |value| value.reason.as_str()),
+        ))
     }
 }
 
@@ -402,6 +452,11 @@ pub fn show_diagnostics(context: &Context, open: &mut bool, snapshot: &Diagnosti
                 for track in &snapshot.alignment_tracks {
                     ui.monospace(track);
                 }
+            }
+            if let Some(landmarks) = &snapshot.landmarks {
+                ui.separator();
+                ui.strong("Genome landmarks");
+                ui.monospace(landmarks);
             }
             ui.monospace(&snapshot.layout_cache);
             ui.monospace(&snapshot.gpu_upload);

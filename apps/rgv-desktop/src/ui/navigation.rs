@@ -619,7 +619,9 @@ fn stain_color(stain: CytobandStain) -> Color32 {
     match stain {
         CytobandStain::Negative => Color32::WHITE,
         CytobandStain::Positive25 => Color32::from_gray(205),
+        CytobandStain::Positive33 => Color32::from_gray(190),
         CytobandStain::Positive50 => Color32::from_gray(155),
+        CytobandStain::Positive66 => Color32::from_gray(120),
         CytobandStain::Positive75 => Color32::from_gray(95),
         CytobandStain::Positive100 => Color32::from_gray(30),
         CytobandStain::Centromere => Color32::from_rgb(210, 62, 55),

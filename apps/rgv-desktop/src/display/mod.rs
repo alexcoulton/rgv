@@ -546,9 +546,21 @@ pub(crate) fn pane_layout_snapshot(
 }
 
 impl Viewer {
-    pub(crate) fn ensure_alignment_rows(&mut self) {
+    pub(crate) fn ensure_alignment_rows(&mut self) -> bool {
+        let track_ids = self
+            .alignment_tracks
+            .iter()
+            .map(|track| track.config.id)
+            .collect::<Vec<_>>();
+        let mut all_ready = true;
+        for track_id in track_ids {
+            all_ready &= self.ensure_alignment_rows_for_track(track_id);
+        }
+        all_ready
+    }
+
+    fn ensure_alignment_rows_for_track(&mut self, track_id: TrackId) -> bool {
         let panel_id = self.panels.active().id;
-        let primary_id = self.primary_alignment_track_id();
         let viewport = self.panels.active().viewport;
         let navigation_intervals = self
             .panels
@@ -557,32 +569,46 @@ impl Viewer {
             .entries()
             .copied()
             .collect::<Vec<_>>();
-        if self.primary_alignment_filters().alignment_sort_mode == AlignmentSortMode::Base
-            && self
-                .primary_alignment_filters()
+        let Some(track_index) = self
+            .alignment_tracks
+            .iter()
+            .position(|track| track.config.id == track_id)
+        else {
+            return true;
+        };
+        if self.alignment_tracks[track_index]
+            .config
+            .filters
+            .alignment_sort_mode
+            == AlignmentSortMode::Base
+            && self.alignment_tracks[track_index]
+                .config
+                .filters
                 .alignment_sort_anchor
                 .is_none()
         {
-            self.primary_alignment_filters_mut().alignment_sort_anchor =
+            self.alignment_tracks[track_index]
+                .config
+                .filters
+                .alignment_sort_anchor =
                 alignment_sort_position(AlignmentSortMode::Base, None, viewport);
         }
-        let filters = self.primary_alignment_filters().clone();
-        let Some(query) = self.alignment_query_for_track(primary_id).cloned() else {
-            return;
+        let filters = self.alignment_tracks[track_index].config.filters.clone();
+        let Some(query) = self.alignment_query_for_track(track_id).cloned() else {
+            return true;
         };
-        let layout_query = self
-            .alignment_tracks
-            .first()
-            .and_then(|track| track.projection(panel_id))
+        let layout_query = self.alignment_tracks[track_index]
+            .projection(panel_id)
             .and_then(|projection| projection.layout_query.clone())
             .unwrap_or_else(|| Arc::clone(&query));
         let read_refusal =
             alignment::individual_read_refusal(&query, &layout_query, filters.read_stacking_mode);
         let max_rows = query.batch.len().max(layout_query.batch.len()).max(1);
-        let observed_pair_length_bounds = self.effective_template_length_bounds(&layout_query);
+        let observed_pair_length_bounds =
+            effective_template_length_bounds_for_filters(&filters, &layout_query);
         let pair_length_bounds = self
             .alignment_tracks
-            .first_mut()
+            .get_mut(track_index)
             .map(|track| {
                 let projection = track.projection_mut(panel_id);
                 projection
@@ -598,7 +624,7 @@ impl Viewer {
         );
         let promoted_read_name_hash = self
             .promoted_read
-            .filter(|(track_id, _)| *track_id == primary_id)
+            .filter(|(promoted_track_id, _)| *promoted_track_id == track_id)
             .map(|(_, hash)| hash);
         let pair_bounds_relevant = alignment_row_pair_bounds_relevant(
             filters.alignment_group_mode,
@@ -606,7 +632,7 @@ impl Viewer {
         );
         let rows_match = self
             .alignment_tracks
-            .first()
+            .get(track_index)
             .and_then(|track| track.projection(panel_id))
             .and_then(|projection| projection.alignment_rows.as_ref())
             .is_some_and(|cached| {
@@ -625,11 +651,11 @@ impl Viewer {
             });
         let pending_repack = self
             .alignment_tracks
-            .first()
+            .get(track_index)
             .and_then(|track| track.projection(panel_id))
             .is_some_and(|projection| projection.pending_row_repack);
         if rows_match && !pending_repack {
-            return;
+            return true;
         }
         let options = AlignmentLayoutOptions {
             group_mode: filters.alignment_group_mode,
@@ -643,10 +669,72 @@ impl Viewer {
             pair_length_bounds,
             ..AlignmentLayoutOptions::default()
         };
-        if let Some(track) = self.alignment_tracks.first_mut() {
+        let repack = pending_repack && filters.read_stacking_mode == ReadStackingMode::Stable;
+        let key = AlignmentRowLayoutTaskKey {
+            query_identity: Arc::as_ptr(&query) as usize,
+            layout_query_identity: Arc::as_ptr(&layout_query) as usize,
+            group_mode: options.group_mode,
+            group_order: options.group_order,
+            sort_mode: options.sort_mode,
+            sort_order: options.sort_order,
+            sort_position: options.sort_position,
+            promoted_read_name_hash: options.promoted_read_name_hash,
+            max_rows: options.max_rows,
+            view_as_pairs: options.view_as_pairs,
+            pair_length_bounds: options.pair_length_bounds,
+            stacking_mode: filters.read_stacking_mode,
+            repack,
+        };
+        if self
+            .alignment_row_layout_tasks
+            .iter()
+            .any(|task| task.panel_id == panel_id && task.track_id == track_id && task.key == key)
+        {
+            return false;
+        }
+        let Some((request_revision, history, cancellation_clock, cancellation_generation)) =
+            self.alignment_tracks.get_mut(track_index).map(|track| {
+                let projection = track.projection_mut(panel_id);
+                projection.row_layout_request_revision =
+                    projection.row_layout_request_revision.saturating_add(1);
+                let cancellation_generation = projection.row_layout_clock.advance();
+                (
+                    projection.row_layout_request_revision,
+                    projection.row_history.clone(),
+                    projection.row_layout_clock.clone(),
+                    cancellation_generation,
+                )
+            })
+        else {
+            return true;
+        };
+        match self.start_alignment_row_layout_task(
+            panel_id,
+            track_id,
+            request_revision,
+            key,
+            Arc::clone(&query),
+            Arc::clone(&layout_query),
+            options,
+            filters.read_stacking_mode,
+            repack,
+            read_refusal.is_some(),
+            history,
+            cancellation_clock,
+            cancellation_generation,
+        ) {
+            AlignmentRowLayoutSubmit::Submitted => return false,
+            AlignmentRowLayoutSubmit::QueueFull => {
+                self.data_status = "Read layout queued behind active work…".to_owned();
+                return false;
+            }
+            AlignmentRowLayoutSubmit::Disconnected => {}
+        }
+
+        // Pool disconnection is exceptional. Keep the view usable with a
+        // synchronous fallback while preserving the same transactional key.
+        if let Some(track) = self.alignment_tracks.get_mut(track_index) {
             let projection = track.projection_mut(panel_id);
-            let repack = std::mem::take(&mut projection.pending_row_repack)
-                && filters.read_stacking_mode == ReadStackingMode::Stable;
             let (layout, reconciliation) = if read_refusal.is_some() {
                 (
                     assign_alignment_rows(&query, options, None),
@@ -662,6 +750,9 @@ impl Viewer {
                     repack,
                 )
             };
+            if repack {
+                projection.pending_row_repack = false;
+            }
             projection.alignment_rows = Some(CachedAlignmentRows {
                 query,
                 layout_query,
@@ -680,9 +771,13 @@ impl Viewer {
             });
         }
         self.layout_cache.clear();
+        true
     }
 
     pub(crate) fn rebuild_genomic_display(&mut self) {
+        if !self.ensure_alignment_rows() {
+            return;
+        }
         let annotation_auto_fit = self.track_presentation.annotation_pane_auto_fit;
         let annotation_content_height = annotation_auto_fit
             .then(|| annotation_frame_content_height(&self.panels.active().track_frames))
@@ -700,7 +795,6 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     fn rebuild_genomic_display_pass(&mut self, annotation_content_height: Option<f32>) -> f32 {
-        self.ensure_alignment_rows();
         let shared_sashimi_raw = self.shared_sashimi_maximum(SashimiCountMode::Raw);
         let shared_sashimi_cpm = self.shared_sashimi_maximum(SashimiCountMode::CountsPerMillion);
         let primary_alignment_id = self.primary_alignment_track_id();
@@ -1333,6 +1427,54 @@ impl Viewer {
             // scrollable primary track must give every complete record a row
             // opportunity instead of imposing a second display-only cap.
             options.max_rows = query.batch.len().max(1);
+            let primary_rows = self
+                .alignment_tracks
+                .first()
+                .and_then(|track| track.projection(self.panels.active().id))
+                .and_then(|projection| projection.alignment_rows.as_ref());
+            let total_rows = primary_rows.map_or(options.max_rows, |cached| {
+                if cached.stacking_mode == ReadStackingMode::Stable {
+                    cached.layout.row_capacity()
+                } else {
+                    cached.layout.used_row_count()
+                }
+            });
+            let clip_top = primary_read_bounds.top.max(read_clip_top);
+            let clip_bottom = primary_read_bounds.bottom.min(scroll_clip_bottom);
+            let read_scroll = self
+                .panels
+                .active()
+                .read_panel_scroll_state(primary_alignment_id)
+                .effective_scroll_points();
+            options.materialized_row_range = Some(alignment::materialized_alignment_row_range(
+                options.reads_top,
+                options.row_height,
+                clip_top,
+                clip_bottom,
+                read_scroll,
+                total_rows,
+                alignment::MATERIALIZED_ALIGNMENT_ROW_OVERSCAN,
+            ));
+            if let Some((track_id, record_index)) = self.panels.active().pending_read_reveal
+                && track_id == primary_alignment_id
+                && let Some(row) = primary_rows.and_then(|cached| cached.layout.row(record_index))
+            {
+                let visible_rows = ((clip_bottom - clip_top) / options.row_height)
+                    .ceil()
+                    .max(1.0) as usize;
+                let start = row
+                    .saturating_sub(visible_rows / 2)
+                    .saturating_sub(alignment::MATERIALIZED_ALIGNMENT_ROW_OVERSCAN);
+                options.materialized_row_range = Some((
+                    start,
+                    start
+                        .saturating_add(visible_rows)
+                        .saturating_add(
+                            alignment::MATERIALIZED_ALIGNMENT_ROW_OVERSCAN.saturating_mul(2),
+                        )
+                        .min(total_rows),
+                ));
+            }
             options.row_layout_revision = self
                 .alignment_tracks
                 .first()
@@ -1397,11 +1539,13 @@ impl Viewer {
                         .first()
                         .and_then(|track| track.projection(self.panels.active().id))
                         .and_then(|projection| projection.alignment_rows.as_ref())
-                        .filter(|cached| cached.stacking_mode == ReadStackingMode::Stable)
                         .map_or(natural_bottom, |cached| {
-                            options.reads_top
-                                + cached.layout.row_capacity() as f32 * options.row_height
-                                + 6.0
+                            let rows = if cached.stacking_mode == ReadStackingMode::Stable {
+                                cached.layout.row_capacity()
+                            } else {
+                                cached.layout.used_row_count()
+                            };
+                            options.reads_top + rows as f32 * options.row_height + 6.0
                         })
                 };
                 natural_bottom.max(reserved_bottom)
@@ -1449,6 +1593,8 @@ impl Viewer {
                         .and_then(|track| track.projection(self.panels.active().id))
                         .and_then(|projection| projection.alignment_rows.as_ref())
                         .map(|cached| cached.reconciliation.revision),
+                    materialized_row_range: options.materialized_row_range,
+                    total_rows: Some(total_rows),
                     overview: ui::ScrollbarOverview::default(),
                     actual_content_bottom: actual_read_content_bottom,
                     clip_top: primary_read_bounds.top.max(read_clip_top),
@@ -1784,6 +1930,9 @@ impl Viewer {
             .entries()
             .copied()
             .collect::<Vec<_>>();
+        let active_panel_id = self.panels.active().id;
+        let active_viewport = self.panels.active().viewport;
+        let active_contig_name = self.panels.active().contig_name.clone();
         for track in self.alignment_tracks.iter_mut().skip(1) {
             let track_id = track.config.id;
             let annotation_group_collapsed = collapsed_annotation_group_members.contains(&track_id);
@@ -1839,14 +1988,29 @@ impl Viewer {
                 top: scroll_clip_bottom,
                 bottom: scroll_clip_bottom,
             });
+            let read_effective_scroll = self
+                .panels
+                .active()
+                .read_panel_scroll_state(track_id)
+                .effective_scroll_points();
+            let pending_read_reveal_index = self
+                .panels
+                .active()
+                .pending_read_reveal
+                .filter(|(reveal_track, _)| *reveal_track == track_id)
+                .map(|(_, index)| index);
             let (layout, mut frame, mut read_frame) = secondary_alignment_track_layout(
-                self.panels.active_mut().id,
+                active_panel_id,
                 track,
-                self.panels.active_mut().viewport,
-                &self.panels.active_mut().contig_name,
+                active_viewport,
+                &active_contig_name,
                 top,
                 read_bounds.top,
                 read_bounds.bottom,
+                read_bounds.top.max(read_clip_top),
+                read_bounds.bottom.min(scroll_clip_bottom),
+                read_effective_scroll,
+                pending_read_reveal_index,
                 read_panel_densities
                     .get(&track_id)
                     .copied()
@@ -1950,16 +2114,33 @@ impl Viewer {
                     let row_revision = projection
                         .and_then(|projection| projection.alignment_rows.as_ref())
                         .map(|cached| cached.reconciliation.revision);
+                    let total_rows = projection
+                        .and_then(|projection| projection.alignment_rows.as_ref())
+                        .map(|cached| {
+                            if cached.stacking_mode == ReadStackingMode::Stable {
+                                cached.layout.row_capacity()
+                            } else {
+                                cached.layout.used_row_count()
+                            }
+                        });
+                    let materialized_row_range = Some((
+                        layout.stats.materialized_row_start,
+                        layout.stats.materialized_row_end,
+                    ));
                     let reserved_bottom = if read_refused {
                         natural_bottom
                     } else {
                         projection
                             .and_then(|projection| projection.alignment_rows.as_ref())
-                            .filter(|cached| cached.stacking_mode == ReadStackingMode::Stable)
                             .map_or(natural_bottom, |cached| {
+                                let rows = if cached.stacking_mode == ReadStackingMode::Stable {
+                                    cached.layout.row_capacity()
+                                } else {
+                                    cached.layout.used_row_count()
+                                };
                                 read_bounds.top
                                     + READ_PANE_HEADER_HEIGHT
-                                    + cached.layout.row_capacity() as f32 * row_height
+                                    + rows as f32 * row_height
                                     + 6.0
                             })
                     };
@@ -1970,6 +2151,8 @@ impl Viewer {
                         row_origin: Some(read_bounds.top + READ_PANE_HEADER_HEIGHT),
                         row_height: Some(row_height),
                         row_layout_revision: row_revision,
+                        materialized_row_range,
+                        total_rows,
                         overview: ui::ScrollbarOverview::default(),
                         actual_content_bottom: natural_bottom.max(reserved_bottom),
                         clip_top: read_bounds.top.max(read_clip_top),
@@ -2106,6 +2289,8 @@ impl Viewer {
                     row_origin: None,
                     row_height: None,
                     row_layout_revision: None,
+                    materialized_row_range: None,
+                    total_rows: None,
                     overview: ui::ScrollbarOverview::default(),
                     actual_content_bottom: bottom,
                     clip_top: bounds.top.max(read_clip_top),
@@ -3014,6 +3199,7 @@ impl Viewer {
                 .scroll_display_cache
                 .as_ref()
                 .is_some_and(|cache| cache.supports_fast_scroll)
+            || !self.active_panel_materialization_covers_scroll()
             || !self.rebuild_active_panel_from_scroll_cache()
         {
             return false;
@@ -3021,6 +3207,41 @@ impl Viewer {
         self.composite_display_list = composite_panel_display_lists(&self.panels);
         self.prepare_rectangle_renderer();
         true
+    }
+
+    fn active_panel_materialization_covers_scroll(&self) -> bool {
+        let panel = self.panels.active();
+        let Some(cache) = panel.scroll_display_cache.as_ref() else {
+            return false;
+        };
+        cache.read_panels.iter().all(|read_panel| {
+            let (
+                Some((materialized_start, materialized_end)),
+                Some(total_rows),
+                Some(row_origin),
+                Some(row_height),
+            ) = (
+                read_panel.materialized_row_range,
+                read_panel.total_rows,
+                read_panel.row_origin,
+                read_panel.row_height,
+            )
+            else {
+                return true;
+            };
+            let (required_start, required_end) = alignment::materialized_alignment_row_range(
+                row_origin,
+                row_height,
+                read_panel.clip_top,
+                read_panel.clip_bottom,
+                panel
+                    .read_panel_scroll_state(read_panel.track_id)
+                    .effective_scroll_points(),
+                total_rows,
+                0,
+            );
+            materialized_start <= required_start && required_end <= materialized_end
+        })
     }
 
     /// Applies the one workspace annotation camera to every locus and refreshes

@@ -88,6 +88,48 @@ fn json_round_trip_preserves_schema_and_sources() {
 }
 
 #[test]
+fn builtin_landmark_identity_and_suppression_round_trip_portably() {
+    let mut document = SessionDocument::new(SessionLocus {
+        contig: "chr1".to_owned(),
+        start: 100,
+        end: 200,
+    });
+    document.landmark_context = Some(crate::BuiltInLandmarkContext {
+        bundle_id: "hg38".to_owned(),
+        bundle_version: "1.0-rgv1".to_owned(),
+    });
+    document
+        .suppressed_builtin_gene_bundles
+        .insert("mm39".to_owned());
+    document.tracks.push(
+        TrackConfig::new(
+            TrackId::new(9),
+            "Genes".to_owned(),
+            TrackKind::GeneModel,
+            TrackSource::Local {
+                path: "/developer/machine/genes.genePred.gz".to_owned(),
+            },
+        )
+        .with_built_in(crate::BuiltInTrackIdentity {
+            bundle_id: "hg38".to_owned(),
+            bundle_version: "1.0-rgv1".to_owned(),
+            asset_role: crate::LandmarkAssetRole::RepresentativeGenes,
+            sha256: "a".repeat(64),
+        }),
+    );
+    document.normalize_presentation();
+
+    let restored = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
+    assert_eq!(restored.landmark_context, document.landmark_context);
+    assert_eq!(
+        restored.suppressed_builtin_gene_bundles,
+        document.suppressed_builtin_gene_bundles
+    );
+    assert_eq!(restored.tracks[0].built_in, document.tracks[0].built_in);
+    assert_eq!(restored.tracks[0].source, document.tracks[0].source);
+}
+
+#[test]
 fn invalid_track_sample_associations_are_rejected() {
     let mut document = SessionDocument::new(SessionLocus {
         contig: "chr1".to_owned(),

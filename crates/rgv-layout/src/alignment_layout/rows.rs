@@ -120,14 +120,79 @@ pub fn reconcile_alignment_rows_with_horizon(
     stacking_mode: ReadStackingMode,
     repack_stable: bool,
 ) -> (AlignmentRowLayout, AlignmentRowReconciliationStats) {
+    reconcile_alignment_rows_with_horizon_internal(
+        query,
+        layout_query,
+        options,
+        history,
+        stacking_mode,
+        repack_stable,
+        &|| false,
+    )
+    .expect("non-cancellable alignment reconciliation completes")
+}
+
+/// Reconciles rows on an owned candidate history and returns nothing once a
+/// newer generation cancels the work. Because the candidate is consumed, a
+/// cancelled sweep can never partially mutate the caller's committed history.
+pub fn reconcile_alignment_rows_with_horizon_cancellable<F>(
+    query: &AlignmentQuery,
+    layout_query: &AlignmentQuery,
+    options: AlignmentLayoutOptions,
+    mut candidate_history: AlignmentRowHistory,
+    stacking_mode: ReadStackingMode,
+    repack_stable: bool,
+    is_cancelled: F,
+) -> Option<(
+    AlignmentRowLayout,
+    AlignmentRowReconciliationStats,
+    AlignmentRowHistory,
+)>
+where
+    F: Fn() -> bool,
+{
+    reconcile_alignment_rows_with_horizon_internal(
+        query,
+        layout_query,
+        options,
+        &mut candidate_history,
+        stacking_mode,
+        repack_stable,
+        &is_cancelled,
+    )
+    .map(|(layout, stats)| (layout, stats, candidate_history))
+}
+
+fn reconcile_alignment_rows_with_horizon_internal(
+    query: &AlignmentQuery,
+    layout_query: &AlignmentQuery,
+    options: AlignmentLayoutOptions,
+    history: &mut AlignmentRowHistory,
+    stacking_mode: ReadStackingMode,
+    repack_stable: bool,
+    is_cancelled: &impl Fn() -> bool,
+) -> Option<(AlignmentRowLayout, AlignmentRowReconciliationStats)> {
     let reconciliation_started = std::time::Instant::now();
+    if is_cancelled() {
+        return None;
+    }
     if stacking_mode == ReadStackingMode::Compact {
+        let allocation_started = std::time::Instant::now();
         let layout = assign_alignment_rows_internal(query, options, None, true);
+        if is_cancelled() {
+            return None;
+        }
+        let row_allocation_micros = elapsed_micros(allocation_started);
+        let metrics_started = std::time::Instant::now();
         let organization = alignment_row_organization_metrics(query, options, &layout);
+        let canonical_metrics_micros = elapsed_micros(metrics_started);
         let stats = AlignmentRowReconciliationStats {
             revision: history.revision(),
             architecture_version: organization.architecture_version,
             reconciliation_micros: elapsed_micros(reconciliation_started),
+            row_allocation_micros,
+            canonical_metrics_micros,
+            rows_appended: representative_row_count(&layout),
             added: representative_row_count(&layout),
             contexts: history.context_count(),
             islands: history.island_count(),
@@ -153,7 +218,7 @@ pub fn reconcile_alignment_rows_with_horizon(
             horizon_truncated: !query.individual_reads_complete(),
             ..AlignmentRowReconciliationStats::default()
         };
-        return (layout, stats);
+        return (!is_cancelled()).then_some((layout, stats));
     }
 
     history.revision = history.revision.saturating_add(1);
@@ -182,6 +247,7 @@ pub fn reconcile_alignment_rows_with_horizon(
         repacked,
         connected_history,
         horizon_extension,
+        mut work,
     ) = {
         let context = &mut history.contexts[context_index];
         let mut connected = context
@@ -209,10 +275,39 @@ pub fn reconcile_alignment_rows_with_horizon(
             .is_some_and(|covered| !interval_contains(covered, layout_query.interval));
 
         if connected.is_empty() {
+            let allocation_started = std::time::Instant::now();
             let mut layout = assign_alignment_rows_internal(layout_query, options, None, true);
-            let added = seed_history_island(context, layout_query, &layout, options, revision);
+            if is_cancelled() {
+                return None;
+            }
+            let row_allocation_micros = elapsed_micros(allocation_started);
+            let commit_started = std::time::Instant::now();
+            let added = seed_history_island(
+                context,
+                layout_query,
+                &layout,
+                options,
+                revision,
+                is_cancelled,
+            )?;
+            let history_commit_micros = elapsed_micros(commit_started);
             layout.max_rows = layout.used_row_count().max(1);
-            (layout, 0, 0, added, 0, repack_stable, false, false)
+            (
+                layout,
+                0,
+                0,
+                added,
+                0,
+                repack_stable,
+                false,
+                false,
+                HistoryReconciliationWork {
+                    row_allocation_micros,
+                    history_commit_micros,
+                    rows_appended: added,
+                    ..HistoryReconciliationWork::default()
+                },
+            )
         } else {
             let island_index = merge_connected_islands(
                 context,
@@ -222,12 +317,13 @@ pub fn reconcile_alignment_rows_with_horizon(
                 horizon_extension,
                 revision,
             );
-            let (layout, retained, restored, added, reservations) = reconcile_history_island(
+            let (layout, retained, restored, added, reservations, work) = reconcile_history_island(
                 &mut context.islands[island_index],
                 layout_query,
                 options,
                 revision,
-            );
+                is_cancelled,
+            )?;
             (
                 layout,
                 retained,
@@ -237,6 +333,7 @@ pub fn reconcile_alignment_rows_with_horizon(
                 false,
                 true,
                 horizon_extension,
+                work,
             )
         }
     };
@@ -248,11 +345,18 @@ pub fn reconcile_alignment_rows_with_horizon(
             .iter()
             .position(|island| interval_contains(island.interval, query.interval))
             .expect("the visible query must be contained by its layout horizon");
-        let (visible_layout, _, _, visible_added, visible_reservations) =
-            reconcile_history_island(&mut context.islands[island_index], query, options, revision);
+        let (visible_layout, _, _, visible_added, visible_reservations, visible_work) =
+            reconcile_history_island(
+                &mut context.islands[island_index],
+                query,
+                options,
+                revision,
+                is_cancelled,
+            )?;
         layout = visible_layout;
         added = added.saturating_add(visible_added);
         reservations = visible_reservations;
+        work.add_assign(visible_work);
     }
 
     let (horizon_interval, horizon_generation, horizon_extensions, horizon_truncated) = history
@@ -274,6 +378,9 @@ pub fn reconcile_alignment_rows_with_horizon(
         })
         .expect("the active layout horizon must remain in row history");
     enforce_history_budget(history, revision);
+    if is_cancelled() {
+        return None;
+    }
     let transition_reason = if repacked {
         ReadStackingTransitionReason::ExplicitRebuild
     } else if horizon_extension {
@@ -285,12 +392,25 @@ pub fn reconcile_alignment_rows_with_horizon(
     } else {
         ReadStackingTransitionReason::InitialCanonical
     };
+    let metrics_started = std::time::Instant::now();
     let organization = alignment_row_organization_metrics(query, options, &layout);
+    if is_cancelled() {
+        return None;
+    }
+    let canonical_metrics_micros = elapsed_micros(metrics_started);
 
     let stats = AlignmentRowReconciliationStats {
         revision,
         architecture_version: organization.architecture_version,
         reconciliation_micros: elapsed_micros(reconciliation_started),
+        incumbent_projection_micros: work.incumbent_projection_micros,
+        history_index_micros: work.history_index_micros,
+        row_allocation_micros: work.row_allocation_micros,
+        history_commit_micros: work.history_commit_micros,
+        canonical_metrics_micros,
+        compatibility_probes: work.compatibility_probes,
+        rows_reused: work.rows_reused,
+        rows_appended: work.rows_appended,
         retained,
         restored,
         added,
@@ -322,7 +442,7 @@ pub fn reconcile_alignment_rows_with_horizon(
         horizon_bytes: layout_query.estimated_bytes(),
         horizon_truncated,
     };
-    (layout, stats)
+    Some((layout, stats))
 }
 
 pub fn alignment_row_organization_metrics(
@@ -393,6 +513,39 @@ pub fn alignment_row_organization_metrics(
 
 fn elapsed_micros(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HistoryReconciliationWork {
+    incumbent_projection_micros: u64,
+    history_index_micros: u64,
+    row_allocation_micros: u64,
+    history_commit_micros: u64,
+    compatibility_probes: usize,
+    rows_reused: usize,
+    rows_appended: usize,
+}
+
+impl HistoryReconciliationWork {
+    fn add_assign(&mut self, other: Self) {
+        self.incumbent_projection_micros = self
+            .incumbent_projection_micros
+            .saturating_add(other.incumbent_projection_micros);
+        self.history_index_micros = self
+            .history_index_micros
+            .saturating_add(other.history_index_micros);
+        self.row_allocation_micros = self
+            .row_allocation_micros
+            .saturating_add(other.row_allocation_micros);
+        self.history_commit_micros = self
+            .history_commit_micros
+            .saturating_add(other.history_commit_micros);
+        self.compatibility_probes = self
+            .compatibility_probes
+            .saturating_add(other.compatibility_probes);
+        self.rows_reused = self.rows_reused.saturating_add(other.rows_reused);
+        self.rows_appended = self.rows_appended.saturating_add(other.rows_appended);
+    }
 }
 
 fn alignment_row_policy_fingerprint(options: &AlignmentLayoutOptions) -> u64 {
@@ -501,12 +654,16 @@ fn seed_history_island(
     layout: &AlignmentRowLayout,
     options: AlignmentLayoutOptions,
     revision: u64,
-) -> usize {
+    is_cancelled: &impl Fn() -> bool,
+) -> Option<usize> {
     let (pairs, identities, _, group_by_index) = row_inputs(query, options);
     let mut assignments = HashMap::new();
     let mut row_groups = BTreeMap::<usize, BTreeSet<AlignmentGroupKey>>::new();
     let mut added = 0;
     for index in 0..query.batch.len() {
+        if cancellation_checkpoint(index, is_cancelled) {
+            return None;
+        }
         if pairs.representatives[index] != index {
             continue;
         }
@@ -537,7 +694,7 @@ fn seed_history_island(
         last_used_revision: revision,
         navigation_pinned: false,
     });
-    added
+    Some(added)
 }
 
 fn merge_connected_islands(
@@ -599,18 +756,127 @@ fn reconcile_history_island(
     query: &AlignmentQuery,
     options: AlignmentLayoutOptions,
     revision: u64,
-) -> (AlignmentRowLayout, usize, usize, usize, usize) {
+    is_cancelled: &impl Fn() -> bool,
+) -> Option<(
+    AlignmentRowLayout,
+    usize,
+    usize,
+    usize,
+    usize,
+    HistoryReconciliationWork,
+)> {
     island.last_used_revision = revision;
+    let preparation_started = std::time::Instant::now();
     let (pairs, identities, groups, group_by_index) = row_inputs(query, options);
+    if is_cancelled() {
+        return None;
+    }
     let mut rows = vec![None; query.batch.len()];
     let mut retained = 0;
     let mut restored = 0;
     let mut current_identities = BTreeSet::new();
+    let mut work = HistoryReconciliationWork::default();
+
+    // A refused/truncated canonical horizon can legitimately establish an
+    // empty island before a Complete foreground arrives. Seeding that first
+    // real batch through the historical insertion path used to scan every
+    // previously appended row for every read: a dense n-read clique therefore
+    // performed roughly n²/2 compatibility checks. There are no incumbents to
+    // preserve in an empty island, so use the canonical scratch sweep directly
+    // and establish history from its result in one pass.
+    if island.assignments.is_empty() {
+        let ordered_groups = ordered_group_entries(&groups, options.group_order);
+        let group_count = groups.len().max(1);
+        let max_rows = options.max_rows.max(1);
+        let rows_per_group = if max_rows >= query.batch.len() {
+            max_rows
+        } else {
+            (max_rows / group_count).max(1)
+        };
+        let mut group_starts = BTreeMap::new();
+        assign_rows_from_scratch(
+            &ordered_groups,
+            &pairs,
+            rows_per_group,
+            max_rows,
+            &mut rows,
+            &mut group_starts,
+        );
+        copy_pair_rows(&pairs, &mut rows);
+        // Identity construction, grouping, canonical ordering, and row choice
+        // are all part of allocation for a first real batch. Keep them in one
+        // stage measurement rather than reporting only the final heap sweep.
+        work.row_allocation_micros = elapsed_micros(preparation_started);
+
+        let commit_started = std::time::Instant::now();
+        let mut added = 0;
+        for index in 0..query.batch.len() {
+            if cancellation_checkpoint(index, is_cancelled) {
+                return None;
+            }
+            if pairs.representatives[index] != index {
+                continue;
+            }
+            let Some(row) = rows[index] else {
+                continue;
+            };
+            let identity = identities[index];
+            let group = group_by_index[index].clone();
+            island
+                .row_groups
+                .entry(row)
+                .or_default()
+                .insert(group.clone());
+            island.assignments.insert(
+                identity,
+                HistoricalRowAssignment {
+                    group,
+                    row,
+                    start: pairs.starts[index],
+                    end: pairs.ends[index],
+                    last_seen_revision: revision,
+                },
+            );
+            current_identities.insert(identity);
+            added += 1;
+        }
+        work.history_commit_micros = elapsed_micros(commit_started);
+        work.rows_appended = added;
+        let effective_max_rows = island
+            .row_groups
+            .last_key_value()
+            .map_or(1, |(&row, _)| row.saturating_add(1));
+        return Some((
+            AlignmentRowLayout {
+                rows,
+                identities,
+                pair_representatives: pairs.representatives,
+                group_starts,
+                group_mode: options.group_mode,
+                group_order: options.group_order,
+                sort_mode: options.sort_mode,
+                sort_order: options.sort_order,
+                sort_position: effective_sort_position(&options),
+                promoted_read_name_hash: options.promoted_read_name_hash,
+                max_rows: effective_max_rows,
+                view_as_pairs: options.view_as_pairs,
+            },
+            0,
+            0,
+            added,
+            0,
+            work,
+        ));
+    }
 
     // Refresh known spans before building row occupancy. Pair view can learn a
     // wider template span when the mate enters the query; the identity and row
     // remain stable while the reservation conservatively expands.
+    let projection_started = std::time::Instant::now();
     for index in 0..query.batch.len() {
+        if cancellation_checkpoint(index, is_cancelled) {
+            return None;
+        }
         if pairs.representatives[index] != index {
             continue;
         }
@@ -632,9 +898,14 @@ fn reconcile_history_island(
             rows[index] = Some(assignment.row);
         }
     }
+    work.incumbent_projection_micros = elapsed_micros(projection_started);
 
+    let index_started = std::time::Instant::now();
     let mut occupied = BTreeMap::<usize, Vec<(u64, u64, AlignmentRowIdentity)>>::new();
-    for (&identity, assignment) in &island.assignments {
+    for (index, (&identity, assignment)) in island.assignments.iter().enumerate() {
+        if cancellation_checkpoint(index, is_cancelled) {
+            return None;
+        }
         occupied.entry(assignment.row).or_default().push((
             assignment.start,
             assignment.end,
@@ -653,58 +924,51 @@ fn reconcile_history_island(
         });
         debug_assert!(intervals.windows(2).all(|pair| pair[0].1 <= pair[1].0));
     }
+    work.history_index_micros = elapsed_micros(index_started);
 
     let ordered_groups = ordered_group_entries(&groups, options.group_order);
     let mut added = 0;
+    let allocation_started = std::time::Instant::now();
     for &(group, indices) in &ordered_groups {
-        for &index in indices {
-            if pairs.representatives[index] != index || rows[index].is_some() {
-                continue;
-            }
-            let identity = identities[index];
-            let start = pairs.starts[index];
-            let end = pairs.ends[index];
-            let row = island
-                .row_groups
-                .iter()
-                .filter(|(_, owners)| owners.contains(group))
-                .map(|(&row, _)| row)
-                .find(|row| {
-                    occupied
-                        .get(row)
-                        .is_none_or(|intervals| history_interval_fits(intervals, start, end))
-                })
-                .unwrap_or_else(|| {
-                    let row = island
-                        .row_groups
-                        .last_key_value()
-                        .map_or(0, |(&last, _)| last.saturating_add(1));
-                    island
-                        .row_groups
-                        .entry(row)
-                        .or_default()
-                        .insert(group.clone());
-                    row
-                });
-            let intervals = occupied.entry(row).or_default();
-            let insert_at =
-                intervals.partition_point(|&(existing_start, _, _)| existing_start <= start);
-            intervals.insert(insert_at, (start, end, identity));
-            island.assignments.insert(
-                identity,
-                HistoricalRowAssignment {
-                    group: group_by_index[index].clone(),
-                    row,
-                    start,
-                    end,
-                    last_seen_revision: revision,
-                },
-            );
-            rows[index] = Some(row);
-            current_identities.insert(identity);
-            added += 1;
+        if is_cancelled() {
+            return None;
         }
+        let mut new_representatives = indices
+            .iter()
+            .copied()
+            .filter(|&index| pairs.representatives[index] == index && rows[index].is_none())
+            .collect::<Vec<_>>();
+        if new_representatives.is_empty() {
+            continue;
+        }
+        if !new_representatives
+            .windows(2)
+            .all(|pair| pairs.starts[pair[0]] <= pairs.starts[pair[1]])
+        {
+            // Stable incumbents cannot be reordered to reproduce a fresh
+            // viewport-local sort. Place only the new identities by genomic
+            // start so the gap sweep remains indexed; stable sorting retains
+            // the selected/group sort priority for equal-start reads, which
+            // is the case in which that priority determines vertical order.
+            new_representatives.sort_by_key(|&index| (pairs.starts[index], pairs.ends[index]));
+        }
+        added += assign_monotonic_history_rows(
+            group,
+            &new_representatives,
+            &pairs,
+            &identities,
+            &group_by_index,
+            island,
+            &mut occupied,
+            &mut rows,
+            revision,
+            &mut work,
+            is_cancelled,
+        )?;
     }
+    work.row_allocation_micros = work
+        .row_allocation_micros
+        .saturating_add(elapsed_micros(allocation_started));
     copy_pair_rows(&pairs, &mut rows);
 
     let mut group_starts = BTreeMap::new();
@@ -736,18 +1000,260 @@ fn reconcile_history_island(
         max_rows: effective_max_rows,
         view_as_pairs: options.view_as_pairs,
     };
-    (layout, retained, restored, added, reservations)
+    Some((layout, retained, restored, added, reservations, work))
 }
 
-fn history_interval_fits(
-    intervals: &[(u64, u64, AlignmentRowIdentity)],
+const ALIGNMENT_ROW_CANCELLATION_CHUNK: usize = 2_048;
+
+fn cancellation_checkpoint(index: usize, is_cancelled: &impl Fn() -> bool) -> bool {
+    index.is_multiple_of(ALIGNMENT_ROW_CANCELLATION_CHUNK) && is_cancelled()
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RowGapEvent {
     start: u64,
+    row: usize,
     end: u64,
-) -> bool {
-    let next = intervals.partition_point(|&(existing_start, _, _)| existing_start < start);
-    let clears_previous = next == 0 || intervals[next - 1].1 <= start;
-    let clears_next = next == intervals.len() || end <= intervals[next].0;
-    clears_previous && clears_next
+}
+
+/// Segment tree that returns the visually highest row whose currently active
+/// free gap ends at or after a requested alignment end.
+///
+/// Gap starts are handled by the event sweep in
+/// `assign_monotonic_history_rows`; each leaf therefore needs only the active
+/// gap end. Interior maximums let an incompatible subtree be rejected without
+/// inspecting any of its rows.
+struct FirstCompatibleRowTree {
+    leaf_count: usize,
+    maximum_ends: Vec<u64>,
+}
+
+impl FirstCompatibleRowTree {
+    fn with_capacity(row_capacity: usize) -> Self {
+        let leaf_count = row_capacity.max(1).next_power_of_two();
+        Self {
+            leaf_count,
+            maximum_ends: vec![0; leaf_count.saturating_mul(2)],
+        }
+    }
+
+    fn set(&mut self, row: usize, end: u64) {
+        debug_assert!(row < self.leaf_count);
+        let mut node = self.leaf_count + row;
+        self.maximum_ends[node] = end;
+        while node > 1 {
+            node /= 2;
+            self.maximum_ends[node] =
+                self.maximum_ends[node * 2].max(self.maximum_ends[node * 2 + 1]);
+        }
+    }
+
+    fn end(&self, row: usize) -> u64 {
+        self.maximum_ends[self.leaf_count + row]
+    }
+
+    fn first_ending_at_or_after(
+        &self,
+        required_end: u64,
+        compatibility_probes: &mut usize,
+    ) -> Option<usize> {
+        *compatibility_probes = compatibility_probes.saturating_add(1);
+        if self.maximum_ends[1] < required_end {
+            return None;
+        }
+        let mut node = 1;
+        while node < self.leaf_count {
+            *compatibility_probes = compatibility_probes.saturating_add(1);
+            let left = node * 2;
+            node = if self.maximum_ends[left] >= required_end {
+                left
+            } else {
+                left + 1
+            };
+        }
+        Some(node - self.leaf_count)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assign_monotonic_history_rows(
+    group: &AlignmentGroupKey,
+    indices: &[usize],
+    pairs: &PairLayoutMetadata,
+    identities: &[AlignmentRowIdentity],
+    group_by_index: &[AlignmentGroupKey],
+    island: &mut AlignmentRowIsland,
+    occupied: &mut BTreeMap<usize, Vec<(u64, u64, AlignmentRowIdentity)>>,
+    rows: &mut [Option<usize>],
+    revision: u64,
+    work: &mut HistoryReconciliationWork,
+    is_cancelled: &impl Fn() -> bool,
+) -> Option<usize> {
+    let index_started = std::time::Instant::now();
+    let owned_rows = island
+        .row_groups
+        .iter()
+        .filter(|(_, owners)| owners.contains(group))
+        .map(|(&row, _)| row)
+        .collect::<Vec<_>>();
+    let mut next_row = island
+        .row_groups
+        .last_key_value()
+        .map_or(0, |(&row, _)| row.saturating_add(1));
+    let capacity = next_row.saturating_add(indices.len()).max(1);
+    let mut gaps = BinaryHeap::<Reverse<RowGapEvent>>::new();
+    for row in owned_rows {
+        add_row_gap_events(row, occupied.get(&row).map(Vec::as_slice), &mut gaps);
+    }
+    let mut compatible = FirstCompatibleRowTree::with_capacity(capacity);
+    let mut pending = BTreeMap::<usize, Vec<(u64, u64, AlignmentRowIdentity)>>::new();
+    work.history_index_micros = work
+        .history_index_micros
+        .saturating_add(elapsed_micros(index_started));
+
+    for (position, &index) in indices.iter().enumerate() {
+        if cancellation_checkpoint(position, is_cancelled) {
+            return None;
+        }
+        let start = pairs.starts[index];
+        let end = pairs.ends[index];
+        while gaps
+            .peek()
+            .is_some_and(|Reverse(event)| event.start <= start)
+        {
+            let Reverse(event) = gaps
+                .pop()
+                .expect("an eligible row-gap event was observed at the heap head");
+            compatible.set(event.row, event.end);
+        }
+
+        let (row, gap_end) = if let Some(row) =
+            compatible.first_ending_at_or_after(end, &mut work.compatibility_probes)
+        {
+            let gap_end = compatible.end(row);
+            compatible.set(row, 0);
+            work.rows_reused = work.rows_reused.saturating_add(1);
+            (row, gap_end)
+        } else {
+            let row = next_row;
+            next_row = next_row.saturating_add(1);
+            island
+                .row_groups
+                .entry(row)
+                .or_default()
+                .insert(group.clone());
+            work.rows_appended = work.rows_appended.saturating_add(1);
+            (row, u64::MAX)
+        };
+        if end < gap_end {
+            gaps.push(Reverse(RowGapEvent {
+                start: end,
+                row,
+                end: gap_end,
+            }));
+        }
+
+        let identity = identities[index];
+        pending.entry(row).or_default().push((start, end, identity));
+        island.assignments.insert(
+            identity,
+            HistoricalRowAssignment {
+                group: group_by_index[index].clone(),
+                row,
+                start,
+                end,
+                last_seen_revision: revision,
+            },
+        );
+        rows[index] = Some(row);
+    }
+
+    let commit_started = std::time::Instant::now();
+    for (index, (row, additions)) in pending.into_iter().enumerate() {
+        if cancellation_checkpoint(index, is_cancelled) {
+            return None;
+        }
+        let historical = occupied.remove(&row).unwrap_or_default();
+        occupied.insert(row, merge_history_intervals(&historical, &additions));
+    }
+    work.history_commit_micros = work
+        .history_commit_micros
+        .saturating_add(elapsed_micros(commit_started));
+    Some(indices.len())
+}
+
+fn add_row_gap_events(
+    row: usize,
+    intervals: Option<&[(u64, u64, AlignmentRowIdentity)]>,
+    gaps: &mut BinaryHeap<Reverse<RowGapEvent>>,
+) {
+    add_span_gap_events(
+        row,
+        intervals
+            .into_iter()
+            .flatten()
+            .map(|&(start, end, _)| (start, end)),
+        gaps,
+    );
+}
+
+fn add_span_gap_events(
+    row: usize,
+    intervals: impl IntoIterator<Item = (u64, u64)>,
+    gaps: &mut BinaryHeap<Reverse<RowGapEvent>>,
+) {
+    let mut previous_end = 0;
+    let mut populated = false;
+    for (start, end) in intervals {
+        populated = true;
+        if previous_end < start {
+            gaps.push(Reverse(RowGapEvent {
+                start: previous_end,
+                row,
+                end: start,
+            }));
+        }
+        previous_end = previous_end.max(end);
+    }
+    if !populated {
+        gaps.push(Reverse(RowGapEvent {
+            start: 0,
+            row,
+            end: u64::MAX,
+        }));
+        return;
+    }
+    if previous_end < u64::MAX {
+        gaps.push(Reverse(RowGapEvent {
+            start: previous_end,
+            row,
+            end: u64::MAX,
+        }));
+    }
+}
+
+fn merge_history_intervals(
+    historical: &[(u64, u64, AlignmentRowIdentity)],
+    additions: &[(u64, u64, AlignmentRowIdentity)],
+) -> Vec<(u64, u64, AlignmentRowIdentity)> {
+    debug_assert!(historical.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+    debug_assert!(additions.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+    let mut merged = Vec::with_capacity(historical.len().saturating_add(additions.len()));
+    let mut old = 0;
+    let mut new = 0;
+    while old < historical.len() || new < additions.len() {
+        let take_old = new == additions.len()
+            || (old < historical.len() && historical[old].0 <= additions[new].0);
+        if take_old {
+            merged.push(historical[old]);
+            old += 1;
+        } else {
+            merged.push(additions[new]);
+            new += 1;
+        }
+    }
+    debug_assert!(merged.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+    merged
 }
 
 #[derive(Clone, Debug)]
@@ -853,80 +1359,103 @@ pub(crate) fn assign_rows_from_scratch(
             .windows(2)
             .all(|pair| pairs.starts[pair[0]] <= pairs.starts[pair[1]]);
         if !starts_are_monotonic {
-            let allocated = assign_rows_top_first_general(
-                &representatives,
+            let mut coordinate_order = representatives.clone();
+            // Interval partitioning is optimal and near-linear when processed
+            // by start. The former arbitrary-sort fallback scanned every row
+            // and became quadratic at dense loci. Preserve the user's sort as
+            // a row-order priority after packing: a dense clique therefore
+            // retains the exact requested order, while reusable rows remain a
+            // compact deterministic interval coloring.
+            coordinate_order.sort_by_key(|&index| (pairs.starts[index], pairs.ends[index]));
+            let allocated = assign_rows_coordinate_sweep(
+                &coordinate_order,
                 pairs,
                 next_group_row,
                 group_capacity,
                 rows,
             );
+            reorder_scratch_rows_by_priority(&representatives, next_group_row, allocated, rows);
             next_group_row = next_group_row.saturating_add(allocated);
             continue;
         }
 
-        // `active_by_end` establishes when a row becomes reusable;
-        // `available_rows` deliberately chooses the visually highest reusable
-        // row. The previous one-heap implementation chose whichever row ended
-        // earliest, which was height-optimal but rotated free lanes and made a
-        // canonical stable baseline look vertically scrambled.
-        let mut active_by_end = BinaryHeap::<Reverse<(u64, usize)>>::new();
-        let mut available_rows = BinaryHeap::<Reverse<usize>>::new();
-        let mut allocated = 0_usize;
-        for index in representatives {
-            while active_by_end
-                .peek()
-                .is_some_and(|Reverse((end, _))| *end <= pairs.starts[index])
-            {
-                let Reverse((_, row)) = active_by_end
-                    .pop()
-                    .expect("a reusable row was observed at the heap head");
-                available_rows.push(Reverse(row));
-            }
-            let local_row = if let Some(Reverse(row)) = available_rows.pop() {
-                row
-            } else if allocated < group_capacity {
-                let row = allocated;
-                allocated += 1;
-                row
-            } else {
-                continue;
-            };
-            let absolute_row = next_group_row.saturating_add(local_row);
-            active_by_end.push(Reverse((pairs.ends[index], local_row)));
-            rows[index] = Some(absolute_row);
-        }
+        let allocated = assign_rows_coordinate_sweep(
+            &representatives,
+            pairs,
+            next_group_row,
+            group_capacity,
+            rows,
+        );
         next_group_row = next_group_row.saturating_add(allocated);
     }
 }
 
-fn assign_rows_top_first_general(
+fn assign_rows_coordinate_sweep(
     representatives: &[usize],
     pairs: &PairLayoutMetadata,
     first_row: usize,
     capacity: usize,
     rows: &mut [Option<usize>],
 ) -> usize {
-    let mut occupied = Vec::<Vec<(u64, u64, usize)>>::new();
+    // `active_by_end` establishes when a row becomes reusable;
+    // `available_rows` deliberately chooses the visually highest reusable
+    // row. The previous one-heap implementation chose whichever row ended
+    // earliest, which was height-optimal but rotated free lanes and made a
+    // canonical stable baseline look vertically scrambled.
+    let mut active_by_end = BinaryHeap::<Reverse<(u64, usize)>>::new();
+    let mut available_rows = BinaryHeap::<Reverse<usize>>::new();
+    let mut allocated = 0_usize;
     for &index in representatives {
-        let start = pairs.starts[index];
-        let end = pairs.ends[index];
-        let row = occupied
-            .iter()
-            .position(|intervals| interval_fits(intervals, start, end))
-            .or_else(|| (occupied.len() < capacity).then_some(occupied.len()));
-        let Some(row) = row else {
+        while active_by_end
+            .peek()
+            .is_some_and(|Reverse((end, _))| *end <= pairs.starts[index])
+        {
+            let Reverse((_, row)) = active_by_end
+                .pop()
+                .expect("a reusable row was observed at the heap head");
+            available_rows.push(Reverse(row));
+        }
+        let local_row = if let Some(Reverse(row)) = available_rows.pop() {
+            row
+        } else if allocated < capacity {
+            let row = allocated;
+            allocated += 1;
+            row
+        } else {
             continue;
         };
-        if row == occupied.len() {
-            occupied.push(Vec::new());
-        }
-        let intervals = &mut occupied[row];
-        let insert_at =
-            intervals.partition_point(|&(existing_start, _, _)| existing_start <= start);
-        intervals.insert(insert_at, (start, end, index));
-        rows[index] = Some(first_row.saturating_add(row));
+        let absolute_row = first_row.saturating_add(local_row);
+        active_by_end.push(Reverse((pairs.ends[index], local_row)));
+        rows[index] = Some(absolute_row);
     }
-    occupied.len()
+    allocated
+}
+
+fn reorder_scratch_rows_by_priority(
+    representatives: &[usize],
+    first_row: usize,
+    allocated: usize,
+    rows: &mut [Option<usize>],
+) {
+    let mut priority = vec![usize::MAX; allocated];
+    for (rank, &index) in representatives.iter().enumerate() {
+        let Some(local_row) = rows[index].and_then(|row| row.checked_sub(first_row)) else {
+            continue;
+        };
+        priority[local_row] = priority[local_row].min(rank);
+    }
+    let mut ordered_rows = (0..allocated).collect::<Vec<_>>();
+    ordered_rows.sort_unstable_by_key(|&row| (priority[row], row));
+    let mut remap = vec![0; allocated];
+    for (next, previous) in ordered_rows.into_iter().enumerate() {
+        remap[previous] = next;
+    }
+    for &index in representatives {
+        let Some(local_row) = rows[index].and_then(|row| row.checked_sub(first_row)) else {
+            continue;
+        };
+        rows[index] = Some(first_row.saturating_add(remap[local_row]));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -989,23 +1518,48 @@ pub(crate) fn assign_rows_with_history(
             *intervals = retained;
         }
 
-        for &index in indices {
-            if pairs.representatives[index] != index {
-                continue;
-            }
-            if rows[index].is_some() {
-                continue;
-            }
+        let mut gaps = BinaryHeap::<Reverse<RowGapEvent>>::new();
+        for (local_row, intervals) in occupied.iter().enumerate() {
+            add_span_gap_events(
+                local_row,
+                intervals.iter().map(|&(start, end, _)| (start, end)),
+                &mut gaps,
+            );
+        }
+        let mut compatible = FirstCompatibleRowTree::with_capacity(group_capacity);
+        let mut newcomers = indices
+            .iter()
+            .copied()
+            .filter(|&index| pairs.representatives[index] == index && rows[index].is_none())
+            .collect::<Vec<_>>();
+        newcomers.sort_by_key(|&index| (pairs.starts[index], pairs.ends[index]));
+        let mut ignored_probes = 0;
+        for index in newcomers {
             let start = pairs.starts[index];
             let end = pairs.ends[index];
-            let Some(local_row) =
-                (0..group_capacity).find(|&row| interval_fits(&occupied[row], start, end))
+            while gaps
+                .peek()
+                .is_some_and(|Reverse(event)| event.start <= start)
+            {
+                let Reverse(event) = gaps
+                    .pop()
+                    .expect("an eligible previous-layout gap was observed");
+                compatible.set(event.row, event.end);
+            }
+            let Some(local_row) = compatible.first_ending_at_or_after(end, &mut ignored_probes)
             else {
                 continue;
             };
-            let insert_at = occupied[local_row]
-                .partition_point(|&(existing_start, _, _)| existing_start <= start);
-            occupied[local_row].insert(insert_at, (start, end, index));
+            let gap_end = compatible.end(local_row);
+            compatible.set(local_row, 0);
+            if end < gap_end {
+                gaps.push(Reverse(RowGapEvent {
+                    start: end,
+                    row: local_row,
+                    end: gap_end,
+                }));
+            }
+            occupied[local_row].push((start, end, index));
             rows[index] = Some(next_group_row + local_row);
         }
 
@@ -1015,13 +1569,6 @@ pub(crate) fn assign_rows_with_history(
             .map_or(0, |last| last + 1);
         next_group_row = next_group_row.saturating_add(used_rows);
     }
-}
-
-pub(crate) fn interval_fits(intervals: &[(u64, u64, usize)], start: u64, end: u64) -> bool {
-    let next = intervals.partition_point(|&(existing_start, _, _)| existing_start < start);
-    let clears_previous = next == 0 || intervals[next - 1].1 <= start;
-    let clears_next = next == intervals.len() || end <= intervals[next].0;
-    clears_previous && clears_next
 }
 
 pub(crate) fn alignment_row_identities(

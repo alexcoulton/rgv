@@ -3,6 +3,7 @@ members = [
     "apps/rgv-desktop",
     "apps/rgv-mcp",
     "benchmarks/alignment-io",
+    "benchmarks/dense-layout",
     "benchmarks/interaction",
     "benchmarks/comparison",
     "benchmarks/remote-range",

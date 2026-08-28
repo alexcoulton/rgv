@@ -16,6 +16,7 @@ pub(crate) fn pinned_gene_layout_maximum_rows(height: f32) -> usize {
     ((height / 20.0).floor() as usize).clamp(1, TrackLayoutOptions::default().maximum_rows)
 }
 
+#[cfg(test)]
 pub(crate) fn feature_layout_row_count(
     maximum_rows: usize,
     display_mode: FeatureDisplayMode,
@@ -315,6 +316,7 @@ pub(crate) fn quantitative_display_records<'a>(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn feature_record_index_at_position_and_row(
     records: &[rgv_hts::FeatureRecord],
     viewport: Viewport,
@@ -341,6 +343,33 @@ pub(crate) fn feature_record_index_at_position_and_row(
             row_ends[row] = row_ends[row].max(record.end);
             (row == selected_row && record.start <= position && position < record.end)
                 .then_some((record.end.saturating_sub(record.start), record_index))
+        })
+        .min()
+        .map(|(_, record_index)| record_index)
+}
+
+pub(crate) fn feature_record_index_at_display_point(
+    display: &DisplayList,
+    records: &[rgv_hts::FeatureRecord],
+    x: f32,
+    y: f32,
+    object_id_base: u32,
+) -> Option<usize> {
+    display
+        .rectangles
+        .iter()
+        .filter_map(|rectangle| {
+            if rectangle.object_id < object_id_base
+                || x < rectangle.x
+                || x >= rectangle.x + rectangle.width
+                || y < rectangle.y
+                || y >= rectangle.y + rectangle.height
+            {
+                return None;
+            }
+            let record_index = usize::try_from(rectangle.object_id - object_id_base).ok()?;
+            let record = records.get(record_index)?;
+            Some((record.end.saturating_sub(record.start), record_index))
         })
         .min()
         .map(|(_, record_index)| record_index)

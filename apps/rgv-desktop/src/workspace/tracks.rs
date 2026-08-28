@@ -825,7 +825,7 @@ impl Viewer {
                 && !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_))
             {
                 for projection in track.projections.values_mut() {
-                    projection.clock.advance();
+                    projection.advance_query_generation();
                     projection.pending_query = true;
                 }
                 query_requested = true;
@@ -976,7 +976,7 @@ impl Viewer {
             track.config.filters.clone_from(&source.filters);
             track.config.maximum_alignments = source.maximum_alignments;
             for projection in track.projections.values_mut() {
-                projection.clock.advance();
+                projection.advance_query_generation();
                 projection.pending_query =
                     !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
                 projection.alignment_rows = None;
@@ -1005,6 +1005,14 @@ impl Viewer {
     }
 
     pub(crate) fn remove_auxiliary_tracks(&mut self, ids: &[TrackId]) -> Result<usize> {
+        self.remove_auxiliary_tracks_with_suppression(ids, true)
+    }
+
+    pub(crate) fn remove_auxiliary_tracks_with_suppression(
+        &mut self,
+        ids: &[TrackId],
+        suppress_builtin_genes: bool,
+    ) -> Result<usize> {
         let requested = ids.iter().copied().collect::<HashSet<_>>();
         let actual = self
             .tracks
@@ -1016,6 +1024,15 @@ impl Viewer {
         if actual.is_empty() {
             return Ok(0);
         }
+        let suppressed_bundles = self
+            .tracks
+            .tracks()
+            .iter()
+            .filter(|track| actual.contains(&track.id))
+            .filter_map(|track| track.built_in.as_ref())
+            .filter(|identity| identity.asset_role == LandmarkAssetRole::RepresentativeGenes)
+            .map(|identity| identity.bundle_id.clone())
+            .collect::<BTreeSet<_>>();
         if let Some(engine) = &self.track_engine {
             // The actor request is queued before any replacement query. Do not
             // mutate visible state if bounded backpressure rejects the command.
@@ -1028,6 +1045,11 @@ impl Viewer {
             self.track_presentation.remove_source(*id);
             self.automation_auxiliary_open_state.remove(id);
             self.metadata_selected_tracks.remove(id);
+        }
+        if suppress_builtin_genes && !suppressed_bundles.is_empty() {
+            self.suppressed_builtin_gene_bundles
+                .extend(suppressed_bundles);
+            self.landmark_search_index = None;
         }
         self.reconcile_track_presentation();
         clear_removed_quantitative_dependencies(self.tracks.tracks_mut(), &removed);
@@ -1100,7 +1122,7 @@ impl Viewer {
     pub(crate) fn advance_alignment_generations(&self, panel_id: PanelId) {
         for track in &self.alignment_tracks {
             if let Some(projection) = track.projection(panel_id) {
-                projection.clock.advance();
+                projection.advance_query_generation();
             }
         }
     }
@@ -1138,7 +1160,7 @@ impl Viewer {
         }
         if outcome.query_changed && !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_)) {
             for projection in track.projections.values_mut() {
-                projection.clock.advance();
+                projection.advance_query_generation();
                 projection.pending_query = true;
             }
             self.panels.active_mut().pending_queries.alignment = true;

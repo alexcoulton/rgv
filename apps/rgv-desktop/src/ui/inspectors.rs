@@ -20,6 +20,7 @@ pub(crate) struct InspectorUiActions {
     pub(crate) sashimi_png_export_requested: bool,
     pub(crate) sashimi_svg_export_requested: bool,
     pub(crate) add_selected_feature_to_review: bool,
+    pub(crate) show_all_transcripts_requested: Option<String>,
     pub(crate) review_open: bool,
     pub(crate) variant_sample_search: String,
 }
@@ -706,6 +707,7 @@ pub(crate) fn show_properties(
     let mut sashimi_png_export_requested = false;
     let mut sashimi_svg_export_requested = false;
     let mut add_selected_feature_to_review = false;
+    let mut show_all_transcripts_requested = None;
     let mut review_open = false;
 
     let has_inspector = inspector.is_some()
@@ -847,6 +849,9 @@ pub(crate) fn show_properties(
                     add_selected_feature_to_review = true;
                     review_open = true;
                 }
+                InspectorActionId::ShowAllTranscriptsForGene(bundle_id) => {
+                    show_all_transcripts_requested = Some(bundle_id);
+                }
                 InspectorActionId::ClearSelection => clear_selection = true,
                 InspectorActionId::CopyDetails
                 | InspectorActionId::CopyCigar
@@ -984,6 +989,7 @@ pub(crate) fn show_properties(
         sashimi_png_export_requested,
         sashimi_svg_export_requested,
         add_selected_feature_to_review,
+        show_all_transcripts_requested,
         review_open,
         variant_sample_search,
     }

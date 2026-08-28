@@ -28,6 +28,8 @@ pub(crate) struct ReadPanelDisplayCache {
     pub(crate) row_origin: Option<f32>,
     pub(crate) row_height: Option<f32>,
     pub(crate) row_layout_revision: Option<u64>,
+    pub(crate) materialized_row_range: Option<(usize, usize)>,
+    pub(crate) total_rows: Option<usize>,
     pub(crate) overview: ScrollbarOverview,
     pub(crate) actual_content_bottom: f32,
     pub(crate) clip_top: f32,

@@ -2,9 +2,12 @@
 
 > **Complete-read amendment (2026-08-28):** The sampling and truncation policy in this historical
 > architecture plan is superseded by
-> [Complete read presentation](COMPLETE_READ_PRESENTATION_PLAN.md). Foreground batches and every
-> identity-bearing layout horizon must now be complete. An over-limit foreground or horizon yields
-> no individual-read presentation; deterministic ordering remains only a packing mechanism.
+> [Complete read presentation](COMPLETE_READ_PRESENTATION_PLAN.md), as amended by
+> [dense-alignment performance](DENSE_ALIGNMENT_LAYOUT_PERFORMANCE_PLAN.md). Foreground batches and
+> every identity-bearing seed must be Complete. An over-limit foreground yields no individual-read
+> presentation; an over-limit preferred wider horizon instead falls back to a Complete smaller
+> horizon or the Complete exact foreground and is reported as truncated. Deterministic ordering
+> remains only a packing mechanism.
 
 Status: implemented and qualified
 

@@ -444,10 +444,11 @@ the right-side navigator keeps the same stable row and within-row offset at the 
 
 Foreground admission covers the exact requested viewport. Off-screen prefetch is a separate,
 best-effort cache request and cannot consume the foreground limit or change its result. Stable row
-architecture is likewise built only from a complete deterministic layout horizon. If the preferred
-horizon is Too dense, RGV tries the smaller fixed horizon that still covers the viewport; if no
-complete horizon fits, Stable mode shows no individual reads and reports a stable-horizon refusal.
-Compact mode needs only the complete foreground population.
+architecture prefers a complete deterministic layout horizon. If that wider horizon is Too dense,
+RGV tries the smaller fixed horizon and then falls back to the Complete exact foreground. The view
+remains Complete and the diagnostics mark the best-known architecture as horizon-truncated; no
+sampled horizon identities are used. Compact mode likewise needs only the complete foreground
+population.
 
 Choose **Compact each view** when minimum height is more important than visual continuity. It packs
 each settled query independently and does not delete the track's retained stable history, so

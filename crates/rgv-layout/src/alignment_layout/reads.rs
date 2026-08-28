@@ -27,6 +27,10 @@ pub(crate) fn add_reads(
             stats.hidden += 1;
             continue;
         };
+        if !options.materializes_row(row) {
+            stats.virtualized += 1;
+            continue;
+        }
         let smrt_mode = match options.color_mode {
             AlignmentColorMode::SmrtKinetics(mode) => Some(mode),
             _ => None,

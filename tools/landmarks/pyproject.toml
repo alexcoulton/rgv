@@ -1,0 +1,12 @@
+[project]
+name = "rgv-landmark-curator"
+version = "0.1.0"
+description = "Offline curation pipeline for RGV's built-in genome landmarks"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy==2.3.5",
+    "pyBigWig==0.3.24",
+]
+
+[tool.uv]
+package = false

@@ -424,7 +424,7 @@ impl Viewer {
         controller: AlignmentTrackController,
     ) {
         for projection in controller.projections.values() {
-            projection.clock.advance();
+            projection.advance_query_generation();
         }
         let AlignmentTrackController { engine, .. } = controller;
         if let Some(task) = engine.retire() {
@@ -510,7 +510,7 @@ impl Viewer {
         }
         for track in &mut self.alignment_tracks {
             for projection in track.projections.values_mut() {
-                projection.clock.advance();
+                projection.advance_query_generation();
                 projection.pending_query =
                     !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
             }

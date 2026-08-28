@@ -304,6 +304,7 @@ impl ApplicationHandler for Application {
                 || !viewer.session_load_tasks.is_empty()
                 || !viewer.workspace_list_import_tasks.is_empty()
                 || !viewer.alignment_retirement_tasks.is_empty()
+                || !viewer.alignment_row_layout_tasks.is_empty()
                 || viewer
                     .automation
                     .as_ref()
@@ -325,6 +326,7 @@ impl ApplicationHandler for Application {
             viewer.finish_session_save_tasks();
             viewer.finish_export_tasks();
             viewer.finish_workspace_list_import_tasks();
+            viewer.finish_alignment_row_layout_tasks();
             viewer.finish_alignment_retirement_tasks();
             viewer.finish_automation_tasks();
             if let Some(service) = viewer.control_service.as_mut() {

@@ -211,19 +211,26 @@ Prefetch entries are cached only as:
 No cache entry contains an undisclosed sample, and eviction removes whole entries rather than
 trimming batches.
 
-### 4. Require a complete stable-layout horizon
+### 4. Use complete identity-bearing context without making the preferred horizon a gate
+
+> Amended by the dense-alignment performance work. The exact Complete foreground is the
+> presentation authority. A preferred wider horizon is optional layout context and cannot suppress
+> that foreground merely because the wider interval exceeds its independent admission budget.
 
 Stable layout must not use sampled identities. For a Complete foreground view:
 
 - try the preferred deterministic canonical horizon;
 - if it is Too dense, try the existing smaller fixed deterministic horizon level that still covers
   the viewport;
-- commit rows only from a complete horizon; and
-- if no complete horizon covers the viewport, refuse Stable read presentation with a distinct
-  layout-horizon Too-dense reason.
+- commit identities only from a Complete horizon or Complete exact foreground;
+- if no complete wider horizon covers the viewport, seed or extend the best-known stable
+  architecture from the Complete exact foreground and report `horizon_truncated = true`; and
+- never relabel or refuse a Complete exact foreground because optional layout context was Too
+  dense.
 
-Compact mode needs only a complete foreground batch. A rejected stable-horizon extension leaves
-the previously committed row architecture unchanged.
+Compact mode also needs only a complete foreground batch. A rejected stable-horizon extension
+leaves incumbents unchanged while the Complete exact foreground may add candidate assignments
+transactionally.
 
 ### 5. Commit one truth state across the desktop
 
@@ -348,7 +355,8 @@ This work is complete when:
   rendering, interaction, export, automation, and MCP;
 - aggregate evidence is labelled complete only when it used every eligible record;
 - foreground admission is independent of prefetch;
-- every stable-layout horizon and extension is complete;
+- every identity-bearing row seed is Complete, while preferred wider horizons may be explicitly
+  truncated without suppressing a Complete foreground;
 - Too-dense views retain no partial read batch, geometry, or interaction target;
 - Checking never reprojects stale reads as current evidence;
 - the 50,000 default is exposed as a configurable Complete read limit and is not described as a

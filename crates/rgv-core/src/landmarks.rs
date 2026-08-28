@@ -1,0 +1,1359 @@
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fs,
+    io::Read,
+    path::{Component, Path, PathBuf},
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+use crate::{ContigAliases, ReferenceDictionary};
+
+pub const LANDMARK_CATALOGUE_SCHEMA_VERSION: u32 = 1;
+pub const LANDMARK_SEARCH_SCHEMA_VERSION: &str = "rgv_gene_names_v1";
+pub const MAXIMUM_LANDMARK_BUNDLES: usize = 64;
+pub const MAXIMUM_LANDMARK_ASSETS: usize = 32;
+const MAXIMUM_LANDMARK_CONTIGS: usize = 100_000;
+const MAXIMUM_LANDMARK_ALIASES: usize = 100_000;
+const MAXIMUM_LANDMARK_SEARCH_ENTRIES: usize = 2_000_000;
+const MAXIMUM_LANDMARK_STRING_BYTES: usize = 16_384;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandmarkAssetRole {
+    RepresentativeGenes,
+    DetailedTranscripts,
+    GeneSearch,
+    Cytobands,
+    ContigAliases,
+    ChromosomeSizes,
+    Notice,
+}
+
+/// Portable identity for an application-provided track. The resolved local
+/// path is merely a runtime cache location; this tuple is the persisted source
+/// of truth used to rebind the track on another installation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuiltInTrackIdentity {
+    pub bundle_id: String,
+    pub bundle_version: String,
+    pub asset_role: LandmarkAssetRole,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BuiltInLandmarkContext {
+    pub bundle_id: String,
+    pub bundle_version: String,
+}
+
+impl BuiltInLandmarkContext {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.bundle_id.trim().is_empty()
+            && self.bundle_id.len() <= 256
+            && !self.bundle_version.trim().is_empty()
+            && self.bundle_version.len() <= 256
+    }
+}
+
+impl BuiltInTrackIdentity {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.bundle_id.trim().is_empty()
+            && self.bundle_id.len() <= 256
+            && !self.bundle_version.trim().is_empty()
+            && self.bundle_version.len() <= 256
+            && self.sha256.len() == 64
+            && self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+}
+
+impl LandmarkAssetRole {
+    const REQUIRED: [Self; 7] = [
+        Self::RepresentativeGenes,
+        Self::DetailedTranscripts,
+        Self::GeneSearch,
+        Self::Cytobands,
+        Self::ContigAliases,
+        Self::ChromosomeSizes,
+        Self::Notice,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandmarkAssetFormat {
+    BigGenePred,
+    GenePredExtGzip,
+    RgvGeneNamesV1Gzip,
+    UcscCytoband,
+    AliasTsv,
+    ChromSizesTsv,
+    Markdown,
+}
+
+impl LandmarkAssetFormat {
+    const fn supports(self, role: LandmarkAssetRole) -> bool {
+        matches!(
+            (role, self),
+            (
+                LandmarkAssetRole::RepresentativeGenes | LandmarkAssetRole::DetailedTranscripts,
+                Self::BigGenePred | Self::GenePredExtGzip
+            ) | (LandmarkAssetRole::GeneSearch, Self::RgvGeneNamesV1Gzip)
+                | (LandmarkAssetRole::Cytobands, Self::UcscCytoband)
+                | (LandmarkAssetRole::ContigAliases, Self::AliasTsv)
+                | (LandmarkAssetRole::ChromosomeSizes, Self::ChromSizesTsv)
+                | (LandmarkAssetRole::Notice, Self::Markdown)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GenomeLandmarkAsset {
+    pub role: LandmarkAssetRole,
+    pub path: String,
+    pub format: LandmarkAssetFormat,
+    pub bytes: u64,
+    pub sha256: String,
+    pub source_url: String,
+    pub upstream_project: String,
+    pub upstream_version: String,
+    pub derivation: String,
+    pub citation: String,
+    pub license: String,
+    pub license_url: String,
+    #[serde(default)]
+    pub required_notice: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LandmarkContigFingerprint {
+    pub name: String,
+    pub length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    #[serde(default = "default_true")]
+    pub primary: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LandmarkAssemblyIdentity {
+    pub stable_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub compatible_ids: Vec<String>,
+    pub primary_contig_count: usize,
+    pub dictionary_sha256: String,
+    /// Additional exact ordered dictionaries qualified as coordinate-compatible
+    /// with this assembly (for example a primary assembly plus spike-ins).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatible_dictionary_sha256: Vec<String>,
+    pub contigs: Vec<LandmarkContigFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GenomeLandmarkBundle {
+    pub id: String,
+    pub version: String,
+    pub display_name: String,
+    pub provider: String,
+    pub release: String,
+    pub selection_policy: String,
+    pub assembly: LandmarkAssemblyIdentity,
+    pub assets: Vec<GenomeLandmarkAsset>,
+}
+
+impl GenomeLandmarkBundle {
+    #[must_use]
+    pub fn asset(&self, role: LandmarkAssetRole) -> Option<&GenomeLandmarkAsset> {
+        self.assets.iter().find(|asset| asset.role == role)
+    }
+
+    #[must_use]
+    pub fn stable_asset_id(&self, role: LandmarkAssetRole) -> Option<String> {
+        self.asset(role)
+            .map(|asset| format!("{}:{}:{role:?}:{}", self.id, self.version, asset.sha256))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GenomeLandmarkCatalogue {
+    pub schema_version: u32,
+    pub bundles: Vec<GenomeLandmarkBundle>,
+}
+
+impl GenomeLandmarkCatalogue {
+    pub fn read(path: impl AsRef<Path>) -> Result<Self, GenomeLandmarkCatalogueError> {
+        let text = fs::read_to_string(path)?;
+        let catalogue = serde_json::from_str::<Self>(&text)?;
+        catalogue.validate()?;
+        Ok(catalogue)
+    }
+
+    pub fn validate(&self) -> Result<(), GenomeLandmarkCatalogueError> {
+        if self.schema_version != LANDMARK_CATALOGUE_SCHEMA_VERSION {
+            return Err(GenomeLandmarkCatalogueError::UnsupportedVersion(
+                self.schema_version,
+            ));
+        }
+        if self.bundles.is_empty() || self.bundles.len() > MAXIMUM_LANDMARK_BUNDLES {
+            return Err(GenomeLandmarkCatalogueError::BundleLimit);
+        }
+        let mut bundle_ids = BTreeSet::new();
+        let mut stable_ids = BTreeSet::new();
+        let mut dictionary_hashes = BTreeSet::new();
+        for bundle in &self.bundles {
+            validate_short(&bundle.id)?;
+            validate_short(&bundle.version)?;
+            validate_short(&bundle.display_name)?;
+            validate_short(&bundle.provider)?;
+            validate_short(&bundle.release)?;
+            validate_long(&bundle.selection_policy)?;
+            if !bundle_ids.insert(bundle.id.clone()) {
+                return Err(GenomeLandmarkCatalogueError::DuplicateBundle(
+                    bundle.id.clone(),
+                ));
+            }
+            validate_assembly(&bundle.assembly)?;
+            if !stable_ids.insert(bundle.assembly.stable_id.to_ascii_lowercase()) {
+                return Err(GenomeLandmarkCatalogueError::DuplicateAssembly(
+                    bundle.assembly.stable_id.clone(),
+                ));
+            }
+            for hash in std::iter::once(&bundle.assembly.dictionary_sha256)
+                .chain(&bundle.assembly.compatible_dictionary_sha256)
+            {
+                validate_sha256(hash)?;
+                if !dictionary_hashes.insert(hash.clone()) {
+                    return Err(GenomeLandmarkCatalogueError::DuplicateAssembly(
+                        hash.clone(),
+                    ));
+                }
+            }
+            if bundle.assets.is_empty() || bundle.assets.len() > MAXIMUM_LANDMARK_ASSETS {
+                return Err(GenomeLandmarkCatalogueError::AssetLimit(bundle.id.clone()));
+            }
+            let mut roles = BTreeSet::new();
+            for asset in &bundle.assets {
+                validate_asset(asset)?;
+                if !roles.insert(asset.role) {
+                    return Err(GenomeLandmarkCatalogueError::DuplicateAssetRole {
+                        bundle: bundle.id.clone(),
+                        role: asset.role,
+                    });
+                }
+            }
+            for role in LandmarkAssetRole::REQUIRED {
+                if !roles.contains(&role) {
+                    return Err(GenomeLandmarkCatalogueError::MissingAssetRole {
+                        bundle: bundle.id.clone(),
+                        role,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn bundle(&self, id: &str) -> Option<&GenomeLandmarkBundle> {
+        self.bundles.iter().find(|bundle| bundle.id == id)
+    }
+
+    pub fn resolve_asset(
+        &self,
+        root: &Path,
+        bundle_id: &str,
+        role: LandmarkAssetRole,
+    ) -> Result<PathBuf, GenomeLandmarkCatalogueError> {
+        let bundle = self
+            .bundle(bundle_id)
+            .ok_or_else(|| GenomeLandmarkCatalogueError::UnknownBundle(bundle_id.to_owned()))?;
+        let asset =
+            bundle
+                .asset(role)
+                .ok_or_else(|| GenomeLandmarkCatalogueError::MissingAssetRole {
+                    bundle: bundle_id.to_owned(),
+                    role,
+                })?;
+        safe_relative_path(&asset.path)?;
+        Ok(root.join(&asset.path))
+    }
+
+    pub fn verify_asset(
+        &self,
+        root: &Path,
+        bundle_id: &str,
+        role: LandmarkAssetRole,
+    ) -> Result<PathBuf, GenomeLandmarkCatalogueError> {
+        let bundle = self
+            .bundle(bundle_id)
+            .ok_or_else(|| GenomeLandmarkCatalogueError::UnknownBundle(bundle_id.to_owned()))?;
+        let asset =
+            bundle
+                .asset(role)
+                .ok_or_else(|| GenomeLandmarkCatalogueError::MissingAssetRole {
+                    bundle: bundle_id.to_owned(),
+                    role,
+                })?;
+        let path = self.resolve_asset(root, bundle_id, role)?;
+        let canonical_root = fs::canonicalize(root)?;
+        let canonical_path = fs::canonicalize(&path)?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(GenomeLandmarkCatalogueError::UnsafePath(asset.path.clone()));
+        }
+        let metadata = fs::metadata(&canonical_path)?;
+        if !metadata.is_file() || metadata.len() != asset.bytes {
+            return Err(GenomeLandmarkCatalogueError::AssetSizeMismatch {
+                path: asset.path.clone(),
+                expected: asset.bytes,
+                actual: metadata.len(),
+            });
+        }
+        let mut file = fs::File::open(&canonical_path)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        let actual = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if !actual.eq_ignore_ascii_case(&asset.sha256) {
+            return Err(GenomeLandmarkCatalogueError::AssetHashMismatch {
+                path: asset.path.clone(),
+                expected: asset.sha256.clone(),
+                actual,
+            });
+        }
+        Ok(canonical_path)
+    }
+
+    #[must_use]
+    pub fn resolve(&self, input: &AssemblyResolutionInput<'_>) -> AssemblyResolution {
+        resolve_assembly(self, input)
+    }
+}
+
+fn validate_assembly(
+    assembly: &LandmarkAssemblyIdentity,
+) -> Result<(), GenomeLandmarkCatalogueError> {
+    validate_short(&assembly.stable_id)?;
+    validate_short(&assembly.display_name)?;
+    validate_sha256(&assembly.dictionary_sha256)?;
+    if assembly.primary_contig_count == 0
+        || assembly.contigs.is_empty()
+        || assembly.contigs.len() > MAXIMUM_LANDMARK_CONTIGS
+        || assembly.primary_contig_count
+            != assembly
+                .contigs
+                .iter()
+                .filter(|contig| contig.primary)
+                .count()
+    {
+        return Err(GenomeLandmarkCatalogueError::InvalidAssembly(
+            assembly.stable_id.clone(),
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for compatible in &assembly.compatible_ids {
+        validate_short(compatible)?;
+    }
+    for contig in &assembly.contigs {
+        validate_short(&contig.name)?;
+        if contig.length == 0 || !names.insert(contig.name.clone()) {
+            return Err(GenomeLandmarkCatalogueError::InvalidAssembly(
+                assembly.stable_id.clone(),
+            ));
+        }
+        if let Some(md5) = &contig.md5
+            && (md5.len() != 32 || !md5.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(GenomeLandmarkCatalogueError::InvalidAssembly(
+                assembly.stable_id.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_asset(asset: &GenomeLandmarkAsset) -> Result<(), GenomeLandmarkCatalogueError> {
+    safe_relative_path(&asset.path)?;
+    validate_sha256(&asset.sha256)?;
+    if asset.bytes == 0 || !asset.format.supports(asset.role) {
+        return Err(GenomeLandmarkCatalogueError::InvalidAsset(
+            asset.path.clone(),
+        ));
+    }
+    for value in [
+        &asset.source_url,
+        &asset.upstream_project,
+        &asset.upstream_version,
+        &asset.derivation,
+        &asset.citation,
+        &asset.license,
+        &asset.license_url,
+    ] {
+        validate_long(value)?;
+    }
+    if asset.required_notice.len() > MAXIMUM_LANDMARK_STRING_BYTES {
+        return Err(GenomeLandmarkCatalogueError::InvalidAsset(
+            asset.path.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_short(value: &str) -> Result<(), GenomeLandmarkCatalogueError> {
+    if value.trim().is_empty() || value.len() > 256 {
+        return Err(GenomeLandmarkCatalogueError::InvalidString);
+    }
+    Ok(())
+}
+
+fn validate_long(value: &str) -> Result<(), GenomeLandmarkCatalogueError> {
+    if value.trim().is_empty() || value.len() > MAXIMUM_LANDMARK_STRING_BYTES {
+        return Err(GenomeLandmarkCatalogueError::InvalidString);
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> Result<(), GenomeLandmarkCatalogueError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(GenomeLandmarkCatalogueError::InvalidHash(value.to_owned()));
+    }
+    Ok(())
+}
+
+fn safe_relative_path(value: &str) -> Result<(), GenomeLandmarkCatalogueError> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.contains(['\\', ':'])
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(GenomeLandmarkCatalogueError::UnsafePath(value.to_owned()));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum GenomeLandmarkCatalogueError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("landmark catalogue schema version {0} is not supported")]
+    UnsupportedVersion(u32),
+    #[error("landmark catalogue exceeds its bundle bound or is empty")]
+    BundleLimit,
+    #[error("landmark bundle {0} exceeds its asset bound or has no assets")]
+    AssetLimit(String),
+    #[error("duplicate landmark bundle ID {0}")]
+    DuplicateBundle(String),
+    #[error("duplicate landmark assembly claim {0}")]
+    DuplicateAssembly(String),
+    #[error("landmark bundle {bundle} has duplicate asset role {role:?}")]
+    DuplicateAssetRole {
+        bundle: String,
+        role: LandmarkAssetRole,
+    },
+    #[error("landmark bundle {bundle} is missing required asset role {role:?}")]
+    MissingAssetRole {
+        bundle: String,
+        role: LandmarkAssetRole,
+    },
+    #[error("unknown landmark bundle {0}")]
+    UnknownBundle(String),
+    #[error("invalid landmark assembly {0}")]
+    InvalidAssembly(String),
+    #[error("invalid landmark asset {0}")]
+    InvalidAsset(String),
+    #[error("unsafe landmark asset path {0}")]
+    UnsafePath(String),
+    #[error("invalid SHA-256 {0}")]
+    InvalidHash(String),
+    #[error("invalid or unbounded landmark catalogue string")]
+    InvalidString,
+    #[error("landmark asset {path} has {actual} bytes, expected {expected}")]
+    AssetSizeMismatch {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("landmark asset {path} has SHA-256 {actual}, expected {expected}")]
+    AssetHashMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssemblyResolutionInput<'a> {
+    pub explicit_stable_id: Option<&'a str>,
+    pub dictionary: &'a ReferenceDictionary,
+    pub sequence_md5: &'a BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssemblyResolutionStatus {
+    Matched,
+    Suggested,
+    Ambiguous,
+    Unknown,
+    Incompatible,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssemblyMatchEvidence {
+    ExplicitIdentity,
+    OrderedDictionarySha256,
+    SequenceMd5,
+    CompletePrimaryLengths,
+    None,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssemblyResolution {
+    pub status: AssemblyResolutionStatus,
+    pub bundle_id: Option<String>,
+    pub stable_id: Option<String>,
+    pub display_name: Option<String>,
+    pub evidence: AssemblyMatchEvidence,
+    pub matched_contigs: usize,
+    pub expected_contigs: usize,
+    pub subset: bool,
+    pub reason: String,
+    #[serde(default)]
+    pub rejected: Vec<String>,
+}
+
+impl AssemblyResolution {
+    fn unknown(reason: impl Into<String>, rejected: Vec<String>) -> Self {
+        Self {
+            status: AssemblyResolutionStatus::Unknown,
+            bundle_id: None,
+            stable_id: None,
+            display_name: None,
+            evidence: AssemblyMatchEvidence::None,
+            matched_contigs: 0,
+            expected_contigs: 0,
+            subset: false,
+            reason: reason.into(),
+            rejected,
+        }
+    }
+}
+
+#[must_use]
+pub fn dictionary_sha256(dictionary: &ReferenceDictionary) -> String {
+    let mut digest = Sha256::new();
+    for contig in dictionary.iter() {
+        digest.update(contig.name().as_bytes());
+        digest.update(b"\t");
+        digest.update(contig.length().to_string().as_bytes());
+        digest.update(b"\n");
+    }
+    let digest = digest.finalize();
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn resolve_assembly(
+    catalogue: &GenomeLandmarkCatalogue,
+    input: &AssemblyResolutionInput<'_>,
+) -> AssemblyResolution {
+    let mut rejected = Vec::new();
+    if let Some(explicit) = input.explicit_stable_id {
+        let candidates = catalogue
+            .bundles
+            .iter()
+            .filter(|bundle| identity_matches(&bundle.assembly, explicit))
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return AssemblyResolution::unknown(
+                format!("explicit assembly identity {explicit} is not uniquely catalogued"),
+                Vec::new(),
+            );
+        }
+        let bundle = candidates[0];
+        let (matched, conflicts) = compatible_contigs(bundle, input.dictionary);
+        if !conflicts.is_empty() {
+            return AssemblyResolution {
+                status: AssemblyResolutionStatus::Incompatible,
+                bundle_id: Some(bundle.id.clone()),
+                stable_id: Some(bundle.assembly.stable_id.clone()),
+                display_name: Some(bundle.assembly.display_name.clone()),
+                evidence: AssemblyMatchEvidence::ExplicitIdentity,
+                matched_contigs: matched,
+                expected_contigs: bundle.assembly.primary_contig_count,
+                subset: matched < bundle.assembly.primary_contig_count,
+                reason: "explicit identity conflicts with the loaded sequence dictionary"
+                    .to_owned(),
+                rejected: conflicts,
+            };
+        }
+        return matched_resolution(
+            bundle,
+            AssemblyMatchEvidence::ExplicitIdentity,
+            matched,
+            "explicit assembly identity is compatible with the sequence dictionary",
+        );
+    }
+
+    if !input.dictionary.is_empty() {
+        let hash = dictionary_sha256(input.dictionary);
+        let exact = catalogue
+            .bundles
+            .iter()
+            .filter(|bundle| {
+                bundle
+                    .assembly
+                    .dictionary_sha256
+                    .eq_ignore_ascii_case(&hash)
+                    || bundle
+                        .assembly
+                        .compatible_dictionary_sha256
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(&hash))
+            })
+            .collect::<Vec<_>>();
+        if exact.len() == 1 {
+            if let FingerprintMatch::Rejected(reason) =
+                fingerprint_match(exact[0], input.dictionary, input.sequence_md5)
+            {
+                return AssemblyResolution {
+                    status: AssemblyResolutionStatus::Incompatible,
+                    bundle_id: Some(exact[0].id.clone()),
+                    stable_id: Some(exact[0].assembly.stable_id.clone()),
+                    display_name: Some(exact[0].assembly.display_name.clone()),
+                    evidence: AssemblyMatchEvidence::OrderedDictionarySha256,
+                    matched_contigs: input.dictionary.len(),
+                    expected_contigs: exact[0].assembly.primary_contig_count,
+                    subset: false,
+                    reason: "sequence MD5 conflicts with an exact dictionary candidate".to_owned(),
+                    rejected: vec![reason],
+                };
+            }
+            return matched_resolution(
+                exact[0],
+                AssemblyMatchEvidence::OrderedDictionarySha256,
+                input.dictionary.len(),
+                "ordered sequence dictionary SHA-256 matched exactly",
+            );
+        }
+    }
+
+    let mut fingerprint_candidates = Vec::new();
+    if !input.sequence_md5.is_empty() {
+        for bundle in &catalogue.bundles {
+            match fingerprint_match(bundle, input.dictionary, input.sequence_md5) {
+                FingerprintMatch::Matched(count) => fingerprint_candidates.push((bundle, count)),
+                FingerprintMatch::Rejected(reason) => {
+                    rejected.push(format!("{}: {reason}", bundle.id));
+                }
+                FingerprintMatch::Insufficient => {}
+            }
+        }
+    }
+    if fingerprint_candidates.len() == 1 {
+        let (bundle, count) = fingerprint_candidates[0];
+        return AssemblyResolution {
+            status: AssemblyResolutionStatus::Matched,
+            bundle_id: Some(bundle.id.clone()),
+            stable_id: Some(bundle.assembly.stable_id.clone()),
+            display_name: Some(bundle.assembly.display_name.clone()),
+            evidence: AssemblyMatchEvidence::SequenceMd5,
+            matched_contigs: count,
+            expected_contigs: bundle.assembly.primary_contig_count,
+            subset: count < bundle.assembly.primary_contig_count,
+            reason: format!("{count} sequence length and MD5 fingerprints matched"),
+            rejected,
+        };
+    }
+    if fingerprint_candidates.len() > 1 {
+        return AssemblyResolution {
+            status: AssemblyResolutionStatus::Ambiguous,
+            bundle_id: None,
+            stable_id: None,
+            display_name: None,
+            evidence: AssemblyMatchEvidence::SequenceMd5,
+            matched_contigs: 0,
+            expected_contigs: 0,
+            subset: true,
+            reason: "sequence fingerprints match more than one landmark bundle".to_owned(),
+            rejected,
+        };
+    }
+
+    let length_candidates = catalogue
+        .bundles
+        .iter()
+        .filter(|bundle| complete_primary_lengths_match(bundle, input.dictionary))
+        .collect::<Vec<_>>();
+    if length_candidates.len() == 1 {
+        let bundle = length_candidates[0];
+        return AssemblyResolution {
+            status: AssemblyResolutionStatus::Suggested,
+            bundle_id: Some(bundle.id.clone()),
+            stable_id: Some(bundle.assembly.stable_id.clone()),
+            display_name: Some(bundle.assembly.display_name.clone()),
+            evidence: AssemblyMatchEvidence::CompletePrimaryLengths,
+            matched_contigs: bundle.assembly.primary_contig_count,
+            expected_contigs: bundle.assembly.primary_contig_count,
+            subset: false,
+            reason: "primary-contig lengths match uniquely, but no strong identity evidence is available"
+                .to_owned(),
+            rejected,
+        };
+    }
+    if length_candidates.len() > 1 {
+        return AssemblyResolution {
+            status: AssemblyResolutionStatus::Ambiguous,
+            bundle_id: None,
+            stable_id: None,
+            display_name: None,
+            evidence: AssemblyMatchEvidence::CompletePrimaryLengths,
+            matched_contigs: 0,
+            expected_contigs: 0,
+            subset: false,
+            reason: "primary-contig lengths match more than one landmark bundle".to_owned(),
+            rejected,
+        };
+    }
+    AssemblyResolution::unknown(
+        "no landmark bundle matches the sequence dictionary",
+        rejected,
+    )
+}
+
+fn identity_matches(assembly: &LandmarkAssemblyIdentity, requested: &str) -> bool {
+    assembly.stable_id.eq_ignore_ascii_case(requested)
+        || assembly
+            .compatible_ids
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(requested))
+}
+
+fn compatible_contigs(
+    bundle: &GenomeLandmarkBundle,
+    dictionary: &ReferenceDictionary,
+) -> (usize, Vec<String>) {
+    let expected = bundle
+        .assembly
+        .contigs
+        .iter()
+        .map(|contig| (contig.name.as_str(), contig.length))
+        .collect::<HashMap<_, _>>();
+    let mut matched = 0;
+    let mut conflicts = Vec::new();
+    for contig in dictionary.iter() {
+        if let Some(length) = expected.get(contig.name()) {
+            if *length == contig.length() {
+                matched += 1;
+            } else {
+                conflicts.push(format!(
+                    "{} has length {}, expected {}",
+                    contig.name(),
+                    contig.length(),
+                    length
+                ));
+            }
+        }
+    }
+    (matched, conflicts)
+}
+
+fn matched_resolution(
+    bundle: &GenomeLandmarkBundle,
+    evidence: AssemblyMatchEvidence,
+    matched: usize,
+    reason: &str,
+) -> AssemblyResolution {
+    AssemblyResolution {
+        status: AssemblyResolutionStatus::Matched,
+        bundle_id: Some(bundle.id.clone()),
+        stable_id: Some(bundle.assembly.stable_id.clone()),
+        display_name: Some(bundle.assembly.display_name.clone()),
+        evidence,
+        matched_contigs: matched,
+        expected_contigs: bundle.assembly.primary_contig_count,
+        subset: matched < bundle.assembly.primary_contig_count,
+        reason: reason.to_owned(),
+        rejected: Vec::new(),
+    }
+}
+
+enum FingerprintMatch {
+    Matched(usize),
+    Rejected(String),
+    Insufficient,
+}
+
+fn fingerprint_match(
+    bundle: &GenomeLandmarkBundle,
+    dictionary: &ReferenceDictionary,
+    sequence_md5: &BTreeMap<String, String>,
+) -> FingerprintMatch {
+    let mut matched = 0;
+    for contig in bundle
+        .assembly
+        .contigs
+        .iter()
+        .filter(|contig| contig.md5.is_some())
+    {
+        let Some(actual_md5) = sequence_md5.get(&contig.name) else {
+            continue;
+        };
+        let Some(actual) = dictionary
+            .id_by_name(&contig.name)
+            .and_then(|id| dictionary.get(id))
+        else {
+            continue;
+        };
+        if actual.length() != contig.length
+            || !actual_md5.eq_ignore_ascii_case(contig.md5.as_deref().unwrap_or_default())
+        {
+            return FingerprintMatch::Rejected(format!("{} length or MD5 conflicts", contig.name));
+        }
+        matched += 1;
+    }
+    if matched >= 3 {
+        FingerprintMatch::Matched(matched)
+    } else {
+        FingerprintMatch::Insufficient
+    }
+}
+
+fn complete_primary_lengths_match(
+    bundle: &GenomeLandmarkBundle,
+    dictionary: &ReferenceDictionary,
+) -> bool {
+    bundle
+        .assembly
+        .contigs
+        .iter()
+        .filter(|contig| contig.primary)
+        .all(|expected| {
+            dictionary
+                .id_by_name(&expected.name)
+                .and_then(|id| dictionary.get(id))
+                .is_some_and(|actual| actual.length() == expected.length)
+        })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LandmarkSearchEntry {
+    pub normalized_term: String,
+    pub display_symbol: String,
+    pub gene_id: String,
+    pub transcript_id: String,
+    pub contig: String,
+    pub start: u64,
+    pub end: u64,
+    pub strand: char,
+    pub synonyms: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LandmarkSearchIndex {
+    pub entries: Vec<LandmarkSearchEntry>,
+}
+
+impl LandmarkSearchIndex {
+    #[must_use]
+    pub fn search(&self, query: &str, maximum_hits: usize) -> Vec<&LandmarkSearchEntry> {
+        let normalized = query.trim().to_ascii_lowercase();
+        if normalized.is_empty() || maximum_hits == 0 {
+            return Vec::new();
+        }
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.normalized_term.starts_with(&normalized)
+                    || entry
+                        .synonyms
+                        .iter()
+                        .any(|synonym| synonym.to_ascii_lowercase().starts_with(&normalized))
+            })
+            .take(maximum_hits)
+            .collect()
+    }
+}
+
+pub fn parse_landmark_search_index(
+    text: &str,
+) -> Result<LandmarkSearchIndex, LandmarkSearchIndexError> {
+    let mut lines = text.lines();
+    if lines.next() != Some(LANDMARK_SEARCH_SCHEMA_VERSION) {
+        return Err(LandmarkSearchIndexError::UnsupportedVersion);
+    }
+    let mut entries = Vec::new();
+    for (line_index, line) in lines.enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        if entries.len() == MAXIMUM_LANDMARK_SEARCH_ENTRIES {
+            return Err(LandmarkSearchIndexError::EntryLimit);
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 9 || fields.iter().any(|field| field.len() > 4_096) {
+            return Err(LandmarkSearchIndexError::InvalidRow(line_index + 2));
+        }
+        let start = fields[5]
+            .parse::<u64>()
+            .map_err(|_| LandmarkSearchIndexError::InvalidRow(line_index + 2))?;
+        let end = fields[6]
+            .parse::<u64>()
+            .map_err(|_| LandmarkSearchIndexError::InvalidRow(line_index + 2))?;
+        let strand = match fields[7] {
+            "+" => '+',
+            "-" => '-',
+            _ => return Err(LandmarkSearchIndexError::InvalidRow(line_index + 2)),
+        };
+        if fields[0].is_empty() || fields[1].is_empty() || fields[4].is_empty() || start >= end {
+            return Err(LandmarkSearchIndexError::InvalidRow(line_index + 2));
+        }
+        entries.push(LandmarkSearchEntry {
+            normalized_term: fields[0].to_owned(),
+            display_symbol: fields[1].to_owned(),
+            gene_id: fields[2].to_owned(),
+            transcript_id: fields[3].to_owned(),
+            contig: fields[4].to_owned(),
+            start,
+            end,
+            strand,
+            synonyms: fields[8]
+                .split(',')
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+        });
+    }
+    Ok(LandmarkSearchIndex { entries })
+}
+
+pub fn parse_landmark_aliases(text: &str) -> Result<ContigAliases, LandmarkSearchIndexError> {
+    let mut aliases = ContigAliases::new();
+    for (line_index, line) in text.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if aliases.len() == MAXIMUM_LANDMARK_ALIASES {
+            return Err(LandmarkSearchIndexError::EntryLimit);
+        }
+        let mut fields = line.split('\t');
+        let (Some(alias), Some(canonical), None) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(LandmarkSearchIndexError::InvalidRow(line_index + 1));
+        };
+        if alias.is_empty()
+            || canonical.is_empty()
+            || aliases
+                .insert(alias.to_owned(), canonical.to_owned())
+                .is_some()
+        {
+            return Err(LandmarkSearchIndexError::InvalidRow(line_index + 1));
+        }
+    }
+    Ok(aliases)
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum LandmarkSearchIndexError {
+    #[error("unsupported landmark search index version")]
+    UnsupportedVersion,
+    #[error("landmark index exceeds its entry bound")]
+    EntryLimit,
+    #[error("invalid landmark index row {0}")]
+    InvalidRow(usize),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset(
+        role: LandmarkAssetRole,
+        format: LandmarkAssetFormat,
+        path: &str,
+    ) -> GenomeLandmarkAsset {
+        GenomeLandmarkAsset {
+            role,
+            path: path.to_owned(),
+            format,
+            bytes: 1,
+            sha256: "a".repeat(64),
+            source_url: "https://example.test/source".to_owned(),
+            upstream_project: "Example".to_owned(),
+            upstream_version: "1".to_owned(),
+            derivation: "copied".to_owned(),
+            citation: "Example citation".to_owned(),
+            license: "Example license".to_owned(),
+            license_url: "https://example.test/license".to_owned(),
+            required_notice: String::new(),
+        }
+    }
+
+    fn catalogue() -> GenomeLandmarkCatalogue {
+        let contigs = vec![
+            LandmarkContigFingerprint {
+                name: "chr1".to_owned(),
+                length: 100,
+                md5: Some("1".repeat(32)),
+                primary: true,
+            },
+            LandmarkContigFingerprint {
+                name: "chr2".to_owned(),
+                length: 200,
+                md5: Some("2".repeat(32)),
+                primary: true,
+            },
+            LandmarkContigFingerprint {
+                name: "chrM".to_owned(),
+                length: 50,
+                md5: Some("3".repeat(32)),
+                primary: true,
+            },
+        ];
+        let dictionary = ReferenceDictionary::from_contigs(
+            contigs
+                .iter()
+                .map(|contig| (contig.name.clone(), contig.length)),
+        );
+        GenomeLandmarkCatalogue {
+            schema_version: LANDMARK_CATALOGUE_SCHEMA_VERSION,
+            bundles: vec![GenomeLandmarkBundle {
+                id: "test".to_owned(),
+                version: "1.0-rgv1".to_owned(),
+                display_name: "Test genes".to_owned(),
+                provider: "Example".to_owned(),
+                release: "1".to_owned(),
+                selection_policy: "one transcript per gene".to_owned(),
+                assembly: LandmarkAssemblyIdentity {
+                    stable_id: "TEST.1".to_owned(),
+                    display_name: "Test assembly".to_owned(),
+                    compatible_ids: vec!["test".to_owned()],
+                    primary_contig_count: 3,
+                    dictionary_sha256: dictionary_sha256(&dictionary),
+                    compatible_dictionary_sha256: Vec::new(),
+                    contigs,
+                },
+                assets: vec![
+                    asset(
+                        LandmarkAssetRole::RepresentativeGenes,
+                        LandmarkAssetFormat::BigGenePred,
+                        "test/genes.bb",
+                    ),
+                    asset(
+                        LandmarkAssetRole::DetailedTranscripts,
+                        LandmarkAssetFormat::BigGenePred,
+                        "test/all.bb",
+                    ),
+                    asset(
+                        LandmarkAssetRole::GeneSearch,
+                        LandmarkAssetFormat::RgvGeneNamesV1Gzip,
+                        "test/names.tsv.gz",
+                    ),
+                    asset(
+                        LandmarkAssetRole::Cytobands,
+                        LandmarkAssetFormat::UcscCytoband,
+                        "test/cytobands.txt",
+                    ),
+                    asset(
+                        LandmarkAssetRole::ContigAliases,
+                        LandmarkAssetFormat::AliasTsv,
+                        "test/aliases.tsv",
+                    ),
+                    asset(
+                        LandmarkAssetRole::ChromosomeSizes,
+                        LandmarkAssetFormat::ChromSizesTsv,
+                        "test/chrom.sizes",
+                    ),
+                    asset(
+                        LandmarkAssetRole::Notice,
+                        LandmarkAssetFormat::Markdown,
+                        "test/NOTICE.md",
+                    ),
+                ],
+            }],
+        }
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn catalogue_validation_rejects_unsafe_asset_paths() {
+        let mut catalogue = catalogue();
+        catalogue.bundles[0].assets[0].path = "../genes.bb".to_owned();
+        assert!(matches!(
+            catalogue.validate(),
+            Err(GenomeLandmarkCatalogueError::UnsafePath(_))
+        ));
+    }
+
+    #[test]
+    fn catalogue_validation_rejects_duplicate_roles_and_wrong_formats() {
+        let mut duplicate = catalogue();
+        duplicate.bundles[0].assets[1].role = LandmarkAssetRole::RepresentativeGenes;
+        assert!(matches!(
+            duplicate.validate(),
+            Err(GenomeLandmarkCatalogueError::DuplicateAssetRole { .. })
+        ));
+
+        let mut wrong_format = catalogue();
+        wrong_format.bundles[0].assets[0].format = LandmarkAssetFormat::AliasTsv;
+        assert!(matches!(
+            wrong_format.validate(),
+            Err(GenomeLandmarkCatalogueError::InvalidAsset(_))
+        ));
+    }
+
+    #[test]
+    fn asset_verification_rejects_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("test");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("genes.bb");
+        fs::write(&path, b"x").unwrap();
+        let mut catalogue = catalogue();
+        catalogue.bundles[0].assets[0].sha256 = sha256(b"x");
+
+        assert_eq!(
+            catalogue
+                .verify_asset(root.path(), "test", LandmarkAssetRole::RepresentativeGenes)
+                .unwrap(),
+            path.canonicalize().unwrap()
+        );
+        fs::write(&path, b"y").unwrap();
+        assert!(matches!(
+            catalogue.verify_asset(root.path(), "test", LandmarkAssetRole::RepresentativeGenes),
+            Err(GenomeLandmarkCatalogueError::AssetHashMismatch { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn asset_verification_rejects_a_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), b"x").unwrap();
+        let directory = root.path().join("test");
+        fs::create_dir(&directory).unwrap();
+        symlink(outside.path(), directory.join("genes.bb")).unwrap();
+        let mut catalogue = catalogue();
+        catalogue.bundles[0].assets[0].sha256 = sha256(b"x");
+
+        assert!(matches!(
+            catalogue.verify_asset(root.path(), "test", LandmarkAssetRole::RepresentativeGenes),
+            Err(GenomeLandmarkCatalogueError::UnsafePath(_))
+        ));
+    }
+
+    #[test]
+    fn exact_dictionary_and_partial_fingerprints_resolve_confidently() {
+        let catalogue = catalogue();
+        catalogue.validate().unwrap();
+        let all = ReferenceDictionary::from_contigs([
+            ("chr1".to_owned(), 100),
+            ("chr2".to_owned(), 200),
+            ("chrM".to_owned(), 50),
+        ]);
+        let exact = catalogue.resolve(&AssemblyResolutionInput {
+            explicit_stable_id: None,
+            dictionary: &all,
+            sequence_md5: &BTreeMap::new(),
+        });
+        assert_eq!(exact.status, AssemblyResolutionStatus::Matched);
+        assert_eq!(
+            exact.evidence,
+            AssemblyMatchEvidence::OrderedDictionarySha256
+        );
+
+        let md5 = BTreeMap::from([
+            ("chr1".to_owned(), "1".repeat(32)),
+            ("chr2".to_owned(), "2".repeat(32)),
+            ("chrM".to_owned(), "3".repeat(32)),
+        ]);
+        let fingerprint = catalogue.resolve(&AssemblyResolutionInput {
+            explicit_stable_id: None,
+            dictionary: &all,
+            sequence_md5: &md5,
+        });
+        assert_eq!(fingerprint.status, AssemblyResolutionStatus::Matched);
+    }
+
+    #[test]
+    fn prefix_only_and_conflicting_md5_do_not_match() {
+        let catalogue = catalogue();
+        let prefix_only = ReferenceDictionary::from_contigs([
+            ("chr1".to_owned(), 101),
+            ("chr2".to_owned(), 201),
+            ("chrM".to_owned(), 51),
+        ]);
+        assert_eq!(
+            catalogue
+                .resolve(&AssemblyResolutionInput {
+                    explicit_stable_id: None,
+                    dictionary: &prefix_only,
+                    sequence_md5: &BTreeMap::new()
+                })
+                .status,
+            AssemblyResolutionStatus::Unknown
+        );
+
+        let dictionary = ReferenceDictionary::from_contigs([
+            ("chr1".to_owned(), 100),
+            ("chr2".to_owned(), 200),
+            ("chrM".to_owned(), 50),
+        ]);
+        let md5 = BTreeMap::from([
+            ("chr1".to_owned(), "1".repeat(32)),
+            ("chr2".to_owned(), "0".repeat(32)),
+            ("chrM".to_owned(), "3".repeat(32)),
+        ]);
+        assert_ne!(
+            catalogue
+                .resolve(&AssemblyResolutionInput {
+                    explicit_stable_id: None,
+                    dictionary: &dictionary,
+                    sequence_md5: &md5
+                })
+                .status,
+            AssemblyResolutionStatus::Matched
+        );
+    }
+
+    #[test]
+    fn normalized_search_index_supports_exact_and_prefix_queries() {
+        let text = "rgv_gene_names_v1\nbrca1\tBRCA1\tENSG1\tNM_1\tchr17\t10\t20\t-\tRNF53\n";
+        let index = parse_landmark_search_index(text).unwrap();
+        assert_eq!(index.search("BRC", 8)[0].display_symbol, "BRCA1");
+        assert_eq!(index.search("rnf", 8)[0].gene_id, "ENSG1");
+    }
+
+    #[test]
+    fn all_supported_build_fixtures_resolve_by_exact_dictionary() {
+        let builds = [
+            ("hg38", "GRCh38.no_alt_analysis_set", 100_u64),
+            ("hg19", "GRCh37.p13", 200_u64),
+            ("mm10", "GRCm38.p6", 300_u64),
+            ("mm39", "GRCm39", 400_u64),
+            ("hs1", "T2T-CHM13v2.0", 500_u64),
+        ];
+        let mut template_catalogue = catalogue();
+        let template = template_catalogue.bundles.remove(0);
+        let bundles = builds
+            .iter()
+            .map(|(id, stable_id, base)| {
+                let mut bundle = template.clone();
+                bundle.id = (*id).to_owned();
+                bundle.display_name = format!("{id} genes");
+                bundle.assembly.stable_id = (*stable_id).to_owned();
+                bundle.assembly.display_name = (*id).to_owned();
+                bundle.assembly.compatible_ids = vec![(*id).to_owned()];
+                bundle.assembly.contigs = vec![
+                    LandmarkContigFingerprint {
+                        name: "chr1".to_owned(),
+                        length: *base + 1,
+                        md5: None,
+                        primary: true,
+                    },
+                    LandmarkContigFingerprint {
+                        name: "chr2".to_owned(),
+                        length: *base + 2,
+                        md5: None,
+                        primary: true,
+                    },
+                    LandmarkContigFingerprint {
+                        name: "chrM".to_owned(),
+                        length: *base + 3,
+                        md5: None,
+                        primary: true,
+                    },
+                ];
+                let dictionary = ReferenceDictionary::from_contigs(
+                    bundle
+                        .assembly
+                        .contigs
+                        .iter()
+                        .map(|contig| (contig.name.clone(), contig.length)),
+                );
+                bundle.assembly.dictionary_sha256 = dictionary_sha256(&dictionary);
+                for asset in &mut bundle.assets {
+                    asset.path = format!("{id}/{}", asset.path.rsplit('/').next().unwrap());
+                }
+                bundle
+            })
+            .collect::<Vec<_>>();
+        let catalogue = GenomeLandmarkCatalogue {
+            schema_version: LANDMARK_CATALOGUE_SCHEMA_VERSION,
+            bundles,
+        };
+        catalogue.validate().unwrap();
+
+        for (id, _, base) in builds {
+            let dictionary = ReferenceDictionary::from_contigs([
+                ("chr1".to_owned(), base + 1),
+                ("chr2".to_owned(), base + 2),
+                ("chrM".to_owned(), base + 3),
+            ]);
+            let resolution = catalogue.resolve(&AssemblyResolutionInput {
+                explicit_stable_id: None,
+                dictionary: &dictionary,
+                sequence_md5: &BTreeMap::new(),
+            });
+            assert_eq!(resolution.status, AssemblyResolutionStatus::Matched);
+            assert_eq!(resolution.bundle_id.as_deref(), Some(id));
+        }
+    }
+
+    #[test]
+    fn explicit_identity_rejects_a_conflicting_dictionary() {
+        let catalogue = catalogue();
+        let conflicting = ReferenceDictionary::from_contigs([
+            ("chr1".to_owned(), 101),
+            ("chr2".to_owned(), 200),
+            ("chrM".to_owned(), 50),
+        ]);
+        let resolution = catalogue.resolve(&AssemblyResolutionInput {
+            explicit_stable_id: Some("TEST.1"),
+            dictionary: &conflicting,
+            sequence_md5: &BTreeMap::new(),
+        });
+        assert_eq!(resolution.status, AssemblyResolutionStatus::Incompatible);
+        assert!(
+            resolution
+                .rejected
+                .iter()
+                .any(|reason| reason.contains("chr1"))
+        );
+    }
+}

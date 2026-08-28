@@ -1,10 +1,14 @@
 use super::super::*;
 use crate::display::alignment::{
     INDEX_ONLY_READ_NOTICE, ReadPanelKey, ReadPanelSpec, index_only_read_display,
-    index_only_read_notice, individual_read_refusal, read_pane_layout, read_panel_bounds,
-    read_panel_bounds_for_track, read_refusal_detail, read_state_display,
+    index_only_read_notice, individual_read_refusal, materialized_alignment_row_range,
+    read_pane_layout, read_panel_bounds, read_panel_bounds_for_track, read_refusal_detail,
+    read_state_display,
 };
-use crate::display::auxiliary::{feature_layout_row_count, pinned_gene_layout_maximum_rows};
+use crate::display::auxiliary::{
+    feature_layout_row_count, feature_record_index_at_display_point,
+    pinned_gene_layout_maximum_rows,
+};
 use crate::display::{
     ANNOTATION_PANE_BACKGROUND, PINNED_ALIGNMENT_COVERAGE_HEIGHT,
     PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT, PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
@@ -17,6 +21,22 @@ use crate::display::{
     synthetic_section_display, track_section_geometry,
 };
 use rgv_layout::RectShape;
+
+#[test]
+fn alignment_row_materialization_tracks_vertical_camera_with_overscan() {
+    assert_eq!(
+        materialized_alignment_row_range(220.0, 10.0, 220.0, 320.0, 100.0, 1_000, 2),
+        (8, 22)
+    );
+    assert_eq!(
+        materialized_alignment_row_range(220.0, 10.0, 220.0, 320.0, 0.0, 15, 32),
+        (0, 15)
+    );
+    assert_eq!(
+        materialized_alignment_row_range(220.0, 10.0, 320.0, 320.0, 0.0, 15, 2),
+        (0, 0)
+    );
+}
 
 #[test]
 fn read_panels_tile_the_read_pane_with_independent_viewport_heights() {
@@ -896,7 +916,7 @@ fn filtered_read_details_report_ignored_unmapped_records() {
 }
 
 #[test]
-fn read_refusal_distinguishes_foreground_and_stable_horizon_density() {
+fn read_refusal_uses_the_visible_query_not_the_wider_layout_horizon() {
     let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
     let query = |eligible, limit, status| AlignmentQuery {
         interval,
@@ -934,10 +954,7 @@ fn read_refusal_distinguishes_foreground_and_stable_horizon_density() {
     assert_eq!(foreground.scope, IndividualReadRefusalScope::Foreground);
     assert!(read_refusal_detail(foreground).contains("50001 eligible reads"));
 
-    let horizon =
-        individual_read_refusal(&complete, &horizon_dense, ReadStackingMode::Stable).unwrap();
-    assert_eq!(horizon.scope, IndividualReadRefusalScope::LayoutHorizon);
-    assert!(read_refusal_detail(horizon).contains("70000 stable-horizon reads"));
+    assert!(individual_read_refusal(&complete, &horizon_dense, ReadStackingMode::Stable).is_none());
     assert!(
         individual_read_refusal(&complete, &horizon_dense, ReadStackingMode::Compact).is_none()
     );
@@ -2256,6 +2273,68 @@ fn pinned_gene_picking_uses_the_rendered_row_count() {
 }
 
 #[test]
+fn gene_picking_uses_the_exact_rendered_primitive_geometry() {
+    let records = (0..6)
+        .map(|index| rgv_hts::FeatureRecord {
+            contig: "chr1".to_owned(),
+            start: 100,
+            end: 300,
+            name: Some(format!("row-{index}")),
+            feature_type: Some("transcript".to_owned()),
+            score: None,
+            strand: rgv_hts::Strand::Forward,
+            blocks: vec![(120, 180), (240, 280)],
+            coding_interval: Some((130, 270)),
+            peak: None,
+            attributes: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 300).unwrap(),
+        1_000.0,
+    )
+    .unwrap();
+    let object_id_base = 50;
+    let display = layout_features(
+        &records,
+        viewport,
+        TrackLayoutOptions {
+            top: 0.0,
+            height: 48.0,
+            maximum_rows: 6,
+            object_id_base,
+            feature_display_mode: FeatureDisplayMode::Expanded,
+            ..TrackLayoutOptions::default()
+        },
+    )
+    .0;
+    let third_row_rectangle = display
+        .rectangles
+        .iter()
+        .find(|rectangle| rectangle.object_id == object_id_base + 2 && rectangle.height > 1.0)
+        .unwrap();
+    let picked = feature_record_index_at_display_point(
+        &display,
+        &records,
+        third_row_rectangle.x + third_row_rectangle.width * 0.5,
+        third_row_rectangle.y + third_row_rectangle.height * 0.5,
+        object_id_base,
+    );
+    assert_eq!(picked, Some(2));
+
+    assert_eq!(
+        feature_record_index_at_display_point(
+            &display,
+            &records,
+            third_row_rectangle.x + third_row_rectangle.width * 0.5,
+            47.5,
+            object_id_base,
+        ),
+        None,
+    );
+}
+
+#[test]
 fn feature_inspector_reports_gene_models_and_peak_statistics() {
     let inspector = FeatureInspectorSnapshot {
         track_name: "peaks".to_owned(),
@@ -2289,6 +2368,64 @@ fn feature_inspector_reports_gene_models_and_peak_statistics() {
             .iter()
             .any(|(label, value)| { label == "Location" && value.contains("chr1:100-200") })
     );
+}
+
+#[test]
+fn builtin_gene_properties_include_model_and_bundle_provenance() {
+    let inspector = FeatureInspectorSnapshot {
+        track_name: "Genes".to_owned(),
+        record: rgv_hts::FeatureRecord {
+            contig: "chr1".to_owned(),
+            start: 100,
+            end: 400,
+            name: Some("TP53".to_owned()),
+            feature_type: Some("transcript".to_owned()),
+            score: None,
+            strand: rgv_hts::Strand::Reverse,
+            blocks: vec![(100, 150), (220, 260), (350, 400)],
+            coding_interval: Some((120, 380)),
+            peak: None,
+            attributes: vec![
+                ("gene_name".to_owned(), "TP53".to_owned()),
+                ("gene_id".to_owned(), "7157".to_owned()),
+                ("transcript_id".to_owned(), "NM_000546.6".to_owned()),
+                ("gene_biotype".to_owned(), "protein_coding".to_owned()),
+                ("landmark_bundle_id".to_owned(), "hg38".to_owned()),
+                ("landmark_bundle_version".to_owned(), "1.0-rgv1".to_owned()),
+                (
+                    "landmark_asset_role".to_owned(),
+                    "representative_genes".to_owned(),
+                ),
+                ("landmark_asset_sha256".to_owned(), "a".repeat(64)),
+                (
+                    "landmark_selection_policy".to_owned(),
+                    "MANE Select".to_owned(),
+                ),
+            ],
+        },
+    };
+    let document = feature_inspector_document(&inspector);
+    let overview = document
+        .sections
+        .iter()
+        .find(|section| section.id == "overview")
+        .unwrap();
+    assert!(overview.fields.iter().any(|field| field.id == "exon-count"));
+    assert!(
+        overview
+            .fields
+            .iter()
+            .any(|field| field.id == "coding-status")
+    );
+    assert!(
+        document
+            .sections
+            .iter()
+            .any(|section| section.id == "landmark-source")
+    );
+    assert!(document.actions.iter().any(|action| {
+        action.id == InspectorActionId::ShowAllTranscriptsForGene("hg38".to_owned())
+    }));
 }
 
 #[test]

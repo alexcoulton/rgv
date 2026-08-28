@@ -15,3 +15,5 @@
 
 # HTSlib may cache this adjacent remote-test index in the crate working directory.
 /crates/rgv-hts/variants.bcf.csi
+/tools/landmarks/.venv/
+/tools/landmarks/__pycache__/

@@ -90,6 +90,13 @@ pub(crate) struct AlignmentPanelProjection {
     pub(crate) layout_query_cache_hit: bool,
     pub(crate) query_stats: Option<QueryStats>,
     pub(crate) alignment_rows: Option<CachedAlignmentRows>,
+    /// Monotonic identity for transactional off-thread row-layout requests.
+    /// A completed worker may commit only when this value still matches.
+    pub(crate) row_layout_request_revision: u64,
+    /// Dedicated cancellation generation for row sweeps. Query generations
+    /// and layout generations advance independently, so this clock changes
+    /// only when a distinct row-layout request supersedes existing work.
+    pub(crate) row_layout_clock: GenerationClock,
     /// Query-independent stable row assignments. Ordinary query replacement,
     /// Overview LOD, filters, and rendering changes must not clear this.
     pub(crate) row_history: AlignmentRowHistory,
@@ -103,6 +110,13 @@ pub(crate) struct AlignmentPanelProjection {
 }
 
 impl AlignmentPanelProjection {
+    /// Starts a new query generation and immediately invalidates any row
+    /// candidate that was derived from the previous settled query.
+    pub(crate) fn advance_query_generation(&self) -> ViewportGeneration {
+        self.row_layout_clock.advance();
+        self.clock.advance()
+    }
+
     /// Whether the projection belongs to the track clock's current generation.
     /// `pending_query` covers work waiting to be dispatched; the generation
     /// comparison also covers a request that has been queued and is still

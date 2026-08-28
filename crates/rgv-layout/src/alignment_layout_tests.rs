@@ -1969,6 +1969,181 @@ fn canonical_horizon_makes_narrow_and_broad_entry_order_identical() {
 }
 
 #[test]
+fn complete_foreground_rows_survive_a_truncated_empty_horizon() {
+    let mut visible = row_test_query(&[
+        row_test_record(b"visible-a", 50, 90),
+        row_test_record(b"visible-b", 60, 100),
+    ]);
+    visible.interval = GenomicInterval::new(ContigId::new(0), 40, 110).unwrap();
+    let mut dense_horizon = row_test_query(&[]);
+    dense_horizon.stats.records_eligible = 70_000;
+    dense_horizon.stats.individual_reads =
+        rgv_hts::IndividualReadStatus::TooDense { limit: 50_000 };
+    let mut history = AlignmentRowHistory::default();
+
+    let (layout, stats) = reconcile_alignment_rows_with_horizon(
+        &visible,
+        &dense_horizon,
+        AlignmentLayoutOptions {
+            max_rows: visible.batch.len(),
+            ..AlignmentLayoutOptions::default()
+        },
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(layout.rows, vec![Some(0), Some(1)]);
+    assert_eq!(stats.horizon_records, 0);
+    assert!(stats.horizon_truncated);
+    assert_eq!(stats.assignments, visible.batch.len());
+}
+
+#[test]
+fn dense_complete_foreground_seeds_empty_horizon_without_compatibility_scans() {
+    const RECORDS: usize = 10_000;
+    let records = (0..RECORDS)
+        .map(|index| row_test_record(format!("dense-foreground-{index:05}").as_bytes(), 50, 100))
+        .collect::<Vec<_>>();
+    let visible = row_test_query(&records);
+    let mut dense_horizon = row_test_query(&[]);
+    dense_horizon.stats.records_eligible = 700_000;
+    dense_horizon.stats.individual_reads =
+        rgv_hts::IndividualReadStatus::TooDense { limit: 50_000 };
+    let mut history = AlignmentRowHistory::default();
+
+    let (layout, stats) = reconcile_alignment_rows_with_horizon(
+        &visible,
+        &dense_horizon,
+        AlignmentLayoutOptions {
+            max_rows: RECORDS,
+            ..AlignmentLayoutOptions::default()
+        },
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(layout.used_row_count(), RECORDS);
+    assert_eq!(stats.assignments, RECORDS);
+    assert_eq!(stats.added, RECORDS);
+    assert_eq!(stats.rows_appended, RECORDS);
+    assert_eq!(stats.rows_reused, 0);
+    assert_eq!(stats.compatibility_probes, 0);
+    assert!(stats.horizon_truncated);
+}
+
+#[test]
+fn cancelled_dense_reconciliation_drops_the_candidate_history() {
+    const RECORDS: usize = 10_000;
+    let records = (0..RECORDS)
+        .map(|index| row_test_record(format!("cancel-{index:05}").as_bytes(), 50, 100))
+        .collect::<Vec<_>>();
+    let query = row_test_query(&records);
+    let committed = AlignmentRowHistory::default();
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+
+    let result = reconcile_alignment_rows_with_horizon_cancellable(
+        &query,
+        &query,
+        AlignmentLayoutOptions {
+            max_rows: RECORDS,
+            ..AlignmentLayoutOptions::default()
+        },
+        committed.clone(),
+        ReadStackingMode::Stable,
+        false,
+        || checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4,
+    );
+
+    assert!(result.is_none());
+    assert!(checks.load(std::sync::atomic::Ordering::Relaxed) >= 5);
+    assert_eq!(committed.revision(), 0);
+    assert_eq!(committed.assignment_count(), 0);
+}
+
+#[test]
+fn monotonic_history_extension_reuses_an_indexed_historical_gap() {
+    let initial = row_test_query(&[
+        row_test_record(b"left", 0, 10),
+        row_test_record(b"right", 20, 30),
+    ]);
+    let extended = row_test_query(&[
+        row_test_record(b"left", 0, 10),
+        row_test_record(b"gap", 10, 20),
+        row_test_record(b"right", 20, 30),
+    ]);
+    let mut history = AlignmentRowHistory::default();
+    let options = AlignmentLayoutOptions {
+        max_rows: extended.batch.len(),
+        ..AlignmentLayoutOptions::default()
+    };
+    let (initial_layout, _) = reconcile_alignment_rows(
+        &initial,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (extended_layout, stats) = reconcile_alignment_rows(
+        &extended,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(initial_layout.rows, vec![Some(0), Some(0)]);
+    assert_eq!(extended_layout.rows, vec![Some(0), Some(0), Some(0)]);
+    assert_eq!(stats.rows_reused, 1);
+    assert_eq!(stats.rows_appended, 0);
+    assert!(stats.compatibility_probes > 0);
+}
+
+#[test]
+fn dense_history_extension_has_logarithmic_probe_growth() {
+    const INCUMBENTS: usize = 2_048;
+    const ADDED: usize = 4_096;
+    let initial_records = (0..INCUMBENTS)
+        .map(|index| row_test_record(format!("incumbent-{index:05}").as_bytes(), 20, 180))
+        .collect::<Vec<_>>();
+    let initial = row_test_query(&initial_records);
+    let mut extended_records = initial_records;
+    extended_records.extend(
+        (0..ADDED).map(|index| row_test_record(format!("addition-{index:05}").as_bytes(), 20, 180)),
+    );
+    let extended = row_test_query(&extended_records);
+    let mut history = AlignmentRowHistory::default();
+    let options = AlignmentLayoutOptions {
+        max_rows: extended.batch.len(),
+        ..AlignmentLayoutOptions::default()
+    };
+    reconcile_alignment_rows(
+        &initial,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (layout, stats) = reconcile_alignment_rows(
+        &extended,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(layout.used_row_count(), INCUMBENTS + ADDED);
+    assert_eq!(stats.rows_appended, ADDED);
+    assert_eq!(stats.rows_reused, 0);
+    assert!(
+        stats.compatibility_probes <= ADDED * 20,
+        "{} probes for {ADDED} new dense reads",
+        stats.compatibility_probes
+    );
+}
+
+#[test]
 fn rich_visible_payload_maps_to_layout_only_horizon_identities() {
     let layout_query = row_test_query(&[
         row_test_record(b"alpha", 10, 80),
@@ -3969,6 +4144,22 @@ fn deep_overlapping_reads_extend_beyond_the_old_ninety_row_cap() {
         .map(|rectangle| rectangle.y + rectangle.height)
         .fold(0.0_f32, f32::max);
     assert!(bottom > options.reads_top + 90.0 * options.row_height);
+
+    let virtualized = layout_alignment_query(
+        &query,
+        viewport,
+        AlignmentLayoutOptions {
+            materialized_row_range: Some((40, 50)),
+            ..options
+        },
+    );
+    assert_eq!(virtualized.stats.rendered_alignments, 10);
+    assert_eq!(virtualized.stats.virtualized_alignments, 110);
+    assert_eq!(virtualized.stats.hidden_alignments, 110);
+    assert_eq!(virtualized.stats.packed_row_count, 120);
+    assert_eq!(virtualized.stats.materialized_row_start, 40);
+    assert_eq!(virtualized.stats.materialized_row_end, 50);
+    assert!(virtualized.display_list.rectangles.len() < layout.display_list.rectangles.len() / 4);
 }
 
 #[test]
@@ -4078,7 +4269,7 @@ fn canonical_start_packing_reuses_the_topmost_free_row() {
         },
         &rows,
     );
-    assert_eq!(metrics.architecture_version, 2);
+    assert_eq!(metrics.architecture_version, 3);
     assert_eq!(metrics.canonical_rows, 2);
     assert_eq!(metrics.stable_rows, 2);
     assert_eq!(metrics.row_inflation, 0);

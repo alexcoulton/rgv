@@ -18,6 +18,7 @@ pub enum AssemblyIdentityConfidence {
     #[default]
     Unknown,
     Explicit,
+    Dictionary,
     Fingerprint,
 }
 
@@ -250,7 +251,9 @@ pub enum GenomeConfigurationError {
 pub enum CytobandStain {
     Negative,
     Positive25,
+    Positive33,
     Positive50,
+    Positive66,
     Positive75,
     Positive100,
     Centromere,
@@ -367,7 +370,9 @@ fn parse_stain(value: &str, line: usize) -> Result<CytobandStain, CytobandParseE
     match value.to_ascii_lowercase().as_str() {
         "gneg" => Ok(CytobandStain::Negative),
         "gpos25" => Ok(CytobandStain::Positive25),
+        "gpos33" => Ok(CytobandStain::Positive33),
         "gpos50" => Ok(CytobandStain::Positive50),
+        "gpos66" => Ok(CytobandStain::Positive66),
         "gpos75" => Ok(CytobandStain::Positive75),
         "gpos100" => Ok(CytobandStain::Positive100),
         "acen" => Ok(CytobandStain::Centromere),

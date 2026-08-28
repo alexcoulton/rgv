@@ -194,10 +194,11 @@ pub fn layout_features(
         };
         row_ends[row] = row_ends[row].max(feature.end);
         let row_top = options.top + row as f32 * row_height;
+        let selected = options.selected_record == Some(index);
         let label = (feature.feature_type.as_deref() == Some("transcript"))
             .then_some(feature.name.as_deref())
             .flatten()
-            .filter(|name| !name.is_empty() && row_height >= 16.0);
+            .filter(|name| !name.is_empty() && (row_height >= 16.0 || selected));
         let label_band = if label.is_some() { 10.0 } else { 0.0 };
         let y = row_top + label_band + 2.0;
         let object_id = options
@@ -210,10 +211,10 @@ pub fn layout_features(
             y,
             (row_height - label_band - 4.0).max(2.0),
             object_id,
-            options.selected_record == Some(index),
+            selected,
             &mut direction_marker_budget,
         );
-        if let Some(label) = label.filter(|_| labels < MAX_FEATURE_LABELS) {
+        if let Some(label) = label.filter(|_| selected || labels < MAX_FEATURE_LABELS) {
             let text = label.chars().take(32).collect::<String>();
             let text_width = text.chars().count() as f32 * 9.0 * 0.62;
             let half_width = text_width * 0.5;
@@ -226,7 +227,7 @@ pub fn layout_features(
                 let has_collision = label_intervals[row]
                     .iter()
                     .any(|occupied| interval.0 < occupied.1 + 6.0 && interval.1 + 6.0 > occupied.0);
-                if !has_collision {
+                if selected || !has_collision {
                     display.texts.push(TextPrimitive {
                         x: center,
                         y: row_top + 5.5,
@@ -235,7 +236,9 @@ pub fn layout_features(
                         color: Rgba::new(0.16, 0.18, 0.22, 0.96),
                     });
                     label_intervals[row].push(interval);
-                    labels = labels.saturating_add(1);
+                    if !selected {
+                        labels = labels.saturating_add(1);
+                    }
                 }
             }
         }
@@ -2067,6 +2070,30 @@ fn add_feature(
     };
     let transcript_model = feature.feature_type.as_deref() == Some("transcript");
     let terminal_geometry = feature_uses_terminal_geometry(feature);
+    let block_detail_visible = !transcript_model
+        || blocks.iter().any(|&(start, end)| {
+            let (_, width) = clipped_geometry(start, end, viewport);
+            width >= 1.5
+        });
+    if !block_detail_visible {
+        // At overview scale exon blocks would all expand from subpixel spans
+        // into misleading one-pixel bars. The transcript connector above is
+        // the stable gene landmark; one bounded direction glyph preserves
+        // strand without emitting a primitive per exon.
+        add_component_feature_direction_marker(
+            display,
+            feature,
+            viewport,
+            y + height * 0.5,
+            base_color,
+            object_id,
+            direction_marker_budget,
+        );
+        if selected {
+            add_feature_selection_outline(display, x, y, width, height, object_id);
+        }
+        return;
+    }
     for &(start, end) in blocks {
         let (x, width) = clipped_geometry(start, end, viewport);
         if width <= 0.0 {
@@ -2095,7 +2122,7 @@ fn add_feature(
             let coding_end = end.min(coding_end);
             if coding_start < coding_end {
                 let (coding_x, coding_width) = clipped_geometry(coding_start, coding_end, viewport);
-                if coding_width > 0.0 {
+                if coding_width >= 1.5 {
                     display.rectangles.push(RectPrimitive {
                         x: coding_x,
                         y,

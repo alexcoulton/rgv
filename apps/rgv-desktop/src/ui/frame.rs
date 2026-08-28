@@ -181,6 +181,14 @@ impl Viewer {
         let mut junction_bed_export_requested = false;
         let mut sashimi_png_export_requested = false;
         let mut sashimi_svg_export_requested = false;
+        let mut show_all_transcripts_requested = None;
+        let mut return_to_representative_genes_requested = None;
+        let builtin_track_identities = self
+            .tracks
+            .tracks()
+            .iter()
+            .filter_map(|track| track.built_in.clone().map(|identity| (track.id, identity)))
+            .collect::<BTreeMap<_, _>>();
         let mut variant_sample_search = self.variant_sample_search.clone();
         let mut variant_settings_sample_search = self.variant_settings_sample_search.clone();
         let mut variant_predicate_scope = self.variant_predicate_scope;
@@ -502,6 +510,8 @@ impl Viewer {
         let mut open_alignment_requested = pending_command == Some(UiCommand::OpenAlignment);
         let mut open_reference_requested = false;
         let mut open_genome_config_requested = false;
+        let mut restore_default_genes_requested = false;
+        let mut open_landmark_folder_requested = false;
         let mut add_track_requested = pending_command == Some(UiCommand::AddTrack);
         let mut open_session_requested = pending_command == Some(UiCommand::OpenSession);
         let mut save_session_requested = pending_command == Some(UiCommand::SaveSession);
@@ -1004,12 +1014,42 @@ impl Viewer {
                                     "Genome context incomplete — open a genome configuration",
                                 );
                             }
+                            if let Some(resolution) = &self.landmark_resolution {
+                                ui.small(format!(
+                                    "Landmarks: {:?} · {:?} · {}",
+                                    resolution.status, resolution.evidence, resolution.reason
+                                ));
+                            }
+                            if let Some(error) = &self.landmark_catalogue_error {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(170, 45, 38),
+                                    error,
+                                );
+                            }
                             if ui.button("Open FASTA…").clicked() {
                                 open_reference_requested = true;
                                 ui.close();
                             }
                             if ui.button("Open genome configuration…").clicked() {
                                 open_genome_config_requested = true;
+                                ui.close();
+                            }
+                            if self
+                                .landmark_resolution
+                                .as_ref()
+                                .and_then(|resolution| resolution.bundle_id.as_ref())
+                                .is_some_and(|bundle_id| {
+                                    self.suppressed_builtin_gene_bundles.contains(bundle_id)
+                                })
+                                && ui.button("Restore default genes").clicked()
+                            {
+                                restore_default_genes_requested = true;
+                                ui.close();
+                            }
+                            if self.landmark_resource_root.is_some()
+                                && ui.button("Open landmark resource folder").clicked()
+                            {
+                                open_landmark_folder_requested = true;
                                 ui.close();
                             }
                             ui.separator();
@@ -1579,6 +1619,10 @@ impl Viewer {
                                     inspector_actions.sashimi_svg_export_requested;
                                 add_selected_feature_to_review |=
                                     inspector_actions.add_selected_feature_to_review;
+                                if inspector_actions.show_all_transcripts_requested.is_some() {
+                                    show_all_transcripts_requested =
+                                        inspector_actions.show_all_transcripts_requested;
+                                }
                                 review_open |= inspector_actions.review_open;
                                 variant_sample_search = inspector_actions.variant_sample_search;
                             });
@@ -2547,6 +2591,31 @@ impl Viewer {
                                     .find(|(candidate, _)| *candidate == id)
                                     .map_or(0, |(_, count)| *count);
                                 ui.label(format!("{count} records at the current locus"));
+                                if let Some(identity) = builtin_track_identities.get(&id) {
+                                    ui.separator();
+                                    match identity.asset_role {
+                                        LandmarkAssetRole::RepresentativeGenes => {
+                                            if ui.button("Show all transcripts").clicked() {
+                                                show_all_transcripts_requested =
+                                                    Some(identity.bundle_id.clone());
+                                            }
+                                        }
+                                        LandmarkAssetRole::DetailedTranscripts => {
+                                            if ui.button("Return to representative genes").clicked()
+                                            {
+                                                return_to_representative_genes_requested =
+                                                    Some(identity.bundle_id.clone());
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    ui.small(format!(
+                                        "Built-in bundle {} · {} · {}",
+                                        identity.bundle_id,
+                                        identity.bundle_version,
+                                        &identity.sha256[..12]
+                                    ));
+                                }
                                 if let Some((_, settings)) = feature_settings_controls
                                     .iter_mut()
                                     .find(|(track_id, _)| *track_id == id)
@@ -3612,6 +3681,22 @@ impl Viewer {
                 .add_filter("RGV genome configuration", &["json", "rgvgenome"])
                 .pick_file()
             && let Err(error) = self.open_genome_configuration(&path)
+        {
+            self.data_status = error.to_string();
+        }
+        if restore_default_genes_requested && let Err(error) = self.restore_default_genes() {
+            self.data_status = error.to_string();
+        }
+        if open_landmark_folder_requested && let Err(error) = self.open_landmark_resource_folder() {
+            self.data_status = error.to_string();
+        }
+        if let Some(bundle_id) = show_all_transcripts_requested
+            && let Err(error) = self.show_all_transcripts(&bundle_id)
+        {
+            self.data_status = error.to_string();
+        }
+        if let Some(bundle_id) = return_to_representative_genes_requested
+            && let Err(error) = self.return_to_representative_genes(&bundle_id)
         {
             self.data_status = error.to_string();
         }

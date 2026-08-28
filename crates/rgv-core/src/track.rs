@@ -682,6 +682,10 @@ pub struct TrackConfig {
     pub source: TrackSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<TrackFormat>,
+    /// Stable application-resource identity. Sessions re-resolve this through
+    /// the installed landmark catalogue instead of trusting `source.path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_in: Option<crate::BuiltInTrackIdentity>,
     #[serde(default)]
     pub sample_key: Option<String>,
     /// Legacy annotation visibility, consumed into `WorkspacePresentation`
@@ -730,6 +734,7 @@ impl TrackConfig {
             kind,
             source,
             format: None,
+            built_in: None,
             sample_key: None,
             visible: true,
             collapsed: false,
@@ -753,6 +758,12 @@ impl TrackConfig {
     #[must_use]
     pub fn with_format(mut self, format: TrackFormat) -> Self {
         self.format = Some(format);
+        self
+    }
+
+    #[must_use]
+    pub fn with_built_in(mut self, identity: crate::BuiltInTrackIdentity) -> Self {
+        self.built_in = Some(identity);
         self
     }
 }

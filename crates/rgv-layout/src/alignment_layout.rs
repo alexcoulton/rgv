@@ -46,7 +46,7 @@ const MAX_EXPANDED_JUNCTION_ROWS: usize = 12;
 pub const MAX_ANNOTATED_JUNCTIONS: usize = 100_000;
 /// Version two replaces earliest-ending lane rotation with a deterministic
 /// topmost-compatible canonical baseline.
-pub const ALIGNMENT_ROW_ARCHITECTURE_VERSION: u16 = 2;
+pub const ALIGNMENT_ROW_ARCHITECTURE_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum IndividualReadRefusalScope {
@@ -139,6 +139,10 @@ pub struct AlignmentLayoutOptions {
     pub row_height: f32,
     pub read_height: f32,
     pub max_rows: usize,
+    /// Half-open stable-row range for which expensive read and picking
+    /// primitives should be materialised. Row assignment always covers the
+    /// complete admitted query; `None` retains the headless/all-rows default.
+    pub materialized_row_range: Option<(usize, usize)>,
     /// Revision of the query-to-stable-row projection consumed by this render.
     /// It is paint-cache metadata and does not participate in row policy.
     pub row_layout_revision: u64,
@@ -202,6 +206,7 @@ impl Default for AlignmentLayoutOptions {
             row_height: 7.0,
             read_height: 5.0,
             max_rows: 4_096,
+            materialized_row_range: None,
             row_layout_revision: 0,
             color_mode: AlignmentColorMode::Strand,
             group_mode: AlignmentGroupMode::None,
@@ -248,11 +253,21 @@ impl Default for AlignmentLayoutOptions {
     }
 }
 
+impl AlignmentLayoutOptions {
+    pub fn materializes_row(&self, row: usize) -> bool {
+        self.materialized_row_range
+            .is_none_or(|(start, end)| start <= row && row < end)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AlignmentLayoutStats {
     pub input_alignments: usize,
     pub rendered_alignments: usize,
     pub hidden_alignments: usize,
+    /// Complete admitted alignments whose stable rows are outside the current
+    /// vertical materialisation window.
+    pub virtualized_alignments: usize,
     pub primitive_count: usize,
     pub maximum_coverage: u32,
     pub rendered_junctions: usize,
@@ -284,6 +299,8 @@ pub struct AlignmentLayoutStats {
     /// Maximum number of alignment spans concurrent in the viewport before
     /// grouping/sorting constraints are applied.
     pub natural_stack_height: usize,
+    pub materialized_row_start: usize,
+    pub materialized_row_end: usize,
 }
 
 /// Strand-specific visual component of one biological splice junction.
@@ -367,6 +384,7 @@ impl SmrtKineticsRenderBudget {
 struct ReadRenderStats {
     rendered: usize,
     hidden: usize,
+    virtualized: usize,
     bisulfite_marks_omitted: usize,
     smrt_kinetics_marks_omitted: usize,
     smrt_kinetics_unavailable_records: usize,
@@ -604,6 +622,21 @@ pub struct AlignmentRowReconciliationStats {
     /// Wall-clock time spent reconciling this settled query, reported for
     /// diagnostics only and never used as layout state.
     pub reconciliation_micros: u64,
+    /// Time spent projecting identities already present in stable history.
+    pub incumbent_projection_micros: u64,
+    /// Time spent building row occupancy and compatibility indexes.
+    pub history_index_micros: u64,
+    /// Time spent choosing rows for newly discovered representatives.
+    pub row_allocation_micros: u64,
+    /// Time spent merging and committing new compact history intervals.
+    pub history_commit_micros: u64,
+    /// Time spent comparing the stable layout with a fresh canonical layout.
+    pub canonical_metrics_micros: u64,
+    /// Compatibility-index nodes or fallback rows inspected while assigning
+    /// new representatives. This is a complexity regression oracle.
+    pub compatibility_probes: usize,
+    pub rows_reused: usize,
+    pub rows_appended: usize,
     pub retained: usize,
     pub restored: usize,
     pub added: usize,
@@ -925,7 +958,8 @@ pub fn layout_alignment_query_with_rows_and_annotations(
         stats: AlignmentLayoutStats {
             input_alignments: query.stats.records_eligible,
             rendered_alignments: read_stats.rendered,
-            hidden_alignments: read_stats.hidden,
+            hidden_alignments: read_stats.hidden.saturating_add(read_stats.virtualized),
+            virtualized_alignments: read_stats.virtualized,
             primitive_count,
             maximum_coverage,
             rendered_junctions,
@@ -951,6 +985,10 @@ pub fn layout_alignment_query_with_rows_and_annotations(
             visible_occupied_rows: visible_rows.len(),
             visible_row_span,
             natural_stack_height: natural_stack_height(query, viewport.interval()),
+            materialized_row_start: options.materialized_row_range.map_or(0, |(start, _)| start),
+            materialized_row_end: options
+                .materialized_row_range
+                .map_or(packed_row_count, |(_, end)| end.min(packed_row_count)),
         },
     }
 }
@@ -1082,6 +1120,7 @@ use rows::{AlignmentGroupKey, effective_sort_position, first_of_pair_reverse};
 pub use rows::{
     alignment_read_name_hash, alignment_row_organization_metrics, assign_alignment_rows,
     reconcile_alignment_rows, reconcile_alignment_rows_with_horizon,
+    reconcile_alignment_rows_with_horizon_cancellable,
 };
 mod coverage;
 pub use coverage::junction_count_value;

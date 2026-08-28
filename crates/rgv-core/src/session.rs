@@ -1605,6 +1605,12 @@ pub struct SessionDocument {
     pub sample_metadata: Option<SampleMetadataTable>,
     #[serde(default)]
     pub contig_aliases: ContigAliases,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landmark_context: Option<crate::BuiltInLandmarkContext>,
+    /// Bundle IDs whose automatic representative Genes track the user removed.
+    /// Hiding a track does not populate this set; explicit restoration clears it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub suppressed_builtin_gene_bundles: BTreeSet<String>,
     pub tracks: Vec<TrackConfig>,
     /// Workspace-wide hard bound. Per-track limits are requests within this shared ceiling.
     pub maximum_alignments: usize,
@@ -1661,6 +1667,8 @@ impl MultiTrackSessionDocument {
             review_items: Vec::new(),
             sample_metadata: None,
             contig_aliases: ContigAliases::default(),
+            landmark_context: None,
+            suppressed_builtin_gene_bundles: BTreeSet::new(),
             tracks: self.tracks,
             maximum_alignments: self.maximum_alignments,
         }
@@ -1699,6 +1707,8 @@ impl LegacySessionDocument {
             review_items: Vec::new(),
             sample_metadata: None,
             contig_aliases: ContigAliases::default(),
+            landmark_context: None,
+            suppressed_builtin_gene_bundles: BTreeSet::new(),
             tracks: self.tracks,
             maximum_alignments: self.maximum_alignments,
         }
@@ -1728,6 +1738,8 @@ impl SessionDocument {
             review_items: Vec::new(),
             sample_metadata: None,
             contig_aliases: ContigAliases::default(),
+            landmark_context: None,
+            suppressed_builtin_gene_bundles: BTreeSet::new(),
             tracks: Vec::new(),
             maximum_alignments: default_maximum_alignments(),
         }
@@ -2110,6 +2122,11 @@ impl SessionDocument {
                 || !track.height.is_finite()
                 || track.height < 26.0
                 || !valid_track_format(track)
+                || track.built_in.as_ref().is_some_and(|identity| {
+                    !identity.is_valid()
+                        || identity.asset_role != crate::LandmarkAssetRole::RepresentativeGenes
+                            && identity.asset_role != crate::LandmarkAssetRole::DetailedTranscripts
+                })
                 || (track.kind == TrackKind::Variant && !track.variant.is_valid())
                 || (track.kind == TrackKind::Mutation && !track.mutation.is_valid())
                 || (track.kind == TrackKind::Gwas && !track.gwas.is_valid())
@@ -2438,6 +2455,22 @@ fn validate_session_genome_metadata(document: &SessionDocument) -> Result<(), Se
         })
     {
         return Err(SessionError::InvalidContigAliases);
+    }
+    if document.suppressed_builtin_gene_bundles.len() > crate::MAXIMUM_LANDMARK_BUNDLES
+        || document.suppressed_builtin_gene_bundles.iter().any(|id| {
+            id.trim().is_empty()
+                || id.len() > 256
+                || id.contains([' ', '\t', '\r', '\n', '/', '\\'])
+        })
+    {
+        return Err(SessionError::InvalidGenomeMetadata);
+    }
+    if document
+        .landmark_context
+        .as_ref()
+        .is_some_and(|context| !context.is_valid())
+    {
+        return Err(SessionError::InvalidGenomeMetadata);
     }
     let unique_frames = document
         .reference_translation_frames

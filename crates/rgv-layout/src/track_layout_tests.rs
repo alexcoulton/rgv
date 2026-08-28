@@ -208,6 +208,79 @@ fn gene_model_labels_do_not_overlap_at_overview_scale() {
 }
 
 #[test]
+fn overview_gene_models_suppress_subpixel_exons_but_keep_a_landmark_and_direction() {
+    let transcript = FeatureRecord {
+        contig: "chr1".to_owned(),
+        start: 1_000,
+        end: 9_000,
+        name: Some("GENE_OVERVIEW".to_owned()),
+        feature_type: Some("transcript".to_owned()),
+        score: None,
+        strand: Strand::Forward,
+        blocks: (0..100)
+            .map(|index| {
+                let start = 1_000 + index * 80;
+                (start, start + 10)
+            })
+            .collect(),
+        coding_interval: Some((1_010, 8_990)),
+        peak: None,
+        attributes: Vec::new(),
+    };
+    let wide = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 0, 1_000_000).unwrap(),
+        1_000.0,
+    )
+    .unwrap();
+    let (display, stats) = layout_features(
+        &[transcript],
+        wide,
+        TrackLayoutOptions {
+            height: 48.0,
+            maximum_rows: 2,
+            ..TrackLayoutOptions::default()
+        },
+    );
+    assert_eq!(stats.rendered_records, 1);
+    assert!(display.rectangles.len() <= 3);
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.shape == RectShape::ChevronRight)
+    );
+}
+
+#[test]
+fn selected_gene_label_survives_normal_collision_suppression() {
+    let gene = |name: &str| FeatureRecord {
+        contig: "chr1".to_owned(),
+        start: 110,
+        end: 190,
+        name: Some(name.to_owned()),
+        feature_type: Some("transcript".to_owned()),
+        score: None,
+        strand: Strand::Forward,
+        blocks: vec![(110, 140), (160, 190)],
+        coding_interval: Some((120, 180)),
+        peak: None,
+        attributes: Vec::new(),
+    };
+    let (display, _) = layout_features(
+        &[gene("FIRST"), gene("SELECTED")],
+        viewport(),
+        TrackLayoutOptions {
+            height: 12.0,
+            maximum_rows: 1,
+            selected_record: Some(1),
+            feature_display_mode: FeatureDisplayMode::Collapsed,
+            ..TrackLayoutOptions::default()
+        },
+    );
+    assert!(display.texts.iter().any(|text| text.text == "SELECTED"));
+}
+
+#[test]
 fn narrow_peaks_render_the_called_summit() {
     let feature = FeatureRecord {
         contig: "chr1".to_owned(),

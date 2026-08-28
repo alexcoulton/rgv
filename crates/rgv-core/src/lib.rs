@@ -4,6 +4,7 @@ mod automation;
 mod coordinates;
 mod generation;
 mod genome;
+mod landmarks;
 mod lod;
 mod navigation;
 mod panel;
@@ -22,7 +23,8 @@ pub use automation::{
     AutomationEnvironmentTelemetry, AutomationError, AutomationErrorCode, AutomationEvidenceField,
     AutomationExportKind, AutomationFrameTelemetry, AutomationGenomeSnapshot,
     AutomationGpuTelemetry, AutomationHistoryEntrySnapshot, AutomationHistoryNavigation,
-    AutomationInteractionTrace, AutomationInteractionTraceEvent, AutomationNavigationDestination,
+    AutomationInteractionTrace, AutomationInteractionTraceEvent, AutomationLandmarkIntegrityState,
+    AutomationLandmarkSnapshot, AutomationLandmarkTrackState, AutomationNavigationDestination,
     AutomationNavigationHistorySnapshot, AutomationOptionScope, AutomationPaneItemLayoutSnapshot,
     AutomationPaneLayoutSnapshot, AutomationPanelSnapshot, AutomationPresentationCompositeSnapshot,
     AutomationPresentationGroupSnapshot, AutomationPresentationNodeSnapshot,
@@ -53,6 +55,15 @@ pub use genome::{
     GenomeAssemblyIdentity, GenomeAssetProvenance, GenomeConfiguration, GenomeConfigurationError,
     MAXIMUM_DEFAULT_ANNOTATIONS, MAXIMUM_GENOME_ASSET_PROVENANCE, ReferenceTranslationFrame,
     parse_ucsc_cytobands,
+};
+pub use landmarks::{
+    AssemblyMatchEvidence, AssemblyResolution, AssemblyResolutionInput, AssemblyResolutionStatus,
+    BuiltInLandmarkContext, BuiltInTrackIdentity, GenomeLandmarkAsset, GenomeLandmarkBundle,
+    GenomeLandmarkCatalogue, GenomeLandmarkCatalogueError, LANDMARK_CATALOGUE_SCHEMA_VERSION,
+    LANDMARK_SEARCH_SCHEMA_VERSION, LandmarkAssemblyIdentity, LandmarkAssetFormat,
+    LandmarkAssetRole, LandmarkContigFingerprint, LandmarkSearchEntry, LandmarkSearchIndex,
+    LandmarkSearchIndexError, MAXIMUM_LANDMARK_ASSETS, MAXIMUM_LANDMARK_BUNDLES, dictionary_sha256,
+    parse_landmark_aliases, parse_landmark_search_index,
 };
 pub use lod::{DetailLevel, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, RenderBudget};
 pub use navigation::NavigationHistory;

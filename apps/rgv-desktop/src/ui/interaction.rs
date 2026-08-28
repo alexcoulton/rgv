@@ -987,7 +987,7 @@ impl Viewer {
             }
             for track in &mut self.alignment_tracks {
                 for projection in track.projections.values_mut() {
-                    projection.clock.advance();
+                    projection.advance_query_generation();
                     // Retain the last committed query only as non-visible
                     // history. Generation gates replace its read geometry and
                     // interactions with the neutral Checking state until the
@@ -1240,7 +1240,7 @@ impl Viewer {
         }
         for track in &mut self.alignment_tracks {
             if let Some(projection) = track.projections.remove(&id) {
-                projection.clock.advance();
+                projection.advance_query_generation();
             }
         }
         let removed = self.panels.remove(id).is_some();

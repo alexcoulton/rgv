@@ -70,7 +70,7 @@ fn automation_read_presentation_reports_complete_or_zero_records() {
     assert_eq!(refused.refusal_eligible_records, 50_001);
     assert_eq!(refused.refusal_scope.as_deref(), Some("foreground"));
 
-    let refused_horizon = automation_read_presentation_fields(
+    let admitted_with_dense_horizon = automation_read_presentation_fields(
         Some(&complete),
         Some(&horizon_dense),
         ReadStackingMode::Stable,
@@ -79,16 +79,13 @@ fn automation_read_presentation_reports_complete_or_zero_records() {
         50_000,
     );
     assert_eq!(
-        refused_horizon.state,
-        AutomationReadPresentationState::TooDense
+        admitted_with_dense_horizon.state,
+        AutomationReadPresentationState::Complete
     );
-    assert_eq!(refused_horizon.eligible_records, 20);
-    assert_eq!(refused_horizon.complete_records, 0);
-    assert_eq!(refused_horizon.refusal_eligible_records, 70_000);
-    assert_eq!(
-        refused_horizon.refusal_scope.as_deref(),
-        Some("layout_horizon")
-    );
+    assert_eq!(admitted_with_dense_horizon.eligible_records, 20);
+    assert_eq!(admitted_with_dense_horizon.complete_records, 20);
+    assert_eq!(admitted_with_dense_horizon.refusal_eligible_records, 0);
+    assert_eq!(admitted_with_dense_horizon.refusal_scope, None);
 
     let compact = automation_read_presentation_fields(
         Some(&complete),

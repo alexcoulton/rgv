@@ -18,9 +18,11 @@ The remaining documents preserve detailed implementation, remediation, and desig
 
 - [Canonical stable read architecture](CANONICAL_STABLE_READ_ARCHITECTURE_PLAN.md)
 - [Complete read presentation and resource admission](COMPLETE_READ_PRESENTATION_PLAN.md)
+- [Dense-alignment layout performance](DENSE_ALIGNMENT_LAYOUT_PERFORMANCE_PLAN.md)
 - [Transactional navigation preview](TRANSACTIONAL_NAVIGATION_PREVIEW_PLAN.md)
 - [Directionality rendering remediation](DIRECTIONALITY_RENDERING_REMEDIATION_PLAN.md)
 - [GUI redesign](GUI_REDESIGN_PLAN.md)
+- [Built-in genome landmark integration](GENOME_LANDMARK_INTEGRATION_PLAN.md)
 - [Manual fixture suite](MANUAL_FIXTURE_SUITE_PLAN.md)
 - [MF-01 follow-up remediation](MF01_FOLLOWUP_REMEDIATION_PLAN.md)
 - [Modularisation](MODULARISATION_PLAN.md)

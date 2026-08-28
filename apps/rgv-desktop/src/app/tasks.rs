@@ -49,7 +49,275 @@ pub(crate) struct WorkspaceListImportTask {
     pub(crate) worker: JoinHandle<std::result::Result<WorkspaceListImport, String>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AlignmentRowLayoutTaskKey {
+    pub(crate) query_identity: usize,
+    pub(crate) layout_query_identity: usize,
+    pub(crate) group_mode: AlignmentGroupMode,
+    pub(crate) group_order: AlignmentOrderDirection,
+    pub(crate) sort_mode: AlignmentSortMode,
+    pub(crate) sort_order: AlignmentOrderDirection,
+    pub(crate) sort_position: Option<u64>,
+    pub(crate) promoted_read_name_hash: Option<u64>,
+    pub(crate) max_rows: usize,
+    pub(crate) view_as_pairs: bool,
+    pub(crate) pair_length_bounds: TemplateLengthBounds,
+    pub(crate) stacking_mode: ReadStackingMode,
+    pub(crate) repack: bool,
+}
+
+pub(crate) struct AlignmentRowLayoutTask {
+    pub(crate) panel_id: PanelId,
+    pub(crate) track_id: TrackId,
+    pub(crate) request_revision: u64,
+    pub(crate) key: AlignmentRowLayoutTaskKey,
+}
+
+pub(crate) struct AlignmentRowLayoutTaskResult {
+    pub(crate) rows: CachedAlignmentRows,
+    pub(crate) history: AlignmentRowHistory,
+}
+
+pub(crate) struct AlignmentRowLayoutWork {
+    panel_id: PanelId,
+    track_id: TrackId,
+    request_revision: u64,
+    key: AlignmentRowLayoutTaskKey,
+    query: Arc<AlignmentQuery>,
+    layout_query: Arc<AlignmentQuery>,
+    options: AlignmentLayoutOptions,
+    stacking_mode: ReadStackingMode,
+    repack: bool,
+    refused: bool,
+    history: AlignmentRowHistory,
+    cancellation_clock: GenerationClock,
+    cancellation_generation: ViewportGeneration,
+}
+
+pub(crate) struct CompletedAlignmentRowLayoutWork {
+    panel_id: PanelId,
+    track_id: TrackId,
+    request_revision: u64,
+    key: AlignmentRowLayoutTaskKey,
+    result: Option<AlignmentRowLayoutTaskResult>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AlignmentRowLayoutSubmit {
+    Submitted,
+    QueueFull,
+    Disconnected,
+}
+
+pub(crate) fn process_alignment_row_layout_work(
+    work: AlignmentRowLayoutWork,
+    _scheduler_clock: &GenerationClock,
+    _scheduler_generation: ViewportGeneration,
+) -> Option<CompletedAlignmentRowLayoutWork> {
+    let AlignmentRowLayoutWork {
+        panel_id,
+        track_id,
+        request_revision,
+        key,
+        query,
+        layout_query,
+        options,
+        stacking_mode,
+        repack,
+        refused,
+        history,
+        cancellation_clock,
+        cancellation_generation,
+    } = work;
+    let result = if refused {
+        if !cancellation_clock.is_current(cancellation_generation) {
+            None
+        } else {
+            let layout = assign_alignment_rows(&query, options, None);
+            cancellation_clock
+                .is_current(cancellation_generation)
+                .then_some((layout, AlignmentRowReconciliationStats::default(), history))
+        }
+    } else {
+        reconcile_alignment_rows_with_horizon_cancellable(
+            &query,
+            &layout_query,
+            options,
+            history,
+            stacking_mode,
+            repack,
+            || !cancellation_clock.is_current(cancellation_generation),
+        )
+    }
+    .map(
+        |(layout, reconciliation, history)| AlignmentRowLayoutTaskResult {
+            rows: CachedAlignmentRows {
+                query,
+                layout_query,
+                layout: Arc::new(layout),
+                group_mode: options.group_mode,
+                group_order: options.group_order,
+                sort_mode: options.sort_mode,
+                sort_order: options.sort_order,
+                sort_position: options.sort_position,
+                promoted_read_name_hash: options.promoted_read_name_hash,
+                max_rows: options.max_rows,
+                view_as_pairs: options.view_as_pairs,
+                pair_length_bounds: options.pair_length_bounds,
+                stacking_mode,
+                reconciliation,
+            },
+            history,
+        },
+    );
+    Some(CompletedAlignmentRowLayoutWork {
+        panel_id,
+        track_id,
+        request_revision,
+        key,
+        result,
+    })
+}
+
 impl Viewer {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_alignment_row_layout_task(
+        &mut self,
+        panel_id: PanelId,
+        track_id: TrackId,
+        request_revision: u64,
+        key: AlignmentRowLayoutTaskKey,
+        query: Arc<AlignmentQuery>,
+        layout_query: Arc<AlignmentQuery>,
+        options: AlignmentLayoutOptions,
+        stacking_mode: ReadStackingMode,
+        repack: bool,
+        refused: bool,
+        history: AlignmentRowHistory,
+        cancellation_clock: GenerationClock,
+        cancellation_generation: ViewportGeneration,
+    ) -> AlignmentRowLayoutSubmit {
+        if self
+            .alignment_row_layout_tasks
+            .iter()
+            .any(|task| task.panel_id == panel_id && task.track_id == track_id && task.key == key)
+        {
+            return AlignmentRowLayoutSubmit::Submitted;
+        }
+        let work = AlignmentRowLayoutWork {
+            panel_id,
+            track_id,
+            request_revision,
+            key,
+            query,
+            layout_query,
+            options,
+            stacking_mode,
+            repack,
+            refused,
+            history,
+            cancellation_clock,
+            cancellation_generation,
+        };
+        match self.alignment_row_layout_scheduler.try_submit(WorkItem {
+            generation: self.alignment_row_layout_scheduler_clock.current(),
+            payload: work,
+        }) {
+            Ok(()) => {
+                self.alignment_row_layout_tasks
+                    .push(AlignmentRowLayoutTask {
+                        panel_id,
+                        track_id,
+                        request_revision,
+                        key,
+                    });
+                AlignmentRowLayoutSubmit::Submitted
+            }
+            Err(SchedulerError::QueueFull(_)) => AlignmentRowLayoutSubmit::QueueFull,
+            Err(SchedulerError::Disconnected(_)) => AlignmentRowLayoutSubmit::Disconnected,
+        }
+    }
+
+    pub(crate) fn poll_alignment_row_layout_tasks(&mut self) {
+        let mut committed = false;
+        let mut processed = false;
+        loop {
+            let completed = match self.alignment_row_layout_scheduler.try_receive() {
+                Ok(Some(completed)) => completed.output,
+                Ok(None) => break,
+                Err(_) => {
+                    self.data_status = "Read-layout worker pool disconnected".to_owned();
+                    self.display_dirty = true;
+                    break;
+                }
+            };
+            processed = true;
+            if let Some(index) = self.alignment_row_layout_tasks.iter().position(|task| {
+                task.panel_id == completed.panel_id
+                    && task.track_id == completed.track_id
+                    && task.request_revision == completed.request_revision
+                    && task.key == completed.key
+            }) {
+                self.alignment_row_layout_tasks.remove(index);
+            }
+            let Some(track) = self
+                .alignment_tracks
+                .iter_mut()
+                .find(|track| track.config.id == completed.track_id)
+            else {
+                continue;
+            };
+            let projection = track.projection_mut(completed.panel_id);
+            let result_is_current = projection.row_layout_request_revision
+                == completed.request_revision
+                && completed.result.as_ref().is_some_and(|result| {
+                    projection
+                        .current_query
+                        .as_ref()
+                        .is_some_and(|query| Arc::ptr_eq(query, &result.rows.query))
+                        && projection
+                            .layout_query
+                            .as_ref()
+                            .or(projection.current_query.as_ref())
+                            .is_some_and(|query| Arc::ptr_eq(query, &result.rows.layout_query))
+                });
+            match completed.result {
+                Some(result) if result_is_current => {
+                    projection.row_history = result.history;
+                    projection.alignment_rows = Some(result.rows);
+                    projection.cached_layout = None;
+                    if completed.key.repack {
+                        projection.pending_row_repack = false;
+                    }
+                    committed = true;
+                }
+                Some(_) => {
+                    self.navigation_stale_result_rejections =
+                        self.navigation_stale_result_rejections.saturating_add(1);
+                }
+                None => {
+                    self.alignment_row_layout_cancellations =
+                        self.alignment_row_layout_cancellations.saturating_add(1);
+                }
+            }
+        }
+        if committed || processed {
+            self.layout_cache.clear();
+            self.display_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
+    pub(crate) fn finish_alignment_row_layout_tasks(&mut self) {
+        for track in &self.alignment_tracks {
+            for projection in track.projections.values() {
+                projection.row_layout_clock.advance();
+            }
+        }
+        self.alignment_row_layout_scheduler_clock.advance();
+        self.alignment_row_layout_tasks.clear();
+    }
+
     pub(crate) fn start_export(&mut self, path: PathBuf, contents: String) {
         self.start_export_job(path, move |path| std::fs::write(path, contents));
     }

@@ -51,6 +51,7 @@ impl Viewer {
             _ => None,
         };
         self.add_configured_track_source(path, kind, track_kind, name, format)
+            .map(|_| ())
     }
 
     pub(crate) fn add_configured_track_source(
@@ -60,7 +61,7 @@ impl Viewer {
         track_kind: TrackKind,
         name: String,
         format: Option<TrackFormat>,
-    ) -> Result<()> {
+    ) -> Result<TrackId> {
         let id = TrackId::new(
             self.tracks
                 .tracks()
@@ -75,9 +76,21 @@ impl Viewer {
                 .unwrap_or_default()
                 .saturating_add(1),
         );
+        let mut config = TrackConfig::new(id, name, track_kind, track_source(path));
+        config.format = format;
+        self.add_preconfigured_track_source(path, kind, config)
+    }
+
+    pub(crate) fn add_preconfigured_track_source(
+        &mut self,
+        path: &Path,
+        kind: TrackSpecKind,
+        config: TrackConfig,
+    ) -> Result<TrackId> {
+        let id = config.id;
         let specification = TrackSpec {
             id,
-            name: name.clone(),
+            name: config.name.clone(),
             path: path.to_path_buf(),
             kind,
         };
@@ -86,15 +99,13 @@ impl Viewer {
         } else {
             self.track_engine = Some(TrackEngine::spawn(vec![specification], 8));
         }
-        let mut config = TrackConfig::new(id, name, track_kind, track_source(path));
-        config.format = format;
         let source_label = config.source.redacted_label();
         self.tracks.push(config);
         self.invalidate_navigation_preview_contract("auxiliary track added");
         self.reconcile_track_presentation();
         self.synthetic = false;
         self.data_status = format!("Opening track {source_label}…");
-        Ok(())
+        Ok(id)
     }
 
     pub(crate) fn expand_tdf_channels(
@@ -202,6 +213,15 @@ impl Viewer {
     }
 
     pub(crate) fn apply_session(&mut self, session: &SessionDocument) -> Result<()> {
+        let mut rebound_session = session.clone();
+        if let Some(error) = LaunchOptions::rebind_builtin_session_tracks(
+            &mut rebound_session,
+            self.landmark_resource_root.as_deref(),
+            self.landmark_catalogue.as_ref(),
+        ) {
+            self.landmark_catalogue_error = Some(error);
+        }
+        let session = &rebound_session;
         self.reference_open_error = None;
         self.automation_auxiliary_open_state.clear();
         self.unresolved_session_sources = session.unresolved_local_sources();
@@ -251,6 +271,8 @@ impl Viewer {
             None => None,
         };
         self.contig_aliases.clone_from(&session.contig_aliases);
+        self.suppressed_builtin_gene_bundles
+            .clone_from(&session.suppressed_builtin_gene_bundles);
         let (specifications, tracks) = session_track_specs(session);
         self.tracks = tracks;
         self.automation_auxiliary_open_state.extend(
@@ -388,6 +410,23 @@ impl Viewer {
             review_items: self.review_items.clone(),
             sample_metadata: self.sample_metadata.clone(),
             contig_aliases: self.contig_aliases.clone(),
+            landmark_context: self
+                .landmark_resolution
+                .as_ref()
+                .filter(|resolution| {
+                    resolution.status == rgv_core::AssemblyResolutionStatus::Matched
+                })
+                .and_then(|resolution| resolution.bundle_id.as_ref())
+                .and_then(|bundle_id| {
+                    self.landmark_catalogue
+                        .as_ref()?
+                        .bundle(bundle_id)
+                        .map(|bundle| rgv_core::BuiltInLandmarkContext {
+                            bundle_id: bundle.id.clone(),
+                            bundle_version: bundle.version.clone(),
+                        })
+                }),
+            suppressed_builtin_gene_bundles: self.suppressed_builtin_gene_bundles.clone(),
             tracks: self.tracks.tracks().to_vec(),
             maximum_alignments: self.workspace_alignment_limit,
         }

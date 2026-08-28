@@ -21,6 +21,10 @@ pub(super) struct LaunchOptions {
     /// Display name for the reference assembly loaded from the alignment header.
     #[arg(long, default_value = "BAM header")]
     pub(super) genome_name: String,
+    /// Directory containing the schema-versioned built-in landmark catalog.
+    /// Defaults to RGV_LANDMARK_RESOURCE_ROOT, packaged resources, or the local development bundle.
+    #[arg(long)]
+    pub(super) landmark_resource_root: Option<PathBuf>,
     /// Portable JSON genome bundle describing FASTA, aliases, cytobands, and default annotations.
     #[arg(long, conflicts_with_all = ["session", "import_igv"])]
     pub(super) genome_config: Option<PathBuf>,
@@ -125,6 +129,10 @@ pub(super) struct LaunchOptions {
     #[arg(skip)]
     pub(super) loaded_genome: Option<GenomeConfiguration>,
     #[arg(skip)]
+    pub(super) loaded_landmark_catalogue: Option<GenomeLandmarkCatalogue>,
+    #[arg(skip)]
+    pub(super) landmark_catalogue_error: Option<String>,
+    #[arg(skip)]
     pub(super) loaded_settings: DesktopSettings,
     #[arg(skip)]
     pub(super) loaded_igv_report: Option<IgvImportReport>,
@@ -140,6 +148,7 @@ pub(super) struct LaunchOptions {
 
 impl LaunchOptions {
     pub(super) fn load_session(&mut self) -> Result<()> {
+        self.load_landmark_catalogue();
         let settings_path = self
             .settings_path
             .clone()
@@ -180,7 +189,7 @@ impl LaunchOptions {
         } else {
             None
         };
-        let document = if let Some(path) = &self.session {
+        let mut document = if let Some(path) = &self.session {
             Some(
                 SessionDocument::read(path)
                     .with_context(|| format!("failed to read RGV session {}", path.display()))?,
@@ -201,6 +210,15 @@ impl LaunchOptions {
         } else {
             None
         };
+        if let Some(document) = &mut document {
+            if let Some(error) = Self::rebind_builtin_session_tracks(
+                document,
+                self.landmark_resource_root.as_deref(),
+                self.loaded_landmark_catalogue.as_ref(),
+            ) {
+                self.landmark_catalogue_error = Some(error);
+            }
+        }
         if let Some(document) = &document {
             self.bam = primary_alignment_track(document).map(|track| source_path(&track.source));
             self.reference = document.reference.as_ref().map(source_path);
@@ -230,6 +248,212 @@ impl LaunchOptions {
         Ok(())
     }
 
+    fn load_landmark_catalogue(&mut self) {
+        let Some(root) = discover_landmark_resource_root(self.landmark_resource_root.as_deref())
+        else {
+            self.landmark_catalogue_error = Some(
+                "No built-in landmark catalogue was found; automatic Genes tracks are unavailable"
+                    .to_owned(),
+            );
+            return;
+        };
+        let catalogue_path = root.join("catalog.json");
+        match GenomeLandmarkCatalogue::read(&catalogue_path) {
+            Ok(catalogue) => {
+                tracing::info!(
+                    path = %catalogue_path.display(),
+                    bundles = catalogue.bundles.len(),
+                    "loaded built-in landmark catalogue"
+                );
+                self.landmark_resource_root = Some(root);
+                self.loaded_landmark_catalogue = Some(catalogue);
+                self.landmark_catalogue_error = None;
+            }
+            Err(error) => {
+                let message = format!(
+                    "Built-in landmark catalogue {} is invalid: {error}",
+                    catalogue_path.display()
+                );
+                tracing::warn!(%message);
+                self.landmark_resource_root = Some(root);
+                self.loaded_landmark_catalogue = None;
+                self.landmark_catalogue_error = Some(message);
+            }
+        }
+    }
+
+    pub(super) fn rebind_builtin_session_tracks(
+        document: &mut SessionDocument,
+        root: Option<&Path>,
+        catalogue: Option<&GenomeLandmarkCatalogue>,
+    ) -> Option<String> {
+        let context = document.landmark_context.clone().or_else(|| {
+            document.tracks.iter().find_map(|track| {
+                track
+                    .built_in
+                    .as_ref()
+                    .filter(|identity| {
+                        identity.asset_role == LandmarkAssetRole::RepresentativeGenes
+                    })
+                    .map(|identity| rgv_core::BuiltInLandmarkContext {
+                        bundle_id: identity.bundle_id.clone(),
+                        bundle_version: identity.bundle_version.clone(),
+                    })
+            })
+        });
+        let built_in_bundles = document
+            .tracks
+            .iter()
+            .filter_map(|track| track.built_in.as_ref())
+            .map(|identity| identity.bundle_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let (Some(root), Some(catalogue)) = (root, catalogue) else {
+            if !built_in_bundles.is_empty() || context.is_some() {
+                document
+                    .suppressed_builtin_gene_bundles
+                    .extend(built_in_bundles);
+                if let Some(context) = context {
+                    document
+                        .suppressed_builtin_gene_bundles
+                        .insert(context.bundle_id);
+                }
+                document.tracks.retain(|track| track.built_in.is_none());
+                document.landmark_context = None;
+                document.cytobands = None;
+                document.contig_aliases.clear();
+                document.normalize_presentation();
+                return Some(
+                    "Saved built-in landmark tracks could not be rebound because their catalogue is unavailable; they remain suppressed until restored"
+                        .to_owned(),
+                );
+            }
+            return None;
+        };
+
+        let context_error = context.as_ref().and_then(|context| {
+            let bundle = catalogue.bundle(&context.bundle_id)?;
+            (bundle.version != context.bundle_version).then(|| {
+                format!(
+                    "Saved landmark context {} {} is not installed",
+                    context.bundle_id, context.bundle_version
+                )
+            })
+        });
+        let context_error = context_error.or_else(|| {
+            context.as_ref().and_then(|context| {
+                (catalogue.bundle(&context.bundle_id).is_none()).then(|| {
+                    format!(
+                        "Saved landmark context {} is not installed",
+                        context.bundle_id
+                    )
+                })
+            })
+        });
+        let rebound_context = if let (Some(context), None) = (&context, &context_error) {
+            (|| -> Result<_> {
+                let aliases_path = catalogue.verify_asset(
+                    root,
+                    &context.bundle_id,
+                    LandmarkAssetRole::ContigAliases,
+                )?;
+                let cytobands_path = catalogue.verify_asset(
+                    root,
+                    &context.bundle_id,
+                    LandmarkAssetRole::Cytobands,
+                )?;
+                let aliases = std::fs::read_to_string(&aliases_path)
+                    .with_context(|| format!("failed to read {}", aliases_path.display()))?;
+                Ok((rgv_core::parse_landmark_aliases(&aliases)?, cytobands_path))
+            })()
+            .map_err(|error| {
+                format!(
+                    "Saved landmark context {} failed integrity verification: {error}",
+                    context.bundle_id
+                )
+            })
+        } else if let Some(error) = context_error {
+            Err(error)
+        } else {
+            Ok((document.contig_aliases.clone(), PathBuf::new()))
+        };
+
+        let mut track_errors = Vec::new();
+        let mut newly_suppressed = std::collections::BTreeSet::new();
+        document.tracks.retain_mut(|track| {
+            let Some(identity) = &track.built_in else {
+                return true;
+            };
+            if context.as_ref().is_some_and(|context| {
+                context.bundle_id == identity.bundle_id && rebound_context.is_err()
+            }) {
+                newly_suppressed.insert(identity.bundle_id.clone());
+                return false;
+            }
+            let rebound = (|| -> Result<PathBuf> {
+                let bundle = catalogue
+                    .bundle(&identity.bundle_id)
+                    .with_context(|| format!("bundle {} is not installed", identity.bundle_id))?;
+                let asset = bundle.asset(identity.asset_role).with_context(|| {
+                    format!(
+                        "asset {:?} is not installed for {}",
+                        identity.asset_role, identity.bundle_id
+                    )
+                })?;
+                anyhow::ensure!(
+                    bundle.version == identity.bundle_version
+                        && asset.sha256.eq_ignore_ascii_case(&identity.sha256),
+                    "version/checksum is not installed for {}",
+                    identity.bundle_id
+                );
+                Ok(catalogue.verify_asset(root, &identity.bundle_id, identity.asset_role)?)
+            })();
+            match rebound {
+                Ok(path) => {
+                    track.source = track_source(&path);
+                    true
+                }
+                Err(error) => {
+                    newly_suppressed.insert(identity.bundle_id.clone());
+                    track_errors.push(format!(
+                        "Saved landmark asset {} could not be rebound: {error}",
+                        identity.bundle_id
+                    ));
+                    false
+                }
+            }
+        });
+        document
+            .suppressed_builtin_gene_bundles
+            .extend(newly_suppressed);
+
+        match (context, rebound_context) {
+            (Some(context), Ok((aliases, cytobands_path))) => {
+                document.contig_aliases = aliases;
+                document.cytobands = Some(track_source(&cytobands_path));
+                document.landmark_context = Some(context);
+            }
+            (Some(context), Err(error)) => {
+                document
+                    .suppressed_builtin_gene_bundles
+                    .insert(context.bundle_id);
+                document.landmark_context = None;
+                document.cytobands = None;
+                document.contig_aliases.clear();
+                track_errors.push(error);
+            }
+            (None, _) => {}
+        }
+        document.normalize_presentation();
+        if track_errors.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "{}; built-in genes remain suppressed until restored",
+                track_errors.join("; ")
+            ))
+        }
+    }
+
     pub(super) fn load_control_configuration(&mut self) -> Result<()> {
         if self.control_port.is_none() {
             return Ok(());
@@ -253,6 +477,37 @@ impl LaunchOptions {
         );
         Ok(())
     }
+}
+
+pub(super) fn discover_landmark_resource_root(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return path
+            .join("catalog.json")
+            .is_file()
+            .then(|| path.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("RGV_LANDMARK_RESOURCE_ROOT") {
+        let path = PathBuf::from(path);
+        if path.join("catalog.json").is_file() {
+            return Some(path);
+        }
+    }
+    let mut candidates = vec![
+        PathBuf::from("benchmark-data/large-public-alignments/landmarks/igv"),
+        PathBuf::from("resources/landmarks"),
+    ];
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        candidates.extend([
+            directory.join("landmarks"),
+            directory.join("resources/landmarks"),
+            directory.join("../Resources/landmarks"),
+        ]);
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.join("catalog.json").is_file())
 }
 
 pub(super) fn default_settings_path() -> PathBuf {
@@ -428,5 +683,55 @@ impl RunMarker {
         {
             tracing::warn!(%error, "could not remove clean-exit marker");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_catalogue_never_trusts_a_saved_builtin_path() {
+        let mut document = SessionDocument::new(SessionLocus {
+            contig: "chr1".to_owned(),
+            start: 0,
+            end: 100,
+        });
+        document.landmark_context = Some(rgv_core::BuiltInLandmarkContext {
+            bundle_id: "hg38".to_owned(),
+            bundle_version: "1.0-rgv1".to_owned(),
+        });
+        document.tracks.push(
+            TrackConfig::new(
+                TrackId::new(7),
+                "Genes".to_owned(),
+                TrackKind::GeneModel,
+                TrackSource::Local {
+                    path: "/untrusted/developer/path/genes.genePred.gz".to_owned(),
+                },
+            )
+            .with_built_in(rgv_core::BuiltInTrackIdentity {
+                bundle_id: "hg38".to_owned(),
+                bundle_version: "1.0-rgv1".to_owned(),
+                asset_role: LandmarkAssetRole::RepresentativeGenes,
+                sha256: "a".repeat(64),
+            }),
+        );
+        document.normalize_presentation();
+        let mut options = LaunchOptions::parse_from(["rgv"]);
+        options.landmark_resource_root = None;
+        options.loaded_landmark_catalogue = None;
+
+        options.landmark_catalogue_error = LaunchOptions::rebind_builtin_session_tracks(
+            &mut document,
+            options.landmark_resource_root.as_deref(),
+            options.loaded_landmark_catalogue.as_ref(),
+        );
+
+        assert!(document.tracks.is_empty());
+        assert!(document.landmark_context.is_none());
+        assert!(document.suppressed_builtin_gene_bundles.contains("hg38"));
+        assert!(options.landmark_catalogue_error.is_some());
+        assert!(document.presentation.pane_tracks.is_empty());
     }
 }

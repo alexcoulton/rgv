@@ -513,6 +513,7 @@ impl Viewer {
         self.dispatch_due_resolution_query_refresh(now);
         self.poll_reference_events();
         self.poll_alignment_events();
+        self.poll_alignment_row_layout_tasks();
         self.poll_track_events();
         self.poll_alignment_retirement_tasks();
         self.poll_session_load_tasks();
@@ -645,11 +646,12 @@ impl Viewer {
                         let default_annotation_count = self.assembly.default_annotation_count;
                         self.assembly = load_assembly(
                             &self.assembly_name,
-                            dictionary,
+                            dictionary.clone(),
                             self.cytoband_path.as_deref(),
                         );
                         self.assembly.default_annotation_count = default_annotation_count;
                     }
+                    self.update_landmark_resolution_from_dictionary(&dictionary);
                     self.assembly.reference_contig_count = reference_contig_count;
                     self.assembly.identity.clone_from(&self.assembly_identity);
                     self.synthetic = false;
@@ -925,8 +927,7 @@ impl Viewer {
                     remote_io_stats,
                     ..
                 } if event_is_current => {
-                    self.suggested_assembly_identity =
-                        rgv_hts::recognize_assembly_from_header(&query.header);
+                    self.update_landmark_resolution_from_header(&query.header);
                     let is_active = request.panel_id() == active_panel_id;
                     if let Some(panel) = self.panels.get_mut(request.panel_id()) {
                         let has_pending_selection = panel
@@ -1124,12 +1125,13 @@ impl Viewer {
                 }
                 TrackEngineEvent::SearchCompleted {
                     generation,
-                    results,
+                    mut results,
                 } if generation == self.annotation_search_generation => {
                     let pending = self
                         .pending_annotation_navigation
                         .take()
                         .filter(|query| query.eq_ignore_ascii_case(results.query.trim()));
+                    self.merge_landmark_search_results(&results.query.clone(), &mut results);
                     self.annotation_search_results = results;
                     if let Some(query) = pending {
                         self.submit_annotation_search_results(&query);

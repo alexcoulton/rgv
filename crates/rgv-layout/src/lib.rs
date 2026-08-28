@@ -22,7 +22,7 @@ pub use alignment_layout::{
     layout_alignment_query_with_rows_and_annotations, layout_reference_slice,
     layout_reference_slice_oriented, layout_reference_translation, layout_sashimi,
     modification_code_color, reconcile_alignment_rows, reconcile_alignment_rows_with_horizon,
-    ultima_quality_color,
+    reconcile_alignment_rows_with_horizon_cancellable, ultima_quality_color,
 };
 pub use display::{
     Direction, DisplayList, JunctionArcGeometrySample, READ_DETAIL_OBJECT_BIT, RectPrimitive,
