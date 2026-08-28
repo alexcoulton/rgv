@@ -1919,6 +1919,22 @@ fn primary_alignment_upsert_allocates_an_id_after_auxiliary_tracks() {
 }
 
 #[test]
+fn explicit_complete_read_limit_can_raise_the_default_workspace_budget() {
+    assert_eq!(
+        expanded_workspace_alignment_limit(50_000, 100_000),
+        (100_000, 100_000)
+    );
+    assert_eq!(
+        expanded_workspace_alignment_limit(100_000, 25_000),
+        (100_000, 25_000)
+    );
+    assert_eq!(
+        expanded_workspace_alignment_limit(50_000, 300_000),
+        (250_000, 250_000)
+    );
+}
+
+#[test]
 fn alignment_workspace_budgets_are_divided_across_live_tracks() {
     let cache_share = alignment_cache_share(320 * 1024 * 1024, 4).get();
     assert_eq!(cache_share, 80 * 1024 * 1024);

@@ -715,6 +715,10 @@ pub struct SessionPresentationComposite {
 pub struct WorkspacePresentation {
     #[serde(default = "default_alignment_track_height")]
     pub read_pane_height: f32,
+    /// Content-fit the annotation/read split until the user explicitly
+    /// allocates pane height with the shared divider.
+    #[serde(default = "default_true")]
+    pub annotation_pane_auto_fit: bool,
     /// Non-destructive workspace gate for the complete annotation section.
     /// Child visibility, grouping, heights, and cameras remain authoritative
     /// while the section is folded.
@@ -843,6 +847,7 @@ impl Default for WorkspacePresentation {
     fn default() -> Self {
         Self {
             read_pane_height: default_alignment_track_height(),
+            annotation_pane_auto_fit: true,
             annotation_section_expanded: true,
             read_section_expanded: true,
             reference_content_visible: true,
@@ -1043,6 +1048,7 @@ impl WorkspacePresentation {
                 .map_or_else(default_alignment_track_height, |track| {
                     track.height.clamp(100.0, 1_200.0)
                 }),
+            annotation_pane_auto_fit: true,
             annotation_section_expanded: true,
             read_section_expanded: true,
             reference_content_visible: true,
@@ -1382,9 +1388,10 @@ impl WorkspacePresentation {
                 if !height.is_finite() || !(100.0..=1_200.0).contains(height) {
                     return Err(TrackIntentError::InvalidSize);
                 }
-                changes.presentation_changed |=
-                    (self.read_pane_height - height).abs() > f32::EPSILON;
+                changes.presentation_changed |= self.annotation_pane_auto_fit
+                    || (self.read_pane_height - height).abs() > f32::EPSILON;
                 self.read_pane_height = *height;
+                self.annotation_pane_auto_fit = false;
             }
             TrackIntent::GroupNodes { channel, members } => {
                 let unique = members.iter().copied().collect::<BTreeSet<_>>();

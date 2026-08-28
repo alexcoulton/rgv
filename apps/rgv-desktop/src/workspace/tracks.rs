@@ -1106,8 +1106,14 @@ impl Viewer {
     pub(crate) fn apply_secondary_alignment_settings(
         &mut self,
         id: TrackId,
-        update: AlignmentSettingsDraft,
+        mut update: AlignmentSettingsDraft,
     ) {
+        let (workspace_limit, requested_limit) = expanded_workspace_alignment_limit(
+            self.workspace_alignment_limit,
+            update.maximum_alignments,
+        );
+        self.workspace_alignment_limit = workspace_limit;
+        update.maximum_alignments = requested_limit;
         let Some(track) = self
             .alignment_tracks
             .iter_mut()
@@ -1120,7 +1126,7 @@ impl Viewer {
             &mut track.filter_editor,
             &mut track.active_filters,
             update,
-            self.workspace_alignment_limit,
+            workspace_limit,
         );
         if outcome.configuration_changed {
             for projection in track.projections.values_mut() {

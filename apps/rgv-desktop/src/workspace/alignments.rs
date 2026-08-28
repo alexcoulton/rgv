@@ -1,5 +1,19 @@
 use super::super::*;
 
+pub(crate) const MAX_CONFIGURABLE_COMPLETE_READ_LIMIT: usize = 250_000;
+
+pub(crate) fn expanded_workspace_alignment_limit(
+    current_workspace_limit: usize,
+    requested_track_limit: usize,
+) -> (usize, usize) {
+    let requested_track_limit =
+        requested_track_limit.clamp(1, MAX_CONFIGURABLE_COMPLETE_READ_LIMIT);
+    (
+        current_workspace_limit.max(requested_track_limit),
+        requested_track_limit,
+    )
+}
+
 #[derive(Clone)]
 pub(crate) struct FilterEditor {
     pub(crate) minimum_mapq: u8,
@@ -488,9 +502,9 @@ impl Viewer {
     }
 
     pub(crate) fn set_primary_alignment_limit(&mut self, maximum_alignments: usize) {
-        let maximum_alignments = maximum_alignments
-            .min(self.workspace_alignment_limit)
-            .max(1);
+        let (workspace_limit, maximum_alignments) =
+            expanded_workspace_alignment_limit(self.workspace_alignment_limit, maximum_alignments);
+        self.workspace_alignment_limit = workspace_limit;
         if let Some(track) = self.alignment_tracks.first_mut() {
             track.config.maximum_alignments = maximum_alignments;
         } else {

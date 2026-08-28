@@ -115,6 +115,24 @@ fn resize_stop_actions_on_pointer_release(
         .collect()
 }
 
+fn read_pane_resize_origin(
+    configured_height: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+    rendered_divider_y: f32,
+) -> f32 {
+    let viewport_height = (viewport_bottom - viewport_top).max(1.0);
+    let maximum = (viewport_height - 80.0).max(100.0);
+    if rendered_divider_y.is_finite()
+        && rendered_divider_y >= viewport_top
+        && rendered_divider_y <= viewport_bottom
+    {
+        (viewport_bottom - rendered_divider_y).clamp(100.0, maximum)
+    } else {
+        configured_height.clamp(100.0, maximum)
+    }
+}
+
 impl Viewer {
     pub(crate) fn append_pointer_release_resize_actions(
         &self,
@@ -558,7 +576,13 @@ impl Viewer {
                     outcome.read_geometry_changed = true;
                 }
                 TrackUiAction::ResizeReadPaneStarted => {
-                    self.resizing_read_pane = Some(self.track_presentation.read_pane_height);
+                    let viewport = self.canvas_geometry().viewport;
+                    self.resizing_read_pane = Some(read_pane_resize_origin(
+                        self.track_presentation.read_pane_height,
+                        viewport.top(),
+                        viewport.bottom(),
+                        draft.pane_layout.annotation.pane_rect.bottom(),
+                    ));
                 }
                 TrackUiAction::ResizeReadPaneDragged(delta) => {
                     if let Some(current) = self.resizing_read_pane {
@@ -577,11 +601,14 @@ impl Viewer {
                     self.resizing_read_pane = None;
                 }
                 TrackUiAction::ResizeReadPaneKeyboard(delta) => {
-                    let height = ui::resized_read_pane_height(
+                    let viewport = self.canvas_geometry().viewport;
+                    let origin = read_pane_resize_origin(
                         self.track_presentation.read_pane_height,
-                        delta,
-                        self.canvas_geometry().viewport.height(),
+                        viewport.top(),
+                        viewport.bottom(),
+                        draft.pane_layout.annotation.pane_rect.bottom(),
                     );
+                    let height = ui::resized_read_pane_height(origin, delta, viewport.height());
                     presentation_intents.push(TrackIntent::ResizeReadPane { height });
                     outcome.read_geometry_changed = true;
                 }
@@ -755,6 +782,15 @@ mod tests {
         );
         assert!(
             resize_stop_actions_on_pointer_release(true, Some(annotation), None, false).is_empty()
+        );
+    }
+
+    #[test]
+    fn pane_resize_starts_from_the_rendered_auto_fit_divider() {
+        assert_eq!(read_pane_resize_origin(360.0, 100.0, 900.0, 452.0), 448.0);
+        assert_eq!(
+            read_pane_resize_origin(360.0, 100.0, 900.0, f32::NAN),
+            360.0
         );
     }
 }

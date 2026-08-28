@@ -184,8 +184,10 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   individual eye state. Configurable auxiliary annotations expose thin
   horizontal resize boundaries in the left label gutter; the pointer changes to a vertical-resize
   cursor at a boundary. Drag the horizontal divider across the genomic canvas to allocate more
-  height to either the annotation pane or the read pane. Annotation heights do not change with
-  read density. Every track header has a visible gear button that opens its settings; right-clicking
+  height to either the annotation pane or the read pane. The annotation pane initially fits its
+  measured content up to the configured limit; manually moving the divider establishes an explicit
+  pane allocation. Annotation heights do not change with read density. Every track header has a
+  visible gear button that opens its settings; right-clicking
   the header opens the same track menu. The read-pane eye hides or restores the Reads lane without
   collapsing the complete alignment track.
 - The right edge contains two scrollbar segments on the same x-axis. The upper segment is a

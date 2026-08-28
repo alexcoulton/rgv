@@ -683,10 +683,13 @@ impl Viewer {
     }
 
     pub(crate) fn rebuild_genomic_display(&mut self) {
-        let annotation_content_height =
-            annotation_frame_content_height(&self.panels.active().track_frames);
+        let annotation_auto_fit = self.track_presentation.annotation_pane_auto_fit;
+        let annotation_content_height = annotation_auto_fit
+            .then(|| annotation_frame_content_height(&self.panels.active().track_frames))
+            .flatten();
         let measured_content_height = self.rebuild_genomic_display_pass(annotation_content_height);
-        if self.track_presentation.annotation_section_expanded
+        if annotation_auto_fit
+            && self.track_presentation.annotation_section_expanded
             && self.track_presentation.read_section_expanded
             && annotation_content_height
                 .is_none_or(|previous| (previous - measured_content_height).abs() >= 0.5)
@@ -3254,7 +3257,9 @@ impl Viewer {
                 self.track_presentation.read_pane_height,
                 annotation_section_expanded,
                 read_section_expanded,
-                Some(annotation_content_height),
+                self.track_presentation
+                    .annotation_pane_auto_fit
+                    .then_some(annotation_content_height),
             );
             let annotation_content_top =
                 section_geometry.annotation_clip_top + READ_PANE_HEADER_HEIGHT;

@@ -3101,13 +3101,15 @@ impl Viewer {
             }
             AutomationSetting::CompleteReadLimit { track_ids, value } => {
                 self.ensure_automation_alignment_tracks(track_ids)?;
-                let effective = (*value).min(self.workspace_alignment_limit).max(1);
+                let (workspace_limit, requested_limit) =
+                    expanded_workspace_alignment_limit(self.workspace_alignment_limit, *value);
+                self.workspace_alignment_limit = workspace_limit;
                 for track in self
                     .alignment_tracks
                     .iter_mut()
                     .filter(|track| track_ids.contains(&track.config.id))
                 {
-                    track.config.maximum_alignments = effective;
+                    track.config.maximum_alignments = requested_limit;
                 }
                 self.invalidate_automation_alignment_layouts(Some(track_ids), true);
                 self.request_all_panel_queries();

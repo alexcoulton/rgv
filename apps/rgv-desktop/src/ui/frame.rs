@@ -319,7 +319,7 @@ impl Viewer {
             }),
         )
         .unwrap_or(u32::MAX)
-        .clamp(1, 250_000);
+        .clamp(1, MAX_CONFIGURABLE_COMPLETE_READ_LIMIT as u32);
         let mut alignment_track_controls = self
             .alignment_tracks
             .iter()
@@ -789,6 +789,7 @@ impl Viewer {
         let mut overview_interaction = ui::OverviewInteraction::default();
         let mut overview_panel_id = active_panel_id;
         let mut genomic_canvas_layer_id = None;
+        let mut pane_divider_rect = None;
         let mut diagnostics_open = self.diagnostics_open;
         let mut metadata_open = self.open_panel == Some(UiPanel::Metadata);
         let mut regions_open = self.open_panel == Some(UiPanel::Regions);
@@ -1722,6 +1723,7 @@ impl Viewer {
                         read_content_top: pane_layout.reads.pane_rect.top(),
                     },
                 );
+                pane_divider_rect = gutter.pane_divider_rect;
                 track_ui_actions.extend(gutter.actions);
                 let frame_genomic_texts = remap_genomic_texts_for_layout(
                     &genomic_texts,
@@ -2488,8 +2490,11 @@ impl Viewer {
                                     "At or below the effective limit, every eligible viewport read is shown. Above it, RGV shows no individual reads and asks you to zoom in or raise the limit. The default is 50,000; raising it can increase memory, query/layout time, and GPU work. Multi-panel or multi-track workspace allocation can make the effective limit lower than this requested value.",
                                 );
                                 ui.add(
-                                    egui::Slider::new(&mut complete_read_limit, 1_000..=250_000)
-                                        .logarithmic(true),
+                                    egui::Slider::new(
+                                        &mut complete_read_limit,
+                                        1_000..=MAX_CONFIGURABLE_COMPLETE_READ_LIMIT as u32,
+                                    )
+                                    .logarithmic(true),
                                 );
                             });
                             if ui.button("Apply filters").clicked() {
@@ -2812,6 +2817,7 @@ impl Viewer {
             .map_or(Duration::MAX, |output| output.repaint_delay);
         self.announced_status.clone_from(&data_status);
         self.genomic_canvas_layer_id = genomic_canvas_layer_id;
+        self.pane_divider_rect = pane_divider_rect;
         self.command_search = command_search;
         self.exit_confirmation_open = exit_confirmation_open;
         self.user_exit_requested |= user_exit_requested;

@@ -767,6 +767,19 @@ fn presentation_reducer_is_atomic_and_channel_qualified() {
 }
 
 #[test]
+fn explicit_read_pane_resize_leaves_annotation_auto_fit() {
+    let mut presentation = three_track_presentation();
+    assert!(presentation.annotation_pane_auto_fit);
+
+    presentation
+        .apply_intents(&[TrackIntent::ResizeReadPane { height: 420.0 }])
+        .unwrap();
+
+    assert_eq!(presentation.read_pane_height, 420.0);
+    assert!(!presentation.annotation_pane_auto_fit);
+}
+
+#[test]
 fn section_folding_is_a_nondestructive_workspace_gate() {
     let mut presentation = three_track_presentation();
     presentation.reference_content_visible = false;

@@ -818,6 +818,7 @@ struct Viewer {
     panels: PanelWorkspace,
     workspace_layout: WorkspaceLayoutSnapshot,
     genomic_canvas_layer_id: Option<egui::LayerId>,
+    pane_divider_rect: Option<egui::Rect>,
     composite_display_list: DisplayList,
     /// Canonical workspace annotation row heights, keyed by presentation
     /// identity. Every locus uses this table before its display is clipped.

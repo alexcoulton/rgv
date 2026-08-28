@@ -464,6 +464,7 @@ impl Viewer {
             panels,
             workspace_layout,
             genomic_canvas_layer_id: None,
+            pane_divider_rect: None,
             composite_display_list: DisplayList::default(),
             shared_annotation_frame_heights: BTreeMap::new(),
             alignment_tracks,

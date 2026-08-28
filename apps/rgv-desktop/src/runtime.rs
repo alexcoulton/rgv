@@ -1,5 +1,13 @@
 use super::*;
 
+fn native_canvas_press_starts_drag(
+    unobstructed_canvas: bool,
+    pointer: egui::Pos2,
+    pane_divider: Option<egui::Rect>,
+) -> bool {
+    unobstructed_canvas && pane_divider.is_none_or(|divider| !divider.contains(pointer))
+}
+
 pub(super) struct Application {
     pub(super) viewer: Option<Viewer>,
     pub(super) options: LaunchOptions,
@@ -166,8 +174,17 @@ impl ApplicationHandler for Application {
                 if state == ElementState::Pressed {
                     viewer.begin_vertical_scrollbar_drag();
                 }
+                let scale = viewer.window.scale_factor();
+                let pointer = egui::pos2(
+                    (viewer.cursor.x / scale) as f32,
+                    (viewer.cursor.y / scale) as f32,
+                );
                 if state == ElementState::Pressed
-                    && viewer.cursor_over_unobstructed_genomic_canvas()
+                    && native_canvas_press_starts_drag(
+                        viewer.cursor_over_unobstructed_genomic_canvas(),
+                        pointer,
+                        viewer.pane_divider_rect,
+                    )
                 {
                     if let Some(panel_id) = viewer.panel_at_cursor() {
                         viewer.activate_view_panel(panel_id);
@@ -357,6 +374,32 @@ mod tests {
         assert!(!should_request_egui_redraw(
             &WindowEvent::Focused(true),
             false,
+        ));
+    }
+
+    #[test]
+    fn pane_divider_press_is_owned_by_resize_instead_of_native_canvas_pan() {
+        let divider = egui::Rect::from_min_max(egui::pos2(0.0, 244.0), egui::pos2(786.0, 256.0));
+
+        assert!(!native_canvas_press_starts_drag(
+            true,
+            egui::pos2(400.0, 250.0),
+            Some(divider),
+        ));
+        assert!(native_canvas_press_starts_drag(
+            true,
+            egui::pos2(400.0, 300.0),
+            Some(divider),
+        ));
+        assert!(native_canvas_press_starts_drag(
+            true,
+            egui::pos2(400.0, 250.0),
+            None,
+        ));
+        assert!(!native_canvas_press_starts_drag(
+            false,
+            egui::pos2(400.0, 300.0),
+            Some(divider),
         ));
     }
 

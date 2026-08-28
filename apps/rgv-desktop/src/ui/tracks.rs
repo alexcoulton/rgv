@@ -379,6 +379,10 @@ pub enum TrackUiAction {
 #[derive(Default)]
 pub struct TrackGutterResult {
     pub actions: Vec<TrackUiAction>,
+    /// Exact same-frame hitbox of the shared annotation/read pane splitter.
+    /// Native canvas gestures consume this rectangle to avoid starting a
+    /// genomic pan underneath the egui resize interaction.
+    pub pane_divider_rect: Option<Rect>,
 }
 
 /// Fixed workspace section chrome. Content bounds are supplied by the display
@@ -2610,9 +2614,10 @@ pub fn paint_track_viewport_chrome_with_sections(
         && annotation_clip_bottom < geometry.viewport.bottom()
     {
         let divider_handle = Rect::from_min_max(
-            pos2(geometry.gutter.left(), annotation_clip_bottom - 4.0),
-            pos2(geometry.scrollbar.left(), annotation_clip_bottom + 4.0),
+            pos2(geometry.gutter.left(), annotation_clip_bottom - 6.0),
+            pos2(geometry.scrollbar.left(), annotation_clip_bottom + 6.0),
         );
+        result.pane_divider_rect = Some(divider_handle);
         let divider = ui
             .interact(
                 divider_handle,
@@ -2663,7 +2668,11 @@ pub fn paint_track_viewport_chrome_with_sections(
                 pos2(geometry.viewport.left(), annotation_clip_bottom),
                 pos2(geometry.viewport.right(), annotation_clip_bottom),
             ],
-            Stroke::new(1.5, Color32::from_gray(165)),
+            if divider.hovered() || divider.dragged() {
+                Stroke::new(3.0, Color32::from_rgb(45, 92, 175))
+            } else {
+                Stroke::new(1.5, Color32::from_gray(165))
+            },
         );
     }
     if rename_state.as_ref().is_some_and(|state| {
@@ -4960,6 +4969,121 @@ mod tests {
             |ui| actions = render(ui).actions,
         );
         assert_eq!(actions, vec![TrackUiAction::ResizeReadPaneDragged(10.0)]);
+    }
+
+    #[test]
+    fn pane_divider_owns_drag_above_the_read_section_header() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome_with_sections(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &[],
+                0.0,
+                0.0,
+                26.0,
+                250.0,
+                None,
+                &[],
+                &[],
+                &[],
+                TrackSectionChrome {
+                    annotation_expanded: true,
+                    reads_expanded: true,
+                    annotation_track_count: 1,
+                    read_track_count: 1,
+                    annotation_content_top: 26.0,
+                    read_content_top: 276.0,
+                },
+            )
+        };
+        // The lower half of the splitter overlaps the painted Read data
+        // section header. That overlap must belong to the splitter on press.
+        let pointer = pos2(400.0, 252.0);
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+
+        assert_eq!(actions, vec![TrackUiAction::ResizeReadPaneStarted]);
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![egui::Event::PointerMoved(pos2(400.0, 262.0))],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+        assert_eq!(actions, vec![TrackUiAction::ResizeReadPaneDragged(10.0)]);
+    }
+
+    #[test]
+    fn pane_divider_remains_draggable_above_the_canvas_accessibility_surface() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let render = |ui: &mut Ui| {
+            let geometry = CanvasGeometry::from_viewport(ui.max_rect());
+            let result =
+                paint_track_viewport_chrome(ui, geometry, &[], 0.0, 0.0, 0.0, 250.0, None, &[]);
+            ui.interact(
+                geometry.genomic,
+                egui::Id::new("test-genomic-canvas-accessibility"),
+                egui::Sense::focusable_noninteractive(),
+            );
+            result
+        };
+        let pointer = pos2(400.0, 250.0);
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+
+        assert_eq!(actions, vec![TrackUiAction::ResizeReadPaneStarted]);
     }
 
     #[test]
