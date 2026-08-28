@@ -30,6 +30,8 @@ fn json_round_trip_preserves_schema_and_sources() {
     filters.alignment_group_order = AlignmentOrderDirection::Reverse;
     filters.alignment_sort_mode = AlignmentSortMode::Base;
     filters.alignment_sort_order = AlignmentOrderDirection::Reverse;
+    filters.alignment_sort_anchor = Some(151);
+    filters.read_stacking_mode = ReadStackingMode::Compact;
     filters.view_as_pairs = true;
     filters.minimum_template_length = Some(100);
     filters.maximum_template_length = Some(900);
@@ -1554,6 +1556,8 @@ fn early_version_one_sessions_receive_pileup_defaults() {
         filters.alignment_sort_order,
         AlignmentOrderDirection::Natural
     );
+    assert_eq!(filters.alignment_sort_anchor, None);
+    assert_eq!(filters.read_stacking_mode, ReadStackingMode::Stable);
     assert!(!filters.view_as_pairs);
     assert_eq!(filters.minimum_template_length, None);
     assert_eq!(filters.maximum_template_length, None);

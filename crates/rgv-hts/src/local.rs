@@ -25,12 +25,14 @@ use crate::{
     pileup::{
         OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, aligned_observation,
     },
-    sampling::BoundedSampler,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum QueryDetail {
     Layout,
+    /// Layout columns plus sequence/qualities for fixed-position base sorting,
+    /// without retaining unrelated auxiliary payload.
+    Sequence,
     Full,
 }
 
@@ -38,6 +40,12 @@ pub enum QueryDetail {
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryOptions {
     pub detail: QueryDetail,
+    /// Auxiliary tags retained by layout-only queries because the active row
+    /// policy uses them. Full-detail queries retain every auxiliary field.
+    pub retained_auxiliary_tags: Vec<[u8; 2]>,
+    /// The active row policy needs sequence (currently fixed-position base
+    /// sorting), so a layout-horizon query cannot omit it.
+    pub layout_requires_sequence: bool,
     pub max_records: NonZeroUsize,
     pub cancellation_chunk: NonZeroUsize,
     pub coverage_bins: NonZeroUsize,
@@ -56,6 +64,8 @@ impl Default for QueryOptions {
     fn default() -> Self {
         Self {
             detail: QueryDetail::Layout,
+            retained_auxiliary_tags: Vec::new(),
+            layout_requires_sequence: false,
             max_records: NonZeroUsize::new(50_000).unwrap(),
             cancellation_chunk: NonZeroUsize::new(256).unwrap(),
             coverage_bins: NonZeroUsize::new(1_024).unwrap(),
@@ -82,6 +92,11 @@ impl QueryOptions {
             }
         };
         write(&[self.detail as u8]);
+        for tag in &self.retained_auxiliary_tags {
+            write(tag);
+        }
+        write(&[0xff]);
+        write(&[u8::from(self.layout_requires_sequence)]);
         write(&self.max_records.get().to_le_bytes());
         write(&self.coverage_bins.get().to_le_bytes());
         write(&[
@@ -129,6 +144,22 @@ impl Default for AlignmentOpenOptions {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IndividualReadStatus {
+    #[default]
+    Complete,
+    TooDense {
+        limit: usize,
+    },
+}
+
+impl IndividualReadStatus {
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryStats {
     pub records_seen: usize,
     /// Unmapped records ignored even when an index returns a placed record.
@@ -147,11 +178,17 @@ pub struct QueryStats {
     pub records_filtered_qc_failed: usize,
     /// Records that passed flags and user filters in the backing query interval.
     pub records_eligible: usize,
-    /// Records loaded for individual layout/inspection, equal to `records_eligible`
-    /// unless the explicit query safety bound was exceeded.
+    /// Records loaded for individual layout/inspection. This equals
+    /// `records_eligible` for a complete result and is zero for Too dense.
     pub records_emitted: usize,
-    /// The explicit query safety bound omitted otherwise eligible records.
+    /// Legacy compatibility flag. A true value now means the individual-read
+    /// result is Too dense and the committed batch is empty; it never denotes
+    /// a retained partial batch.
     pub truncated: bool,
+    /// Actual foreground/horizon admission limit applied to this query after
+    /// workspace allocation.
+    pub complete_read_limit: usize,
+    pub individual_reads: IndividualReadStatus,
     pub cancelled: bool,
 }
 
@@ -168,6 +205,11 @@ pub struct AlignmentQuery {
 }
 
 impl AlignmentQuery {
+    #[must_use]
+    pub const fn individual_reads_complete(&self) -> bool {
+        self.stats.individual_reads.is_complete()
+    }
+
     pub fn estimated_bytes(&self) -> usize {
         self.batch
             .estimated_bytes()
@@ -317,8 +359,13 @@ impl AlignmentSource for LocalAlignmentSource {
         let end = i64::try_from(interval.end()).map_err(|_| AlignmentError::CoordinateOverflow)?;
         self.reader.fetch((tid, start, end))?;
 
-        let mut stats = QueryStats::default();
-        let mut samples = BoundedSampler::new(options.max_records.get());
+        let maximum_records = options.max_records.get();
+        let mut stats = QueryStats {
+            complete_read_limit: maximum_records,
+            ..QueryStats::default()
+        };
+        let mut retained = Vec::new();
+        let mut too_dense = false;
         let mut pileup = PileupBuilder::new(
             interval,
             options.coverage_bins.get(),
@@ -369,6 +416,11 @@ impl AlignmentSource for LocalAlignmentSource {
                 continue;
             }
             stats.records_eligible += 1;
+            if stats.records_eligible > maximum_records && !too_dense {
+                retained.clear();
+                retained.shrink_to_fit();
+                too_dense = true;
+            }
             pairs.add_fields(
                 record.qname(),
                 ContigId::new(u32::try_from(record.tid()).unwrap_or_default()),
@@ -395,32 +447,27 @@ impl AlignmentSource for LocalAlignmentSource {
                 overlap_mask,
             ));
             let normalized_for_modifications = if let Some(builder) = &mut modifications {
-                let normalized = normalize_record(&record, QueryDetail::Full)?;
+                let normalized = normalize_record(&record, QueryDetail::Full, &[])?;
                 builder.add_record(&normalized);
                 Some(normalized)
             } else {
                 None
             };
 
-            let score = sampling_score(&record);
-            if samples.would_retain(score, stats.records_seen) {
-                samples.insert(
-                    score,
-                    stats.records_seen,
-                    match normalized_for_modifications {
-                        // Modification rendering, export, inspection, and MCP
-                        // discovery must all observe the same retained record.
-                        // The summary already paid the cost to normalize the
-                        // full record, so do not discard its sequence/tags at
-                        // Regional or Overview detail.
-                        Some(normalized) => normalized,
-                        None => normalize_record(&record, options.detail)?,
-                    },
-                );
+            if !too_dense {
+                retained.push(match normalized_for_modifications {
+                    // Modification rendering, export, inspection, and MCP
+                    // discovery must all observe the same complete record set.
+                    // The summary already paid the cost to normalize the full
+                    // record, so do not discard its sequence/tags.
+                    Some(normalized) => normalized,
+                    None => {
+                        normalize_record(&record, options.detail, &options.retained_auxiliary_tags)?
+                    }
+                });
             }
         }
 
-        let mut retained = samples.into_values();
         retained.sort_by(|left, right| {
             (left.start, left.end, &left.read_name).cmp(&(right.start, right.end, &right.read_name))
         });
@@ -429,7 +476,14 @@ impl AlignmentSource for LocalAlignmentSource {
             batch.push(record).map_err(AlignmentError::BatchOverflow)?;
         }
         stats.records_emitted = retained.len();
-        stats.truncated = stats.records_eligible > stats.records_emitted;
+        stats.truncated = too_dense;
+        stats.individual_reads = if too_dense {
+            IndividualReadStatus::TooDense {
+                limit: maximum_records,
+            }
+        } else {
+            IndividualReadStatus::Complete
+        };
         let mut pileup = pileup.finish(PileupProvenance {
             eligible_records: stats.records_eligible,
             rendered_records: stats.records_emitted,
@@ -474,22 +528,6 @@ fn cancelled_query(
             ..QueryStats::default()
         },
     }
-}
-
-fn sampling_score(record: &bam::Record) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in record
-        .qname()
-        .iter()
-        .copied()
-        .chain(record.tid().to_le_bytes())
-        .chain(record.pos().to_le_bytes())
-        .chain(record.flags().to_le_bytes())
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 fn add_record_pileup(
@@ -603,6 +641,7 @@ fn htslib_junction_strand(record: &bam::Record) -> JunctionStrandInput {
 fn normalize_record(
     record: &bam::Record,
     detail: QueryDetail,
+    retained_auxiliary_tags: &[[u8; 2]],
 ) -> Result<AlignmentRecord, AlignmentError> {
     use rust_htslib::bam::record::Cigar;
 
@@ -640,16 +679,25 @@ fn normalize_record(
             qualities,
         }
     };
-    let auxiliary_fields = if detail == QueryDetail::Full {
+    let auxiliary_fields = if detail == QueryDetail::Full || !retained_auxiliary_tags.is_empty() {
         record
             .aux_iter()
             .map(|result| {
                 let (tag, value) = result?;
                 let tag: [u8; 2] = tag.try_into().map_err(|_| AlignmentError::InvalidAuxTag)?;
-                Ok(AuxField {
-                    tag,
-                    value: normalize_aux(value),
-                })
+                Ok((tag, value))
+            })
+            .filter_map(|result| match result {
+                Ok((tag, value))
+                    if detail == QueryDetail::Full || retained_auxiliary_tags.contains(&tag) =>
+                {
+                    Some(Ok(AuxField {
+                        tag,
+                        value: normalize_aux(value),
+                    }))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
             })
             .collect::<Result<Vec<_>, AlignmentError>>()?
     } else {
@@ -800,6 +848,45 @@ mod tests {
     }
 
     #[test]
+    fn layout_detail_retains_only_row_policy_payload() {
+        use rust_htslib::bam::record::{Cigar, CigarString};
+
+        let mut record = bam::Record::new();
+        record.set(
+            b"layout-policy",
+            Some(&CigarString(vec![Cigar::Equal(4)])),
+            b"ACGT",
+            &[30; 4],
+        );
+        record.set_tid(0);
+        record.set_pos(10);
+        record.push_aux(b"RG", Aux::String("group-a")).unwrap();
+        record.push_aux(b"ZZ", Aux::String("unrelated")).unwrap();
+
+        let layout = normalize_record(&record, QueryDetail::Layout, &[*b"RG"]).unwrap();
+        assert_eq!(layout.sequence, SequenceData::NotLoaded);
+        assert_eq!(layout.auxiliary_fields.len(), 1);
+        assert_eq!(layout.auxiliary_fields[0].tag, *b"RG");
+
+        let sequence = normalize_record(&record, QueryDetail::Sequence, &[*b"RG"]).unwrap();
+        assert!(matches!(sequence.sequence, SequenceData::Present { .. }));
+        assert_eq!(sequence.auxiliary_fields.len(), 1);
+
+        let full = normalize_record(&record, QueryDetail::Full, &[]).unwrap();
+        assert!(matches!(full.sequence, SequenceData::Present { .. }));
+        assert_eq!(full.auxiliary_fields.len(), 2);
+
+        let tagged_options = QueryOptions {
+            retained_auxiliary_tags: vec![*b"RG"],
+            ..QueryOptions::default()
+        };
+        assert_ne!(
+            QueryOptions::default().fingerprint(),
+            tagged_options.fingerprint()
+        );
+    }
+
+    #[test]
     fn query_can_be_cancelled_before_io() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
         if !path.exists() {
@@ -816,6 +903,42 @@ mod tests {
             .unwrap();
         assert!(query.stats.cancelled);
         assert!(query.batch.is_empty());
+    }
+
+    #[test]
+    fn cancellation_after_refusal_never_exposes_provisional_reads_or_complete_aggregates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
+        if !path.exists() {
+            return;
+        }
+        let mut source =
+            LocalAlignmentSource::open(path, &AlignmentOpenOptions::default()).unwrap();
+        let cancellation_checks = AtomicUsize::new(0);
+        let query = source
+            .query(
+                GenomicInterval::new(ContigId::new(0), 9_999, 10_001).unwrap(),
+                QueryOptions {
+                    max_records: NonZeroUsize::new(1).unwrap(),
+                    cancellation_chunk: NonZeroUsize::new(1).unwrap(),
+                    ..QueryOptions::default()
+                },
+                &|| cancellation_checks.fetch_add(1, Ordering::SeqCst) < 3,
+            )
+            .unwrap();
+
+        assert!(query.stats.cancelled);
+        assert_eq!(query.stats.records_eligible, 2);
+        assert_eq!(query.stats.records_emitted, 0);
+        assert_eq!(
+            query.stats.individual_reads,
+            IndividualReadStatus::TooDense { limit: 1 }
+        );
+        assert!(query.batch.is_empty());
+        assert!(!query.pileup.provenance.all_eligible_records);
+        assert!(!query.junctions.provenance.all_eligible_records);
+        assert!(!query.pairs.all_eligible_records);
     }
 
     #[test]
@@ -897,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn pair_summary_uses_all_eligible_templates_before_display_sampling() {
+    fn pair_summary_remains_complete_when_individual_reads_are_refused() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
         if !path.exists() {
             return;
@@ -917,14 +1040,19 @@ mod tests {
                 )
                 .unwrap()
         };
-        let sampled = query(1);
+        let refused = query(1);
         let complete = query(50_000);
-        assert!(sampled.stats.truncated);
-        assert_eq!(sampled.pairs, complete.pairs);
-        assert!(sampled.pairs.eligible_proper_templates >= 100);
-        assert_eq!(sampled.pairs.median_template_length, Some(166));
+        assert_eq!(refused.batch.len(), 0);
+        assert_eq!(refused.stats.records_emitted, 0);
+        assert!(matches!(
+            refused.stats.individual_reads,
+            IndividualReadStatus::TooDense { limit: 1 }
+        ));
+        assert_eq!(refused.pairs, complete.pairs);
+        assert!(refused.pairs.eligible_proper_templates >= 100);
+        assert_eq!(refused.pairs.median_template_length, Some(166));
         assert_eq!(
-            sampled.pairs.inferred_bounds,
+            refused.pairs.inferred_bounds,
             Some(crate::TemplateLengthBounds {
                 minimum: Some(166),
                 maximum: Some(166),
@@ -1011,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_mate_policy_collapses_the_right_end_before_sampling() {
+    fn overlapping_mate_policy_collapses_the_right_end_before_read_admission() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
         if !path.exists() {
             return;
@@ -1050,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn modification_summary_is_independent_of_visible_sampling() {
+    fn modification_summary_remains_complete_when_individual_reads_are_refused() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
         if !path.exists() {
             return;
@@ -1072,18 +1200,19 @@ mod tests {
                 )
                 .unwrap()
         };
-        let sampled = query(1);
+        let refused = query(1);
         let complete = query(50_000);
-        assert!(sampled.stats.truncated);
-        assert_eq!(sampled.pileup.modifications, complete.pileup.modifications);
+        assert!(refused.stats.truncated);
+        assert!(refused.batch.is_empty());
+        assert_eq!(refused.pileup.modifications, complete.pileup.modifications);
         assert_eq!(
-            sampled.pileup.modifications.provenance.eligible_records,
-            sampled.stats.records_eligible
+            refused.pileup.modifications.provenance.eligible_records,
+            refused.stats.records_eligible
         );
     }
 
     #[test]
-    fn junction_summary_is_complete_and_independent_of_visible_sampling() {
+    fn junction_summary_remains_complete_when_individual_reads_are_refused() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
         if !path.exists() {
             return;
@@ -1103,35 +1232,36 @@ mod tests {
                 )
                 .unwrap()
         };
-        let sampled = query(1);
+        let refused = query(1);
         let complete = query(50_000);
-        assert!(sampled.stats.truncated);
-        assert_eq!(sampled.junctions, complete.junctions);
-        assert_eq!(sampled.junctions.junctions.len(), 10_000);
-        assert_eq!(sampled.junctions.provenance.spliced_records, 10_000);
+        assert!(refused.stats.truncated);
+        assert!(refused.batch.is_empty());
+        assert_eq!(refused.junctions, complete.junctions);
+        assert_eq!(refused.junctions.junctions.len(), 10_000);
+        assert_eq!(refused.junctions.provenance.spliced_records, 10_000);
         assert_eq!(
-            sampled.junctions.provenance.supporting_spliced_records,
+            refused.junctions.provenance.supporting_spliced_records,
             10_000
         );
         assert_eq!(
-            sampled.junctions.provenance.junction_observations_retained,
+            refused.junctions.provenance.junction_observations_retained,
             10_000
         );
         assert_eq!(
-            sampled.junctions.provenance.normalization_mapped_records,
+            refused.junctions.provenance.normalization_mapped_records,
             Some(282_017)
         );
-        assert_eq!(sampled.junctions.provenance.xs_tagged_observations, 5_000);
+        assert_eq!(refused.junctions.provenance.xs_tagged_observations, 5_000);
         assert_eq!(
-            sampled
+            refused
                 .junctions
                 .provenance
                 .alignment_strand_fallback_observations,
             2_500
         );
-        assert_eq!(sampled.junctions.provenance.invalid_xs_observations, 2_500);
+        assert_eq!(refused.junctions.provenance.invalid_xs_observations, 2_500);
         assert_eq!(
-            sampled
+            refused
                 .junctions
                 .junctions
                 .iter()
@@ -1140,7 +1270,7 @@ mod tests {
             5_000
         );
         assert_eq!(
-            sampled
+            refused
                 .junctions
                 .junctions
                 .iter()
@@ -1149,7 +1279,7 @@ mod tests {
             2_500
         );
         assert_eq!(
-            sampled
+            refused
                 .junctions
                 .junctions
                 .iter()
@@ -1157,7 +1287,7 @@ mod tests {
                 .sum::<u32>(),
             2_500
         );
-        assert!(sampled.junctions.provenance.all_eligible_records);
+        assert!(refused.junctions.provenance.all_eligible_records);
 
         let mut source =
             LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
@@ -1184,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn variant_truth_pileup_is_exact_and_independent_of_visible_sampling() {
+    fn variant_truth_pileup_is_exact_when_individual_reads_are_refused() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
         if !path.exists() {
             return;
@@ -1208,19 +1338,20 @@ mod tests {
                 .unwrap()
         };
 
-        let sampled = query(1);
+        let refused = query(1);
         let complete = query(1_000);
-        assert_eq!(sampled.stats.records_eligible, 13);
-        assert_eq!(sampled.stats.records_emitted, 1);
-        assert!(sampled.stats.truncated);
-        assert_eq!(sampled.pileup.bins, complete.pileup.bins);
-        assert_eq!(sampled.pileup.provenance.eligible_records, 13);
-        assert_eq!(sampled.pileup.provenance.rendered_records, 1);
-        assert!(sampled.pileup.provenance.all_eligible_records);
+        assert_eq!(refused.stats.records_eligible, 13);
+        assert_eq!(refused.stats.records_emitted, 0);
+        assert!(refused.stats.truncated);
+        assert!(refused.batch.is_empty());
+        assert_eq!(refused.pileup.bins, complete.pileup.bins);
+        assert_eq!(refused.pileup.provenance.eligible_records, 13);
+        assert_eq!(refused.pileup.provenance.rendered_records, 0);
+        assert!(refused.pileup.provenance.all_eligible_records);
 
-        let (_, insertion_anchor) = sampled.pileup.bin_at(interval, 9_999).unwrap();
+        let (_, insertion_anchor) = refused.pileup.bin_at(interval, 9_999).unwrap();
         assert_eq!(insertion_anchor.alleles.insertion, 4);
-        let (_, variant) = sampled.pileup.bin_at(interval, 10_000).unwrap();
+        let (_, variant) = refused.pileup.bin_at(interval, 10_000).unwrap();
         assert_eq!(variant.depth, 8);
         assert_eq!(variant.alleles.a, 7);
         assert_eq!(variant.alleles.c, 1);
@@ -1232,6 +1363,52 @@ mod tests {
         assert_eq!(variant.reverse_depth, 0);
         assert_eq!(variant.mean_base_quality(), Some(40.0));
         assert_eq!(variant.mean_mapping_quality(), Some(60.0));
+    }
+
+    #[test]
+    fn complete_read_limit_is_all_or_nothing_at_the_exact_boundary() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
+        if !path.exists() {
+            return;
+        }
+        let interval = GenomicInterval::new(ContigId::new(0), 9_999, 10_001).unwrap();
+        let query = |maximum_records| {
+            let mut source =
+                LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+            source
+                .query(
+                    interval,
+                    QueryOptions {
+                        max_records: NonZeroUsize::new(maximum_records).unwrap(),
+                        coverage_bins: NonZeroUsize::new(2).unwrap(),
+                        collect_alleles: true,
+                        ..QueryOptions::default()
+                    },
+                    &|| true,
+                )
+                .unwrap()
+        };
+
+        let exact = query(13);
+        assert_eq!(exact.stats.records_eligible, 13);
+        assert_eq!(exact.stats.records_emitted, 13);
+        assert_eq!(exact.stats.complete_read_limit, 13);
+        assert_eq!(exact.stats.individual_reads, IndividualReadStatus::Complete);
+        assert_eq!(exact.batch.len(), 13);
+        assert!(!exact.stats.truncated);
+
+        let over = query(12);
+        assert_eq!(over.stats.records_eligible, 13);
+        assert_eq!(over.stats.records_emitted, 0);
+        assert_eq!(over.stats.complete_read_limit, 12);
+        assert_eq!(
+            over.stats.individual_reads,
+            IndividualReadStatus::TooDense { limit: 12 }
+        );
+        assert!(over.batch.is_empty());
+        assert!(over.stats.truncated);
+        assert_eq!(over.pileup.bins, exact.pileup.bins);
+        assert!(over.pileup.provenance.all_eligible_records);
     }
 
     #[test]

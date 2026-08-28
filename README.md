@@ -15,8 +15,11 @@ The current native prototype supports:
   reference track, and bounded off-thread sequence fetching; the same FASTA also configures CRAM.
 - All CIGAR operations, secondary/supplementary reads, arbitrary auxiliary fields, and missing
   sequence/quality states in the normalized alignment model.
-- Full-query coverage with deterministic, bounded 50-base-window sampling at deep loci so nearby
-  navigation does not reshuffle reads already in view.
+- Complete-or-refuse individual reads with a configurable workspace ceiling: a viewport either
+  presents every eligible read or asks the user to zoom in or raise the limit; reads are never
+  sampled or partially presented.
+- Transactional pan/zoom previews retain orientation while coalesced exact queries settle, then
+  switch atomically without fading; preview pixels are never exposed as current evidence.
 - CPU read packing and instanced GPU rendering for coverage and CIGAR geometry.
 - Generation-based cancellation so stale queries never replace a newer viewport.
 - Reference bases, quality-aware mismatches, mate links, `MM`/`ML` overlays, picking, and a read

@@ -1,6 +1,7 @@
 use egui::Context;
 
 use super::super::*;
+use crate::display::alignment;
 
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticsSnapshot {
@@ -13,6 +14,7 @@ pub struct DiagnosticsSnapshot {
     pub remote: Option<String>,
     pub layout_cache: String,
     pub gpu_upload: String,
+    pub navigation: String,
     pub interaction: Option<String>,
 }
 
@@ -67,25 +69,45 @@ impl Viewer {
                 match &track.lifecycle {
                     AlignmentTrackLifecycle::Opening => "opening".to_owned(),
                     AlignmentTrackLifecycle::Ready
-                        if projection.is_some_and(|projection| projection.pending_query) =>
+                        if projection.is_some_and(AlignmentPanelProjection::query_is_checking) =>
                     {
-                        "loading".to_owned()
+                        "checking".to_owned()
                     }
                     AlignmentTrackLifecycle::Ready => "ready".to_owned(),
                     AlignmentTrackLifecycle::Failed(message) => format!("failed: {message}"),
                 }
             };
-            let records = projection
-                .and_then(|projection| projection.current_query.as_ref())
-                .map_or_else(
-                    || "no result".to_owned(),
-                    |query| {
-                        format!(
-                            "{}/{} records",
-                            query.stats.records_emitted, query.stats.records_eligible
-                        )
-                    },
-                );
+            let records = projection.map_or_else(
+                || "no result".to_owned(),
+                |projection| {
+                    if projection.query_is_checking() {
+                        return "checking current viewport".to_owned();
+                    }
+                    let Some(query) = projection.current_query.as_deref() else {
+                        return "no result".to_owned();
+                    };
+                    let layout_query = projection.layout_query.as_deref().unwrap_or(query);
+                    alignment::individual_read_refusal(
+                        query,
+                        layout_query,
+                        track.config.filters.read_stacking_mode,
+                    )
+                    .map_or_else(
+                        || {
+                            format!(
+                                "complete · {} records · limit {}",
+                                query.stats.records_eligible, query.stats.complete_read_limit
+                            )
+                        },
+                        |refusal| {
+                            format!(
+                                "too dense · {} eligible · limit {} · 0 individual records",
+                                refusal.eligible_records, refusal.limit
+                            )
+                        },
+                    )
+                },
+            );
             let cache = track.cache_stats.map_or_else(
                 || "cache n/a".to_owned(),
                 |stats| format!("cache {} MiB", stats.resident_weight / (1024 * 1024)),
@@ -98,6 +120,22 @@ impl Viewer {
 
         let layout_cache = self.layout_cache.stats();
         let upload = self.rectangle_renderer.last_prepare_stats();
+        let navigation_preview = self.navigation_preview_renderer.stats();
+        let navigation_counters = self.panels.iter().fold([0_u64; 10], |mut counters, panel| {
+            let schedule = &panel.navigation_query_schedule;
+            counters[0] = counters[0].saturating_add(schedule.input_updates);
+            counters[1] = counters[1].saturating_add(schedule.coalesced_updates);
+            counters[2] = counters[2].saturating_add(schedule.dispatched_targets);
+            counters[3] = counters[3].saturating_add(schedule.gesture_end_dispatches);
+            counters[4] = counters[4].saturating_add(schedule.cancelled_targets);
+            counters[5] = counters[5].saturating_add(schedule.committed_targets);
+            counters[6] = counters[6].saturating_add(schedule.preview_frames);
+            counters[7] = counters[7].saturating_add(schedule.neutral_frames_after_commit);
+            counters[8] = counters[8].max(schedule.last_transaction_preview_frames);
+            counters[9] = counters[9].max(schedule.last_commit_micros);
+            counters
+        });
+        let diagnostic_now = Instant::now();
         DiagnosticsSnapshot {
             frame: format!(
                 "{:.2} ms · {:.0} FPS",
@@ -106,7 +144,7 @@ impl Viewer {
             ),
             workspace: (!self.alignment_tracks.is_empty()).then(|| {
                 format!(
-                    "{} alignment tracks · {} visible · {} record ceiling",
+                    "{} alignment tracks · {} visible · {} complete-read ceiling",
                     self.alignment_tracks.len(),
                     self.alignment_tracks
                         .iter()
@@ -133,13 +171,49 @@ impl Viewer {
                 .panels
                 .iter()
                 .map(|panel| {
+                    let source = panel
+                        .navigation_presentation
+                        .source
+                        .as_ref()
+                        .map(|source| {
+                            format!(
+                                " · source {}:{}-{}@{}",
+                                panel.contig_name,
+                                source.interval.start().saturating_add(1),
+                                source.interval.end(),
+                                source.generation,
+                            )
+                        })
+                        .unwrap_or_default();
+                    let transaction = if panel.navigation_presentation.is_unsettled() {
+                        format!(
+                            " · target @{} · {} ms · {}",
+                            panel.navigation_presentation.target_generation,
+                            panel
+                                .navigation_presentation
+                                .age(diagnostic_now)
+                                .as_millis(),
+                            panel
+                                .navigation_presentation
+                                .preview_kind
+                                .map_or("neutral", NavigationPreviewKind::label),
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let invalidation = panel
+                        .navigation_presentation
+                        .invalidation_reason
+                        .as_deref()
+                        .map_or_else(String::new, |reason| format!(" · invalidated: {reason}"));
                     format!(
-                        "panel {} · {}:{}-{} · generation {}{}",
+                        "panel {} · {}:{}-{} · generation {} · {:?}{source}{transaction}{invalidation}{}",
                         panel.id.get(),
                         panel.contig_name,
                         panel.viewport.interval().start().saturating_add(1),
                         panel.viewport.interval().end(),
                         panel.generation_clock.current().get(),
+                        panel.navigation_presentation.phase,
                         if panel.id == active_panel_id {
                             " · active"
                         } else {
@@ -178,9 +252,37 @@ impl Viewer {
                 layout_cache.misses
             ),
             gpu_upload: format!(
-                "GPU upload {} KiB{}",
+                "GPU upload {} KiB{} · preview {}x{} px @ {:.2}x · {} MiB · {} captures / {} composites / {} invalidations / {} fallbacks · horizon {} checks / {} hits / {} misses / {} budget fallbacks · {} µs / {} rectangles",
                 upload.uploaded_bytes / 1024,
-                if upload.truncated { " · capped" } else { "" }
+                if upload.truncated { " · capped" } else { "" },
+                navigation_preview.width,
+                navigation_preview.height,
+                self.window.scale_factor(),
+                navigation_preview.allocated_bytes / (1024 * 1024),
+                navigation_preview.texture_captures,
+                navigation_preview.texture_composites,
+                navigation_preview.texture_invalidations,
+                navigation_preview.texture_fallbacks,
+                self.navigation_horizon_preview_stats.eligibility_checks,
+                self.navigation_horizon_preview_stats.hits,
+                self.navigation_horizon_preview_stats.misses,
+                self.navigation_horizon_preview_stats.budget_fallbacks,
+                self.navigation_horizon_preview_stats.last_build_micros,
+                self.navigation_horizon_preview_stats.last_rectangle_count,
+            ),
+            navigation: format!(
+                "navigation {} inputs / {} coalesced / {} dispatched / {} release-dispatched / {} cancelled / {} committed · {} preview frames / {} neutral-after-commit · last {} frames / {:.2} ms · {} stale results rejected",
+                navigation_counters[0],
+                navigation_counters[1],
+                navigation_counters[2],
+                navigation_counters[3],
+                navigation_counters[4],
+                navigation_counters[5],
+                navigation_counters[6],
+                navigation_counters[7],
+                navigation_counters[8],
+                navigation_counters[9] as f64 / 1_000.0,
+                self.navigation_stale_result_rejections,
             ),
             interaction: self.interaction_trace.snapshot().map(|trace| {
                 let maximum = trace
@@ -234,6 +336,7 @@ pub fn show_diagnostics(context: &Context, open: &mut bool, snapshot: &Diagnosti
             }
             ui.monospace(&snapshot.layout_cache);
             ui.monospace(&snapshot.gpu_upload);
+            ui.monospace(&snapshot.navigation);
             if let Some(interaction) = &snapshot.interaction {
                 ui.monospace(interaction);
             }

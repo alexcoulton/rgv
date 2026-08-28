@@ -171,3 +171,34 @@ pub(crate) fn reconcile_vertical_scroll(
     };
     (scroll, retained_fraction)
 }
+
+pub(crate) fn capture_stable_row_camera(
+    effective_scroll: f32,
+    row_height: f32,
+    layout_revision: u64,
+) -> Option<StableRowCameraAnchor> {
+    if !effective_scroll.is_finite() || !row_height.is_finite() || row_height <= f32::EPSILON {
+        return None;
+    }
+    let row_position = effective_scroll.max(0.0) / row_height;
+    let row = row_position.floor() as usize;
+    Some(StableRowCameraAnchor {
+        row,
+        offset_fraction: (row_position - row as f32).clamp(0.0, 1.0),
+        layout_revision,
+        row_height,
+    })
+}
+
+pub(crate) fn reproject_stable_row_camera(
+    anchor: StableRowCameraAnchor,
+    row_height: f32,
+    layout_revision: u64,
+) -> Option<f32> {
+    if anchor.layout_revision == layout_revision
+        && (anchor.row_height - row_height).abs() <= f32::EPSILON
+    {
+        return None;
+    }
+    Some((anchor.row as f32 + anchor.offset_fraction) * row_height)
+}

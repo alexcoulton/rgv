@@ -58,6 +58,50 @@ pub(crate) fn index_only_read_display(
     display
 }
 
+/// Non-interactive read-pane status used while no current query may be
+/// presented. It intentionally owns no object IDs, so Checking, failure, and
+/// unavailable states cannot expose stale read interaction.
+pub(crate) fn read_state_display(
+    width: f32,
+    top: f32,
+    bottom: f32,
+    message: impl Into<String>,
+) -> DisplayList {
+    let mut display = DisplayList::default();
+    let notice_top = top + 5.0;
+    let notice_height = 32.0_f32.min((bottom - notice_top - 5.0).max(0.0));
+    let notice_width = (width - 24.0).max(0.0);
+    if notice_width <= 0.0 || notice_height <= 0.0 {
+        return display;
+    }
+    display.rectangles.push(RectPrimitive {
+        x: 12.0,
+        y: notice_top,
+        width: notice_width,
+        height: notice_height,
+        color: Rgba::new(0.94, 0.95, 0.97, 0.96),
+        object_id: 0,
+        shape: Default::default(),
+    });
+    display.rectangles.push(RectPrimitive {
+        x: 12.0,
+        y: notice_top,
+        width: 3.0_f32.min(notice_width),
+        height: notice_height,
+        color: Rgba::new(0.43, 0.49, 0.59, 0.90),
+        object_id: 0,
+        shape: Default::default(),
+    });
+    display.texts.push(rgv_layout::TextPrimitive {
+        x: width * 0.5,
+        y: notice_top + notice_height * 0.5,
+        text: message.into(),
+        font_size: 12.0,
+        color: Rgba::new(0.27, 0.30, 0.36, 1.0),
+    });
+    display
+}
+
 pub(crate) fn apply_alignment_annotation_height(
     options: &mut AlignmentLayoutOptions,
     frame_top: f32,
@@ -310,7 +354,14 @@ pub(crate) fn secondary_alignment_track_layout(
     shared_sashimi_raw: Option<f64>,
     shared_sashimi_cpm: Option<f64>,
     junction_annotations: &JunctionAnnotationLookup,
+    navigation_intervals: &[GenomicInterval],
 ) -> (Option<Arc<AlignmentLayout>>, TrackFrame, Option<TrackFrame>) {
+    if track.config.filters.alignment_sort_mode == AlignmentSortMode::Base
+        && track.config.filters.alignment_sort_anchor.is_none()
+    {
+        track.config.filters.alignment_sort_anchor =
+            alignment_sort_position(AlignmentSortMode::Base, None, viewport);
+    }
     let config = track.config.clone();
     let lifecycle = track.lifecycle.clone();
     let active_filters = track.active_filters.clone();
@@ -325,16 +376,24 @@ pub(crate) fn secondary_alignment_track_layout(
         .as_ref()
         .and_then(|dictionary| interval_for_track(dictionary, contig_name, viewport.interval()));
     let projection = track.projection_mut(panel_id);
+    projection
+        .row_history
+        .pin_navigation_intervals(navigation_intervals);
     // Select overview presentation from the current viewport immediately.
     // A regional query may remain retained until query dispatch settles, but
     // rendering it here would expose a stale count for the previous interval.
     let index_only_overview =
         projection.index_only_overview || viewport.detail_level() == DetailLevel::Overview;
     let Some(query) = projection.current_query.clone().filter(|query| {
-        !index_only_overview
+        projection.query_is_current()
+            && !index_only_overview
             && expected_interval
                 .is_some_and(|interval| retained_data_overlaps(query.interval, interval))
     }) else {
+        // Query-local geometry from the previous generation must not remain
+        // available to CPU picking while the neutral Checking state is shown.
+        projection.alignment_rows = None;
+        projection.cached_layout = None;
         if index_only_overview {
             frame_bottom = frame_top + 48.0;
         }
@@ -345,7 +404,10 @@ pub(crate) fn secondary_alignment_track_layout(
         } else {
             match &lifecycle {
                 AlignmentTrackLifecycle::Opening => "Opening…".to_owned(),
-                AlignmentTrackLifecycle::Ready => "Loading locus…".to_owned(),
+                AlignmentTrackLifecycle::Ready if projection.checking_notice_visible => {
+                    "Checking current viewport for complete reads…".to_owned()
+                }
+                AlignmentTrackLifecycle::Ready => String::new(),
                 AlignmentTrackLifecycle::Failed(message) => format!("Error: {message}"),
             }
         };
@@ -374,8 +436,13 @@ pub(crate) fn secondary_alignment_track_layout(
             None,
         );
     };
+    let layout_query = projection
+        .layout_query
+        .clone()
+        .unwrap_or_else(|| Arc::clone(&query));
 
     let filters = &config.filters;
+    let read_refusal = individual_read_refusal(&query, &layout_query, filters.read_stacking_mode);
     let density = read_density;
     let annotation_lane_heights = alignment_annotation_lane_heights(filters);
     let content_top = frame_top + 22.0;
@@ -431,6 +498,7 @@ pub(crate) fn secondary_alignment_track_layout(
     }
     let annotation_context_bottom = lane_top.max(frame_top + 22.0);
     options.show_reads = read_content_visible;
+    options.read_refusal = read_refusal;
     options.reads_top = read_frame_top + if read_content_visible { 22.0 } else { 0.0 };
     options.row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
     options.read_height = (5.0 * density).clamp(1.5, (options.row_height - 1.0).max(1.5));
@@ -445,11 +513,16 @@ pub(crate) fn secondary_alignment_track_layout(
     options.group_order = filters.alignment_group_order;
     options.sort_mode = filters.alignment_sort_mode;
     options.sort_order = filters.alignment_sort_order;
-    options.sort_position = alignment_sort_position(filters.alignment_sort_mode, viewport);
+    options.sort_position = alignment_sort_position(
+        filters.alignment_sort_mode,
+        filters.alignment_sort_anchor,
+        viewport,
+    );
     options.promoted_read_name_hash = promoted_read_name_hash;
     options.selected_chain_read_name_hash = selected_read_name_hash.or(promoted_read_name_hash);
     options.view_as_pairs = filters.view_as_pairs;
-    options.pair_length_bounds = effective_template_length_bounds_for_filters(filters, &query);
+    let observed_pair_bounds = effective_template_length_bounds_for_filters(filters, &layout_query);
+    options.pair_length_bounds = projection.row_policy_pair_bounds(filters, observed_pair_bounds);
     options.minimum_allele_fraction = filters.minimum_allele_fraction;
     options.quality_weighted_alleles = filters.quality_weighted_alleles;
     options.show_coverage_center_line = filters.show_coverage_center_line;
@@ -468,14 +541,15 @@ pub(crate) fn secondary_alignment_track_layout(
     ) {
         *slot = Some(code);
     }
-    // The query safety cap already bounds retained records. Every BAM in the
-    // sample's read panel must give each retained record a row opportunity; the
+    // Complete admission already bounds retained records. Every BAM in the
+    // track's read panel must give each complete record a row opportunity; the
     // pane scrollbar, rather than an annotation-track height, limits what is
     // visible at once.
-    options.max_rows = query.batch.len().max(1);
+    options.max_rows = query.batch.len().max(layout_query.batch.len()).max(1);
 
     let rows_match = projection.alignment_rows.as_ref().is_some_and(|cached| {
         Arc::ptr_eq(&cached.query, &query)
+            && Arc::ptr_eq(&cached.layout_query, &layout_query)
             && cached.group_mode == options.group_mode
             && cached.group_order == options.group_order
             && cached.sort_mode == options.sort_mode
@@ -484,25 +558,32 @@ pub(crate) fn secondary_alignment_track_layout(
             && cached.promoted_read_name_hash == options.promoted_read_name_hash
             && cached.max_rows == options.max_rows
             && cached.view_as_pairs == options.view_as_pairs
-            && cached.pair_length_bounds == options.pair_length_bounds
+            && cached.stacking_mode == filters.read_stacking_mode
+            && (!alignment_row_pair_bounds_relevant(options.group_mode, options.sort_mode)
+                || cached.pair_length_bounds == options.pair_length_bounds)
     });
-    if !rows_match {
-        let previous = projection.alignment_rows.as_ref().and_then(|cached| {
-            (cached.group_mode == options.group_mode
-                && cached.group_order == options.group_order
-                && cached.sort_mode == options.sort_mode
-                && cached.sort_order == options.sort_order
-                && cached.sort_position == options.sort_position
-                && cached.promoted_read_name_hash == options.promoted_read_name_hash
-                && cached.max_rows == options.max_rows
-                && cached.view_as_pairs == options.view_as_pairs
-                && cached.pair_length_bounds == options.pair_length_bounds)
-                .then_some(cached.layout.as_ref())
-        });
-        let layout = Arc::new(assign_alignment_rows(&query, options, previous));
+    if !rows_match || projection.pending_row_repack {
+        let repack = std::mem::take(&mut projection.pending_row_repack)
+            && filters.read_stacking_mode == ReadStackingMode::Stable;
+        let (layout, reconciliation) = if read_refusal.is_some() {
+            (
+                assign_alignment_rows(&query, options, None),
+                AlignmentRowReconciliationStats::default(),
+            )
+        } else {
+            reconcile_alignment_rows_with_horizon(
+                &query,
+                &layout_query,
+                options,
+                &mut projection.row_history,
+                filters.read_stacking_mode,
+                repack,
+            )
+        };
         projection.alignment_rows = Some(CachedAlignmentRows {
             query: Arc::clone(&query),
-            layout,
+            layout_query: Arc::clone(&layout_query),
+            layout: Arc::new(layout),
             group_mode: options.group_mode,
             group_order: options.group_order,
             sort_mode: options.sort_mode,
@@ -512,9 +593,15 @@ pub(crate) fn secondary_alignment_track_layout(
             max_rows: options.max_rows,
             view_as_pairs: options.view_as_pairs,
             pair_length_bounds: options.pair_length_bounds,
+            stacking_mode: filters.read_stacking_mode,
+            reconciliation,
         });
         projection.cached_layout = None;
     }
+    options.row_layout_revision = projection
+        .alignment_rows
+        .as_ref()
+        .map_or(0, |cached| cached.reconciliation.revision);
     let key = alignment_layout_key(
         PanelTrackId::new(panel_id, config.id),
         Some(&config.source),
@@ -604,28 +691,26 @@ pub(crate) fn secondary_alignment_track_layout(
     }
     if options.show_reads {
         let overview = viewport.detail_level() == DetailLevel::Overview;
-        let mut read_details = if overview {
+        let mut read_details = if let Some(refusal) = read_refusal {
+            vec![read_refusal_detail(refusal)]
+        } else if overview {
             vec![overview_read_detail(
                 query.stats.records_eligible,
                 query.stats.cancelled,
             )]
         } else {
             vec![format!(
-                "{} visible · {} loaded",
+                "{} rendered · {} complete reads",
                 layout.stats.rendered_alignments, query.stats.records_emitted,
             )]
         };
-        if query.stats.truncated && !overview {
-            read_details.push(format!(
-                "safety cap: {}/{} loaded",
-                query.stats.records_emitted, query.stats.records_eligible
-            ));
-        }
         read_details.extend(filtered_read_details(query.stats));
-        if let Some(detail) = regional_insertion_detail(layout.stats) {
-            read_details.push(detail);
+        if read_refusal.is_none() {
+            if let Some(detail) = regional_insertion_detail(layout.stats) {
+                read_details.push(detail);
+            }
+            read_details.push(row_occupancy_detail(layout.stats));
         }
-        read_details.push(row_occupancy_detail(layout.stats));
         if layout.stats.bisulfite_marks_omitted > 0 {
             read_details.push(format!(
                 "{} bisulfite marks omitted at display cap",
@@ -786,6 +871,41 @@ pub(crate) fn secondary_alignment_track_layout(
     }
 }
 
+pub(crate) fn individual_read_refusal(
+    query: &AlignmentQuery,
+    layout_query: &AlignmentQuery,
+    stacking_mode: ReadStackingMode,
+) -> Option<IndividualReadRefusal> {
+    if let IndividualReadStatus::TooDense { limit } = query.stats.individual_reads {
+        return Some(IndividualReadRefusal {
+            eligible_records: query.stats.records_eligible,
+            limit,
+            scope: IndividualReadRefusalScope::Foreground,
+        });
+    }
+    if stacking_mode == ReadStackingMode::Stable
+        && let IndividualReadStatus::TooDense { limit } = layout_query.stats.individual_reads
+    {
+        return Some(IndividualReadRefusal {
+            eligible_records: layout_query.stats.records_eligible,
+            limit,
+            scope: IndividualReadRefusalScope::LayoutHorizon,
+        });
+    }
+    None
+}
+
+pub(crate) fn read_refusal_detail(refusal: IndividualReadRefusal) -> String {
+    let scope = match refusal.scope {
+        IndividualReadRefusalScope::Foreground => "eligible reads",
+        IndividualReadRefusalScope::LayoutHorizon => "stable-horizon reads",
+    };
+    format!(
+        "complete reads unavailable: {} {scope} exceed limit {} · zoom in or raise the limit",
+        refusal.eligible_records, refusal.limit
+    )
+}
+
 pub(crate) fn overview_read_detail(count: usize, cancelled: bool) -> String {
     if cancelled {
         if count == 0 {
@@ -917,6 +1037,15 @@ pub(crate) fn alignment_layout_key(
         layout_bytes.extend_from_slice(&value.to_bits().to_le_bytes());
     }
     layout_bytes.extend_from_slice(&options.max_rows.to_le_bytes());
+    layout_bytes.extend_from_slice(&options.row_layout_revision.to_le_bytes());
+    if let Some(refusal) = options.read_refusal {
+        layout_bytes.push(1);
+        layout_bytes.extend_from_slice(&refusal.eligible_records.to_le_bytes());
+        layout_bytes.extend_from_slice(&refusal.limit.to_le_bytes());
+        layout_bytes.push(refusal.scope as u8);
+    } else {
+        layout_bytes.push(0);
+    }
     layout_bytes.push(options.group_order as u8);
     layout_bytes.push(options.sort_order as u8);
     layout_bytes.extend_from_slice(&options.sort_position.unwrap_or(u64::MAX).to_le_bytes());

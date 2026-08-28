@@ -1,4 +1,5 @@
 pub(crate) mod auxiliary;
+pub(crate) mod document;
 pub(crate) mod inspector_controller;
 pub(crate) mod model;
 pub(crate) mod navigation;

@@ -34,11 +34,9 @@ use control_service::{ControlRequest, ControlService, ControlStatusMetadata, rea
 use display::reference_bases_label;
 use display::{alignment::*, auxiliary::*, hit_test::*};
 use egui_wgpu::{RendererOptions, ScreenDescriptor};
-use inspection::{auxiliary::*, model::*, read::*, rna::*, variant::*};
+use inspection::{auxiliary::*, document::*, model::*, read::*, rna::*, variant::*};
 use interaction_trace::{InteractionTraceRecorder, InteractionTraceStage};
 use launch::*;
-#[cfg(test)]
-use rgv_core::SessionPaneTrackState;
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,
     AutomationAlignmentSelector, AutomationAlignmentState, AutomationAlignmentTrackSnapshot,
@@ -49,22 +47,22 @@ use rgv_core::{
     AutomationNavigationDestination, AutomationOptionScope, AutomationPaneItemLayoutSnapshot,
     AutomationPaneLayoutSnapshot, AutomationPanelSnapshot, AutomationPresentationCompositeSnapshot,
     AutomationPresentationGroupSnapshot, AutomationPresentationNodeSnapshot,
-    AutomationReadPanelStateSnapshot, AutomationRectSnapshot, AutomationRenderLaneSnapshot,
-    AutomationRenderOmissionReason, AutomationReviewNavigation, AutomationRunReport,
-    AutomationRunTelemetry, AutomationSelection, AutomationSelectionGranularity,
-    AutomationSelectionKind, AutomationSelectionSnapshot, AutomationSetting,
-    AutomationSnapshotFormat, AutomationSnapshotScope, AutomationTrackGestureKind,
-    AutomationTrackGestureSnapshot, AutomationTrackLifecycle, AutomationTrackSnapshot,
-    AutomationUnsavedChangesPolicy, AutomationViewportOperation, AutomationWorkspaceLayoutSnapshot,
-    AutomationWorkspacePanelLayoutSnapshot, AutomationWorkspaceSnapshot, BisulfiteContext,
-    ContigAliases, ContigId, CopyNumberSortLocus, CopyNumberSortMode, CopyNumberTrackSettings,
-    CopyNumberValueMode, CoverageScaleTransform, DesktopSettings, DetailLevel, FeatureDisplayMode,
-    GenerationClock, GeneticCode, GenomeAssembly, GenomeAssemblyIdentity, GenomeConfiguration,
-    GenomicInterval, GenomicSourceFormat, GwasColorMode, GwasTrackSettings, IgvImportReport,
-    InspectorActivation, InteractionDisplayMode, InteractionTrackSettings, JunctionDisplayMode,
-    MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_AUTOMATION_EVIDENCE_FIELDS,
-    MAXIMUM_AUTOMATION_HISTORY_ENTRIES, MAXIMUM_AUTOMATION_LOCI,
-    MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS, MAXIMUM_AUTOSAVE_INTERVAL_SECONDS,
+    AutomationReadPanelStateSnapshot, AutomationReadPresentationState, AutomationRectSnapshot,
+    AutomationRenderLaneSnapshot, AutomationRenderOmissionReason, AutomationReviewNavigation,
+    AutomationRunReport, AutomationRunTelemetry, AutomationSelection,
+    AutomationSelectionGranularity, AutomationSelectionKind, AutomationSelectionSnapshot,
+    AutomationSetting, AutomationSnapshotFormat, AutomationSnapshotScope,
+    AutomationTrackGestureKind, AutomationTrackGestureSnapshot, AutomationTrackLifecycle,
+    AutomationTrackSnapshot, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
+    AutomationWorkspaceLayoutSnapshot, AutomationWorkspacePanelLayoutSnapshot,
+    AutomationWorkspaceSnapshot, BisulfiteContext, ContigAliases, ContigId, CopyNumberSortLocus,
+    CopyNumberSortMode, CopyNumberTrackSettings, CopyNumberValueMode, CoverageScaleTransform,
+    DesktopSettings, DetailLevel, FeatureDisplayMode, GenerationClock, GeneticCode, GenomeAssembly,
+    GenomeAssemblyIdentity, GenomeConfiguration, GenomicInterval, GenomicSourceFormat,
+    GwasColorMode, GwasTrackSettings, IgvImportReport, InspectorActivation, InteractionDisplayMode,
+    InteractionTrackSettings, JunctionDisplayMode, MAXIMUM_ALIGNMENT_TRACKS,
+    MAXIMUM_AUTOMATION_EVIDENCE_FIELDS, MAXIMUM_AUTOMATION_HISTORY_ENTRIES,
+    MAXIMUM_AUTOMATION_LOCI, MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS, MAXIMUM_AUTOSAVE_INTERVAL_SECONDS,
     MAXIMUM_AUTOSAVE_RETENTION, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, MAXIMUM_CACHE_BUDGET_MIB,
     MAXIMUM_INTERFACE_SCALE_PERCENT, MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS,
     MAXIMUM_REVIEW_NOTE_BYTES, MAXIMUM_VIEW_PANELS, MINIMUM_AUTOSAVE_INTERVAL_SECONDS,
@@ -73,16 +71,16 @@ use rgv_core::{
     OverlappingMatePolicy, PanelGeneration, PanelId, PanelTrackId, PresentationNodeId,
     QuantitativeArithmetic, QuantitativeDisplayMode, QuantitativeMissingMode,
     QuantitativeScaleMode, QuantitativeScaleTransform, QuantitativeTrackSettings,
-    QuantitativeWindowFunction, ReadBaseDisplayMode, ReferenceDictionary,
+    QuantitativeWindowFunction, ReadBaseDisplayMode, ReadStackingMode, ReferenceDictionary,
     ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus, SampleMetadataTable,
     SashimiCountMode, SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode,
-    SessionAlignmentTrack, SessionDocument, SessionFilters, SessionLocus, SessionReadPanelState,
-    SessionViewPanel, SmrtKineticsMode, TrackChangeSet, TrackCollection, TrackConfig, TrackFormat,
-    TrackId, TrackIntent, TrackKind, TrackSource, UltimaDisplayOptions, UltimaQualityMode,
-    UnresolvedSessionSource, VariantColorMode, VariantFieldComparison, VariantFieldPredicate,
-    VariantFieldScope, VariantGenotypeFilter, VariantGenotypeGrouping, VariantMissingValueRule,
-    VariantTrackSettings, VariantTypeGroup, Viewport, WorkspacePresentation,
-    classify_genomic_source, parse_ucsc_cytobands, resolve_contig_alias,
+    SessionAlignmentTrack, SessionDocument, SessionFilters, SessionLocus, SessionPaneTrackState,
+    SessionReadPanelState, SessionViewPanel, SmrtKineticsMode, TrackChangeSet, TrackCollection,
+    TrackConfig, TrackFormat, TrackId, TrackIntent, TrackKind, TrackSource, UltimaDisplayOptions,
+    UltimaQualityMode, UnresolvedSessionSource, VariantColorMode, VariantFieldComparison,
+    VariantFieldPredicate, VariantFieldScope, VariantGenotypeFilter, VariantGenotypeGrouping,
+    VariantMissingValueRule, VariantTrackSettings, VariantTypeGroup, Viewport,
+    WorkspacePresentation, classify_genomic_source, parse_ucsc_cytobands, resolve_contig_alias,
 };
 use rgv_engine::{
     AlignmentEngine, AlignmentEngineEvent, CacheBudgets, CacheStats, EngineQueueError,
@@ -93,26 +91,33 @@ use rgv_engine::{
 use rgv_hts::{
     AlignedBaseClassification, AlignmentFilter, AlignmentOpenOptions, AlignmentQuery,
     AlignmentRecord, AuxPredicate, AuxValue, CigarOpKind, FastaOpenOptions, HttpRangeConfig,
-    ModificationCode, QUALITY_WEIGHT_SCALE, QueryDetail, QueryOptions, QueryStats, ReferenceSlice,
-    RemoteAuthentication, RemoteIoStats, SequenceData, SupplementarySegment, TemplateLengthBounds,
-    UltimaEventUnavailable, UltimaIndelKind, UltimaQualitySource, UltimaTagOrientation,
-    analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse, classify_aligned_base,
-    decode_modified_bases, decode_supplementary_chain, pair_evidence, smrt_kinetics_series,
-    summarize_bisulfite_record, summarize_sbx_record,
+    IndividualReadStatus, ModificationCode, QUALITY_WEIGHT_SCALE, QueryDetail, QueryOptions,
+    QueryStats, ReferenceSlice, RemoteAuthentication, RemoteIoStats, SequenceData,
+    SupplementarySegment, TemplateLengthBounds, UltimaEventUnavailable, UltimaIndelKind,
+    UltimaQualitySource, UltimaTagOrientation, analyze_ultima_record_with_tag_orientation,
+    bisulfite_strand_is_reverse, classify_aligned_base, decode_modified_bases,
+    decode_supplementary_chain, pair_evidence, smrt_kinetics_series, summarize_bisulfite_record,
+    summarize_sbx_record,
 };
 use rgv_layout::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentLayout, AlignmentLayoutOptions,
-    AlignmentLayoutStats, AlignmentOrderDirection, AlignmentRowLayout, AlignmentSortMode,
-    COPY_NUMBER_HEADER_HEIGHT, DisplayList, JunctionAnnotationLookup, JunctionAnnotationStatus,
-    MAX_HIDDEN_MODIFICATION_CODES, MINIMUM_BASE_GLYPH_PIXEL_WIDTH, MUTATION_HEADER_HEIGHT,
-    QuantitativeRange, RectPrimitive, Rgba, TrackLayoutOptions, alignment_read_name_hash,
-    assign_alignment_rows, compose_quantitative_records, copy_number_sample_order, gwas_point_y,
-    junction_count_value, layout_alignment_query_with_rows_and_annotations, layout_copy_number,
-    layout_features, layout_gwas, layout_interactions, layout_mutations, layout_quantitative,
+    AlignmentLayoutStats, AlignmentOrderDirection, AlignmentRowHistory, AlignmentRowLayout,
+    AlignmentRowReconciliationStats, AlignmentSortMode, COPY_NUMBER_HEADER_HEIGHT, DisplayList,
+    IndividualReadRefusal, IndividualReadRefusalScope, JunctionAnnotationLookup,
+    JunctionAnnotationStatus, MAX_HIDDEN_MODIFICATION_CODES, MINIMUM_BASE_GLYPH_PIXEL_WIDTH,
+    MUTATION_HEADER_HEIGHT, QuantitativeRange, RectPrimitive, Rgba, TrackLayoutOptions,
+    alignment_read_name_hash, assign_alignment_rows, compose_quantitative_records,
+    copy_number_sample_order, gwas_point_y, junction_count_value, layout_alignment_query_with_rows,
+    layout_alignment_query_with_rows_and_annotations, layout_copy_number, layout_features,
+    layout_gwas, layout_interactions, layout_mutations, layout_quantitative,
     layout_reference_slice_oriented, layout_reference_translation, layout_sashimi, layout_variants,
-    modification_code_color, quantitative_data_range, record_object_id, ultima_quality_color,
+    modification_code_color, quantitative_data_range, reconcile_alignment_rows_with_horizon,
+    record_object_id, ultima_quality_color,
 };
-use rgv_render::{PrepareStats, RectangleRenderer, export_png};
+use rgv_render::{
+    NavigationPreviewInstance, NavigationPreviewRenderer, PrepareStats, RectangleRenderer,
+    export_png, navigation_preview_source_uv,
+};
 use runtime::*;
 use sha2::{Digest as _, Sha256};
 use sources::*;
@@ -131,7 +136,8 @@ use winit::{
     window::{CursorGrabMode, Theme, Window, WindowAttributes, WindowId},
 };
 use workspace::{
-    alignments::*, lists::*, navigation::*, panels::*, tracks::replace_panel_track_selection,
+    alignments::*, lists::*, navigation::*, navigation_preview::*, panels::*,
+    tracks::replace_panel_track_selection,
 };
 use workspace_lists::{
     WorkspaceListImport, WorkspaceListKind, import_workspace_list, region_bed_export,
@@ -617,6 +623,10 @@ struct Viewer {
     queue: wgpu::Queue,
     surface_config: wgpu::SurfaceConfiguration,
     rectangle_renderer: RectangleRenderer,
+    navigation_preview_renderer: NavigationPreviewRenderer,
+    navigation_texture_revisions: HashMap<PanelId, u64>,
+    navigation_horizon_preview_stats: NavigationHorizonPreviewStats,
+    navigation_stale_result_rejections: u64,
     egui_context: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
@@ -680,6 +690,7 @@ struct Viewer {
     promoted_read: Option<(TrackId, u64)>,
     synthetic: bool,
     workspace_alignment_limit: usize,
+    navigation_contract_revision: u64,
     display_dirty: bool,
     display_upload_pending_metrics: bool,
     pending_resolution_query_refresh: Option<Instant>,

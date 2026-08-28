@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "name": "GRCh38 + ERCC + phiX (GENCODE v29)",
+  "assembly_identity": {
+    "stable_id": "GRCh38.p12-gencode-v29-ucsc",
+    "display_name": "GRCh38 (GENCODE v29)",
+    "confidence": "explicit",
+    "provenance": "Version-locked GENCODE v29 annotation and the matching UCSC-named FASTA/FAI dictionary.",
+    "matched_fingerprints": 0,
+    "expected_primary_contigs": 25
+  },
+  "reference": {
+    "Local": {
+      "path": "../benchmark-data/large-public-alignments/reference/GRCh38_V29_UCSC_names_ERCC_phiX.fa"
+    }
+  },
+  "cytobands": {
+    "Local": {
+      "path": "../validation/assets/grch38/cytoBandIdeo.txt"
+    }
+  },
+  "contig_aliases": {
+    "1": "chr1",
+    "2": "chr2",
+    "3": "chr3",
+    "4": "chr4",
+    "5": "chr5",
+    "6": "chr6",
+    "7": "chr7",
+    "8": "chr8",
+    "9": "chr9",
+    "10": "chr10",
+    "11": "chr11",
+    "12": "chr12",
+    "13": "chr13",
+    "14": "chr14",
+    "15": "chr15",
+    "16": "chr16",
+    "17": "chr17",
+    "18": "chr18",
+    "19": "chr19",
+    "20": "chr20",
+    "21": "chr21",
+    "22": "chr22",
+    "X": "chrX",
+    "Y": "chrY",
+    "M": "chrM",
+    "MT": "chrM"
+  },
+  "default_annotations": [
+    {
+      "name": "GENCODE v29 gene landmarks",
+      "kind": "GeneModel",
+      "source": {
+        "Local": {
+          "path": "../benchmark-data/large-public-alignments/landmarks/grch38-gencode-v29/genes.bigGenePred"
+        }
+      },
+      "format": "big_gene_pred"
+    }
+  ],
+  "asset_provenance": [
+    {
+      "role": "gene_landmarks",
+      "source": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_29/gencode.v29.basic.annotation.gtf.gz",
+      "version": "GENCODE 29; one deterministic representative transcript per gene",
+      "sha256": "87a0af2606e675fd11c818a27e161a5b242b9f7f316fdfea49a190d427a02a7a",
+      "license": "GENCODE project data are open access; cite GENCODE and Ensembl as described by the source project."
+    },
+    {
+      "role": "detailed_transcripts",
+      "source": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_29/gencode.v29.basic.annotation.gtf.gz",
+      "version": "GENCODE 29; all exon-bearing basic transcripts",
+      "sha256": "1570396b95908878e29b57767c0286d6df34e4492b621a30c15a69aaf6b26bfa",
+      "license": "GENCODE project data are open access; cite GENCODE and Ensembl as described by the source project."
+    },
+    {
+      "role": "name_search",
+      "source": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_29/gencode.v29.basic.annotation.gtf.gz",
+      "version": "RGV landmark names v1 generated from GENCODE 29",
+      "sha256": "552299da93f7e5a426a10695774c405fd30d647970131405a6e24d75265d98fd",
+      "license": "GENCODE project data are open access; cite GENCODE and Ensembl as described by the source project."
+    }
+  ]
+}

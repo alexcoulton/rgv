@@ -103,6 +103,7 @@ impl Viewer {
                 Ok(()) => {
                     let projection = track.projection_mut(panel_id);
                     projection.pending_query = false;
+                    projection.begin_checking(Instant::now());
                     projection.last_query_resolution = Some(resolution);
                     sent = sent.saturating_add(1);
                 }
@@ -164,6 +165,8 @@ impl Viewer {
         configs.push(config);
         match self.replace_alignment_track_controllers(configs) {
             Ok(()) => {
+                self.invalidate_navigation_preview_contract("alignment source set changed");
+                self.begin_all_panel_refresh_transactions();
                 self.panels.active_mut().pending_queries.alignment = false;
                 self.synthetic = false;
                 self.data_status =
@@ -269,6 +272,8 @@ impl Viewer {
                 } else {
                     self.alignment_tracks[0] = controller;
                 }
+                self.invalidate_navigation_preview_contract("alignment source changed");
+                self.begin_all_panel_refresh_transactions();
                 self.reconcile_track_presentation();
                 self.panels.active_mut().pending_queries.alignment = false;
                 self.panels.active_mut().selected_chain = None;
@@ -336,6 +341,8 @@ impl Viewer {
         self.synthetic = false;
         self.primary_alignment_filters_mut().show_reference = true;
         self.data_status = format!("Opening reference genome {source_label}…");
+        self.invalidate_navigation_preview_contract("reference source changed");
+        self.begin_all_panel_refresh_transactions();
         self.rebuild_all_panel_displays();
         self.display_dirty = true;
     }
@@ -353,13 +360,14 @@ impl Viewer {
             .default_annotations
             .iter()
             .map(|annotation| {
-                track_spec_kind(annotation.kind, &annotation.source, None)
+                track_spec_kind(annotation.kind, &annotation.source, annotation.format)
                     .map(|kind| {
                         (
                             source_path(&annotation.source),
                             kind,
                             annotation.kind,
                             annotation.name.clone(),
+                            annotation.format,
                         )
                     })
                     .with_context(|| format!("unsupported default annotation {}", annotation.name))
@@ -378,8 +386,8 @@ impl Viewer {
         self.cytoband_path = cytoband_path;
         let reference = source_path(&configuration.reference);
         self.open_reference_source(&reference);
-        for (annotation_path, kind, track_kind, name) in annotations {
-            self.add_configured_track_source(&annotation_path, kind, track_kind, name, None)?;
+        for (annotation_path, kind, track_kind, name, format) in annotations {
+            self.add_configured_track_source(&annotation_path, kind, track_kind, name, format)?;
         }
         self.data_status = format!("Opening genome configuration {}…", path.display());
         Ok(())
@@ -507,6 +515,8 @@ impl Viewer {
                     !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
             }
         }
+        self.invalidate_navigation_preview_contract("alignment source removed");
+        self.begin_all_panel_refresh_transactions();
         self.request_all_alignment_queries();
         self.rebuild_all_panel_displays();
         self.display_dirty = true;

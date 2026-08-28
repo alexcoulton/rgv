@@ -594,6 +594,24 @@ impl AlignmentBatch {
         Ok(fields)
     }
 
+    /// Stable digest of the packed auxiliary payload for identity
+    /// disambiguation without materialising the record or exposing the
+    /// private arena encoding.
+    pub fn auxiliary_fingerprint(&self, index: usize) -> Option<(u64, u64)> {
+        let data = arena_slice(&self.auxiliary_offsets, &self.auxiliary_data, index)?;
+        let mix = |mut hash: u64| {
+            for &byte in data {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        };
+        Some((
+            mix(0xcbf2_9ce4_8422_2325_u64),
+            mix(0x6c62_272e_07bb_0142_u64),
+        ))
+    }
+
     pub fn materialize_record(&self, index: usize) -> Result<AlignmentRecord, PackedRecordError> {
         let contig = *self
             .contigs

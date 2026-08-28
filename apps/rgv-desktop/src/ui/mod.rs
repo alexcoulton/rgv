@@ -466,8 +466,7 @@ impl WorkspaceLayoutSnapshot {
         )
     }
 
-    #[cfg(test)]
-    pub fn physical_canvas_scissor(
+    pub(crate) fn physical_canvas_scissor(
         &self,
         panel_id: rgv_core::PanelId,
         scale_factor: f32,

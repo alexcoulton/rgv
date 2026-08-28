@@ -165,10 +165,10 @@ impl DisplayList {
         }
     }
 
-    pub fn synthetic_coverage_and_reads_at(width: f32, rows: u32, count: u32, top: f32) -> Self {
+    pub fn synthetic_coverage_at(width: f32, top: f32) -> Self {
         let bin_count = width.round().clamp(64.0, 1_024.0) as u32;
         let bin_width = width.max(1.0) / bin_count as f32;
-        let mut rectangles = Vec::with_capacity(bin_count as usize + count as usize);
+        let mut rectangles = Vec::with_capacity(bin_count as usize);
         for bin in 0..bin_count {
             let hash = bin.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
             let fraction = ((hash >> 16) & 0xff) as f32 / 255.0;
@@ -183,12 +183,17 @@ impl DisplayList {
                 shape: Default::default(),
             });
         }
-        let reads = Self::synthetic_reads_at(width, rows, count, top + 72.0);
-        rectangles.extend(reads.rectangles);
         Self {
             rectangles,
             texts: Vec::new(),
         }
+    }
+
+    pub fn synthetic_coverage_and_reads_at(width: f32, rows: u32, count: u32, top: f32) -> Self {
+        let mut display = Self::synthetic_coverage_at(width, top);
+        let reads = Self::synthetic_reads_at(width, rows, count, top + 72.0);
+        display.rectangles.extend(reads.rectangles);
+        display
     }
 
     /// Applies a vertical canvas offset and clips primitives to the visible

@@ -9,6 +9,67 @@ pub(crate) struct InspectorSnapshot {
     pub(crate) read_sequence: Option<BoundedSequenceCopy>,
 }
 
+impl InspectorSnapshot {
+    pub(crate) fn document(
+        &self,
+        identity: impl Into<String>,
+        title: impl Into<String>,
+    ) -> InspectorDocument {
+        let mut document =
+            InspectorDocument::from_legacy_fields(identity, title, self.fields.clone());
+        document.header.source = self
+            .fields
+            .iter()
+            .find(|(label, _)| label == "Track")
+            .map(|(_, value)| value.clone());
+        let location = document.all_fields().find_map(|field| match &field.value {
+            InspectorValue::GenomicLocation(location) => Some(location.clone()),
+            _ => None,
+        });
+        document.header.location = location;
+        if let Some(details) = document.sections.first_mut()
+            && let Some(event_start) = details
+                .fields
+                .iter()
+                .position(|field| field.label == "Selected event")
+        {
+            let event_fields = details.fields.split_off(event_start);
+            document.sections.push(
+                InspectorSection::new("selected-event", "Selected event", 20)
+                    .with_fields(event_fields),
+            );
+        }
+        document.raw_fields = self
+            .auxiliary
+            .iter()
+            .enumerate()
+            .map(|(index, (key, value))| {
+                InspectorField::new(
+                    format!("auxiliary-{index}"),
+                    key,
+                    InspectorValue::RawKeyValue {
+                        key: key.clone(),
+                        value: value.clone(),
+                    },
+                )
+                .with_copy_value(format!("{key}:{value}"))
+            })
+            .collect();
+        if !document.raw_fields.is_empty() {
+            document.notices.push(InspectorNotice {
+                id: "auxiliary-tag-provenance".to_owned(),
+                tone: InspectorTone::Informative,
+                message: format!(
+                    "{} loaded auxiliary SAM tags are available below in source order.",
+                    document.raw_fields.len()
+                ),
+            });
+        }
+        document.preserve_automation_fields(&self.fields);
+        document
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RetainedEvidenceSnapshot {
     pub(crate) selection: AutomationSelectionSnapshot,
@@ -23,7 +84,7 @@ pub(crate) struct BoundedSequenceCopy {
     pub(crate) total_bases: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SelectedSupplementaryChain {
     pub(crate) read_name: Vec<u8>,
     pub(crate) segments: Vec<SupplementarySegment>,
@@ -205,6 +266,6 @@ pub(crate) struct VariantAlignmentEvidence {
     pub(crate) modification_calls: u32,
     pub(crate) pair_templates_sampled: usize,
     pub(crate) retained_records: usize,
-    pub(crate) retained_records_sampled: bool,
+    pub(crate) complete_individual_reads: bool,
     pub(crate) complete_pileup: bool,
 }

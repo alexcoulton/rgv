@@ -136,7 +136,9 @@ pub(super) fn build_track_specs(options: &LaunchOptions) -> (Vec<TrackSpec>, Tra
     }
     if let Some(genome) = &options.loaded_genome {
         for annotation in &genome.default_annotations {
-            let Some(kind) = track_spec_kind(annotation.kind, &annotation.source, None) else {
+            let Some(kind) =
+                track_spec_kind(annotation.kind, &annotation.source, annotation.format)
+            else {
                 continue;
             };
             let id = TrackId::new(next_id);
@@ -147,12 +149,14 @@ pub(super) fn build_track_specs(options: &LaunchOptions) -> (Vec<TrackSpec>, Tra
                 path: source_path(&annotation.source),
                 kind,
             });
-            tracks.push(TrackConfig::new(
+            let mut config = TrackConfig::new(
                 id,
                 annotation.name.clone(),
                 annotation.kind,
                 annotation.source.clone(),
-            ));
+            );
+            config.format = annotation.format;
+            tracks.push(config);
         }
     }
     (specifications, tracks)

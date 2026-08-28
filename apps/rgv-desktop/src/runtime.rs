@@ -105,6 +105,23 @@ impl ApplicationHandler for Application {
             WindowEvent::Focused(false) => {
                 viewer.finish_overview_capture();
                 viewer.finish_vertical_scrollbar_drag();
+                let was_canvas_dragging = viewer.dragging;
+                viewer.dragging = false;
+                viewer.last_cursor = None;
+                viewer.press_cursor = None;
+                if let Some(origin) = viewer.drag_origin_interval.take() {
+                    let interval = viewer.panels.active().viewport.interval();
+                    if origin != interval {
+                        viewer
+                            .panels
+                            .active_mut()
+                            .navigation_history
+                            .visit(interval);
+                    }
+                }
+                if was_canvas_dragging {
+                    viewer.finish_navigation_gesture();
+                }
             }
             WindowEvent::MouseInput {
                 state,
@@ -134,17 +151,16 @@ impl ApplicationHandler for Application {
                     viewer.dragging = false;
                     viewer.last_cursor = None;
                     viewer.press_cursor = None;
-                    if viewer
-                        .drag_origin_interval
-                        .take()
-                        .is_some_and(|origin| origin != viewer.panels.active().viewport.interval())
-                    {
+                    if let Some(origin) = viewer.drag_origin_interval.take() {
                         let interval = viewer.panels.active().viewport.interval();
-                        viewer
-                            .panels
-                            .active_mut()
-                            .navigation_history
-                            .visit(interval);
+                        if origin != interval {
+                            viewer
+                                .panels
+                                .active_mut()
+                                .navigation_history
+                                .visit(interval);
+                        }
+                        viewer.finish_navigation_gesture();
                     }
                     // `press_cursor` is only recorded for the unobstructed GPU canvas.
                     // The surrounding egui panel reports ordinary canvas presses as
@@ -155,7 +171,7 @@ impl ApplicationHandler for Application {
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. }
+            WindowEvent::MouseWheel { delta, phase, .. }
                 if viewer.cursor_over_unobstructed_track_viewport() =>
             {
                 // The central panel is painted by egui, which may mark wheel input as
@@ -169,6 +185,12 @@ impl ApplicationHandler for Application {
                     viewer.scroll_tracks(delta);
                 } else {
                     viewer.zoom(delta);
+                    if matches!(
+                        phase,
+                        winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
+                    ) {
+                        viewer.finish_navigation_gesture();
+                    }
                 }
             }
             WindowEvent::DroppedFile(path) => viewer.handle_dropped_file(&path),

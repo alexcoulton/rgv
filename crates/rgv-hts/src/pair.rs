@@ -11,7 +11,7 @@ pub const MIN_TEMPLATE_LENGTH_SAMPLES: usize = 100;
 ///
 /// SAM defines records with the same QNAME as belonging to one template. RGV retains the name in
 /// its packed model and hashes it with a fixed algorithm so identity does not depend on process
-/// randomization, record order, viewport, or retained-record safety limiting.
+/// randomization, record order, viewport, or individual-read admission.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TemplateId(u64);
 
@@ -60,7 +60,7 @@ pub enum MateVisibility {
     OutOfView,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct TemplateLengthBounds {
     pub minimum: Option<u64>,
     pub maximum: Option<u64>,

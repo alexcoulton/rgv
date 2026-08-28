@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::display::alignment;
 
 fn updated_track_pane_selection<T: Copy + Eq>(
     track_order: &[T],
@@ -430,11 +431,58 @@ impl Viewer {
     }
 
     pub(crate) fn alignment_query_for_track(&self, id: TrackId) -> Option<&Arc<AlignmentQuery>> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .permits_staged_display()
+        {
+            return None;
+        }
         self.alignment_tracks
             .iter()
             .find(|track| track.config.id == id)
             .and_then(|track| track.projection(self.panels.active().id))
+            .filter(|projection| projection.query_is_current())
             .and_then(|projection| projection.current_query.as_ref())
+    }
+
+    pub(crate) fn complete_read_query_for_track_in_panel(
+        &self,
+        id: TrackId,
+        panel_id: PanelId,
+    ) -> Option<&Arc<AlignmentQuery>> {
+        if !self
+            .panels
+            .get(panel_id)?
+            .navigation_presentation
+            .permits_staged_display()
+        {
+            return None;
+        }
+        let track = self
+            .alignment_tracks
+            .iter()
+            .find(|track| track.config.id == id)?;
+        let projection = track
+            .projection(panel_id)
+            .filter(|projection| projection.query_is_current())?;
+        let query = projection.current_query.as_ref()?;
+        let layout_query = projection.layout_query.as_deref().unwrap_or(query);
+        alignment::individual_read_refusal(
+            query,
+            layout_query,
+            track.config.filters.read_stacking_mode,
+        )
+        .is_none()
+        .then_some(query)
+    }
+
+    pub(crate) fn complete_read_query_for_track(
+        &self,
+        id: TrackId,
+    ) -> Option<&Arc<AlignmentQuery>> {
+        self.complete_read_query_for_track_in_panel(id, self.panels.active().id)
     }
 
     pub(crate) fn primary_alignment_query(&self) -> Option<&Arc<AlignmentQuery>> {
@@ -1008,6 +1056,8 @@ impl Viewer {
             panel.pending_queries.tracks = has_engine;
             clear_removed_auxiliary_panel_state(panel, &removed);
         }
+        self.invalidate_navigation_preview_contract("auxiliary track removed");
+        self.begin_all_panel_refresh_transactions();
         self.request_all_auxiliary_track_queries();
         self.rebuild_all_panel_displays();
         self.display_dirty = true;

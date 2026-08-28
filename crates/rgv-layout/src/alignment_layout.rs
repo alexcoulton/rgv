@@ -1,12 +1,14 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
+    hash::{Hash, Hasher},
 };
 
 pub use rgv_core::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
-    BisulfiteContext, CoverageScaleTransform, SbxDisplayOptions, SbxSimplexTailMode,
-    SmrtKineticsMode, UltimaDisplayOptions, UltimaQualityMode,
+    BisulfiteContext, CoverageScaleTransform, ReadStackingMode, ReadStackingTransitionReason,
+    SbxDisplayOptions, SbxSimplexTailMode, SmrtKineticsMode, UltimaDisplayOptions,
+    UltimaQualityMode,
 };
 use rgv_core::{
     DetailLevel, GeneticCode, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, ModifiedBaseColorMode,
@@ -42,6 +44,22 @@ pub const MAX_RENDERED_REGIONAL_INSERTIONS: usize = 50_000;
 pub const MINIMUM_BASE_GLYPH_PIXEL_WIDTH: f32 = 7.0;
 const MAX_EXPANDED_JUNCTION_ROWS: usize = 12;
 pub const MAX_ANNOTATED_JUNCTIONS: usize = 100_000;
+/// Version two replaces earliest-ending lane rotation with a deterministic
+/// topmost-compatible canonical baseline.
+pub const ALIGNMENT_ROW_ARCHITECTURE_VERSION: u16 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IndividualReadRefusalScope {
+    Foreground,
+    LayoutHorizon,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct IndividualReadRefusal {
+    pub eligible_records: usize,
+    pub limit: usize,
+    pub scope: IndividualReadRefusalScope,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum JunctionAnnotationStatus {
@@ -121,6 +139,9 @@ pub struct AlignmentLayoutOptions {
     pub row_height: f32,
     pub read_height: f32,
     pub max_rows: usize,
+    /// Revision of the query-to-stable-row projection consumed by this render.
+    /// It is paint-cache metadata and does not participate in row policy.
+    pub row_layout_revision: u64,
     pub color_mode: AlignmentColorMode,
     pub group_mode: AlignmentGroupMode,
     pub group_order: AlignmentOrderDirection,
@@ -134,6 +155,10 @@ pub struct AlignmentLayoutOptions {
     pub show_coverage: bool,
     pub show_junctions: bool,
     pub show_reads: bool,
+    /// Complete-or-refuse state supplied by the query/horizon owner. When
+    /// present, aggregate evidence remains visible but no read primitive or
+    /// picking target is emitted.
+    pub read_refusal: Option<IndividualReadRefusal>,
     pub coverage_scale_maximum: Option<u32>,
     pub coverage_scale_transform: CoverageScaleTransform,
     pub show_coverage_center_line: bool,
@@ -178,6 +203,7 @@ impl Default for AlignmentLayoutOptions {
             row_height: 7.0,
             read_height: 5.0,
             max_rows: 4_096,
+            row_layout_revision: 0,
             color_mode: AlignmentColorMode::Strand,
             group_mode: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,
@@ -190,6 +216,7 @@ impl Default for AlignmentLayoutOptions {
             show_coverage: true,
             show_junctions: true,
             show_reads: true,
+            read_refusal: None,
             coverage_scale_maximum: None,
             coverage_scale_transform: CoverageScaleTransform::Linear,
             show_coverage_center_line: false,
@@ -399,11 +426,200 @@ pub struct AlignmentLayout {
     pub stats: AlignmentLayoutStats,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct AlignmentRowIdentity {
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AlignmentRowIdentity {
     primary: u64,
     secondary: u64,
     occurrence: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct AlignmentRowPolicy {
+    group_mode: AlignmentGroupMode,
+    group_order: AlignmentOrderDirection,
+    sort_mode: AlignmentSortMode,
+    sort_order: AlignmentOrderDirection,
+    sort_position: Option<u64>,
+    promoted_read_name_hash: Option<u64>,
+    view_as_pairs: bool,
+    pair_length_bounds: Option<TemplateLengthBounds>,
+}
+
+impl AlignmentRowPolicy {
+    fn from_options(options: &AlignmentLayoutOptions) -> Self {
+        let pair_length_bounds = (options.group_mode == AlignmentGroupMode::UnexpectedPair
+            || options.sort_mode == AlignmentSortMode::PairStatus)
+            .then_some(options.pair_length_bounds);
+        Self {
+            group_mode: options.group_mode,
+            group_order: options.group_order,
+            sort_mode: options.sort_mode,
+            sort_order: options.sort_order,
+            sort_position: effective_sort_position(options),
+            promoted_read_name_hash: options.promoted_read_name_hash,
+            view_as_pairs: options.view_as_pairs,
+            pair_length_bounds,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HistoricalRowAssignment {
+    group: AlignmentGroupKey,
+    row: usize,
+    start: u64,
+    end: u64,
+    last_seen_revision: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AlignmentRowIsland {
+    interval: rgv_core::GenomicInterval,
+    horizon_generation: u64,
+    horizon_extensions: usize,
+    horizon_truncated: bool,
+    assignments: HashMap<AlignmentRowIdentity, HistoricalRowAssignment>,
+    row_groups: BTreeMap<usize, BTreeSet<AlignmentGroupKey>>,
+    last_used_revision: u64,
+    navigation_pinned: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AlignmentRowHistoryContext {
+    contig: rgv_core::ContigId,
+    policy: AlignmentRowPolicy,
+    islands: Vec<AlignmentRowIsland>,
+}
+
+/// Persistent, query-independent read-row state for one panel/alignment track.
+///
+/// Contexts are separated by contig and explicit row policy. Within a context,
+/// overlapping query intervals extend a layout island. Alignments absent from
+/// the current query remain compact reservations so a later return can restore
+/// their original rows.
+#[derive(Clone, Debug, Default)]
+pub struct AlignmentRowHistory {
+    contexts: Vec<AlignmentRowHistoryContext>,
+    revision: u64,
+    evictions: usize,
+}
+
+impl AlignmentRowHistory {
+    pub fn clear(&mut self) {
+        self.contexts.clear();
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn context_count(&self) -> usize {
+        self.contexts.len()
+    }
+
+    pub fn island_count(&self) -> usize {
+        self.contexts
+            .iter()
+            .map(|context| context.islands.len())
+            .sum()
+    }
+
+    pub fn assignment_count(&self) -> usize {
+        self.contexts
+            .iter()
+            .flat_map(|context| &context.islands)
+            .map(|island| island.assignments.len())
+            .sum()
+    }
+
+    pub fn eviction_count(&self) -> usize {
+        self.evictions
+    }
+
+    /// Protects islands reachable through the owning panel's bounded
+    /// navigation history. Pins are refreshed by the desktop before each
+    /// reconciliation and are never applied to record data, only compact row
+    /// assignments.
+    pub fn pin_navigation_intervals(&mut self, intervals: &[rgv_core::GenomicInterval]) {
+        for island in self
+            .contexts
+            .iter_mut()
+            .flat_map(|context| &mut context.islands)
+        {
+            island.navigation_pinned = intervals.iter().any(|interval| {
+                island.interval.contig() == interval.contig()
+                    && island.interval.start() < interval.end()
+                    && interval.start() < island.interval.end()
+            });
+        }
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        self.assignment_count()
+            .saturating_mul(std::mem::size_of::<(
+                AlignmentRowIdentity,
+                HistoricalRowAssignment,
+            )>())
+            .saturating_add(
+                self.island_count()
+                    .saturating_mul(std::mem::size_of::<AlignmentRowIsland>()),
+            )
+    }
+}
+
+pub const DEFAULT_ALIGNMENT_ROW_HISTORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentRowReconciliationStats {
+    pub revision: u64,
+    pub architecture_version: u16,
+    /// Wall-clock time spent reconciling this settled query, reported for
+    /// diagnostics only and never used as layout state.
+    pub reconciliation_micros: u64,
+    pub retained: usize,
+    pub restored: usize,
+    pub added: usize,
+    pub moved: usize,
+    pub reservations: usize,
+    pub contexts: usize,
+    pub islands: usize,
+    pub assignments: usize,
+    pub history_bytes: usize,
+    pub compact: bool,
+    pub repacked: bool,
+    pub evictions: usize,
+    pub transition_reason: ReadStackingTransitionReason,
+    pub policy_fingerprint: u64,
+    pub projection_fingerprint: u64,
+    pub stable_rows: usize,
+    pub canonical_rows: usize,
+    pub row_inflation: usize,
+    pub canonical_displacement: usize,
+    pub top_first_violations: usize,
+    pub query_occupied_row_span: usize,
+    pub query_empty_rows: usize,
+    pub query_empty_ratio_ppm: u32,
+    pub horizon_start: u64,
+    pub horizon_end: u64,
+    pub horizon_generation: u64,
+    pub horizon_extensions: usize,
+    pub horizon_records: usize,
+    pub horizon_bytes: usize,
+    pub horizon_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentRowOrganizationMetrics {
+    pub architecture_version: u16,
+    pub canonical_rows: usize,
+    pub stable_rows: usize,
+    pub row_inflation: usize,
+    pub canonical_displacement: usize,
+    pub top_first_violations: usize,
+    pub occupied_row_span: usize,
+    pub empty_rows: usize,
+    pub empty_ratio_ppm: u32,
 }
 
 /// Viewport-independent row assignments for one bounded alignment query.
@@ -433,6 +649,57 @@ impl AlignmentRowLayout {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    pub fn row(&self, index: usize) -> Option<usize> {
+        self.rows.get(index).copied().flatten()
+    }
+
+    pub fn identity(&self, index: usize) -> Option<AlignmentRowIdentity> {
+        self.identities.get(index).copied()
+    }
+
+    pub fn row_for_identity(&self, identity: AlignmentRowIdentity) -> Option<usize> {
+        self.identities
+            .iter()
+            .position(|candidate| *candidate == identity)
+            .and_then(|index| self.row(index))
+    }
+
+    pub fn used_row_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter_map(|row| *row)
+            .max()
+            .map_or(0, |row| row.saturating_add(1))
+    }
+
+    /// Stable row-space extent, including rows currently occupied only by
+    /// historical reservations.
+    pub fn row_capacity(&self) -> usize {
+        self.max_rows
+    }
+
+    /// Order-independent digest of representative identity-to-row mappings.
+    /// It is intended for qualification and diagnostics, not persistence.
+    pub fn assignment_fingerprint(&self) -> u64 {
+        let mut assignments = self
+            .identities
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, _)| self.representative(*index) == *index)
+            .filter_map(|(index, identity)| self.row(index).map(|row| (identity, row)))
+            .collect::<Vec<_>>();
+        assignments.sort_unstable();
+        assignments
+            .into_iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, (identity, row)| {
+                let hash = rows::fnv_mix(hash, &identity.primary.to_le_bytes());
+                let hash = rows::fnv_mix(hash, &identity.secondary.to_le_bytes());
+                let hash = rows::fnv_mix(hash, &identity.occurrence.to_le_bytes());
+                rows::fnv_mix(hash, &row.to_le_bytes())
+            })
     }
 
     fn compatible_with(&self, options: &AlignmentLayoutOptions, record_count: usize) -> bool {
@@ -557,20 +824,6 @@ pub fn layout_alignment_query_with_rows_and_annotations(
         viewport,
         &options,
     );
-    if options.show_reads
-        && query.stats.truncated
-        && viewport.detail_level() != DetailLevel::Overview
-    {
-        display_list.rectangles.push(RectPrimitive {
-            x: 0.0,
-            y: options.coverage_top + options.coverage_height + 2.0,
-            width: viewport.pixel_width() as f32,
-            height: 3.0,
-            color: Rgba::new(0.08, 0.08, 0.08, 1.0),
-            object_id: 0,
-            shape: Default::default(),
-        });
-    }
     // Reference and coverage are emitted first so the desktop can keep this
     // prefix frozen while applying vertical scrolling only to the read stack.
     let pinned_rectangle_count = display_list.rectangles.len();
@@ -578,6 +831,12 @@ pub fn layout_alignment_query_with_rows_and_annotations(
     let read_stats = if !options.show_reads {
         ReadRenderStats {
             hidden: query.batch.len(),
+            ..ReadRenderStats::default()
+        }
+    } else if let Some(refusal) = options.read_refusal {
+        add_complete_read_refusal_placeholder(&mut display_list, viewport, &options, refusal);
+        ReadRenderStats {
+            hidden: refusal.eligible_records,
             ..ReadRenderStats::default()
         }
     } else if matches!(
@@ -657,6 +916,56 @@ pub fn layout_alignment_query_with_rows_and_annotations(
     }
 }
 
+fn add_complete_read_refusal_placeholder(
+    display_list: &mut DisplayList,
+    viewport: Viewport,
+    options: &AlignmentLayoutOptions,
+    refusal: IndividualReadRefusal,
+) {
+    let top = options.reads_top + 5.0;
+    let width = (viewport.pixel_width() as f32 - 24.0).max(1.0);
+    display_list.rectangles.push(RectPrimitive {
+        x: 12.0,
+        y: top,
+        width,
+        height: 48.0,
+        color: Rgba::new(0.96, 0.93, 0.87, 0.98),
+        object_id: 0,
+        shape: Default::default(),
+    });
+    display_list.rectangles.push(RectPrimitive {
+        x: 12.0,
+        y: top,
+        width: 3.0_f32.min(width),
+        height: 48.0,
+        color: Rgba::new(0.76, 0.45, 0.12, 1.0),
+        object_id: 0,
+        shape: Default::default(),
+    });
+    let subject = match refusal.scope {
+        IndividualReadRefusalScope::Foreground => "eligible reads overlap this interval",
+        IndividualReadRefusalScope::LayoutHorizon => "reads occur in the stable layout horizon",
+    };
+    display_list.texts.push(TextPrimitive {
+        x: viewport.pixel_width() as f32 * 0.5,
+        y: top + 15.0,
+        text: format!(
+            "{} {subject}; complete-read limit is {}",
+            refusal.eligible_records, refusal.limit
+        ),
+        font_size: 12.0,
+        color: Rgba::new(0.30, 0.24, 0.17, 1.0),
+    });
+    display_list.texts.push(TextPrimitive {
+        x: viewport.pixel_width() as f32 * 0.5,
+        y: top + 34.0,
+        text: "Zoom in to inspect complete reads, or raise the limit in track properties"
+            .to_owned(),
+        font_size: 11.0,
+        color: Rgba::new(0.38, 0.31, 0.22, 1.0),
+    });
+}
+
 fn natural_stack_height(query: &AlignmentQuery, interval: rgv_core::GenomicInterval) -> usize {
     let mut events = BTreeMap::<u64, i64>::new();
     for (&start, &end) in query.batch.starts.iter().zip(&query.batch.ends) {
@@ -731,7 +1040,10 @@ mod rows;
 #[cfg(test)]
 use rows::grouped_indices;
 use rows::{AlignmentGroupKey, effective_sort_position, first_of_pair_reverse};
-pub use rows::{alignment_read_name_hash, assign_alignment_rows};
+pub use rows::{
+    alignment_read_name_hash, alignment_row_organization_metrics, assign_alignment_rows,
+    reconcile_alignment_rows, reconcile_alignment_rows_with_horizon,
+};
 mod coverage;
 pub use coverage::junction_count_value;
 use coverage::{

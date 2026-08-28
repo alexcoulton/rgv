@@ -1,4 +1,7 @@
 use super::super::*;
+use crate::display::navigation_preview::{
+    complete_horizon_preview_eligible, remove_navigation_preview_semantics,
+};
 
 #[test]
 fn overview_resolution_is_index_only_and_regional_resolution_requests_records() {
@@ -12,6 +15,633 @@ fn overview_resolution_is_index_only_and_regional_resolution_requests_records() 
     assert!(!overview.requires_alignment_records());
     assert_eq!(regional.detail, DetailLevel::Regional);
     assert!(regional.requires_alignment_records());
+}
+
+#[test]
+fn projection_is_checking_until_the_current_generation_settles() {
+    let mut projection = AlignmentPanelProjection::default();
+    assert!(projection.query_is_checking());
+
+    projection.settled_generation = Some(projection.clock.current().get());
+    assert!(projection.query_is_current());
+
+    projection.clock.advance();
+    assert!(projection.query_is_checking());
+    assert!(!projection.query_is_current());
+
+    projection.pending_query = true;
+    projection.settled_generation = Some(projection.clock.current().get());
+    assert!(projection.query_is_checking());
+
+    projection.pending_query = false;
+    assert!(projection.query_is_current());
+}
+
+#[test]
+fn checking_notice_is_debounced_without_delaying_the_truth_state() {
+    let mut projection = AlignmentPanelProjection::default();
+    projection.settled_generation = Some(projection.clock.current().get());
+    projection.clock.advance();
+    let started = Instant::now();
+    projection.begin_checking(started);
+
+    assert!(projection.query_is_checking());
+    assert!(!projection.checking_notice_visible);
+    assert!(!projection.reveal_checking_notice_if_due(
+        started + READ_CHECKING_NOTICE_DELAY - Duration::from_millis(1)
+    ));
+    assert!(projection.query_is_checking());
+    assert!(projection.reveal_checking_notice_if_due(started + READ_CHECKING_NOTICE_DELAY));
+    assert!(projection.checking_notice_visible);
+    assert!(!projection.reveal_checking_notice_if_due(
+        started + READ_CHECKING_NOTICE_DELAY + Duration::from_secs(1)
+    ));
+
+    projection.finish_checking();
+    projection.settled_generation = Some(projection.clock.current().get());
+    assert!(projection.query_is_current());
+    assert!(!projection.checking_notice_visible);
+    assert!(projection.checking_started.is_none());
+}
+
+#[test]
+fn navigation_preview_keeps_one_committed_source_across_superseded_targets() {
+    let source = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let first_target = GenomicInterval::new(ContigId::new(0), 75, 225).unwrap();
+    let second_target = GenomicInterval::new(ContigId::new(0), 50, 250).unwrap();
+    let started = Instant::now();
+    let mut presentation = NavigationPresentation::initial(source, 1, started);
+    presentation.phase = NavigationPresentationPhase::Committing;
+    assert!(presentation.finish_commit(9, 4));
+
+    presentation.begin_navigation(
+        test_viewport(first_target),
+        2,
+        9,
+        4,
+        "100 complete reads",
+        started,
+    );
+    let committed_source = presentation.source.clone().unwrap();
+    assert!(presentation.shows_texture_preview());
+    assert!(!presentation.is_interactive());
+
+    presentation.begin_navigation(
+        test_viewport(second_target),
+        3,
+        9,
+        4,
+        "replacement status must not win",
+        started + Duration::from_millis(20),
+    );
+    let superseded_source = presentation.source.as_ref().unwrap();
+    assert_eq!(superseded_source.interval, committed_source.interval);
+    assert_eq!(
+        superseded_source.content_revision,
+        committed_source.content_revision
+    );
+    assert_eq!(presentation.target_interval, second_target);
+    assert_eq!(presentation.source_status, "100 complete reads");
+}
+
+#[test]
+fn navigation_preview_invalidates_on_layout_contract_or_contig_change() {
+    let source = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let same_contig = GenomicInterval::new(ContigId::new(0), 50, 250).unwrap();
+    let other_contig = GenomicInterval::new(ContigId::new(1), 50, 250).unwrap();
+    let now = Instant::now();
+    let mut presentation = NavigationPresentation::initial(source, 1, now);
+    presentation.phase = NavigationPresentationPhase::Committing;
+    assert!(presentation.finish_commit(7, 3));
+
+    presentation.begin_navigation(test_viewport(same_contig), 2, 8, 3, "ready", now);
+    assert_eq!(
+        presentation.phase,
+        NavigationPresentationPhase::CheckingWithoutPreview
+    );
+    assert_eq!(
+        presentation.invalidation_reason.as_deref(),
+        Some("workspace layout changed")
+    );
+
+    presentation.phase = NavigationPresentationPhase::Settled;
+    presentation.begin_navigation(test_viewport(other_contig), 3, 7, 3, "ready", now);
+    assert_eq!(
+        presentation.invalidation_reason.as_deref(),
+        Some("target is on a different contig")
+    );
+}
+
+#[test]
+fn navigation_preview_uses_only_useful_overlap_and_can_recover_its_original_source() {
+    let source = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let disjoint = GenomicInterval::new(ContigId::new(0), 1_000, 1_100).unwrap();
+    let overlapping = GenomicInterval::new(ContigId::new(0), 150, 250).unwrap();
+    let now = Instant::now();
+    let mut presentation = NavigationPresentation::initial(source, 1, now);
+    presentation.phase = NavigationPresentationPhase::Committing;
+    assert!(presentation.finish_commit(7, 3));
+
+    presentation.begin_navigation(test_viewport(disjoint), 2, 7, 3, "ready", now);
+    assert!(presentation.source.is_none());
+    assert_eq!(
+        presentation.invalidation_reason.as_deref(),
+        Some("target has no useful overlap with committed preview")
+    );
+
+    presentation.begin_navigation(test_viewport(overlapping), 3, 7, 3, "ready", now);
+    assert_eq!(
+        presentation.source.as_ref().map(|source| source.interval),
+        Some(source)
+    );
+    assert!(presentation.shows_texture_preview());
+}
+
+#[test]
+fn navigation_preview_requires_at_least_one_target_pixel_of_overlap() {
+    let source_interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let target_interval = GenomicInterval::new(ContigId::new(0), 199, 1_199).unwrap();
+    let source = NavigationPreviewSource {
+        generation: 1,
+        interval: source_interval,
+        exact_start: 100.0,
+        span: 100.0,
+        content_revision: 1,
+        layout_revision: 1,
+        contract_revision: 1,
+    };
+    let narrow_canvas = Viewport::new(target_interval, 500.0).unwrap();
+    let wide_canvas = Viewport::new(target_interval, 2_000.0).unwrap();
+
+    assert!(!navigation_preview_has_useful_overlap(
+        &source,
+        narrow_canvas
+    ));
+    assert!(navigation_preview_has_useful_overlap(&source, wide_canvas));
+}
+
+#[test]
+fn navigation_preview_refuses_an_uncaptured_committed_revision() {
+    let source = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let target = GenomicInterval::new(ContigId::new(0), 75, 225).unwrap();
+    let now = Instant::now();
+    let mut presentation = NavigationPresentation::initial(source, 1, now);
+    presentation.phase = NavigationPresentationPhase::Committing;
+    assert!(presentation.finish_commit(1, 1));
+    presentation.begin_navigation(test_viewport(target), 2, 1, 1, "complete", now);
+    let captured_revision = presentation
+        .source
+        .as_ref()
+        .map(|source| source.content_revision);
+    assert!(captured_revision.is_some());
+
+    let mut captured = presentation.clone();
+    captured.require_captured_source_revision(captured_revision);
+    assert!(captured.shows_texture_preview());
+
+    presentation.require_captured_source_revision(None);
+    assert_eq!(
+        presentation.phase,
+        NavigationPresentationPhase::CheckingWithoutPreview
+    );
+    assert_eq!(
+        presentation.invalidation_reason.as_deref(),
+        Some("committed preview texture capture is unavailable")
+    );
+}
+
+#[test]
+fn navigation_notice_is_delayed_but_preview_truth_state_is_immediate() {
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let started = Instant::now();
+    let mut presentation = NavigationPresentation::initial(interval, 1, started);
+    assert!(presentation.is_unsettled());
+    assert!(!presentation.is_interactive());
+    assert!(!presentation.reveal_notice_if_due(
+        started + NAVIGATION_PREVIEW_NOTICE_DELAY - Duration::from_millis(1)
+    ));
+    assert!(presentation.reveal_notice_if_due(started + NAVIGATION_PREVIEW_NOTICE_DELAY));
+    assert!(presentation.notice_visible);
+}
+
+#[test]
+fn unchanged_viewports_do_not_start_duplicate_navigation_targets() {
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let viewport = test_viewport(interval);
+    let mut presentation = NavigationPresentation::initial(interval, 1, Instant::now());
+    assert!(presentation.targets_viewport(viewport));
+
+    let shifted = viewport.pan_pixels(1.0, 10_000).unwrap();
+    assert!(!presentation.targets_viewport(shifted));
+    presentation.begin_navigation(shifted, 2, 0, 0, "", Instant::now());
+    assert!(presentation.targets_viewport(shifted));
+}
+
+#[test]
+fn navigation_scheduler_coalesces_idle_bursts_and_dispatches_the_latest_target() {
+    let interval_a = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let interval_b = GenomicInterval::new(ContigId::new(0), 110, 210).unwrap();
+    let viewport_a = Viewport::new(interval_a, 1_000.0).unwrap();
+    let viewport_b = Viewport::new(interval_b, 1_000.0).unwrap();
+    let started = Instant::now();
+    let mut schedule = NavigationQuerySchedule::default();
+    schedule.update(
+        NavigationQueryTarget {
+            fingerprint: NavigationTargetFingerprint::from_viewport(viewport_a),
+            generation: 1,
+        },
+        started,
+        true,
+        false,
+    );
+    schedule.update(
+        NavigationQueryTarget {
+            fingerprint: NavigationTargetFingerprint::from_viewport(viewport_b),
+            generation: 2,
+        },
+        started + Duration::from_millis(20),
+        true,
+        false,
+    );
+
+    assert!(
+        schedule
+            .take_due(started + Duration::from_millis(69))
+            .is_none()
+    );
+    let dispatched = schedule
+        .take_due(started + Duration::from_millis(70))
+        .unwrap();
+    assert_eq!(dispatched.fingerprint.interval, interval_b);
+    assert_eq!(dispatched.generation, 2);
+    assert_eq!(schedule.coalesced_updates, 1);
+}
+
+#[test]
+fn navigation_scheduler_gives_independent_wheel_bursts_fresh_idle_windows() {
+    let started = Instant::now();
+    let first = NavigationQueryTarget {
+        fingerprint: NavigationTargetFingerprint::from_viewport(test_viewport(
+            GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+        )),
+        generation: 1,
+    };
+    let second = NavigationQueryTarget {
+        fingerprint: NavigationTargetFingerprint::from_viewport(test_viewport(
+            GenomicInterval::new(ContigId::new(0), 120, 220).unwrap(),
+        )),
+        generation: 2,
+    };
+    let mut schedule = NavigationQuerySchedule::default();
+    schedule.update(first, started, true, false);
+    assert_eq!(
+        schedule.take_due(started + NAVIGATION_QUERY_IDLE_DELAY),
+        Some(first)
+    );
+    assert!(!schedule.gesture_active);
+
+    let next_burst = started + Duration::from_secs(1);
+    schedule.update(second, next_burst, true, false);
+    assert!(
+        schedule
+            .take_due(next_burst + NAVIGATION_QUERY_IDLE_DELAY - Duration::from_millis(1))
+            .is_none()
+    );
+    assert_eq!(
+        schedule.take_due(next_burst + NAVIGATION_QUERY_IDLE_DELAY),
+        Some(second)
+    );
+}
+
+#[test]
+fn navigation_scheduler_uses_bounded_cadence_and_immediate_gesture_end() {
+    let started = Instant::now();
+    let interval_a = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let interval_b = GenomicInterval::new(ContigId::new(0), 120, 220).unwrap();
+    let mut schedule = NavigationQuerySchedule::default();
+    schedule.update(
+        NavigationQueryTarget {
+            fingerprint: NavigationTargetFingerprint::from_viewport(
+                Viewport::new(interval_a, 1_000.0).unwrap(),
+            ),
+            generation: 1,
+        },
+        started,
+        true,
+        true,
+    );
+    assert!(
+        schedule
+            .take_due(started + NAVIGATION_QUERY_MAX_CADENCE)
+            .is_some()
+    );
+
+    schedule.update(
+        NavigationQueryTarget {
+            fingerprint: NavigationTargetFingerprint::from_viewport(
+                Viewport::new(interval_b, 1_000.0).unwrap(),
+            ),
+            generation: 2,
+        },
+        started + Duration::from_millis(160),
+        true,
+        true,
+    );
+    let final_target = schedule
+        .take_immediate(started + Duration::from_millis(161), true)
+        .unwrap();
+    assert_eq!(final_target.fingerprint.interval, interval_b);
+    assert!(!schedule.gesture_active);
+    assert!(!schedule.hold_commit_until_end);
+    assert_eq!(schedule.gesture_end_dispatches, 1);
+}
+
+#[test]
+fn navigation_scheduler_suppresses_only_the_same_target_generation() {
+    let now = Instant::now();
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+        1_000.0,
+    )
+    .unwrap();
+    let target = NavigationQueryTarget {
+        fingerprint: NavigationTargetFingerprint::from_viewport(viewport),
+        generation: 1,
+    };
+    let mut schedule = NavigationQuerySchedule::default();
+    schedule.update(target, now, false, false);
+    assert_eq!(schedule.take_immediate(now, false), Some(target));
+
+    schedule.update(target, now, false, false);
+    assert!(schedule.take_immediate(now, false).is_none());
+
+    let replacement_generation = NavigationQueryTarget {
+        generation: 2,
+        ..target
+    };
+    schedule.update(replacement_generation, now, false, false);
+    assert_eq!(
+        schedule.take_immediate(now, false),
+        Some(replacement_generation)
+    );
+}
+
+#[test]
+fn pointer_gesture_holds_atomic_commit_after_a_cadence_query_finishes() {
+    let started = Instant::now();
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let mut schedule = NavigationQuerySchedule::default();
+    schedule.update(
+        NavigationQueryTarget {
+            fingerprint: NavigationTargetFingerprint::from_viewport(
+                Viewport::new(interval, 1_000.0).unwrap(),
+            ),
+            generation: 1,
+        },
+        started,
+        true,
+        true,
+    );
+
+    assert!(
+        schedule
+            .take_due(started + NAVIGATION_QUERY_MAX_CADENCE)
+            .is_some()
+    );
+    assert!(schedule.hold_commit_until_end);
+    assert!(
+        schedule
+            .take_immediate(started + NAVIGATION_QUERY_MAX_CADENCE, true)
+            .is_none()
+    );
+    assert!(!schedule.hold_commit_until_end);
+}
+
+#[test]
+fn navigation_commit_remains_noninteractive_until_frame_submission() {
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let now = Instant::now();
+    let mut presentation = NavigationPresentation::initial(interval, 1, now);
+
+    presentation.mark_ready_to_commit();
+    assert!(!presentation.is_interactive());
+    assert!(!presentation.permits_staged_display());
+    assert!(presentation.begin_commit());
+    assert!(!presentation.is_interactive());
+    assert!(presentation.permits_staged_display());
+    assert!(presentation.finish_commit(1, 1));
+    assert!(presentation.is_interactive());
+}
+
+#[test]
+fn zoom_out_during_pan_has_a_deterministic_truthful_atomic_trace() {
+    let source = GenomicInterval::new(ContigId::new(0), 1_000, 1_100).unwrap();
+    let first_target = GenomicInterval::new(ContigId::new(0), 950, 1_150).unwrap();
+    let final_target = GenomicInterval::new(ContigId::new(0), 900, 1_300).unwrap();
+    let started = Instant::now();
+    let mut presentation = NavigationPresentation::initial(source, 1, started);
+    presentation.phase = NavigationPresentationPhase::Committing;
+    assert!(presentation.finish_commit(1, 1));
+    let mut schedule = NavigationQuerySchedule::default();
+    let mut trace = Vec::new();
+
+    presentation.begin_navigation(test_viewport(first_target), 2, 1, 1, "complete", started);
+    schedule.begin_transaction();
+    schedule.update(
+        NavigationQueryTarget {
+            fingerprint: NavigationTargetFingerprint::from_viewport(test_viewport(first_target)),
+            generation: 2,
+        },
+        started,
+        true,
+        true,
+    );
+    trace.push((
+        presentation.phase,
+        presentation.source.is_some(),
+        presentation.is_interactive(),
+    ));
+
+    presentation.begin_navigation(
+        test_viewport(final_target),
+        3,
+        1,
+        1,
+        "must remain source status",
+        started + Duration::from_millis(20),
+    );
+    let final_query = NavigationQueryTarget {
+        fingerprint: NavigationTargetFingerprint::from_viewport(test_viewport(final_target)),
+        generation: 3,
+    };
+    schedule.record_superseded_target();
+    schedule.update(final_query, started + Duration::from_millis(20), true, true);
+    trace.push((
+        presentation.phase,
+        presentation.source.is_some(),
+        presentation.is_interactive(),
+    ));
+
+    assert_eq!(
+        schedule.take_due(started + NAVIGATION_QUERY_MAX_CADENCE),
+        Some(final_query)
+    );
+    assert!(
+        schedule
+            .take_immediate(started + Duration::from_millis(151), true)
+            .is_none()
+    );
+    assert!(!schedule.hold_commit_until_end);
+    presentation.mark_ready_to_commit();
+    trace.push((
+        presentation.phase,
+        presentation.source.is_some(),
+        presentation.is_interactive(),
+    ));
+    assert!(presentation.begin_commit());
+    trace.push((
+        presentation.phase,
+        presentation.source.is_some(),
+        presentation.is_interactive(),
+    ));
+    assert!(presentation.finish_commit(1, 1));
+    schedule.record_commit(Duration::from_millis(180));
+    trace.push((
+        presentation.phase,
+        presentation.source.is_some(),
+        presentation.is_interactive(),
+    ));
+
+    assert_eq!(
+        trace,
+        vec![
+            (NavigationPresentationPhase::Preview, true, false),
+            (NavigationPresentationPhase::Preview, true, false),
+            (NavigationPresentationPhase::ReadyToCommit, true, false),
+            (NavigationPresentationPhase::Committing, true, false),
+            (NavigationPresentationPhase::Settled, false, true),
+        ]
+    );
+    assert_eq!(schedule.dispatched_targets, 1);
+    assert_eq!(schedule.coalesced_updates, 1);
+    assert_eq!(schedule.cancelled_targets, 1);
+    assert_eq!(schedule.committed_targets, 1);
+    assert_eq!(schedule.last_commit_micros, 180_000);
+}
+
+#[test]
+fn complete_horizon_preview_requires_complete_containing_matching_data() {
+    let target = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let mut query = (*test_alignment_query(50)).clone();
+    query.interval = GenomicInterval::new(ContigId::new(0), 50, 250).unwrap();
+    query.stats.complete_read_limit = 50_000;
+
+    assert!(complete_horizon_preview_eligible(
+        &query, target, 4, 4, 50_000
+    ));
+    assert!(!complete_horizon_preview_eligible(
+        &query, target, 3, 4, 50_000
+    ));
+    assert!(!complete_horizon_preview_eligible(
+        &query, target, 4, 4, 25_000
+    ));
+
+    query.stats.individual_reads = IndividualReadStatus::TooDense { limit: 50_000 };
+    assert!(!complete_horizon_preview_eligible(
+        &query, target, 4, 4, 50_000
+    ));
+
+    query.stats.individual_reads = IndividualReadStatus::Complete;
+    query.stats.cancelled = true;
+    assert!(!complete_horizon_preview_eligible(
+        &query, target, 4, 4, 50_000
+    ));
+
+    query.stats.cancelled = false;
+    let partially_contained = GenomicInterval::new(ContigId::new(0), 25, 200).unwrap();
+    assert!(!complete_horizon_preview_eligible(
+        &query,
+        partially_contained,
+        4,
+        4,
+        50_000
+    ));
+}
+
+#[test]
+fn provisional_horizon_geometry_has_no_text_or_object_identity() {
+    let mut display = DisplayList::synthetic_reads(200.0, 4, 16);
+    display.texts.push(rgv_layout::TextPrimitive {
+        x: 10.0,
+        y: 10.0,
+        text: "stale label".to_owned(),
+        color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+        font_size: 12.0,
+    });
+    remove_navigation_preview_semantics(&mut display);
+
+    assert!(display.texts.is_empty());
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .all(|rectangle| rectangle.object_id == 0)
+    );
+}
+
+#[test]
+fn provisional_horizon_reconciliation_cannot_mutate_committed_row_history() {
+    let mut query = (*test_alignment_query(32)).clone();
+    query
+        .batch
+        .push(&AlignmentRecord {
+            contig: ContigId::new(0),
+            start: 34,
+            end: 39,
+            flags: rgv_hts::AlignmentFlags::from_bits(0),
+            mapping_quality: Some(60),
+            mate_contig: None,
+            mate_start: None,
+            template_length: 0,
+            read_name: b"provisional-row".to_vec(),
+            cigar: vec![rgv_hts::CigarOp {
+                kind: CigarOpKind::Match,
+                len: 5,
+            }],
+            sequence: SequenceData::NotLoaded,
+            auxiliary_fields: Vec::new(),
+        })
+        .unwrap();
+    let options = AlignmentLayoutOptions {
+        max_rows: query.batch.len(),
+        ..AlignmentLayoutOptions::default()
+    };
+    let mut committed = AlignmentRowHistory::default();
+    let _ = reconcile_alignment_rows_with_horizon(
+        &query,
+        &query,
+        options,
+        &mut committed,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let committed_revision = committed.revision();
+    let committed_assignments = committed.assignment_count();
+    let mut provisional = committed.clone();
+
+    let _ = reconcile_alignment_rows_with_horizon(
+        &query,
+        &query,
+        options,
+        &mut provisional,
+        ReadStackingMode::Stable,
+        false,
+    );
+    provisional.clear();
+
+    assert_eq!(committed.revision(), committed_revision);
+    assert_eq!(committed.assignment_count(), committed_assignments);
+    assert!(committed_assignments > 0);
 }
 
 #[test]
@@ -39,6 +669,45 @@ fn index_only_overview_settles_without_retaining_alignment_query_state() {
     assert_eq!(
         projection.settled_generation,
         Some(projection.clock.current().get())
+    );
+}
+
+#[test]
+fn pair_policy_bounds_freeze_only_for_dependent_row_policies() {
+    let broad = TemplateLengthBounds {
+        minimum: Some(0),
+        maximum: Some(526),
+    };
+    let narrow = TemplateLengthBounds {
+        minimum: Some(0),
+        maximum: Some(398),
+    };
+    let mut projection = AlignmentPanelProjection::default();
+    let ordinary = SessionFilters::default();
+    assert_eq!(projection.row_policy_pair_bounds(&ordinary, broad), broad);
+    assert_eq!(projection.row_policy_pair_bounds(&ordinary, narrow), narrow);
+    assert!(projection.row_pair_policy_bounds.is_none());
+
+    let dependent = SessionFilters {
+        alignment_group_mode: AlignmentGroupMode::UnexpectedPair,
+        ..SessionFilters::default()
+    };
+    assert_eq!(projection.row_policy_pair_bounds(&dependent, broad), broad);
+    assert_eq!(projection.row_policy_pair_bounds(&dependent, narrow), broad);
+
+    let explicit = SessionFilters {
+        alignment_group_mode: AlignmentGroupMode::UnexpectedPair,
+        minimum_template_length: Some(100),
+        maximum_template_length: Some(900),
+        ..SessionFilters::default()
+    };
+    let configured = TemplateLengthBounds {
+        minimum: Some(100),
+        maximum: Some(900),
+    };
+    assert_eq!(
+        projection.row_policy_pair_bounds(&explicit, configured),
+        configured
     );
 }
 
@@ -167,6 +836,10 @@ fn test_panel(id: u64) -> ViewPanelController {
         "chr1".to_owned(),
         1_000_000,
     )
+}
+
+fn test_viewport(interval: GenomicInterval) -> Viewport {
+    Viewport::new(interval, 1_000.0).unwrap()
 }
 
 fn test_alignment_query(start: u64) -> Arc<AlignmentQuery> {
@@ -834,6 +1507,7 @@ fn session_panel_workspace_restores_order_active_locus_and_width() {
             latent_scroll_fraction: Some(0.6),
             content_bottom_points: 900.0,
             density: Some(3.0),
+            stable_row_anchor: None,
         })
     );
     assert_eq!(workspace.active().contig_name, "chr2");
@@ -1485,6 +2159,8 @@ fn bulk_appearance_preserves_sample_specific_filters() {
         alignment_group_order: AlignmentOrderDirection::Reverse,
         alignment_sort_mode: AlignmentSortMode::Base,
         alignment_sort_order: AlignmentOrderDirection::Reverse,
+        alignment_sort_anchor: Some(4_242),
+        read_stacking_mode: ReadStackingMode::Compact,
         alignment_density: 2.5,
         show_junctions: false,
         minimum_junction_flank: 14,
@@ -1521,6 +2197,8 @@ fn bulk_appearance_preserves_sample_specific_filters() {
         target.alignment_sort_order,
         AlignmentOrderDirection::Reverse
     );
+    assert_eq!(target.alignment_sort_anchor, Some(4_242));
+    assert_eq!(target.read_stacking_mode, ReadStackingMode::Compact);
     assert!((target.alignment_density - 2.5).abs() < f32::EPSILON);
     assert!(!target.show_junctions);
     assert_eq!(target.minimum_junction_flank, 0);
@@ -1540,7 +2218,7 @@ fn bulk_appearance_preserves_sample_specific_filters() {
 }
 
 #[test]
-fn base_sort_position_tracks_each_panel_centre_only_in_base_mode() {
+fn base_sort_position_captures_a_centre_then_keeps_the_fixed_anchor() {
     let viewport = Viewport::new(
         GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
         1_000.0,
@@ -1548,11 +2226,20 @@ fn base_sort_position_tracks_each_panel_centre_only_in_base_mode() {
     .unwrap();
 
     assert_eq!(
-        alignment_sort_position(AlignmentSortMode::Base, viewport),
+        alignment_sort_position(AlignmentSortMode::Base, None, viewport),
+        Some(150)
+    );
+    let moved = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 500, 900).unwrap(),
+        1_000.0,
+    )
+    .unwrap();
+    assert_eq!(
+        alignment_sort_position(AlignmentSortMode::Base, Some(150), moved),
         Some(150)
     );
     assert_eq!(
-        alignment_sort_position(AlignmentSortMode::MappingQuality, viewport),
+        alignment_sort_position(AlignmentSortMode::MappingQuality, None, viewport),
         None
     );
 }

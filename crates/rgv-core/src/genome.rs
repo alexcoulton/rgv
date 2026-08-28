@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ContigAliases, ContigId, GenomicInterval, ReferenceDictionary, TrackKind, TrackSource,
+    ContigAliases, ContigId, GenomicInterval, ReferenceDictionary, TrackFormat, TrackKind,
+    TrackSource,
 };
 
 pub const GENOME_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
@@ -97,6 +98,9 @@ pub struct GenomeAnnotation {
     pub name: String,
     pub kind: TrackKind,
     pub source: TrackSource,
+    /// Exact binary schema when a generic `.bb` URL or filename is ambiguous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<TrackFormat>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -158,6 +162,21 @@ impl GenomeConfiguration {
                 annotation.name.trim().is_empty()
                     || annotation.name.len() > 256
                     || matches!(annotation.kind, TrackKind::Alignment | TrackKind::Reference)
+                    || matches!(
+                        annotation.format,
+                        Some(TrackFormat::BigGenePred)
+                            if annotation.kind != TrackKind::GeneModel
+                    )
+                    || matches!(
+                        annotation.format,
+                        Some(TrackFormat::BigNarrowPeak)
+                            if annotation.kind != TrackKind::Feature
+                    )
+                    || matches!(
+                        annotation.format,
+                        Some(TrackFormat::TdfChannel { .. })
+                            if annotation.kind != TrackKind::Quantitative
+                    )
             })
         {
             return Err(GenomeConfigurationError::InvalidAnnotations);
@@ -426,8 +445,9 @@ mod tests {
                 name: "Genes".to_owned(),
                 kind: TrackKind::GeneModel,
                 source: TrackSource::Local {
-                    path: "annotations/genes.gtf.gz".to_owned(),
+                    path: "annotations/genes.bb".to_owned(),
                 },
+                format: Some(TrackFormat::BigGenePred),
             }],
             asset_provenance: Vec::new(),
         };
@@ -456,10 +476,14 @@ mod tests {
             TrackSource::Local {
                 path: directory
                     .path()
-                    .join("annotations/genes.gtf.gz")
+                    .join("annotations/genes.bb")
                     .to_string_lossy()
                     .into_owned()
             }
+        );
+        assert_eq!(
+            configuration.default_annotations[0].format,
+            Some(TrackFormat::BigGenePred)
         );
     }
 }

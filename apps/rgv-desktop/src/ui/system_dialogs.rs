@@ -1,5 +1,10 @@
 use super::super::*;
 
+fn exit_confirmation_modal() -> egui::Modal {
+    let id = egui::Id::new("exit-confirmation");
+    egui::Modal::new(id).area(egui::Modal::default_area(id).fade_in(false))
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct SystemDialogDraft {
     pub(crate) exit_confirmation_open: bool,
@@ -410,7 +415,11 @@ pub(crate) fn show_system_dialogs(
     // Paint the exit confirmation last so it remains above any already-open
     // window. Modal blocks interactions with the workspace until dismissed.
     if draft.exit_confirmation_open {
-        let response = egui::Modal::new(egui::Id::new("exit-confirmation")).show(ui.ctx(), |ui| {
+        // Exit confirmation is a blocking response to an explicit command;
+        // presenting it gradually makes the application feel unresponsive.
+        // Disable the area's own fade rather than changing animation timing
+        // globally, so the dialog appears at full opacity immediately.
+        let response = exit_confirmation_modal().show(ui.ctx(), |ui| {
             ui.heading("Exit RGV?");
             let shortcut = if cfg!(target_os = "macos") {
                 "Cmd+W"
@@ -433,5 +442,55 @@ pub(crate) fn show_system_dialogs(
         if response.should_close() {
             draft.exit_confirmation_open = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_modal_is_full_opacity_on_its_first_visible_frame() {
+        let context = egui::Context::default();
+        let theme = context.theme();
+        context.style_mut_of(theme, |style| style.animation_time = 0.2);
+        let original_animation_time = context.style_of(theme).animation_time;
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            time: Some(0.0),
+            ..egui::RawInput::default()
+        };
+
+        // The first pass measures a newly-created area. The following pass is
+        // the first one that users see, which is where Area normally fades in.
+        let _ = context.run_ui(input(), |root_ui| {
+            exit_confirmation_modal().show(root_ui.ctx(), |ui| {
+                ui.label("Exit RGV?");
+            });
+        });
+        let output = context.run_ui(input(), |root_ui| {
+            exit_confirmation_modal().show(root_ui.ctx(), |ui| {
+                ui.label("Exit RGV?");
+            });
+        });
+        let maximum_alpha = context
+            .tessellate(output.shapes, output.pixels_per_point)
+            .into_iter()
+            .filter_map(|primitive| match primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => {
+                    mesh.vertices.iter().map(|vertex| vertex.color.a()).max()
+                }
+                egui::epaint::Primitive::Callback(_) => None,
+            })
+            .max();
+
+        assert_eq!(maximum_alpha, Some(u8::MAX));
+        assert_eq!(
+            context.style_of(theme).animation_time,
+            original_animation_time
+        );
     }
 }

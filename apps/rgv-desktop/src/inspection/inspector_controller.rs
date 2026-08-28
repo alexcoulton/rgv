@@ -3,6 +3,14 @@ use super::super::*;
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn inspector_snapshot(&self) -> Option<InspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         if let Some(retained) = &self.panels.active().retained_evidence
             && matches!(
                 retained.selection.kind,
@@ -17,7 +25,7 @@ impl Viewer {
             .active()
             .selected_alignment_track
             .unwrap_or_else(|| self.primary_alignment_track_id());
-        let query = self.alignment_query_for_track(track_id)?;
+        let query = self.complete_read_query_for_track(track_id)?;
         let record = query.materialize_record(index).ok()?;
         let mate = match (record.mate_contig, record.mate_start) {
             (Some(contig_id), Some(position)) => {
@@ -441,6 +449,14 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn pileup_inspector_snapshot(&self) -> Option<InspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         if let Some(retained) = &self.panels.active().retained_evidence
             && retained.selection.kind == AutomationSelectionKind::Pileup
         {
@@ -619,6 +635,14 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn modification_inspector_snapshot(&self) -> Option<InspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         if let Some(retained) = &self.panels.active().retained_evidence
             && retained.selection.kind == AutomationSelectionKind::Modification
         {
@@ -728,6 +752,14 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn junction_inspector_snapshot(&self) -> Option<InspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         if let Some(retained) = &self.panels.active().retained_evidence
             && retained.selection.kind == AutomationSelectionKind::Junction
         {

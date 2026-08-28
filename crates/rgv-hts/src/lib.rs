@@ -13,7 +13,6 @@ mod pileup;
 mod reference;
 mod remote;
 mod remote_alignment;
-mod sampling;
 mod sbx;
 mod smrt_kinetics;
 mod supplementary;
@@ -38,8 +37,8 @@ pub use junction::{
     MAX_JUNCTIONS_PER_RECORD,
 };
 pub use local::{
-    AlignmentError, AlignmentOpenOptions, AlignmentQuery, AlignmentSource, LocalAlignmentSource,
-    QueryDetail, QueryOptions, QueryStats,
+    AlignmentError, AlignmentOpenOptions, AlignmentQuery, AlignmentSource, IndividualReadStatus,
+    LocalAlignmentSource, QueryDetail, QueryOptions, QueryStats,
 };
 pub use modification_summary::{
     MAX_MODIFICATION_SERIES, ModificationBin, ModificationProvenance, ModificationSeries,

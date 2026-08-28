@@ -81,6 +81,16 @@ struct WorkspaceScrollbarsDraft {
     read_panels: Vec<ReadPanelScrollbarDraft>,
 }
 
+fn pane_vertical_bounds(layout: &ui::PaneLayoutSnapshot, fallback: f32) -> (f32, f32) {
+    let top = layout.pane_rect.top();
+    let bottom = layout.pane_rect.bottom();
+    if top.is_finite() && bottom.is_finite() && bottom >= top {
+        (top, bottom)
+    } else {
+        (fallback, fallback)
+    }
+}
+
 /// Rebase semantic genomic text from the display list that was committed at
 /// the start of an egui pass onto the shell geometry computed during that
 /// pass. GPU rectangles are rebuilt before submission; this affine rebase
@@ -129,7 +139,18 @@ impl Viewer {
         let bases_per_pixel = self.panels.active().viewport.bases_per_pixel();
         let detail = self.panels.active().viewport.detail_level();
         let contig_name = self.panels.active().contig_name.clone();
-        let data_status = self.data_status.clone();
+        let navigation = &self.panels.active().navigation_presentation;
+        let data_status = if navigation.is_unsettled() {
+            if navigation.notice_visible {
+                "Updating view…".to_owned()
+            } else if navigation.source_status.is_empty() {
+                self.data_status.clone()
+            } else {
+                navigation.source_status.clone()
+            }
+        } else {
+            self.data_status.clone()
+        };
         let announce_status = self.announced_status != data_status;
         let active_panel_id = self.panels.active().id;
         let diagnostics = self.diagnostics_snapshot();
@@ -292,7 +313,7 @@ impl Viewer {
         let mut apply_bulk_alignment_appearance = false;
         let mut bulk_alignment_visibility = None;
         let mut bulk_alignment_collapsed = None;
-        let mut primitive_limit = u32::try_from(
+        let mut complete_read_limit = u32::try_from(
             settings_controller.map_or(self.primary_alignment_limit(), |track| {
                 track.config.maximum_alignments
             }),
@@ -455,6 +476,8 @@ impl Viewer {
         let mut group_order = settings_filters.alignment_group_order;
         let mut sort_mode = settings_filters.alignment_sort_mode;
         let mut sort_order = settings_filters.alignment_sort_order;
+        let mut read_stacking_mode = settings_filters.read_stacking_mode;
+        let mut compact_repack_requested = false;
         let mut view_as_pairs = settings_filters.view_as_pairs;
         let pair_summary = settings_query
             .as_deref()
@@ -578,18 +601,18 @@ impl Viewer {
             .enumerate()
             .map(|(index, panel)| {
                 let annotation_maximum = shared_annotation_maximum;
+                let (pane_clip_top, pane_clip_bottom) = pane_vertical_bounds(
+                    &panel.pane_layout.annotation,
+                    committed_canvas_geometry.viewport.top(),
+                );
                 let annotation_clip_top = panel
                     .scroll_display_cache
                     .as_ref()
-                    .map_or(committed_canvas_geometry.viewport.top(), |cache| {
-                        cache.annotation_clip_top
-                    });
+                    .map_or(pane_clip_top, |cache| cache.annotation_clip_top);
                 let annotation_clip_bottom = panel
                     .scroll_display_cache
                     .as_ref()
-                    .map_or(committed_canvas_geometry.viewport.top(), |cache| {
-                        cache.annotation_clip_bottom
-                    });
+                    .map_or(pane_clip_bottom, |cache| cache.annotation_clip_bottom);
                 let read_panels = panel
                     .scroll_display_cache
                     .as_ref()
@@ -654,23 +677,26 @@ impl Viewer {
                 }
             })
             .collect::<Vec<_>>();
-        let annotation_clip_top = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(committed_canvas_geometry.viewport.top(), |cache| {
-                cache.annotation_clip_top
-            });
-        let annotation_clip_bottom = self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .map_or(committed_canvas_geometry.viewport.top(), |cache| {
-                cache.annotation_clip_bottom
-            });
-        let genomic_texts = self.composite_display_list.texts.clone();
+        let (pane_annotation_top, pane_annotation_bottom) = pane_vertical_bounds(
+            &pane_layout.annotation,
+            committed_canvas_geometry.viewport.top(),
+        );
+        let genomic_texts = self
+            .composite_display_list
+            .texts
+            .iter()
+            .filter(|text| {
+                self.workspace_layout
+                    .panels
+                    .iter()
+                    .find(|layout| {
+                        text.x >= layout.canvas.left() && text.x <= layout.canvas.right()
+                    })
+                    .and_then(|layout| self.panels.get(layout.panel_id))
+                    .is_some_and(|panel| panel.navigation_presentation.permits_staged_display())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let selected_track = self.panels.active().selected_track;
         let assembly = self.assembly.clone();
         let assembly_label = assembly.context_label();
@@ -1674,8 +1700,13 @@ impl Viewer {
                     &track_frames,
                     self.panels.annotation_scroll_points,
                     0.0,
-                    annotation_clip_top,
-                    annotation_clip_bottom,
+                    // Section chrome belongs to the current pane-layout
+                    // revision. A scroll display cache can legitimately lag
+                    // by one frame during a window resize; mixing its old
+                    // annotation edge with the new read-pane edge stretches
+                    // the Read data header across the intervening space.
+                    pane_annotation_top,
+                    pane_annotation_bottom,
                     selected_track,
                     &selected_annotation_track_ids,
                     &self.panels.active().selected_read_tracks,
@@ -1961,7 +1992,7 @@ impl Viewer {
                                 let response = ui.add(
                                     egui::TextEdit::singleline(&mut read_name_editor)
                                         .desired_width(240.0)
-                                        .hint_text("Exact loaded read name"),
+                                        .hint_text("Exact read name"),
                                 ).labelled_by(label.id);
                                 if ui.button("Select").clicked()
                                     || (response.lost_focus()
@@ -1971,7 +2002,7 @@ impl Viewer {
                                 }
                             });
                             ui.small(
-                                "Searches the bounded records loaded at this panel's current locus; names are not saved in sessions.",
+                                "Searches the complete individual-read population admitted for this panel's current viewport; names are not saved in sessions.",
                             );
                             if ui
                                 .checkbox(&mut alignment_visible, "Show annotation content")
@@ -2192,6 +2223,68 @@ impl Viewer {
                                 &mut sort_order,
                                 &mut style_tag_editor,
                             );
+                            if sort_mode == AlignmentSortMode::Base {
+                                let anchor = settings_filters.alignment_sort_anchor.or_else(|| {
+                                    alignment_sort_position(
+                                        AlignmentSortMode::Base,
+                                        None,
+                                        self.panels.active().viewport,
+                                    )
+                                });
+                                if let Some(anchor) = anchor {
+                                    ui.small(format!(
+                                        "Base-sort anchor: {}:{}",
+                                        self.panels.active().contig_name,
+                                        anchor.saturating_add(1)
+                                    ));
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                let label = ui.label("Read stacking");
+                                egui::ComboBox::from_id_salt("read-stacking-mode")
+                                    .selected_text(match read_stacking_mode {
+                                        ReadStackingMode::Stable => "Stable across navigation",
+                                        ReadStackingMode::Compact => "Compact each view",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut read_stacking_mode,
+                                            ReadStackingMode::Stable,
+                                            "Stable across navigation",
+                                        )
+                                        .on_hover_text(
+                                            "Builds an organised row architecture and keeps each read on its row",
+                                        );
+                                        ui.selectable_value(
+                                            &mut read_stacking_mode,
+                                            ReadStackingMode::Compact,
+                                            "Compact each view",
+                                        )
+                                        .on_hover_text(
+                                            "Rebuilds the current view for density; reads may move while navigating",
+                                        );
+                                    })
+                                    .response
+                                    .labelled_by(label.id);
+                                if read_stacking_mode == ReadStackingMode::Stable
+                                    && ui
+                                        .button("Rebuild stable architecture")
+                                        .on_hover_text(
+                                            "Use the current known neighbourhood as a new organised stable baseline",
+                                        )
+                                        .clicked()
+                                {
+                                    compact_repack_requested = true;
+                                }
+                            });
+                            ui.small(match read_stacking_mode {
+                                ReadStackingMode::Stable => {
+                                    "Builds an organised row architecture and keeps each read on its row."
+                                }
+                                ReadStackingMode::Compact => {
+                                    "Rebuilds the current view for density; reads may move while navigating."
+                                }
+                            });
                             ui.checkbox(&mut view_as_pairs, "View as pairs")
                                 .on_hover_text(
                                     "Pack primary ends with the same read name on one row and select them as one template",
@@ -2391,9 +2484,11 @@ impl Viewer {
                                 );
                             });
                             ui.horizontal(|ui| {
-                                ui.label("Read safety cap");
+                                ui.label("Complete read limit").on_hover_text(
+                                    "At or below the effective limit, every eligible viewport read is shown. Above it, RGV shows no individual reads and asks you to zoom in or raise the limit. The default is 50,000; raising it can increase memory, query/layout time, and GPU work. Multi-panel or multi-track workspace allocation can make the effective limit lower than this requested value.",
+                                );
                                 ui.add(
-                                    egui::Slider::new(&mut primitive_limit, 1_000..=250_000)
+                                    egui::Slider::new(&mut complete_read_limit, 1_000..=250_000)
                                         .logarithmic(true),
                                 );
                             });
@@ -2730,11 +2825,22 @@ impl Viewer {
         if properties_resize_active {
             self.pending_resolution_query_refresh = None;
         }
-        if self.workspace_layout.revision != new_workspace_layout.revision {
+        let workspace_layout_changed =
+            self.workspace_layout.revision != new_workspace_layout.revision;
+        if workspace_layout_changed {
             self.workspace_layout_recomputations =
                 self.workspace_layout_recomputations.saturating_add(1);
         }
         self.workspace_layout = new_workspace_layout;
+        if workspace_layout_changed {
+            for panel in self.panels.iter_mut() {
+                panel
+                    .navigation_presentation
+                    .invalidate_preview("workspace layout changed");
+                panel.navigation_provisional_display = None;
+            }
+            self.discard_navigation_preview_texture();
+        }
         if !committed_canvas_geometry.approximately_equals(new_canvas_geometry) {
             let width_changed = (committed_canvas_geometry.genomic.width()
                 - new_canvas_geometry.genomic.width())
@@ -2945,6 +3051,7 @@ impl Viewer {
             alignment_configuration_changed = true;
         }
         if alignment_configuration_changed {
+            self.invalidate_navigation_preview_contract("alignment track layout changed");
             self.rebuild_genomic_display();
             self.display_dirty = true;
         }
@@ -3275,6 +3382,7 @@ impl Viewer {
         self.review_items = review_items;
         self.review_status_filter = review_status_filter;
         if regions_changed {
+            self.invalidate_navigation_preview_contract("region overlays changed");
             self.rebuild_all_panel_displays();
             self.display_dirty = true;
         } else if review_changed {
@@ -3567,6 +3675,14 @@ impl Viewer {
             self.start_session_save(path);
         }
         if export_png_requested
+            && self
+                .panels
+                .iter()
+                .any(|panel| panel.navigation_presentation.is_unsettled())
+        {
+            "The target viewport is still being checked; export is available after it settles"
+                .clone_into(&mut self.data_status);
+        } else if export_png_requested
             && let Some(path) = rfd::FileDialog::new()
                 .set_file_name("rgv-view.png")
                 .add_filter("PNG image", &["png"])
@@ -3613,7 +3729,8 @@ impl Viewer {
         if select_read_name_requested {
             let name = read_name_editor.trim().as_bytes().to_vec();
             if self.select_read_or_template_by_name(settings_alignment_id, &name) {
-                "Selected the exact loaded read/template name".clone_into(&mut self.data_status);
+                "Selected the exact read/template name from the complete view"
+                    .clone_into(&mut self.data_status);
             } else {
                 "No exact read/template name is loaded in this track at the current locus"
                     .clone_into(&mut self.data_status);
@@ -3672,6 +3789,7 @@ impl Viewer {
             self.reference_reverse_complement = reference_reverse_complement;
             self.reference_translation_frames = reference_translation_frames;
             self.reference_genetic_code = reference_genetic_code;
+            self.invalidate_navigation_preview_contract("reference presentation changed");
             self.rebuild_all_panel_displays();
             self.display_dirty = true;
         }
@@ -3768,6 +3886,7 @@ impl Viewer {
                 .copied()
                 .map(modification_code_label)
                 .collect();
+            self.invalidate_navigation_preview_contract("alignment presentation changed");
             self.layout_cache.clear();
             self.rebuild_genomic_display();
             self.display_dirty = true;
@@ -3918,6 +4037,7 @@ impl Viewer {
                 .into_iter()
                 .collect::<HashSet<_>>();
         if track_configuration_changed {
+            self.invalidate_navigation_preview_contract("auxiliary track presentation changed");
             self.reconcile_track_presentation();
             self.rebuild_genomic_display();
             self.display_dirty = true;
@@ -3941,12 +4061,28 @@ impl Viewer {
                 sort_mode = AlignmentSortMode::Tag(tag);
             }
         }
+        let alignment_sort_anchor = (sort_mode == AlignmentSortMode::Base)
+            .then(|| {
+                (settings_filters.alignment_sort_mode == AlignmentSortMode::Base)
+                    .then_some(settings_filters.alignment_sort_anchor)
+                    .flatten()
+                    .or_else(|| {
+                        alignment_sort_position(
+                            AlignmentSortMode::Base,
+                            None,
+                            self.panels.active().viewport,
+                        )
+                    })
+            })
+            .flatten();
         if editing_primary_settings
             && (color_mode != self.primary_alignment_filters().alignment_color_mode
                 || group_mode != self.primary_alignment_filters().alignment_group_mode
                 || group_order != self.primary_alignment_filters().alignment_group_order
                 || sort_mode != self.primary_alignment_filters().alignment_sort_mode
                 || sort_order != self.primary_alignment_filters().alignment_sort_order
+                || alignment_sort_anchor != self.primary_alignment_filters().alignment_sort_anchor
+                || read_stacking_mode != self.primary_alignment_filters().read_stacking_mode
                 || view_as_pairs != self.primary_alignment_filters().view_as_pairs
                 || (override_pair_bounds.then_some(minimum_template_length)
                     != self.primary_alignment_filters().minimum_template_length)
@@ -3961,6 +4097,8 @@ impl Viewer {
             self.primary_alignment_filters_mut().alignment_group_order = group_order;
             self.primary_alignment_filters_mut().alignment_sort_mode = sort_mode;
             self.primary_alignment_filters_mut().alignment_sort_order = sort_order;
+            self.primary_alignment_filters_mut().alignment_sort_anchor = alignment_sort_anchor;
+            self.primary_alignment_filters_mut().read_stacking_mode = read_stacking_mode;
             self.primary_alignment_filters_mut().view_as_pairs = view_as_pairs;
             if override_pair_bounds {
                 maximum_template_length = maximum_template_length.max(minimum_template_length);
@@ -4024,9 +4162,10 @@ impl Viewer {
             }
         }
         if editing_primary_settings
-            && primitive_limit != u32::try_from(self.primary_alignment_limit()).unwrap_or(u32::MAX)
+            && complete_read_limit
+                != u32::try_from(self.primary_alignment_limit()).unwrap_or(u32::MAX)
         {
-            self.set_primary_alignment_limit(primitive_limit as usize);
+            self.set_primary_alignment_limit(complete_read_limit as usize);
             self.query_options_changed();
         }
         if !editing_primary_settings && editing_alignment_id.is_some() {
@@ -4036,6 +4175,8 @@ impl Viewer {
             filters.alignment_group_order = group_order;
             filters.alignment_sort_mode = sort_mode;
             filters.alignment_sort_order = sort_order;
+            filters.alignment_sort_anchor = alignment_sort_anchor;
+            filters.read_stacking_mode = read_stacking_mode;
             filters.view_as_pairs = view_as_pairs;
             filters.minimum_template_length =
                 override_pair_bounds.then_some(minimum_template_length);
@@ -4085,10 +4226,23 @@ impl Viewer {
                         expression: filter_expression,
                         error: filter_error,
                     },
-                    maximum_alignments: primitive_limit as usize,
+                    maximum_alignments: complete_read_limit as usize,
                     apply_filter,
                 },
             );
+        }
+        if compact_repack_requested
+            && let Some(track) = self
+                .alignment_tracks
+                .iter_mut()
+                .find(|track| track.config.id == settings_alignment_id)
+        {
+            let projection = track.projection_mut(active_panel_id);
+            projection.pending_row_repack = true;
+            projection.alignment_rows = None;
+            projection.cached_layout = None;
+            self.rebuild_genomic_display();
+            self.display_dirty = true;
         }
         if apply_bulk_alignment_appearance
             && let Err(error) =
@@ -4226,5 +4380,21 @@ mod tests {
         };
 
         assert!(remap_genomic_texts_for_layout(&[outside], &previous, &current).is_empty());
+    }
+
+    #[test]
+    fn pane_snapshot_supplies_section_chrome_bounds_without_a_scroll_cache() {
+        let mut layout = ui::PaneLayoutSnapshot::empty(ui::TrackPane::Annotation);
+        layout.pane_rect =
+            egui::Rect::from_min_max(egui::pos2(0.0, 220.0), egui::pos2(800.0, 540.0));
+
+        assert_eq!(pane_vertical_bounds(&layout, 100.0), (220.0, 540.0));
+        assert_eq!(
+            pane_vertical_bounds(
+                &ui::PaneLayoutSnapshot::empty(ui::TrackPane::Annotation),
+                100.0,
+            ),
+            (100.0, 100.0)
+        );
     }
 }

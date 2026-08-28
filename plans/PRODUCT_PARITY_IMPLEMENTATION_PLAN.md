@@ -1,5 +1,10 @@
 # RGV Product Parity Implementation Plan
 
+> **Complete-read amendment (2026-08-28):** Individual-read sampling requirements in this plan are
+> superseded by [Complete read presentation](COMPLETE_READ_PRESENTATION_PLAN.md). Complete
+> aggregate accumulation remains required, but an over-limit individual-read view now presents no
+> reads and reports Too dense.
+
 Status date: 22 August 2026
 
 ## Implementation status

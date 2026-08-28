@@ -9,7 +9,8 @@ use thiserror::Error;
 use crate::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
     CoverageScaleTransform, DetailLevel, ModifiedBaseColorMode, OverlappingMatePolicy, PanelId,
-    ReadBaseDisplayMode, ReviewStatus, TrackId, TrackKind, TrackSource,
+    ReadBaseDisplayMode, ReadStackingMode, ReadStackingTransitionReason, ReviewStatus, TrackId,
+    TrackKind, TrackSource,
 };
 
 pub const AUTOMATION_SCHEMA_VERSION: u32 = 4;
@@ -575,6 +576,21 @@ pub enum AutomationSetting {
         track_ids: Vec<TrackId>,
         value: AlignmentColorMode,
     },
+    ReadStackingMode {
+        track_ids: Vec<TrackId>,
+        value: ReadStackingMode,
+    },
+    CompleteReadLimit {
+        track_ids: Vec<TrackId>,
+        value: usize,
+    },
+    /// One-shot stable-baseline replacement. This is deliberately distinct
+    /// from the persistent compact stacking mode.
+    #[serde(alias = "compact_repack_reads")]
+    RebuildStableReadArchitecture {
+        panel_id: PanelId,
+        track_ids: Vec<TrackId>,
+    },
     AlignmentDensity {
         value: f32,
     },
@@ -696,6 +712,21 @@ impl AutomationSetting {
                     validate_sam_tag_bytes(*tag)?;
                 }
                 Ok(())
+            }
+            Self::ReadStackingMode { track_ids, .. } => validate_track_selection(track_ids),
+            Self::CompleteReadLimit { track_ids, value } => {
+                validate_track_selection(track_ids)?;
+                (1_000..=250_000)
+                    .contains(value)
+                    .then_some(())
+                    .ok_or_else(|| "complete read limit must be between 1000 and 250000".to_owned())
+            }
+            Self::RebuildStableReadArchitecture {
+                panel_id,
+                track_ids,
+            } => {
+                validate_panel_id(*panel_id)?;
+                validate_track_selection(track_ids)
             }
             Self::AlignmentDensity { value }
                 if value.is_finite() && (0.25..=4.0).contains(value) =>
@@ -1145,6 +1176,24 @@ pub struct AutomationPanelSnapshot {
     #[serde(default)]
     pub settled: bool,
     #[serde(default)]
+    pub navigation_transaction_active: bool,
+    #[serde(default)]
+    pub navigation_preview_active: bool,
+    #[serde(default)]
+    pub preview_source_locus: Option<String>,
+    #[serde(default)]
+    pub preview_target_locus: Option<String>,
+    #[serde(default)]
+    pub preview_source_generation: Option<u64>,
+    #[serde(default)]
+    pub preview_target_generation: Option<u64>,
+    #[serde(default)]
+    pub preview_age_ms: Option<u64>,
+    #[serde(default)]
+    pub preview_kind: Option<String>,
+    #[serde(default)]
+    pub preview_invalidation_reason: Option<String>,
+    #[serde(default)]
     pub render_lanes: Vec<AutomationRenderLaneSnapshot>,
     #[serde(default)]
     pub read_panel_states: Vec<AutomationReadPanelStateSnapshot>,
@@ -1227,6 +1276,7 @@ pub enum AutomationRenderOmissionReason {
     NoReference,
     NoData,
     Loading,
+    TooDense,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1258,6 +1308,17 @@ pub enum AutomationTrackLifecycle {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationReadPresentationState {
+    #[default]
+    Unavailable,
+    Checking,
+    Complete,
+    TooDense,
+    Failed,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationAlignmentTrackSnapshot {
@@ -1265,9 +1326,89 @@ pub struct AutomationAlignmentTrackSnapshot {
     pub group_order: AlignmentOrderDirection,
     pub sort_mode: AlignmentSortMode,
     pub sort_order: AlignmentOrderDirection,
+    #[serde(default)]
+    pub sort_anchor: Option<u64>,
     pub filter_expression: String,
     #[serde(default)]
     pub view_as_pairs: bool,
+    #[serde(default)]
+    pub read_stacking_mode: ReadStackingMode,
+    #[serde(default)]
+    pub read_presentation_state: AutomationReadPresentationState,
+    #[serde(default)]
+    pub requested_complete_read_limit: usize,
+    #[serde(default)]
+    pub effective_complete_read_limit: usize,
+    #[serde(default)]
+    pub eligible_read_records: usize,
+    #[serde(default)]
+    pub complete_read_records: usize,
+    #[serde(default)]
+    pub refusal_eligible_read_records: usize,
+    #[serde(default)]
+    pub read_refusal_scope: Option<String>,
+    #[serde(default)]
+    pub row_layout_revision: u64,
+    #[serde(default)]
+    pub row_layout_architecture_version: u16,
+    #[serde(default)]
+    pub row_layout_reconciliation_micros: u64,
+    #[serde(default)]
+    pub row_layout_retained: usize,
+    #[serde(default)]
+    pub row_layout_restored: usize,
+    #[serde(default)]
+    pub row_layout_added: usize,
+    #[serde(default)]
+    pub row_layout_moved: usize,
+    #[serde(default)]
+    pub row_layout_reservations: usize,
+    #[serde(default)]
+    pub row_layout_history_bytes: usize,
+    #[serde(default)]
+    pub row_layout_islands: usize,
+    #[serde(default)]
+    pub row_layout_evictions: usize,
+    #[serde(default)]
+    pub row_layout_transition_reason: ReadStackingTransitionReason,
+    #[serde(default)]
+    pub row_layout_policy_fingerprint: u64,
+    #[serde(default)]
+    pub row_layout_projection_fingerprint: u64,
+    #[serde(default)]
+    pub row_layout_stable_rows: usize,
+    #[serde(default)]
+    pub row_layout_canonical_rows: usize,
+    #[serde(default)]
+    pub row_layout_row_inflation: usize,
+    #[serde(default)]
+    pub row_layout_canonical_displacement: usize,
+    #[serde(default)]
+    pub row_layout_top_first_violations: usize,
+    #[serde(default)]
+    pub row_layout_query_occupied_row_span: usize,
+    #[serde(default)]
+    pub row_layout_query_empty_rows: usize,
+    #[serde(default)]
+    pub row_layout_query_empty_ratio_ppm: u32,
+    #[serde(default)]
+    pub row_layout_horizon_start: u64,
+    #[serde(default)]
+    pub row_layout_horizon_end: u64,
+    #[serde(default)]
+    pub row_layout_horizon_generation: u64,
+    #[serde(default)]
+    pub row_layout_horizon_extensions: usize,
+    #[serde(default)]
+    pub row_layout_horizon_records: usize,
+    #[serde(default)]
+    pub row_layout_horizon_bytes: usize,
+    #[serde(default)]
+    pub row_layout_horizon_truncated: bool,
+    #[serde(default)]
+    pub row_layout_horizon_cache_hit: bool,
+    #[serde(default, alias = "compact_repack_pending")]
+    pub stable_architecture_rebuild_pending: bool,
     #[serde(default)]
     pub overlapping_mate_policy: OverlappingMatePolicy,
     #[serde(default)]
@@ -1573,6 +1714,7 @@ pub enum AutomationErrorCode {
     InvalidSettingScope,
     SettingOutOfRange,
     EffectiveStateUnavailable,
+    TooDense,
     NoSelection,
     SelectionStale,
     StaleHandle,
@@ -2078,6 +2220,15 @@ mod tests {
                 maximum_read_stack_scroll_points: 0.0,
                 render_generation: 1,
                 settled: true,
+                navigation_transaction_active: false,
+                navigation_preview_active: false,
+                preview_source_locus: None,
+                preview_target_locus: None,
+                preview_source_generation: None,
+                preview_target_generation: None,
+                preview_age_ms: None,
+                preview_kind: None,
+                preview_invalidation_reason: None,
                 render_lanes: Vec::new(),
                 read_panel_states: Vec::new(),
                 selected_presentation_nodes: Vec::new(),
@@ -2199,9 +2350,12 @@ mod tests {
             serde_json::from_str::<AutomationSelectionSnapshot>(&selection_json).unwrap(),
             selection
         );
-        assert!(!workspace_json.contains("source"));
-        assert!(!workspace_json.contains("path"));
-        assert!(!workspace_json.contains("sequence"));
+        // Safe navigation metadata deliberately includes
+        // `preview_source_locus`; the privacy boundary forbids source/path/
+        // sequence payload fields, not the word "source" in a semantic key.
+        assert!(!workspace_json.contains("\"source\":"));
+        assert!(!workspace_json.contains("\"path\":"));
+        assert!(!workspace_json.contains("\"sequence\":"));
     }
 
     #[test]
@@ -2259,6 +2413,66 @@ mod tests {
             invalid.to_json(),
             Err(AutomationError::InvalidCommand { index: 0, .. })
         ));
+    }
+
+    #[test]
+    fn stable_mode_and_one_shot_repack_are_distinct_typed_settings() {
+        let batch = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::ReadStackingMode {
+                        track_ids: vec![TrackId::new(2)],
+                        value: ReadStackingMode::Stable,
+                    },
+                },
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::RebuildStableReadArchitecture {
+                        panel_id: PanelId::new(1),
+                        track_ids: vec![TrackId::new(2)],
+                    },
+                },
+            ],
+        };
+
+        let json = batch.to_json().unwrap();
+        assert!(json.contains("read_stacking_mode"));
+        assert!(json.contains("rebuild_stable_read_architecture"));
+        assert_eq!(AutomationBatch::from_json(&json).unwrap(), batch);
+        let legacy = json.replace("rebuild_stable_read_architecture", "compact_repack_reads");
+        assert_eq!(AutomationBatch::from_json(&legacy).unwrap(), batch);
+    }
+
+    #[test]
+    fn complete_read_limit_is_a_bounded_typed_setting() {
+        let valid = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::Configure {
+                setting: AutomationSetting::CompleteReadLimit {
+                    track_ids: vec![TrackId::new(2)],
+                    value: 50_000,
+                },
+            }],
+        };
+        let json = valid.to_json().unwrap();
+        assert!(json.contains("complete_read_limit"));
+        assert_eq!(AutomationBatch::from_json(&json).unwrap(), valid);
+
+        for value in [999, 250_001] {
+            let invalid = AutomationBatch {
+                schema_version: AUTOMATION_SCHEMA_VERSION,
+                commands: vec![AutomationCommand::Configure {
+                    setting: AutomationSetting::CompleteReadLimit {
+                        track_ids: vec![TrackId::new(2)],
+                        value,
+                    },
+                }],
+            };
+            assert!(matches!(
+                invalid.to_json(),
+                Err(AutomationError::InvalidCommand { index: 0, .. })
+            ));
+        }
     }
 
     #[test]

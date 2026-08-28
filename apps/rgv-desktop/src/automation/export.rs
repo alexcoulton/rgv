@@ -360,13 +360,13 @@ pub(crate) fn automation_alignments_export(
         let _ = push_automation_export_line(
             &mut output,
             &format!(
-                "# track_provenance\t{}\t{}\trecords_seen={}\trecords_eligible={}\trecords_retained={}\tretained_truncated={}\tunmapped_ignored={}\tsecondary_filtered={}\tsupplementary_filtered={}\tuser_filtered={}\tduplicate_filtered={}\tqc_failed_filtered={}",
+                "# track_provenance\t{}\t{}\tread_presentation=complete\tcomplete_read_limit={}\trecords_seen={}\trecords_eligible={}\tcomplete_records={}\tunmapped_ignored={}\tsecondary_filtered={}\tsupplementary_filtered={}\tuser_filtered={}\tduplicate_filtered={}\tqc_failed_filtered={}",
                 track.id.get(),
                 sanitized_tsv_field(&track.name, 4_096),
+                query.stats.complete_read_limit,
                 query.stats.records_seen,
                 query.stats.records_eligible,
                 query.batch.len(),
-                query.stats.truncated,
                 query.stats.records_filtered_unmapped,
                 query.stats.records_filtered_secondary,
                 query.stats.records_filtered_supplementary,

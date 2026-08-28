@@ -434,17 +434,23 @@ pub(crate) fn effective_template_length_bounds_for_filters(
     }
 }
 
-pub(crate) fn alignment_sort_position(mode: AlignmentSortMode, viewport: Viewport) -> Option<u64> {
+pub(crate) fn alignment_sort_position(
+    mode: AlignmentSortMode,
+    fixed_anchor: Option<u64>,
+    viewport: Viewport,
+) -> Option<u64> {
     if mode != AlignmentSortMode::Base {
         return None;
     }
     let interval = viewport.interval();
-    Some(
-        interval
-            .start()
-            .saturating_add(interval.len() / 2)
-            .min(interval.end().saturating_sub(1)),
-    )
+    fixed_anchor.or_else(|| {
+        Some(
+            interval
+                .start()
+                .saturating_add(interval.len() / 2)
+                .min(interval.end().saturating_sub(1)),
+        )
+    })
 }
 
 pub(crate) fn mutation_record_index_at_position(

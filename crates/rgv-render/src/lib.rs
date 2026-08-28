@@ -12,7 +12,16 @@ use rgv_layout::{
 use wgpu::util::DeviceExt;
 
 const RECTANGLE_SHADER: &str = include_str!("rectangle.wgsl");
+const NAVIGATION_PREVIEW_SHADER: &str = include_str!("navigation_preview.wgsl");
 const MAX_UPLOAD_BYTES_PER_FRAME: usize = 16 * 1024 * 1024;
+pub const MAX_NAVIGATION_PREVIEW_BYTES: u64 = 128 * 1024 * 1024;
+
+fn navigation_preview_texture_bytes(width: u32, height: u32) -> Option<u64> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(4)?;
+    (width > 0 && height > 0 && bytes <= MAX_NAVIGATION_PREVIEW_BYTES).then_some(bytes)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
@@ -71,6 +80,8 @@ pub struct RectangleRenderer {
     pipeline: wgpu::RenderPipeline,
     screen_buffer: wgpu::Buffer,
     screen_bind_group: wgpu::BindGroup,
+    neutral_screen_buffer: wgpu::Buffer,
+    neutral_screen_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     instance_count: u32,
@@ -125,6 +136,23 @@ impl RectangleRenderer {
                 resource: screen_buffer.as_entire_binding(),
             }],
         });
+        let neutral_screen_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RGV neutral rectangle screen uniform"),
+            contents: bytemuck::bytes_of(&ScreenUniform {
+                size: [1.0, 1.0],
+                selected_object_id: 0,
+                hovered_object_id: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let neutral_screen_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("RGV neutral rectangle screen bind group"),
+            layout: &screen_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: neutral_screen_buffer.as_entire_binding(),
+            }],
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("RGV rectangle pipeline layout"),
             bind_group_layouts: &[Some(&screen_layout)],
@@ -162,6 +190,8 @@ impl RectangleRenderer {
             pipeline,
             screen_buffer,
             screen_bind_group,
+            neutral_screen_buffer,
+            neutral_screen_bind_group,
             instance_buffer,
             instance_capacity,
             instance_count: 0,
@@ -189,6 +219,15 @@ impl RectangleRenderer {
             hovered_object_id: hovered_object_id.unwrap_or_default(),
         };
         queue.write_buffer(&self.screen_buffer, 0, bytemuck::bytes_of(&screen));
+        queue.write_buffer(
+            &self.neutral_screen_buffer,
+            0,
+            bytemuck::bytes_of(&ScreenUniform {
+                size: screen.size,
+                selected_object_id: 0,
+                hovered_object_id: 0,
+            }),
+        );
 
         let maximum_instances =
             MAX_UPLOAD_BYTES_PER_FRAME / std::mem::size_of::<RectangleInstance>();
@@ -252,6 +291,16 @@ impl RectangleRenderer {
         pass.draw(0..6, 0..self.instance_count);
     }
 
+    pub fn render_unhighlighted<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        if self.instance_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.neutral_screen_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+        pass.draw(0..6, 0..self.instance_count);
+    }
+
     pub const fn instance_count(&self) -> u32 {
         self.instance_count
     }
@@ -259,6 +308,492 @@ impl RectangleRenderer {
     pub const fn last_prepare_stats(&self) -> PrepareStats {
         self.last_prepare_stats
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct NavigationPreviewInstance {
+    pub destination_origin: [f32; 2],
+    pub destination_size: [f32; 2],
+    pub source_origin: [f32; 2],
+    pub source_size: [f32; 2],
+    /// Source-local x = destination-local x * scale + offset. The third
+    /// component is 1 for a valid source and 0 for a neutral fallback.
+    pub sample_transform: [f32; 4],
+}
+
+impl NavigationPreviewInstance {
+    pub fn new(
+        destination_origin: [f32; 2],
+        destination_size: [f32; 2],
+        source_origin: [f32; 2],
+        source_size: [f32; 2],
+        source_interval: Option<(f64, f64)>,
+        target_interval: (f64, f64),
+    ) -> Self {
+        let transform = source_interval.and_then(|(source_start, source_end)| {
+            let source_length = source_end - source_start;
+            let target_length = target_interval.1 - target_interval.0;
+            (source_start.is_finite()
+                && source_end.is_finite()
+                && target_interval.0.is_finite()
+                && target_interval.1.is_finite()
+                && source_length > 0.0
+                && target_length > 0.0)
+                .then(|| {
+                    [
+                        (target_length / source_length) as f32,
+                        ((target_interval.0 - source_start) / source_length) as f32,
+                        1.0,
+                        0.0,
+                    ]
+                })
+        });
+        Self {
+            destination_origin,
+            destination_size,
+            source_origin,
+            source_size,
+            sample_transform: transform.unwrap_or([1.0, 0.0, 0.0, 0.0]),
+        }
+    }
+
+    pub fn source_x_for_destination_fraction(self, fraction: f32) -> Option<f32> {
+        (self.sample_transform[2] >= 0.5)
+            .then(|| fraction.mul_add(self.sample_transform[0], self.sample_transform[1]))
+    }
+
+    fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
+        const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+            0 => Float32x2,
+            1 => Float32x2,
+            2 => Float32x2,
+            3 => Float32x2,
+            4 => Float32x4
+        ];
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &ATTRIBUTES,
+        }
+    }
+}
+
+/// Converts an integer capture rectangle into filter-safe normalized UVs.
+/// Sampling texel centres prevents linear filtering from blending pixels from
+/// adjacent panels or window chrome at a sub-rectangle boundary.
+pub fn navigation_preview_source_uv(
+    origin: [u32; 2],
+    size: [u32; 2],
+    texture_size: [u32; 2],
+) -> ([f32; 2], [f32; 2]) {
+    let texture_width = texture_size[0].max(1) as f32;
+    let texture_height = texture_size[1].max(1) as f32;
+    (
+        [
+            (origin[0] as f32 + 0.5) / texture_width,
+            (origin[1] as f32 + 0.5) / texture_height,
+        ],
+        [
+            size[0].saturating_sub(1) as f32 / texture_width,
+            size[1].saturating_sub(1) as f32 / texture_height,
+        ],
+    )
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct NavigationPreviewScreen {
+    size: [f32; 2],
+    padding: [f32; 2],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NavigationPreviewStats {
+    pub allocated_bytes: u64,
+    pub texture_captures: u64,
+    pub texture_composites: u64,
+    pub texture_invalidations: u64,
+    pub texture_fallbacks: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+struct NavigationPreviewTexture {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+}
+
+pub struct NavigationPreviewRenderer {
+    preview_pipeline: wgpu::RenderPipeline,
+    background_pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    screen_buffer: wgpu::Buffer,
+    instance_buffer: wgpu::Buffer,
+    instance_capacity: usize,
+    instance_count: u32,
+    texture: Option<NavigationPreviewTexture>,
+    fallback_texture: NavigationPreviewTexture,
+    format: wgpu::TextureFormat,
+    size: [u32; 2],
+    needs_clear: bool,
+    stats: NavigationPreviewStats,
+}
+
+impl NavigationPreviewRenderer {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("RGV navigation preview shader"),
+            source: wgpu::ShaderSource::Wgsl(NAVIGATION_PREVIEW_SHADER.into()),
+        });
+        let screen_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("RGV navigation preview screen uniform"),
+            contents: bytemuck::bytes_of(&NavigationPreviewScreen {
+                size: [1.0, 1.0],
+                padding: [0.0; 2],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("RGV navigation preview sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RGV navigation preview bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let preview_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RGV navigation preview pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let preview_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("RGV navigation preview pipeline"),
+            layout: Some(&preview_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("preview_vertex"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[NavigationPreviewInstance::vertex_buffer_layout()],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("preview_fragment"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let background_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RGV navigation preview background layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("RGV navigation preview background pipeline"),
+            layout: Some(&background_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("background_vertex"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("background_fragment"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let instance_capacity = 1;
+        let instance_buffer = create_navigation_preview_instance_buffer(device, instance_capacity);
+        let fallback_gpu_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RGV navigation preview fallback texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let fallback_view =
+            fallback_gpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let fallback_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("RGV navigation preview fallback bind group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: screen_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&fallback_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        let fallback_texture = NavigationPreviewTexture {
+            _texture: fallback_gpu_texture,
+            view: fallback_view,
+            bind_group: fallback_bind_group,
+        };
+        Self {
+            preview_pipeline,
+            background_pipeline,
+            bind_group_layout,
+            sampler,
+            screen_buffer,
+            instance_buffer,
+            instance_capacity,
+            instance_count: 0,
+            texture: None,
+            fallback_texture,
+            format,
+            size: [0, 0],
+            needs_clear: false,
+            stats: NavigationPreviewStats::default(),
+        }
+    }
+
+    pub fn ensure_texture(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool {
+        let Some(requested_bytes) = navigation_preview_texture_bytes(width, height) else {
+            self.invalidate_texture();
+            self.stats.texture_fallbacks = self.stats.texture_fallbacks.saturating_add(1);
+            return false;
+        };
+        if self.texture.is_some() && self.size == [width, height] {
+            return true;
+        }
+        if self.texture.is_some() {
+            self.stats.texture_invalidations = self.stats.texture_invalidations.saturating_add(1);
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RGV committed genomic canvas"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("RGV navigation preview bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.screen_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.texture = Some(NavigationPreviewTexture {
+            _texture: texture,
+            view,
+            bind_group,
+        });
+        self.size = [width, height];
+        self.needs_clear = true;
+        self.stats.allocated_bytes = requested_bytes;
+        self.stats.width = width;
+        self.stats.height = height;
+        true
+    }
+
+    /// Releases the retained evidentiary source immediately. The 1x1 neutral
+    /// fallback remains resident so checking frames can still be rendered
+    /// without allocating a pathological full-size texture.
+    pub fn invalidate_texture(&mut self) {
+        if self.texture.take().is_some() {
+            self.stats.texture_invalidations = self.stats.texture_invalidations.saturating_add(1);
+        }
+        self.size = [0, 0];
+        self.needs_clear = false;
+        self.stats.allocated_bytes = 0;
+        self.stats.width = 0;
+        self.stats.height = 0;
+    }
+
+    pub fn capture_committed_regions(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        rectangle_renderer: &RectangleRenderer,
+        regions: &[[u32; 4]],
+    ) {
+        let Some(texture) = self.texture.as_ref() else {
+            return;
+        };
+        let load = if self.needs_clear {
+            wgpu::LoadOp::Clear(wgpu::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            })
+        } else {
+            wgpu::LoadOp::Load
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("RGV committed genomic canvas capture"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &texture.view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        for [x, y, width, height] in regions.iter().copied() {
+            if width == 0 || height == 0 {
+                continue;
+            }
+            pass.set_scissor_rect(x, y, width, height);
+            pass.set_pipeline(&self.background_pipeline);
+            pass.draw(0..3, 0..1);
+            rectangle_renderer.render_unhighlighted(&mut pass);
+            self.stats.texture_captures = self.stats.texture_captures.saturating_add(1);
+        }
+        drop(pass);
+        self.needs_clear = false;
+    }
+
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen_size: [u32; 2],
+        instances: &[NavigationPreviewInstance],
+        composite_targets: u64,
+    ) {
+        queue.write_buffer(
+            &self.screen_buffer,
+            0,
+            bytemuck::bytes_of(&NavigationPreviewScreen {
+                size: [screen_size[0].max(1) as f32, screen_size[1].max(1) as f32],
+                padding: [0.0; 2],
+            }),
+        );
+        if instances.len() > self.instance_capacity {
+            self.instance_capacity = instances.len().next_power_of_two();
+            self.instance_buffer =
+                create_navigation_preview_instance_buffer(device, self.instance_capacity);
+        }
+        if !instances.is_empty() {
+            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
+        }
+        self.instance_count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
+        self.stats.texture_composites = self
+            .stats
+            .texture_composites
+            .saturating_add(u64::from(self.instance_count).saturating_mul(composite_targets));
+    }
+
+    pub fn render<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        if self.instance_count == 0 {
+            return;
+        }
+        let texture = self.texture.as_ref().unwrap_or(&self.fallback_texture);
+        pass.set_pipeline(&self.preview_pipeline);
+        pass.set_bind_group(0, &texture.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+        pass.draw(0..6, 0..self.instance_count);
+    }
+
+    pub const fn texture_available(&self) -> bool {
+        self.texture.is_some()
+    }
+
+    pub const fn stats(&self) -> NavigationPreviewStats {
+        self.stats
+    }
+}
+
+fn create_navigation_preview_instance_buffer(
+    device: &wgpu::Device,
+    capacity: usize,
+) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("RGV navigation preview instances"),
+        size: (capacity * std::mem::size_of::<NavigationPreviewInstance>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 fn screen_uniform_visibility() -> wgpu::ShaderStages {
@@ -465,6 +1000,159 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn navigation_preview_transform_preserves_genomic_mapping() {
+        let preview = NavigationPreviewInstance::new(
+            [0.0, 0.0],
+            [1_000.0, 600.0],
+            [0.0, 0.0],
+            [1.0, 1.0],
+            Some((100.0, 200.0)),
+            (50.0, 250.0),
+        );
+        assert_eq!(preview.source_x_for_destination_fraction(0.0), Some(-0.5));
+        assert_eq!(preview.source_x_for_destination_fraction(0.25), Some(0.0));
+        assert_eq!(preview.source_x_for_destination_fraction(0.5), Some(0.5));
+        assert_eq!(preview.source_x_for_destination_fraction(0.75), Some(1.0));
+        assert_eq!(preview.source_x_for_destination_fraction(1.0), Some(1.5));
+    }
+
+    #[test]
+    fn navigation_preview_transform_samples_a_zoomed_in_subset() {
+        let preview = NavigationPreviewInstance::new(
+            [0.0, 0.0],
+            [1_000.0, 600.0],
+            [0.0, 0.0],
+            [1.0, 1.0],
+            Some((50.0, 250.0)),
+            (100.0, 200.0),
+        );
+        assert_eq!(preview.source_x_for_destination_fraction(0.0), Some(0.25));
+        assert_eq!(preview.source_x_for_destination_fraction(0.5), Some(0.5));
+        assert_eq!(preview.source_x_for_destination_fraction(1.0), Some(0.75));
+    }
+
+    #[test]
+    fn navigation_preview_transform_preserves_fractional_base_camera_state() {
+        let preview = NavigationPreviewInstance::new(
+            [0.0, 0.0],
+            [1_000.0, 600.0],
+            [0.0, 0.0],
+            [1.0, 1.0],
+            Some((100.25, 200.25)),
+            (125.25, 175.25),
+        );
+        assert_eq!(preview.source_x_for_destination_fraction(0.0), Some(0.25));
+        assert_eq!(preview.source_x_for_destination_fraction(0.5), Some(0.5));
+        assert_eq!(preview.source_x_for_destination_fraction(1.0), Some(0.75));
+    }
+
+    #[test]
+    fn navigation_preview_transform_handles_single_base_and_contig_edge_views() {
+        let single_base = NavigationPreviewInstance::new(
+            [0.0, 0.0],
+            [1_000.0, 600.0],
+            [0.0, 0.0],
+            [1.0, 1.0],
+            Some((0.0, 1.0)),
+            (0.0, 1.0),
+        );
+        assert_eq!(
+            single_base.source_x_for_destination_fraction(0.0),
+            Some(0.0)
+        );
+        assert_eq!(
+            single_base.source_x_for_destination_fraction(1.0),
+            Some(1.0)
+        );
+
+        let zoomed_out_at_edge = NavigationPreviewInstance::new(
+            [0.0, 0.0],
+            [1_000.0, 600.0],
+            [0.0, 0.0],
+            [1.0, 1.0],
+            Some((0.0, 100.0)),
+            (0.0, 200.0),
+        );
+        assert_eq!(
+            zoomed_out_at_edge.source_x_for_destination_fraction(0.0),
+            Some(0.0)
+        );
+        assert_eq!(
+            zoomed_out_at_edge.source_x_for_destination_fraction(0.5),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn repeated_mixed_targets_always_map_from_the_original_committed_source() {
+        let source = (100.25, 200.25);
+        let genomic_anchor = 150.25;
+        for target in [
+            (75.25, 225.25),
+            (125.25, 175.25),
+            (50.25, 250.25),
+            (140.125, 190.125),
+        ] {
+            let preview = NavigationPreviewInstance::new(
+                [0.0, 0.0],
+                [1_000.0, 600.0],
+                [0.0, 0.0],
+                [1.0, 1.0],
+                Some(source),
+                target,
+            );
+            let target_fraction = ((genomic_anchor - target.0) / (target.1 - target.0)) as f32;
+            let expected_source_fraction =
+                ((genomic_anchor - source.0) / (source.1 - source.0)) as f32;
+            let mapped = preview
+                .source_x_for_destination_fraction(target_fraction)
+                .unwrap();
+            assert!((mapped - expected_source_fraction).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn navigation_preview_without_a_source_uses_neutral_fallback() {
+        let preview = NavigationPreviewInstance::new(
+            [0.0, 0.0],
+            [1_000.0, 600.0],
+            [0.0, 0.0],
+            [1.0, 1.0],
+            None,
+            (100.0, 200.0),
+        );
+        assert_eq!(preview.source_x_for_destination_fraction(0.5), None);
+    }
+
+    #[test]
+    fn navigation_preview_texture_budget_is_hard_and_overflow_safe() {
+        assert_eq!(navigation_preview_texture_bytes(0, 1_000), None);
+        assert_eq!(
+            navigation_preview_texture_bytes(1_920, 1_080),
+            Some(8_294_400)
+        );
+        assert_eq!(
+            navigation_preview_texture_bytes(8_192, 4_096),
+            Some(MAX_NAVIGATION_PREVIEW_BYTES)
+        );
+        assert_eq!(navigation_preview_texture_bytes(8_193, 4_096), None);
+        assert_eq!(navigation_preview_texture_bytes(u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn navigation_preview_subrect_uvs_sample_only_capture_texel_centres() {
+        let (origin, size) = navigation_preview_source_uv([100, 50], [200, 100], [1_000, 500]);
+        assert!((origin[0] - 0.1005).abs() < f32::EPSILON);
+        assert!((origin[1] - 0.101).abs() < f32::EPSILON);
+        assert!((origin[0] + size[0] - 0.2995).abs() < f32::EPSILON);
+        assert!((origin[1] + size[1] - 0.299).abs() < f32::EPSILON);
+
+        let (single_origin, single_size) = navigation_preview_source_uv([7, 9], [1, 1], [20, 20]);
+        assert_eq!(single_size, [0.0, 0.0]);
+        assert_eq!(single_origin, [0.375, 0.475]);
+    }
 
     #[test]
     fn primitive_conversion_preserves_geometry_and_pick_id() {
@@ -995,7 +1683,7 @@ mod tests {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
         assert_eq!(
-            hash, 14_681_773_654_668_215_052,
+            hash, 2_874_170_321_630_723_772,
             "update only after reviewing the short-, long-, spliced-, supplementary-, paired-, and deep-read fixture"
         );
     }

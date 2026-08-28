@@ -1,5 +1,149 @@
 use super::super::*;
 
+fn automation_read_query(
+    eligible_records: usize,
+    emitted_records: usize,
+    limit: usize,
+    individual_reads: IndividualReadStatus,
+) -> AlignmentQuery {
+    AlignmentQuery {
+        interval: GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+        header: Arc::default(),
+        batch: rgv_hts::AlignmentBatch::default(),
+        pileup: rgv_hts::PileupSummary::default(),
+        junctions: rgv_hts::JunctionSummary::default(),
+        pairs: rgv_hts::PairSummary::default(),
+        reference: None,
+        stats: QueryStats {
+            records_eligible: eligible_records,
+            records_emitted: emitted_records,
+            complete_read_limit: limit,
+            individual_reads,
+            ..QueryStats::default()
+        },
+    }
+}
+
+#[test]
+fn automation_read_presentation_reports_complete_or_zero_records() {
+    let complete = automation_read_query(20, 20, 50_000, IndividualReadStatus::Complete);
+    let foreground_dense = automation_read_query(
+        50_001,
+        0,
+        50_000,
+        IndividualReadStatus::TooDense { limit: 50_000 },
+    );
+    let horizon_dense = automation_read_query(
+        70_000,
+        0,
+        50_000,
+        IndividualReadStatus::TooDense { limit: 50_000 },
+    );
+
+    let admitted = automation_read_presentation_fields(
+        Some(&complete),
+        Some(&complete),
+        ReadStackingMode::Stable,
+        false,
+        false,
+        80_000,
+    );
+    assert_eq!(admitted.state, AutomationReadPresentationState::Complete);
+    assert_eq!(admitted.requested_limit, 80_000);
+    assert_eq!(admitted.effective_limit, 50_000);
+    assert_eq!(admitted.eligible_records, 20);
+    assert_eq!(admitted.complete_records, 20);
+    assert_eq!(admitted.refusal_eligible_records, 0);
+    assert_eq!(admitted.refusal_scope, None);
+
+    let refused = automation_read_presentation_fields(
+        Some(&foreground_dense),
+        Some(&foreground_dense),
+        ReadStackingMode::Compact,
+        false,
+        false,
+        50_000,
+    );
+    assert_eq!(refused.state, AutomationReadPresentationState::TooDense);
+    assert_eq!(refused.eligible_records, 50_001);
+    assert_eq!(refused.complete_records, 0);
+    assert_eq!(refused.refusal_eligible_records, 50_001);
+    assert_eq!(refused.refusal_scope.as_deref(), Some("foreground"));
+
+    let refused_horizon = automation_read_presentation_fields(
+        Some(&complete),
+        Some(&horizon_dense),
+        ReadStackingMode::Stable,
+        false,
+        false,
+        50_000,
+    );
+    assert_eq!(
+        refused_horizon.state,
+        AutomationReadPresentationState::TooDense
+    );
+    assert_eq!(refused_horizon.eligible_records, 20);
+    assert_eq!(refused_horizon.complete_records, 0);
+    assert_eq!(refused_horizon.refusal_eligible_records, 70_000);
+    assert_eq!(
+        refused_horizon.refusal_scope.as_deref(),
+        Some("layout_horizon")
+    );
+
+    let compact = automation_read_presentation_fields(
+        Some(&complete),
+        Some(&horizon_dense),
+        ReadStackingMode::Compact,
+        false,
+        false,
+        50_000,
+    );
+    assert_eq!(compact.state, AutomationReadPresentationState::Complete);
+    assert_eq!(compact.complete_records, 20);
+}
+
+#[test]
+fn automation_read_presentation_prioritises_transitional_and_failure_states() {
+    let complete = automation_read_query(20, 20, 50_000, IndividualReadStatus::Complete);
+    let checking = automation_read_presentation_fields(
+        Some(&complete),
+        Some(&complete),
+        ReadStackingMode::Stable,
+        true,
+        false,
+        50_000,
+    );
+    assert_eq!(checking.state, AutomationReadPresentationState::Checking);
+
+    let failed = automation_read_presentation_fields(
+        Some(&complete),
+        Some(&complete),
+        ReadStackingMode::Stable,
+        true,
+        true,
+        50_000,
+    );
+    assert_eq!(failed.state, AutomationReadPresentationState::Failed);
+
+    let unavailable = automation_read_presentation_fields(
+        None,
+        None,
+        ReadStackingMode::Stable,
+        false,
+        false,
+        50_000,
+    );
+    assert_eq!(
+        unavailable.state,
+        AutomationReadPresentationState::Unavailable
+    );
+}
+
+#[test]
+fn inspector_redesign_keeps_automation_schema_version_four() {
+    assert_eq!(AUTOMATION_SCHEMA_VERSION, 4);
+}
+
 #[test]
 fn automation_runner_stops_at_the_first_failure_and_reports_skipped_commands() {
     let batch = AutomationBatch {
@@ -405,6 +549,9 @@ fn automation_structured_exports_preserve_active_interval_semantics() {
     let alignment = automation_alignments_export("GRCh38", "chr1", interval, &alignment_tracks);
     let pileup = automation_pileup_export("GRCh38", "chr1", interval, &alignment_tracks);
     assert!(alignment.contains("read-1\t0x0010\t42\t5M"));
+    assert!(alignment.contains("read_presentation=complete"));
+    assert!(alignment.contains("complete_read_limit="));
+    assert!(!alignment.contains("retained_truncated"));
     assert!(alignment.contains("\t102\t106\t"));
     assert!(pileup.contains("eligible_records=0"));
     assert!(pileup.contains("\t101\t105\t3\t"));

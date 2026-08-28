@@ -1,17 +1,20 @@
 use super::super::*;
 use crate::display::alignment::{
     INDEX_ONLY_READ_NOTICE, ReadPanelKey, ReadPanelSpec, index_only_read_display,
-    index_only_read_notice, read_pane_layout, read_panel_bounds, read_panel_bounds_for_track,
+    index_only_read_notice, individual_read_refusal, read_pane_layout, read_panel_bounds,
+    read_panel_bounds_for_track, read_refusal_detail, read_state_display,
 };
 use crate::display::auxiliary::{feature_layout_row_count, pinned_gene_layout_maximum_rows};
 use crate::display::{
     ANNOTATION_PANE_BACKGROUND, PINNED_ALIGNMENT_COVERAGE_HEIGHT,
     PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT, PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
     PINNED_ALIGNMENT_MODIFICATION_HEIGHT, PINNED_ALIGNMENT_REFERENCE_HEIGHT,
-    READ_PANE_HEADER_HEIGHT, alignment_annotation_lane_heights, append_annotation_pane_background,
+    READ_PANE_HEADER_HEIGHT, SYNTHETIC_READ_ROW_STRIDE, alignment_annotation_lane_heights,
+    annotation_frame_content_height, append_annotation_pane_background,
     ensure_annotation_presentation_frames, pane_layout_snapshot, pinned_gene_track_height,
     primary_pinned_gene_id, reflow_annotation_presentation,
-    reflow_annotation_presentation_with_heights,
+    reflow_annotation_presentation_with_heights, synthetic_read_rows_for_bounds,
+    synthetic_section_display, track_section_geometry,
 };
 
 #[test]
@@ -54,6 +57,90 @@ fn a_single_read_panel_occupies_the_pane_without_a_saved_bottom_bound() {
         (200.0, 600.0)
     );
     assert_eq!(layout.content_bottom, 600.0);
+}
+
+#[test]
+fn synthetic_single_read_panel_tracks_the_viewport_bottom() {
+    assert_eq!(synthetic_read_rows_for_bounds(202.0, 902.0), 100);
+    assert_eq!(synthetic_read_rows_for_bounds(202.0, 1_042.0), 120);
+}
+
+#[test]
+fn synthetic_coverage_and_reads_are_owned_by_their_sections() {
+    let geometry = track_section_geometry(100.0, 900.0, 360.0, true, true, Some(84.0));
+    let read_content_top = geometry.read_clip_top + READ_PANE_HEADER_HEIGHT;
+    let both = synthetic_section_display(800.0, 10_000, 900.0, geometry, true, true);
+    let annotations_only = synthetic_section_display(800.0, 10_000, 900.0, geometry, true, false);
+    let reads_only = synthetic_section_display(800.0, 10_000, 900.0, geometry, false, true);
+
+    assert!(
+        annotations_only
+            .rectangles
+            .iter()
+            .all(|primitive| primitive.y + primitive.height <= geometry.annotation_clip_bottom)
+    );
+    assert!(
+        reads_only
+            .rectangles
+            .iter()
+            .all(|primitive| primitive.y >= read_content_top)
+    );
+    assert_eq!(
+        both.rectangles.len(),
+        annotations_only.rectangles.len() + reads_only.rectangles.len()
+    );
+    assert!(both.rectangles.iter().any(|primitive| {
+        (primitive.y + primitive.height - 900.0).abs() < SYNTHETIC_READ_ROW_STRIDE
+    }));
+}
+
+#[test]
+fn content_sized_annotation_section_does_not_inherit_blank_pane_space() {
+    let geometry = track_section_geometry(100.0, 900.0, 360.0, true, true, Some(84.0));
+
+    assert_eq!(geometry.annotation_clip_top, 126.0);
+    assert_eq!(geometry.annotation_clip_bottom, 210.0);
+    assert_eq!(geometry.read_clip_top, 236.0);
+}
+
+#[test]
+fn annotation_section_adapts_to_measured_frames_up_to_its_configured_limit() {
+    let frames = vec![
+        TrackFrame {
+            key: TrackFrameKey::Reference,
+            channel: crate::ui::TrackPane::Annotation,
+            name: "Reference".to_owned(),
+            kind: TrackKind::Reference,
+            source_label: None,
+            top: 126.0,
+            bottom: 166.0,
+            visible: true,
+            collapsed: false,
+            frozen_bottom: None,
+            subtracks: Vec::new(),
+        },
+        TrackFrame {
+            key: TrackFrameKey::Auxiliary(TrackId::new(9)),
+            channel: crate::ui::TrackPane::Annotation,
+            name: "Features".to_owned(),
+            kind: TrackKind::Feature,
+            source_label: None,
+            top: 166.0,
+            bottom: 306.0,
+            visible: true,
+            collapsed: false,
+            frozen_bottom: None,
+            subtracks: Vec::new(),
+        },
+    ];
+    let measured = annotation_frame_content_height(&frames).unwrap();
+    let fitted = track_section_geometry(100.0, 900.0, 360.0, true, true, Some(measured));
+    let overflowing = track_section_geometry(100.0, 900.0, 360.0, true, true, Some(900.0));
+
+    assert_eq!(measured, 180.0);
+    assert_eq!(fitted.annotation_clip_bottom, 306.0);
+    assert_eq!(fitted.read_clip_top, 332.0);
+    assert_eq!(overflowing.annotation_clip_bottom, 540.0);
 }
 
 #[test]
@@ -768,6 +855,24 @@ fn index_only_overview_prefers_the_indexed_contig_count_when_available() {
 }
 
 #[test]
+fn checking_read_state_is_visible_but_never_interactive() {
+    let display = read_state_display(
+        800.0,
+        240.0,
+        500.0,
+        "Checking current viewport for complete reads…",
+    );
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .all(|primitive| primitive.object_id == 0)
+    );
+    assert_eq!(display.texts.len(), 1);
+    assert!(display.texts[0].text.contains("Checking current viewport"));
+}
+
+#[test]
 fn overview_read_detail_distinguishes_present_empty_and_incomplete_data() {
     assert_eq!(
         overview_read_detail(31, false),
@@ -787,6 +892,54 @@ fn filtered_read_details_report_ignored_unmapped_records() {
         ..rgv_hts::QueryStats::default()
     });
     assert_eq!(details, ["3 unmapped ignored"]);
+}
+
+#[test]
+fn read_refusal_distinguishes_foreground_and_stable_horizon_density() {
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let query = |eligible, limit, status| AlignmentQuery {
+        interval,
+        header: Arc::default(),
+        batch: rgv_hts::AlignmentBatch::default(),
+        pileup: rgv_hts::PileupSummary::default(),
+        junctions: rgv_hts::JunctionSummary::default(),
+        pairs: rgv_hts::PairSummary::default(),
+        reference: None,
+        stats: QueryStats {
+            records_eligible: eligible,
+            complete_read_limit: limit,
+            individual_reads: status,
+            ..QueryStats::default()
+        },
+    };
+    let complete = query(20, 50_000, IndividualReadStatus::Complete);
+    let foreground_dense = query(
+        50_001,
+        50_000,
+        IndividualReadStatus::TooDense { limit: 50_000 },
+    );
+    let horizon_dense = query(
+        70_000,
+        50_000,
+        IndividualReadStatus::TooDense { limit: 50_000 },
+    );
+
+    let foreground = individual_read_refusal(
+        &foreground_dense,
+        &foreground_dense,
+        ReadStackingMode::Compact,
+    )
+    .unwrap();
+    assert_eq!(foreground.scope, IndividualReadRefusalScope::Foreground);
+    assert!(read_refusal_detail(foreground).contains("50001 eligible reads"));
+
+    let horizon =
+        individual_read_refusal(&complete, &horizon_dense, ReadStackingMode::Stable).unwrap();
+    assert_eq!(horizon.scope, IndividualReadRefusalScope::LayoutHorizon);
+    assert!(read_refusal_detail(horizon).contains("70000 stable-horizon reads"));
+    assert!(
+        individual_read_refusal(&complete, &horizon_dense, ReadStackingMode::Compact).is_none()
+    );
 }
 
 #[test]
@@ -929,6 +1082,18 @@ fn vertical_overview_retains_its_camera_while_content_fits() {
         reconcile_vertical_scroll(300.0, 400.0, 600.0, retained, None);
     assert!((ordinary_scroll - 300.0).abs() < f32::EPSILON);
     assert_eq!(ordinary_fraction, Some(0.5));
+}
+
+#[test]
+fn stable_row_camera_preserves_row_and_offset_across_layout_and_density_changes() {
+    let anchor = capture_stable_row_camera(10.5 * 7.0, 7.0, 4).unwrap();
+    assert_eq!(anchor.row, 10);
+    assert!((anchor.offset_fraction - 0.5).abs() < f32::EPSILON);
+    assert_eq!(reproject_stable_row_camera(anchor, 7.0, 4), None);
+    assert_eq!(
+        reproject_stable_row_camera(anchor, 14.0, 5),
+        Some(10.5 * 14.0)
+    );
 }
 
 #[test]
@@ -1196,6 +1361,10 @@ fn layout_cache_distinguishes_subtrack_visibility_and_coverage_scale() {
         },
         AlignmentLayoutOptions {
             promoted_read_name_hash: Some(alignment_read_name_hash(b"selected")),
+            ..baseline
+        },
+        AlignmentLayoutOptions {
+            row_layout_revision: 7,
             ..baseline
         },
     ] {
@@ -1655,6 +1824,12 @@ fn copy_number_inspector_reports_exact_segment_and_sort_provenance() {
             label == "Sort locus" && value.contains("base-weighted mean")
         })
     );
+    let document = copy_number_inspector_document(&inspector);
+    assert!(document.all_fields().any(|field| {
+        field.label == "Value interpretation"
+            && matches!(field.provenance, InspectorProvenance::Inferred(_))
+    }));
+    assert_eq!(document.flatten_automation_fields(), fields);
 }
 
 #[test]
@@ -1715,6 +1890,26 @@ fn mutation_inspector_preserves_source_order_and_cap_provenance() {
             && value.contains("2 omitted header columns")
             && value.contains("1 truncated/omitted values")
     }));
+    let document = mutation_inspector_document(&inspector);
+    assert_eq!(
+        document
+            .raw_fields
+            .iter()
+            .map(|field| field.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Hugo_Symbol", "HGVSp_Short"]
+    );
+    assert!(matches!(
+        document.raw_fields[1].provenance,
+        InspectorProvenance::Truncated { total: None, .. }
+    ));
+    assert!(
+        document
+            .notices
+            .iter()
+            .any(|notice| notice.id == "mutation-resource-bounds")
+    );
+    assert_eq!(document.flatten_automation_fields(), fields);
 }
 
 #[test]
@@ -1889,4 +2084,277 @@ fn feature_inspector_labels_psl_blocks_and_preserves_alignment_counts() {
             .any(|(label, value)| label == "Alignment blocks (2)" && value.contains("101-130"))
     );
     assert!(fields.contains(&("Attribute · matches".to_owned(), "70".to_owned())));
+}
+
+#[test]
+fn feature_document_promotes_gencode_semantics_and_preserves_duplicate_tags() {
+    let inspector = FeatureInspectorSnapshot {
+        track_name: "GENCODE v29".to_owned(),
+        record: rgv_hts::FeatureRecord {
+            contig: "chr1".to_owned(),
+            start: 36_339_623,
+            end: 36_341_973,
+            name: Some("STK40".to_owned()),
+            feature_type: Some("UTR".to_owned()),
+            score: None,
+            strand: rgv_hts::Strand::Reverse,
+            blocks: Vec::new(),
+            coding_interval: None,
+            peak: None,
+            attributes: vec![
+                ("gene_id".to_owned(), "ENSG00000196182.10".to_owned()),
+                ("gene_name".to_owned(), "STK40".to_owned()),
+                ("transcript_id".to_owned(), "ENST00000373130.7".to_owned()),
+                ("transcript_name".to_owned(), "STK40-203".to_owned()),
+                ("transcript_type".to_owned(), "protein_coding".to_owned()),
+                ("transcript_support_level".to_owned(), "1".to_owned()),
+                ("exon_number".to_owned(), "11".to_owned()),
+                ("tag".to_owned(), "basic".to_owned()),
+                ("tag".to_owned(), "CCDS".to_owned()),
+                ("tag".to_owned(), "appris_principal_1".to_owned()),
+            ],
+        },
+    };
+    let legacy = feature_inspector_fields(&inspector);
+    let document = feature_inspector_document(&inspector);
+
+    assert_eq!(document.header.title, "STK40");
+    assert_eq!(
+        document.header.subtitle.as_deref(),
+        Some("UTR · STK40-203 · exon 11")
+    );
+    assert!(document.sections.iter().any(|section| section.id == "gene"));
+    assert!(
+        document
+            .sections
+            .iter()
+            .any(|section| section.id == "transcript")
+    );
+    let tags = document
+        .sections
+        .iter()
+        .find(|section| section.id == "tags")
+        .and_then(|section| section.fields.first())
+        .map(|field| &field.value);
+    assert_eq!(
+        tags,
+        Some(&InspectorValue::Tags(vec![
+            "Basic".to_owned(),
+            "CCDS".to_owned(),
+            "APPRIS principal 1".to_owned(),
+        ]))
+    );
+    assert_eq!(
+        document
+            .raw_fields
+            .iter()
+            .filter(|field| field.label == "tag")
+            .count(),
+        3
+    );
+    assert_eq!(document.flatten_automation_fields(), legacy);
+}
+
+#[test]
+fn feature_document_fallback_keeps_blocks_unknown_attributes_and_complete_copy_values() {
+    let long_value = "ACGT".repeat(1_200);
+    let inspector = FeatureInspectorSnapshot {
+        track_name: "custom BED12".to_owned(),
+        record: rgv_hts::FeatureRecord {
+            contig: "chr7".to_owned(),
+            start: 100,
+            end: 260,
+            name: None,
+            feature_type: None,
+            score: None,
+            strand: rgv_hts::Strand::Forward,
+            blocks: vec![(100, 140), (200, 260)],
+            coding_interval: Some((110, 240)),
+            peak: None,
+            attributes: vec![
+                ("custom".to_owned(), "first".to_owned()),
+                ("custom".to_owned(), long_value.clone()),
+            ],
+        },
+    };
+    let document = feature_inspector_document(&inspector);
+
+    assert_eq!(document.header.title, "Feature");
+    assert!(document.header.location.is_some());
+    assert!(document.sections.iter().any(|section| {
+        section.fields.iter().any(|field| {
+            field.label == "Blocks / exons"
+                && matches!(&field.value, InspectorValue::List(blocks) if blocks.len() == 2)
+        })
+    }));
+    assert!(
+        !document
+            .sections
+            .iter()
+            .any(|section| { section.fields.iter().any(|field| field.label == "Score") })
+    );
+    assert_eq!(document.raw_fields.len(), 2);
+    assert_eq!(document.raw_fields[1].complete_copy_value(), long_value);
+    assert!(document.copy_details_text().contains(&long_value));
+    assert!(matches!(
+        document.raw_fields[1].provenance,
+        InspectorProvenance::Truncated { .. }
+    ));
+}
+
+#[test]
+fn feature_documents_cover_gene_transcript_exon_cds_and_utr_contexts() {
+    for feature_type in ["gene", "transcript", "exon", "CDS", "UTR"] {
+        let inspector = FeatureInspectorSnapshot {
+            track_name: "GENCODE".to_owned(),
+            record: rgv_hts::FeatureRecord {
+                contig: "chr3".to_owned(),
+                start: 10,
+                end: 40,
+                name: None,
+                feature_type: Some(feature_type.to_owned()),
+                score: None,
+                strand: rgv_hts::Strand::Forward,
+                blocks: Vec::new(),
+                coding_interval: None,
+                peak: None,
+                attributes: vec![
+                    ("gene_id".to_owned(), "ENSG00000000001.2".to_owned()),
+                    ("gene_name".to_owned(), "GENE1".to_owned()),
+                    ("transcript_id".to_owned(), "ENST00000000001.3".to_owned()),
+                    ("transcript_name".to_owned(), "GENE1-201".to_owned()),
+                    ("exon_id".to_owned(), "ENSE00000000001.1".to_owned()),
+                    ("exon_number".to_owned(), "2".to_owned()),
+                ],
+            },
+        };
+        let document = feature_inspector_document(&inspector);
+
+        assert!(document.sections.iter().any(|section| section.id == "gene"));
+        assert!(
+            document
+                .sections
+                .iter()
+                .any(|section| section.id == "transcript")
+        );
+        if matches!(feature_type, "exon" | "CDS" | "UTR") {
+            let context = document
+                .sections
+                .iter()
+                .find(|section| section.id == "feature-context")
+                .unwrap();
+            assert!(context.fields.iter().any(|field| {
+                field.id == "feature-context-type" && field.value.display_text() == feature_type
+            }));
+        }
+    }
+}
+
+#[test]
+fn feature_documents_keep_genepred_and_refflat_model_geometry() {
+    for track_name in ["genes.genePred", "genes.refFlat"] {
+        let inspector = FeatureInspectorSnapshot {
+            track_name: track_name.to_owned(),
+            record: rgv_hts::FeatureRecord {
+                contig: "chr12".to_owned(),
+                start: 100,
+                end: 500,
+                name: Some("NM_000001".to_owned()),
+                feature_type: Some("transcript".to_owned()),
+                score: None,
+                strand: rgv_hts::Strand::Reverse,
+                blocks: vec![(100, 180), (300, 500)],
+                coding_interval: Some((130, 450)),
+                peak: None,
+                attributes: vec![("gene_name".to_owned(), "GENE2".to_owned())],
+            },
+        };
+        let document = feature_inspector_document(&inspector);
+
+        let overview = document
+            .sections
+            .iter()
+            .find(|section| section.id == "overview")
+            .unwrap();
+        assert!(overview.fields.iter().any(|field| {
+            field.label == "Blocks / exons"
+                && matches!(&field.value, InspectorValue::List(blocks) if blocks == &vec!["101–180".to_owned(), "301–500".to_owned()])
+        }));
+        assert!(overview.fields.iter().any(|field| {
+            field.label == "Coding sequence"
+                && matches!(&field.value, InspectorValue::GenomicLocation(_))
+        }));
+        assert_eq!(document.header.source.as_deref(), Some(track_name));
+    }
+}
+
+#[test]
+fn interaction_document_uses_semantic_endpoints_and_preserves_actions_and_compatibility() {
+    let inspector = InteractionInspectorSnapshot {
+        track_name: "loops".to_owned(),
+        query: Arc::new(rgv_hts::InteractionQuery {
+            records: vec![rgv_hts::InteractionRecord {
+                source: rgv_hts::InteractionEndpoint {
+                    contig: "chr1".to_owned(),
+                    start: 100,
+                    end: 120,
+                    name: Some("promoter".to_owned()),
+                    strand: rgv_hts::Strand::Forward,
+                },
+                target: rgv_hts::InteractionEndpoint {
+                    contig: "chr8".to_owned(),
+                    start: 800,
+                    end: 850,
+                    name: Some("enhancer".to_owned()),
+                    strand: rgv_hts::Strand::Reverse,
+                },
+                name: Some("loop-1".to_owned()),
+                score: Some(42.0),
+                value: Some(0.75),
+                experiment: Some("Hi-C".to_owned()),
+                color: None,
+                directional: true,
+            }],
+            provenance: rgv_hts::InteractionQueryProvenance {
+                endpoint_entries_examined: 100_001,
+                records_truncated: true,
+                ..rgv_hts::InteractionQueryProvenance::default()
+            },
+        }),
+        record_index: 0,
+        settings: InteractionTrackSettings::default(),
+    };
+    let compatibility = interaction_inspector_fields(&inspector);
+    let document = interaction_inspector_presentation_document(&inspector, 0);
+
+    let endpoints = document
+        .sections
+        .iter()
+        .find(|section| section.id == "interaction-endpoints")
+        .unwrap();
+    assert_eq!(endpoints.fields.len(), 2);
+    assert!(
+        endpoints
+            .fields
+            .iter()
+            .all(|field| matches!(&field.value, InspectorValue::GenomicLocation(_)))
+    );
+    assert!(
+        document
+            .actions
+            .iter()
+            .filter(|action| {
+                matches!(action.id, InspectorActionId::OpenInteractionEndpoint(_))
+                    && !action.enabled
+            })
+            .count()
+            == 2
+    );
+    assert!(
+        document
+            .notices
+            .iter()
+            .any(|notice| notice.id == "interaction-query-bound")
+    );
+    assert_eq!(document.flatten_automation_fields(), compatibility);
 }

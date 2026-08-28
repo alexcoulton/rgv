@@ -13,8 +13,8 @@ use rgv_core::{
 };
 use rgv_hts::{
     AlignmentError, AlignmentIndexOverview, AlignmentOpenOptions, AlignmentQuery, AlignmentSource,
-    FastaOpenOptions, FastaReference, ProductionAlignmentSource, QueryOptions, RemoteCancellation,
-    RemoteIoStats,
+    FastaOpenOptions, FastaReference, ProductionAlignmentSource, QueryDetail, QueryOptions,
+    RemoteCancellation, RemoteIoStats,
 };
 use thiserror::Error;
 
@@ -24,6 +24,7 @@ use crate::{
 };
 
 const ALIGNMENT_CACHE_BYTES: usize = 320 * 1024 * 1024;
+pub const ALIGNMENT_LAYOUT_TILE_BASES: u64 = 32_768;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PanDirection {
@@ -54,7 +55,11 @@ pub enum AlignmentEngineEvent {
     QueryCompleted {
         request: PanelGeneration,
         query: Arc<AlignmentQuery>,
+        /// Fixed-neighbourhood records used to establish or extend the
+        /// canonical row architecture independently of viewport scale.
+        layout_query: Arc<AlignmentQuery>,
         cache_hit: bool,
+        layout_cache_hit: bool,
         cache_stats: CacheStats,
         remote_io_stats: Option<RemoteIoStats>,
     },
@@ -268,68 +273,110 @@ fn worker_loop(
                     );
                     continue;
                 };
-                let options_fingerprint = options.fingerprint();
                 let navigation = navigation_by_panel
                     .entry(request.panel_id())
                     .or_insert((None, None));
-                let direction = navigation_direction(navigation.0, interval);
+                let previous_interval = navigation.0;
+                let direction = navigation_direction(previous_interval, interval);
                 let stable_direction = direction.filter(|value| Some(*value) == navigation.1);
                 *navigation = (Some(interval), direction);
-                let expanded_interval = tile_aligned_prefetch_interval(
-                    interval,
-                    source.reference_dictionary(),
-                    stable_direction,
-                );
                 let key = QueryCacheKey {
-                    interval: expanded_interval,
-                    options_fingerprint,
+                    interval,
+                    options_fingerprint: options.fingerprint(),
                 };
-                if let Some(query) = cache.get(&key).cloned() {
-                    AlignmentEngineEvent::QueryCompleted {
-                        request,
-                        query,
-                        cache_hit: true,
-                        cache_stats: cache.stats(),
-                        remote_io_stats: combined_remote_io_stats(
-                            source.remote_io_stats(),
-                            reference.as_ref().and_then(FastaReference::remote_io_stats),
-                        ),
-                    }
-                } else {
-                    let expanded_options =
-                        expanded_query_options(options, interval, expanded_interval);
-                    match query_with_reference(
-                        source,
-                        reference.as_ref(),
-                        expanded_interval,
-                        expanded_options,
-                        &clock,
-                        request.generation(),
-                    ) {
-                        Ok(query)
-                            if clock.is_current(request.generation()) && !query.stats.cancelled =>
-                        {
-                            let query = Arc::new(query);
-                            let _ = cache.insert(key, Arc::clone(&query), query.estimated_bytes());
-                            AlignmentEngineEvent::QueryCompleted {
-                                request,
-                                query,
-                                cache_hit: false,
-                                cache_stats: cache.stats(),
-                                remote_io_stats: combined_remote_io_stats(
-                                    source.remote_io_stats(),
-                                    reference.as_ref().and_then(FastaReference::remote_io_stats),
-                                ),
+                match cached_or_query_alignment(
+                    &mut cache,
+                    key,
+                    source,
+                    reference.as_ref(),
+                    options.clone(),
+                    &clock,
+                    request.generation(),
+                ) {
+                    Ok((query, cache_hit))
+                        if clock.is_current(request.generation()) && !query.stats.cancelled =>
+                    {
+                        let preferred_layout_interval = canonical_layout_horizon_interval(
+                            interval,
+                            source.reference_dictionary(),
+                            source.is_remote(),
+                        );
+                        let layout_result = if !query.individual_reads_complete() {
+                            Ok((Arc::clone(&query), cache_hit))
+                        } else {
+                            let layout_options = layout_horizon_query_options(options.clone());
+                            cached_complete_layout_horizon(
+                                &mut cache,
+                                source,
+                                reference.as_ref(),
+                                interval,
+                                preferred_layout_interval,
+                                layout_options,
+                                &clock,
+                                request.generation(),
+                            )
+                        };
+                        match layout_result {
+                            Ok((layout_query, layout_cache_hit))
+                                if clock.is_current(request.generation())
+                                    && !layout_query.stats.cancelled =>
+                            {
+                                let event = AlignmentEngineEvent::QueryCompleted {
+                                    request,
+                                    query,
+                                    layout_query,
+                                    cache_hit,
+                                    layout_cache_hit,
+                                    cache_stats: cache.stats(),
+                                    remote_io_stats: combined_remote_io_stats(
+                                        source.remote_io_stats(),
+                                        reference
+                                            .as_ref()
+                                            .and_then(FastaReference::remote_io_stats),
+                                    ),
+                                };
+                                send_event(output, event);
+                                if let Some(prefetch_interval) = adjacent_prefetch_interval(
+                                    interval,
+                                    stable_direction,
+                                    source.reference_dictionary(),
+                                ) && clock.is_current(request.generation())
+                                {
+                                    let prefetch_key = QueryCacheKey {
+                                        interval: prefetch_interval,
+                                        options_fingerprint: options.fingerprint(),
+                                    };
+                                    // Background prefetch is best effort. Complete and Too-dense
+                                    // results are both truth-bearing cache entries; cancellation or
+                                    // source failure never changes the already committed foreground.
+                                    let _ = cached_or_query_alignment(
+                                        &mut cache,
+                                        prefetch_key,
+                                        source,
+                                        reference.as_ref(),
+                                        options,
+                                        &clock,
+                                        request.generation(),
+                                    );
+                                }
+                                continue;
                             }
-                        }
-                        Err(error) if clock.is_current(request.generation()) => {
-                            AlignmentEngineEvent::Error {
-                                request: Some(request),
-                                message: error.to_string(),
+                            Err(error) if clock.is_current(request.generation()) => {
+                                AlignmentEngineEvent::Error {
+                                    request: Some(request),
+                                    message: error.to_string(),
+                                }
                             }
+                            Ok(_) | Err(_) => continue,
                         }
-                        Ok(_) | Err(_) => continue,
                     }
+                    Err(error) if clock.is_current(request.generation()) => {
+                        AlignmentEngineEvent::Error {
+                            request: Some(request),
+                            message: error.to_string(),
+                        }
+                    }
+                    Ok(_) | Err(_) => continue,
                 }
             }
         };
@@ -412,37 +459,119 @@ fn query_with_reference(
     Ok(query)
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct QueryCacheKey {
-    interval: GenomicInterval,
-    options_fingerprint: u64,
+#[allow(clippy::too_many_arguments)]
+fn cached_or_query_alignment(
+    cache: &mut WeightedLruCache<QueryCacheKey, Arc<AlignmentQuery>>,
+    key: QueryCacheKey,
+    source: &mut ProductionAlignmentSource,
+    reference: Option<&FastaReference>,
+    options: QueryOptions,
+    clock: &GenerationClock,
+    generation: ViewportGeneration,
+) -> Result<(Arc<AlignmentQuery>, bool), AlignmentError> {
+    if let Some(query) = cache.get(&key).cloned() {
+        return Ok((query, true));
+    }
+    let query = Arc::new(query_with_reference(
+        source,
+        reference,
+        key.interval,
+        options,
+        clock,
+        generation,
+    )?);
+    // Cancellation is generation-local, not a reusable source result. Caching
+    // it would make the next identical viewport hit an empty cancelled entry
+    // and never receive a settled Complete or Too-dense state.
+    if !query.stats.cancelled {
+        let _ = cache.insert(key, Arc::clone(&query), query.estimated_bytes());
+    }
+    Ok((query, false))
 }
 
-fn tile_aligned_prefetch_interval(
+#[allow(clippy::too_many_arguments)]
+fn cached_complete_layout_horizon(
+    cache: &mut WeightedLruCache<QueryCacheKey, Arc<AlignmentQuery>>,
+    source: &mut ProductionAlignmentSource,
+    reference: Option<&FastaReference>,
+    requested: GenomicInterval,
+    preferred: GenomicInterval,
+    options: QueryOptions,
+    clock: &GenerationClock,
+    generation: ViewportGeneration,
+) -> Result<(Arc<AlignmentQuery>, bool), AlignmentError> {
+    let minimum = canonical_layout_horizon_interval(requested, source.reference_dictionary(), true);
+    let mut last = None;
+    for interval in [preferred, minimum] {
+        if last
+            .as_ref()
+            .is_some_and(|(query, _): &(Arc<AlignmentQuery>, bool)| query.interval == interval)
+        {
+            continue;
+        }
+        let key = QueryCacheKey {
+            interval,
+            options_fingerprint: options.fingerprint(),
+        };
+        let result = cached_or_query_alignment(
+            cache,
+            key,
+            source,
+            reference,
+            options.clone(),
+            clock,
+            generation,
+        )?;
+        if result.0.individual_reads_complete() || !clock.is_current(generation) {
+            return Ok(result);
+        }
+        last = Some(result);
+    }
+    Ok(last.expect("the complete-horizon candidate list is non-empty"))
+}
+
+fn layout_horizon_query_options(mut options: QueryOptions) -> QueryOptions {
+    options.detail = if options.layout_requires_sequence {
+        QueryDetail::Sequence
+    } else {
+        QueryDetail::Layout
+    };
+    options.coverage_bins = NonZeroUsize::new(1).expect("one coverage bin is non-zero");
+    options.collect_alleles = false;
+    options.collect_modifications = false;
+    options.include_reference = false;
+    options
+}
+
+fn canonical_layout_horizon_interval(
     requested: GenomicInterval,
     dictionary: &ReferenceDictionary,
-    direction: Option<PanDirection>,
+    remote: bool,
 ) -> GenomicInterval {
     let Some(contig) = dictionary.get(requested.contig()) else {
         return requested;
     };
-    let tile_width = requested
-        .len()
-        .checked_next_power_of_two()
-        .unwrap_or(requested.len());
-    let first_tile = requested.start() / tile_width;
-    let last_tile = requested.end().saturating_sub(1) / tile_width;
-    let first_prefetched_tile = if direction == Some(PanDirection::Backward) {
-        first_tile.saturating_sub(1)
-    } else {
-        first_tile
-    };
-    let start = first_prefetched_tile.saturating_mul(tile_width);
+    let first_tile = requested.start() / ALIGNMENT_LAYOUT_TILE_BASES;
+    let last_tile = requested.end().saturating_sub(1) / ALIGNMENT_LAYOUT_TILE_BASES;
+    // Local sources pay for one navigation tile on both sides up front. Remote
+    // sources stay cache-aligned but extend only when approached so background
+    // layout cannot create an unbounded range-I/O surprise.
+    let margin = u64::from(!remote);
+    let start = first_tile
+        .saturating_sub(margin)
+        .saturating_mul(ALIGNMENT_LAYOUT_TILE_BASES);
     let end = last_tile
-        .saturating_add(1 + u64::from(direction == Some(PanDirection::Forward)))
-        .saturating_mul(tile_width)
+        .saturating_add(1)
+        .saturating_add(margin)
+        .saturating_mul(ALIGNMENT_LAYOUT_TILE_BASES)
         .min(contig.length());
     GenomicInterval::new(requested.contig(), start, end).unwrap_or(requested)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct QueryCacheKey {
+    interval: GenomicInterval,
+    options_fingerprint: u64,
 }
 
 fn navigation_direction(
@@ -457,23 +586,28 @@ fn navigation_direction(
     }
 }
 
-fn expanded_query_options(
-    mut options: QueryOptions,
-    requested: GenomicInterval,
-    expanded: GenomicInterval,
-) -> QueryOptions {
-    let multiplier = usize::try_from(expanded.len().div_ceil(requested.len()))
-        .unwrap_or(1)
-        .max(1);
-    let expanded_bins = options
-        .coverage_bins
-        .get()
-        .saturating_mul(multiplier)
-        .min(16_384)
-        .min(usize::try_from(expanded.len()).unwrap_or(usize::MAX))
-        .max(1);
-    options.coverage_bins = NonZeroUsize::new(expanded_bins).unwrap();
-    options
+fn adjacent_prefetch_interval(
+    current: GenomicInterval,
+    direction: Option<PanDirection>,
+    dictionary: &ReferenceDictionary,
+) -> Option<GenomicInterval> {
+    let direction = direction?;
+    let contig_length = dictionary.get(current.contig())?.length();
+    let (start, end) = match direction {
+        PanDirection::Backward => {
+            let end = current.start();
+            (end.saturating_sub(current.len()), end)
+        }
+        PanDirection::Forward => {
+            let start = current.end();
+            (
+                start,
+                start.saturating_add(current.len()).min(contig_length),
+            )
+        }
+    };
+    let adjacent = GenomicInterval::new(current.contig(), start, end).ok()?;
+    (adjacent != current).then_some(adjacent)
 }
 
 fn send_event(output: &CoalescingSender<AlignmentEngineEvent>, event: AlignmentEngineEvent) {
@@ -503,17 +637,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prefetch_adds_only_the_stable_navigation_side() {
+    fn prefetch_uses_the_next_non_overlapping_equal_span_interval() {
         let dictionary = ReferenceDictionary::from_contigs([("chr1".to_owned(), 10_000_u64)]);
-        let requested = GenomicInterval::new(ContigId::new(0), 2_100, 3_100).unwrap();
-        let neutral = tile_aligned_prefetch_interval(requested, &dictionary, None);
+        let current = GenomicInterval::new(ContigId::new(0), 2_100, 3_100).unwrap();
         let forward =
-            tile_aligned_prefetch_interval(requested, &dictionary, Some(PanDirection::Forward));
+            adjacent_prefetch_interval(current, Some(PanDirection::Forward), &dictionary).unwrap();
         let backward =
-            tile_aligned_prefetch_interval(requested, &dictionary, Some(PanDirection::Backward));
-        assert_eq!((neutral.start(), neutral.end()), (2_048, 4_096));
-        assert_eq!((forward.start(), forward.end()), (2_048, 5_120));
-        assert_eq!((backward.start(), backward.end()), (1_024, 4_096));
+            adjacent_prefetch_interval(current, Some(PanDirection::Backward), &dictionary).unwrap();
+        assert_eq!((forward.start(), forward.end()), (3_100, 4_100));
+        assert_eq!((backward.start(), backward.end()), (1_100, 2_100));
+        assert!(adjacent_prefetch_interval(current, None, &dictionary).is_none());
+    }
+
+    #[test]
+    fn canonical_layout_horizon_is_fixed_across_the_motivating_zoom_pair() {
+        let dictionary = ReferenceDictionary::from_contigs([("chr1".to_owned(), 248_956_422_u64)]);
+        let narrow = GenomicInterval::new(ContigId::new(0), 36_339_308, 36_343_089).unwrap();
+        let broad = GenomicInterval::new(ContigId::new(0), 36_337_133, 36_345_430).unwrap();
+        let narrow_horizon = canonical_layout_horizon_interval(narrow, &dictionary, false);
+        let broad_horizon = canonical_layout_horizon_interval(broad, &dictionary, false);
+
+        assert_eq!(narrow_horizon, broad_horizon);
+        assert!(narrow_horizon.start() <= broad.start());
+        assert!(narrow_horizon.end() >= broad.end());
+        assert_eq!(
+            (narrow_horizon.start(), narrow_horizon.end()),
+            (36_274_176, 36_405_248)
+        );
+    }
+
+    #[test]
+    fn remote_layout_horizon_uses_only_intersecting_fixed_tiles() {
+        let dictionary = ReferenceDictionary::from_contigs([("chr1".to_owned(), 248_956_422_u64)]);
+        let requested = GenomicInterval::new(ContigId::new(0), 36_339_308, 36_343_089).unwrap();
+        let horizon = canonical_layout_horizon_interval(requested, &dictionary, true);
+        assert_eq!((horizon.start(), horizon.end()), (36_306_944, 36_372_480));
     }
 
     #[test]
@@ -561,6 +719,16 @@ mod tests {
             },
         );
         for generation in 1..=32 {
+            let query = Arc::new(AlignmentQuery {
+                interval: GenomicInterval::new(ContigId::new(0), 0, 1).unwrap(),
+                header: std::sync::Arc::default(),
+                batch: AlignmentBatch::default(),
+                pileup: PileupSummary::default(),
+                junctions: rgv_hts::JunctionSummary::default(),
+                pairs: rgv_hts::PairSummary::default(),
+                reference: None,
+                stats: QueryStats::default(),
+            });
             send_event(
                 &output,
                 AlignmentEngineEvent::QueryCompleted {
@@ -568,17 +736,10 @@ mod tests {
                         PanelId::new(1),
                         ViewportGeneration::new(generation),
                     ),
-                    query: Arc::new(AlignmentQuery {
-                        interval: GenomicInterval::new(ContigId::new(0), 0, 1).unwrap(),
-                        header: std::sync::Arc::default(),
-                        batch: AlignmentBatch::default(),
-                        pileup: PileupSummary::default(),
-                        junctions: rgv_hts::JunctionSummary::default(),
-                        pairs: rgv_hts::PairSummary::default(),
-                        reference: None,
-                        stats: QueryStats::default(),
-                    }),
+                    query: Arc::clone(&query),
+                    layout_query: query,
                     cache_hit: false,
+                    layout_cache_hit: false,
                     cache_stats: CacheStats::default(),
                     remote_io_stats: None,
                 },
@@ -596,6 +757,274 @@ mod tests {
                     == PanelGeneration::new(PanelId::new(1), ViewportGeneration::new(32))
         ));
         assert_eq!(receiver.try_receive().unwrap(), None);
+    }
+
+    #[test]
+    fn full_query_commits_a_cached_layout_only_horizon_atomically() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+        if !path.exists() {
+            return;
+        }
+        let engine = AlignmentEngine::spawn(4);
+        engine
+            .try_open(path, AlignmentOpenOptions::default())
+            .unwrap();
+        let dictionary = loop {
+            match engine.receive_timeout(Duration::from_secs(10)).unwrap() {
+                Some(AlignmentEngineEvent::Opened { dictionary, .. }) => break dictionary,
+                Some(AlignmentEngineEvent::Error { message, .. }) => panic!("{message}"),
+                Some(_) | None => continue,
+            }
+        };
+        let contig = dictionary.id_by_name("chr1").unwrap_or(ContigId::new(0));
+        let requested = GenomicInterval::new(contig, 2_150_000, 2_150_010).unwrap();
+        let clock = GenerationClock::default();
+
+        for expected_cache_hit in [false, true] {
+            let request = PanelGeneration::new(PanelId::new(1), clock.advance());
+            engine
+                .try_query(
+                    request,
+                    clock.clone(),
+                    requested,
+                    QueryOptions {
+                        detail: QueryDetail::Full,
+                        ..QueryOptions::default()
+                    },
+                )
+                .unwrap();
+            let completed =
+                loop {
+                    match engine.receive_timeout(Duration::from_secs(10)).unwrap() {
+                        Some(
+                            event @ AlignmentEngineEvent::QueryCompleted { request: seen, .. },
+                        ) if seen == request => break event,
+                        Some(AlignmentEngineEvent::Error { message, .. }) => panic!("{message}"),
+                        Some(_) | None => continue,
+                    }
+                };
+            let AlignmentEngineEvent::QueryCompleted {
+                query,
+                layout_query,
+                cache_hit,
+                layout_cache_hit,
+                ..
+            } = completed
+            else {
+                unreachable!()
+            };
+            assert_eq!(cache_hit, expected_cache_hit);
+            assert_eq!(layout_cache_hit, expected_cache_hit);
+            assert_eq!(query.interval, requested);
+            assert!(
+                query.individual_reads_complete(),
+                "foreground eligible records: {}",
+                query.stats.records_eligible
+            );
+            assert!(layout_query.interval.start() <= query.interval.start());
+            assert!(layout_query.interval.end() >= query.interval.end());
+            if !layout_query.batch.is_empty() {
+                assert!(matches!(
+                    layout_query.materialize_record(0).unwrap().sequence,
+                    rgv_hts::SequenceData::NotLoaded
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn complete_foreground_is_not_sampled_when_the_stable_horizon_is_too_dense() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+        if !path.exists() {
+            return;
+        }
+        let engine = AlignmentEngine::spawn(4);
+        engine
+            .try_open(path, AlignmentOpenOptions::default())
+            .unwrap();
+        let dictionary = loop {
+            match engine.receive_timeout(Duration::from_secs(10)).unwrap() {
+                Some(AlignmentEngineEvent::Opened { dictionary, .. }) => break dictionary,
+                Some(AlignmentEngineEvent::Error { message, .. }) => panic!("{message}"),
+                Some(_) | None => continue,
+            }
+        };
+        let contig = dictionary.id_by_name("chr1").unwrap_or(ContigId::new(0));
+        let requested = GenomicInterval::new(contig, 2_150_000, 2_150_010).unwrap();
+        let clock = GenerationClock::default();
+        let request = PanelGeneration::new(PanelId::new(1), clock.advance());
+        engine
+            .try_query(
+                request,
+                clock.clone(),
+                requested,
+                QueryOptions {
+                    detail: QueryDetail::Full,
+                    max_records: NonZeroUsize::new(100).unwrap(),
+                    ..QueryOptions::default()
+                },
+            )
+            .unwrap();
+        let completed = loop {
+            match engine.receive_timeout(Duration::from_secs(10)).unwrap() {
+                Some(event @ AlignmentEngineEvent::QueryCompleted { request: seen, .. })
+                    if seen == request =>
+                {
+                    break event;
+                }
+                Some(AlignmentEngineEvent::Error { message, .. }) => panic!("{message}"),
+                Some(_) | None => continue,
+            }
+        };
+        let AlignmentEngineEvent::QueryCompleted {
+            query,
+            layout_query,
+            ..
+        } = completed
+        else {
+            unreachable!()
+        };
+        assert_eq!(query.interval, requested);
+        assert!(
+            query.individual_reads_complete(),
+            "foreground eligible records: {}",
+            query.stats.records_eligible
+        );
+        assert_eq!(query.batch.len(), query.stats.records_eligible);
+        assert!(matches!(
+            layout_query.stats.individual_reads,
+            rgv_hts::IndividualReadStatus::TooDense { limit: 100 }
+        ));
+        assert!(layout_query.batch.is_empty());
+        assert!(layout_query.stats.records_eligible > 100);
+    }
+
+    #[test]
+    fn cancelled_foreground_is_not_reused_for_the_next_identical_generation() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+        if !path.exists() {
+            return;
+        }
+        let engine = AlignmentEngine::spawn(4);
+        engine
+            .try_open(path, AlignmentOpenOptions::default())
+            .unwrap();
+        let dictionary = loop {
+            match engine.receive_timeout(Duration::from_secs(10)).unwrap() {
+                Some(AlignmentEngineEvent::Opened { dictionary, .. }) => break dictionary,
+                Some(AlignmentEngineEvent::Error { message, .. }) => panic!("{message}"),
+                Some(_) | None => continue,
+            }
+        };
+        let contig = dictionary.id_by_name("chr1").unwrap_or(ContigId::new(0));
+        let interval = GenomicInterval::new(contig, 2_150_000, 2_150_010).unwrap();
+        let clock = GenerationClock::default();
+        let stale_generation = clock.advance();
+        let current_generation = clock.advance();
+        let stale = PanelGeneration::new(PanelId::new(1), stale_generation);
+        let current = PanelGeneration::new(PanelId::new(1), current_generation);
+        let options = QueryOptions {
+            detail: QueryDetail::Full,
+            ..QueryOptions::default()
+        };
+
+        engine
+            .try_query(stale, clock.clone(), interval, options.clone())
+            .unwrap();
+        engine
+            .try_query(current, clock.clone(), interval, options)
+            .unwrap();
+
+        let completed = loop {
+            match engine.receive_timeout(Duration::from_secs(10)).unwrap() {
+                Some(event @ AlignmentEngineEvent::QueryCompleted { request, .. })
+                    if request == current =>
+                {
+                    break event;
+                }
+                Some(AlignmentEngineEvent::Error { message, .. }) => panic!("{message}"),
+                Some(_) | None => continue,
+            }
+        };
+        let AlignmentEngineEvent::QueryCompleted {
+            query, cache_hit, ..
+        } = completed
+        else {
+            unreachable!()
+        };
+        assert!(!query.stats.cancelled);
+        assert!(query.individual_reads_complete());
+        assert!(
+            !cache_hit,
+            "a cancelled entry must never become a cache hit"
+        );
+    }
+
+    #[test]
+    fn too_dense_foreground_commits_no_individual_batch() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+        if !path.exists() {
+            return;
+        }
+        let engine = AlignmentEngine::spawn(4);
+        engine
+            .try_open(path, AlignmentOpenOptions::default())
+            .unwrap();
+        let dictionary = loop {
+            match engine.receive_timeout(Duration::from_secs(10)).unwrap() {
+                Some(AlignmentEngineEvent::Opened { dictionary, .. }) => break dictionary,
+                Some(AlignmentEngineEvent::Error { message, .. }) => panic!("{message}"),
+                Some(_) | None => continue,
+            }
+        };
+        let contig = dictionary.id_by_name("chr1").unwrap_or(ContigId::new(0));
+        let requested = GenomicInterval::new(contig, 2_100_000, 2_301_100).unwrap();
+        let clock = GenerationClock::default();
+        let request = PanelGeneration::new(PanelId::new(1), clock.advance());
+        engine
+            .try_query(
+                request,
+                clock.clone(),
+                requested,
+                QueryOptions {
+                    detail: QueryDetail::Full,
+                    max_records: NonZeroUsize::new(10).unwrap(),
+                    ..QueryOptions::default()
+                },
+            )
+            .unwrap();
+        let completed = loop {
+            match engine.receive_timeout(Duration::from_secs(10)).unwrap() {
+                Some(event @ AlignmentEngineEvent::QueryCompleted { request: seen, .. })
+                    if seen == request =>
+                {
+                    break event;
+                }
+                Some(AlignmentEngineEvent::Error { message, .. }) => panic!("{message}"),
+                Some(_) | None => continue,
+            }
+        };
+        let AlignmentEngineEvent::QueryCompleted {
+            query,
+            layout_query,
+            ..
+        } = completed
+        else {
+            unreachable!()
+        };
+        assert_eq!(query.interval, requested);
+        assert!(matches!(
+            query.stats.individual_reads,
+            rgv_hts::IndividualReadStatus::TooDense { limit: 10 }
+        ));
+        assert_eq!(query.stats.records_emitted, 0);
+        assert!(query.batch.is_empty());
+        assert!(query.pileup.provenance.all_eligible_records);
+        assert!(Arc::ptr_eq(&query, &layout_query));
     }
 
     #[test]

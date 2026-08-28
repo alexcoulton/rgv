@@ -55,6 +55,51 @@ fn row_test_query(records: &[AlignmentRecord]) -> AlignmentQuery {
 }
 
 #[test]
+fn too_dense_read_layout_emits_only_a_non_interactive_refusal_placeholder() {
+    let query = row_test_query(&[
+        row_test_record(b"one", 20, 60),
+        row_test_record(b"two", 80, 120),
+    ]);
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 0, 200).unwrap(),
+        800.0,
+    )
+    .unwrap();
+    let options = AlignmentLayoutOptions {
+        show_reference: false,
+        show_coverage: false,
+        show_junctions: false,
+        read_refusal: Some(IndividualReadRefusal {
+            eligible_records: 50_001,
+            limit: 50_000,
+            scope: IndividualReadRefusalScope::Foreground,
+        }),
+        ..AlignmentLayoutOptions::default()
+    };
+
+    let layout = layout_alignment_query(&query, viewport, options);
+    assert_eq!(layout.stats.rendered_alignments, 0);
+    assert_eq!(layout.stats.hidden_alignments, 50_001);
+    assert!(
+        layout
+            .display_list
+            .rectangles
+            .iter()
+            .all(|primitive| primitive.object_id == 0)
+    );
+    assert!(layout.display_list.texts.iter().any(|text| {
+        text.text.contains("50001") && text.text.contains("complete-read limit is 50000")
+    }));
+    assert!(
+        layout
+            .display_list
+            .texts
+            .iter()
+            .any(|text| { text.text.contains("Zoom in") && text.text.contains("raise the limit") })
+    );
+}
+
+#[test]
 fn bisulfite_contexts_match_both_reference_strands_exactly() {
     let interval = GenomicInterval::new(ContigId::new(0), 0, 20).unwrap();
     let reference = ReferenceSlice {
@@ -1811,6 +1856,580 @@ fn uncapped_query_refresh_preserves_rows_when_loaded_read_count_changes() {
     assert_eq!(narrowed_rows.rows[0], refined_rows.rows[2]);
 }
 
+#[test]
+fn persistent_history_restores_broad_narrow_broad_rows() {
+    let broad = row_test_query(&[
+        row_test_record(b"leading", 0, 70),
+        row_test_record(b"retained", 50, 110),
+        row_test_record(b"trailing", 105, 150),
+    ]);
+    let narrow = row_test_query(&[row_test_record(b"retained", 50, 110)]);
+    let options = AlignmentLayoutOptions {
+        max_rows: broad.batch.len(),
+        ..AlignmentLayoutOptions::default()
+    };
+    let mut history = AlignmentRowHistory::default();
+
+    let (first, initial) = reconcile_alignment_rows(
+        &broad,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (middle, narrowed) = reconcile_alignment_rows(
+        &narrow,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (restored, returned) = reconcile_alignment_rows(
+        &broad,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(middle.rows[0], first.rows[1]);
+    assert_eq!(restored.rows, first.rows);
+    assert_eq!(initial.added, 3);
+    assert_eq!(narrowed.retained, 1);
+    assert_eq!(narrowed.reservations, 2);
+    assert_eq!(returned.restored, 2);
+    assert_eq!(returned.moved, 0);
+}
+
+#[test]
+fn canonical_horizon_makes_narrow_and_broad_entry_order_identical() {
+    let horizon = row_test_query(&[
+        row_test_record(b"long", 0, 100),
+        row_test_record(b"short-a", 10, 20),
+        row_test_record(b"short-b", 30, 40),
+        row_test_record(b"middle", 60, 130),
+        row_test_record(b"after", 110, 150),
+    ]);
+    let mut narrow = row_test_query(&[
+        row_test_record(b"short-b", 30, 40),
+        row_test_record(b"middle", 60, 130),
+        row_test_record(b"after", 110, 150),
+    ]);
+    narrow.interval = GenomicInterval::new(ContigId::new(0), 25, 155).unwrap();
+    let options = AlignmentLayoutOptions {
+        max_rows: horizon.batch.len(),
+        ..AlignmentLayoutOptions::default()
+    };
+
+    let mut narrow_first_history = AlignmentRowHistory::default();
+    let (narrow_first, first_stats) = reconcile_alignment_rows_with_horizon(
+        &narrow,
+        &horizon,
+        options,
+        &mut narrow_first_history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    let mut broad_first_history = AlignmentRowHistory::default();
+    let (_, broad_stats) = reconcile_alignment_rows_with_horizon(
+        &horizon,
+        &horizon,
+        options,
+        &mut broad_first_history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (narrow_after_broad, revisit_stats) = reconcile_alignment_rows_with_horizon(
+        &narrow,
+        &horizon,
+        options,
+        &mut broad_first_history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(narrow_first.rows, narrow_after_broad.rows);
+    assert_eq!(
+        first_stats.transition_reason,
+        ReadStackingTransitionReason::InitialCanonical
+    );
+    assert_eq!(
+        broad_stats.transition_reason,
+        ReadStackingTransitionReason::InitialCanonical
+    );
+    assert_eq!(
+        revisit_stats.transition_reason,
+        ReadStackingTransitionReason::Navigation
+    );
+    assert_eq!(first_stats.horizon_generation, 1);
+    assert_eq!(first_stats.horizon_extensions, 0);
+    assert_eq!(first_stats.horizon_records, horizon.batch.len());
+    assert_eq!(revisit_stats.moved, 0);
+}
+
+#[test]
+fn rich_visible_payload_maps_to_layout_only_horizon_identities() {
+    let layout_query = row_test_query(&[
+        row_test_record(b"alpha", 10, 80),
+        row_test_record(b"beta", 20, 90),
+    ]);
+    let mut alpha = row_test_record(b"alpha", 10, 80);
+    alpha.sequence = SequenceData::Present {
+        bases: vec![b'A'; 70],
+        qualities: Some(vec![30; 70]),
+    };
+    alpha.auxiliary_fields.push(AuxField {
+        tag: *b"ZZ",
+        value: AuxValue::String("inspector-only".to_owned()),
+    });
+    let mut beta = row_test_record(b"beta", 20, 90);
+    beta.auxiliary_fields.push(AuxField {
+        tag: *b"XY",
+        value: AuxValue::String("unrelated".to_owned()),
+    });
+    let visible_query = row_test_query(&[alpha, beta]);
+    let mut history = AlignmentRowHistory::default();
+    let (layout, stats) = reconcile_alignment_rows_with_horizon(
+        &visible_query,
+        &layout_query,
+        AlignmentLayoutOptions::default(),
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(layout.rows, vec![Some(0), Some(1)]);
+    assert_eq!(stats.added, layout_query.batch.len());
+    assert_eq!(stats.assignments, layout_query.batch.len());
+}
+
+#[test]
+fn horizon_extension_is_additive_and_typed() {
+    let mut initial = row_test_query(&[
+        row_test_record(b"incumbent-a", 10, 90),
+        row_test_record(b"incumbent-b", 20, 100),
+    ]);
+    initial.interval = GenomicInterval::new(ContigId::new(0), 0, 200).unwrap();
+    let mut extended = row_test_query(&[
+        row_test_record(b"incumbent-a", 10, 90),
+        row_test_record(b"incumbent-b", 20, 100),
+        row_test_record(b"new-top-fit", 220, 260),
+    ]);
+    extended.interval = GenomicInterval::new(ContigId::new(0), 0, 400).unwrap();
+    let options = AlignmentLayoutOptions {
+        max_rows: extended.batch.len(),
+        ..AlignmentLayoutOptions::default()
+    };
+    let mut history = AlignmentRowHistory::default();
+    let (before, _) = reconcile_alignment_rows_with_horizon(
+        &initial,
+        &initial,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (after, stats) = reconcile_alignment_rows_with_horizon(
+        &extended,
+        &extended,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(&after.rows[..2], &before.rows);
+    assert_eq!(after.rows[2], Some(0));
+    assert_eq!(
+        stats.transition_reason,
+        ReadStackingTransitionReason::HorizonExtension
+    );
+    assert_eq!(stats.horizon_generation, 2);
+    assert_eq!(stats.horizon_extensions, 1);
+    assert_eq!(stats.moved, 0);
+}
+
+#[test]
+fn persistent_reservation_cannot_be_stolen_by_a_conflicting_new_read() {
+    let broad = row_test_query(&[
+        row_test_record(b"reserved", 10, 90),
+        row_test_record(b"retained", 10, 90),
+    ]);
+    let changed = row_test_query(&[
+        row_test_record(b"retained", 10, 90),
+        row_test_record(b"new", 10, 90),
+    ]);
+    let options = AlignmentLayoutOptions {
+        max_rows: 3,
+        ..AlignmentLayoutOptions::default()
+    };
+    let mut history = AlignmentRowHistory::default();
+    let (first, _) = reconcile_alignment_rows(
+        &broad,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (next, stats) = reconcile_alignment_rows(
+        &changed,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(next.rows[0], first.rows[1]);
+    assert_eq!(next.rows[1], Some(2));
+    assert_eq!(stats.reservations, 1);
+    assert_eq!(stats.added, 1);
+}
+
+#[test]
+fn compact_projection_does_not_destroy_stable_history() {
+    let broad = row_test_query(&[
+        row_test_record(b"leading", 0, 70),
+        row_test_record(b"retained", 50, 110),
+    ]);
+    let narrow = row_test_query(&[row_test_record(b"retained", 50, 110)]);
+    let options = AlignmentLayoutOptions::default();
+    let mut history = AlignmentRowHistory::default();
+    let (stable, _) = reconcile_alignment_rows(
+        &broad,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let revision = history.revision();
+    let (compact, compact_stats) = reconcile_alignment_rows(
+        &narrow,
+        options,
+        &mut history,
+        ReadStackingMode::Compact,
+        false,
+    );
+    let (restored, restored_stats) = reconcile_alignment_rows(
+        &narrow,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(compact.rows, vec![Some(0)]);
+    assert_eq!(history.revision(), revision + 1);
+    assert_eq!(restored.rows[0], stable.rows[1]);
+    assert!(compact_stats.compact);
+    assert_eq!(
+        restored_stats.transition_reason,
+        ReadStackingTransitionReason::Navigation
+    );
+}
+
+#[test]
+fn one_shot_repack_establishes_a_new_stable_baseline() {
+    let broad = row_test_query(&[
+        row_test_record(b"leading", 0, 70),
+        row_test_record(b"retained", 50, 110),
+    ]);
+    let narrow = row_test_query(&[row_test_record(b"retained", 50, 110)]);
+    let options = AlignmentLayoutOptions::default();
+    let mut history = AlignmentRowHistory::default();
+    reconcile_alignment_rows(
+        &broad,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (repacked, stats) = reconcile_alignment_rows(
+        &narrow,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        true,
+    );
+    let (again, _) = reconcile_alignment_rows(
+        &narrow,
+        options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(repacked.rows, vec![Some(0)]);
+    assert_eq!(again.rows, repacked.rows);
+    assert!(stats.repacked);
+    assert_eq!(
+        stats.transition_reason,
+        ReadStackingTransitionReason::ExplicitRebuild
+    );
+}
+
+#[test]
+fn query_local_pair_bounds_do_not_change_ordinary_row_policy() {
+    let query = row_test_query(&[
+        row_test_record(b"first", 10, 80),
+        row_test_record(b"second", 20, 90),
+    ]);
+    let broad_options = AlignmentLayoutOptions {
+        pair_length_bounds: TemplateLengthBounds {
+            minimum: Some(0),
+            maximum: Some(526),
+        },
+        ..AlignmentLayoutOptions::default()
+    };
+    let narrow_options = AlignmentLayoutOptions {
+        pair_length_bounds: TemplateLengthBounds {
+            minimum: Some(0),
+            maximum: Some(398),
+        },
+        ..broad_options
+    };
+    let mut history = AlignmentRowHistory::default();
+    let (first, _) = reconcile_alignment_rows(
+        &query,
+        broad_options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (second, stats) = reconcile_alignment_rows(
+        &query,
+        narrow_options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(history.context_count(), 1);
+    assert_eq!(second.rows, first.rows);
+    assert_eq!(stats.retained, 2);
+    assert_eq!(
+        stats.transition_reason,
+        ReadStackingTransitionReason::Navigation
+    );
+}
+
+#[test]
+fn large_rna_zoom_reproducer_keeps_all_1262_shared_rows() {
+    const BROAD_COUNT: usize = 3_655;
+    const SHARED_COUNT: usize = 1_262;
+    let leading_count = BROAD_COUNT - SHARED_COUNT;
+    let mut broad_records = Vec::with_capacity(BROAD_COUNT);
+    for index in 0..leading_count {
+        broad_records.push(row_test_record(
+            format!("leading-{index:04}").as_bytes(),
+            10,
+            190,
+        ));
+    }
+    let mut narrow_records = Vec::with_capacity(SHARED_COUNT);
+    for index in 0..SHARED_COUNT {
+        let record = row_test_record(format!("shared-{index:04}").as_bytes(), 10, 190);
+        broad_records.push(record.clone());
+        narrow_records.push(record);
+    }
+    let broad = row_test_query(&broad_records);
+    let narrow = row_test_query(&narrow_records);
+    let broad_options = AlignmentLayoutOptions {
+        max_rows: BROAD_COUNT,
+        pair_length_bounds: TemplateLengthBounds {
+            minimum: Some(0),
+            maximum: Some(526),
+        },
+        ..AlignmentLayoutOptions::default()
+    };
+    let narrow_options = AlignmentLayoutOptions {
+        max_rows: SHARED_COUNT,
+        pair_length_bounds: TemplateLengthBounds {
+            minimum: Some(0),
+            maximum: Some(398),
+        },
+        ..broad_options
+    };
+
+    let scratch_broad = assign_alignment_rows(&broad, broad_options, None);
+    let scratch_narrow = assign_alignment_rows(&narrow, narrow_options, None);
+    let scratch_moved = (0..SHARED_COUNT)
+        .filter(|index| scratch_broad.rows[leading_count + index] != scratch_narrow.rows[*index])
+        .count();
+    assert!(scratch_moved >= 1_250);
+
+    let mut history = AlignmentRowHistory::default();
+    let (stable_broad, _) = reconcile_alignment_rows(
+        &broad,
+        broad_options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (stable_narrow, stats) = reconcile_alignment_rows(
+        &narrow,
+        narrow_options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let stable_moved = (0..SHARED_COUNT)
+        .filter(|index| stable_broad.rows[leading_count + index] != stable_narrow.rows[*index])
+        .count();
+
+    assert_eq!(stable_moved, 0);
+    assert_eq!(stats.retained, SHARED_COUNT);
+    assert_eq!(stats.moved, 0);
+    assert_eq!(history.context_count(), 1);
+}
+
+#[test]
+fn disjoint_loci_create_independent_stable_islands() {
+    let mut left = row_test_query(&[row_test_record(b"left", 10, 30)]);
+    left.interval = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+    let mut right = row_test_query(&[row_test_record(b"right", 410, 430)]);
+    right.interval = GenomicInterval::new(ContigId::new(0), 400, 500).unwrap();
+    let mut history = AlignmentRowHistory::default();
+    reconcile_alignment_rows(
+        &left,
+        AlignmentLayoutOptions::default(),
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    reconcile_alignment_rows(
+        &right,
+        AlignmentLayoutOptions::default(),
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(history.context_count(), 1);
+    assert_eq!(history.island_count(), 2);
+}
+
+#[test]
+fn overlapping_navigation_sequences_never_move_known_identities_or_collide() {
+    let mut seed = 0x5eed_cafe_u64;
+    let records = (0..256)
+        .map(|index| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let start = 20 + seed % 1_760;
+            let length = 20 + (seed >> 16) % 180;
+            row_test_record(
+                format!("property-{index:04}").as_bytes(),
+                start,
+                (start + length).min(1_990),
+            )
+        })
+        .collect::<Vec<_>>();
+    let intervals = [
+        (0, 700),
+        (250, 950),
+        (500, 1_200),
+        (750, 1_450),
+        (500, 1_200),
+        (250, 950),
+        (0, 700),
+        (600, 1_600),
+        (900, 1_900),
+        (600, 1_600),
+    ];
+    let mut history = AlignmentRowHistory::default();
+    let mut known = HashMap::<AlignmentRowIdentity, usize>::new();
+
+    for (step, (start, end)) in intervals.into_iter().enumerate() {
+        let mut visible = records
+            .iter()
+            .filter(|record| record.start < end && start < record.end)
+            .cloned()
+            .collect::<Vec<_>>();
+        if step % 2 == 1 {
+            visible.reverse();
+        }
+        let mut query = row_test_query(&visible);
+        query.interval = GenomicInterval::new(ContigId::new(0), start, end).unwrap();
+        let (layout, stats) = reconcile_alignment_rows(
+            &query,
+            AlignmentLayoutOptions {
+                max_rows: query.batch.len().max(1),
+                ..AlignmentLayoutOptions::default()
+            },
+            &mut history,
+            ReadStackingMode::Stable,
+            false,
+        );
+        assert_eq!(stats.moved, 0);
+        for index in 0..query.batch.len() {
+            let identity = layout.identities[index];
+            let row = layout.rows[index].unwrap();
+            if let Some(previous) = known.insert(identity, row) {
+                assert_eq!(row, previous, "identity moved at navigation step {step}");
+            }
+        }
+        for left in 0..query.batch.len() {
+            for right in left + 1..query.batch.len() {
+                if layout.rows[left] == layout.rows[right]
+                    && query.batch.starts[left] < query.batch.ends[right]
+                    && query.batch.starts[right] < query.batch.ends[left]
+                {
+                    panic!("overlapping records shared a row at navigation step {step}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn initial_stable_baseline_is_independent_of_batch_iteration_order() {
+    let mut supplementary = row_test_record(b"repeated-name", 10, 90);
+    supplementary.flags = AlignmentFlags::from_bits(0x800);
+    let records = vec![
+        row_test_record(b"zeta", 10, 90),
+        supplementary,
+        row_test_record(b"alpha", 10, 90),
+    ];
+    let forward = row_test_query(&records);
+    let mut reversed_records = records;
+    reversed_records.reverse();
+    let reversed = row_test_query(&reversed_records);
+    let mut forward_history = AlignmentRowHistory::default();
+    let mut reversed_history = AlignmentRowHistory::default();
+    let (forward_layout, _) = reconcile_alignment_rows(
+        &forward,
+        AlignmentLayoutOptions::default(),
+        &mut forward_history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (reversed_layout, _) = reconcile_alignment_rows(
+        &reversed,
+        AlignmentLayoutOptions::default(),
+        &mut reversed_history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let forward_rows = forward_layout
+        .identities
+        .iter()
+        .copied()
+        .zip(forward_layout.rows.iter().copied())
+        .collect::<BTreeMap<_, _>>();
+    let reversed_rows = reversed_layout
+        .identities
+        .iter()
+        .copied()
+        .zip(reversed_layout.rows.iter().copied())
+        .collect::<BTreeMap<_, _>>();
+
+    assert_eq!(forward_rows, reversed_rows);
+    assert_eq!(
+        forward_layout.assignment_fingerprint(),
+        reversed_layout.assignment_fingerprint()
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 #[test]
 fn layout_distinguishes_cigar_operations() {
@@ -3197,9 +3816,8 @@ fn deep_overlapping_reads_extend_beyond_the_old_ninety_row_cap() {
         reference: None,
         stats: QueryStats {
             records_seen: 120,
-            records_eligible: 121,
+            records_eligible: 120,
             records_emitted: 120,
-            truncated: true,
             ..QueryStats::default()
         },
     };
@@ -3212,11 +3830,6 @@ fn deep_overlapping_reads_extend_beyond_the_old_ninety_row_cap() {
 
     assert_eq!(layout.stats.rendered_alignments, 120);
     assert_eq!(layout.stats.hidden_alignments, 0);
-    assert!(layout.display_list.rectangles.iter().any(|rectangle| {
-        rectangle.object_id == 0
-            && (rectangle.height - 3.0).abs() < f32::EPSILON
-            && rectangle.color.red < 0.1
-    }));
     let bottom = layout
         .display_list
         .rectangles
@@ -3296,6 +3909,93 @@ fn regional_spans_reuse_rows_after_preceding_alignments_end() {
             .iter()
             .filter(|rectangle| rectangle.object_id != 0)
             .all(|rectangle| rectangle.width >= 1.0)
+    );
+}
+
+#[test]
+fn canonical_start_packing_reuses_the_topmost_free_row() {
+    let query = row_test_query(&[
+        row_test_record(b"long", 0, 100),
+        row_test_record(b"short-one", 10, 20),
+        row_test_record(b"short-two", 30, 40),
+        row_test_record(b"after-all", 110, 120),
+    ]);
+    let rows = assign_alignment_rows(
+        &query,
+        AlignmentLayoutOptions {
+            max_rows: query.batch.len(),
+            ..AlignmentLayoutOptions::default()
+        },
+        None,
+    );
+
+    assert_eq!(rows.row(0), Some(0));
+    assert_eq!(rows.row(1), Some(1));
+    assert_eq!(rows.row(2), Some(1));
+    assert_eq!(
+        rows.row(3),
+        Some(0),
+        "when every lane is free, canonical packing must choose the topmost lane"
+    );
+    assert_eq!(rows.used_row_count(), 2);
+    let metrics = alignment_row_organization_metrics(
+        &query,
+        AlignmentLayoutOptions {
+            max_rows: query.batch.len(),
+            ..AlignmentLayoutOptions::default()
+        },
+        &rows,
+    );
+    assert_eq!(metrics.architecture_version, 2);
+    assert_eq!(metrics.canonical_rows, 2);
+    assert_eq!(metrics.stable_rows, 2);
+    assert_eq!(metrics.row_inflation, 0);
+    assert_eq!(metrics.canonical_displacement, 0);
+    assert_eq!(metrics.top_first_violations, 0);
+}
+
+#[test]
+fn canonical_start_height_equals_maximum_concurrent_span_depth() {
+    let mut seed = 0x7f4a_7c15_d1ce_ba5e_u64;
+    let records = (0..512)
+        .map(|index| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let start = seed % 8_000;
+            let length = 1 + (seed >> 17) % 600;
+            row_test_record(
+                format!("depth-{index:04}").as_bytes(),
+                start,
+                start + length,
+            )
+        })
+        .collect::<Vec<_>>();
+    let query = row_test_query(&records);
+    let rows = assign_alignment_rows(
+        &query,
+        AlignmentLayoutOptions {
+            max_rows: query.batch.len(),
+            ..AlignmentLayoutOptions::default()
+        },
+        None,
+    );
+    let mut events = records
+        .iter()
+        .flat_map(|record| [(record.start, 1_i32), (record.end, -1_i32)])
+        .collect::<Vec<_>>();
+    events.sort_unstable();
+    let mut depth = 0_i32;
+    let maximum_depth = events
+        .into_iter()
+        .map(|(_, delta)| {
+            depth += delta;
+            depth
+        })
+        .max()
+        .unwrap_or_default();
+
+    assert_eq!(
+        rows.used_row_count(),
+        usize::try_from(maximum_depth).unwrap()
     );
 }
 

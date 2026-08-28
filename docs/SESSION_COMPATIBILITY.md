@@ -30,7 +30,11 @@ source XML.
 Version 2 replaces the single document-level alignment source and filters with an ordered
 `alignment_tracks` array. Each entry has a stable ID, name, source, visibility, collapsed state,
 height, filters, and requested alignment limit. `maximum_alignments` remains at document level as a
-workspace-wide hard ceiling; no track may request more than that ceiling.
+workspace-wide hard ceiling; no track may request more than that ceiling. The field now represents
+the maximum records in an admitted complete individual-read batch, not a retained sample size. A
+query above its effective allocation exposes no individual reads while preserving complete
+aggregates where available. This semantic correction removes an incomplete presentation and does
+not change the serialized value, default, or migration path.
 
 The version-1 migration is deterministic:
 

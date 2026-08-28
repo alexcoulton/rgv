@@ -37,7 +37,6 @@ use crate::{
         OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, aligned_observation,
     },
     read_remote_object_bounded, remote_url_with_extension,
-    sampling::BoundedSampler,
 };
 
 type NoodlesReader = bam::io::IndexedReader<noodles::bgzf::io::Reader<HttpRangeReader>>;
@@ -106,6 +105,10 @@ pub enum ProductionAlignmentSource {
 }
 
 impl ProductionAlignmentSource {
+    pub fn is_remote(&self) -> bool {
+        !matches!(self, Self::Htslib(_))
+    }
+
     pub fn open(
         path: impl AsRef<std::path::Path>,
         options: &AlignmentOpenOptions,
@@ -530,8 +533,13 @@ where
     );
     let mut pairs = crate::pair::PairSummaryBuilder::new();
     let mut overlap_collapser = OverlapCollapser::new(options.overlapping_mate_policy);
-    let mut samples = BoundedSampler::new(options.max_records.get());
-    let mut stats = QueryStats::default();
+    let maximum_records = options.max_records.get();
+    let mut retained = Vec::new();
+    let mut too_dense = false;
+    let mut stats = QueryStats {
+        complete_read_limit: maximum_records,
+        ..QueryStats::default()
+    };
     for result in records {
         let record = result?;
         stats.records_seen = stats.records_seen.saturating_add(1);
@@ -574,6 +582,11 @@ where
             }
         }
         stats.records_eligible = stats.records_eligible.saturating_add(1);
+        if stats.records_eligible > maximum_records && !too_dense {
+            retained.clear();
+            retained.shrink_to_fit();
+            too_dense = true;
+        }
         let flags = AlignmentFlags::from_bits(record.flags()?.bits());
         let record_contig = record
             .reference_sequence_id(header)
@@ -616,32 +629,31 @@ where
             overlap_mask,
         )?);
         let normalized_for_modifications = if let Some(builder) = &mut modifications {
-            let normalized = normalize_record(&record, header, QueryDetail::Full)?;
+            let normalized = normalize_record(&record, header, QueryDetail::Full, &[])?;
             builder.add_record(&normalized);
             Some(normalized)
         } else {
             None
         };
-        let score = sampling_score(&record, header)?;
-        if samples.would_retain(score, stats.records_seen) {
-            samples.insert(
-                score,
-                stats.records_seen,
-                match normalized_for_modifications {
-                    // Keep the record used for modification aggregation so
-                    // inspectors and automation cannot contradict the
-                    // rendered/exported modification evidence.
-                    Some(normalized) => normalized,
-                    None => normalize_record(&record, header, options.detail)?,
-                },
-            );
+        if !too_dense {
+            retained.push(match normalized_for_modifications {
+                // Keep the record used for modification aggregation so
+                // inspectors and automation cannot contradict the complete
+                // rendered/exported modification evidence.
+                Some(normalized) => normalized,
+                None => normalize_record(
+                    &record,
+                    header,
+                    options.detail,
+                    &options.retained_auxiliary_tags,
+                )?,
+            });
         }
     }
     if stats.cancelled {
         return Ok(cancelled_query(interval, metadata));
     }
 
-    let mut retained = samples.into_values();
     retained.sort_by(|left, right| {
         (left.start, left.end, &left.read_name).cmp(&(right.start, right.end, &right.read_name))
     });
@@ -650,7 +662,14 @@ where
         batch.push(record).map_err(AlignmentError::BatchOverflow)?;
     }
     stats.records_emitted = retained.len();
-    stats.truncated = stats.records_eligible > stats.records_emitted;
+    stats.truncated = too_dense;
+    stats.individual_reads = if too_dense {
+        crate::IndividualReadStatus::TooDense {
+            limit: maximum_records,
+        }
+    } else {
+        crate::IndividualReadStatus::Complete
+    };
     let mut pileup = pileup.finish(PileupProvenance {
         eligible_records: stats.records_eligible,
         rendered_records: stats.records_emitted,
@@ -1020,34 +1039,6 @@ fn eligibility(
     Ok(Eligibility::Eligible)
 }
 
-fn sampling_score(
-    record: &dyn sam::alignment::Record,
-    header: &sam::Header,
-) -> Result<u64, AlignmentError> {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    let reference_id = record
-        .reference_sequence_id(header)
-        .transpose()?
-        .unwrap_or_default();
-    let start = record
-        .alignment_start()
-        .transpose()?
-        .map_or(0, |position| position.get());
-    for byte in record
-        .name()
-        .map_or(&[][..], AsRef::<[u8]>::as_ref)
-        .iter()
-        .copied()
-        .chain(reference_id.to_le_bytes())
-        .chain(start.to_le_bytes())
-        .chain(record.flags()?.bits().to_le_bytes())
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    Ok(hash)
-}
-
 fn add_pileup(
     record: &dyn sam::alignment::Record,
     pileup: &mut PileupBuilder,
@@ -1204,6 +1195,7 @@ fn normalize_record(
     record: &dyn sam::alignment::Record,
     header: &sam::Header,
     detail: QueryDetail,
+    retained_auxiliary_tags: &[[u8; 2]],
 ) -> Result<AlignmentRecord, AlignmentError> {
     let contig = record
         .reference_sequence_id(header)
@@ -1266,16 +1258,22 @@ fn normalize_record(
             qualities: (!qualities.iter().all(|quality| *quality == u8::MAX)).then_some(qualities),
         }
     };
-    let auxiliary_fields = if detail == QueryDetail::Full {
+    let auxiliary_fields = if detail == QueryDetail::Full || !retained_auxiliary_tags.is_empty() {
         record
             .data()
             .iter()
             .map(|result| {
                 let (tag, value) = result?;
-                Ok(AuxField {
-                    tag: *tag.as_ref(),
-                    value: normalize_aux(value)?,
-                })
+                Ok((*tag.as_ref(), value))
+            })
+            .filter_map(|result| match result {
+                Ok((tag, value))
+                    if detail == QueryDetail::Full || retained_auxiliary_tags.contains(&tag) =>
+                {
+                    Some(normalize_aux(value).map(|value| AuxField { tag, value }))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
             })
             .collect::<Result<Vec<_>, AlignmentError>>()?
     } else {
@@ -1573,6 +1571,17 @@ mod tests {
                 )
                 .set_sequence(Sequence::from(b"ACGTGACGACGT".as_slice()))
                 .set_quality_scores(QualityScores::from(vec![35; 12]))
+                .set_data(data.clone())
+                .build();
+            let second_record = RecordBuf::builder()
+                .set_name("remote-cram-read-2")
+                .set_flags(Flags::empty())
+                .set_reference_sequence_id(0)
+                .set_alignment_start(Position::try_from(41).unwrap())
+                .set_mapping_quality(MappingQuality::new(48).unwrap())
+                .set_cigar([Op::new(CigarKind::Match, 12)].into_iter().collect())
+                .set_sequence(Sequence::from(b"ACGTACGTACGT".as_slice()))
+                .set_quality_scores(QualityScores::from(vec![35; 12]))
                 .set_data(data)
                 .build();
             let local_cram = directory.path().join("fixture.cram");
@@ -1583,6 +1592,9 @@ mod tests {
                 .build_from_writer(file);
             writer.write_header(&sam_header).ok()?;
             writer.write_alignment_record(&sam_header, &record).ok()?;
+            writer
+                .write_alignment_record(&sam_header, &second_record)
+                .ok()?;
             writer.try_finish(&sam_header).ok()?;
             drop(writer);
             let index = cram::fs::index(&local_cram).ok()?;
@@ -1831,6 +1843,29 @@ mod tests {
             .unwrap();
         assert_eq!(remote_pairs.pairs, local_pairs.pairs);
         assert_eq!(remote_pairs.pairs.median_template_length, Some(166));
+        let refused_options = QueryOptions {
+            max_records: std::num::NonZeroUsize::new(1).unwrap(),
+            ..QueryOptions::default()
+        };
+        let remote_refused = source
+            .query(pair_interval, refused_options.clone(), &|| true)
+            .unwrap();
+        let local_refused = local
+            .query(pair_interval, refused_options, &|| true)
+            .unwrap();
+        assert_eq!(
+            remote_refused.stats.records_eligible,
+            local_refused.stats.records_eligible
+        );
+        assert_eq!(remote_refused.stats.records_emitted, 0);
+        assert_eq!(remote_refused.stats.complete_read_limit, 1);
+        assert_eq!(
+            remote_refused.stats.individual_reads,
+            crate::IndividualReadStatus::TooDense { limit: 1 }
+        );
+        assert!(remote_refused.batch.is_empty());
+        assert_eq!(remote_refused.pileup, local_refused.pileup);
+        assert_eq!(remote_refused.pairs, local_refused.pairs);
         let junction_interval =
             GenomicInterval::new(ContigId::new(0), 2_100_000, 2_301_100).unwrap();
         let remote_junctions = source
@@ -1965,9 +2000,9 @@ mod tests {
         let remote_query = remote
             .query(interval, query_options.clone(), &|| true)
             .unwrap();
-        assert_eq!(remote_query.stats.records_seen, 1);
-        assert_eq!(remote_query.stats.records_emitted, 1);
-        assert_eq!(remote_query.batch.len(), 1);
+        assert_eq!(remote_query.stats.records_seen, 2);
+        assert_eq!(remote_query.stats.records_emitted, 2);
+        assert_eq!(remote_query.batch.len(), 2);
         assert_eq!(
             remote_query.batch.materialize_record(0).unwrap().read_name,
             b"remote-cram-read"
@@ -1999,6 +2034,24 @@ mod tests {
         assert_eq!(remote_query.pileup, local_query.pileup);
         assert_eq!(remote_query.junctions, local_query.junctions);
         assert_eq!(remote_query.pairs, local_query.pairs);
+        let refusal_options = QueryOptions {
+            max_records: std::num::NonZeroUsize::new(1).unwrap(),
+            ..QueryOptions::default()
+        };
+        let remote_refused = remote
+            .query(interval, refusal_options.clone(), &|| true)
+            .unwrap();
+        let local_refused = local.query(interval, refusal_options, &|| true).unwrap();
+        assert_eq!(remote_refused.stats.records_eligible, 2);
+        assert_eq!(remote_refused.stats.records_emitted, 0);
+        assert_eq!(
+            remote_refused.stats.individual_reads,
+            crate::IndividualReadStatus::TooDense { limit: 1 }
+        );
+        assert!(remote_refused.batch.is_empty());
+        assert_eq!(remote_refused.pileup, local_refused.pileup);
+        assert_eq!(remote_refused.junctions, local_refused.junctions);
+        assert_eq!(remote_refused.pairs, local_refused.pairs);
 
         let conventional_options = AlignmentOpenOptions {
             remote_index_url: None,
@@ -2009,7 +2062,7 @@ mod tests {
         let conventional_query = conventional
             .query(interval, QueryOptions::default(), &|| true)
             .unwrap();
-        assert_eq!(conventional_query.stats.records_emitted, 1);
+        assert_eq!(conventional_query.stats.records_emitted, 2);
 
         let mut fallback =
             ProductionAlignmentSource::open(&fixture.fallback_cram_url, &conventional_options)
@@ -2017,7 +2070,7 @@ mod tests {
         let fallback_query = fallback
             .query(interval, QueryOptions::default(), &|| true)
             .unwrap();
-        assert_eq!(fallback_query.stats.records_emitted, 1);
+        assert_eq!(fallback_query.stats.records_emitted, 2);
 
         assert_mismatched_cram_reference_is_rejected(&fixture, interval);
 

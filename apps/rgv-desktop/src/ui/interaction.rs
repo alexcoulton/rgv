@@ -1,5 +1,6 @@
 use super::super::*;
 
+#[cfg(test)]
 fn alignment_query_supports_gesture_detail(
     query: &AlignmentQuery,
     interval: GenomicInterval,
@@ -71,7 +72,7 @@ impl Viewer {
                     .pan_pixels(-delta_points, self.panels.active_mut().contig_length)
                 {
                     self.panels.active_mut().viewport = viewport;
-                    self.viewport_changed();
+                    self.viewport_gesture_changed();
                 }
             }
             self.last_cursor = Some(position);
@@ -140,7 +141,7 @@ impl Viewer {
                 .active_mut()
                 .navigation_history
                 .visit(viewport.interval());
-            self.viewport_changed();
+            self.viewport_gesture_changed();
         }
     }
 
@@ -187,6 +188,7 @@ impl Viewer {
         if (next - state.scroll_points).abs() <= f32::EPSILON {
             return;
         }
+        self.invalidate_navigation_preview_contract("read panel vertical scroll changed");
         let primary_track_id = self.primary_alignment_track_id();
         let latent_fraction = {
             let state = self
@@ -217,6 +219,7 @@ impl Viewer {
         if (next - self.panels.annotation_scroll_points).abs() <= f32::EPSILON {
             return;
         }
+        self.invalidate_navigation_preview_contract("annotation vertical scroll changed");
         if !self.refresh_shared_annotation_scroll_display(next) {
             self.display_dirty = true;
         }
@@ -305,114 +308,20 @@ impl Viewer {
     }
 
     pub(crate) fn viewport_changed(&mut self) {
-        self.panels.active_mut().last_gesture_query_at = None;
         self.remember_current_locus();
         self.panels.active_mut().hovered_record = None;
-        self.display_dirty = true;
-        if !self.synthetic
-            && (self.primary_alignment_dictionary().is_some()
-                || self.reference_dictionary.is_some()
-                || self.track_engine.is_some())
-        {
-            self.retain_active_read_selection_for_query_refresh();
-            self.panels.active().generation_clock.advance();
-            self.advance_alignment_generations(self.panels.active().id);
-            let interval = self.panels.active().viewport.interval();
-            let alignment_covers_viewport = !self.has_alignment_engine()
-                || self
-                    .primary_alignment_query()
-                    .is_some_and(|query| query.interval.contains_interval(interval));
-            let tracks_cover_viewport = self.track_engine.is_none()
-                || self
-                    .panels
-                    .active()
-                    .track_snapshot_interval
-                    .is_some_and(|loaded| loaded.contains_interval(interval));
-            let reference_covers_viewport = self.reference_engine.is_none()
-                || self.panels.active().viewport.bases_per_pixel()
-                    > MAXIMUM_BASE_MARK_BASES_PER_PIXEL
-                || self
-                    .panels
-                    .active()
-                    .reference_slice
-                    .as_ref()
-                    .is_some_and(|slice| slice.interval.contains_interval(interval));
-            if alignment_covers_viewport && tracks_cover_viewport && reference_covers_viewport {
-                self.rebuild_genomic_display();
-            }
-            self.request_alignment_query();
-            self.request_reference_query();
-            self.request_track_query();
-        }
+        self.panels.active_mut().hover_inspector_target = None;
+        self.begin_viewport_navigation(false, false);
     }
 
     pub(crate) fn viewport_gesture_changed(&mut self) {
         self.remember_current_locus();
         self.panels.active_mut().hovered_record = None;
-        self.display_dirty = true;
-        self.rebuild_genomic_display();
-        self.request_gesture_refinement_if_needed();
-    }
-
-    pub(crate) fn request_gesture_refinement_if_needed(&mut self) {
-        if self.synthetic {
-            return;
-        }
-        let interval = self.panels.active().viewport.interval();
-        let viewport = self.panels.active().viewport;
-        let detail = viewport.detail_level();
-        let reference_available = self.reference_engine.is_some();
-        let alignment_needs_refinement = self.has_alignment_engine()
-            && !self.primary_alignment_query().is_some_and(|query| {
-                alignment_query_supports_gesture_detail(
-                    query,
-                    interval,
-                    detail,
-                    viewport.bases_per_pixel(),
-                    reference_available,
-                )
-            });
-        let tracks_need_refinement = self.track_engine.is_some()
-            && !self
-                .panels
-                .active()
-                .track_snapshot_interval
-                .is_some_and(|loaded| loaded.contains_interval(interval));
-        let reference_needs_refinement = self.reference_engine.is_some()
-            && viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
-            && !self
-                .panels
-                .active()
-                .reference_slice
-                .as_ref()
-                .is_some_and(|slice| slice.interval.contains_interval(interval));
-        if !alignment_needs_refinement && !tracks_need_refinement && !reference_needs_refinement {
-            return;
-        }
-        let now = Instant::now();
-        if self
-            .panels
-            .active()
-            .last_gesture_query_at
-            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(100))
-        {
-            return;
-        }
-        self.panels.active_mut().last_gesture_query_at = Some(now);
-        if alignment_needs_refinement {
-            self.retain_active_read_selection_for_query_refresh();
-        }
-        self.panels.active().generation_clock.advance();
-        self.advance_alignment_generations(self.panels.active().id);
-        if alignment_needs_refinement {
-            self.request_alignment_query();
-        }
-        if reference_needs_refinement {
-            self.request_reference_query();
-        }
-        if tracks_need_refinement {
-            self.request_track_query();
-        }
+        self.panels.active_mut().hover_inspector_target = None;
+        let hold_commit_until_end = self.dragging
+            || self.horizontal_overview_drag.is_some()
+            || self.overview_capture == Some(OverviewCapture::Horizontal);
+        self.begin_viewport_navigation(true, hold_commit_until_end);
     }
 
     /// Preserve a read selection across an alignment query refresh.
@@ -432,14 +341,17 @@ impl Viewer {
             // so a later query can bind it again.
             return;
         }
-        let Some(pending) = self.alignment_query_for_track(track_id).and_then(|query| {
-            read_selection_for_query_refresh(
-                self.panels.active().selected_alignment_track,
-                self.panels.active().selected_record,
-                track_id,
-                query,
-            )
-        }) else {
+        let Some(pending) = self
+            .complete_read_query_for_track(track_id)
+            .and_then(|query| {
+                read_selection_for_query_refresh(
+                    self.panels.active().selected_alignment_track,
+                    self.panels.active().selected_record,
+                    track_id,
+                    query,
+                )
+            })
+        else {
             return;
         };
         self.panels.active_mut().pending_read_selection = Some(pending);
@@ -506,15 +418,15 @@ impl Viewer {
                 interaction.press_handle_fraction,
                 self.panels.active().contig_length,
             );
-            if viewport != self.panels.active_mut().viewport {
-                self.panels.active_mut().viewport = viewport;
-                self.viewport_gesture_changed();
-            }
             self.horizontal_overview_drag = Some(HorizontalOverviewDrag {
                 anchor_fraction,
                 last_pointer_x: press_x,
                 last_pointer_y: press_y,
             });
+            if viewport != self.panels.active_mut().viewport {
+                self.panels.active_mut().viewport = viewport;
+                self.viewport_gesture_changed();
+            }
         }
         let was_captured = self.overview_capture == Some(OverviewCapture::Horizontal);
         if interaction.dragging
@@ -551,7 +463,7 @@ impl Viewer {
         if interaction.drag_stopped && self.horizontal_overview_drag.take().is_some() {
             let interval = self.panels.active().viewport.interval();
             self.panels.active_mut().navigation_history.visit(interval);
-            self.viewport_changed();
+            self.finish_navigation_gesture();
         }
     }
 
@@ -950,9 +862,11 @@ impl Viewer {
             self.display_dirty = true;
             self.interaction_trace
                 .record_once(InteractionTraceStage::DensityChanged);
-        } else if scroll_changed && (self.synthetic || !self.refresh_active_panel_scroll_display())
-        {
-            self.display_dirty = true;
+        } else if scroll_changed {
+            self.invalidate_navigation_preview_contract("read panel vertical scroll changed");
+            if self.synthetic || !self.refresh_active_panel_scroll_display() {
+                self.display_dirty = true;
+            }
         } else if (drag.virtual_scroll_fraction - previous_fraction).abs() > f32::EPSILON {
             self.window.request_redraw();
         }
@@ -977,7 +891,7 @@ impl Viewer {
                 if self.horizontal_overview_drag.take().is_some() {
                     let interval = self.panels.active().viewport.interval();
                     self.panels.active_mut().navigation_history.visit(interval);
-                    self.viewport_changed();
+                    self.finish_navigation_gesture();
                 }
             }
             OverviewCapture::VerticalDensity => {
@@ -991,22 +905,22 @@ impl Viewer {
         self.remember_current_locus();
         self.display_dirty = true;
         self.layout_cache.clear();
+        self.invalidate_navigation_preview_contract("query or presentation options changed");
         if !self.synthetic && (self.has_alignment_engine() || self.track_engine.is_some()) {
             for panel in &mut self.panels.panels {
                 panel.generation_clock.advance();
-                panel.selected_record = None;
-                panel.selected_alignment_track = None;
-                panel.selected_read_event = None;
-                panel.selected_junction = None;
             }
             for track in &mut self.alignment_tracks {
                 for projection in track.projections.values_mut() {
                     projection.clock.advance();
-                    projection.current_query = None;
-                    projection.alignment_rows = None;
+                    // Retain the last committed query only as non-visible
+                    // history. Generation gates replace its read geometry and
+                    // interactions with the neutral Checking state until the
+                    // replacement query and layout horizon commit together.
                     projection.cached_layout = None;
                 }
             }
+            self.begin_all_panel_refresh_transactions();
             self.request_all_panel_queries();
         }
     }
@@ -1222,6 +1136,7 @@ impl Viewer {
         );
         panel.content_bottom_points = self.canvas_geometry().viewport.top();
         anyhow::ensure!(self.panels.push(panel), "view panel identity collision");
+        self.invalidate_navigation_preview_contract("view panel added");
         for track in &mut self.alignment_tracks {
             track.projection_mut(id).pending_query =
                 !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
@@ -1243,6 +1158,7 @@ impl Viewer {
         }
         let removed = self.panels.remove(id).is_some();
         if removed {
+            self.invalidate_navigation_preview_contract("view panel removed");
             self.synchronize_panel_widths();
             self.refresh_active_panel_context();
             self.request_all_panel_queries();
@@ -1254,6 +1170,7 @@ impl Viewer {
     pub(crate) fn move_view_panel(&mut self, id: PanelId, new_index: usize) -> bool {
         let moved = self.panels.move_panel(id, new_index);
         if moved {
+            self.invalidate_navigation_preview_contract("view panel order changed");
             self.display_dirty = true;
             self.rebuild_all_panel_displays();
         }

@@ -5,7 +5,7 @@
 //! coverage for arrows, dingbats, or miscellaneous technical symbols, and
 //! platform font fallback is neither portable nor deterministic.
 
-use egui::{Color32, Painter, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2, Widget};
+use egui::{Color32, Painter, Pos2, Rect, Response, Stroke, Ui, Vec2, Widget};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AppIcon {
@@ -20,7 +20,6 @@ pub(crate) enum AppIcon {
     ChevronLeft,
     ChevronRight,
     Settings,
-    StatusDot,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -65,14 +64,6 @@ impl Widget for IconButton {
         });
         response
     }
-}
-
-pub(crate) fn icon_swatch(ui: &mut Ui, color: Color32, accessible_label: &str) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-    paint_icon(ui.painter(), rect, AppIcon::StatusDot, color);
-    response
-        .on_hover_text(accessible_label)
-        .on_hover_cursor(egui::CursorIcon::Default)
 }
 
 pub(crate) fn paint_icon(painter: &Painter, target: Rect, icon: AppIcon, color: Color32) {
@@ -146,9 +137,6 @@ pub(crate) fn paint_icon(painter: &Painter, target: Rect, icon: AppIcon, color: 
             for (x, y) in [(7.0, 5.0), (13.0, 10.0), (8.5, 15.0)] {
                 painter.circle_filled(point(x, y), 2.0 * unit, color);
             }
-        }
-        AppIcon::StatusDot => {
-            painter.circle_filled(rect.center(), side * 0.38, color);
         }
     }
 }

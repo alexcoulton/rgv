@@ -163,11 +163,19 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   remain fixed, and read density is controlled exclusively by the right overview. Read rows are
   assigned over the bounded retained query before viewport clipping, so existing reads keep their
   vertical positions from chromosome scale through Regional, Reads, and Bases detail. Refined
-  queries retain assignments for shared read identities and place newly loaded reads around them.
+  queries retain assignments for shared read identities and place newly admitted complete reads around them.
   Navigator handles capture immediately on press; at extreme zoom their enlarged hit targets stay
   relative to the current viewport, while a stationary click elsewhere on the rail recentres.
-  When zooming beyond the loaded interval, overlapping retained reads and coverage remain visible
-  while throttled background refinements expand the query; release commits one final query.
+  Horizontal navigation is transactional. RGV immediately transforms the last committed genomic
+  canvas while coalescing background queries, then replaces it in one frame only after the exact
+  target reference, tracks, complete reads, and layout have settled. The transformed image is a
+  non-interactive orientation aid: it cannot be selected, inspected, exported, or reported as
+  current evidence. Uncovered zoom-out flanks are neutral rather than stretched. Where every
+  visible read track has a complete, policy-matching canonical horizon that contains the target,
+  RGV may overlay accurate target-oriented rows with no object IDs; coverage remains retained
+  preview pixels until commit. A delayed `Updating view…` notice appears only for a sustained
+  transaction, and commits never fade. Resize, pane, density, vertical-scroll, track-presentation,
+  or display-scale changes invalidate an incompatible preview safely.
 - Drag horizontally to pan and use the wheel or trackpad to zoom around the pointer.
 - Annotation tracks occupy the upper pane and reads occupy the lower pane. They are independent
   presentation channels even when both rows refer to the same alignment source. Every row has an
@@ -334,11 +342,13 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   supplementary alignments by default. The gutter, diagnostics, exports, and MCP snapshots report
   exclusions; saved projects retain their explicit choices.
 
-RGV retains every eligible alignment for ordinary detailed views; it does not apply IGV-style
-per-window read downsampling. The configurable **Read safety cap** is an emergency workspace
-resource bound. If a query exceeds it, the gutter reports the exact loaded/eligible counts and the
-retained set is deterministic. Raising the safety cap increases memory, layout work, and GPU
-primitives. Coverage always uses every eligible read, including beyond that safety bound.
+RGV never presents a sampled individual-read stack. The configurable **Complete read limit** is
+50,000 by default and can be set from 1,000 to 250,000 in alignment-track properties. If every
+eligible read in the exact viewport fits within the effective limit, RGV presents all of them. If
+the population exceeds the limit, RGV presents no individual reads, reports the exact eligible
+count and effective limit, and asks you to zoom in or raise the setting. Raising the limit can
+increase memory, query/layout time, primitive counts, and GPU work. Coverage and other aggregates
+remain available when they were computed from every eligible source record.
 
 RGV currently computes coverage from the explicitly loaded alignment source. It does not discover
 or substitute a precomputed coverage file by filename convention; support for such a source will
@@ -351,7 +361,7 @@ generation, filters, retained query, and row layout. Its annotation and read rep
 separate ordered presentation nodes, visibility, grouping, and preferred heights. The workspace
 owns the annotation/read divider rather than whichever source happens to be first. The
 **Tracks** menu lists every alignment source, including hidden tracks. **Settings…** opens the same
-complete appearance, grouping, pairing, modification, junction, filtering, and record-cap surface
+complete appearance, grouping, pairing, modification, junction, filtering, and Complete read-limit surface
 for any selected alignment track; partially entered filter text and validation errors remain local
 to that track. Dragging any alignment label reorders the complete alignment list and can promote a
 track to first position without reopening it or changing its stable identity. **Remove track**
@@ -364,15 +374,17 @@ grouping, pairing, junction, and modification presentation. It deliberately pres
 MAPQ/base-quality filters, SAM-tag predicates, secondary/supplementary inclusion, and record cap.
 
 The decoded-alignment cache is divided when tracks are opened, and the workspace record ceiling is
-allocated fairly among loaded, queryable tracks as a hard total. Consequently, adding samples does not
-multiply the declared cache or record cap. Read, CIGAR-event, pileup, junction, modification, and
+allocated fairly among loaded, queryable tracks as a hard total. Consequently, adding samples does
+not multiply the declared cache or limit. The Too-dense state reports the effective allocation
+actually used by the query; it never trims an already presented batch into a sample. Read,
+CIGAR-event, pileup, junction, modification, and
 supplementary-chain inspection first resolves the owning track frame and then reads that track's
 query and dictionary. Alignment sources with a different header order therefore remain safe, and a
 chromosome missing from one source is reported only in that track.
 
 ### Splice junctions
 
-Eligible CIGAR `N` operations are aggregated before visible-read sampling into a bounded junction
+Eligible CIGAR `N` operations are aggregated independently of individual-read admission into a bounded junction
 summary. Enable **Junctions** in alignment settings, set **Junction depth ≥** for a display filter,
 and set **Aligned flank ≥** to requery and count only reads with the declared number of aligned
 `M`/`=`/`X` bases in both adjacent exon blocks. The inspector reports the observed left/right flank
@@ -405,6 +417,40 @@ multi-sample Sashimi PNG or SVG for the selected visible tracks. At most 16 trac
 text/vector output are retained; actual layout, image encoding, and file writes run outside the UI
 thread.
 
+### Stable read stacking
+
+**Read stacking** defaults to **Stable across navigation** for every alignment track. A read that is
+shared by two overlapping views keeps the same row through zoom, pan, filter, Reads/Bases detail
+changes, Overview transitions, query-cache replacement, and window or pane resizing. Reads that are
+temporarily absent retain lightweight row reservations, so returning to a broader view restores the
+previous architecture. The first layout is built deterministically over a fixed, tiled neighbourhood:
+reads are ordered canonically and placed in the highest compatible row. That gives zoom levels the
+same organised architecture instead of freezing whichever viewport happened to load first. Later
+horizon extensions can leave gaps or make the read stack taller because existing reads do not move;
+the right-side navigator keeps the same stable row and within-row offset at the top of the pane.
+
+Foreground admission covers the exact requested viewport. Off-screen prefetch is a separate,
+best-effort cache request and cannot consume the foreground limit or change its result. Stable row
+architecture is likewise built only from a complete deterministic layout horizon. If the preferred
+horizon is Too dense, RGV tries the smaller fixed horizon that still covers the viewport; if no
+complete horizon fits, Stable mode shows no individual reads and reports a stable-horizon refusal.
+Compact mode needs only the complete foreground population.
+
+Choose **Compact each view** when minimum height is more important than visual continuity. It packs
+each settled query independently and does not delete the track's retained stable history, so
+switching back restores the matching stable context. In Stable mode, **Rebuild stable architecture** makes
+the current compact arrangement a new stable baseline once without enabling persistent compact
+mode. Grouping, sorting, pair view, and a newly chosen base-sort anchor are explicit layout-policy
+changes; colour, labels, annotation height, density, and observed query statistics are not.
+
+Disjoint loci and different row policies use separate bounded layout islands. Diagnostics and the
+automation workspace snapshot report the active mode, architecture version, policy and projection
+fingerprints, layout revision, reconciliation time, retained/restored/added/moved counts,
+reservations, canonical and stable row counts, row inflation, displacement, top-first violations,
+occupied and empty-row measures, horizon interval/generation/extensions/records/bytes/truncation,
+islands, history bytes, evictions, and the typed transition reason. Navigation-only transitions
+should always report `moved = 0`.
+
 ### Paired reads
 
 Enable **View as pairs** in alignment track settings to pack primary records with the same SAM read
@@ -418,7 +464,7 @@ inspector also reports orientation, read order, whether the mate is visible, out
 on another chromosome, unmapped, or unavailable, and a stable non-identifying template hash.
 
 Expected template-length bounds are inferred from eligible, proper, primary first-of-template
-records before retained-record safety limiting. Inference uses a deterministic sample capped at 4,096
+records independently of individual-read admission. Inference uses a deterministic aggregate-model sample capped at 4,096
 templates, requires at least 100 templates, reports its sample size and median, and uses a robust
 three-IQR envelope. Track settings can override the inferred minimum and maximum; those explicit
 bounds are validated, session-persisted, and used by pair classification, colour, grouping, and
@@ -464,8 +510,8 @@ Click the lane to inspect every modification series in that bin, including canon
 modification code and strand, optional `HP`, raw and probability-weighted fractions, alignment
 strand counts, missing `ML` calls, and evidence provenance. The inspector reports malformed tags,
 unavailable sequences, incomplete queries, and the bounded 32-series cap. Its details are copyable.
-The aggregate is calculated from every eligible record before the retained-record safety bound, so
-lowering the read safety cap does not change its counts. The per-read probability threshold does
+The aggregate is calculated from every eligible record independently of individual-read admission,
+so lowering the Complete read limit does not change its counts. The per-read probability threshold does
 not rewrite the aggregate; the inspector exposes both raw and probability-weighted evidence.
 Insertions and deletions are reported separately and are not incorporated into this consensus.
 
@@ -711,7 +757,7 @@ records for selection. Display settings and source identity round-trip in RGV pr
 
 The fixed left gutter identifies every track while genomic content pans and zooms independently.
 Alignment tracks identify reference, coverage, and reads separately, including maximum visible
-coverage and deterministic-sampling status. Hover a track label for its full name, type, and
+coverage and Complete/Checking/Too-dense read-presentation status. Hover a track label for its full name, type, and
 redacted source. Right-click a label to open settings, collapse or expand it, hide it, export the
 current view, or remove a track. Drag an alignment or auxiliary label to reorder it and drag its
 bottom separator to resize it. Hidden tracks remain discoverable in the **Tracks** menu.
@@ -818,8 +864,9 @@ metadata records the RGV version, genome, loci, visible stable track IDs and nam
 embedding source URLs, credentials, read names, or sequence. Structured commands export visible
 active-panel alignments, pileup bins, modified-base series, junctions, variants/genotypes,
 quantitative windows, selected evidence, region BED, and workspace track-name TSV. Each format has
-an explicit 64 MiB limit and records query sampling, filtering, truncation, or malformed-evidence
-provenance where the source model provides it. Every file operation runs on a worker, reports its
+an explicit 64 MiB limit and records Complete/Too-dense read state, semantic filtering, bounded
+aggregate presentation, or malformed-evidence provenance where the source model provides it. Every
+file operation runs on a worker, reports its
 resolved output path, and is joined on shutdown.
 
 Commands run in order. The first failure stops mutation, marks the remaining commands as skipped,

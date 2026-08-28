@@ -1,5 +1,21 @@
 use super::super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameTargetPlan {
+    render_surface: bool,
+    render_capture: bool,
+}
+
+const fn frame_target_plan(capture_requested: bool) -> FrameTargetPlan {
+    FrameTargetPlan {
+        // A capture is an additional output, never a replacement for the
+        // presented window frame. This keeps navigation commit and visible
+        // presentation in the same queue submission.
+        render_surface: true,
+        render_capture: capture_requested,
+    }
+}
+
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn new(
@@ -46,6 +62,8 @@ impl Viewer {
         surface.configure(&device, &surface_config);
 
         let rectangle_renderer = RectangleRenderer::new(&device, surface_config.format);
+        let navigation_preview_renderer =
+            NavigationPreviewRenderer::new(&device, surface_config.format);
         let egui_context = egui::Context::default();
         egui_context.set_visuals(egui::Visuals::light());
         let egui_state = egui_winit::State::new(
@@ -264,6 +282,22 @@ impl Viewer {
             track_presentation =
                 WorkspacePresentation::from_legacy(&alignment_track_configs, tracks.tracks());
         }
+        if synthetic {
+            track_presentation.pane_tracks.extend([
+                SessionPaneTrackState {
+                    channel: ui::TrackPane::Annotation,
+                    track_id: SYNTHETIC_ALIGNMENT_TRACK_ID,
+                    content_visible: true,
+                    preferred_height: None,
+                },
+                SessionPaneTrackState {
+                    channel: ui::TrackPane::Reads,
+                    track_id: SYNTHETIC_ALIGNMENT_TRACK_ID,
+                    content_visible: true,
+                    preferred_height: None,
+                },
+            ]);
+        }
         let primary_alignment = alignment_track_configs.first();
         let alignment_name = if synthetic {
             "Synthetic reads".to_owned()
@@ -420,6 +454,10 @@ impl Viewer {
             queue,
             surface_config,
             rectangle_renderer,
+            navigation_preview_renderer,
+            navigation_texture_revisions: HashMap::new(),
+            navigation_horizon_preview_stats: NavigationHorizonPreviewStats::default(),
+            navigation_stale_result_rejections: 0,
             egui_context,
             egui_state,
             egui_renderer,
@@ -510,6 +548,7 @@ impl Viewer {
             promoted_read: None,
             synthetic,
             workspace_alignment_limit,
+            navigation_contract_revision: 0,
             display_dirty: true,
             display_upload_pending_metrics: false,
             pending_resolution_query_refresh: None,
@@ -591,6 +630,75 @@ impl Viewer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn render_composed_frame_target(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        paint_jobs: &[egui::ClippedPrimitive],
+        screen_descriptor: &ScreenDescriptor,
+        preview_instances_empty: bool,
+        live_regions: &[[u32; 4]],
+        scale_factor: f32,
+    ) {
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("RGV genomic canvas"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 1.0,
+                            g: 1.0,
+                            b: 1.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            self.navigation_preview_renderer.render(&mut pass);
+            if preview_instances_empty && live_regions.len() == self.workspace_layout.panels.len() {
+                let scissor = self.workspace_layout.physical_genomic_scissor(
+                    scale_factor,
+                    self.surface_config.width,
+                    self.surface_config.height,
+                );
+                if scissor.width > 0 && scissor.height > 0 {
+                    pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
+                    self.rectangle_renderer.render(&mut pass);
+                }
+            } else {
+                for [x, y, width, height] in live_regions.iter().copied() {
+                    if width > 0 && height > 0 {
+                        pass.set_scissor_rect(x, y, width, height);
+                        self.rectangle_renderer.render(&mut pass);
+                    }
+                }
+            }
+        }
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("RGV application chrome"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            self.egui_renderer
+                .render(&mut pass.forget_lifetime(), paint_jobs, screen_descriptor);
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn submit_ui_frame(
         &mut self,
@@ -620,7 +728,23 @@ impl Viewer {
                 .update_texture(&self.device, &self.queue, *id, image_delta);
         }
 
-        let capture_task = self.pending_native_window_capture.take();
+        let capture_task = self.pending_native_window_capture.take().map(|mut task| {
+            task.automation_data["navigation_preview_active"] = serde_json::Value::Bool(
+                self.panels
+                    .iter()
+                    .any(|panel| panel.navigation_presentation.shows_retained_preview()),
+            );
+            // A Committing frame renders the authoritative target and becomes
+            // settled immediately after this submission, so its pixels are not
+            // labelled as a still-active transaction.
+            task.automation_data["navigation_transaction_active"] =
+                serde_json::Value::Bool(self.panels.iter().any(|panel| {
+                    panel.navigation_presentation.is_unsettled()
+                        && panel.navigation_presentation.phase
+                            != NavigationPresentationPhase::Committing
+                }));
+            task
+        });
         let capture_texture = capture_task.as_ref().map(|_| {
             self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("RGV native window capture"),
@@ -638,34 +762,50 @@ impl Viewer {
             })
         });
         let surface_started = Instant::now();
-        let mut surface_frame = None;
-        let view = if let Some(texture) = capture_texture.as_ref() {
-            texture.create_view(&wgpu::TextureViewDescriptor::default())
-        } else {
-            let frame = match self.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-                wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                    self.reconfigure_surface();
-                    frame
+        let surface_frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                self.reconfigure_surface();
+                frame
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.pending_native_window_capture = capture_task;
+                self.window.request_redraw();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.pending_native_window_capture = capture_task;
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.pending_native_window_capture = capture_task;
+                self.reconfigure_surface();
+                self.window.request_redraw();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.pending_native_window_capture = capture_task;
+                for panel in self.panels.iter_mut() {
+                    panel
+                        .navigation_presentation
+                        .invalidate_preview("rendering surface was lost");
+                    panel.navigation_provisional_display = None;
                 }
-                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                    return;
-                }
-                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                    self.reconfigure_surface();
-                    return;
-                }
-                wgpu::CurrentSurfaceTexture::Validation => {
-                    tracing::warn!("surface validation failed while acquiring a frame");
-                    return;
-                }
-            };
-            let view = frame
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            surface_frame = Some(frame);
-            view
+                self.discard_navigation_preview_texture();
+                self.reconfigure_surface();
+                self.window.request_redraw();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.pending_native_window_capture = capture_task;
+                tracing::warn!("surface validation failed while acquiring a frame");
+                self.window.request_redraw();
+                return;
+            }
         };
+        let surface_view = surface_frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         if self.interaction_trace.is_active() {
             self.interaction_trace.record_phase(
                 InteractionTraceStage::SurfaceAcquired,
@@ -691,51 +831,172 @@ impl Viewer {
                 egui_buffers_started.elapsed(),
             );
         }
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("RGV genomic canvas"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            let scissor = self.workspace_layout.physical_genomic_scissor(
-                self.window.scale_factor() as f32,
+        let previous_preview_size = {
+            let stats = self.navigation_preview_renderer.stats();
+            [stats.width, stats.height]
+        };
+        let scale_factor = self.window.scale_factor() as f32;
+        let has_visible_genomic_canvas = self.workspace_layout.panels.iter().any(|layout| {
+            self.workspace_layout
+                .physical_canvas_scissor(
+                    layout.panel_id,
+                    scale_factor,
+                    self.surface_config.width,
+                    self.surface_config.height,
+                )
+                .is_some_and(|scissor| scissor.width > 0 && scissor.height > 0)
+        });
+        let preview_texture_available = if has_visible_genomic_canvas {
+            self.navigation_preview_renderer.ensure_texture(
+                &self.device,
                 self.surface_config.width,
                 self.surface_config.height,
-            );
-            if scissor.width > 0 && scissor.height > 0 {
-                pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
-                self.rectangle_renderer.render(&mut pass);
+            )
+        } else {
+            self.navigation_preview_renderer.invalidate_texture();
+            false
+        };
+        if !preview_texture_available {
+            let reason = if has_visible_genomic_canvas {
+                "preview texture exceeds the defensive memory budget"
+            } else {
+                "no visible non-empty genomic canvas"
+            };
+            for panel in self.panels.iter_mut() {
+                if panel.navigation_presentation.source.is_some() {
+                    panel.navigation_presentation.invalidate_preview(reason);
+                    panel.navigation_provisional_display = None;
+                }
             }
         }
+        if previous_preview_size != [self.surface_config.width, self.surface_config.height] {
+            self.navigation_texture_revisions.clear();
+        }
+        let mut capture_regions = Vec::new();
+        let mut capture_revisions = Vec::new();
+        let mut live_regions = Vec::new();
+        let mut preview_instances = Vec::new();
+        let mut preview_frame_records = Vec::new();
+        for layout in &self.workspace_layout.panels {
+            let Some(panel) = self.panels.get(layout.panel_id) else {
+                continue;
+            };
+            let Some(scissor) = self.workspace_layout.physical_canvas_scissor(
+                panel.id,
+                scale_factor,
+                self.surface_config.width,
+                self.surface_config.height,
+            ) else {
+                continue;
+            };
+            let region = [scissor.x, scissor.y, scissor.width, scissor.height];
+            if panel.navigation_presentation.permits_staged_display() {
+                live_regions.push(region);
+                if prepared_stats.is_some()
+                    && preview_texture_available
+                    && self.panel_navigation_data_is_settled(panel.id)
+                {
+                    let content_revision = panel
+                        .navigation_presentation
+                        .committed_content_revision
+                        .saturating_add(1)
+                        .max(1);
+                    capture_regions.push(region);
+                    capture_revisions.push((panel.id, content_revision));
+                }
+                continue;
+            }
+
+            let source = panel
+                .navigation_presentation
+                .source
+                .as_ref()
+                .filter(|source| {
+                    panel.navigation_presentation.shows_retained_preview()
+                        && source.layout_revision == self.workspace_layout.revision
+                        && source.contract_revision == self.navigation_contract_revision
+                        && self.navigation_texture_revisions.get(&panel.id)
+                            == Some(&source.content_revision)
+                        && preview_texture_available
+                })
+                .map(|source| (source.exact_start, source.exact_start + source.span));
+            let (source_origin, source_size) = navigation_preview_source_uv(
+                [scissor.x, scissor.y],
+                [scissor.width, scissor.height],
+                [self.surface_config.width, self.surface_config.height],
+            );
+            preview_instances.push(NavigationPreviewInstance::new(
+                [scissor.x as f32, scissor.y as f32],
+                [scissor.width as f32, scissor.height as f32],
+                source_origin,
+                source_size,
+                source,
+                (
+                    panel.navigation_presentation.target_exact_start,
+                    panel.navigation_presentation.target_exact_start
+                        + panel.navigation_presentation.target_span,
+                ),
+            ));
+            preview_frame_records.push((
+                panel.id,
+                source.is_none() && panel.navigation_presentation.committed_interval.is_some(),
+            ));
+            if matches!(
+                panel.navigation_presentation.preview_kind,
+                Some(NavigationPreviewKind::CompleteHorizon)
+            ) && panel.navigation_provisional_display.is_some()
+            {
+                live_regions.push(region);
+            }
+        }
+        for (panel_id, neutral_after_commit) in preview_frame_records {
+            if let Some(panel) = self.panels.get_mut(panel_id) {
+                panel
+                    .navigation_query_schedule
+                    .record_preview_frame(neutral_after_commit);
+            }
+        }
+        if preview_texture_available && !capture_regions.is_empty() {
+            self.navigation_preview_renderer.capture_committed_regions(
+                &mut encoder,
+                &self.rectangle_renderer,
+                &capture_regions,
+            );
+        }
+        let targets = frame_target_plan(capture_texture.is_some());
+        let composite_targets =
+            u64::from(targets.render_surface).saturating_add(u64::from(targets.render_capture));
+        self.navigation_preview_renderer.prepare(
+            &self.device,
+            &self.queue,
+            [self.surface_config.width, self.surface_config.height],
+            &preview_instances,
+            composite_targets,
+        );
+        if targets.render_surface {
+            self.render_composed_frame_target(
+                &mut encoder,
+                &surface_view,
+                &paint_jobs,
+                &screen_descriptor,
+                preview_instances.is_empty(),
+                &live_regions,
+                scale_factor,
+            );
+        }
+        if targets.render_capture
+            && let Some(texture) = capture_texture.as_ref()
         {
-            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("RGV application chrome"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            self.egui_renderer
-                .render(&mut pass.forget_lifetime(), &paint_jobs, &screen_descriptor);
+            let capture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.render_composed_frame_target(
+                &mut encoder,
+                &capture_view,
+                &paint_jobs,
+                &screen_descriptor,
+                preview_instances.is_empty(),
+                &live_regions,
+                scale_factor,
+            );
         }
 
         let capture_readback = capture_texture.as_ref().map(|texture| {
@@ -776,21 +1037,35 @@ impl Viewer {
         let queue_started = Instant::now();
         self.queue
             .submit(callback_commands.into_iter().chain([encoder.finish()]));
+        for (panel_id, content_revision) in &capture_revisions {
+            self.navigation_texture_revisions
+                .insert(*panel_id, *content_revision);
+        }
+        self.finish_navigation_commits();
+        for (panel_id, content_revision) in capture_revisions {
+            if let Some(panel) = self.panels.get_mut(panel_id) {
+                panel.navigation_presentation.record_settled_capture(
+                    panel.viewport,
+                    panel.generation_clock.current().get(),
+                    content_revision,
+                    self.workspace_layout.revision,
+                    self.navigation_contract_revision,
+                );
+            }
+        }
         if self.interaction_trace.is_active() {
             self.interaction_trace.record_phase(
                 InteractionTraceStage::QueueSubmitted,
                 queue_started.elapsed(),
             );
         }
-        if let Some(frame) = surface_frame {
-            let present_started = Instant::now();
-            frame.present();
-            if self.interaction_trace.is_active() {
-                self.interaction_trace.record_phase(
-                    InteractionTraceStage::PresentCalled,
-                    present_started.elapsed(),
-                );
-            }
+        let present_started = Instant::now();
+        surface_frame.present();
+        if self.interaction_trace.is_active() {
+            self.interaction_trace.record_phase(
+                InteractionTraceStage::PresentCalled,
+                present_started.elapsed(),
+            );
         }
         if let (Some(task), Some((buffer, padded_bytes_per_row))) = (capture_task, capture_readback)
         {
@@ -933,7 +1208,18 @@ fn decoded_capture_pixels(
 
 #[cfg(test)]
 mod capture_tests {
-    use super::decoded_capture_pixels;
+    use super::{decoded_capture_pixels, frame_target_plan};
+
+    #[test]
+    fn native_capture_adds_a_target_without_replacing_the_presented_surface() {
+        let ordinary = frame_target_plan(false);
+        assert!(ordinary.render_surface);
+        assert!(!ordinary.render_capture);
+
+        let captured = frame_target_plan(true);
+        assert!(captured.render_surface);
+        assert!(captured.render_capture);
+    }
 
     #[test]
     fn readback_removes_row_padding_and_converts_bgra_to_rgba() {

@@ -24,10 +24,6 @@ pub(crate) struct InspectorUiActions {
     pub(crate) variant_sample_search: String,
 }
 
-fn read_inspector_max_height(content_height: f32) -> f32 {
-    (content_height * 0.45).clamp(260.0, 520.0)
-}
-
 fn break_long_monospace_runs(value: &str) -> String {
     const MAXIMUM_UNBROKEN_CHARACTERS: usize = 24;
     let mut display = String::with_capacity(value.len());
@@ -53,47 +49,385 @@ fn wrapped_monospace(ui: &mut egui::Ui, value: &str) -> egui::Response {
     )
 }
 
-/// Builder-compatible adapter used while the inspector UI is docked. Keeping
-/// the old window sizing calls as no-ops lets every inspector retain its full
-/// contents and actions without allowing it to float over the genomic canvas.
-struct PropertySection<'a> {
-    ui: &'a mut egui::Ui,
-    title: &'static str,
+#[derive(Default)]
+struct InspectorDocumentResponse {
+    actions: Vec<InspectorActionId>,
+    section_ids: Vec<egui::Id>,
 }
 
-impl<'a> PropertySection<'a> {
-    fn new(ui: &'a mut egui::Ui, title: &'static str) -> Self {
-        Self { ui, title }
+fn inspector_tone_color(ui: &egui::Ui, tone: InspectorTone) -> egui::Color32 {
+    match tone {
+        InspectorTone::Neutral => ui.visuals().weak_text_color(),
+        InspectorTone::Informative if ui.visuals().dark_mode => {
+            egui::Color32::from_rgb(125, 177, 255)
+        }
+        InspectorTone::Positive if ui.visuals().dark_mode => egui::Color32::from_rgb(105, 205, 142),
+        InspectorTone::Warning if ui.visuals().dark_mode => egui::Color32::from_rgb(245, 177, 88),
+        InspectorTone::Informative => egui::Color32::from_rgb(45, 92, 175),
+        InspectorTone::Positive => egui::Color32::from_rgb(32, 112, 72),
+        InspectorTone::Warning => egui::Color32::from_rgb(150, 88, 20),
     }
+}
 
-    fn default_pos<T>(self, _position: T) -> Self {
-        self
-    }
-
-    fn default_size<T>(self, _size: T) -> Self {
-        self
-    }
-
-    fn max_size<T>(self, _size: T) -> Self {
-        self
-    }
-
-    fn default_width(self, _width: f32) -> Self {
-        self
-    }
-
-    fn resizable(self, _resizable: bool) -> Self {
-        self
-    }
-
-    fn show<R>(self, _context: &egui::Context, add_contents: impl FnOnce(&mut egui::Ui) -> R) {
-        egui::Frame::group(self.ui.style()).show(self.ui, |ui| {
-            egui::CollapsingHeader::new(self.title)
-                .default_open(true)
-                .show(ui, add_contents);
+fn show_inspector_badge(ui: &mut egui::Ui, badge: &InspectorBadge) {
+    let color = inspector_tone_color(ui, badge.tone);
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.10))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.55)))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(&badge.label).color(color).size(11.0));
         });
-        self.ui.add_space(6.0);
+}
+
+fn show_inspector_field_label(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let caption_color = if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(184, 199, 218)
+    } else {
+        egui::Color32::from_rgb(58, 75, 98)
+    };
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(label)
+                .strong()
+                .size(11.0)
+                .color(caption_color),
+        )
+        .wrap(),
+    )
+}
+
+fn show_inspector_provenance(ui: &mut egui::Ui, provenance: &InspectorProvenance) {
+    let message = match provenance {
+        InspectorProvenance::Source | InspectorProvenance::Parsed => None,
+        InspectorProvenance::Inferred(reason) => Some(format!("Inferred · {reason}")),
+        InspectorProvenance::Aggregated(reason) => Some(format!("Aggregated · {reason}")),
+        InspectorProvenance::Truncated {
+            displayed,
+            total,
+            reason,
+        } => Some(total.map_or_else(
+            || format!("Showing a bounded {displayed}-unit value · {reason}"),
+            |total| {
+                format!(
+                    "Showing {displayed} of {total} · {reason}; copy retains the complete bounded value"
+                )
+            },
+        )),
+        InspectorProvenance::Missing(reason) => Some(format!("Unavailable · {reason}")),
+    };
+    if let Some(message) = message {
+        ui.label(
+            egui::RichText::new(message)
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
     }
+}
+
+fn show_inspector_table(
+    ui: &mut egui::Ui,
+    table: &InspectorTable,
+    search: &mut Option<&mut String>,
+) {
+    if let Some(label) = &table.search_label
+        && let Some(search) = search.as_deref_mut()
+    {
+        let search_label = ui.label("Search");
+        ui.add(
+            egui::TextEdit::singleline(search)
+                .hint_text(label)
+                .desired_width(ui.available_width().min(260.0)),
+        )
+        .labelled_by(search_label.id);
+    }
+    if !table.columns.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for column in &table.columns {
+                ui.strong(column);
+            }
+        });
+        ui.separator();
+    }
+    let query = if table.search_label.is_some() {
+        search
+            .as_deref()
+            .map_or_else(String::new, |search| search.trim().to_ascii_lowercase())
+    } else {
+        String::new()
+    };
+    let matching_rows = inspector_table_matching_rows(table, &query);
+    if matching_rows.is_empty() {
+        ui.weak(if query.is_empty() {
+            "No rows are available."
+        } else {
+            "No rows match this search."
+        });
+    } else {
+        egui::ScrollArea::vertical()
+            .id_salt("inspector-table")
+            .max_height(280.0)
+            .show_rows(ui, 20.0, matching_rows.len(), |ui, rows| {
+                for row in rows {
+                    ui.horizontal_wrapped(|ui| {
+                        for value in &table.rows[matching_rows[row]] {
+                            ui.monospace(value);
+                        }
+                    });
+                }
+            });
+    }
+    if table.omitted_rows > 0 {
+        ui.colored_label(
+            inspector_tone_color(ui, InspectorTone::Warning),
+            format!(
+                "{} of {} rows are omitted from the bounded presentation.",
+                table.omitted_rows, table.total_rows
+            ),
+        );
+    }
+}
+
+fn inspector_table_matching_rows(table: &InspectorTable, query: &str) -> Vec<usize> {
+    table
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            (query.is_empty()
+                || row
+                    .iter()
+                    .any(|value| value.to_ascii_lowercase().contains(query)))
+            .then_some(index)
+        })
+        .collect()
+}
+
+fn show_inspector_value(
+    ui: &mut egui::Ui,
+    field: &InspectorField,
+    table_search: &mut Option<&mut String>,
+    actions: &mut Vec<InspectorActionId>,
+) {
+    match &field.value {
+        InspectorValue::Tags(tags) => {
+            ui.horizontal_wrapped(|ui| {
+                for tag in tags {
+                    show_inspector_badge(
+                        ui,
+                        &InspectorBadge {
+                            label: tag.clone(),
+                            tone: InspectorTone::Neutral,
+                        },
+                    );
+                }
+            });
+        }
+        InspectorValue::List(values) => {
+            for value in values {
+                wrapped_monospace(ui, value);
+            }
+        }
+        InspectorValue::Table(table) => show_inspector_table(ui, table, table_search),
+        InspectorValue::SupplementaryChainDiagram(chain) => {
+            if let Some(index) = paint_supplementary_chain_diagram(ui, chain) {
+                actions.push(InspectorActionId::NavigateChain(index));
+            }
+        }
+        InspectorValue::Status { label, tone } => {
+            ui.colored_label(inspector_tone_color(ui, *tone), label);
+        }
+        InspectorValue::Missing {
+            display,
+            consequential,
+        } => {
+            if *consequential {
+                ui.colored_label(inspector_tone_color(ui, InspectorTone::Warning), display);
+            } else {
+                ui.weak(display);
+            }
+        }
+        value if value.uses_monospace() => {
+            wrapped_monospace(ui, &value.display_text());
+        }
+        value => {
+            ui.add(egui::Label::new(value.display_text()).wrap());
+        }
+    }
+    show_inspector_provenance(ui, &field.provenance);
+    if matches!(
+        field.value,
+        InspectorValue::Identifier(_)
+            | InspectorValue::GenomicLocation(_)
+            | InspectorValue::Sequence { .. }
+            | InspectorValue::RawKeyValue { .. }
+    ) && ui
+        .small_button("Copy")
+        .on_hover_text(format!("Copy complete {} value", field.label))
+        .clicked()
+    {
+        ui.ctx().copy_text(field.complete_copy_value());
+    }
+}
+
+fn show_inspector_field(
+    ui: &mut egui::Ui,
+    field: &InspectorField,
+    table_search: &mut Option<&mut String>,
+    actions: &mut Vec<InspectorActionId>,
+) {
+    let narrow = ui.available_width() < 360.0;
+    if narrow || matches!(field.value, InspectorValue::Table(_)) {
+        show_inspector_field_label(ui, &field.label);
+        show_inspector_value(ui, field, table_search, actions);
+    } else {
+        let label_width = (ui.available_width() * 0.34).clamp(96.0, 168.0);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(label_width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    show_inspector_field_label(ui, &field.label);
+                },
+            );
+            ui.add_space(8.0);
+            ui.vertical(|ui| show_inspector_value(ui, field, table_search, actions));
+        });
+    }
+    ui.add_space(3.0);
+}
+
+#[allow(clippy::too_many_lines)]
+fn show_inspector_document(
+    ui: &mut egui::Ui,
+    document: &InspectorDocument,
+    mut table_search: Option<&mut String>,
+) -> InspectorDocumentResponse {
+    let mut response = InspectorDocumentResponse::default();
+    ui.push_id(&document.identity, |ui| {
+        ui.heading(&document.header.title);
+        if let Some(subtitle) = &document.header.subtitle {
+            ui.label(egui::RichText::new(subtitle).size(14.0));
+        }
+        if !document.header.badges.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for badge in &document.header.badges {
+                    show_inspector_badge(ui, badge);
+                }
+            });
+        }
+        if let Some(location) = &document.header.location {
+            ui.monospace(&location.display);
+        }
+        if let Some(source) = &document.header.source {
+            ui.label(
+                egui::RichText::new(format!("Source · {source}"))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+        ui.add_space(8.0);
+
+        for notice in &document.notices {
+            ui.push_id(&notice.id, |ui| {
+                ui.colored_label(inspector_tone_color(ui, notice.tone), &notice.message);
+            });
+        }
+
+        let mut sections = document.sections.iter().collect::<Vec<_>>();
+        sections.sort_by_key(|section| section.priority);
+        for section in sections {
+            if section.fields.is_empty() {
+                continue;
+            }
+            let header = egui::CollapsingHeader::new(&section.title)
+                .id_salt(&section.id)
+                .default_open(section.initially_expanded);
+            let collapsing = header.show(ui, |ui| {
+                for field in &section.fields {
+                    ui.push_id(&field.id, |ui| {
+                        show_inspector_field(ui, field, &mut table_search, &mut response.actions);
+                    });
+                }
+            });
+            response.section_ids.push(collapsing.header_response.id);
+            ui.separator();
+        }
+
+        if !document.raw_fields.is_empty() {
+            egui::CollapsingHeader::new(format!("Raw attributes ({})", document.raw_fields.len()))
+                .id_salt("raw-attributes")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for field in &document.raw_fields {
+                        ui.push_id(&field.id, |ui| {
+                            show_inspector_field(
+                                ui,
+                                field,
+                                &mut table_search,
+                                &mut response.actions,
+                            );
+                        });
+                    }
+                });
+            ui.separator();
+        }
+
+        let mut ordinary_actions = document
+            .actions
+            .iter()
+            .filter(|action| action.emphasis != InspectorActionEmphasis::Low)
+            .collect::<Vec<_>>();
+        ordinary_actions.sort_by_key(|action| match action.emphasis {
+            InspectorActionEmphasis::Primary => 0,
+            InspectorActionEmphasis::Normal => 1,
+            InspectorActionEmphasis::Low => 2,
+        });
+        ui.horizontal_wrapped(|ui| {
+            for action in ordinary_actions {
+                let button = ui.add_enabled(action.enabled, egui::Button::new(&action.label));
+                let button = action
+                    .hover_text
+                    .as_deref()
+                    .map_or(button.clone(), |hover| button.on_hover_text(hover));
+                let button = button.on_disabled_hover_text(
+                    action.disabled_reason.as_deref().unwrap_or("Unavailable"),
+                );
+                if button.clicked() {
+                    if action.id == InspectorActionId::CopyDetails {
+                        ui.ctx().copy_text(document.copy_details_text());
+                    } else {
+                        response.actions.push(action.id.clone());
+                    }
+                }
+            }
+        });
+        for action in document
+            .actions
+            .iter()
+            .filter(|action| action.emphasis == InspectorActionEmphasis::Low)
+        {
+            let button = ui.add_enabled(
+                action.enabled,
+                egui::Button::new(
+                    egui::RichText::new(&action.label).color(ui.visuals().weak_text_color()),
+                )
+                .frame(false),
+            );
+            let button = action
+                .hover_text
+                .as_deref()
+                .map_or(button.clone(), |hover| button.on_hover_text(hover));
+            if button
+                .on_disabled_hover_text(action.disabled_reason.as_deref().unwrap_or("Unavailable"))
+                .clicked()
+            {
+                response.actions.push(action.id.clone());
+            }
+        }
+    });
+    response
 }
 
 #[allow(clippy::too_many_lines)]
@@ -123,7 +457,6 @@ pub(crate) fn show_properties(
     let visible_consensus = viewer.visible_consensus();
     let visible_reference_sequence = viewer.visible_reference_sequence();
     let panel_controls = viewer.panels.iter().map(|_| ()).collect::<Vec<_>>();
-    let sample_metadata = viewer.sample_metadata.clone();
     let mut clear_selection = false;
     let mut selected_to_top_requested = false;
     let mut chain_navigation_requested = None;
@@ -163,868 +496,242 @@ pub(crate) fn show_properties(
     }
 
     if let Some(inspector) = &inspector {
-        let context = ui.ctx().clone();
-        let inspector_max_height = read_inspector_max_height(context.content_rect().height());
-        PropertySection::new(ui, "Active alignment segment")
-            .default_pos([24.0, 210.0])
-            .default_size([520.0, 360.0])
-            .max_size([720.0, inspector_max_height])
-            .resizable(true)
-            .show(&context, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height((inspector_max_height - 105.0).max(140.0))
-                    .show(ui, |ui| {
-                        for (label, value) in &inspector.fields {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.strong(label);
-                                wrapped_monospace(ui, value);
-                            });
-                        }
-                        ui.collapsing(
-                            format!("Auxiliary tags ({})", inspector.auxiliary.len()),
-                            |ui| {
-                                for (tag, value) in &inspector.auxiliary {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.monospace(tag);
-                                        wrapped_monospace(ui, value);
-                                        if ui.small_button("Copy").clicked() {
-                                            ui.ctx().copy_text(format!("{tag}:{value}"));
-                                        }
-                                    });
-                                }
-                            },
-                        );
-                        if let Some(cigar) = &inspector.cigar
-                            && cigar.len() > 256
-                        {
-                            ui.collapsing(
-                                format!("Exact CIGAR ({} characters)", cigar.len()),
-                                |ui| {
-                                    egui::ScrollArea::horizontal().max_width(660.0).show(
-                                        ui,
-                                        |ui| {
-                                            ui.monospace(cigar);
-                                        },
-                                    );
-                                },
-                            );
-                        }
-                    });
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy details").clicked() {
-                        ui.ctx().copy_text(inspector_fields_text(&inspector.fields));
-                    }
-                    if let Some(cigar) = &inspector.cigar
-                        && ui.button("Copy CIGAR").clicked()
-                    {
+        let document = alignment_inspector_document(
+            inspector,
+            format!(
+                "alignment-segment:{}",
+                viewer.panels.active().selected_record.unwrap_or_default()
+            ),
+            visible_reference_sequence.as_ref(),
+            mate_target_available,
+            MAXIMUM_VIEW_PANELS.saturating_sub(panel_controls.len()),
+        );
+        let response = show_inspector_document(ui, &document, None);
+        for action in response.actions {
+            match action {
+                InspectorActionId::CopyCigar => {
+                    if let Some(cigar) = &inspector.cigar {
                         ui.ctx().copy_text(cigar.clone());
                     }
-                    if ui
-                        .add_enabled(
-                            inspector.read_sequence.is_some(),
-                            egui::Button::new("Copy read sequence"),
-                        )
-                        .on_disabled_hover_text(
-                            "Sequence was not loaded or is missing from the record",
-                        )
-                        .on_hover_text(sequence_copy_hover(
-                            inspector.read_sequence.as_ref(),
-                            "read",
-                        ))
-                        .clicked()
-                        && let Some(sequence) = &inspector.read_sequence
-                    {
+                }
+                InspectorActionId::CopyReadSequence => {
+                    if let Some(sequence) = &inspector.read_sequence {
                         ui.ctx().copy_text(sequence.text.clone());
                     }
-                    if ui
-                        .add_enabled(
-                            !inspector.auxiliary.is_empty(),
-                            egui::Button::new("Copy tags"),
-                        )
-                        .on_disabled_hover_text("This record has no loaded auxiliary tags")
-                        .clicked()
-                    {
-                        ui.ctx()
-                            .copy_text(auxiliary_tags_text(&inspector.auxiliary));
+                }
+                InspectorActionId::CopyEventSequence => {
+                    if let Some(sequence) = &inspector.event_sequence {
+                        ui.ctx().copy_text(sequence.clone());
                     }
-                    if ui
-                        .add_enabled(
-                            visible_reference_sequence.is_some(),
-                            egui::Button::new("Copy visible reference"),
-                        )
-                        .on_disabled_hover_text(
-                            "Zoom to base detail with a reference FASTA available",
-                        )
-                        .on_hover_text(sequence_copy_hover(
-                            visible_reference_sequence.as_ref(),
-                            "reference",
-                        ))
-                        .clicked()
-                        && let Some(reference) = &visible_reference_sequence
-                    {
+                }
+                InspectorActionId::CopyAuxiliaryTags => {
+                    ui.ctx()
+                        .copy_text(auxiliary_tags_text(&inspector.auxiliary));
+                }
+                InspectorActionId::CopyVisibleReference => {
+                    if let Some(reference) = &visible_reference_sequence {
                         ui.ctx().copy_text(reference.text.clone());
                     }
-                });
-                if let Some(sequence) = &inspector.event_sequence
-                    && ui.button("Copy event sequence").clicked()
-                {
-                    ui.ctx().copy_text(sequence.clone());
                 }
-                if ui
-                    .add_enabled(
-                        mate_target_available && panel_controls.len() < MAXIMUM_VIEW_PANELS,
-                        egui::Button::new("Open mate in new panel"),
-                    )
-                    .on_disabled_hover_text(
-                        "A mapped mate and space for another panel are required",
-                    )
-                    .clicked()
-                {
-                    mate_panel_requested = true;
-                }
-                if ui.button("Move selected to top").clicked() {
-                    selected_to_top_requested = true;
-                }
-                if ui.button("Clear selection").clicked() {
-                    clear_selection = true;
-                }
-            });
+                InspectorActionId::OpenMate => mate_panel_requested = true,
+                InspectorActionId::MoveReadToTop => selected_to_top_requested = true,
+                InspectorActionId::ClearSelection => clear_selection = true,
+                _ => {}
+            }
+        }
     }
     if let Some(chain) = &chain_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "Supplementary alignments")
-                    .default_pos([470.0, 210.0])
-                    .default_width(620.0)
-                    .resizable(true)
-                    .show(&context, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.strong("Read");
-                            ui.monospace(String::from_utf8_lossy(&chain.read_name));
-                        });
-                        ui.label(format!(
-                            "{} segments · {} malformed entries{}{}",
-                            chain.segments.len(),
-                            chain.malformed_entries,
-                            if chain.invalid_tag_type {
-                                " · invalid SA tag type"
-                            } else {
-                                ""
-                            },
-                            if chain.truncated {
-                                " · chain capped"
-                            } else {
-                                ""
-                            }
-                        ));
-                        ui.separator();
-                        if let Some(index) = paint_supplementary_chain_diagram(ui, chain) {
-                            chain_navigation_requested = Some(index);
-                        }
-                        ui.collapsing("Exact segment details", |ui| {
-                            for (index, segment) in chain.segments.iter().enumerate() {
-                                let strand = if segment.reverse { '-' } else { '+' };
-                                let breakpoint = if segment.reverse {
-                                    segment.start + 1
-                                } else {
-                                    segment.end
-                                };
-                                let mapping_quality = segment.mapping_quality.map_or_else(
-                                    || "missing".to_owned(),
-                                    |value| value.to_string(),
-                                );
-                                let label = format!(
-                                    "{}:{}-{} {strand} · MAPQ {mapping_quality} · NM {} · breakpoint {}:{} · {}",
-                                    segment.reference_name,
-                                    segment.start + 1,
-                                    segment.end,
-                                    segment.edit_distance,
-                                    segment.reference_name,
-                                    breakpoint,
-                                    format_cigar(&segment.cigar)
-                                );
-                                if ui
-                                    .selectable_label(index == chain.active_segment, label)
-                                    .on_hover_text("Navigate the active view to this segment")
-                                    .clicked()
-                                {
-                                    chain_navigation_requested = Some(index);
-                                }
-                            }
-                        });
-                        ui.separator();
-                        ui.horizontal_wrapped(|ui| {
-                            let count = chain.segments.len();
-                            if ui.add_enabled(count > 1, egui::Button::new("Previous segment")).clicked() {
-                                chain_navigation_requested = Some(
-                                    chain.active_segment.checked_sub(1).unwrap_or(count - 1),
-                                );
-                            }
-                            if ui.add_enabled(count > 1, egui::Button::new("Next segment")).clicked() {
-                                chain_navigation_requested =
-                                    Some((chain.active_segment + 1) % count);
-                            }
-                            if ui
-                                .add_enabled(
-                                    count > 0 && panel_controls.len() < MAXIMUM_VIEW_PANELS,
-                                    egui::Button::new("Open active segment in new panel"),
-                                )
-                                .clicked()
-                            {
-                                chain_panel_requested = Some(chain.active_segment);
-                            }
-                            if ui
-                                .add_enabled(
-                                    count > 1 && panel_controls.len() < MAXIMUM_VIEW_PANELS,
-                                    egui::Button::new("Open all segments in panels"),
-                                )
-                                .on_disabled_hover_text(
-                                    "More than one segment and space for another panel are required",
-                                )
-                                .clicked()
-                            {
-                                chain_all_panels_requested = true;
-                            }
-                            if ui.button("Clear chain").clicked() {
-                                clear_selection = true;
-                            }
-                        });
-                    });
+        let document = supplementary_chain_inspector_document(
+            chain,
+            MAXIMUM_VIEW_PANELS.saturating_sub(panel_controls.len()),
+        );
+        let response = show_inspector_document(ui, &document, None);
+        for action in response.actions {
+            match action {
+                InspectorActionId::NavigateChain(index) => {
+                    chain_navigation_requested = Some(index);
+                }
+                InspectorActionId::OpenChainSegment(index) => {
+                    chain_panel_requested = Some(index);
+                }
+                InspectorActionId::OpenAllChainSegments => {
+                    chain_all_panels_requested = true;
+                }
+                InspectorActionId::ClearSelection => clear_selection = true,
+                _ => {}
+            }
+        }
     }
     if let Some(inspector) = &pileup_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "Pileup")
-            .default_pos([24.0, 210.0])
-            .default_width(460.0)
-            .resizable(true)
-            .show(&context, |ui| {
-                for (label, value) in &inspector.fields {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(label);
-                        ui.monospace(value);
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy details").clicked() {
-                        ui.ctx().copy_text(inspector_fields_text(&inspector.fields));
-                    }
-                    if ui
-                        .add_enabled(
-                            visible_consensus.is_some(),
-                            egui::Button::new("Copy visible consensus"),
-                        )
-                        .on_disabled_hover_text(
-                            "Zoom to exact base resolution to calculate consensus",
-                        )
-                        .on_hover_text(sequence_copy_hover(visible_consensus.as_ref(), "consensus"))
-                        .clicked()
-                        && let Some(consensus) = &visible_consensus
-                    {
+        let document = pileup_inspector_document(
+            inspector,
+            visible_consensus.as_ref(),
+            visible_reference_sequence.as_ref(),
+        );
+        let response = show_inspector_document(ui, &document, None);
+        for action in response.actions {
+            match action {
+                InspectorActionId::CopyVisibleConsensus => {
+                    if let Some(consensus) = &visible_consensus {
                         ui.ctx().copy_text(consensus.text.clone());
                     }
-                    if ui
-                        .add_enabled(
-                            visible_reference_sequence.is_some(),
-                            egui::Button::new("Copy visible reference"),
-                        )
-                        .on_disabled_hover_text(
-                            "Zoom to base detail with a reference FASTA available",
-                        )
-                        .on_hover_text(sequence_copy_hover(
-                            visible_reference_sequence.as_ref(),
-                            "reference",
-                        ))
-                        .clicked()
-                        && let Some(reference) = &visible_reference_sequence
-                    {
+                }
+                InspectorActionId::CopyVisibleReference => {
+                    if let Some(reference) = &visible_reference_sequence {
                         ui.ctx().copy_text(reference.text.clone());
                     }
-                    if ui.button("Clear selection").clicked() {
-                        clear_selection = true;
-                    }
-                });
-            });
+                }
+                InspectorActionId::ClearSelection => clear_selection = true,
+                _ => {}
+            }
+        }
     }
     if let Some(inspector) = &modification_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "Modification frequency")
-            .default_pos([24.0, 210.0])
-            .default_width(620.0)
-            .resizable(true)
-            .show(&context, |ui| {
-                for (label, value) in &inspector.fields {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(label);
-                        ui.monospace(value);
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy details").clicked() {
-                        ui.ctx().copy_text(inspector_fields_text(&inspector.fields));
-                    }
-                    if ui.button("Clear selection").clicked() {
-                        clear_selection = true;
-                    }
-                });
-            });
+        let document = modification_inspector_document(inspector);
+        let response = show_inspector_document(ui, &document, None);
+        clear_selection |= response
+            .actions
+            .contains(&InspectorActionId::ClearSelection);
     }
     if let Some(inspector) = &junction_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "Junction")
-            .default_pos([24.0, 210.0])
-            .default_width(520.0)
-            .resizable(true)
-            .show(&context, |ui| {
-                for (label, value) in &inspector.fields {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(label);
-                        ui.monospace(value);
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy details").clicked() {
-                        ui.ctx().copy_text(inspector_fields_text(&inspector.fields));
-                    }
-                    if ui.button("Export junction BED…").clicked() {
-                        junction_bed_export_requested = true;
-                    }
-                    if ui.button("Export Sashimi PNG…").clicked() {
-                        sashimi_png_export_requested = true;
-                    }
-                    if ui.button("Export Sashimi SVG…").clicked() {
-                        sashimi_svg_export_requested = true;
-                    }
-                    if ui.button("Clear selection").clicked() {
-                        clear_selection = true;
-                    }
-                });
-            });
+        let document = junction_inspector_document(inspector);
+        let response = show_inspector_document(ui, &document, None);
+        for action in response.actions {
+            match action {
+                InspectorActionId::ExportJunctionBed => junction_bed_export_requested = true,
+                InspectorActionId::ExportSashimiPng => sashimi_png_export_requested = true,
+                InspectorActionId::ExportSashimiSvg => sashimi_svg_export_requested = true,
+                InspectorActionId::ClearSelection => clear_selection = true,
+                _ => {}
+            }
+        }
     }
     if let Some(inspector) = &feature_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "Feature")
-            .default_pos([24.0, 210.0])
-            .default_width(560.0)
-            .resizable(true)
-            .show(&context, |ui| {
-                let fields = feature_inspector_fields(inspector);
-                egui::ScrollArea::vertical()
-                    .max_height(500.0)
-                    .show(ui, |ui| {
-                        for (label, value) in &fields {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.strong(label);
-                                ui.monospace(value);
-                            });
-                        }
-                    });
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy details").clicked() {
-                        ui.ctx().copy_text(inspector_fields_text(&fields));
-                    }
-                    if ui.button("Add feature to review queue").clicked() {
-                        add_selected_feature_to_review = true;
-                        review_open = true;
-                    }
-                    if ui.button("Clear selection").clicked() {
-                        clear_selection = true;
-                    }
-                });
-            });
+        let document = feature_inspector_document(inspector);
+        let response = show_inspector_document(ui, &document, None);
+        for action in response.actions {
+            match action {
+                InspectorActionId::AddFeatureToReview => {
+                    add_selected_feature_to_review = true;
+                    review_open = true;
+                }
+                InspectorActionId::ClearSelection => clear_selection = true,
+                InspectorActionId::CopyDetails
+                | InspectorActionId::CopyCigar
+                | InspectorActionId::CopyReadSequence
+                | InspectorActionId::CopyEventSequence
+                | InspectorActionId::CopyAuxiliaryTags
+                | InspectorActionId::CopyVisibleReference
+                | InspectorActionId::CopyVisibleConsensus
+                | InspectorActionId::OpenMate
+                | InspectorActionId::MoveReadToTop
+                | InspectorActionId::NavigateChain(_)
+                | InspectorActionId::OpenChainSegment(_)
+                | InspectorActionId::OpenAllChainSegments
+                | InspectorActionId::ExportJunctionBed
+                | InspectorActionId::ExportSashimiPng
+                | InspectorActionId::ExportSashimiSvg
+                | InspectorActionId::OpenInteractionEndpoint(_)
+                | InspectorActionId::OpenVariantPartner(_)
+                | InspectorActionId::OpenVariantEndpoint
+                | InspectorActionId::InspectVariantPileup(_, _)
+                | InspectorActionId::InspectVariantModifications(_, _)
+                | InspectorActionId::ExportVariantGenotypes
+                | InspectorActionId::ExportVariantEvidence => {}
+            }
+        }
     }
     if let Some(inspector) = &quantitative_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "Quantitative value")
-            .default_pos([24.0, 210.0])
-            .default_width(500.0)
-            .resizable(true)
-            .show(&context, |ui| {
-                let fields = quantitative_inspector_fields(inspector);
-                for (label, value) in &fields {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(label);
-                        ui.monospace(value);
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy details").clicked() {
-                        ui.ctx().copy_text(inspector_fields_text(&fields));
-                    }
-                    if ui.button("Clear selection").clicked() {
-                        clear_selection = true;
-                    }
-                });
-            });
+        let document = quantitative_inspector_document(inspector);
+        let response = show_inspector_document(ui, &document, None);
+        clear_selection |= response
+            .actions
+            .contains(&InspectorActionId::ClearSelection);
     }
     if let Some(inspector) = &gwas_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "GWAS association")
-            .default_pos([24.0, 210.0])
-            .default_width(560.0)
-            .resizable(true)
-            .show(&context, |ui| {
-                let fields = gwas_inspector_fields(inspector);
-                egui::ScrollArea::vertical()
-                    .max_height(500.0)
-                    .show(ui, |ui| {
-                        for (label, value) in &fields {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.strong(label);
-                                ui.monospace(value);
-                            });
-                        }
-                    });
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy details").clicked() {
-                        ui.ctx().copy_text(inspector_fields_text(&fields));
-                    }
-                    if ui.button("Clear selection").clicked() {
-                        clear_selection = true;
-                    }
-                });
-            });
+        let document = gwas_inspector_document(inspector);
+        let response = show_inspector_document(ui, &document, None);
+        clear_selection |= response
+            .actions
+            .contains(&InspectorActionId::ClearSelection);
     }
     if let Some(inspector) = &copy_number_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "Copy number")
-            .default_pos([24.0, 210.0])
-            .default_width(540.0)
-            .resizable(true)
-            .show(&context, |ui| {
-                let fields = copy_number_inspector_fields(inspector);
-                for (label, value) in &fields {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(label);
-                        ui.monospace(value);
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy details").clicked() {
-                        ui.ctx().copy_text(inspector_fields_text(&fields));
-                    }
-                    if ui.button("Clear selection").clicked() {
-                        clear_selection = true;
-                    }
-                });
-            });
+        let document = copy_number_inspector_document(inspector);
+        let response = show_inspector_document(ui, &document, None);
+        clear_selection |= response
+            .actions
+            .contains(&InspectorActionId::ClearSelection);
     }
     if let Some(inspector) = &mutation_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "Mutation")
-            .default_pos([24.0, 210.0])
-            .default_width(620.0)
-            .resizable(true)
-            .show(&context, |ui| {
-                let fields = mutation_inspector_fields(inspector);
-                egui::ScrollArea::vertical()
-                    .max_height(500.0)
-                    .show(ui, |ui| {
-                        for (label, value) in &fields {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.strong(label);
-                                ui.monospace(value);
-                            });
-                        }
-                    });
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copy details").clicked() {
-                        ui.ctx().copy_text(inspector_fields_text(&fields));
-                    }
-                    if ui.button("Clear selection").clicked() {
-                        clear_selection = true;
-                    }
-                });
-            });
+        let document = mutation_inspector_document(inspector);
+        let response = show_inspector_document(ui, &document, None);
+        clear_selection |= response
+            .actions
+            .contains(&InspectorActionId::ClearSelection);
     }
     if let Some(inspector) = &interaction_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "Interaction")
-            .default_pos([24.0, 210.0])
-            .default_width(560.0)
-            .resizable(true)
-            .show(&context, |ui| {
-                let record = &inspector.query.records[inspector.record_index];
-                let fields = interaction_inspector_fields(inspector);
-                for (label, value) in &fields {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(label);
-                        ui.monospace(value);
-                    });
+        let record = &inspector.query.records[inspector.record_index];
+        let document = interaction_inspector_presentation_document(
+            inspector,
+            MAXIMUM_VIEW_PANELS.saturating_sub(panel_controls.len()),
+        );
+        let response = show_inspector_document(ui, &document, None);
+        for action in response.actions {
+            match action {
+                InspectorActionId::OpenInteractionEndpoint(endpoint) => {
+                    let endpoint = match endpoint {
+                        InspectorEndpoint::Source => &record.source,
+                        InspectorEndpoint::Target => &record.target,
+                    };
+                    interaction_endpoint_requested = Some((
+                        endpoint.contig.clone(),
+                        endpoint_center_position(endpoint.start, endpoint.end),
+                    ));
                 }
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            panel_controls.len() < MAXIMUM_VIEW_PANELS,
-                            egui::Button::new("Open source endpoint"),
-                        )
-                        .clicked()
-                    {
-                        interaction_endpoint_requested = Some((
-                            record.source.contig.clone(),
-                            endpoint_center_position(record.source.start, record.source.end),
-                        ));
-                    }
-                    if ui
-                        .add_enabled(
-                            panel_controls.len() < MAXIMUM_VIEW_PANELS,
-                            egui::Button::new("Open target endpoint"),
-                        )
-                        .clicked()
-                    {
-                        interaction_endpoint_requested = Some((
-                            record.target.contig.clone(),
-                            endpoint_center_position(record.target.start, record.target.end),
-                        ));
-                    }
-                    if ui.button("Copy details").clicked() {
-                        ui.ctx().copy_text(inspector_fields_text(&fields));
-                    }
-                    if ui.button("Clear selection").clicked() {
-                        clear_selection = true;
-                    }
-                });
-            });
+                InspectorActionId::ClearSelection => clear_selection = true,
+                _ => {}
+            }
+        }
     }
     if let Some(inspector) = &variant_inspector {
-        let context = ui.ctx().clone();
-        PropertySection::new(ui, "Variant")
-                    .default_pos([24.0, 210.0])
-                    .default_width(680.0)
-                    .resizable(true)
-                    .show(&context, |ui| {
-                        let record = &inspector.query.records[inspector.record_index];
-                        let fields = variant_inspector_fields(inspector, record);
-                        for (label, value) in &fields {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.strong(label);
-                                ui.monospace(value);
-                            });
-                        }
-                        ui.collapsing(format!("INFO ({})", record.info.len()), |ui| {
-                            for field in &record.info {
-                                let description = inspector
-                                    .query
-                                    .header
-                                    .info
-                                    .iter()
-                                    .find(|schema| schema.id == field.key)
-                                    .map_or("No header description", |schema| {
-                                        schema.description.as_str()
-                                    });
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.monospace(&field.key).on_hover_text(description);
-                                    ui.monospace(format_variant_field(field));
-                                });
-                            }
-                        });
-                        if !record.breakends.is_empty() {
-                            ui.collapsing(
-                                format!("Breakend partners ({})", record.breakends.len()),
-                                |ui| {
-                                    for partner in &record.breakends {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.monospace(format!(
-                                                "ALT {}: local join {} -> {}:{} partner join {}",
-                                                partner.alternate_index + 1,
-                                                breakend_join_side(
-                                                    partner.local_join_after_position
-                                                ),
-                                                partner.contig,
-                                                partner.position + 1,
-                                                breakend_join_side(
-                                                    partner.partner_join_after_position
-                                                ),
-                                            ));
-                                            if ui
-                                                .add_enabled(
-                                                    panel_controls.len() < MAXIMUM_VIEW_PANELS,
-                                                    egui::Button::new("Open partner"),
-                                                )
-                                                .clicked()
-                                            {
-                                                variant_partner_requested = Some((
-                                                    partner.contig.clone(),
-                                                    partner.position,
-                                                ));
-                                            }
-                                        });
-                                    }
-                                },
-                            );
-                        }
-                        if !record.breakpoint_orientations.is_empty() {
-                            ui.collapsing(
-                                format!(
-                                    "Breakpoint orientations ({})",
-                                    record.breakpoint_orientations.len()
-                                ),
-                                |ui| {
-                                    for orientation in &record.breakpoint_orientations {
-                                        ui.monospace(format!(
-                                            "local join {} -> partner join {}{}",
-                                            breakend_join_side(
-                                                orientation.local_join_after_position
-                                            ),
-                                            breakend_join_side(
-                                                orientation.partner_join_after_position
-                                            ),
-                                            orientation
-                                                .support
-                                                .map_or_else(String::new, |support| {
-                                                    format!(" · support {support}")
-                                                }),
-                                        ));
-                                    }
-                                },
-                            );
-                        }
-                        ui.collapsing(
-                            format!(
-                                "Alignment evidence ({})",
-                                variant_alignment_evidence.len()
-                            ),
-                            |ui| {
-                                if variant_alignment_evidence.is_empty() {
-                                    ui.label(
-                                        "No alignment query currently covers this variant position.",
-                                    );
-                                }
-                                for evidence in &variant_alignment_evidence {
-                                    ui.group(|ui| {
-                                        ui.strong(&evidence.track_name);
-                                        ui.monospace(format!(
-                                            "{}:{}-{} · depth {}× (forward {} · reverse {})",
-                                            record.contig,
-                                            evidence.bin_start + 1,
-                                            evidence.bin_end,
-                                            evidence.depth,
-                                            evidence.forward_depth,
-                                            evidence.reverse_depth,
-                                        ));
-                                        ui.monospace(&evidence.allele_summary);
-                                        ui.label(format!(
-                                            "Co-located modifications: {} calls across {} series",
-                                            evidence.modification_calls,
-                                            evidence.modification_series,
-                                        ));
-                                        ui.small(format!(
-                                            "Read context: {} retained records{} · template-length model sampled {} proper pairs{}",
-                                            evidence.retained_records,
-                                            if evidence.retained_records_sampled {
-                                                " (display safety-limited)"
-                                            } else {
-                                                ""
-                                            },
-                                            evidence.pair_templates_sampled,
-                                            if evidence.complete_pileup {
-                                                " · pileup complete"
-                                            } else {
-                                                " · pileup incomplete"
-                                            },
-                                        ));
-                                        ui.horizontal_wrapped(|ui| {
-                                            if ui.button("Inspect pileup").clicked() {
-                                                variant_pileup_requested = Some((
-                                                    evidence.track_id,
-                                                    evidence.position,
-                                                ));
-                                            }
-                                            if ui
-                                                .add_enabled(
-                                                    evidence.modification_calls > 0,
-                                                    egui::Button::new("Inspect modifications"),
-                                                )
-                                                .clicked()
-                                            {
-                                                variant_modification_requested = Some((
-                                                    evidence.track_id,
-                                                    evidence.position,
-                                                ));
-                                            }
-                                            if ui
-                                                .add_enabled(
-                                                    record.end > record.start + 1
-                                                        && panel_controls.len()
-                                                            < MAXIMUM_VIEW_PANELS,
-                                                    egui::Button::new(
-                                                        "Open event end for pair/split review",
-                                                    ),
-                                                )
-                                                .clicked()
-                                            {
-                                                variant_endpoint_requested = Some((
-                                                    record.contig.clone(),
-                                                    record.end.saturating_sub(1),
-                                                ));
-                                            }
-                                        });
-                                    });
-                                }
-                                ui.small(
-                                    "These are observations at the selected coordinate, not an RGV variant call. Read overlap, pair context, and modification co-location are not labelled as support without allele-specific proof.",
-                                );
-                            },
-                        );
-                        ui.separator();
-                        ui.horizontal_wrapped(|ui| {
-                            ui.strong(format!(
-                                "Genotypes ({} loaded / {} selected / {} in file)",
-                                record.genotypes.len(),
-                                inspector.query.provenance.selected_samples,
-                                inspector.query.provenance.total_samples,
-                            ));
-                            let sample_label = ui.label("Sample");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut variant_sample_search)
-                                    .desired_width(220.0)
-                                    .hint_text("Filter loaded samples"),
-                            )
-                            .labelled_by(sample_label.id);
-                        });
-                        let search = variant_sample_search.to_ascii_lowercase();
-                        let mut matching = record
-                            .genotypes
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(genotype_index, genotype)| {
-                                let sample = inspector
-                                    .query
-                                    .header
-                                    .samples
-                                    .get(genotype.sample_index)?;
-                                (search.is_empty()
-                                    || sample.to_ascii_lowercase().contains(&search))
-                                .then_some(genotype_index)
-                            })
-                            .collect::<Vec<_>>();
-                        let pedigree_order = (inspector.settings.genotype_grouping
-                            == VariantGenotypeGrouping::Pedigree)
-                            .then(|| {
-                                sample_metadata.as_ref().and_then(|metadata| {
-                                    metadata
-                                        .pedigree_sample_order(&inspector.query.header.samples)
-                                })
-                            })
-                            .flatten();
-                        if inspector.settings.genotype_grouping
-                            == VariantGenotypeGrouping::Genotype
-                        {
-                            matching.sort_by_key(|index| {
-                                let genotype = &record.genotypes[*index];
-                                (variant_genotype_group_rank(genotype), genotype.sample_index)
-                            });
-                        } else if let Some(order) = &pedigree_order
-                        {
-                            let mut rank = vec![usize::MAX; inspector.query.header.samples.len()];
-                            for (position, &sample_index) in order.iter().enumerate() {
-                                if let Some(rank) = rank.get_mut(sample_index) {
-                                    *rank = position;
-                                }
-                            }
-                            matching.sort_by_key(|index| {
-                                let sample_index = record.genotypes[*index].sample_index;
-                                (
-                                    rank.get(sample_index).copied().unwrap_or(usize::MAX),
-                                    sample_index,
-                                )
-                            });
-                        }
-                        if inspector.settings.genotype_grouping
-                            == VariantGenotypeGrouping::Pedigree
-                            && pedigree_order.is_none()
-                        {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(150, 88, 20),
-                                "Pedigree order requires imported father_id or mother_id sample attributes; retaining VCF header order.",
-                            );
-                        }
-                        egui::ScrollArea::vertical().max_height(280.0).show_rows(
-                            ui,
-                            19.0,
-                            matching.len(),
-                            |ui, rows| {
-                                for row in rows {
-                                    let genotype = &record.genotypes[matching[row]];
-                                    let sample = inspector
-                                        .query
-                                        .header
-                                        .samples
-                                        .get(genotype.sample_index)
-                                        .map_or("?", String::as_str);
-                                    ui.horizontal_wrapped(|ui| {
-                                        let group = variant_genotype_group_label(genotype);
-                                        super::icons::icon_swatch(
-                                            ui,
-                                            variant_genotype_color(genotype),
-                                            group,
-                                        );
-                                        if inspector.settings.genotype_grouping
-                                            == VariantGenotypeGrouping::Genotype
-                                            && (row == 0
-                                                || variant_genotype_group_rank(genotype)
-                                                    != variant_genotype_group_rank(
-                                                        &record.genotypes[matching[row - 1]],
-                                                    ))
-                                        {
-                                            ui.strong(group);
-                                        }
-                                        ui.monospace(sample);
-                                        ui.monospace(format_genotype(genotype));
-                                        for field in &genotype.fields {
-                                            ui.monospace(format!(
-                                                "{}={}",
-                                                field.key,
-                                                format_variant_field(field)
-                                            ));
-                                        }
-                                    });
-                                }
-                            },
-                        );
-                        let provenance = inspector.query.provenance;
-                        if provenance.genotype_cells_omitted > 0
-                            || provenance.records_truncated
-                            || provenance.header_samples_omitted > 0
-                            || provenance.info_fields_truncated > 0
-                            || provenance.format_fields_truncated > 0
-                        {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(150, 88, 20),
-                                format!(
-                                    "Bounded query: {} genotype cells omitted · {} header samples omitted · {} INFO schemas omitted · {} FORMAT schemas omitted{}",
-                                    provenance.genotype_cells_omitted,
-                                    provenance.header_samples_omitted,
-                                    provenance.info_fields_truncated,
-                                    provenance.format_fields_truncated,
-                                    if provenance.records_truncated {
-                                        " · record limit reached"
-                                    } else {
-                                        ""
-                                    }
-                                ),
-                            );
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("Copy details").clicked() {
-                                ui.ctx().copy_text(variant_details_text(&fields, record));
-                            }
-                            if ui.button("Export variant + genotypes TSV…").clicked() {
-                                variant_genotypes_export_requested = true;
-                            }
-                            if ui
-                                .add_enabled(
-                                    !variant_alignment_evidence.is_empty(),
-                                    egui::Button::new("Export alignment evidence TSV…"),
-                                )
-                                .clicked()
-                            {
-                                variant_evidence_export_requested = true;
-                            }
-                            if ui.button("Clear selection").clicked() {
-                                clear_selection = true;
-                            }
-                        });
-                    });
+        let record = &inspector.query.records[inspector.record_index];
+        let document = variant_inspector_presentation_document(
+            inspector,
+            record,
+            &variant_alignment_evidence,
+            viewer.sample_metadata.as_ref(),
+            &variant_sample_search,
+            MAXIMUM_VIEW_PANELS.saturating_sub(panel_controls.len()),
+        );
+        let response = show_inspector_document(ui, &document, Some(&mut variant_sample_search));
+        for action in response.actions {
+            match action {
+                InspectorActionId::OpenVariantPartner(index) => {
+                    if let Some(partner) = record.breakends.get(index) {
+                        variant_partner_requested =
+                            Some((partner.contig.clone(), partner.position));
+                    }
+                }
+                InspectorActionId::OpenVariantEndpoint => {
+                    variant_endpoint_requested =
+                        Some((record.contig.clone(), record.end.saturating_sub(1)));
+                }
+                InspectorActionId::InspectVariantPileup(track_id, position) => {
+                    variant_pileup_requested = Some((track_id, position));
+                }
+                InspectorActionId::InspectVariantModifications(track_id, position) => {
+                    variant_modification_requested = Some((track_id, position));
+                }
+                InspectorActionId::ExportVariantGenotypes => {
+                    variant_genotypes_export_requested = true;
+                }
+                InspectorActionId::ExportVariantEvidence => {
+                    variant_evidence_export_requested = true;
+                }
+                InspectorActionId::ClearSelection => clear_selection = true,
+                _ => {}
+            }
+        }
     }
 
     InspectorUiActions {
@@ -1053,29 +760,12 @@ pub(crate) fn show_properties(
 #[cfg(test)]
 mod tests {
     use super::{
-        PropertySection, break_long_monospace_runs, read_inspector_max_height, wrapped_monospace,
+        break_long_monospace_runs, inspector_table_matching_rows, show_inspector_document,
+        wrapped_monospace,
     };
-
-    #[test]
-    fn read_inspector_is_bounded_at_supported_window_heights() {
-        for height in [600.0_f32, 800.0, 1_080.0, 1_600.0] {
-            let inspector = read_inspector_max_height(height);
-            assert!(inspector <= height * 0.45 + f32::EPSILON);
-            assert!(inspector <= 520.0);
-        }
-    }
-
-    #[test]
-    fn property_section_renders_inside_its_parent_ui() {
-        let context = egui::Context::default();
-        let output = context.run_ui(egui::RawInput::default(), |ui| {
-            let child_context = ui.ctx().clone();
-            PropertySection::new(ui, "Read").show(&child_context, |ui| {
-                ui.label("read-name");
-            });
-        });
-        assert!(output.shapes.len() > 1);
-    }
+    use crate::{
+        InspectorDocument, InspectorField, InspectorSection, InspectorTable, InspectorValue,
+    };
 
     #[test]
     fn wrapped_monospace_stays_inside_a_narrow_property_row() {
@@ -1092,5 +782,119 @@ mod tests {
                 assert!(response.rect.height() > ui.text_style_height(&egui::TextStyle::Monospace));
             });
         });
+    }
+
+    #[test]
+    fn shared_document_renderer_handles_supported_panel_widths_and_dense_values() {
+        let mut document = InspectorDocument::new("feature:width-test", "A very long feature name");
+        document.sections.push(
+            InspectorSection::new("summary", "Summary", 0).with_fields(vec![
+                InspectorField::new(
+                    "identifier",
+                    "Stable identifier",
+                    InspectorValue::Identifier("ENST00000373130.7-extra-long-suffix".repeat(3)),
+                ),
+                InspectorField::new(
+                    "tags",
+                    "Tags",
+                    InspectorValue::Tags(vec![
+                        "Basic".to_owned(),
+                        "CCDS".to_owned(),
+                        "APPRIS principal".to_owned(),
+                    ]),
+                ),
+                InspectorField::new(
+                    "table",
+                    "Samples",
+                    InspectorValue::Table(InspectorTable {
+                        columns: vec!["Sample".to_owned(), "GT".to_owned()],
+                        rows: (0..100)
+                            .map(|index| vec![format!("sample-{index}"), "0/1".to_owned()])
+                            .collect(),
+                        total_rows: 100,
+                        omitted_rows: 0,
+                        search_label: Some("Filter samples".to_owned()),
+                    }),
+                ),
+            ]),
+        );
+
+        for width in [280.0_f32, 340.0, 520.0] {
+            for (scale, native_pixels_per_point) in [(0.8_f32, 1.0_f32), (2.0, 1.0), (1.0, 2.0)] {
+                let context = egui::Context::default();
+                context.set_zoom_factor(scale);
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 900.0),
+                    )),
+                    ..egui::RawInput::default()
+                };
+                input
+                    .viewports
+                    .get_mut(&input.viewport_id)
+                    .expect("the root viewport is present")
+                    .native_pixels_per_point = Some(native_pixels_per_point);
+                let output = context.run_ui(input, |ui| {
+                    ui.set_max_width(width);
+                    let _ = show_inspector_document(ui, &document, None);
+                });
+                assert!(!output.shapes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn stable_section_ids_preserve_expansion_state_across_redraws() {
+        let mut document = InspectorDocument::new("feature:stable", "Stable feature");
+        document.sections.push(
+            InspectorSection::new("raw-context", "Context", 0).with_fields(vec![
+                InspectorField::new("id", "Identifier", InspectorValue::Identifier("x".into())),
+            ]),
+        );
+        let context = egui::Context::default();
+        let mut section_id = None;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let response = show_inspector_document(ui, &document, None);
+            section_id = response.section_ids.first().copied();
+        });
+        let section_id = section_id.expect("the section returned its persistent identity");
+        let mut state = egui::collapsing_header::CollapsingState::load(&context, section_id)
+            .expect("the rendered section stores expansion state");
+        state.set_open(false);
+        state.store(&context);
+
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let _ = show_inspector_document(ui, &document, None);
+        });
+
+        assert!(
+            !egui::collapsing_header::CollapsingState::load(&context, section_id)
+                .unwrap()
+                .is_open()
+        );
+    }
+
+    #[test]
+    fn table_filtering_is_bounded_and_does_not_change_source_order() {
+        let table = InspectorTable {
+            columns: vec!["Sample".to_owned()],
+            rows: vec![
+                vec!["sample-z".to_owned()],
+                vec!["sample-a".to_owned()],
+                vec!["sample-b".to_owned()],
+            ],
+            total_rows: 10_000,
+            omitted_rows: 9_997,
+            search_label: Some("Filter presented samples".to_owned()),
+        };
+
+        assert_eq!(
+            inspector_table_matching_rows(&table, "sample"),
+            vec![0, 1, 2]
+        );
+        assert_eq!(inspector_table_matching_rows(&table, "-a"), vec![1]);
+        assert_eq!(table.rows.len(), 3);
+        assert_eq!(table.omitted_rows, 9_997);
     }
 }

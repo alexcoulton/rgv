@@ -1,6 +1,60 @@
 use super::super::*;
+use crate::display::alignment;
 
 const MAXIMUM_AUTOMATION_SUPPLEMENTARY_SEGMENTS: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AutomationReadPresentationFields {
+    pub(crate) state: AutomationReadPresentationState,
+    pub(crate) requested_limit: usize,
+    pub(crate) effective_limit: usize,
+    pub(crate) eligible_records: usize,
+    pub(crate) complete_records: usize,
+    pub(crate) refusal_eligible_records: usize,
+    pub(crate) refusal_scope: Option<String>,
+}
+
+pub(crate) fn automation_read_presentation_fields(
+    query: Option<&AlignmentQuery>,
+    layout_query: Option<&AlignmentQuery>,
+    stacking_mode: ReadStackingMode,
+    checking: bool,
+    failed: bool,
+    requested_limit: usize,
+) -> AutomationReadPresentationFields {
+    let refusal = query.and_then(|query| {
+        alignment::individual_read_refusal(query, layout_query.unwrap_or(query), stacking_mode)
+    });
+    let state = if failed {
+        AutomationReadPresentationState::Failed
+    } else if checking {
+        AutomationReadPresentationState::Checking
+    } else if refusal.is_some() {
+        AutomationReadPresentationState::TooDense
+    } else if query.is_some() {
+        AutomationReadPresentationState::Complete
+    } else {
+        AutomationReadPresentationState::Unavailable
+    };
+    AutomationReadPresentationFields {
+        state,
+        requested_limit,
+        effective_limit: query.map_or(requested_limit, |query| query.stats.complete_read_limit),
+        eligible_records: query.map_or(0, |query| query.stats.records_eligible),
+        complete_records: query.map_or(0, |query| {
+            if refusal.is_none() && query.individual_reads_complete() {
+                query.stats.records_emitted
+            } else {
+                0
+            }
+        }),
+        refusal_eligible_records: refusal.map_or(0, |refusal| refusal.eligible_records),
+        refusal_scope: refusal.map(|refusal| match refusal.scope {
+            IndividualReadRefusalScope::Foreground => "foreground".to_owned(),
+            IndividualReadRefusalScope::LayoutHorizon => "layout_horizon".to_owned(),
+        }),
+    }
+}
 
 fn automation_locus(contig: &str, interval: GenomicInterval) -> String {
     format!(
@@ -9,6 +63,38 @@ fn automation_locus(contig: &str, interval: GenomicInterval) -> String {
         interval.start().saturating_add(1),
         interval.end()
     )
+}
+
+fn automation_complete_alignment_query(
+    track: &AlignmentTrackController,
+    panel_id: PanelId,
+    presentation_committed: bool,
+) -> Result<Arc<AlignmentQuery>> {
+    anyhow::ensure!(
+        presentation_committed,
+        "the target viewport is still being checked"
+    );
+    let projection = track
+        .projection(panel_id)
+        .context("the alignment query is unavailable for this panel")?;
+    anyhow::ensure!(
+        projection.query_is_current(),
+        "the alignment query has not settled for the current viewport"
+    );
+    let query = projection
+        .current_query
+        .as_ref()
+        .cloned()
+        .context("the alignment query has not settled")?;
+    let layout_query = projection.layout_query.as_deref().unwrap_or(&query);
+    if let Some(refusal) = alignment::individual_read_refusal(
+        &query,
+        layout_query,
+        track.config.filters.read_stacking_mode,
+    ) {
+        anyhow::bail!(alignment::read_refusal_detail(refusal));
+    }
+    Ok(query)
 }
 
 fn bounded_automation_text(value: &str, maximum_bytes: usize) -> String {
@@ -164,6 +250,11 @@ impl Viewer {
             return false;
         }
         for panel in self.panels.iter() {
+            if panel.navigation_presentation.is_unsettled()
+                || panel.navigation_query_schedule.pending.is_some()
+            {
+                return false;
+            }
             if panel.pending_queries.alignment
                 || panel.pending_queries.reference
                 || panel.pending_queries.tracks
@@ -1244,6 +1335,9 @@ impl Viewer {
                 {
                     automation_failure(AutomationErrorCode::EffectiveStateUnavailable, error)
                 }
+                Err(error) if error.to_string().starts_with("complete reads unavailable") => {
+                    automation_failure(AutomationErrorCode::TooDense, error)
+                }
                 Err(error) => automation_failure(AutomationErrorCode::ResourceNotFound, error),
             },
             AutomationCommand::SelectAlignment {
@@ -1268,6 +1362,9 @@ impl Viewer {
                         message: "Selected an opaque alignment handle".to_owned(),
                         data,
                     },
+                    Err(error) if error.to_string().starts_with("complete reads unavailable") => {
+                        automation_failure(AutomationErrorCode::TooDense, error)
+                    }
                     Err(error) => automation_failure(AutomationErrorCode::StaleHandle, error),
                 }
             }
@@ -1381,6 +1478,9 @@ impl Viewer {
                 }
                 match self.start_automation_export(command_index, PathBuf::from(path), kind) {
                     Ok(()) => AutomationExecution::Wait(AutomationWait::File { command_index }),
+                    Err(error) if error.to_string().starts_with("complete reads unavailable") => {
+                        automation_failure(AutomationErrorCode::TooDense, error)
+                    }
                     Err(error) => {
                         automation_failure(AutomationErrorCode::UnsupportedCommand, error)
                     }
@@ -1417,8 +1517,27 @@ impl Viewer {
                     .alignment_tracks
                     .first()
                     .and_then(|track| track.projection(panel.id));
-                let query =
-                    alignment_projection.and_then(|projection| projection.current_query.as_deref());
+                let query = alignment_projection
+                    .filter(|_| panel.navigation_presentation.permits_staged_display())
+                    .filter(|projection| projection.query_is_current())
+                    .and_then(|projection| projection.current_query.as_deref());
+                let layout_query = alignment_projection
+                    .filter(|_| panel.navigation_presentation.permits_staged_display())
+                    .filter(|projection| projection.query_is_current())
+                    .and_then(|projection| projection.layout_query.as_deref());
+                let read_refusal = self
+                    .alignment_tracks
+                    .first()
+                    .and_then(|track| {
+                        query.map(|query| {
+                            alignment::individual_read_refusal(
+                                query,
+                                layout_query.unwrap_or(query),
+                                track.config.filters.read_stacking_mode,
+                            )
+                        })
+                    })
+                    .flatten();
                 let index_only_overview =
                     alignment_projection.is_some_and(|projection| projection.index_only_overview);
                 let layout_stats = self
@@ -1436,7 +1555,8 @@ impl Viewer {
                     .unwrap_or(false);
                 let reads_rendered = read_content_visible
                     && panel.viewport.detail_level() != DetailLevel::Overview
-                    && query.is_some();
+                    && query.is_some()
+                    && read_refusal.is_none();
                 let render_lanes = [
                     ("reference", filters.show_reference),
                     ("coverage", filters.show_coverage),
@@ -1450,10 +1570,16 @@ impl Viewer {
                         && (lane != "reads" && lane != "modifications" || reads_rendered);
                     let omission_reason = (!rendered).then_some(if !configured {
                         AutomationRenderOmissionReason::Disabled
+                    } else if (lane == "reads" || lane == "modifications") && read_refusal.is_some()
+                    {
+                        AutomationRenderOmissionReason::TooDense
                     } else if index_only_overview {
                         AutomationRenderOmissionReason::OverviewDetailThreshold
                     } else if query.is_none() {
-                        if panel.pending_queries.alignment {
+                        if panel.pending_queries.alignment
+                            || alignment_projection
+                                .is_some_and(AlignmentPanelProjection::query_is_checking)
+                        {
                             AutomationRenderOmissionReason::Loading
                         } else {
                             AutomationRenderOmissionReason::NoData
@@ -1467,17 +1593,13 @@ impl Viewer {
                         rendered,
                         omission_reason,
                         queried_items: query.map_or(0, |query| query.stats.records_eligible),
-                        rendered_items: if lane == "reads" {
-                            layout_stats.map_or(0, |stats| stats.rendered_alignments)
-                        } else {
-                            query.map_or(0, |query| query.stats.records_emitted)
+                        rendered_items: match lane {
+                            "reads" => layout_stats.map_or(0, |stats| stats.rendered_alignments),
+                            "coverage" => query.map_or(0, |query| query.stats.records_eligible),
+                            "modifications" => query.map_or(0, |query| query.stats.records_emitted),
+                            _ => 0,
                         },
-                        sampled_items: query.map_or(0, |query| {
-                            query
-                                .stats
-                                .records_eligible
-                                .saturating_sub(query.stats.records_emitted)
-                        }),
+                        sampled_items: 0,
                         truncated: query.is_some_and(|query| query.stats.truncated),
                         filtered_unmapped_items: query
                             .map_or(0, |query| query.stats.records_filtered_unmapped),
@@ -1532,7 +1654,60 @@ impl Viewer {
                     render_generation: panel.generation_clock.current().get(),
                     settled: !panel.pending_queries.alignment
                         && !panel.pending_queries.reference
-                        && !panel.pending_queries.tracks,
+                        && !panel.pending_queries.tracks
+                        && !panel.navigation_presentation.is_unsettled()
+                        && panel.navigation_query_schedule.pending.is_none()
+                        && self
+                            .alignment_tracks
+                            .iter()
+                            .all(|track| match track.lifecycle {
+                                AlignmentTrackLifecycle::Opening => false,
+                                AlignmentTrackLifecycle::Failed(_) => true,
+                                AlignmentTrackLifecycle::Ready => track
+                                    .projection(panel.id)
+                                    .is_some_and(AlignmentPanelProjection::query_is_current),
+                            }),
+                    navigation_transaction_active: panel.navigation_presentation.is_unsettled(),
+                    navigation_preview_active: panel
+                        .navigation_presentation
+                        .shows_retained_preview(),
+                    preview_source_locus: panel
+                        .navigation_presentation
+                        .source
+                        .as_ref()
+                        .map(|source| automation_locus(&panel.contig_name, source.interval)),
+                    preview_target_locus: panel.navigation_presentation.is_unsettled().then(|| {
+                        automation_locus(
+                            &panel.contig_name,
+                            panel.navigation_presentation.target_interval,
+                        )
+                    }),
+                    preview_source_generation: panel
+                        .navigation_presentation
+                        .source
+                        .as_ref()
+                        .map(|source| source.generation),
+                    preview_target_generation: panel
+                        .navigation_presentation
+                        .is_unsettled()
+                        .then_some(panel.navigation_presentation.target_generation),
+                    preview_age_ms: panel.navigation_presentation.is_unsettled().then(|| {
+                        u64::try_from(
+                            panel
+                                .navigation_presentation
+                                .age(Instant::now())
+                                .as_millis(),
+                        )
+                        .unwrap_or(u64::MAX)
+                    }),
+                    preview_kind: panel
+                        .navigation_presentation
+                        .preview_kind
+                        .map(|kind| kind.label().to_owned()),
+                    preview_invalidation_reason: panel
+                        .navigation_presentation
+                        .invalidation_reason
+                        .clone(),
                     render_lanes,
                     read_panel_states: self
                         .alignment_tracks
@@ -1572,10 +1747,29 @@ impl Viewer {
                 }
             })
             .collect();
+        let active_presentation_committed = self
+            .panels
+            .active()
+            .navigation_presentation
+            .permits_staged_display();
         let mut tracks = self
             .alignment_tracks
             .iter()
             .map(|track| {
+                let projection = track.projection(self.panels.active().id);
+                let settled_query = projection
+                    .filter(|_| active_presentation_committed)
+                    .filter(|projection| projection.query_is_current())
+                    .and_then(|projection| projection.current_query.as_deref());
+                let settled_layout_query = projection
+                    .filter(|_| active_presentation_committed)
+                    .filter(|projection| projection.query_is_current())
+                    .and_then(|projection| projection.layout_query.as_deref());
+                let reconciliation = projection
+                    .and_then(|projection| projection.alignment_rows.as_ref())
+                    .map_or_else(AlignmentRowReconciliationStats::default, |cached| {
+                        cached.reconciliation
+                    });
                 let (lifecycle, failure) = match &track.lifecycle {
                     AlignmentTrackLifecycle::Opening => (AutomationTrackLifecycle::Opening, None),
                     AlignmentTrackLifecycle::Ready => (AutomationTrackLifecycle::Ready, None),
@@ -1584,6 +1778,15 @@ impl Viewer {
                         Some("alignment track failed to open".to_owned()),
                     ),
                 };
+                let read_presentation = automation_read_presentation_fields(
+                    settled_query,
+                    settled_layout_query,
+                    track.config.filters.read_stacking_mode,
+                    lifecycle == AutomationTrackLifecycle::Opening
+                        || projection.is_some_and(AlignmentPanelProjection::query_is_checking),
+                    lifecycle == AutomationTrackLifecycle::Failed,
+                    track.config.maximum_alignments,
+                );
                 let annotation = self
                     .track_presentation
                     .pane_track_state(ui::TrackPane::Annotation, track.config.id);
@@ -1609,8 +1812,50 @@ impl Viewer {
                         group_order: track.config.filters.alignment_group_order,
                         sort_mode: track.config.filters.alignment_sort_mode,
                         sort_order: track.config.filters.alignment_sort_order,
+                        sort_anchor: track.config.filters.alignment_sort_anchor,
                         filter_expression: track.filter_editor.expression.clone(),
                         view_as_pairs: track.config.filters.view_as_pairs,
+                        read_stacking_mode: track.config.filters.read_stacking_mode,
+                        read_presentation_state: read_presentation.state,
+                        requested_complete_read_limit: read_presentation.requested_limit,
+                        effective_complete_read_limit: read_presentation.effective_limit,
+                        eligible_read_records: read_presentation.eligible_records,
+                        complete_read_records: read_presentation.complete_records,
+                        refusal_eligible_read_records: read_presentation.refusal_eligible_records,
+                        read_refusal_scope: read_presentation.refusal_scope,
+                        row_layout_revision: reconciliation.revision,
+                        row_layout_architecture_version: reconciliation.architecture_version,
+                        row_layout_reconciliation_micros: reconciliation.reconciliation_micros,
+                        row_layout_retained: reconciliation.retained,
+                        row_layout_restored: reconciliation.restored,
+                        row_layout_added: reconciliation.added,
+                        row_layout_moved: reconciliation.moved,
+                        row_layout_reservations: reconciliation.reservations,
+                        row_layout_history_bytes: reconciliation.history_bytes,
+                        row_layout_islands: reconciliation.islands,
+                        row_layout_evictions: reconciliation.evictions,
+                        row_layout_transition_reason: reconciliation.transition_reason,
+                        row_layout_policy_fingerprint: reconciliation.policy_fingerprint,
+                        row_layout_projection_fingerprint: reconciliation.projection_fingerprint,
+                        row_layout_stable_rows: reconciliation.stable_rows,
+                        row_layout_canonical_rows: reconciliation.canonical_rows,
+                        row_layout_row_inflation: reconciliation.row_inflation,
+                        row_layout_canonical_displacement: reconciliation.canonical_displacement,
+                        row_layout_top_first_violations: reconciliation.top_first_violations,
+                        row_layout_query_occupied_row_span: reconciliation.query_occupied_row_span,
+                        row_layout_query_empty_rows: reconciliation.query_empty_rows,
+                        row_layout_query_empty_ratio_ppm: reconciliation.query_empty_ratio_ppm,
+                        row_layout_horizon_start: reconciliation.horizon_start,
+                        row_layout_horizon_end: reconciliation.horizon_end,
+                        row_layout_horizon_generation: reconciliation.horizon_generation,
+                        row_layout_horizon_extensions: reconciliation.horizon_extensions,
+                        row_layout_horizon_records: reconciliation.horizon_records,
+                        row_layout_horizon_bytes: reconciliation.horizon_bytes,
+                        row_layout_horizon_truncated: reconciliation.horizon_truncated,
+                        row_layout_horizon_cache_hit: projection
+                            .is_some_and(|projection| projection.layout_query_cache_hit),
+                        stable_architecture_rebuild_pending: projection
+                            .is_some_and(|projection| projection.pending_row_repack),
                         overlapping_mate_policy: track.config.filters.overlapping_mate_policy,
                         color_mode: track.config.filters.alignment_color_mode,
                         alignment_density: track.config.filters.alignment_density,
@@ -2003,6 +2248,14 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn automation_selection_snapshot(&self) -> Option<AutomationSelectionSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         Some(observed_retained_selection(
             &self.panels.active().retained_evidence.as_ref()?.selection,
             self.panels.active().viewport.interval(),
@@ -2016,6 +2269,9 @@ impl Viewer {
         const MAXIMUM_FIELD_VALUE_BYTES: usize = 4_096;
 
         let panel = self.panels.active();
+        if !panel.navigation_presentation.is_interactive() {
+            return None;
+        }
         let bounded_fields = |fields: Vec<(String, String)>| {
             let truncated = fields.len() > MAXIMUM_AUTOMATION_EVIDENCE_FIELDS;
             let fields = fields
@@ -2172,7 +2428,9 @@ impl Viewer {
                 interval
                     .map(GenomicInterval::end)
                     .or(Some(position.saturating_add(1))),
-                inspector.fields,
+                inspector
+                    .document(format!("pileup:{position}"), "Pileup")
+                    .flatten_automation_fields(),
             );
             if let Some(query) = query {
                 captured.provenance = vec![
@@ -2210,7 +2468,9 @@ impl Viewer {
                 Some(position),
                 Some(position),
                 Some(position.saturating_add(1)),
-                inspector.fields,
+                inspector
+                    .document(format!("modification:{position}"), "Modification frequency")
+                    .flatten_automation_fields(),
             ));
         }
         if let Some((start, end)) = panel.selected_junction
@@ -2222,17 +2482,23 @@ impl Viewer {
                 Some(start),
                 Some(start),
                 Some(end),
-                inspector.fields,
+                inspector
+                    .document(format!("junction:{start}:{end}"), "Splice junction")
+                    .flatten_automation_fields(),
             ));
         }
         if let Some(index) = panel.selected_record
             && let Some(inspector) = self.inspector_snapshot()
         {
             let track_id = alignment_track.unwrap_or_else(|| self.primary_alignment_track_id());
-            let query = self.alignment_query_for_track(track_id)?;
+            let query = self.complete_read_query_for_track(track_id)?;
             let record = query.materialize_record(index).ok()?;
             let fields = inspector
-                .fields
+                .document(
+                    format!("read:{}:{index}", track_id.get()),
+                    "Alignment segment",
+                )
+                .flatten_automation_fields()
                 .into_iter()
                 .filter(|(key, _)| automation_read_evidence_field_is_public(key))
                 .collect();
@@ -2821,6 +3087,60 @@ impl Viewer {
                 self.invalidate_automation_alignment_layouts(Some(track_ids), false);
                 self.rebuild_all_panel_displays();
             }
+            AutomationSetting::ReadStackingMode { track_ids, value } => {
+                self.ensure_automation_alignment_tracks(track_ids)?;
+                for track in self
+                    .alignment_tracks
+                    .iter_mut()
+                    .filter(|track| track_ids.contains(&track.config.id))
+                {
+                    track.config.filters.read_stacking_mode = *value;
+                }
+                self.invalidate_automation_alignment_layouts(Some(track_ids), false);
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::CompleteReadLimit { track_ids, value } => {
+                self.ensure_automation_alignment_tracks(track_ids)?;
+                let effective = (*value).min(self.workspace_alignment_limit).max(1);
+                for track in self
+                    .alignment_tracks
+                    .iter_mut()
+                    .filter(|track| track_ids.contains(&track.config.id))
+                {
+                    track.config.maximum_alignments = effective;
+                }
+                self.invalidate_automation_alignment_layouts(Some(track_ids), true);
+                self.request_all_panel_queries();
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::RebuildStableReadArchitecture {
+                panel_id,
+                track_ids,
+            } => {
+                self.ensure_automation_alignment_tracks(track_ids)?;
+                anyhow::ensure!(
+                    self.panels.get(*panel_id).is_some(),
+                    "panel {} was not found",
+                    panel_id.get()
+                );
+                for track in self
+                    .alignment_tracks
+                    .iter_mut()
+                    .filter(|track| track_ids.contains(&track.config.id))
+                {
+                    anyhow::ensure!(
+                        track.config.filters.read_stacking_mode == ReadStackingMode::Stable,
+                        "Rebuild stable architecture requires stable read stacking for track {}",
+                        track.config.id.get()
+                    );
+                    let projection = track.projection_mut(*panel_id);
+                    projection.pending_row_repack = true;
+                    projection.alignment_rows = None;
+                    projection.cached_layout = None;
+                }
+                self.layout_cache.clear();
+                self.rebuild_all_panel_displays();
+            }
             AutomationSetting::PresentationSectionExpanded { channel, value } => {
                 self.apply_track_intents(&[TrackIntent::SetSectionExpanded {
                     channel: *channel,
@@ -3028,6 +3348,12 @@ impl Viewer {
                 .iter()
                 .find(|track| track.id == *track_id)
                 .map(|track| serde_json::json!(track.height)),
+            AutomationSetting::CompleteReadLimit { track_ids, .. } => workspace
+                .tracks
+                .iter()
+                .find(|track| track_ids.contains(&track.id))
+                .and_then(|track| track.alignment.as_ref())
+                .map(|alignment| serde_json::json!(alignment.requested_complete_read_limit)),
             _ => Some(
                 requested
                     .get("value")
@@ -3198,6 +3524,10 @@ impl Viewer {
         selector: &AutomationAlignmentSelector,
         maximum_results: usize,
     ) -> Result<serde_json::Value> {
+        let presentation_committed = self
+            .panels
+            .get(panel_id)
+            .is_some_and(|panel| panel.navigation_presentation.is_interactive());
         let track = self
             .alignment_tracks
             .iter()
@@ -3207,12 +3537,7 @@ impl Viewer {
             .projection(panel_id)
             .context("the alignment query is unavailable for this panel")?;
         let generation = projection.clock.current().get();
-        let query = Arc::clone(
-            projection
-                .current_query
-                .as_ref()
-                .context("the alignment query has not settled")?,
-        );
+        let query = automation_complete_alignment_query(track, panel_id, presentation_committed)?;
         let filters = track.config.filters.clone();
         let mut read_name_counts = HashMap::<Vec<u8>, usize>::new();
         let mut supplementary_names = HashSet::<Vec<u8>>::new();
@@ -3383,15 +3708,23 @@ impl Viewer {
             .get(handle)
             .copied()
             .context("alignment handle is stale or unknown")?;
-        let query = self
+        let presentation_committed = self
+            .panels
+            .get(target.panel_id)
+            .is_some_and(|panel| panel.navigation_presentation.is_interactive());
+        let track = self
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == target.track_id)
-            .and_then(|track| track.projection(target.panel_id))
-            .filter(|projection| projection.clock.current().get() == target.query_generation)
-            .and_then(|projection| projection.current_query.as_ref())
-            .cloned()
-            .context("alignment handle is stale")?;
+            .context("alignment handle track is unavailable")?;
+        anyhow::ensure!(
+            track.projection(target.panel_id).is_some_and(|projection| {
+                projection.clock.current().get() == target.query_generation
+            }),
+            "alignment handle is stale"
+        );
+        let query =
+            automation_complete_alignment_query(track, target.panel_id, presentation_committed)?;
         let record = query
             .materialize_record(target.record_index)
             .context("alignment handle no longer identifies a record")?;
@@ -3451,6 +3784,11 @@ impl Viewer {
     }
 
     pub(crate) fn automation_related_alignments(&self) -> Result<serde_json::Value> {
+        let presentation_committed = self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive();
         let track_id = self
             .panels
             .active()
@@ -3461,10 +3799,17 @@ impl Viewer {
             .active()
             .selected_record
             .context("no alignment is selected")?;
-        let record = self
-            .alignment_query_for_track(track_id)
-            .context("selected alignment query is unavailable")?
-            .materialize_record(index)?;
+        let track = self
+            .alignment_tracks
+            .iter()
+            .find(|track| track.config.id == track_id)
+            .context("selected alignment track is unavailable")?;
+        let query = automation_complete_alignment_query(
+            track,
+            self.panels.active().id,
+            presentation_committed,
+        )?;
+        let record = query.materialize_record(index)?;
         let segments =
             self.panels
                 .active()
@@ -3594,6 +3939,7 @@ impl Viewer {
                     "track_id": track.config.id.get(),
                     "mode": track.config.filters.alignment_sort_mode,
                     "direction": track.config.filters.alignment_sort_order,
+                    "anchor": track.config.filters.alignment_sort_anchor,
                 })
             })
             .collect()
@@ -3623,6 +3969,7 @@ impl Viewer {
         let mode = tag.map_or(Ok(mode), |tag| {
             parse_automation_sam_tag(tag).map(AlignmentSortMode::Tag)
         })?;
+        let captured_anchor = alignment_sort_position(mode, None, self.panels.active().viewport);
         for track in self
             .alignment_tracks
             .iter_mut()
@@ -3630,6 +3977,7 @@ impl Viewer {
         {
             track.config.filters.alignment_sort_mode = mode;
             track.config.filters.alignment_sort_order = direction;
+            track.config.filters.alignment_sort_anchor = captured_anchor;
         }
         if track_ids.contains(&self.primary_alignment_track_id()) {
             self.activate_first_alignment_track()?;
@@ -3864,6 +4212,7 @@ impl Viewer {
             .iter()
             .find(|track| track.config.id == track_id)
             .and_then(|track| track.projection(panel_id))
+            .filter(|projection| projection.query_is_current())
             .and_then(|projection| projection.current_query.as_deref())
             .and_then(|query| {
                 let (index, _) = query.pileup.bin_at(query.interval, position)?;
@@ -3915,6 +4264,14 @@ impl Viewer {
             );
             let width = self.surface_config.width;
             let height = self.surface_config.height;
+            let navigation_preview_active = self
+                .panels
+                .iter()
+                .any(|panel| panel.navigation_presentation.shows_retained_preview());
+            let navigation_transaction_active = self
+                .panels
+                .iter()
+                .any(|panel| panel.navigation_presentation.is_unsettled());
             self.pending_native_window_capture = Some(NativeWindowCaptureTask {
                 path,
                 automation_command: command_index,
@@ -3926,6 +4283,8 @@ impl Viewer {
                     "truncated": false,
                     "application_instance_id": self.application_instance_id,
                     "workspace_revision": self.workspace_revision,
+                    "navigation_preview_active": navigation_preview_active,
+                    "navigation_transaction_active": navigation_transaction_active,
                     "selection_id": self.automation_selection_snapshot().map(|selection| selection.selection_id),
                     "evidence_revision": self.automation_selection_snapshot().map(|selection| selection.evidence_revision),
                 }),
@@ -3934,6 +4293,23 @@ impl Viewer {
             self.window.request_redraw();
             return Ok(());
         }
+        let requested_presentations_committed = match scope {
+            AutomationSnapshotScope::VisibleWorkspace => self
+                .panels
+                .iter()
+                .all(|panel| panel.navigation_presentation.is_interactive()),
+            AutomationSnapshotScope::ActivePanel
+            | AutomationSnapshotScope::FullActivePanel
+            | AutomationSnapshotScope::NativeWindow => self
+                .panels
+                .active()
+                .navigation_presentation
+                .is_interactive(),
+        };
+        anyhow::ensure!(
+            requested_presentations_committed,
+            "the target viewport is still being checked"
+        );
         let (display, width, height, scope_label) = match scope {
             AutomationSnapshotScope::VisibleWorkspace => {
                 let bounds = self.workspace_layout.workspace;
@@ -4115,27 +4491,46 @@ impl Viewer {
             | AutomationExportKind::Pileup
             | AutomationExportKind::Modifications
             | AutomationExportKind::Junctions => {
-                let tracks = self
-                    .alignment_tracks
-                    .iter()
-                    .filter(|track| {
-                        self.track_presentation
-                            .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
+                let presentation_committed = self
+                    .panels
+                    .active()
+                    .navigation_presentation
+                    .is_interactive();
+                anyhow::ensure!(
+                    presentation_committed,
+                    "the target viewport is still being checked"
+                );
+                let mut tracks = Vec::new();
+                for track in self.alignment_tracks.iter().filter(|track| {
+                    self.track_presentation
+                        .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
+                        .unwrap_or(false)
+                        || self
+                            .track_presentation
+                            .track_content_exposed(ui::TrackPane::Reads, track.config.id)
                             .unwrap_or(false)
-                            || self
-                                .track_presentation
-                                .track_content_exposed(ui::TrackPane::Reads, track.config.id)
-                                .unwrap_or(false)
-                    })
-                    .filter_map(|track| {
-                        self.alignment_query_for_track(track.config.id)
-                            .map(|query| AutomationAlignmentExportTrack {
-                                id: track.config.id,
-                                name: track.config.name.clone(),
-                                query: Arc::clone(query),
-                            })
-                    })
-                    .collect::<Vec<_>>();
+                }) {
+                    let query = if kind == AutomationExportKind::Alignments {
+                        Some(automation_complete_alignment_query(
+                            track,
+                            self.panels.active().id,
+                            presentation_committed,
+                        )?)
+                    } else {
+                        track
+                            .projection(self.panels.active().id)
+                            .filter(|projection| projection.query_is_current())
+                            .and_then(|projection| projection.current_query.as_ref())
+                            .cloned()
+                    };
+                    if let Some(query) = query {
+                        tracks.push(AutomationAlignmentExportTrack {
+                            id: track.config.id,
+                            name: track.config.name.clone(),
+                            query,
+                        });
+                    }
+                }
                 anyhow::ensure!(
                     !tracks.is_empty(),
                     "no visible settled alignment data is available to export"

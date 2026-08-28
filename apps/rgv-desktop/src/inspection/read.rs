@@ -474,6 +474,278 @@ pub(crate) fn inspector_fields_text(fields: &[(String, String)]) -> String {
         .join("\n")
 }
 
+fn inspector_field_value<'a>(snapshot: &'a InspectorSnapshot, label: &str) -> Option<&'a str> {
+    snapshot
+        .fields
+        .iter()
+        .find(|(candidate, _)| candidate == label)
+        .map(|(_, value)| value.as_str())
+}
+
+fn sequence_field(
+    id: &str,
+    label: &str,
+    sequence: &str,
+    total_bases: usize,
+    copied_bases: usize,
+) -> InspectorField {
+    const PREVIEW_BASES: usize = 160;
+    let mut display = sequence.chars().take(PREVIEW_BASES).collect::<String>();
+    if sequence.chars().count() > PREVIEW_BASES {
+        display.push('…');
+    }
+    InspectorField::new(
+        id,
+        label,
+        InspectorValue::Sequence {
+            display,
+            total_bases,
+            truncated: copied_bases < total_bases,
+        },
+    )
+    .with_copy_value(sequence)
+    .with_provenance(if copied_bases < total_bases {
+        InspectorProvenance::Truncated {
+            displayed: copied_bases,
+            total: Some(total_bases),
+            reason: "sequence clipboard resource limit".to_owned(),
+        }
+    } else {
+        InspectorProvenance::Source
+    })
+}
+
+/// Builds the complete read/read-event presentation document. Runtime
+/// availability is supplied explicitly so the adapter, rather than the UI,
+/// owns which actions exist and why any of them are disabled.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn alignment_inspector_document(
+    inspector: &InspectorSnapshot,
+    identity: impl Into<String>,
+    visible_reference: Option<&BoundedSequenceCopy>,
+    mate_target_available: bool,
+    available_panel_slots: usize,
+) -> InspectorDocument {
+    let title = inspector_field_value(inspector, "Read").unwrap_or("Alignment segment");
+    let mut document = inspector.document(identity, title);
+    document.header.subtitle = inspector_field_value(inspector, "Alignment segment")
+        .map(|role| format!("{role} alignment segment"));
+    document.header.source = inspector_field_value(inspector, "Track").map(str::to_owned);
+    document.header.badges.push(InspectorBadge {
+        label: if inspector.event_sequence.is_some() {
+            "Read event".to_owned()
+        } else {
+            "Read".to_owned()
+        },
+        tone: InspectorTone::Informative,
+    });
+    if let Some(summary) = document.sections.first_mut() {
+        summary.id = "alignment-summary".to_owned();
+        summary.title = "Alignment evidence".to_owned();
+        summary.fields.retain(|field| {
+            !matches!(
+                field.label.as_str(),
+                "Track" | "Read" | "Alignment segment" | "Position"
+            ) && !matches!(
+                field.value,
+                InspectorValue::Missing {
+                    consequential: false,
+                    ..
+                }
+            )
+        });
+    }
+    if let Some(cigar) = &inspector.cigar {
+        if let Some(cigar_field) = document.sections.first_mut().and_then(|summary| {
+            summary
+                .fields
+                .iter_mut()
+                .find(|field| field.label == "CIGAR")
+        }) {
+            let display = cigar_field.value.display_text();
+            cigar_field.id = "cigar".to_owned();
+            cigar_field.value = InspectorValue::Identifier(display.clone());
+            cigar_field.copy_value = Some(cigar.clone());
+            if display != *cigar {
+                cigar_field.provenance = InspectorProvenance::Truncated {
+                    displayed: display.len(),
+                    total: Some(cigar.len()),
+                    reason: "CIGAR presentation limit".to_owned(),
+                };
+            }
+        } else {
+            document.sections.push(
+                InspectorSection::new("exact-cigar", "Exact CIGAR", 90)
+                    .collapsed()
+                    .with_fields(vec![
+                        InspectorField::new(
+                            "cigar",
+                            "CIGAR",
+                            InspectorValue::Identifier(cigar.clone()),
+                        )
+                        .with_copy_value(cigar),
+                    ]),
+            );
+        }
+    }
+    let mut sequences = Vec::new();
+    if let Some(sequence) = &inspector.read_sequence {
+        sequences.push(sequence_field(
+            "read-sequence",
+            "Read sequence",
+            &sequence.text,
+            sequence.total_bases,
+            sequence.copied_bases,
+        ));
+    }
+    if let Some(sequence) = &inspector.event_sequence {
+        sequences.push(sequence_field(
+            "event-sequence",
+            "Event sequence",
+            sequence,
+            sequence.len(),
+            sequence.len(),
+        ));
+    }
+    if !sequences.is_empty() {
+        document.sections.push(
+            InspectorSection::new("sequences", "Sequences", 100)
+                .collapsed()
+                .with_fields(sequences),
+        );
+    }
+
+    document
+        .actions
+        .push(InspectorAction::new(InspectorActionId::CopyDetails, "Copy details").primary());
+    if inspector.cigar.is_some() {
+        document.actions.push(InspectorAction::new(
+            InspectorActionId::CopyCigar,
+            "Copy CIGAR",
+        ));
+    }
+    let copy_read = InspectorAction::new(InspectorActionId::CopyReadSequence, "Copy read sequence")
+        .with_hover_text(sequence_copy_hover(
+            inspector.read_sequence.as_ref(),
+            "read",
+        ));
+    document.actions.push(if inspector.read_sequence.is_some() {
+        copy_read
+    } else {
+        copy_read.disabled("Sequence was not loaded or is missing from the record")
+    });
+    let copy_tags =
+        InspectorAction::new(InspectorActionId::CopyAuxiliaryTags, "Copy auxiliary tags");
+    document.actions.push(if inspector.auxiliary.is_empty() {
+        copy_tags.disabled("This record has no loaded auxiliary tags")
+    } else {
+        copy_tags
+    });
+    if inspector.event_sequence.is_some() {
+        document.actions.push(InspectorAction::new(
+            InspectorActionId::CopyEventSequence,
+            "Copy event sequence",
+        ));
+    }
+    let copy_reference = InspectorAction::new(
+        InspectorActionId::CopyVisibleReference,
+        "Copy visible reference",
+    )
+    .with_hover_text(sequence_copy_hover(visible_reference, "reference"));
+    document.actions.push(if visible_reference.is_some() {
+        copy_reference
+    } else {
+        copy_reference.disabled("Zoom to base detail with a reference FASTA available")
+    });
+    let open_mate = InspectorAction::new(InspectorActionId::OpenMate, "Open mate in new panel");
+    document
+        .actions
+        .push(if mate_target_available && available_panel_slots > 0 {
+            open_mate
+        } else {
+            open_mate.disabled("A mapped mate and space for another panel are required")
+        });
+    document.actions.push(InspectorAction::new(
+        InspectorActionId::MoveReadToTop,
+        "Move selected to top",
+    ));
+    document.actions.push(
+        InspectorAction::new(InspectorActionId::ClearSelection, "Clear selection").low_emphasis(),
+    );
+    document
+}
+
+pub(crate) fn pileup_inspector_document(
+    inspector: &InspectorSnapshot,
+    visible_consensus: Option<&BoundedSequenceCopy>,
+    visible_reference: Option<&BoundedSequenceCopy>,
+) -> InspectorDocument {
+    let mut document = inspector.document("pileup", "Pileup");
+    document.header.source = inspector_field_value(inspector, "Track").map(str::to_owned);
+    document.header.badges.push(InspectorBadge {
+        label: "Pileup".to_owned(),
+        tone: InspectorTone::Informative,
+    });
+    document
+        .actions
+        .push(InspectorAction::new(InspectorActionId::CopyDetails, "Copy details").primary());
+    let consensus = InspectorAction::new(
+        InspectorActionId::CopyVisibleConsensus,
+        "Copy visible consensus",
+    )
+    .with_hover_text(sequence_copy_hover(visible_consensus, "consensus"));
+    document.actions.push(if visible_consensus.is_some() {
+        consensus
+    } else {
+        consensus.disabled("Zoom to exact base resolution to calculate consensus")
+    });
+    let reference = InspectorAction::new(
+        InspectorActionId::CopyVisibleReference,
+        "Copy visible reference",
+    )
+    .with_hover_text(sequence_copy_hover(visible_reference, "reference"));
+    document.actions.push(if visible_reference.is_some() {
+        reference
+    } else {
+        reference.disabled("Zoom to base detail with a reference FASTA available")
+    });
+    document.actions.push(
+        InspectorAction::new(InspectorActionId::ClearSelection, "Clear selection").low_emphasis(),
+    );
+    document
+}
+
+pub(crate) fn modification_inspector_document(inspector: &InspectorSnapshot) -> InspectorDocument {
+    let mut document = inspector.document("modification-frequency", "Modification frequency");
+    document.header.source = inspector_field_value(inspector, "Track").map(str::to_owned);
+    document.header.badges.push(InspectorBadge {
+        label: "Modified bases".to_owned(),
+        tone: InspectorTone::Informative,
+    });
+    document.actions.extend([
+        InspectorAction::new(InspectorActionId::CopyDetails, "Copy details").primary(),
+        InspectorAction::new(InspectorActionId::ClearSelection, "Clear selection").low_emphasis(),
+    ]);
+    document
+}
+
+pub(crate) fn junction_inspector_document(inspector: &InspectorSnapshot) -> InspectorDocument {
+    let mut document = inspector.document("splice-junction", "Splice junction");
+    document.header.source = inspector_field_value(inspector, "Track").map(str::to_owned);
+    document.header.badges.push(InspectorBadge {
+        label: "Junction".to_owned(),
+        tone: InspectorTone::Informative,
+    });
+    document.actions.extend([
+        InspectorAction::new(InspectorActionId::CopyDetails, "Copy details").primary(),
+        InspectorAction::new(InspectorActionId::ExportJunctionBed, "Export junction BED…"),
+        InspectorAction::new(InspectorActionId::ExportSashimiPng, "Export Sashimi PNG…"),
+        InspectorAction::new(InspectorActionId::ExportSashimiSvg, "Export Sashimi SVG…"),
+        InspectorAction::new(InspectorActionId::ClearSelection, "Clear selection").low_emphasis(),
+    ]);
+    document
+}
+
 pub(crate) const MAX_FEATURE_INSPECTOR_BLOCKS: usize = 128;
 pub(crate) const MAX_FEATURE_INSPECTOR_ATTRIBUTES: usize = 256;
 pub(crate) const MAX_FEATURE_INSPECTOR_VALUE_BYTES: usize = 4_096;

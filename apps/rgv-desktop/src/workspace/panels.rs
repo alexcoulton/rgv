@@ -23,10 +23,20 @@ pub(crate) struct ReadPanelDisplayCache {
     pub(crate) track_id: TrackId,
     pub(crate) scrollable: DisplayList,
     pub(crate) density_camera: bool,
+    pub(crate) row_height: Option<f32>,
+    pub(crate) row_layout_revision: Option<u64>,
     pub(crate) overview: ScrollbarOverview,
     pub(crate) actual_content_bottom: f32,
     pub(crate) clip_top: f32,
     pub(crate) clip_bottom: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StableRowCameraAnchor {
+    pub(crate) row: usize,
+    pub(crate) offset_fraction: f32,
+    pub(crate) layout_revision: u64,
+    pub(crate) row_height: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -38,6 +48,9 @@ pub(crate) struct ReadPanelScrollState {
     /// Density selected through this workspace's read navigator. `None` uses
     /// the track's configured default density.
     pub(crate) density: Option<f32>,
+    /// Stable row at the top of the viewport plus the fractional offset into
+    /// it. This survives changes in total stack height and row density.
+    pub(crate) stable_row_anchor: Option<StableRowCameraAnchor>,
 }
 
 impl ReadPanelScrollState {
@@ -85,6 +98,9 @@ pub(crate) struct ViewPanelController {
     pub(crate) hovered_record: Option<(TrackId, usize)>,
     pub(crate) hover_inspector_target: Option<HoverInspectorTarget>,
     pub(crate) display_list: DisplayList,
+    /// Non-evidentiary read geometry derived from a complete canonical horizon.
+    /// It is rendered above the retained texture with zero object IDs only.
+    pub(crate) navigation_provisional_display: Option<DisplayList>,
     pub(crate) scroll_display_cache: Option<PanelScrollDisplayCache>,
     pub(crate) reference_slice: Option<Arc<ReferenceSlice>>,
     pub(crate) reference_settled_generation: Option<u64>,
@@ -116,7 +132,10 @@ pub(crate) struct ViewPanelController {
     /// remain projections used by alignment settings and evidence code.
     pub(crate) selected_presentation_nodes: Vec<PresentationNodeId>,
     pub(crate) presentation_selection_anchor: Option<PresentationNodeId>,
-    pub(crate) last_gesture_query_at: Option<Instant>,
+    pub(crate) navigation_presentation: NavigationPresentation,
+    pub(crate) navigation_query_schedule: NavigationQuerySchedule,
+    pub(crate) reference_query_error_generation: Option<u64>,
+    pub(crate) track_query_error_generation: Option<u64>,
 }
 
 pub(crate) const INITIAL_PANEL_ID: PanelId = PanelId::new(1);
@@ -212,6 +231,7 @@ impl PanelWorkspace {
                                 latent_scroll_fraction: state.latent_scroll_fraction,
                                 content_bottom_points: state.content_bottom_points,
                                 density: state.density,
+                                stable_row_anchor: None,
                             },
                         )
                     })
@@ -427,6 +447,7 @@ impl ViewPanelController {
             hovered_record: None,
             hover_inspector_target: None,
             display_list: DisplayList::default(),
+            navigation_provisional_display: None,
             scroll_display_cache: None,
             reference_slice: None,
             reference_settled_generation: None,
@@ -446,7 +467,14 @@ impl ViewPanelController {
             selected_track: None,
             selected_presentation_nodes: Vec::new(),
             presentation_selection_anchor: None,
-            last_gesture_query_at: None,
+            navigation_presentation: NavigationPresentation::initial(
+                initial_interval,
+                0,
+                Instant::now(),
+            ),
+            navigation_query_schedule: NavigationQuerySchedule::default(),
+            reference_query_error_generation: None,
+            track_query_error_generation: None,
         }
     }
 

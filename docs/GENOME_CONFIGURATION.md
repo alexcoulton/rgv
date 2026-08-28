@@ -26,7 +26,8 @@ schema version is 1.
     {
       "name": "Genes",
       "kind": "GeneModel",
-      "source": { "Local": { "path": "annotations/genes.gtf.gz" } }
+      "source": { "Remote": { "url": "https://example.org/genes.bb" } },
+      "format": "big_gene_pred"
     },
     {
       "name": "Clinically reviewed variants",
@@ -48,7 +49,8 @@ schema version is 1.
 
 Local relative paths are resolved from the configuration file's directory, so the containing
 directory can be moved as one bundle. `Remote` sources use the same `{ "Remote": { "url": "…" } }`
-form as sessions. Cytobands are currently local UCSC-format TSV files.
+form as sessions. Set `format` to `big_gene_pred` or `big_narrow_peak` when a generic `.bb` path
+does not identify its binary schema. Cytobands are currently local UCSC-format TSV files.
 
 Aliases are exact and case-sensitive. Each value must name a canonical FASTA contig. RGV does not
 silently add or remove `chr`; an alias that conflicts with a different canonical contig is rejected.
@@ -70,3 +72,6 @@ separately report reference readiness, reference contig count, cytobands, aliase
 The real ONT parity bundle is [`validation/ont-grch38-subset.rgvgenome`](../validation/ont-grch38-subset.rgvgenome).
 It intentionally identifies a three-contig GRCh38 reference subset and records exact provenance for
 its UCSC cytoband and MANE assets.
+
+See [Curated gene landmark bundles](LANDMARK_BUNDLES.md) for the Python curation workflow, the local
+IGV-compatible hg38, hg19, mm10, mm39, and hs1 resources, and the dataset-specific GENCODE example.

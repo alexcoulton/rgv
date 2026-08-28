@@ -371,14 +371,14 @@ fn variant_alignment_summary_is_observational_and_allele_specific_when_exact() {
         ..rgv_hts::PileupBin::default()
     };
     assert_eq!(
-        variant_allele_evidence_summary(&record, 1, bin),
+        variant_allele_evidence_summary(&record, 1, &bin),
         "ALT T: 3 of 11 base observations"
     );
     record.reference = b"AT".to_vec();
     record.alternates = vec![b"A".to_vec()];
     record.variant_types = vec![rgv_hts::VariantType::Deletion];
     assert_eq!(
-        variant_allele_evidence_summary(&record, 1, bin),
+        variant_allele_evidence_summary(&record, 1, &bin),
         "2 deletion observations"
     );
     let inspector = VariantInspectorSnapshot {
@@ -417,7 +417,7 @@ fn variant_alignment_summary_is_observational_and_allele_specific_when_exact() {
         modification_calls: 0,
         pair_templates_sampled: 20,
         retained_records: 11,
-        retained_records_sampled: false,
+        complete_individual_reads: true,
         complete_pileup: true,
     };
     let evidence_tsv = variant_evidence_export_tsv(&inspector, &[evidence]);
@@ -887,6 +887,23 @@ fn supplementary_chain_segments_expose_complete_accessibility_names() {
             })
             && node.toggled() == Some(egui::accesskit::Toggled::True)
     }));
+    let document = supplementary_chain_inspector_document(&chain, 0);
+    assert!(
+        document
+            .all_fields()
+            .any(|field| { matches!(&field.value, InspectorValue::SupplementaryChainDiagram(_)) })
+    );
+    let table = document
+        .all_fields()
+        .find_map(|field| match &field.value {
+            InspectorValue::Table(table) => Some(table),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(table.rows[0].last().map(String::as_str), Some("75M"));
+    assert!(document.actions.iter().any(|action| {
+        matches!(action.id, InspectorActionId::OpenChainSegment(0)) && !action.enabled
+    }));
 }
 
 #[test]
@@ -1056,5 +1073,238 @@ fn custom_style_tags_follow_sam_tag_syntax() {
             discordant_quality_maximum: 11,
             ..sbx_default
         }))
+    );
+}
+
+#[test]
+fn alignment_document_preserves_bam_evidence_actions_and_complete_bounded_values() {
+    let fields = vec![
+        ("Track".to_owned(), "tumour reads".to_owned()),
+        ("Alignment segment".to_owned(), "Primary".to_owned()),
+        (
+            "Read".to_owned(),
+            "read-with-a-very-long-stable-name".to_owned(),
+        ),
+        ("Position".to_owned(), "chr2:101-250".to_owned()),
+        ("MAPQ".to_owned(), "missing".to_owned()),
+        ("CIGAR".to_owned(), "summarized CIGAR".to_owned()),
+        ("Selected event".to_owned(), "Insertion".to_owned()),
+    ];
+    let sequence = "ACGT".repeat(80);
+    let cigar = "1M1I".repeat(100);
+    let snapshot = InspectorSnapshot {
+        fields: fields.clone(),
+        auxiliary: vec![
+            ("XX".to_owned(), "first".to_owned()),
+            ("XX".to_owned(), "second".to_owned()),
+        ],
+        event_sequence: Some("TGCA".to_owned()),
+        cigar: Some(cigar.clone()),
+        read_sequence: Some(BoundedSequenceCopy {
+            text: sequence.clone(),
+            copied_bases: sequence.len(),
+            total_bases: sequence.len() + 20,
+        }),
+    };
+
+    let document = alignment_inspector_document(&snapshot, "read:1", None, true, 1);
+
+    assert_eq!(document.header.source.as_deref(), Some("tumour reads"));
+    assert_eq!(
+        document
+            .header
+            .location
+            .as_ref()
+            .map(|location| location.start),
+        Some(100)
+    );
+    assert!(
+        document
+            .sections
+            .iter()
+            .any(|section| section.id == "selected-event")
+    );
+    assert_eq!(
+        document
+            .raw_fields
+            .iter()
+            .map(|field| field.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["XX", "XX"]
+    );
+    assert_eq!(document.flatten_automation_fields(), fields);
+    assert!(
+        document.sections[0]
+            .fields
+            .iter()
+            .all(|field| field.label != "Track"
+                && field.label != "Read"
+                && field.label != "Position")
+    );
+    assert!(
+        document.sections[0]
+            .fields
+            .iter()
+            .all(|field| !matches!(field.value, InspectorValue::Missing { .. }))
+    );
+    assert_eq!(
+        document
+            .all_fields()
+            .find(|field| field.id == "cigar")
+            .unwrap()
+            .complete_copy_value(),
+        cigar
+    );
+    let read_sequence = document
+        .all_fields()
+        .find(|field| field.id == "read-sequence")
+        .unwrap();
+    assert_eq!(read_sequence.complete_copy_value(), sequence);
+    assert!(matches!(
+        read_sequence.provenance,
+        InspectorProvenance::Truncated { total: Some(_), .. }
+    ));
+    assert!(
+        document
+            .actions
+            .iter()
+            .any(|action| { action.id == InspectorActionId::OpenMate && action.enabled })
+    );
+    assert!(
+        document.actions.iter().any(|action| {
+            action.id == InspectorActionId::CopyVisibleReference && !action.enabled
+        })
+    );
+}
+
+#[test]
+fn variant_document_preserves_custom_info_multiallelic_copy_and_large_sample_bounds() {
+    let sample_count = 600;
+    let long_alternate = vec![b'T'; VARIANT_ALLELE_PREVIEW_BASES + 7];
+    let record = rgv_hts::VariantRecord {
+        contig: "chr9".to_owned(),
+        start: 999,
+        end: 1_000,
+        id: None,
+        reference: b"A".to_vec(),
+        alternates: vec![b"C".to_vec(), long_alternate.clone()],
+        quality: None,
+        filters: Vec::new(),
+        info: vec![
+            rgv_hts::VariantField {
+                key: "CUSTOM".to_owned(),
+                value: rgv_hts::VariantValue::Strings(vec!["alpha".to_owned(), "beta".to_owned()]),
+                truncated: false,
+            },
+            rgv_hts::VariantField {
+                key: "BOUNDED".to_owned(),
+                value: rgv_hts::VariantValue::Strings(vec!["loaded-prefix".to_owned()]),
+                truncated: true,
+            },
+        ],
+        genotypes: (0..sample_count)
+            .map(|sample_index| rgv_hts::VariantGenotype {
+                sample_index,
+                alleles: vec![
+                    rgv_hts::VariantGenotypeAllele {
+                        index: Some(0),
+                        phased: false,
+                    },
+                    rgv_hts::VariantGenotypeAllele {
+                        index: Some(u32::from(sample_index % 2 == 0)),
+                        phased: false,
+                    },
+                ],
+                fields: Vec::new(),
+            })
+            .collect(),
+        variant_types: vec![rgv_hts::VariantType::Snv],
+        breakends: Vec::new(),
+        breakpoint_orientations: Vec::new(),
+    };
+    let inspector = VariantInspectorSnapshot {
+        track_name: "cohort".to_owned(),
+        query: Arc::new(rgv_hts::VariantQuery {
+            header: rgv_hts::VariantHeader {
+                samples: (0..sample_count)
+                    .map(|index| format!("sample-{index:04}"))
+                    .collect(),
+                ..rgv_hts::VariantHeader::default()
+            },
+            records: vec![record.clone()],
+            provenance: rgv_hts::VariantQueryProvenance {
+                total_samples: sample_count,
+                selected_samples: sample_count,
+                ..rgv_hts::VariantQueryProvenance::default()
+            },
+        }),
+        record_index: 0,
+        settings: VariantTrackSettings {
+            genotype_grouping: VariantGenotypeGrouping::Genotype,
+            ..VariantTrackSettings::default()
+        },
+    };
+
+    let document = variant_inspector_presentation_document(&inspector, &record, &[], None, "", 1);
+    let alternate = document
+        .all_fields()
+        .find(|field| field.label == "ALT")
+        .unwrap();
+    let copied_alternates = alternate.complete_copy_value();
+    assert!(copied_alternates.starts_with("C,"));
+    assert_eq!(copied_alternates.len(), long_alternate.len() + 2);
+    assert!(matches!(
+        alternate.provenance,
+        InspectorProvenance::Truncated { total: Some(_), .. }
+    ));
+    assert_eq!(
+        document
+            .raw_fields
+            .iter()
+            .map(|field| field.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["CUSTOM", "BOUNDED"]
+    );
+    assert!(matches!(
+        document.raw_fields[1].provenance,
+        InspectorProvenance::Truncated { total: None, .. }
+    ));
+    let table = document
+        .all_fields()
+        .find_map(|field| match &field.value {
+            InspectorValue::Table(table) if field.id == "genotype-table" => Some(table),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(table.rows.len(), 512);
+    assert_eq!(table.total_rows, sample_count);
+    assert_eq!(table.omitted_rows, sample_count - 512);
+    let filtered =
+        variant_inspector_presentation_document(&inspector, &record, &[], None, "sample-0599", 1);
+    let filtered_table = filtered
+        .all_fields()
+        .find_map(|field| match &field.value {
+            InspectorValue::Table(table) if field.id == "genotype-table" => Some(table),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(filtered_table.total_rows, 1);
+    assert_eq!(filtered_table.omitted_rows, 0);
+    assert_eq!(filtered_table.rows[0][0], "sample-0599");
+    assert_eq!(
+        document.flatten_automation_fields(),
+        vec![
+            ("Track".to_owned(), "cohort".to_owned()),
+            ("Locus".to_owned(), "chr9:1000-1000".to_owned()),
+            ("ID".to_owned(), "missing".to_owned()),
+            ("Type".to_owned(), "SNV".to_owned()),
+            ("REF".to_owned(), "A".to_owned()),
+            (
+                "ALT".to_owned(),
+                format!("C,{}… (+7 bases)", "T".repeat(VARIANT_ALLELE_PREVIEW_BASES))
+            ),
+            ("QUAL".to_owned(), "missing".to_owned()),
+            ("FILTER".to_owned(), "PASS".to_owned()),
+        ]
     );
 }

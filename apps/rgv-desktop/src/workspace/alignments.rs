@@ -30,6 +30,7 @@ pub(crate) struct EmptyAlignmentState {
 
 pub(crate) struct CachedAlignmentRows {
     pub(crate) query: Arc<AlignmentQuery>,
+    pub(crate) layout_query: Arc<AlignmentQuery>,
     pub(crate) layout: Arc<AlignmentRowLayout>,
     pub(crate) group_mode: AlignmentGroupMode,
     pub(crate) group_order: AlignmentOrderDirection,
@@ -40,6 +41,8 @@ pub(crate) struct CachedAlignmentRows {
     pub(crate) max_rows: usize,
     pub(crate) view_as_pairs: bool,
     pub(crate) pair_length_bounds: TemplateLengthBounds,
+    pub(crate) stacking_mode: ReadStackingMode,
+    pub(crate) reconciliation: AlignmentRowReconciliationStats,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,18 +61,106 @@ pub(crate) struct AlignmentPanelProjection {
     /// the alignment index rather than a BAM/CRAM record query.
     pub(crate) index_only_overview: bool,
     pub(crate) pending_query: bool,
+    /// Generation and start time of the in-flight exact viewport check. Its
+    /// visible notice is delayed so fast queries do not flash a banner during
+    /// ordinary panning.
+    pub(crate) checking_started: Option<(u64, Instant)>,
+    pub(crate) checking_notice_visible: bool,
     pub(crate) current_query: Option<Arc<AlignmentQuery>>,
+    /// Fixed-neighbourhood, layout-detail query used to establish a canonical
+    /// row architecture independently of the visible query scale.
+    pub(crate) layout_query: Option<Arc<AlignmentQuery>>,
+    /// Presentation contract under which `layout_query` was accepted. This
+    /// makes provisional horizon reuse reject stale policy/configuration data.
+    pub(crate) layout_query_contract_revision: u64,
+    pub(crate) layout_query_cache_hit: bool,
     pub(crate) query_stats: Option<QueryStats>,
     pub(crate) alignment_rows: Option<CachedAlignmentRows>,
+    /// Query-independent stable row assignments. Ordinary query replacement,
+    /// Overview LOD, filters, and rendering changes must not clear this.
+    pub(crate) row_history: AlignmentRowHistory,
+    pub(crate) pending_row_repack: bool,
+    /// Frozen inferred bounds used only by pair-classification-dependent row
+    /// policies. Live query statistics may continue to change independently.
+    pub(crate) row_pair_policy_bounds: Option<TemplateLengthBounds>,
+    pub(crate) row_pair_policy_override: (Option<u64>, Option<u64>),
     pub(crate) cached_layout: Option<(LayoutTileKey, Arc<AlignmentLayout>)>,
     pub(crate) last_query_resolution: Option<AlignmentQueryResolution>,
 }
 
 impl AlignmentPanelProjection {
+    /// Whether the projection belongs to the track clock's current generation.
+    /// `pending_query` covers work waiting to be dispatched; the generation
+    /// comparison also covers a request that has been queued and is still
+    /// running. A previous query must not be reprojected or exposed through
+    /// interaction while either condition is true.
+    pub(crate) fn query_is_current(&self) -> bool {
+        !self.pending_query && self.settled_generation == Some(self.clock.current().get())
+    }
+
+    pub(crate) fn query_is_checking(&self) -> bool {
+        !self.query_is_current()
+    }
+
+    pub(crate) fn begin_checking(&mut self, now: Instant) {
+        let generation = self.clock.current().get();
+        if self.checking_started.map(|(seen, _)| seen) != Some(generation) {
+            self.checking_started = Some((generation, now));
+            self.checking_notice_visible = false;
+        }
+    }
+
+    pub(crate) fn reveal_checking_notice_if_due(&mut self, now: Instant) -> bool {
+        if self.checking_notice_visible || !self.query_is_checking() {
+            return false;
+        }
+        let generation = self.clock.current().get();
+        let Some((started_generation, started)) = self.checking_started else {
+            return false;
+        };
+        if started_generation != generation
+            || now.saturating_duration_since(started) < READ_CHECKING_NOTICE_DELAY
+        {
+            return false;
+        }
+        self.checking_notice_visible = true;
+        true
+    }
+
+    pub(crate) fn finish_checking(&mut self) {
+        self.checking_started = None;
+        self.checking_notice_visible = false;
+    }
+
+    pub(crate) fn row_policy_pair_bounds(
+        &mut self,
+        filters: &SessionFilters,
+        observed: TemplateLengthBounds,
+    ) -> TemplateLengthBounds {
+        if !alignment_row_pair_bounds_relevant(
+            filters.alignment_group_mode,
+            filters.alignment_sort_mode,
+        ) {
+            return observed;
+        }
+        let explicit = (
+            filters.minimum_template_length,
+            filters.maximum_template_length,
+        );
+        if self.row_pair_policy_override != explicit {
+            self.row_pair_policy_override = explicit;
+            self.row_pair_policy_bounds = None;
+        }
+        *self.row_pair_policy_bounds.get_or_insert(observed)
+    }
+
     pub(crate) fn settle_index_only_overview(&mut self, resolution: AlignmentQueryResolution) {
         debug_assert!(!resolution.requires_alignment_records());
+        self.finish_checking();
         self.pending_query = false;
         self.current_query = None;
+        self.layout_query = None;
+        self.layout_query_cache_hit = false;
         self.query_stats = None;
         self.alignment_rows = None;
         self.cached_layout = None;
@@ -80,6 +171,7 @@ impl AlignmentPanelProjection {
     }
 }
 
+pub(crate) const READ_CHECKING_NOTICE_DELAY: Duration = Duration::from_millis(150);
 const RESIZE_COVERAGE_BIN_STEP: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,8 +288,11 @@ impl AlignmentTrackController {
 
     pub(crate) fn mark_unavailable(&mut self, panel_id: PanelId, message: String) {
         let projection = self.projections.entry(panel_id).or_default();
+        projection.finish_checking();
         projection.pending_query = false;
         projection.current_query = None;
+        projection.layout_query = None;
+        projection.layout_query_cache_hit = false;
         projection.alignment_rows = None;
         projection.cached_layout = None;
         projection.unavailable = Some(message);
@@ -254,6 +349,9 @@ impl Viewer {
                 state.density = None;
             }
         }
+        if changed {
+            self.invalidate_navigation_preview_contract("read density changed");
+        }
         changed
     }
 
@@ -283,7 +381,11 @@ impl Viewer {
         let state = panel.read_panel_scrolls.entry(track_id).or_default();
         let previous = state.density.unwrap_or(default_density);
         state.density = Some(density);
-        (previous - density).abs() > f32::EPSILON
+        let changed = (previous - density).abs() > f32::EPSILON;
+        if changed {
+            self.invalidate_navigation_preview_contract("read density changed");
+        }
+        changed
     }
 
     pub(crate) fn primary_filter_editor(&self) -> &FilterEditor {
@@ -451,6 +553,8 @@ pub(crate) fn alignment_query_options(
         } else {
             QueryDetail::Layout
         },
+        retained_auxiliary_tags: alignment_row_policy_auxiliary_tags(filters),
+        layout_requires_sequence: filters.alignment_sort_mode == AlignmentSortMode::Base,
         max_records: NonZeroUsize::new(record_allocation).unwrap(),
         coverage_bins: NonZeroUsize::new(coverage_bins).unwrap(),
         collect_alleles,
@@ -470,6 +574,26 @@ pub(crate) fn alignment_query_options(
         filter: track.active_filters.alignment.clone(),
         ..QueryOptions::default()
     }
+}
+
+fn alignment_row_policy_auxiliary_tags(filters: &SessionFilters) -> Vec<[u8; 2]> {
+    let mut tags = Vec::new();
+    match filters.alignment_group_mode {
+        AlignmentGroupMode::ReadGroup => tags.push(*b"RG"),
+        AlignmentGroupMode::Haplotype => tags.push(*b"HP"),
+        AlignmentGroupMode::Chimeric => tags.push(*b"SA"),
+        AlignmentGroupMode::Tag(tag) => tags.push(tag),
+        _ => {}
+    }
+    match filters.alignment_sort_mode {
+        AlignmentSortMode::ReadGroup => tags.push(*b"RG"),
+        AlignmentSortMode::Haplotype => tags.push(*b"HP"),
+        AlignmentSortMode::Tag(tag) => tags.push(tag),
+        _ => {}
+    }
+    tags.sort_unstable();
+    tags.dedup();
+    tags
 }
 
 pub(crate) fn alignment_query_needs_reference(
@@ -659,6 +783,8 @@ pub(crate) fn copy_compatible_alignment_appearance(
     target.alignment_group_order = source.alignment_group_order;
     target.alignment_sort_mode = source.alignment_sort_mode;
     target.alignment_sort_order = source.alignment_sort_order;
+    target.alignment_sort_anchor = source.alignment_sort_anchor;
+    target.read_stacking_mode = source.read_stacking_mode;
     target.view_as_pairs = source.view_as_pairs;
     target.minimum_template_length = source.minimum_template_length;
     target.maximum_template_length = source.maximum_template_length;
@@ -688,6 +814,13 @@ pub(crate) fn copy_compatible_alignment_appearance(
     target
         .hidden_modification_codes
         .clone_from(&source.hidden_modification_codes);
+}
+
+pub(crate) fn alignment_row_pair_bounds_relevant(
+    group_mode: AlignmentGroupMode,
+    sort_mode: AlignmentSortMode,
+) -> bool {
+    group_mode == AlignmentGroupMode::UnexpectedPair || sort_mode == AlignmentSortMode::PairStatus
 }
 
 pub(crate) fn spawn_alignment_track_controller(

@@ -45,6 +45,14 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn select_at_cursor(&mut self) {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return;
+        }
         self.clear_promoted_read();
         self.panels.active_mut().retained_evidence = None;
         self.panels.active_mut().pending_read_selection = None;
@@ -146,7 +154,7 @@ impl Viewer {
             let selected_record = self.record_at_cursor();
             let selected_chain = selected_record.and_then(|(track_id, index)| {
                 let record = self
-                    .alignment_query_for_track(track_id)?
+                    .complete_read_query_for_track(track_id)?
                     .materialize_record(index)
                     .ok()?;
                 selected_supplementary_chain(&record, &self.panels.active().contig_name)
@@ -619,6 +627,14 @@ impl Viewer {
     }
 
     pub(crate) fn feature_inspector_snapshot(&self) -> Option<FeatureInspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         let selection = self.panels.active().selected_feature?;
         self.panels
             .active()
@@ -643,6 +659,14 @@ impl Viewer {
     }
 
     pub(crate) fn interaction_inspector_snapshot(&self) -> Option<InteractionInspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         let selection = self.panels.active().selected_interaction?;
         self.panels
             .active()
@@ -679,6 +703,14 @@ impl Viewer {
     }
 
     pub(crate) fn quantitative_inspector_snapshot(&self) -> Option<QuantitativeInspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         let selection = self.panels.active().selected_quantitative?;
         self.panels
             .active()
@@ -754,6 +786,14 @@ impl Viewer {
     }
 
     pub(crate) fn gwas_inspector_snapshot(&self) -> Option<GwasInspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         let selection = self.panels.active().selected_gwas?;
         self.panels
             .active()
@@ -780,6 +820,14 @@ impl Viewer {
     }
 
     pub(crate) fn copy_number_inspector_snapshot(&self) -> Option<CopyNumberInspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         let selection = self.panels.active().selected_copy_number?;
         self.panels
             .active()
@@ -816,6 +864,14 @@ impl Viewer {
     }
 
     pub(crate) fn mutation_inspector_snapshot(&self) -> Option<MutationInspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         let selection = self.panels.active().selected_mutation?;
         self.panels
             .active()
@@ -844,6 +900,14 @@ impl Viewer {
     }
 
     pub(crate) fn variant_inspector_snapshot(&self) -> Option<VariantInspectorSnapshot> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         let selection = self.panels.active().selected_variant?;
         self.panels
             .active()
@@ -914,12 +978,12 @@ impl Viewer {
                     depth: bin.depth,
                     forward_depth: bin.forward_depth,
                     reverse_depth: bin.reverse_depth,
-                    allele_summary: variant_allele_evidence_summary(record, interval.len(), bin),
+                    allele_summary: variant_allele_evidence_summary(record, interval.len(), &bin),
                     modification_series,
                     modification_calls,
                     pair_templates_sampled: query.pairs.sampled_templates,
                     retained_records: query.batch.len(),
-                    retained_records_sampled: query.stats.truncated,
+                    complete_individual_reads: query.individual_reads_complete(),
                     complete_pileup: query.pileup.provenance.all_eligible_records,
                 })
             })
@@ -1023,6 +1087,14 @@ impl Viewer {
     }
 
     pub(crate) fn record_at_cursor(&self) -> Option<(TrackId, usize)> {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return None;
+        }
         let scale = self.window.scale_factor();
         let x = (self.cursor.x / scale) as f32;
         let y = (self.cursor.y / scale) as f32;
@@ -1036,6 +1108,7 @@ impl Viewer {
         let TrackFrameKey::Alignment(track_id) = frame.key else {
             unreachable!("alignment predicate only returns alignment frames");
         };
+        self.complete_read_query_for_track(track_id)?;
         if track_id != self.primary_alignment_track_id() {
             let track = self
                 .alignment_tracks
@@ -1059,7 +1132,7 @@ impl Viewer {
         track_id: TrackId,
         record_index: usize,
     ) -> Option<ReadEventSelection> {
-        let query = self.alignment_query_for_track(track_id)?;
+        let query = self.complete_read_query_for_track(track_id)?;
         let record = query.materialize_record(record_index).ok()?;
         let scale = self.window.scale_factor();
         let x = self.cursor.x / scale;
@@ -1095,6 +1168,14 @@ impl Viewer {
     }
 
     pub(crate) fn select_visible_read(&mut self, forward: bool) {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return;
+        }
         self.clear_promoted_read();
         self.panels.active_mut().pending_read_selection = None;
         let visible = self
@@ -1128,10 +1209,12 @@ impl Viewer {
         self.panels.active_mut().selected_pileup_position = None;
         self.panels.active_mut().selected_modification_position = None;
         self.panels.active_mut().selected_junction = None;
-        let selected_chain = self.primary_alignment_query().and_then(|query| {
-            let record = query.materialize_record(visible[next]).ok()?;
-            selected_supplementary_chain(&record, &self.panels.active().contig_name)
-        });
+        let selected_chain = self
+            .complete_read_query_for_track(self.primary_alignment_track_id())
+            .and_then(|query| {
+                let record = query.materialize_record(visible[next]).ok()?;
+                selected_supplementary_chain(&record, &self.panels.active().contig_name)
+            });
         self.panels.active_mut().selected_chain = selected_chain;
         let primary_track_id = self.primary_alignment_track_id();
         replace_panel_track_selection(
@@ -1161,6 +1244,14 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn select_loaded_track_evidence(&mut self, forward: bool) {
+        if !self
+            .panels
+            .active()
+            .navigation_presentation
+            .is_interactive()
+        {
+            return;
+        }
         let Some(track_key) = self.panels.active().selected_track else {
             "Select a track before moving through its evidence".clone_into(&mut self.data_status);
             return;
@@ -1175,8 +1266,8 @@ impl Viewer {
                     .clone_into(&mut self.data_status);
             }
             TrackFrameKey::Alignment(track_id) => {
-                let Some(query) = self.alignment_query_for_track(track_id).cloned() else {
-                    "The selected alignment track has no loaded reads"
+                let Some(query) = self.complete_read_query_for_track(track_id).cloned() else {
+                    "The selected alignment track has no complete reads available"
                         .clone_into(&mut self.data_status);
                     return;
                 };
@@ -1184,7 +1275,7 @@ impl Viewer {
                     .then_some(self.panels.active().selected_record)
                     .flatten();
                 let Some(index) = next_evidence_index(current, query.batch.len(), forward) else {
-                    "The selected alignment track has no loaded reads"
+                    "The selected alignment track has no complete reads available"
                         .clone_into(&mut self.data_status);
                     return;
                 };
@@ -1202,7 +1293,7 @@ impl Viewer {
                     ui::TrackPane::Reads,
                 );
                 self.data_status = format!(
-                    "Selected loaded read {} of {} in track {}",
+                    "Selected complete read {} of {} in track {}",
                     index + 1,
                     query.batch.len(),
                     track_id.get()
@@ -1370,7 +1461,7 @@ impl Viewer {
             return false;
         };
         let Some(name) = self
-            .alignment_query_for_track(track_id)
+            .complete_read_query_for_track(track_id)
             .and_then(|query| query.batch.read_name(index))
             .filter(|name| !name.is_empty())
         else {
@@ -1393,14 +1484,17 @@ impl Viewer {
         if name.is_empty() {
             return false;
         }
-        let Some((index, chain)) = self.alignment_query_for_track(track_id).and_then(|query| {
-            let index =
-                (0..query.batch.len()).find(|index| query.batch.read_name(*index) == Some(name))?;
-            let chain = query.materialize_record(index).ok().and_then(|record| {
-                selected_supplementary_chain(&record, &self.panels.active().contig_name)
-            });
-            Some((index, chain))
-        }) else {
+        let Some((index, chain)) = self
+            .complete_read_query_for_track(track_id)
+            .and_then(|query| {
+                let index = (0..query.batch.len())
+                    .find(|index| query.batch.read_name(*index) == Some(name))?;
+                let chain = query.materialize_record(index).ok().and_then(|record| {
+                    selected_supplementary_chain(&record, &self.panels.active().contig_name)
+                });
+                Some((index, chain))
+            })
+        else {
             return false;
         };
         self.clear_promoted_read();

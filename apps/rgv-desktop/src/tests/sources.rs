@@ -254,6 +254,28 @@ fn gwas_inspector_preserves_exact_source_p_value_and_all_columns() {
             && value.contains("250000 retained / 500000 examined")
             && value.contains("cap applied")
     }));
+    let document = gwas_inspector_document(&inspector);
+    assert_eq!(
+        document
+            .raw_fields
+            .iter()
+            .map(|field| (field.label.as_str(), field.complete_copy_value()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("CHR", "chr6".to_owned()),
+            ("BP", "100".to_owned()),
+            ("SNP", "rs-test".to_owned()),
+            ("P", "1.0000e-300".to_owned()),
+            ("BETA", "-0.125".to_owned()),
+        ]
+    );
+    assert!(
+        document
+            .notices
+            .iter()
+            .any(|notice| notice.id == "gwas-query-bound")
+    );
+    assert_eq!(document.flatten_automation_fields(), fields);
 }
 
 #[test]
@@ -511,4 +533,53 @@ fn quantitative_inspector_exposes_tdf_channel_and_resolution() {
         label == "TDF resolution" && value.contains("zoom 3") && value.contains("mean")
     }));
     assert!(fields.contains(&("TDF genome".to_owned(), "hg38".to_owned())));
+    let document = quantitative_inspector_document(&inspector);
+    assert!(
+        document
+            .sections
+            .iter()
+            .any(|section| section.id == "quantitative-source")
+    );
+    assert!(document.all_fields().any(|field| {
+        field.label == "Source value" && field.provenance == InspectorProvenance::Source
+    }));
+    assert!(document.all_fields().any(|field| {
+        field.label == "Displayed scale"
+            && matches!(field.provenance, InspectorProvenance::Aggregated(_))
+    }));
+    assert_eq!(document.flatten_automation_fields(), fields);
+
+    let derived = QuantitativeInspectorSnapshot {
+        operand: Some(QuantitativeOperandSnapshot {
+            name: "control".to_owned(),
+            value: Some(1.5),
+        }),
+        settings: QuantitativeTrackSettings {
+            arithmetic: QuantitativeArithmetic::Subtract,
+            ..QuantitativeTrackSettings::default()
+        },
+        ..inspector.clone()
+    };
+    let derived_document = quantitative_inspector_document(&derived);
+    assert!(derived_document.sections.iter().any(|section| {
+        section.id == "quantitative-derived"
+            && section.fields.iter().any(|field| {
+                field.label == "Derived value"
+                    && matches!(field.provenance, InspectorProvenance::Aggregated(_))
+            })
+    }));
+
+    let unavailable_derived = QuantitativeInspectorSnapshot {
+        operand: Some(QuantitativeOperandSnapshot {
+            name: "control".to_owned(),
+            value: None,
+        }),
+        ..derived
+    };
+    let unavailable_document = quantitative_inspector_document(&unavailable_derived);
+    assert!(unavailable_document.all_fields().any(|field| {
+        field.label == "Derived value"
+            && matches!(field.value, InspectorValue::Missing { .. })
+            && matches!(field.provenance, InspectorProvenance::Missing(_))
+    }));
 }

@@ -610,6 +610,146 @@ pub(crate) fn supplementary_chain_diagram(
     }
 }
 
+#[allow(clippy::too_many_lines)]
+pub(crate) fn supplementary_chain_inspector_document(
+    chain: &SelectedSupplementaryChain,
+    available_panel_slots: usize,
+) -> InspectorDocument {
+    let read_name = String::from_utf8_lossy(&chain.read_name).into_owned();
+    let mut document = InspectorDocument::new(
+        format!("supplementary-chain:{read_name}"),
+        read_name.clone(),
+    );
+    document.header.subtitle = Some(format!(
+        "{} supplementary alignment segments",
+        chain.segments.len()
+    ));
+    document.header.badges.push(InspectorBadge {
+        label: "Supplementary chain".to_owned(),
+        tone: InspectorTone::Informative,
+    });
+    if chain.malformed_entries > 0 || chain.invalid_tag_type || chain.truncated {
+        document.notices.push(InspectorNotice {
+            id: "supplementary-chain-provenance".to_owned(),
+            tone: InspectorTone::Warning,
+            message: format!(
+                "{} malformed entries{}{}",
+                chain.malformed_entries,
+                if chain.invalid_tag_type {
+                    " · invalid SA tag type"
+                } else {
+                    ""
+                },
+                if chain.truncated {
+                    " · chain capped by the segment limit"
+                } else {
+                    ""
+                }
+            ),
+        });
+    }
+    document.sections.push(
+        InspectorSection::new("chain-diagram", "Chain overview", 0).with_fields(vec![
+            InspectorField::new(
+                "chain-diagram",
+                "Read and alignment order",
+                InspectorValue::SupplementaryChainDiagram(chain.clone()),
+            ),
+        ]),
+    );
+    let rows = chain
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let strand = if segment.reverse { "−" } else { "+" };
+            let breakpoint = if segment.reverse {
+                segment.start + 1
+            } else {
+                segment.end
+            };
+            vec![
+                (index + 1).to_string(),
+                format!(
+                    "{}:{}–{} {strand}",
+                    segment.reference_name,
+                    segment.start + 1,
+                    segment.end
+                ),
+                segment
+                    .mapping_quality
+                    .map_or_else(|| "missing".to_owned(), |value| value.to_string()),
+                segment.edit_distance.to_string(),
+                format!("{}:{breakpoint}", segment.reference_name),
+                format_cigar(&segment.cigar),
+            ]
+        })
+        .collect::<Vec<_>>();
+    document.sections.push(
+        InspectorSection::new("chain-segments", "Exact segment details", 10)
+            .collapsed()
+            .with_fields(vec![InspectorField::new(
+                "chain-segment-table",
+                "Segments",
+                InspectorValue::Table(InspectorTable {
+                    columns: vec![
+                        "#".to_owned(),
+                        "Location".to_owned(),
+                        "MAPQ".to_owned(),
+                        "NM".to_owned(),
+                        "Breakpoint".to_owned(),
+                        "CIGAR".to_owned(),
+                    ],
+                    total_rows: rows.len(),
+                    omitted_rows: 0,
+                    rows,
+                    search_label: None,
+                }),
+            )]),
+    );
+    let count = chain.segments.len();
+    if count > 1 {
+        document.actions.extend([
+            InspectorAction::new(
+                InspectorActionId::NavigateChain(
+                    chain.active_segment.checked_sub(1).unwrap_or(count - 1),
+                ),
+                "Previous segment",
+            ),
+            InspectorAction::new(
+                InspectorActionId::NavigateChain((chain.active_segment + 1) % count),
+                "Next segment",
+            ),
+        ]);
+    }
+    let open_active = InspectorAction::new(
+        InspectorActionId::OpenChainSegment(chain.active_segment),
+        "Open active segment in new panel",
+    );
+    document
+        .actions
+        .push(if count > 0 && available_panel_slots > 0 {
+            open_active
+        } else {
+            open_active.disabled("A segment and space for another panel are required")
+        });
+    let open_all = InspectorAction::new(
+        InspectorActionId::OpenAllChainSegments,
+        "Open all segments in panels",
+    );
+    document
+        .actions
+        .push(if count > 1 && available_panel_slots > 0 {
+            open_all
+        } else {
+            open_all.disabled("More than one segment and space for another panel are required")
+        });
+    document.actions.push(
+        InspectorAction::new(InspectorActionId::ClearSelection, "Clear selection").low_emphasis(),
+    );
+    document
+}
+
 pub(crate) fn segment_read_coordinates(
     cigar: &[rgv_hts::CigarOp],
     reverse: bool,

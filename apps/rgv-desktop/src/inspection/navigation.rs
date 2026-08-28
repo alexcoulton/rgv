@@ -40,7 +40,7 @@ impl Viewer {
         let track_id = self.panels.active().selected_alignment_track?;
         let index = self.panels.active().selected_record?;
         let record = self
-            .alignment_query_for_track(track_id)?
+            .complete_read_query_for_track(track_id)?
             .materialize_record(index)
             .ok()?;
         let locus = mate_locus(
@@ -208,6 +208,17 @@ impl Viewer {
             return;
         };
         if pending_track != track_id {
+            return;
+        }
+        if self
+            .complete_read_query_for_track_in_panel(track_id, panel_id)
+            .is_none()
+        {
+            if let Some(panel) = self.panels.get_mut(panel_id) {
+                panel.selected_record = None;
+                panel.selected_read_event = None;
+                panel.selected_chain = None;
+            }
             return;
         }
         let Some(index) = (0..query.batch.len())

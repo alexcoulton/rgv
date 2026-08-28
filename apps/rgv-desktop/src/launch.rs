@@ -30,7 +30,7 @@ pub(super) struct LaunchOptions {
     /// Explicit contig alias in ALIAS=CANONICAL form. May be repeated.
     #[arg(long = "contig-alias", value_name = "ALIAS=CANONICAL")]
     pub(super) contig_aliases: Vec<String>,
-    /// Maximum number of individual alignments retained from a deep query.
+    /// Complete read limit: at or below it every eligible viewport read is shown; above it no individual reads are shown.
     #[arg(long, default_value_t = 50_000)]
     pub(super) max_alignments: usize,
     /// BED or BED12 feature track. May be repeated.

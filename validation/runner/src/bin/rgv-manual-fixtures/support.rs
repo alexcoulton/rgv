@@ -157,6 +157,7 @@ pub(crate) fn write_support_files(suite_root: &Path) -> Result<()> {
             name: "Manual search annotations".to_owned(),
             kind: TrackKind::Feature,
             source: local_source("../data/tracks/default-annotations.bed"),
+            format: None,
         }],
         asset_provenance: Vec::new(),
     };

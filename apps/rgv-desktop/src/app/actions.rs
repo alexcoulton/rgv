@@ -653,6 +653,7 @@ impl Viewer {
                 self.data_status = error.to_string();
                 return;
             }
+            self.invalidate_navigation_preview_contract("read track visibility changed");
             self.rebuild_all_panel_displays();
             self.display_dirty = true;
             return;
@@ -711,6 +712,7 @@ impl Viewer {
 
         let query_changed = subtrack == AlignmentSubtrack::Modifications;
         self.invalidate_automation_alignment_layouts(Some(&[track_id]), query_changed);
+        self.invalidate_navigation_preview_contract("alignment subtrack presentation changed");
         if query_changed {
             self.request_all_alignment_queries();
         }

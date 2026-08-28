@@ -382,7 +382,7 @@ pub enum AlignmentColorMode {
     Tag([u8; 2]),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentGroupMode {
     #[default]
@@ -402,7 +402,7 @@ pub enum AlignmentGroupMode {
     Tag([u8; 2]),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentOrderDirection {
     #[default]
@@ -410,7 +410,7 @@ pub enum AlignmentOrderDirection {
     Reverse,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentSortMode {
     #[default]
@@ -433,6 +433,39 @@ pub enum AlignmentSortMode {
     Tag([u8; 2]),
 }
 
+/// Controls whether alignment rows preserve navigation history or are packed
+/// independently for every settled query.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadStackingMode {
+    /// Keep known alignments on the same rows across zoom, pan, filtering, and
+    /// other query-membership changes. This is the evidence-review default.
+    #[default]
+    Stable,
+    /// Repack every settled query for minimum height. Reads may move when the
+    /// query membership changes.
+    Compact,
+}
+
+/// Why the current read-row projection was established. This is reported to
+/// diagnostics and automation so an intentional reflow is distinguishable
+/// from ordinary navigation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadStackingTransitionReason {
+    #[default]
+    InitialCanonical,
+    Navigation,
+    HorizonExtension,
+    PolicyContext,
+    CompactMode,
+    ExplicitRebuild,
+    /// Legacy diagnostic value retained for older automation captures.
+    Initial,
+    /// Legacy diagnostic value retained for older automation captures.
+    Repack,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionFilters {
@@ -446,6 +479,11 @@ pub struct SessionFilters {
     pub alignment_sort_mode: AlignmentSortMode,
     #[serde(default)]
     pub alignment_sort_order: AlignmentOrderDirection,
+    /// Fixed genomic anchor captured when base-at-position sorting begins.
+    #[serde(default)]
+    pub alignment_sort_anchor: Option<u64>,
+    #[serde(default)]
+    pub read_stacking_mode: ReadStackingMode,
     #[serde(default)]
     pub view_as_pairs: bool,
     #[serde(default)]
@@ -530,6 +568,8 @@ impl Default for SessionFilters {
             alignment_group_order: AlignmentOrderDirection::Natural,
             alignment_sort_mode: AlignmentSortMode::Start,
             alignment_sort_order: AlignmentOrderDirection::Natural,
+            alignment_sort_anchor: None,
+            read_stacking_mode: ReadStackingMode::Stable,
             view_as_pairs: false,
             minimum_template_length: None,
             maximum_template_length: None,
