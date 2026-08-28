@@ -244,7 +244,8 @@ impl Viewer {
             TrackLayoutOptions::default().maximum_rows
         };
         let object_id_base = 1_u32;
-        let display = layout_features(
+        let label_widths = measured_feature_label_widths(&self.egui_context, records);
+        let display = layout_features_with_label_widths(
             records,
             self.panels.active().viewport,
             TrackLayoutOptions {
@@ -255,6 +256,7 @@ impl Viewer {
                 feature_display_mode: display_mode,
                 ..TrackLayoutOptions::default()
             },
+            Some(&label_widths),
         )
         .0;
         feature_record_index_at_display_point(

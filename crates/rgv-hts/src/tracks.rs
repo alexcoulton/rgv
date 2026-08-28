@@ -89,6 +89,63 @@ pub struct FeatureRecord {
     pub attributes: Vec<(String, String)>,
 }
 
+/// Presentation-oriented feature identity resolved without changing the
+/// record's stable source identifiers or genomic coordinates.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FeaturePresentationIdentity<'a> {
+    pub display_symbol: Option<&'a str>,
+    pub gene_id: Option<&'a str>,
+    pub transcript_id: Option<&'a str>,
+    pub record_name: Option<&'a str>,
+}
+
+impl<'a> FeaturePresentationIdentity<'a> {
+    /// Human-readable label used by tracks, search results, and inspectors.
+    #[must_use]
+    pub fn label(self) -> Option<&'a str> {
+        self.display_symbol
+            .or(self.record_name)
+            .or(self.gene_id)
+            .or(self.transcript_id)
+    }
+}
+
+impl FeatureRecord {
+    #[must_use]
+    pub fn presentation_identity(&self) -> FeaturePresentationIdentity<'_> {
+        let attribute = |keys: &[&str]| {
+            self.attributes.iter().find_map(|(key, value)| {
+                (keys
+                    .iter()
+                    .any(|candidate| key.eq_ignore_ascii_case(candidate))
+                    && !value.trim().is_empty()
+                    && value != ".")
+                    .then_some(value.as_str())
+            })
+        };
+        FeaturePresentationIdentity {
+            display_symbol: attribute(&[
+                "gene_name",
+                "gene_name2",
+                "gene_symbol",
+                "symbol",
+                "Name",
+            ]),
+            gene_id: attribute(&["gene_id"]),
+            transcript_id: attribute(&["transcript_id"]),
+            record_name: self
+                .name
+                .as_deref()
+                .filter(|value| !value.trim().is_empty() && *value != "."),
+        }
+    }
+
+    #[must_use]
+    pub fn display_label(&self) -> Option<&str> {
+        self.presentation_identity().label()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PeakMetrics {
     pub signal_value: f32,
@@ -885,6 +942,7 @@ fn parse_gene_pred(line: &str, ref_flat: bool) -> Result<FeatureRecord, String> 
     if let Some(gene_name) = gene_name {
         attributes.push(("gene_name".to_owned(), gene_name.to_owned()));
     }
+    let mut extended_gene_name = None;
     let score = if !ref_flat && available == 15 {
         let score_column = transcript_column + 10;
         let score = fields[score_column]
@@ -915,8 +973,12 @@ fn parse_gene_pred(line: &str, ref_flat: bool) -> Result<FeatureRecord, String> 
         if exon_frames.len() != exon_count {
             return Err("extended genePred exon frame count does not match exon count".to_owned());
         }
+        let parsed_gene_name = fields[score_column + 1];
+        if !parsed_gene_name.is_empty() && parsed_gene_name != "." {
+            extended_gene_name = Some(parsed_gene_name);
+        }
         attributes.extend([
-            ("gene_name".to_owned(), fields[score_column + 1].to_owned()),
+            ("gene_name".to_owned(), parsed_gene_name.to_owned()),
             (
                 "cds_start_status".to_owned(),
                 fields[score_column + 2].to_owned(),
@@ -938,7 +1000,13 @@ fn parse_gene_pred(line: &str, ref_flat: bool) -> Result<FeatureRecord, String> 
         contig: contig.to_owned(),
         start,
         end,
-        name: Some(gene_name.unwrap_or(transcript_name).to_owned()),
+        name: Some(
+            gene_name
+                .filter(|value| !value.is_empty() && *value != ".")
+                .or(extended_gene_name)
+                .unwrap_or(transcript_name)
+                .to_owned(),
+        ),
         feature_type: Some("transcript".to_owned()),
         score,
         strand,

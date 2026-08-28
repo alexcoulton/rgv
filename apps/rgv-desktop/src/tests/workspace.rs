@@ -1844,6 +1844,7 @@ fn annotation_search_requires_a_unique_exact_match_before_navigation() {
         preferred_annotation_search_hit(&results, "BRCA1"),
         Some(&exact)
     );
+    assert_eq!(annotation_search_hit_primary_label(&exact), "BRCA1");
     assert_eq!(annotation_search_hit_locus(&exact), "chr1:101-200");
 
     let ambiguous = TrackSearchResults {
@@ -1852,6 +1853,38 @@ fn annotation_search_requires_a_unique_exact_match_before_navigation() {
         ..TrackSearchResults::default()
     };
     assert_eq!(preferred_annotation_search_hit(&ambiguous, "brca1"), None);
+}
+
+#[test]
+fn annotation_search_presents_symbol_before_stable_identifiers() {
+    let hit = TrackSearchHit {
+        track_id: TrackId::new(1),
+        track_name: "Genes".to_owned(),
+        matched_term: "ensg000001".to_owned(),
+        record: rgv_hts::FeatureRecord {
+            contig: "chr7".to_owned(),
+            start: 100,
+            end: 200,
+            name: Some("ENST000001".to_owned()),
+            feature_type: Some("transcript".to_owned()),
+            score: None,
+            strand: rgv_hts::Strand::Forward,
+            blocks: vec![(100, 200)],
+            coding_interval: None,
+            peak: None,
+            attributes: vec![
+                ("gene_name".to_owned(), "ACTB".to_owned()),
+                ("gene_id".to_owned(), "ENSG000001".to_owned()),
+                ("transcript_id".to_owned(), "ENST000001".to_owned()),
+            ],
+        },
+    };
+
+    assert_eq!(annotation_search_hit_primary_label(&hit), "ACTB");
+    assert_eq!(
+        annotation_search_hit_secondary_identity(&hit),
+        "ENSG000001 · ENST000001"
+    );
 }
 
 #[test]

@@ -19,6 +19,7 @@ The remaining documents preserve detailed implementation, remediation, and desig
 - [Canonical stable read architecture](CANONICAL_STABLE_READ_ARCHITECTURE_PLAN.md)
 - [Complete read presentation and resource admission](COMPLETE_READ_PRESENTATION_PLAN.md)
 - [Dense-alignment layout performance](DENSE_ALIGNMENT_LAYOUT_PERFORMANCE_PLAN.md)
+- [Gene-symbol and chromosome-context usability](GENE_SYMBOL_AND_CHROMOSOME_CONTEXT_USABILITY_PLAN.md)
 - [Transactional navigation preview](TRANSACTIONAL_NAVIGATION_PREVIEW_PLAN.md)
 - [Directionality rendering remediation](DIRECTIONALITY_RENDERING_REMEDIATION_PLAN.md)
 - [GUI redesign](GUI_REDESIGN_PLAN.md)

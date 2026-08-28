@@ -208,6 +208,109 @@ fn gene_model_labels_do_not_overlap_at_overview_scale() {
 }
 
 #[test]
+fn gene_model_label_prefers_symbol_to_transcript_accession() {
+    let transcript = FeatureRecord {
+        contig: "chr1".to_owned(),
+        start: 110,
+        end: 190,
+        name: Some("ENST000001".to_owned()),
+        feature_type: Some("transcript".to_owned()),
+        score: None,
+        strand: Strand::Forward,
+        blocks: vec![(110, 190)],
+        coding_interval: None,
+        peak: None,
+        attributes: vec![
+            ("gene_name".to_owned(), "ACTB".to_owned()),
+            ("gene_id".to_owned(), "ENSG000001".to_owned()),
+            ("transcript_id".to_owned(), "ENST000001".to_owned()),
+        ],
+    };
+    let (display, _) = layout_features(
+        &[transcript],
+        viewport(),
+        TrackLayoutOptions {
+            height: 24.0,
+            maximum_rows: 1,
+            ..TrackLayoutOptions::default()
+        },
+    );
+    assert_eq!(display.texts[0].text, "ACTB");
+}
+
+#[test]
+fn gff_gene_records_receive_automatic_symbol_labels_but_exons_do_not() {
+    let record = |feature_type: &str, start, end| FeatureRecord {
+        contig: "chr1".to_owned(),
+        start,
+        end,
+        name: Some("ENSG000001".to_owned()),
+        feature_type: Some(feature_type.to_owned()),
+        score: None,
+        strand: Strand::Forward,
+        blocks: Vec::new(),
+        coding_interval: None,
+        peak: None,
+        attributes: vec![("gene_name".to_owned(), "ACTB".to_owned())],
+    };
+    let (display, _) = layout_features(
+        &[record("gene", 110, 150), record("exon", 160, 190)],
+        viewport(),
+        TrackLayoutOptions {
+            height: 48.0,
+            maximum_rows: 2,
+            ..TrackLayoutOptions::default()
+        },
+    );
+    assert_eq!(
+        display
+            .texts
+            .iter()
+            .map(|text| text.text.as_str())
+            .collect::<Vec<_>>(),
+        ["ACTB"]
+    );
+}
+
+#[test]
+fn subpixel_gene_labels_are_suppressed_until_selected() {
+    let transcript = FeatureRecord {
+        contig: "chr1".to_owned(),
+        start: 100_000,
+        end: 100_100,
+        name: Some("SMALL".to_owned()),
+        feature_type: Some("transcript".to_owned()),
+        score: None,
+        strand: Strand::Forward,
+        blocks: vec![(100_000, 100_100)],
+        coding_interval: None,
+        peak: None,
+        attributes: Vec::new(),
+    };
+    let wide = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 0, 1_000_000).unwrap(),
+        1_000.0,
+    )
+    .unwrap();
+    let options = TrackLayoutOptions {
+        height: 24.0,
+        maximum_rows: 1,
+        ..TrackLayoutOptions::default()
+    };
+    let (ordinary, _) = layout_features(std::slice::from_ref(&transcript), wide, options);
+    let (selected, _) = layout_features(
+        &[transcript],
+        wide,
+        TrackLayoutOptions {
+            selected_record: Some(0),
+            ..options
+        },
+    );
+    assert!(ordinary.texts.is_empty());
+    assert_eq!(selected.texts[0].text, "SMALL");
+}
+
+#[test]
 fn overview_gene_models_suppress_subpixel_exons_but_keep_a_landmark_and_direction() {
     let transcript = FeatureRecord {
         contig: "chr1".to_owned(),
@@ -277,7 +380,14 @@ fn selected_gene_label_survives_normal_collision_suppression() {
             ..TrackLayoutOptions::default()
         },
     );
-    assert!(display.texts.iter().any(|text| text.text == "SELECTED"));
+    assert_eq!(
+        display
+            .texts
+            .iter()
+            .map(|text| text.text.as_str())
+            .collect::<Vec<_>>(),
+        ["SELECTED"]
+    );
 }
 
 #[test]

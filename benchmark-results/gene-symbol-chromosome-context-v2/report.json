@@ -1,0 +1,254 @@
+{
+  "selection": {
+    "anchor_position": 5527147,
+    "contig": "chr7",
+    "end": 5530601,
+    "evidence_end": 5530601,
+    "evidence_revision": 1,
+    "evidence_start": 5527147,
+    "fields": [
+      {
+        "key": "Track",
+        "value": "Genes"
+      },
+      {
+        "key": "Name",
+        "value": "ACTB"
+      },
+      {
+        "key": "Type",
+        "value": "transcript"
+      },
+      {
+        "key": "Location",
+        "value": "chr7:5527148-5530601 (3454 bp; one-based display)"
+      },
+      {
+        "key": "Strand",
+        "value": "-"
+      },
+      {
+        "key": "Score",
+        "value": "0"
+      },
+      {
+        "key": "Coding sequence",
+        "value": "5527748-5529657 (one-based display)"
+      },
+      {
+        "key": "Exons (6)",
+        "value": "5527148-5527891, 5528004-5528185, 5528281-5528719, 5529161-5529400, 5529535-5529663, 5530524-5530601"
+      },
+      {
+        "key": "Attribute \u00b7 transcript_id",
+        "value": "ENST00000646664.1"
+      },
+      {
+        "key": "Attribute \u00b7 source_format",
+        "value": "genePred"
+      },
+      {
+        "key": "Attribute \u00b7 gene_name",
+        "value": "ACTB"
+      },
+      {
+        "key": "Attribute \u00b7 cds_start_status",
+        "value": "cmpl"
+      },
+      {
+        "key": "Attribute \u00b7 cds_end_status",
+        "value": "cmpl"
+      },
+      {
+        "key": "Attribute \u00b7 exon_frames",
+        "value": "0,1,0,0,0,-1,"
+      },
+      {
+        "key": "Attribute \u00b7 gene_id",
+        "value": "ENSG00000075624.17"
+      },
+      {
+        "key": "Attribute \u00b7 gene_biotype",
+        "value": "protein_coding"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_bundle_id",
+        "value": "hg38"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_bundle_version",
+        "value": "1.0-rgv1"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_assembly",
+        "value": "GRCh38"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_provider",
+        "value": "MANE (NCBI RefSeq and Ensembl/GENCODE)"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_release",
+        "value": "MANE 1.0"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_selection_policy",
+        "value": "one representative transcript per gene: MANE Select first, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and stable accession"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_asset_role",
+        "value": "representative_genes"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_asset_format",
+        "value": "gene_pred_ext_gzip"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_asset_sha256",
+        "value": "8f4ef6013761d128d071e0aff8e3043d686dbb49ff73ea9aa97f2f7d291711bd"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_citation",
+        "value": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_license",
+        "value": "Source-specific; see NOTICE.md"
+      },
+      {
+        "key": "Attribute \u00b7 landmark_license_url",
+        "value": "https://github.com/igvteam/igv-data/blob/main/LICENSE"
+      }
+    ],
+    "granularity": "exact_base",
+    "kind": "feature",
+    "panel_id": 1,
+    "position": 5527147,
+    "presentation_truncated": false,
+    "provenance": [],
+    "selection_id": "bc8a3f7f-b839-42ad-afb1-11bf507a6129",
+    "stale": false,
+    "stale_reason": null,
+    "start": 5527147,
+    "track_id": 2,
+    "truncated": false,
+    "visible_in_active_view": true,
+    "workspace_revision_at_selection": 3
+  },
+  "chromosome_layout": {
+    "canvas": {
+      "bottom": 776.0,
+      "left": 168.0,
+      "right": 918.0,
+      "top": 147.0
+    },
+    "column": {
+      "bottom": 776.0,
+      "left": 168.0,
+      "right": 940.0,
+      "top": 62.0
+    },
+    "cytoband_row": {
+      "bottom": 89.0,
+      "left": 176.0,
+      "right": 910.0,
+      "top": 79.0
+    },
+    "cytobands": "present",
+    "header": {
+      "bottom": 147.0,
+      "left": 168.0,
+      "right": 940.0,
+      "top": 62.0
+    },
+    "header_genomic": {
+      "bottom": 147.0,
+      "left": 168.0,
+      "right": 918.0,
+      "top": 62.0
+    },
+    "header_scrollbar": {
+      "bottom": 147.0,
+      "left": 918.0,
+      "right": 940.0,
+      "top": 62.0
+    },
+    "metadata_row": {
+      "bottom": 79.0,
+      "left": 168.0,
+      "right": 918.0,
+      "top": 62.0
+    },
+    "overview_row": {
+      "bottom": 102.0,
+      "left": 176.0,
+      "right": 910.0,
+      "top": 92.0
+    },
+    "panel_id": 1,
+    "ruler_row": {
+      "bottom": 147.0,
+      "left": 168.0,
+      "right": 918.0,
+      "top": 122.0
+    },
+    "scrollbar": {
+      "bottom": 776.0,
+      "left": 918.0,
+      "right": 940.0,
+      "top": 147.0
+    },
+    "span_row": {
+      "bottom": 122.0,
+      "left": 168.0,
+      "right": 918.0,
+      "top": 105.0
+    }
+  },
+  "captures": [
+    {
+      "name": "actb-automatic-labels.png",
+      "bytes": 408744,
+      "width": 2560,
+      "height": 1600,
+      "sha256": "61a9b2472fadabec442527f9b057c80a788148114e18381345e1e095895a0126",
+      "window_id": null,
+      "window_bounds_points": null,
+      "includes_native_frame": false,
+      "foreground_activated": false
+    },
+    {
+      "name": "actb-selected-inspector-context.png",
+      "bytes": 551185,
+      "width": 2560,
+      "height": 1600,
+      "sha256": "5c5a2e0b2f5dccda1f8d30cbe4e7961e03043467e6e9505eb8751ea431e26941",
+      "window_id": null,
+      "window_bounds_points": null,
+      "includes_native_frame": false,
+      "foreground_activated": false
+    },
+    {
+      "name": "actb-selected-inspector-base.png",
+      "bytes": 464904,
+      "width": 2560,
+      "height": 1600,
+      "sha256": "832c61897ff6691c48058430710344f26d6a457dfb522483322db20d43e3ec03",
+      "window_id": null,
+      "window_bounds_points": null,
+      "includes_native_frame": false,
+      "foreground_activated": false
+    },
+    {
+      "name": "chr7-centromere-shared-axis.png",
+      "bytes": 366289,
+      "width": 2560,
+      "height": 1600,
+      "sha256": "f51f41499413cffb3304d9a2f786e50fe79848ff723bdf0f3399eb786a331a92",
+      "window_id": null,
+      "window_bounds_points": null,
+      "includes_native_frame": false,
+      "foreground_activated": false
+    }
+  ]
+}

@@ -1519,19 +1519,44 @@ impl Viewer {
                     .title_bar(false)
                     .show(ui.ctx(), |ui| {
                         for hit in annotation_search_results.hits.iter().take(12) {
-                            let name = hit
-                                .record
-                                .name
-                                .as_deref()
-                                .unwrap_or(hit.matched_term.as_str());
-                            let label = format!(
-                                "{name}  ·  {}:{}-{}  ·  {}",
+                            let name = annotation_search_hit_primary_label(hit);
+                            let identifiers = annotation_search_hit_secondary_identity(hit);
+                            let detail = format!(
+                                "{}{}:{}-{} · {}",
+                                if identifiers.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("{identifiers} · ")
+                                },
                                 hit.record.contig,
                                 hit.record.start.saturating_add(1),
                                 hit.record.end,
                                 hit.track_name
                             );
-                            if ui.button(label).clicked() {
+                            let mut label = egui::text::LayoutJob::default();
+                            label.append(
+                                name,
+                                0.0,
+                                egui::TextFormat::simple(
+                                    egui::FontId::proportional(12.0),
+                                    egui::Color32::from_gray(30),
+                                ),
+                            );
+                            label.append(
+                                &format!("  ·  {detail}"),
+                                0.0,
+                                egui::TextFormat::simple(
+                                    egui::FontId::proportional(10.5),
+                                    egui::Color32::from_gray(105),
+                                ),
+                            );
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 26.0],
+                                    egui::Button::new(egui::WidgetText::from(label)),
+                                )
+                                .clicked()
+                            {
                                 annotation_hit_requested = Some(hit.clone());
                             }
                         }

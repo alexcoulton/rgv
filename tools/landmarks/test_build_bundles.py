@@ -72,6 +72,53 @@ class LandmarkBundleTests(unittest.TestCase):
                 output_hashes.append((self.digest(genes), self.digest(names)))
             self.assertEqual(output_hashes[0], output_hashes[1])
 
+    def test_curated_gene_assets_require_matching_symbol_identity_and_coordinates(self):
+        representative_row = (
+            "NM_2\tchr1\t+\t0\t80\t10\t70\t2\t0,40,\t20,80,\t0\tACTB\tcmpl\tcmpl\t0,1,\n"
+        )
+        search_row = "actb\tACTB\t7157\tNM_2\tchr1\t0\t80\t+\tbeta actin\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            representatives = root / "genes.genePred.gz"
+            names = root / "names.tsv.gz"
+            build_bundles.write_gzip_lines(representatives, [representative_row])
+            build_bundles.write_gzip_lines(
+                names,
+                [build_bundles.SEARCH_SCHEMA_VERSION + "\n", search_row],
+            )
+            self.assertEqual(
+                build_bundles.validate_curated_gene_assets(representatives, names), 1
+            )
+
+            build_bundles.write_gzip_lines(
+                names,
+                [
+                    build_bundles.SEARCH_SCHEMA_VERSION + "\n",
+                    search_row.replace("\t80\t", "\t79\t"),
+                ],
+            )
+            with self.assertRaisesRegex(ValueError, "metadata disagree"):
+                build_bundles.validate_curated_gene_assets(representatives, names)
+
+    def test_curated_gene_assets_require_nonempty_stable_gene_id(self):
+        representative_row = (
+            "NM_2\tchr1\t+\t0\t80\t10\t70\t1\t0,\t80,\t0\tACTB\tcmpl\tcmpl\t0,\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            representatives = root / "genes.genePred.gz"
+            names = root / "names.tsv.gz"
+            build_bundles.write_gzip_lines(representatives, [representative_row])
+            build_bundles.write_gzip_lines(
+                names,
+                [
+                    build_bundles.SEARCH_SCHEMA_VERSION + "\n",
+                    "actb\tACTB\t\tNM_2\tchr1\t0\t80\t+\t\n",
+                ],
+            )
+            with self.assertRaisesRegex(ValueError, "incomplete identity"):
+                build_bundles.validate_curated_gene_assets(representatives, names)
+
     def test_off_reference_transcripts_are_excluded_and_counted(self):
         rows = [
             "0\tNM_1\tchr1\t+\t0\t80\t10\t70\t1\t0,\t80,\t0\tA\tcmpl\tcmpl\t0,\n",

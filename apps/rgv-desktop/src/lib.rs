@@ -101,6 +101,8 @@ use rgv_hts::{
     decode_supplementary_chain, pair_evidence, smrt_kinetics_series, summarize_bisulfite_record,
     summarize_sbx_record,
 };
+#[cfg(test)]
+use rgv_layout::layout_features;
 use rgv_layout::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentLayout, AlignmentLayoutOptions,
     AlignmentLayoutStats, AlignmentOrderDirection, AlignmentRowHistory, AlignmentRowLayout,
@@ -112,11 +114,11 @@ use rgv_layout::{
     compose_quantitative_records, copy_number_sample_order, gwas_point_y,
     junction_arc_distance_to_point, junction_arc_stroke_width, junction_count_value,
     layout_alignment_query_with_rows, layout_alignment_query_with_rows_and_annotations,
-    layout_copy_number, layout_features, layout_gwas, layout_interactions, layout_mutations,
-    layout_quantitative, layout_reference_slice_oriented, layout_reference_translation,
-    layout_sashimi, layout_variants, modification_code_color, quantitative_data_range,
-    reconcile_alignment_rows_with_horizon, reconcile_alignment_rows_with_horizon_cancellable,
-    record_object_id, ultima_quality_color,
+    layout_copy_number, layout_features_with_label_widths, layout_gwas, layout_interactions,
+    layout_mutations, layout_quantitative, layout_reference_slice_oriented,
+    layout_reference_translation, layout_sashimi, layout_variants, modification_code_color,
+    quantitative_data_range, reconcile_alignment_rows_with_horizon,
+    reconcile_alignment_rows_with_horizon_cancellable, record_object_id, ultima_quality_color,
 };
 use rgv_render::{
     NavigationPreviewInstance, NavigationPreviewRenderer, PrepareStats, RectangleRenderer,

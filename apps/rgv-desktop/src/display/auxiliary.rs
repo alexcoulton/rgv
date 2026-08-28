@@ -16,6 +16,29 @@ pub(crate) fn pinned_gene_layout_maximum_rows(height: f32) -> usize {
     ((height / 20.0).floor() as usize).clamp(1, TrackLayoutOptions::default().maximum_rows)
 }
 
+pub(crate) fn measured_feature_label_widths(
+    context: &egui::Context,
+    records: &[rgv_hts::FeatureRecord],
+) -> Vec<f32> {
+    context.fonts_mut(|fonts| {
+        records
+            .iter()
+            .map(|record| {
+                let label = record
+                    .display_label()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(32)
+                    .collect::<String>();
+                fonts
+                    .layout_no_wrap(label, egui::FontId::proportional(9.0), egui::Color32::WHITE)
+                    .size()
+                    .x
+            })
+            .collect()
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn feature_layout_row_count(
     maximum_rows: usize,

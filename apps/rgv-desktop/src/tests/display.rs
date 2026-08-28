@@ -2405,6 +2405,31 @@ fn builtin_gene_properties_include_model_and_bundle_provenance() {
         },
     };
     let document = feature_inspector_document(&inspector);
+    assert_eq!(document.header.title, "TP53");
+    assert_eq!(
+        document.header.subtitle.as_deref(),
+        Some("transcript · NM_000546.6")
+    );
+    let gene = document
+        .sections
+        .iter()
+        .find(|section| section.id == "gene")
+        .unwrap();
+    assert!(gene.fields.iter().any(|field| {
+        field.label == "Gene symbol" && field.value == InspectorValue::Identifier("TP53".to_owned())
+    }));
+    assert!(gene.fields.iter().any(|field| {
+        field.label == "Gene ID" && field.value == InspectorValue::Identifier("7157".to_owned())
+    }));
+    let transcript = document
+        .sections
+        .iter()
+        .find(|section| section.id == "transcript")
+        .unwrap();
+    assert!(transcript.fields.iter().any(|field| {
+        field.label == "Transcript ID"
+            && field.value == InspectorValue::Identifier("NM_000546.6".to_owned())
+    }));
     let overview = document
         .sections
         .iter()

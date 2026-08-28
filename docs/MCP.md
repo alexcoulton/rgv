@@ -108,7 +108,8 @@ host configuration details. This example passes only the protected file's path; 
   `rgv_refresh_selection` is the only operation that replaces that evidence explicitly.
 - Position selection defaults to `exact_base`; choose `visible_bin` only when the current rendered
   bin is itself the evidence under review. `anchor_position` and the evidence interval are
-  intentionally separate.
+  intentionally separate. A settled annotation snapshot is selected in its current viewport;
+  only alignment evidence that lacks an exact one-base pileup bin may require a one-base query.
 
 ## Tools
 

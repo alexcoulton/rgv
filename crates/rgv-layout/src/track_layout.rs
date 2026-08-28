@@ -165,6 +165,30 @@ pub fn layout_features(
     viewport: Viewport,
     options: TrackLayoutOptions,
 ) -> (DisplayList, TrackLayoutStats) {
+    layout_features_with_label_widths(features, viewport, options, None)
+}
+
+#[derive(Clone, Debug)]
+struct PlacedFeature {
+    record_index: usize,
+    row: usize,
+}
+
+#[derive(Clone, Debug)]
+struct FeatureLabelCandidate {
+    row: usize,
+    text: String,
+    text_width: f32,
+    center: f32,
+    selected: bool,
+}
+
+pub fn layout_features_with_label_widths(
+    features: &[FeatureRecord],
+    viewport: Viewport,
+    options: TrackLayoutOptions,
+    measured_label_widths: Option<&[f32]>,
+) -> (DisplayList, TrackLayoutStats) {
     let mut display = DisplayList::default();
     let row_count = match options.feature_display_mode {
         FeatureDisplayMode::Collapsed => 1,
@@ -172,12 +196,9 @@ pub fn layout_features(
         FeatureDisplayMode::Expanded => options.maximum_rows.max(1),
     };
     let mut row_ends = vec![0_u64; row_count];
-    let mut label_intervals = vec![Vec::<(f32, f32)>::new(); row_count];
     let row_height = options.height / row_ends.len() as f32;
-    let mut rendered = 0;
+    let mut placed = Vec::new();
     let mut hidden = 0;
-    let mut labels = 0;
-    let mut direction_marker_budget = MAX_FEATURE_DIRECTION_MARKERS;
     for (index, feature) in features.iter().enumerate() {
         if feature.end <= viewport.interval().start() || feature.start >= viewport.interval().end()
         {
@@ -193,13 +214,94 @@ pub fn layout_features(
             row
         };
         row_ends[row] = row_ends[row].max(feature.end);
+        placed.push(PlacedFeature {
+            record_index: index,
+            row,
+        });
+    }
+
+    let viewport_width = viewport.pixel_width() as f32;
+    let mut candidates = Vec::new();
+    for placement in &placed {
+        let feature = &features[placement.record_index];
+        let selected = options.selected_record == Some(placement.record_index);
+        let labelable_gene_model = feature.feature_type.as_deref().is_some_and(|feature_type| {
+            ["gene", "transcript", "mrna", "primary_transcript"]
+                .iter()
+                .any(|candidate| feature_type.eq_ignore_ascii_case(candidate))
+        });
+        if !labelable_gene_model || (row_height < 16.0 && !selected) {
+            continue;
+        }
+        let Some(label) = feature.display_label().filter(|label| !label.is_empty()) else {
+            continue;
+        };
+        let text = label.chars().take(32).collect::<String>();
+        let text_width = measured_label_widths
+            .and_then(|widths| widths.get(placement.record_index))
+            .copied()
+            .filter(|width| width.is_finite() && *width >= 0.0)
+            .unwrap_or_else(|| text.chars().count() as f32 * 9.0 * 0.62);
+        if text_width + 4.0 > viewport_width {
+            continue;
+        }
+        let (x, width) = clipped_geometry(feature.start, feature.end, viewport);
+        if !selected && width < 3.0 {
+            continue;
+        }
+        let half_width = text_width * 0.5;
+        let center = (x + width * 0.5).clamp(
+            half_width + 2.0,
+            (viewport_width - half_width - 2.0).max(half_width + 2.0),
+        );
+        candidates.push(FeatureLabelCandidate {
+            row: placement.row,
+            text,
+            text_width,
+            center,
+            selected,
+        });
+    }
+
+    let mut occupied = vec![Vec::<(f32, f32)>::new(); row_count];
+    let mut accepted = Vec::new();
+    let mut ordinary_labels = 0_usize;
+    for selected_pass in [true, false] {
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.selected == selected_pass)
+        {
+            if !candidate.selected && ordinary_labels == MAX_FEATURE_LABELS {
+                break;
+            }
+            let half_width = candidate.text_width * 0.5;
+            let interval = (candidate.center - half_width, candidate.center + half_width);
+            let collision = occupied[candidate.row]
+                .iter()
+                .any(|existing| interval.0 < existing.1 + 6.0 && interval.1 + 6.0 > existing.0);
+            if collision && !candidate.selected {
+                continue;
+            }
+            occupied[candidate.row].push(interval);
+            accepted.push(candidate.clone());
+            if !candidate.selected {
+                ordinary_labels = ordinary_labels.saturating_add(1);
+            }
+        }
+    }
+    let row_has_label = occupied
+        .iter()
+        .map(|intervals| !intervals.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut direction_marker_budget = MAX_FEATURE_DIRECTION_MARKERS;
+    for placement in &placed {
+        let index = placement.record_index;
+        let feature = &features[index];
+        let row = placement.row;
         let row_top = options.top + row as f32 * row_height;
         let selected = options.selected_record == Some(index);
-        let label = (feature.feature_type.as_deref() == Some("transcript"))
-            .then_some(feature.name.as_deref())
-            .flatten()
-            .filter(|name| !name.is_empty() && (row_height >= 16.0 || selected));
-        let label_band = if label.is_some() { 10.0 } else { 0.0 };
+        let label_band = if row_has_label[row] { 10.0 } else { 0.0 };
         let y = row_top + label_band + 2.0;
         let object_id = options
             .object_id_base
@@ -214,42 +316,22 @@ pub fn layout_features(
             selected,
             &mut direction_marker_budget,
         );
-        if let Some(label) = label.filter(|_| selected || labels < MAX_FEATURE_LABELS) {
-            let text = label.chars().take(32).collect::<String>();
-            let text_width = text.chars().count() as f32 * 9.0 * 0.62;
-            let half_width = text_width * 0.5;
-            let (x, width) = clipped_geometry(feature.start, feature.end, viewport);
-            let viewport_width = viewport.pixel_width() as f32;
-            if text_width + 4.0 <= viewport_width {
-                let center =
-                    (x + width * 0.5).clamp(half_width + 2.0, viewport_width - half_width - 2.0);
-                let interval = (center - half_width, center + half_width);
-                let has_collision = label_intervals[row]
-                    .iter()
-                    .any(|occupied| interval.0 < occupied.1 + 6.0 && interval.1 + 6.0 > occupied.0);
-                if selected || !has_collision {
-                    display.texts.push(TextPrimitive {
-                        x: center,
-                        y: row_top + 5.5,
-                        text,
-                        font_size: 9.0,
-                        color: Rgba::new(0.16, 0.18, 0.22, 0.96),
-                    });
-                    label_intervals[row].push(interval);
-                    if !selected {
-                        labels = labels.saturating_add(1);
-                    }
-                }
-            }
-        }
-        rendered += 1;
+    }
+    for label in accepted {
+        display.texts.push(TextPrimitive {
+            x: label.center,
+            y: options.top + label.row as f32 * row_height + 5.5,
+            text: label.text,
+            font_size: 9.0,
+            color: Rgba::new(0.16, 0.18, 0.22, 0.96),
+        });
     }
     let primitive_count = display.rectangles.len();
     (
         display,
         TrackLayoutStats {
             input_records: features.len(),
-            rendered_records: rendered,
+            rendered_records: placed.len(),
             hidden_records: hidden,
             primitive_count,
             ..TrackLayoutStats::default()

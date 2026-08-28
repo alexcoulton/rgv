@@ -31,8 +31,8 @@ pub use display::{
     read_detail_object_id, record_object_id,
 };
 pub use genome_context::{
-    CoordinateRulerLayout, CoordinateRulerOptions, IdeogramLayout, IdeogramSegment, RulerTick,
-    format_genomic_position, layout_coordinate_ruler, layout_ideogram,
+    ContigAxis, CoordinateRulerLayout, CoordinateRulerOptions, IdeogramCentromere, IdeogramLayout,
+    IdeogramSegment, RulerTick, format_genomic_position, layout_coordinate_ruler, layout_ideogram,
 };
 pub use track_layout::{
     COPY_NUMBER_HEADER_HEIGHT, CopyNumberLayout, CopyNumberVisibleRow,
@@ -42,7 +42,7 @@ pub use track_layout::{
     MUTATION_HEADER_HEIGHT, MutationLayout, MutationVisibleRow, QuantitativeComposition,
     QuantitativeCompositionProvenance, QuantitativeRange, TrackLayoutOptions, TrackLayoutStats,
     compose_quantitative_records, copy_number_sample_order, copy_number_track_height,
-    gwas_point_color, gwas_point_y, layout_copy_number, layout_features, layout_gwas,
-    layout_interactions, layout_mutations, layout_quantitative, layout_variants,
-    mutation_track_height, quantitative_data_range,
+    gwas_point_color, gwas_point_y, layout_copy_number, layout_features,
+    layout_features_with_label_widths, layout_gwas, layout_interactions, layout_mutations,
+    layout_quantitative, layout_variants, mutation_track_height, quantitative_data_range,
 };

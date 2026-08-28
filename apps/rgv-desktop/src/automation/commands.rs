@@ -4238,17 +4238,30 @@ impl Viewer {
         track_id: TrackId,
         position: u64,
     ) -> bool {
-        self.alignment_tracks
+        if let Some(available) = self
+            .alignment_tracks
             .iter()
             .find(|track| track.config.id == track_id)
-            .and_then(|track| track.projection(panel_id))
-            .filter(|projection| projection.query_is_current())
-            .and_then(|projection| projection.current_query.as_deref())
-            .and_then(|query| {
-                let (index, _) = query.pileup.bin_at(query.interval, position)?;
-                query.pileup.bin_interval(query.interval, index)
+            .map(|track| {
+                track
+                    .projection(panel_id)
+                    .filter(|projection| projection.query_is_current())
+                    .and_then(|projection| projection.current_query.as_deref())
+                    .and_then(|query| {
+                        let (index, _) = query.pileup.bin_at(query.interval, position)?;
+                        query.pileup.bin_interval(query.interval, index)
+                    })
+                    .is_some_and(|interval| {
+                        interval.start() == position && interval.end() == position + 1
+                    })
             })
-            .is_some_and(|interval| interval.start() == position && interval.end() == position + 1)
+        {
+            return available;
+        }
+
+        self.panels
+            .get(panel_id)
+            .is_some_and(|panel| auxiliary_position_snapshot_is_current(panel, track_id, position))
     }
 
     pub(crate) fn automation_track_key(&self, track_id: TrackId) -> Result<TrackFrameKey> {
@@ -4752,4 +4765,19 @@ impl Viewer {
         self.data_status = format!("Automation is saving {display_path}…");
         Ok(())
     }
+}
+
+pub(crate) fn auxiliary_position_snapshot_is_current(
+    panel: &ViewPanelController,
+    track_id: TrackId,
+    position: u64,
+) -> bool {
+    let interval = panel.viewport.interval();
+    panel.track_snapshot_interval == Some(interval)
+        && panel.track_settled_generation == Some(panel.generation_clock.current().get())
+        && interval.contains(position)
+        && panel
+            .track_snapshots
+            .iter()
+            .any(|snapshot| snapshot.id == track_id)
 }

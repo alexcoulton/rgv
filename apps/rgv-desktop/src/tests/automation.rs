@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::automation::auxiliary_position_snapshot_is_current;
 
 fn automation_read_query(
     eligible_records: usize,
@@ -139,6 +140,38 @@ fn automation_read_presentation_prioritises_transitional_and_failure_states() {
 #[test]
 fn inspector_redesign_keeps_automation_schema_version_four() {
     assert_eq!(AUTOMATION_SCHEMA_VERSION, 4);
+}
+
+#[test]
+fn settled_auxiliary_snapshot_supports_exact_base_selection_without_refetch() {
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let track_id = TrackId::new(7);
+    let mut panel = ViewPanelController::new(
+        PanelId::new(1),
+        Viewport::new(interval, 1_000.0).unwrap(),
+        Some("chr1:101-200".to_owned()),
+        "chr1".to_owned(),
+        1_000,
+    );
+    panel.track_snapshots.push(TrackSnapshot {
+        id: track_id,
+        name: "Genes".to_owned(),
+        data: TrackSnapshotData::Features(Vec::new()),
+    });
+    panel.track_snapshot_interval = Some(interval);
+    panel.track_settled_generation = Some(panel.generation_clock.current().get());
+
+    assert!(auxiliary_position_snapshot_is_current(
+        &panel, track_id, 149
+    ));
+    assert!(!auxiliary_position_snapshot_is_current(
+        &panel, track_id, 250
+    ));
+
+    panel.generation_clock.advance();
+    assert!(!auxiliary_position_snapshot_is_current(
+        &panel, track_id, 149
+    ));
 }
 
 #[test]

@@ -105,7 +105,7 @@ impl Viewer {
                 self.locus_editor = locus;
                 self.data_status = format!(
                     "{} · {} · {}",
-                    hit.record.name.as_deref().unwrap_or(&hit.matched_term),
+                    annotation_search_hit_primary_label(hit),
                     hit.track_name,
                     hit.record.feature_type.as_deref().unwrap_or("feature")
                 );

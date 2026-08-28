@@ -118,16 +118,9 @@ impl Viewer {
             .find(|(key, _)| key == "transcript_id")
             .map(|(_, value)| value.as_str());
         if let Some(entry) = self.landmark_search_index.as_ref().and_then(|index| {
-            index.entries.iter().find(|entry| {
-                entry.contig == record.contig
-                    && entry.start == record.start
-                    && entry.end == record.end
-                    && transcript_id.is_none_or(|id| id == entry.transcript_id)
-            })
+            index.feature_entry(&record.contig, record.start, record.end, transcript_id)
         }) {
-            insert_feature_attribute(record, "gene_id", &entry.gene_id);
-            insert_feature_attribute(record, "gene_name", &entry.display_symbol);
-            insert_feature_attribute(record, "transcript_id", &entry.transcript_id);
+            apply_landmark_feature_identity(record, entry);
         }
 
         let inferred_biotype = if record.coding_interval.is_some() {
@@ -409,7 +402,10 @@ impl Viewer {
                 asset_role: LandmarkAssetRole::RepresentativeGenes,
                 sha256: asset.sha256.clone(),
             });
-            config.feature.display_mode = FeatureDisplayMode::Squished;
+            // Representative models are the compact, symbol-bearing context
+            // lane. Two expanded rows leave enough vertical space for the
+            // adaptive label band; the all-transcript lane remains squished.
+            config.feature.display_mode = FeatureDisplayMode::Expanded;
             config.height = 48.0;
             self.add_preconfigured_track_source(&genes_path, TrackSpecKind::GenePred, config)?;
             self.automation_auxiliary_open_state
@@ -465,19 +461,24 @@ impl Viewer {
         };
         let normalized_query = query.trim().to_ascii_lowercase();
         for entry in index.search(query, 50) {
-            let already_present = results.hits.iter().any(|hit| {
-                hit.track_id == track.id
-                    && hit.record.contig == entry.contig
-                    && hit.record.start == entry.start
-                    && hit.record.end == entry.end
-            });
-            if already_present {
+            let matched_term = LandmarkSearchIndex::matching_term(entry, query)
+                .unwrap_or(&entry.display_symbol)
+                .to_ascii_lowercase();
+            if let Some(hit) = results
+                .hits
+                .iter_mut()
+                .find(|hit| search_hit_matches_landmark_entry(hit, track.id, entry))
+            {
+                apply_landmark_feature_identity(&mut hit.record, entry);
+                if hit.matched_term != normalized_query && matched_term == normalized_query {
+                    hit.matched_term = matched_term;
+                }
                 continue;
             }
             results.hits.push(TrackSearchHit {
                 track_id: track.id,
                 track_name: track.name.clone(),
-                matched_term: entry.normalized_term.clone(),
+                matched_term,
                 record: rgv_hts::FeatureRecord {
                     contig: entry.contig.clone(),
                     start: entry.start,
@@ -503,15 +504,17 @@ impl Viewer {
             });
         }
         results.hits.sort_by(|left, right| {
-            let left_exact = left.matched_term.eq_ignore_ascii_case(&normalized_query);
-            let right_exact = right.matched_term.eq_ignore_ascii_case(&normalized_query);
-            right_exact
-                .cmp(&left_exact)
+            annotation_search_rank(left, &normalized_query)
+                .cmp(&annotation_search_rank(right, &normalized_query))
                 .then_with(|| left.matched_term.cmp(&right.matched_term))
                 .then_with(|| left.record.contig.cmp(&right.record.contig))
                 .then_with(|| left.record.start.cmp(&right.record.start))
                 .then_with(|| left.record.end.cmp(&right.record.end))
+                .then_with(|| left.track_id.cmp(&right.track_id))
         });
+        results
+            .hits
+            .dedup_by(|left, right| search_hits_share_stable_feature_identity(left, right));
         results.hits.truncate(50);
     }
 
@@ -641,6 +644,111 @@ fn insert_feature_attribute(record: &mut rgv_hts::FeatureRecord, key: &str, valu
     }
 }
 
+fn set_feature_attribute(record: &mut rgv_hts::FeatureRecord, key: &str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if let Some((_, existing)) = record
+        .attributes
+        .iter_mut()
+        .find(|(existing, _)| existing == key)
+    {
+        value.clone_into(existing);
+    } else {
+        record.attributes.push((key.to_owned(), value.to_owned()));
+    }
+}
+
+fn feature_attribute<'a>(record: &'a rgv_hts::FeatureRecord, key: &str) -> Option<&'a str> {
+    record
+        .attributes
+        .iter()
+        .find(|(candidate, value)| candidate == key && !value.is_empty())
+        .map(|(_, value)| value.as_str())
+}
+
+fn apply_landmark_feature_identity(
+    record: &mut rgv_hts::FeatureRecord,
+    entry: &rgv_core::LandmarkSearchEntry,
+) {
+    record.name = Some(entry.display_symbol.clone());
+    set_feature_attribute(record, "gene_id", &entry.gene_id);
+    set_feature_attribute(record, "gene_name", &entry.display_symbol);
+    set_feature_attribute(record, "transcript_id", &entry.transcript_id);
+}
+
+fn search_hit_matches_landmark_entry(
+    hit: &TrackSearchHit,
+    track_id: TrackId,
+    entry: &rgv_core::LandmarkSearchEntry,
+) -> bool {
+    hit.track_id == track_id
+        && hit.record.contig == entry.contig
+        && hit.record.start == entry.start
+        && hit.record.end == entry.end
+        && feature_attribute(&hit.record, "transcript_id")
+            .is_none_or(|transcript| transcript == entry.transcript_id)
+}
+
+fn search_hits_share_stable_feature_identity(
+    left: &TrackSearchHit,
+    right: &TrackSearchHit,
+) -> bool {
+    if left.track_id != right.track_id
+        || left.record.contig != right.record.contig
+        || left.record.start != right.record.start
+        || left.record.end != right.record.end
+    {
+        return false;
+    }
+    match (
+        feature_attribute(&left.record, "transcript_id"),
+        feature_attribute(&right.record, "transcript_id"),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => left.record.display_label() == right.record.display_label(),
+    }
+}
+
+fn annotation_search_rank(hit: &TrackSearchHit, normalized_query: &str) -> u8 {
+    let identity = hit.record.presentation_identity();
+    let display = identity
+        .display_symbol
+        .or(identity.record_name)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let gene_id = identity.gene_id.unwrap_or_default().to_ascii_lowercase();
+    let transcript_id = identity
+        .transcript_id
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if display == normalized_query {
+        0
+    } else if display.starts_with(normalized_query) {
+        1
+    } else if !hit.matched_term.eq_ignore_ascii_case(&gene_id)
+        && !hit.matched_term.eq_ignore_ascii_case(&transcript_id)
+        && hit.matched_term.eq_ignore_ascii_case(normalized_query)
+    {
+        2
+    } else if !hit.matched_term.eq_ignore_ascii_case(&gene_id)
+        && !hit.matched_term.eq_ignore_ascii_case(&transcript_id)
+        && hit.matched_term.starts_with(normalized_query)
+    {
+        3
+    } else if gene_id == normalized_query {
+        4
+    } else if gene_id.starts_with(normalized_query) {
+        5
+    } else if transcript_id == normalized_query {
+        6
+    } else if transcript_id.starts_with(normalized_query) {
+        7
+    } else {
+        8
+    }
+}
+
 const fn landmark_asset_role_name(role: LandmarkAssetRole) -> &'static str {
     match role {
         LandmarkAssetRole::RepresentativeGenes => "representative_genes",
@@ -675,4 +783,66 @@ fn read_landmark_search(path: &Path) -> Result<LandmarkSearchIndex> {
         "landmark search index exceeds {MAXIMUM_LANDMARK_SEARCH_BYTES} decompressed bytes"
     );
     rgv_core::parse_landmark_search_index(&text).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_hit() -> TrackSearchHit {
+        TrackSearchHit {
+            track_id: TrackId::new(7),
+            track_name: "Genes".to_owned(),
+            matched_term: "actb".to_owned(),
+            record: rgv_hts::FeatureRecord {
+                contig: "chr7".to_owned(),
+                start: 100,
+                end: 200,
+                name: Some("ENST000001".to_owned()),
+                feature_type: Some("transcript".to_owned()),
+                score: None,
+                strand: rgv_hts::Strand::Forward,
+                blocks: vec![(100, 200)],
+                coding_interval: None,
+                peak: None,
+                attributes: vec![("transcript_id".to_owned(), "ENST000001".to_owned())],
+            },
+        }
+    }
+
+    fn entry() -> rgv_core::LandmarkSearchEntry {
+        rgv_core::LandmarkSearchEntry {
+            normalized_term: "actb".to_owned(),
+            display_symbol: "ACTB".to_owned(),
+            gene_id: "ENSG000001".to_owned(),
+            transcript_id: "ENST000001".to_owned(),
+            contig: "chr7".to_owned(),
+            start: 100,
+            end: 200,
+            strand: '+',
+            synonyms: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn duplicate_raw_landmark_hit_is_upgraded_to_symbol_identity() {
+        let mut hit = raw_hit();
+        let entry = entry();
+        assert!(search_hit_matches_landmark_entry(
+            &hit,
+            TrackId::new(7),
+            &entry
+        ));
+        apply_landmark_feature_identity(&mut hit.record, &entry);
+        assert_eq!(hit.record.display_label(), Some("ACTB"));
+        assert_eq!(
+            feature_attribute(&hit.record, "gene_id"),
+            Some("ENSG000001")
+        );
+        assert_eq!(annotation_search_rank(&hit, "actb"), 0);
+        assert_eq!(annotation_search_rank(&hit, "act"), 1);
+        hit.matched_term = "ensg000001".to_owned();
+        assert_eq!(annotation_search_rank(&hit, "ensg000001"), 4);
+        assert_eq!(annotation_search_rank(&hit, "ensg"), 5);
+    }
 }

@@ -542,10 +542,16 @@ pub(super) fn parse_big_gene_pred_record(
         ("cds_end_status".to_owned(), fields[11].to_owned()),
         ("exon_frames".to_owned(), fields[12].to_owned()),
     ];
+    if !gene_name.is_empty() && gene_name != "." {
+        attributes.push(("gene_id".to_owned(), gene_name.to_owned()));
+    }
+    if !display_name.is_empty() && display_name != "." {
+        attributes.push(("gene_name".to_owned(), display_name.to_owned()));
+    }
     for (key, value) in [
         ("name2", name2),
         ("transcript_type", transcript_type),
-        ("gene_name", gene_name),
+        ("big_gene_pred_gene_name", gene_name),
         ("gene_name2", gene_name2),
         ("gene_type", gene_type),
     ] {

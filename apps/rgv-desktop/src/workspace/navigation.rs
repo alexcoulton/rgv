@@ -164,6 +164,24 @@ pub(crate) fn annotation_search_hit_locus(hit: &TrackSearchHit) -> String {
     )
 }
 
+pub(crate) fn annotation_search_hit_primary_label(hit: &TrackSearchHit) -> &str {
+    hit.record
+        .display_label()
+        .unwrap_or(hit.matched_term.as_str())
+}
+
+pub(crate) fn annotation_search_hit_secondary_identity(hit: &TrackSearchHit) -> String {
+    let identity = hit.record.presentation_identity();
+    let primary = annotation_search_hit_primary_label(hit);
+    let mut identifiers = [identity.gene_id, identity.transcript_id]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.eq_ignore_ascii_case(primary))
+        .collect::<Vec<_>>();
+    identifiers.dedup();
+    identifiers.join(" · ")
+}
+
 pub(crate) fn mate_locus(
     record: &AlignmentRecord,
     dictionary: &ReferenceDictionary,

@@ -165,11 +165,7 @@ pub(crate) fn feature_annotation_label(
     track_name: &str,
 ) -> String {
     record
-        .attributes
-        .iter()
-        .find(|(key, _)| key == "gene_name" || key == "gene_id" || key == "Name")
-        .map(|(_, value)| value.as_str())
-        .or(record.name.as_deref())
+        .display_label()
         .unwrap_or(track_name)
         .chars()
         .take(128)

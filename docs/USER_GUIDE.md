@@ -81,8 +81,11 @@ exact and persisted in sessions; conflicts and aliases targeting absent FASTA co
 The locus field also searches open text annotation tracks. Type at least two characters without a
 colon to autocomplete feature names, gene names, aliases, IDs, and transcript IDs. Exact matches
 are preferred; a unique exact match opens on Enter, while ambiguous matches remain as explicit
-choices with their track and coordinates. Search indexing and prefix scans are bounded and run in
-the background; the results panel reports when a very broad search may omit matches.
+choices with their track and coordinates. Gene results lead with the human-readable gene symbol;
+stable gene and transcript accessions remain visible as secondary identifiers and remain directly
+searchable. Symbol matches rank before aliases and stable identifiers. Search indexing and prefix
+scans are bounded and run in the background; the results panel reports when a very broad search may
+omit matches.
 Submitting a name also searches VCF/BCF record IDs. That bounded ID index is created lazily on the
 background track worker, so opening a variant track does not add a whole-file scan to startup.
 Use **Regions → Previous annotation feature** or **Next annotation feature** to move to the nearest
@@ -141,8 +144,12 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
 
 - The compact navigation toolbar keeps assembly, contig, locus, history, and zoom controls together.
   The chromosome row uses a cytoband ideogram when `--cytobands` is supplied and a fallback bar
-  otherwise. A separate coverage/read-density overview rail directly below it retains the blue
-  visible-span handle and horizontal pan/zoom interactions. Coordinate ruler labels always use
+  otherwise. Rounded chromosome ends and an indented waist identify the centromere wherever the
+  cytoband source provides `acen` records. Hovering any band highlights it and reports its name,
+  one-based coordinate range, and stain. A separate coverage/read-density overview rail directly
+  below it retains the blue visible-span handle and horizontal pan/zoom interactions. The ideogram,
+  density bins, visible-span handle, and pointer navigation use the same full-contig horizontal
+  axis, so positions align exactly between the two rows. Coordinate ruler labels always use
   one-based display positions.
 - The chromosome overview supports Ableton-style direct navigation: drag left/right to pan, drag
   down/up to zoom in/out around the press position, click to recenter, and double-click to show the
@@ -679,9 +686,12 @@ genePred form, the fifteen-column extended form, refFlat's additional gene-name 
 optional leading database `bin` column found in UCSC table exports. Coordinates remain zero-based
 and half-open. Exon counts and arrays must agree; exons must be sorted, non-overlapping, non-empty,
 and contained by the transcript. Coding sequence is drawn as thick exon segments while UTRs and
-non-coding transcript exons remain thin. refFlat labels use the gene name while the inspector keeps
-the transcript accession; extended genePred also retains its alternate gene name, CDS completion
-status, exon frames, and score. Stranded transcript and blocked-feature connectors carry repeated
+non-coding transcript exons remain thin. refFlat and extended genePred labels use the gene symbol
+when one is present, while the inspector separately retains gene and transcript accessions. Extended
+genePred also retains CDS completion status, exon frames, and score. At readable zoom levels, gene
+symbols appear automatically without selection. Labels use measured screen-space width, avoid one
+another, and are suppressed when the view would be crowded; a selected gene keeps its label.
+Stranded transcript and blocked-feature connectors carry repeated
 screen-spaced chevrons, and their true terminal block has a compact directional cap. Unstranded
 records remain rectangular. The same geometry is used for GFF3, GTF, BED12, bigGenePred, blocked
 BigBed, and PSL target orientation; simple stranded intervals and peaks use one compact cue.
@@ -811,7 +821,8 @@ stable ID, locus, and query generation and identify the active panel.
 
 RGV enables the native AccessKit integration supplied by its window stack. Standard controls,
 dialogs, menus, inspectors, metadata tables, regions, and review lists participate in the platform
-accessibility tree and normal Tab/Shift+Tab focus order. The custom chromosome overview, right-side
+accessibility tree and normal Tab/Shift+Tab focus order. The chromosome ideogram exposes its
+chromosome and centromere summary. The custom chromosome overview, right-side
 track navigator, track labels, resize handles, genomic canvas summary, and supplementary-chain
 segments provide explicit roles, names, values, selection state, and visible focus outlines. Status
 changes emit accessibility value-change events so loading and asynchronous failures do not rely on

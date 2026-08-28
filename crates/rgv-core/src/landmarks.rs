@@ -878,6 +878,7 @@ pub struct LandmarkSearchEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LandmarkSearchIndex {
     pub entries: Vec<LandmarkSearchEntry>,
+    by_transcript: HashMap<String, usize>,
 }
 
 impl LandmarkSearchIndex {
@@ -887,18 +888,91 @@ impl LandmarkSearchIndex {
         if normalized.is_empty() || maximum_hits == 0 {
             return Vec::new();
         }
-        self.entries
+        let mut matches = self
+            .entries
             .iter()
-            .filter(|entry| {
-                entry.normalized_term.starts_with(&normalized)
-                    || entry
-                        .synonyms
-                        .iter()
-                        .any(|synonym| synonym.to_ascii_lowercase().starts_with(&normalized))
-            })
+            .filter_map(|entry| search_match_rank(entry, &normalized).map(|rank| (rank, entry)))
+            .collect::<Vec<_>>();
+        matches.sort_by(|(left_rank, left), (right_rank, right)| {
+            left_rank
+                .cmp(right_rank)
+                .then_with(|| left.normalized_term.cmp(&right.normalized_term))
+                .then_with(|| left.contig.cmp(&right.contig))
+                .then_with(|| left.start.cmp(&right.start))
+                .then_with(|| left.end.cmp(&right.end))
+                .then_with(|| left.gene_id.cmp(&right.gene_id))
+                .then_with(|| left.transcript_id.cmp(&right.transcript_id))
+        });
+        matches
+            .into_iter()
             .take(maximum_hits)
+            .map(|(_, entry)| entry)
             .collect()
     }
+
+    #[must_use]
+    pub fn matching_term<'a>(entry: &'a LandmarkSearchEntry, query: &str) -> Option<&'a str> {
+        let normalized = query.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return None;
+        }
+        [entry.display_symbol.as_str()]
+            .into_iter()
+            .chain(entry.synonyms.iter().map(String::as_str))
+            .chain([entry.gene_id.as_str(), entry.transcript_id.as_str()])
+            .find(|term| term.to_ascii_lowercase().starts_with(&normalized))
+    }
+
+    #[must_use]
+    pub fn feature_entry(
+        &self,
+        contig: &str,
+        start: u64,
+        end: u64,
+        transcript_id: Option<&str>,
+    ) -> Option<&LandmarkSearchEntry> {
+        let matches = |entry: &&LandmarkSearchEntry| {
+            entry.contig == contig
+                && entry.start == start
+                && entry.end == end
+                && transcript_id.is_none_or(|id| id == entry.transcript_id)
+        };
+        if let Some(index) = transcript_id.and_then(|id| self.by_transcript.get(id))
+            && let Some(entry) = self.entries.get(*index)
+            && matches(&entry)
+        {
+            return Some(entry);
+        }
+        self.entries.iter().find(matches)
+    }
+}
+
+fn search_match_rank(entry: &LandmarkSearchEntry, normalized_query: &str) -> Option<u8> {
+    let match_rank = |term: &str, exact: u8, prefix: u8| {
+        if term.eq_ignore_ascii_case(normalized_query) {
+            Some(exact)
+        } else if ascii_case_insensitive_prefix(term, normalized_query) {
+            Some(prefix)
+        } else {
+            None
+        }
+    };
+    match_rank(&entry.display_symbol, 0, 1)
+        .or_else(|| {
+            entry
+                .synonyms
+                .iter()
+                .filter_map(|synonym| match_rank(synonym, 2, 3))
+                .min()
+        })
+        .or_else(|| match_rank(&entry.gene_id, 4, 5))
+        .or_else(|| match_rank(&entry.transcript_id, 6, 7))
+}
+
+fn ascii_case_insensitive_prefix(value: &str, normalized_prefix: &str) -> bool {
+    value
+        .get(..normalized_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(normalized_prefix))
 }
 
 pub fn parse_landmark_search_index(
@@ -950,7 +1024,16 @@ pub fn parse_landmark_search_index(
                 .collect(),
         });
     }
-    Ok(LandmarkSearchIndex { entries })
+    let by_transcript = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.transcript_id.is_empty())
+        .map(|(index, entry)| (entry.transcript_id.clone(), index))
+        .collect();
+    Ok(LandmarkSearchIndex {
+        entries,
+        by_transcript,
+    })
 }
 
 pub fn parse_landmark_aliases(text: &str) -> Result<ContigAliases, LandmarkSearchIndexError> {
@@ -1257,6 +1340,41 @@ mod tests {
         let index = parse_landmark_search_index(text).unwrap();
         assert_eq!(index.search("BRC", 8)[0].display_symbol, "BRCA1");
         assert_eq!(index.search("rnf", 8)[0].gene_id, "ENSG1");
+        assert_eq!(index.search("ensg1", 8)[0].display_symbol, "BRCA1");
+        assert_eq!(index.search("nm_1", 8)[0].display_symbol, "BRCA1");
+        assert_eq!(
+            LandmarkSearchIndex::matching_term(&index.entries[0], "ensg"),
+            Some("ENSG1")
+        );
+        assert_eq!(
+            index
+                .feature_entry("chr17", 10, 20, Some("NM_1"))
+                .map(|entry| entry.display_symbol.as_str()),
+            Some("BRCA1")
+        );
+    }
+
+    #[test]
+    fn landmark_search_ranks_symbols_then_aliases_then_stable_identifiers() {
+        let text = concat!(
+            "rgv_gene_names_v1\n",
+            "zzz\tZZZ\tABCGENE\tNM_3\tchr3\t30\t40\t+\t\n",
+            "aliasgene\tALIASGENE\tENSG2\tNM_2\tchr2\t20\t30\t+\tABC\n",
+            "abcd\tABCD\tENSG1\tNM_1\tchr1\t10\t20\t+\t\n",
+        );
+        let index = parse_landmark_search_index(text).unwrap();
+        assert_eq!(
+            index
+                .search("abc", 8)
+                .iter()
+                .map(|entry| entry.display_symbol.as_str())
+                .collect::<Vec<_>>(),
+            ["ABCD", "ALIASGENE", "ZZZ"]
+        );
+        assert_eq!(
+            LandmarkSearchIndex::matching_term(&index.entries[1], "abc"),
+            Some("ABC")
+        );
     }
 
     #[test]

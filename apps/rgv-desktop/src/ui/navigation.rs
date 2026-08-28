@@ -1,7 +1,10 @@
-use egui::{Align2, Color32, FontId, Rect, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{
+    Align2, Color32, CornerRadius, FontId, Rect, Shape, Stroke, StrokeKind, Ui, pos2, vec2,
+};
 use rgv_core::{CytobandStain, GenomeAssembly, Viewport};
 use rgv_layout::{
-    CoordinateRulerOptions, format_genomic_position, layout_coordinate_ruler, layout_ideogram,
+    ContigAxis, CoordinateRulerOptions, IdeogramCentromere, IdeogramLayout, IdeogramSegment,
+    format_genomic_position, layout_coordinate_ruler, layout_ideogram,
 };
 
 use super::{
@@ -329,13 +332,12 @@ pub fn paint_genome_context(
     ));
 
     let overview_rect = rows.overview;
-    let ideogram = layout_ideogram(
-        assembly,
-        contig,
-        contig_length,
-        viewport.interval(),
-        overview_rect.width(),
-    );
+    let contig_axis = ContigAxis::new(contig_length, overview_rect.left(), overview_rect.width());
+    if let Some(cytoband_rect) = rows.cytoband {
+        debug_assert!((cytoband_rect.left() - contig_axis.left()).abs() < f32::EPSILON);
+        debug_assert!((cytoband_rect.right() - contig_axis.right()).abs() < f32::EPSILON);
+    }
+    let ideogram = layout_ideogram(assembly, contig, viewport.interval(), contig_axis);
     debug_assert_eq!(ideogram.has_cytobands, has_cytobands);
     let overview_response = ui
         .interact(
@@ -380,17 +382,80 @@ pub fn paint_genome_context(
     if layout.cytobands == CytobandAvailability::Present
         && let Some(ideogram_rect) = rows.cytoband
     {
-        for segment in &ideogram.segments {
+        let ideogram_response = ui
+            .interact(
+                ideogram_rect,
+                egui::Id::new(("genome-context-ideogram", id_salt)),
+                egui::Sense::click(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Crosshair);
+        let hovered_segment = ideogram_response
+            .hover_pos()
+            .map(|pointer| contig_axis.position_at_x(pointer.x))
+            .and_then(|position| ideogram_segment_at_position(&ideogram, position));
+        let centromere_summary = ideogram.centromere.map_or_else(
+            || "centromere unavailable".to_owned(),
+            |centromere| {
+                format!(
+                    "centromere bases {} through {}",
+                    format_genomic_position(centromere.start.saturating_add(1)),
+                    format_genomic_position(centromere.end)
+                )
+            },
+        );
+        ideogram_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Image,
+                true,
+                format!("Chromosome ideogram for {contig_name}; {centromere_summary}"),
+            )
+        });
+        if let Some(segment) = hovered_segment {
+            ideogram_response.clone().on_hover_ui(|ui| {
+                ui.label(egui::RichText::new(cytoband_hover_text(contig_name, segment)).strong());
+            });
+        } else {
+            ideogram_response.on_hover_text(format!(
+                "Chromosome ideogram for {contig_name} · {centromere_summary}"
+            ));
+        }
+
+        let end_rounding = (ideogram_rect.height() * 0.5).round().clamp(0.0, 255.0) as u8;
+        let last_segment = ideogram.segments.len().saturating_sub(1);
+        for (index, segment) in ideogram.segments.iter().enumerate() {
             let segment_rect = Rect::from_min_size(
-                pos2(ideogram_rect.left() + segment.x, ideogram_rect.top()),
+                pos2(segment.x, ideogram_rect.top()),
                 vec2(segment.width, ideogram_rect.height()),
             );
-            painter.rect_filled(segment_rect, 0.0, stain_color(segment.stain));
+            let rounding = CornerRadius {
+                nw: if index == 0 { end_rounding } else { 0 },
+                sw: if index == 0 { end_rounding } else { 0 },
+                ne: if index == last_segment {
+                    end_rounding
+                } else {
+                    0
+                },
+                se: if index == last_segment {
+                    end_rounding
+                } else {
+                    0
+                },
+            };
+            painter.rect_filled(segment_rect, rounding, stain_color(segment.stain));
             painter.rect_stroke(
                 segment_rect,
-                0.0,
+                rounding,
                 Stroke::new(0.75, Color32::from_gray(95)),
                 StrokeKind::Inside,
+            );
+        }
+        if let Some(centromere) = ideogram.centromere {
+            paint_centromere_waist(&painter, ideogram_rect, centromere);
+        }
+        for segment in &ideogram.segments {
+            let segment_rect = Rect::from_min_size(
+                pos2(segment.x, ideogram_rect.top()),
+                vec2(segment.width, ideogram_rect.height()),
             );
             if segment.width >= 38.0 && !segment.name.is_empty() {
                 painter.text(
@@ -401,6 +466,18 @@ pub fn paint_genome_context(
                     Color32::from_gray(35),
                 );
             }
+        }
+        if let Some(segment) = hovered_segment {
+            let segment_rect = Rect::from_min_size(
+                pos2(segment.x, ideogram_rect.top()),
+                vec2(segment.width, ideogram_rect.height()),
+            );
+            painter.rect_stroke(
+                segment_rect,
+                1.0,
+                Stroke::new(2.0, Color32::from_rgb(45, 92, 175)),
+                StrokeKind::Outside,
+            );
         }
     } else if layout.cytobands == CytobandAvailability::Loading
         && let Some(cytoband_rect) = rows.cytoband
@@ -420,12 +497,9 @@ pub fn paint_genome_context(
         Stroke::new(0.75, Color32::from_gray(130)),
         StrokeKind::Inside,
     );
-    paint_genome_overview_data(&painter, overview_rect, overview_data);
+    paint_genome_overview_data(&painter, overview_rect, contig_axis, overview_data);
     let visible = Rect::from_min_size(
-        pos2(
-            overview_rect.left() + ideogram.visible_x,
-            overview_rect.top() - 1.0,
-        ),
+        pos2(ideogram.visible_x, overview_rect.top() - 1.0),
         vec2(ideogram.visible_width, overview_rect.height() + 2.0),
     );
     painter.rect_stroke(
@@ -525,13 +599,11 @@ pub fn paint_genome_context(
             && !clicked_on_handle)
             .then_some(pointer_position)
             .flatten()
-            .map(|value| ideogram_position_at_pointer(overview_rect, value.x, contig_length)),
-        pointer_position: pointer_position
-            .map(|value| ideogram_position_at_pointer(overview_rect, value.x, contig_length)),
+            .map(|value| contig_axis.position_at_x(value.x)),
+        pointer_position: pointer_position.map(|value| contig_axis.position_at_x(value.x)),
         pointer_x: pointer_position.map(|value| f64::from(value.x)),
         pointer_y: pointer_position.map(|value| f64::from(value.y)),
-        press_position: press_point
-            .map(|value| ideogram_position_at_pointer(overview_rect, value.x, contig_length)),
+        press_position: press_point.map(|value| contig_axis.position_at_x(value.x)),
         press_x: press_point.map(|value| f64::from(value.x)),
         press_y: press_point.map(|value| f64::from(value.y)),
         press_handle_fraction,
@@ -545,14 +617,18 @@ pub fn paint_genome_context(
     }
 }
 
-fn paint_genome_overview_data(painter: &egui::Painter, rect: Rect, overview: &GenomeOverviewData) {
+fn paint_genome_overview_data(
+    painter: &egui::Painter,
+    rect: Rect,
+    axis: ContigAxis,
+    overview: &GenomeOverviewData,
+) {
     if overview.bins.is_empty()
         || overview.bins.len() != overview.observed.len()
         || overview.bins.len() != overview.estimated_bins.len()
     {
         return;
     }
-    let bin_width = rect.width() / overview.bins.len() as f32;
     // Keep index-only occupancy visibly distinct and deliberately slight. A
     // BAI bin can cover 16 kb even when its reads occupy only a few bases, so
     // painting it as full-height coverage materially exaggerates data extent.
@@ -564,11 +640,11 @@ fn paint_genome_overview_data(painter: &egui::Painter, rect: Rect, overview: &Ge
         painter.rect_filled(
             Rect::from_min_max(
                 pos2(
-                    rect.left() + index as f32 * bin_width,
+                    axis.x_at_fraction(index, overview.bins.len()),
                     rect.bottom() - height,
                 ),
                 pos2(
-                    rect.left() + (index + 1) as f32 * bin_width + 0.5,
+                    axis.x_at_fraction(index + 1, overview.bins.len()) + 0.5,
                     rect.bottom(),
                 ),
             ),
@@ -584,11 +660,11 @@ fn paint_genome_overview_data(painter: &egui::Painter, rect: Rect, overview: &Ge
         painter.rect_filled(
             Rect::from_min_max(
                 pos2(
-                    rect.left() + index as f32 * bin_width,
+                    axis.x_at_fraction(index, overview.bins.len()),
                     rect.bottom() - height,
                 ),
                 pos2(
-                    rect.left() + (index + 1) as f32 * bin_width + 0.5,
+                    axis.x_at_fraction(index + 1, overview.bins.len()) + 0.5,
                     rect.bottom(),
                 ),
             ),
@@ -610,9 +686,93 @@ fn overview_bin(position: u64, contig_length: u64, bins: usize) -> usize {
     .min(bins - 1)
 }
 
-fn ideogram_position_at_pointer(rect: Rect, pointer_x: f32, contig_length: u64) -> u64 {
-    let fraction = ((pointer_x - rect.left()) / rect.width().max(f32::EPSILON)).clamp(0.0, 1.0);
-    (f64::from(fraction) * contig_length.saturating_sub(1) as f64).round() as u64
+fn ideogram_segment_at_position(
+    ideogram: &IdeogramLayout,
+    position: u64,
+) -> Option<&IdeogramSegment> {
+    ideogram
+        .segments
+        .iter()
+        .find(|segment| segment.start <= position && position < segment.end)
+}
+
+fn cytoband_hover_text(contig_name: &str, segment: &IdeogramSegment) -> String {
+    format!(
+        "{contig_name} · {} · {}–{} · {}",
+        segment.name,
+        format_genomic_position(segment.start.saturating_add(1)),
+        format_genomic_position(segment.end),
+        cytoband_stain_name(segment.stain)
+    )
+}
+
+fn paint_centromere_waist(
+    painter: &egui::Painter,
+    ideogram_rect: Rect,
+    centromere: IdeogramCentromere,
+) {
+    let left = centromere.x.max(ideogram_rect.left());
+    let right = (centromere.x + centromere.width).min(ideogram_rect.right());
+    if left >= right {
+        return;
+    }
+    let waist = centromere.waist_x.clamp(left, right);
+    let inset = (ideogram_rect.height() * 0.34).max(1.0);
+    let background = Color32::from_gray(250);
+    painter.add(Shape::convex_polygon(
+        vec![
+            pos2(left, ideogram_rect.top() - 1.0),
+            pos2(right, ideogram_rect.top() - 1.0),
+            pos2(waist, ideogram_rect.top() + inset),
+        ],
+        background,
+        Stroke::NONE,
+    ));
+    painter.add(Shape::convex_polygon(
+        vec![
+            pos2(left, ideogram_rect.bottom() + 1.0),
+            pos2(waist, ideogram_rect.bottom() - inset),
+            pos2(right, ideogram_rect.bottom() + 1.0),
+        ],
+        background,
+        Stroke::NONE,
+    ));
+    let outline = Stroke::new(0.9, Color32::from_gray(75));
+    painter.add(Shape::line(
+        vec![
+            pos2(ideogram_rect.left(), ideogram_rect.top()),
+            pos2(left, ideogram_rect.top()),
+            pos2(waist, ideogram_rect.top() + inset),
+            pos2(right, ideogram_rect.top()),
+            pos2(ideogram_rect.right(), ideogram_rect.top()),
+        ],
+        outline,
+    ));
+    painter.add(Shape::line(
+        vec![
+            pos2(ideogram_rect.left(), ideogram_rect.bottom()),
+            pos2(left, ideogram_rect.bottom()),
+            pos2(waist, ideogram_rect.bottom() - inset),
+            pos2(right, ideogram_rect.bottom()),
+            pos2(ideogram_rect.right(), ideogram_rect.bottom()),
+        ],
+        outline,
+    ));
+}
+
+const fn cytoband_stain_name(stain: CytobandStain) -> &'static str {
+    match stain {
+        CytobandStain::Negative => "gneg",
+        CytobandStain::Positive25 => "gpos25",
+        CytobandStain::Positive33 => "gpos33",
+        CytobandStain::Positive50 => "gpos50",
+        CytobandStain::Positive66 => "gpos66",
+        CytobandStain::Positive75 => "gpos75",
+        CytobandStain::Positive100 => "gpos100",
+        CytobandStain::Centromere => "acen · centromere",
+        CytobandStain::Variable => "gvar",
+        CytobandStain::Stalk => "stalk",
+    }
 }
 
 fn stain_color(stain: CytobandStain) -> Color32 {
@@ -869,10 +1029,62 @@ mod tests {
 
     #[test]
     fn ideogram_pointer_maps_across_the_full_contig() {
-        let rect = Rect::from_min_max(pos2(100.0, 0.0), pos2(1_100.0, 20.0));
-        assert_eq!(ideogram_position_at_pointer(rect, 100.0, 10_000), 0);
-        assert_eq!(ideogram_position_at_pointer(rect, 600.0, 10_000), 5_000);
-        assert_eq!(ideogram_position_at_pointer(rect, 1_100.0, 10_000), 9_999);
+        let axis = ContigAxis::new(10_000, 100.0, 1_000.0);
+        assert_eq!(axis.position_at_x(100.0), 0);
+        assert_eq!(axis.position_at_x(600.0), 5_000);
+        assert_eq!(axis.position_at_x(1_100.0), 9_999);
+    }
+
+    #[test]
+    fn band_hit_testing_resolves_edges_and_subpixel_segments_by_genomic_position() {
+        let ideogram = IdeogramLayout {
+            segments: vec![
+                IdeogramSegment {
+                    x: 10.0,
+                    width: 1.0,
+                    start: 0,
+                    end: 1,
+                    name: "p1".to_owned(),
+                    stain: CytobandStain::Negative,
+                },
+                IdeogramSegment {
+                    x: 11.0,
+                    width: 1.0,
+                    start: 1,
+                    end: 9_999,
+                    name: "q1".to_owned(),
+                    stain: CytobandStain::Positive50,
+                },
+                IdeogramSegment {
+                    x: 999.0,
+                    width: 1.0,
+                    start: 9_999,
+                    end: 10_000,
+                    name: "q2".to_owned(),
+                    stain: CytobandStain::Negative,
+                },
+            ],
+            centromere: None,
+            visible_x: 10.0,
+            visible_width: 2.0,
+            has_cytobands: true,
+        };
+        assert_eq!(
+            ideogram_segment_at_position(&ideogram, 0).map(|band| band.name.as_str()),
+            Some("p1")
+        );
+        assert_eq!(
+            ideogram_segment_at_position(&ideogram, 1).map(|band| band.name.as_str()),
+            Some("q1")
+        );
+        assert_eq!(
+            ideogram_segment_at_position(&ideogram, 9_999).map(|band| band.name.as_str()),
+            Some("q2")
+        );
+        assert_eq!(
+            cytoband_hover_text("chr1", &ideogram.segments[2]),
+            "chr1 · q2 · 10,000–10,000 · gneg"
+        );
     }
 
     #[test]
@@ -954,6 +1166,83 @@ mod tests {
                 .any(|label| label.contains("Contig chr1; total length 10,000 bp")),
             "accessibility labels: {labels:?}"
         );
+    }
+
+    #[test]
+    fn ideogram_exposes_centromere_context_in_the_accessibility_tree() {
+        let contig = rgv_core::ContigId::new(0);
+        let dictionary = rgv_core::ReferenceDictionary::from_contigs([("chr1".to_owned(), 10_000)]);
+        let mut assembly = GenomeAssembly::from_dictionary("test", dictionary);
+        for (start, end, name, stain) in [
+            (0, 4_000, "p1", CytobandStain::Negative),
+            (4_000, 4_800, "p11", CytobandStain::Centromere),
+            (4_800, 5_600, "q11", CytobandStain::Centromere),
+            (5_600, 10_000, "q1", CytobandStain::Positive50),
+        ] {
+            assembly.cytobands.push(rgv_core::Cytoband {
+                interval: rgv_core::GenomicInterval::new(contig, start, end).unwrap(),
+                name: name.to_owned(),
+                stain,
+            });
+        }
+        let viewport = Viewport::new(
+            rgv_core::GenomicInterval::new(contig, 100, 200).unwrap(),
+            800.0,
+        )
+        .unwrap();
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let metrics = super::super::GenomeContextMetrics::default();
+        let context_height = metrics.context_height(true);
+        let workspace = super::super::WorkspaceLayoutSnapshot::compute(
+            super::super::WorkspaceLayoutInput::new(
+                Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, context_height + 400.0)),
+                Rect::from_min_size(
+                    egui::pos2(900.0, 0.0),
+                    egui::vec2(340.0, context_height + 400.0),
+                ),
+                true,
+                vec![super::super::WorkspacePanelLayoutInput {
+                    panel_id: rgv_core::PanelId::new(1),
+                    contig_name: "chr1".to_owned(),
+                    contig_length: 10_000,
+                    cytobands: super::super::CytobandAvailability::Present,
+                }],
+                metrics,
+                1.0,
+                1.0,
+            ),
+            1,
+        );
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            let _ = paint_genome_context(
+                ui,
+                &assembly,
+                "chr1",
+                10_000,
+                viewport,
+                &GenomeOverviewData::default(),
+                1,
+                &workspace.panels[0],
+            );
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+        let ideogram = update
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::Image
+                    && node.label().is_some_and(|label| {
+                        label.contains("Chromosome ideogram for chr1")
+                            && label.contains("centromere bases 4,001 through 5,600")
+                    }))
+                .then_some(node)
+            })
+            .expect("ideogram is present in the accessibility tree");
+        let bounds = ideogram.bounds().expect("ideogram has exact bounds");
+        let cytoband = workspace.panels[0].context_rows.cytoband.unwrap();
+        assert!((bounds.x0 - f64::from(cytoband.left())).abs() < 0.01);
+        assert!((bounds.x1 - f64::from(cytoband.right())).abs() < 0.01);
     }
 
     #[test]

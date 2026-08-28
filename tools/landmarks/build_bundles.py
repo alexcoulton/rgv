@@ -142,6 +142,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--force", action="store_true", help="Download existing assets again.")
+    parser.add_argument(
+        "--validate-existing",
+        action="store_true",
+        help="Validate installed bundles and print their gene/cytoband qualification without downloading.",
+    )
     return parser.parse_args(argv)
 
 
@@ -552,6 +557,130 @@ def write_gzip_lines(path: Path, lines: Iterable[str]) -> None:
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
+
+
+def validate_curated_gene_assets(representatives: Path, names: Path) -> int:
+    """Verify the runtime gene model and symbol-search assets describe the same records."""
+    representative_by_transcript: dict[str, tuple[str, str, int, int, str]] = {}
+    for fields in refgene_rows(representatives):
+        transcript = fields[0]
+        if transcript in representative_by_transcript:
+            raise ValueError(f"duplicate representative transcript {transcript!r}")
+        symbol = fields[11]
+        if not symbol:
+            raise ValueError(f"representative transcript {transcript!r} has no gene symbol")
+        representative_by_transcript[transcript] = (
+            symbol,
+            fields[1],
+            int(fields[3]),
+            int(fields[4]),
+            fields[2],
+        )
+
+    search_by_transcript: dict[str, tuple[str, str, int, int, str]] = {}
+    with gzip.open(names, "rt", encoding="utf-8", newline="") as stream:
+        schema = stream.readline().rstrip("\r\n")
+        if schema != SEARCH_SCHEMA_VERSION:
+            raise ValueError(f"unsupported gene-search schema {schema!r}")
+        for line_number, line in enumerate(stream, 2):
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) != 9:
+                raise ValueError(
+                    f"gene-search row {line_number} has {len(fields)} fields instead of 9"
+                )
+            normalized, symbol, gene_id, transcript, chrom, start, end, strand, _ = fields
+            if not symbol or not gene_id or not transcript:
+                raise ValueError(f"gene-search row {line_number} has incomplete identity")
+            if normalized != symbol.casefold():
+                raise ValueError(
+                    f"gene-search row {line_number} has a normalized symbol mismatch"
+                )
+            if strand not in {"+", "-"}:
+                raise ValueError(f"gene-search row {line_number} has invalid strand {strand!r}")
+            if transcript in search_by_transcript:
+                raise ValueError(f"duplicate gene-search transcript {transcript!r}")
+            search_by_transcript[transcript] = (
+                symbol,
+                chrom,
+                int(start),
+                int(end),
+                strand,
+            )
+
+    if representative_by_transcript.keys() != search_by_transcript.keys():
+        missing_search = sorted(representative_by_transcript.keys() - search_by_transcript.keys())
+        missing_model = sorted(search_by_transcript.keys() - representative_by_transcript.keys())
+        raise ValueError(
+            "representative/search transcript sets disagree: "
+            f"missing search rows {missing_search[:3]}, missing models {missing_model[:3]}"
+        )
+    for transcript, representative in representative_by_transcript.items():
+        search = search_by_transcript[transcript]
+        if representative != search:
+            raise ValueError(
+                f"representative/search metadata disagree for {transcript!r}: "
+                f"{representative!r} != {search!r}"
+            )
+    if not representative_by_transcript:
+        raise ValueError("curated gene assets contain no representative records")
+    return len(representative_by_transcript)
+
+
+def validate_existing_bundle(output_root: Path, identifier: str) -> dict[str, Any]:
+    manifest_path = output_root / identifier / "manifest.json"
+    with manifest_path.open(encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"{identifier} has an unsupported manifest schema")
+    bundle = manifest.get("bundle")
+    if not isinstance(bundle, dict) or bundle.get("id") != identifier:
+        raise ValueError(f"{identifier} manifest has the wrong bundle identity")
+    validate_runtime_bundle(bundle)
+
+    canonical_root = output_root.resolve()
+    assets_by_role: dict[str, Path] = {}
+    for entry in bundle["assets"]:
+        path = (output_root / entry["path"]).resolve()
+        if canonical_root != path and canonical_root not in path.parents:
+            raise ValueError(f"bundle asset {entry['role']} escapes the output root")
+        if not path.is_file():
+            raise ValueError(f"bundle asset {entry['role']} is missing at {path}")
+        if path.stat().st_size != entry["bytes"]:
+            raise ValueError(f"bundle asset {entry['role']} has the wrong byte size")
+        if sha256(path) != entry["sha256"]:
+            raise ValueError(f"bundle asset {entry['role']} has the wrong SHA-256")
+        assets_by_role[entry["role"]] = path
+
+    genes = validate_curated_gene_assets(
+        assets_by_role["representative_genes"], assets_by_role["gene_search"]
+    )
+    assembly = bundle["assembly"]
+    sizes = {contig["name"]: contig["length"] for contig in assembly["contigs"]}
+    primary = {contig["name"] for contig in assembly["contigs"] if contig["primary"]}
+    cytoband_contigs: set[str] = set()
+    acen_contigs: set[str] = set()
+    cytoband_count = 0
+    with assets_by_role["cytobands"].open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) != 5:
+                raise ValueError(f"cytoband row {line_number} has {len(fields)} fields instead of 5")
+            row = validate_cytoband_row(
+                fields[0], int(fields[1]), int(fields[2]), fields[3], fields[4], sizes
+            )
+            if row is None:
+                raise ValueError(f"cytoband row {line_number} targets an unknown contig")
+            cytoband_count += 1
+            cytoband_contigs.add(fields[0])
+            if fields[4] == "acen":
+                acen_contigs.add(fields[0])
+    return {
+        "bundle": identifier,
+        "genes": genes,
+        "cytobands": cytoband_count,
+        "primary_without_cytobands": sorted(primary - cytoband_contigs),
+        "primary_without_acen": sorted(primary - acen_contigs),
+    }
 
 
 def curate_refgene(
@@ -980,6 +1109,12 @@ def build_bundle(spec: BuildSpec, output_root: Path, force: bool) -> dict[str, A
         counts = curate_refgene(landmark_source, genes, names, sizes, order)
     else:
         counts = curate_biggenepred(landmark_source, genes, names, sizes, order)
+    validated_gene_count = validate_curated_gene_assets(genes, names)
+    if validated_gene_count != counts["genes"]:
+        raise ValueError(
+            "curated gene count disagrees with representative/search validation: "
+            f"{counts['genes']} != {validated_gene_count}"
+        )
     assets.extend(
         [
             igv_asset(
@@ -1078,6 +1213,12 @@ def build_bundle(spec: BuildSpec, output_root: Path, force: bool) -> dict[str, A
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     builds = args.builds or list(BUILD_SPECS)
+    if args.validate_existing:
+        qualifications = [
+            validate_existing_bundle(args.output_root, identifier) for identifier in builds
+        ]
+        print(json.dumps(qualifications, indent=2))
+        return 0
     args.output_root.mkdir(parents=True, exist_ok=True)
     catalog_by_id: dict[str, dict[str, Any]] = {}
     catalog_path = args.output_root / "catalog.json"

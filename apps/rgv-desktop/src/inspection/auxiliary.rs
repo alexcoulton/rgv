@@ -112,12 +112,14 @@ pub(crate) fn feature_inspector_document(
 ) -> InspectorDocument {
     let record = &inspector.record;
     let legacy_fields = feature_inspector_legacy_fields(inspector);
-    let gene_name = feature_attribute(record, &["gene_name"]);
+    let identity = record.presentation_identity();
+    let gene_name = identity.display_symbol;
     let transcript_name = feature_attribute(record, &["transcript_name"]);
-    let title = gene_name
+    let transcript_label = transcript_name.or(identity.transcript_id);
+    let title = identity
+        .label()
         .or(transcript_name)
         .map(ToOwned::to_owned)
-        .or_else(|| record.name.clone())
         .unwrap_or_else(|| {
             record
                 .feature_type
@@ -126,7 +128,7 @@ pub(crate) fn feature_inspector_document(
         });
     let feature_type = record.feature_type.as_deref().unwrap_or("Feature");
     let exon_number = feature_attribute(record, &["exon_number"]);
-    let subtitle = transcript_name.map_or_else(
+    let subtitle = transcript_label.map_or_else(
         || feature_type.to_owned(),
         |transcript| {
             exon_number.map_or_else(
@@ -263,12 +265,8 @@ pub(crate) fn feature_inspector_document(
     document.sections.push(overview);
 
     let gene_fields = [
-        semantic_identifier_field("gene-name", "Gene", gene_name),
-        semantic_identifier_field(
-            "gene-id",
-            "Stable identifier",
-            feature_attribute(record, &["gene_id"]),
-        ),
+        semantic_identifier_field("gene-name", "Gene symbol", gene_name),
+        semantic_identifier_field("gene-id", "Gene ID", identity.gene_id),
         feature_attribute(record, &["gene_type", "gene_biotype"]).map(|value| {
             InspectorField::new(
                 "gene-biotype",
@@ -291,12 +289,8 @@ pub(crate) fn feature_inspector_document(
     }
 
     let transcript_fields = [
-        semantic_identifier_field("transcript-name", "Transcript", transcript_name),
-        semantic_identifier_field(
-            "transcript-id",
-            "Stable identifier",
-            feature_attribute(record, &["transcript_id"]),
-        ),
+        semantic_identifier_field("transcript-name", "Transcript name", transcript_name),
+        semantic_identifier_field("transcript-id", "Transcript ID", identity.transcript_id),
         feature_attribute(record, &["transcript_type", "transcript_biotype"]).map(|value| {
             InspectorField::new(
                 "transcript-biotype",

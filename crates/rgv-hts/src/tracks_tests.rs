@@ -486,7 +486,8 @@ fn extended_gene_pred_and_ref_flat_keep_gene_and_transcript_names() {
         false,
     )
     .unwrap();
-    assert_eq!(extended.name.as_deref(), Some("tx2"));
+    assert_eq!(extended.name.as_deref(), Some("GENE2"));
+    assert_eq!(extended.display_label(), Some("GENE2"));
     assert_eq!(extended.score, Some(900.0));
     assert_eq!(
         attribute_value(&extended.attributes, &["gene_name"]).as_deref(),
@@ -500,6 +501,26 @@ fn extended_gene_pred_and_ref_flat_keep_gene_and_transcript_names() {
         attribute_value(&ref_flat.attributes, &["transcript_id"]).as_deref(),
         Some("tx3")
     );
+}
+
+#[test]
+fn feature_presentation_identity_uses_symbols_without_changing_plain_bed_names() {
+    let gene = parse_gff(
+        "chr1\tsrc\tgene\t11\t50\t.\t+\t.\tID=ENSG1;gene_name=ACTB;gene_id=ENSG1",
+        false,
+    )
+    .unwrap();
+    assert_eq!(gene.presentation_identity().display_symbol, Some("ACTB"));
+    assert_eq!(gene.presentation_identity().gene_id, Some("ENSG1"));
+    assert_eq!(gene.display_label(), Some("ACTB"));
+
+    let bed = parse_bed("chr1\t10\t50\tplain-feature").unwrap();
+    assert_eq!(bed.presentation_identity().display_symbol, None);
+    assert_eq!(
+        bed.presentation_identity().record_name,
+        Some("plain-feature")
+    );
+    assert_eq!(bed.display_label(), Some("plain-feature"));
 }
 
 #[test]
@@ -549,9 +570,10 @@ fn big_gene_pred_prefers_the_human_readable_gene_symbol() {
 
     assert_eq!(record.name.as_deref(), Some("GENE1"));
     assert_eq!(
-        attribute_value(&record.attributes, &["gene_name"]).as_deref(),
+        attribute_value(&record.attributes, &["gene_id"]).as_deref(),
         Some("ENSG000001")
     );
+    assert_eq!(record.display_label(), Some("GENE1"));
 }
 
 #[test]

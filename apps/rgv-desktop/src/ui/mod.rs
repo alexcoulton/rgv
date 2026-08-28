@@ -794,6 +794,11 @@ mod tests {
         );
         assert_eq!(mixed.panels[0].cytobands, CytobandAvailability::Present);
         assert_eq!(mixed.panels[1].cytobands, CytobandAvailability::Absent);
+        for panel in &mixed.panels {
+            let cytoband = panel.context_rows.cytoband.unwrap();
+            assert_eq!(cytoband.left(), panel.context_rows.overview.left());
+            assert_eq!(cytoband.right(), panel.context_rows.overview.right());
+        }
     }
 
     #[test]

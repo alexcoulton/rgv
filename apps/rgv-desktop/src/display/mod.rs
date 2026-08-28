@@ -1175,8 +1175,14 @@ impl Viewer {
                     feature_display_mode: config.feature.display_mode,
                     ..TrackLayoutOptions::default()
                 };
-                let gene_display =
-                    layout_features(records, self.panels.active().viewport, options).0;
+                let label_widths = measured_feature_label_widths(&self.egui_context, records);
+                let gene_display = layout_features_with_label_widths(
+                    records,
+                    self.panels.active().viewport,
+                    options,
+                    Some(&label_widths),
+                )
+                .0;
                 pinned_display.rectangles.extend(gene_display.rectangles);
                 pinned_display.texts.extend(gene_display.texts);
             }
@@ -2439,7 +2445,15 @@ impl Viewer {
                     };
                     let track_display = match &snapshot.data {
                         TrackSnapshotData::Features(records) => {
-                            layout_features(records, self.panels.active().viewport, options).0
+                            let label_widths =
+                                measured_feature_label_widths(&self.egui_context, records);
+                            layout_features_with_label_widths(
+                                records,
+                                self.panels.active().viewport,
+                                options,
+                                Some(&label_widths),
+                            )
+                            .0
                         }
                         TrackSnapshotData::Variants(records) => {
                             layout_variants(

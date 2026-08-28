@@ -97,48 +97,183 @@ pub fn format_genomic_position(position: u64) -> String {
 pub struct IdeogramSegment {
     pub x: f32,
     pub width: f32,
+    pub start: u64,
+    pub end: u64,
     pub name: String,
     pub stain: CytobandStain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdeogramCentromere {
+    pub x: f32,
+    pub width: f32,
+    pub waist_x: f32,
+    pub start: u64,
+    pub end: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IdeogramLayout {
     pub segments: Vec<IdeogramSegment>,
+    pub centromere: Option<IdeogramCentromere>,
     pub visible_x: f32,
     pub visible_width: f32,
     pub has_cytobands: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContigAxis {
+    contig_length: u64,
+    left: f32,
+    width: f32,
+}
+
+impl ContigAxis {
+    #[must_use]
+    pub fn new(contig_length: u64, left: f32, width: f32) -> Self {
+        Self {
+            contig_length: contig_length.max(1),
+            left,
+            width: width.max(1.0),
+        }
+    }
+
+    #[must_use]
+    pub const fn contig_length(self) -> u64 {
+        self.contig_length
+    }
+
+    #[must_use]
+    pub const fn left(self) -> f32 {
+        self.left
+    }
+
+    #[must_use]
+    pub const fn width(self) -> f32 {
+        self.width
+    }
+
+    #[must_use]
+    pub fn right(self) -> f32 {
+        self.left + self.width
+    }
+
+    #[must_use]
+    pub fn x_at_boundary(self, boundary: u64) -> f32 {
+        self.left
+            + (boundary.min(self.contig_length) as f64 / self.contig_length as f64
+                * f64::from(self.width)) as f32
+    }
+
+    #[must_use]
+    pub fn x_at_fraction(self, numerator: usize, denominator: usize) -> f32 {
+        if denominator == 0 {
+            return self.left;
+        }
+        self.left + numerator.min(denominator) as f32 / denominator as f32 * self.width
+    }
+
+    #[must_use]
+    pub fn position_at_x(self, x: f32) -> u64 {
+        let fraction = ((x - self.left) / self.width).clamp(0.0, 1.0);
+        (f64::from(fraction) * self.contig_length as f64)
+            .floor()
+            .min(self.contig_length.saturating_sub(1) as f64) as u64
+    }
+
+    #[must_use]
+    pub fn interval_geometry(self, start: u64, end: u64, minimum_width: f32) -> (f32, f32) {
+        let x = self.x_at_boundary(start);
+        let right = self.x_at_boundary(end);
+        (x, (right - x).max(minimum_width))
+    }
+}
+
 pub fn layout_ideogram(
     assembly: &GenomeAssembly,
     contig: rgv_core::ContigId,
-    contig_length: u64,
     visible: GenomicInterval,
-    width: f32,
+    axis: ContigAxis,
 ) -> IdeogramLayout {
-    let width = width.max(1.0);
-    let length = contig_length.max(1) as f64;
     let bands = assembly.cytobands_for(contig).collect::<Vec<_>>();
     let has_cytobands = !bands.is_empty();
     let segments = bands
         .into_iter()
-        .map(|band| IdeogramSegment {
-            x: (band.interval.start() as f64 / length * f64::from(width)) as f32,
-            width: ((band.interval.len() as f64 / length) * f64::from(width)).max(1.0) as f32,
-            name: band.name.clone(),
-            stain: band.stain,
+        .map(|band| {
+            let (x, width) =
+                axis.interval_geometry(band.interval.start(), band.interval.end(), 1.0);
+            IdeogramSegment {
+                x,
+                width,
+                start: band.interval.start(),
+                end: band.interval.end(),
+                name: band.name.clone(),
+                stain: band.stain,
+            }
         })
-        .collect();
-    let visible_start = visible.start().min(contig_length);
-    let visible_end = visible.end().min(contig_length);
+        .collect::<Vec<_>>();
+    let centromere = ideogram_centromere(&segments, axis);
+    let visible_start = visible.start().min(axis.contig_length());
+    let visible_end = visible.end().min(axis.contig_length());
+    let (visible_x, visible_width) = axis.interval_geometry(visible_start, visible_end, 2.0);
     IdeogramLayout {
         segments,
-        visible_x: (visible_start as f64 / length * f64::from(width)) as f32,
-        visible_width: (((visible_end.saturating_sub(visible_start)) as f64 / length)
-            * f64::from(width))
-        .max(2.0) as f32,
+        centromere,
+        visible_x,
+        visible_width,
         has_cytobands,
     }
+}
+
+fn ideogram_centromere(
+    segments: &[IdeogramSegment],
+    axis: ContigAxis,
+) -> Option<IdeogramCentromere> {
+    let mut best = None::<(usize, usize)>;
+    let mut run_start = None;
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.stain == CytobandStain::Centromere {
+            run_start.get_or_insert(index);
+        } else if let Some(start) = run_start.take()
+            && best.is_none_or(|(best_start, best_end)| {
+                segments[index - 1]
+                    .end
+                    .saturating_sub(segments[start].start)
+                    > segments[best_end]
+                        .end
+                        .saturating_sub(segments[best_start].start)
+            })
+        {
+            best = Some((start, index - 1));
+        }
+    }
+    if let Some(start) = run_start {
+        let end = segments.len() - 1;
+        if best.is_none_or(|(best_start, best_end)| {
+            segments[end].end.saturating_sub(segments[start].start)
+                > segments[best_end]
+                    .end
+                    .saturating_sub(segments[best_start].start)
+        }) {
+            best = Some((start, end));
+        }
+    }
+    let (first, last) = best?;
+    let start = segments[first].start;
+    let end = segments[last].end;
+    let waist = if first < last {
+        segments[first + (last - first + 1) / 2 - 1].end
+    } else {
+        start + end.saturating_sub(start) / 2
+    };
+    let (x, width) = axis.interval_geometry(start, end, 1.0);
+    Some(IdeogramCentromere {
+        x,
+        width,
+        waist_x: axis.x_at_boundary(waist),
+        start,
+        end,
+    })
 }
 
 #[cfg(test)]
@@ -170,7 +305,12 @@ mod tests {
             ReferenceDictionary::from_contigs([("chr1".to_owned(), 1_000)]),
         );
         let visible = GenomicInterval::new(contig, 250, 500).unwrap();
-        let layout = layout_ideogram(&assembly, contig, 1_000, visible, 400.0);
+        let layout = layout_ideogram(
+            &assembly,
+            contig,
+            visible,
+            ContigAxis::new(1_000, 0.0, 400.0),
+        );
         assert!(!layout.has_cytobands);
         assert!(layout.segments.is_empty());
         assert!((layout.visible_x - 100.0).abs() < f32::EPSILON);
@@ -192,12 +332,60 @@ mod tests {
         let layout = layout_ideogram(
             &assembly,
             contig,
-            1_000,
             GenomicInterval::new(contig, 0, 100).unwrap(),
-            400.0,
+            ContigAxis::new(1_000, 0.0, 400.0),
         );
         assert!(layout.has_cytobands);
         assert!((layout.segments[0].width - 200.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn contig_axis_is_shared_by_bands_visible_interval_and_pointer_mapping() {
+        let axis = ContigAxis::new(10_000, 100.0, 1_000.0);
+        assert_eq!(axis.x_at_boundary(0), 100.0);
+        assert_eq!(axis.x_at_boundary(5_000), 600.0);
+        assert_eq!(axis.x_at_boundary(10_000), 1_100.0);
+        assert_eq!(axis.position_at_x(100.0), 0);
+        assert_eq!(axis.position_at_x(600.0), 5_000);
+        assert_eq!(axis.position_at_x(1_100.0), 9_999);
+        assert_eq!(axis.interval_geometry(2_500, 5_000, 2.0), (350.0, 250.0));
+    }
+
+    #[test]
+    fn ideogram_derives_a_typed_centromere_from_the_acen_pair() {
+        let contig = ContigId::new(0);
+        let mut assembly = GenomeAssembly::from_dictionary(
+            "test",
+            ReferenceDictionary::from_contigs([("chr1".to_owned(), 1_000)]),
+        );
+        for (start, end, name, stain) in [
+            (0, 400, "p1", CytobandStain::Negative),
+            (400, 480, "p11", CytobandStain::Centromere),
+            (480, 560, "q11", CytobandStain::Centromere),
+            (560, 1_000, "q1", CytobandStain::Positive50),
+        ] {
+            assembly.cytobands.push(Cytoband {
+                interval: GenomicInterval::new(contig, start, end).unwrap(),
+                name: name.to_owned(),
+                stain,
+            });
+        }
+        let layout = layout_ideogram(
+            &assembly,
+            contig,
+            GenomicInterval::new(contig, 100, 200).unwrap(),
+            ContigAxis::new(1_000, 20.0, 500.0),
+        );
+        assert_eq!(
+            layout.centromere,
+            Some(IdeogramCentromere {
+                x: 220.0,
+                width: 80.0,
+                waist_x: 260.0,
+                start: 400,
+                end: 560,
+            })
+        );
     }
 
     #[test]

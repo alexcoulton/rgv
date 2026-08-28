@@ -22,7 +22,9 @@ include multi-gigabyte FASTA or 2bit sequences; their manifests preserve the mat
 For mouse tables, representative selection prefers `NM_`, `NR_`, `XM_`, then `XR_` accessions,
 followed by coding length, spliced length, genomic span, and stable accession. Exon arrays and all
 coordinates are validated against IGV's chromosome-size file. The unfiltered source table is kept
-beside the compact derived track.
+beside the compact derived track. Every build also cross-validates the representative gene model
+and symbol-search assets before its manifest is written: transcript, symbol, contig, coordinates,
+and strand must agree one-for-one, and every search row must retain a non-empty stable gene ID.
 
 ## Build or refresh the local catalogue
 
@@ -35,6 +37,16 @@ Build only selected assemblies with repeatable `--build` arguments:
 ```sh
 scripts/build-landmark-bundles.sh --build hg19 --build mm39
 ```
+
+Validate every installed file, representative/search identity pair, and cytoband record without
+performing any network requests:
+
+```sh
+scripts/build-landmark-bundles.sh --validate-existing
+```
+
+The validation report lists primary contigs without cytobands or `acen` records so missing
+centromere structure is explicit rather than inferred.
 
 Outputs are written to:
 
