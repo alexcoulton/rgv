@@ -418,6 +418,28 @@ fn pointer_gesture_holds_atomic_commit_after_a_cadence_query_finishes() {
 }
 
 #[test]
+fn pointer_release_keeps_preview_until_target_row_geometry_is_ready() {
+    assert!(!navigation_target_ready_for_commit(
+        NavigationPresentationPhase::Preview,
+        false,
+        true,
+        false,
+    ));
+    assert!(navigation_target_ready_for_commit(
+        NavigationPresentationPhase::Preview,
+        false,
+        true,
+        true,
+    ));
+    assert!(!navigation_target_ready_for_commit(
+        NavigationPresentationPhase::Preview,
+        true,
+        true,
+        true,
+    ));
+}
+
+#[test]
 fn navigation_commit_remains_noninteractive_until_frame_submission() {
     let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
     let now = Instant::now();

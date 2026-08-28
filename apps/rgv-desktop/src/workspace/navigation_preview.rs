@@ -324,6 +324,20 @@ impl NavigationPresentation {
     }
 }
 
+pub(crate) const fn navigation_target_ready_for_commit(
+    phase: NavigationPresentationPhase,
+    hold_commit_until_end: bool,
+    data_settled: bool,
+    row_layouts_settled: bool,
+) -> bool {
+    matches!(
+        phase,
+        NavigationPresentationPhase::Preview | NavigationPresentationPhase::CheckingWithoutPreview
+    ) && !hold_commit_until_end
+        && data_settled
+        && row_layouts_settled
+}
+
 pub(crate) fn navigation_preview_has_useful_overlap(
     source: &NavigationPreviewSource,
     target: Viewport,

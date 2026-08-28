@@ -171,16 +171,7 @@ impl Viewer {
             return false;
         }
         let panel_generation = panel.generation_clock.current().get();
-        let alignments_settled = self
-            .alignment_tracks
-            .iter()
-            .all(|track| match track.lifecycle {
-                AlignmentTrackLifecycle::Opening => false,
-                AlignmentTrackLifecycle::Ready => track
-                    .projection(panel_id)
-                    .is_some_and(AlignmentPanelProjection::query_is_current),
-                AlignmentTrackLifecycle::Failed(_) => true,
-            });
+        let alignments_settled = self.panel_alignment_queries_are_settled(panel_id);
         let reference_settled = self.reference_engine.is_none()
             || panel.viewport.bases_per_pixel() > MAXIMUM_BASE_MARK_BASES_PER_PIXEL
             || panel.reference_query_error_generation == Some(panel_generation)
@@ -195,8 +186,20 @@ impl Viewer {
         alignments_settled && reference_settled && tracks_settled
     }
 
+    fn panel_alignment_queries_are_settled(&self, panel_id: PanelId) -> bool {
+        self.alignment_tracks
+            .iter()
+            .all(|track| match track.lifecycle {
+                AlignmentTrackLifecycle::Opening => false,
+                AlignmentTrackLifecycle::Ready => track
+                    .projection(panel_id)
+                    .is_some_and(AlignmentPanelProjection::query_is_current),
+                AlignmentTrackLifecycle::Failed(_) => true,
+            })
+    }
+
     fn update_navigation_readiness(&mut self) {
-        let ready = self
+        let candidate_ids = self
             .panels
             .iter()
             .filter(|panel| {
@@ -204,11 +207,31 @@ impl Viewer {
                     panel.navigation_presentation.phase,
                     NavigationPresentationPhase::Preview
                         | NavigationPresentationPhase::CheckingWithoutPreview
-                ) && !panel.navigation_query_schedule.hold_commit_until_end
-                    && self.panel_navigation_data_is_settled(panel.id)
+                )
             })
             .map(|panel| panel.id)
             .collect::<Vec<_>>();
+        let active_id = self.panels.active().id;
+        let mut ready = Vec::new();
+        for panel_id in candidate_ids {
+            let alignment_queries_settled = self.panel_alignment_queries_are_settled(panel_id);
+            self.panels.activate(panel_id);
+            let row_layouts_settled = alignment_queries_settled && self.ensure_alignment_rows();
+            let data_settled = self.panel_navigation_data_is_settled(panel_id);
+            let panel = self
+                .panels
+                .get(panel_id)
+                .expect("navigation candidate belongs to the panel workspace");
+            if navigation_target_ready_for_commit(
+                panel.navigation_presentation.phase,
+                panel.navigation_query_schedule.hold_commit_until_end,
+                data_settled,
+                row_layouts_settled,
+            ) {
+                ready.push(panel_id);
+            }
+        }
+        self.panels.activate(active_id);
         if ready.is_empty() {
             return;
         }

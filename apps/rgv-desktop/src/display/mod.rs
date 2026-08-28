@@ -594,7 +594,19 @@ impl Viewer {
                 alignment_sort_position(AlignmentSortMode::Base, None, viewport);
         }
         let filters = self.alignment_tracks[track_index].config.filters.clone();
-        let Some(query) = self.alignment_query_for_track(track_id).cloned() else {
+        // Row geometry is part of an atomic navigation target. It must be
+        // prepared while the retained drag preview is still visible, before
+        // the presentation enters its live Committing frame. The ordinary
+        // `alignment_query_for_track` accessor deliberately hides query-local
+        // data during Preview, so use the current projection directly here.
+        let Some(query) = self
+            .alignment_tracks
+            .get(track_index)
+            .and_then(|track| track.projection(panel_id))
+            .filter(|projection| projection.query_is_current())
+            .and_then(|projection| projection.current_query.as_ref())
+            .cloned()
+        else {
             return true;
         };
         let layout_query = self.alignment_tracks[track_index]
