@@ -148,7 +148,9 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   down/up to zoom in/out around the press position, click to recenter, and double-click to show the
   complete contig. Indexed BAM sources contribute a stable, logarithmic whole-contig occupancy
   preview derived from BAI/CSI metadata, so zooming into a small query does not erase the rest of
-  the navigation map. This preview estimates alignment density without scanning every record;
+  the navigation map. At Overview detail the alignment lanes also settle in this index-only state:
+  RGV does not request or decode BAM/CRAM records until the viewport returns to Regional, Reads, or
+  Bases detail. This preview estimates alignment density without scanning every record;
   sources without a spatial index summary fall back to loaded alignment coverage, where a faint
   band distinguishes the queried span from unqueried portions of the contig. Pan and zoom can be
   combined in one diagonal gesture. Horizontal movement is

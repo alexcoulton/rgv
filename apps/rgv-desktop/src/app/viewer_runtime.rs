@@ -553,6 +553,8 @@ impl Viewer {
             automation,
             control_service,
             automation_exit_requested: false,
+            exit_confirmation_open: false,
+            user_exit_requested: false,
             cache_budgets,
             locus_editor,
             resizing_annotation_track: None,

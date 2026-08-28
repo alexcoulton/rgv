@@ -1488,6 +1488,8 @@ pub fn paint_track_viewport_chrome_with_sections(
         let frame_pane = frame.channel;
         let read_pane_frame = frame_pane == TrackPane::Reads;
         let group_header = matches!(frame.key, TrackFrameKey::Group { .. });
+        let only_read_data_panel =
+            read_pane_frame && !frame.collapsed && sections.read_track_count == 1;
         let track_group = if let TrackFrameKey::Group {
             channel,
             id: group_id,
@@ -2455,7 +2457,8 @@ pub fn paint_track_viewport_chrome_with_sections(
                 );
             }
         }
-        if boundary_inside_clip(bottom, frame_clip_top, frame_clip_bottom) {
+        if !only_read_data_panel && boundary_inside_clip(bottom, frame_clip_top, frame_clip_bottom)
+        {
             painter.line_segment(
                 [
                     pos2(geometry.viewport.left(), bottom),
@@ -2465,7 +2468,7 @@ pub fn paint_track_viewport_chrome_with_sections(
             );
         }
 
-        if frame.collapsed {
+        if frame.collapsed || only_read_data_panel {
             continue;
         }
         if !boundary_inside_clip(bottom, frame_clip_top, frame_clip_bottom) {
@@ -4792,6 +4795,88 @@ mod tests {
             actions,
             vec![TrackUiAction::ResizeReadTrackStarted(track_id, 100.0)]
         );
+    }
+
+    #[test]
+    fn a_single_read_panel_has_no_lower_resize_boundary() {
+        let context = egui::Context::default();
+        let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
+        let track_id = TrackId::new(9);
+        let frames = [TrackFrame {
+            key: TrackFrameKey::Alignment(track_id),
+            channel: TrackPane::Reads,
+            name: "Reads · sample A".to_owned(),
+            kind: TrackKind::Alignment,
+            source_label: None,
+            top: 200.0,
+            bottom: 500.0,
+            visible: true,
+            collapsed: false,
+            frozen_bottom: Some(222.0),
+            subtracks: vec![TrackSubtrack {
+                label: "Reads".to_owned(),
+                detail: None,
+                top: 222.0,
+                bottom: 500.0,
+                collapsed: false,
+                composite_member: None,
+            }],
+        }];
+        let pointer = pos2(50.0, 499.0);
+        let render = |ui: &mut Ui| {
+            paint_track_viewport_chrome_with_sections(
+                ui,
+                CanvasGeometry::from_viewport(ui.max_rect()),
+                &frames,
+                0.0,
+                0.0,
+                0.0,
+                200.0,
+                None,
+                &[],
+                &[],
+                &[],
+                TrackSectionChrome {
+                    annotation_expanded: true,
+                    reads_expanded: true,
+                    annotation_track_count: 0,
+                    read_track_count: 1,
+                    annotation_content_top: 0.0,
+                    read_content_top: 200.0,
+                },
+            )
+        };
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render(ui);
+            },
+        );
+        let mut actions = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events: vec![
+                    egui::Event::PointerMoved(pointer),
+                    egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..egui::RawInput::default()
+            },
+            |ui| actions = render(ui).actions,
+        );
+
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            TrackUiAction::ResizeReadTrackStarted(id, _) if *id == track_id
+        )));
     }
 
     #[test]

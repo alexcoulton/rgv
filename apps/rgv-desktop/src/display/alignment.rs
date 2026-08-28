@@ -1,5 +1,63 @@
 use super::*;
 
+pub(crate) const INDEX_ONLY_READ_NOTICE: &str = "zoom in to see read data";
+
+pub(crate) fn index_only_read_notice(mapped_record_count: Option<u64>) -> String {
+    mapped_record_count.map_or_else(
+        || INDEX_ONLY_READ_NOTICE.to_owned(),
+        |count| {
+            format!(
+                "{count} indexed alignment{} on this contig — zoom in to view individual reads",
+                if count == 1 { "" } else { "s" }
+            )
+        },
+    )
+}
+
+/// Builds the visible read-pane empty state used while chromosome-scale
+/// overview is served from the alignment index alone. This deliberately does
+/// not depend on an alignment query or layout: overview mode creates neither.
+pub(crate) fn index_only_read_display(
+    width: f32,
+    top: f32,
+    bottom: f32,
+    mapped_record_count: Option<u64>,
+) -> DisplayList {
+    let mut display = DisplayList::default();
+    let notice_top = top + 5.0;
+    let notice_height = 32.0_f32.min((bottom - notice_top - 5.0).max(0.0));
+    let notice_width = (width - 24.0).max(0.0);
+    if notice_width <= 0.0 || notice_height <= 0.0 {
+        return display;
+    }
+    display.rectangles.push(RectPrimitive {
+        x: 12.0,
+        y: notice_top,
+        width: notice_width,
+        height: notice_height,
+        color: Rgba::new(0.92, 0.94, 0.97, 0.95),
+        object_id: 0,
+        shape: Default::default(),
+    });
+    display.rectangles.push(RectPrimitive {
+        x: 12.0,
+        y: notice_top,
+        width: 3.0_f32.min(notice_width),
+        height: notice_height,
+        color: Rgba::new(0.25, 0.45, 0.72, 0.90),
+        object_id: 0,
+        shape: Default::default(),
+    });
+    display.texts.push(rgv_layout::TextPrimitive {
+        x: width * 0.5,
+        y: notice_top + notice_height * 0.5,
+        text: index_only_read_notice(mapped_record_count),
+        font_size: 12.0,
+        color: Rgba::new(0.25, 0.29, 0.35, 1.0),
+    });
+    display
+}
+
 pub(crate) fn apply_alignment_annotation_height(
     options: &mut AlignmentLayoutOptions,
     frame_top: f32,
@@ -74,10 +132,11 @@ impl ReadPanelSpec {
     }
 }
 
-/// Pure lower-pane layout. Preferred heights are literal pixel sizes and
-/// unused space remains bottom slack. If headers plus minimum content cannot
-/// fit, rows retain their interaction minimum and `content_bottom` extends
-/// beyond the pane; the caller owns the conventional parent overflow camera.
+/// Pure lower-pane layout. A sole read panel occupies the complete pane; with
+/// multiple rows, preferred heights are literal pixel sizes and unused space
+/// remains bottom slack. If headers plus minimum content cannot fit, rows
+/// retain their interaction minimum and `content_bottom` extends beyond the
+/// pane; the caller owns the conventional parent overflow camera.
 pub(crate) fn read_pane_layout(
     tracks: &[ReadPanelSpec],
     pane_top: f32,
@@ -141,6 +200,12 @@ pub(crate) fn read_pane_layout(
             ),
         })
         .collect::<Vec<_>>();
+    if tracks.len() == 1 && expanded_count == 1 {
+        // There is no sibling boundary to preserve or resize. Ignore a stale
+        // saved height and let the only read panel follow the pane divider and
+        // window size automatically.
+        desired_expanded_heights[0] = total.max(MINIMUM_EXPANDED_PANEL_HEIGHT);
+    }
     let minimum_total = header_total + expanded_count as f32 * MINIMUM_EXPANDED_PANEL_HEIGHT;
     let desired_total = header_total + desired_expanded_heights.iter().sum::<f32>();
     if desired_total > total && total >= minimum_total {
@@ -260,11 +325,23 @@ pub(crate) fn secondary_alignment_track_layout(
         .as_ref()
         .and_then(|dictionary| interval_for_track(dictionary, contig_name, viewport.interval()));
     let projection = track.projection_mut(panel_id);
+    // Select overview presentation from the current viewport immediately.
+    // A regional query may remain retained until query dispatch settles, but
+    // rendering it here would expose a stale count for the previous interval.
+    let index_only_overview =
+        projection.index_only_overview || viewport.detail_level() == DetailLevel::Overview;
     let Some(query) = projection.current_query.clone().filter(|query| {
-        expected_interval.is_some_and(|interval| retained_data_overlaps(query.interval, interval))
+        !index_only_overview
+            && expected_interval
+                .is_some_and(|interval| retained_data_overlaps(query.interval, interval))
     }) else {
+        if index_only_overview {
+            frame_bottom = frame_top + 48.0;
+        }
         let status = if let Some(message) = &projection.unavailable {
             format!("Unavailable: {message}")
+        } else if index_only_overview {
+            "Index-only overview · no alignment records requested".to_owned()
         } else {
             match &lifecycle {
                 AlignmentTrackLifecycle::Opening => "Opening…".to_owned(),

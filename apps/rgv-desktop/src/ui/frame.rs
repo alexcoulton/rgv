@@ -490,6 +490,8 @@ impl Viewer {
         let mut locus_editor = self.locus_editor.clone();
         let mut navigate_requested = false;
         let mut command_palette_open = self.open_panel == Some(UiPanel::CommandPalette);
+        let mut exit_confirmation_open = self.exit_confirmation_open;
+        let mut user_exit_requested = false;
         let mut command_search = self.command_search.clone();
         let mut palette_command = None;
         let mut remote_source_open = self.open_panel == Some(UiPanel::RemoteSource);
@@ -2649,6 +2651,8 @@ impl Viewer {
             metadata_track_rows = workspace_dialogs.metadata_track_rows;
             ui::show_diagnostics(ui.ctx(), &mut diagnostics_open, &diagnostics);
             let mut system_dialogs = ui::system_dialogs::SystemDialogDraft {
+                exit_confirmation_open,
+                exit_requested: false,
                 command_palette_open,
                 command_search: command_search.clone(),
                 palette_command,
@@ -2676,6 +2680,8 @@ impl Viewer {
                 dismiss_recovery,
             };
             ui::system_dialogs::show_system_dialogs(self, ui, &mut system_dialogs);
+            exit_confirmation_open = system_dialogs.exit_confirmation_open;
+            user_exit_requested |= system_dialogs.exit_requested;
             command_palette_open = system_dialogs.command_palette_open;
             command_search = system_dialogs.command_search;
             palette_command = system_dialogs.palette_command;
@@ -2712,6 +2718,8 @@ impl Viewer {
         self.announced_status.clone_from(&data_status);
         self.genomic_canvas_layer_id = genomic_canvas_layer_id;
         self.command_search = command_search;
+        self.exit_confirmation_open = exit_confirmation_open;
+        self.user_exit_requested |= user_exit_requested;
         self.diagnostics_open = diagnostics_open;
         self.recovery_open = recovery_open && !dismiss_recovery && recovery_requested.is_none();
         let properties_resize_active =

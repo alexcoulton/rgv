@@ -2,6 +2,8 @@ use super::super::*;
 
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct SystemDialogDraft {
+    pub(crate) exit_confirmation_open: bool,
+    pub(crate) exit_requested: bool,
     pub(crate) command_palette_open: bool,
     pub(crate) command_search: String,
     pub(crate) palette_command: Option<UiCommand>,
@@ -404,5 +406,32 @@ pub(crate) fn show_system_dialogs(
                             "A recovered snapshot opens as an unsaved project, so it cannot overwrite the original accidentally.",
                         );
                     });
+    }
+    // Paint the exit confirmation last so it remains above any already-open
+    // window. Modal blocks interactions with the workspace until dismissed.
+    if draft.exit_confirmation_open {
+        let response = egui::Modal::new(egui::Id::new("exit-confirmation")).show(ui.ctx(), |ui| {
+            ui.heading("Exit RGV?");
+            let shortcut = if cfg!(target_os = "macos") {
+                "Cmd+W"
+            } else {
+                "Ctrl+W"
+            };
+            ui.label(format!(
+                "Press {shortcut} again to exit RGV, or choose an option below."
+            ));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    draft.exit_confirmation_open = false;
+                }
+                if ui.button("Exit RGV").clicked() {
+                    draft.exit_requested = true;
+                }
+            });
+        });
+        if response.should_close() {
+            draft.exit_confirmation_open = false;
+        }
     }
 }

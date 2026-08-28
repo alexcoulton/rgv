@@ -12,6 +12,21 @@ pub(crate) fn snapshot_record_count(snapshot: &TrackSnapshot) -> usize {
     }
 }
 
+pub(crate) fn pinned_gene_layout_maximum_rows(height: f32) -> usize {
+    ((height / 20.0).floor() as usize).clamp(1, TrackLayoutOptions::default().maximum_rows)
+}
+
+pub(crate) fn feature_layout_row_count(
+    maximum_rows: usize,
+    display_mode: FeatureDisplayMode,
+) -> usize {
+    match display_mode {
+        FeatureDisplayMode::Collapsed => 1,
+        FeatureDisplayMode::Squished => maximum_rows.saturating_mul(2).max(1),
+        FeatureDisplayMode::Expanded => maximum_rows.max(1),
+    }
+}
+
 pub(crate) fn quantitative_overlay_members<'a>(
     anchor: &'a TrackConfig,
     tracks: &[&'a TrackConfig],

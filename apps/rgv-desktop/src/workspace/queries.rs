@@ -444,6 +444,7 @@ impl Viewer {
                             projection.query_stats = Some(query.stats);
                             projection.current_query = Some(Arc::clone(query));
                             projection.unavailable = None;
+                            projection.index_only_overview = false;
                             projection.settled_generation = Some(request.generation().get());
                             track.cache_stats = Some(*cache_stats);
                             track.remote_io_stats = *remote_io_stats;

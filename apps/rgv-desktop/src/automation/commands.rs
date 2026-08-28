@@ -197,7 +197,8 @@ impl Viewer {
                             || projection.settled_generation
                                 != Some(projection.clock.current().get())
                             || (projection.current_query.is_none()
-                                && projection.unavailable.is_none())
+                                && projection.unavailable.is_none()
+                                && !projection.index_only_overview)
                         {
                             return false;
                         }
@@ -1412,11 +1413,14 @@ impl Viewer {
                 .max(0.0);
                 let maximum_annotation_scroll = maximum_shared_annotation_scroll;
                 let filters = self.primary_alignment_filters();
-                let query = self
+                let alignment_projection = self
                     .alignment_tracks
                     .first()
-                    .and_then(|track| track.projection(panel.id))
-                    .and_then(|projection| projection.current_query.as_deref());
+                    .and_then(|track| track.projection(panel.id));
+                let query =
+                    alignment_projection.and_then(|projection| projection.current_query.as_deref());
+                let index_only_overview =
+                    alignment_projection.is_some_and(|projection| projection.index_only_overview);
                 let layout_stats = self
                     .alignment_tracks
                     .first()
@@ -1446,6 +1450,8 @@ impl Viewer {
                         && (lane != "reads" && lane != "modifications" || reads_rendered);
                     let omission_reason = (!rendered).then_some(if !configured {
                         AutomationRenderOmissionReason::Disabled
+                    } else if index_only_overview {
+                        AutomationRenderOmissionReason::OverviewDetailThreshold
                     } else if query.is_none() {
                         if panel.pending_queries.alignment {
                             AutomationRenderOmissionReason::Loading

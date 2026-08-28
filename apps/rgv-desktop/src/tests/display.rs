@@ -1,7 +1,9 @@
 use super::super::*;
 use crate::display::alignment::{
-    ReadPanelKey, ReadPanelSpec, read_pane_layout, read_panel_bounds, read_panel_bounds_for_track,
+    INDEX_ONLY_READ_NOTICE, ReadPanelKey, ReadPanelSpec, index_only_read_display,
+    index_only_read_notice, read_pane_layout, read_panel_bounds, read_panel_bounds_for_track,
 };
+use crate::display::auxiliary::{feature_layout_row_count, pinned_gene_layout_maximum_rows};
 use crate::display::{
     ANNOTATION_PANE_BACKGROUND, PINNED_ALIGNMENT_COVERAGE_HEIGHT,
     PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT, PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
@@ -31,6 +33,27 @@ fn read_panels_tile_the_read_pane_with_independent_viewport_heights() {
     assert_eq!(bounds[1].key, ReadPanelKey::Track(second));
     assert_eq!((bounds[1].top, bounds[1].bottom), (500.0, 600.0));
     assert_eq!(bounds[0].bottom, bounds[1].top);
+}
+
+#[test]
+fn a_single_read_panel_occupies_the_pane_without_a_saved_bottom_bound() {
+    let track = TrackId::new(101);
+    let layout = read_pane_layout(
+        &[ReadPanelSpec::expanded(
+            ReadPanelKey::Track(track),
+            Some(100.0),
+        )],
+        200.0,
+        600.0,
+    );
+
+    assert_eq!(layout.bounds.len(), 1);
+    assert_eq!(layout.bounds[0].key, ReadPanelKey::Track(track));
+    assert_eq!(
+        (layout.bounds[0].top, layout.bounds[0].bottom),
+        (200.0, 600.0)
+    );
+    assert_eq!(layout.content_bottom, 600.0);
 }
 
 #[test]
@@ -715,6 +738,33 @@ fn zoom_out_retains_data_from_the_overlapping_loaded_interval() {
 
     let disjoint_view = GenomicInterval::new(contig, 920_000, 930_000).unwrap();
     assert!(!retained_data_overlaps(loaded, disjoint_view));
+}
+
+#[test]
+fn index_only_overview_builds_a_visible_read_canvas_notice_without_query_data() {
+    let display = index_only_read_display(800.0, 240.0, 500.0, None);
+
+    assert_eq!(display.rectangles.len(), 2);
+    assert_eq!(display.texts.len(), 1);
+    assert_eq!(display.texts[0].text, INDEX_ONLY_READ_NOTICE);
+    assert_eq!((display.texts[0].x, display.texts[0].y), (400.0, 261.0));
+    assert!(display.texts[0].y >= 240.0 && display.texts[0].y < 500.0);
+
+    let clipped = display.scrolled_and_clipped_vertical(0.0, 240.0, 500.0);
+    assert_eq!(clipped.texts, display.texts);
+}
+
+#[test]
+fn index_only_overview_prefers_the_indexed_contig_count_when_available() {
+    assert_eq!(
+        index_only_read_notice(Some(31)),
+        "31 indexed alignments on this contig — zoom in to view individual reads"
+    );
+    assert_eq!(
+        index_only_read_notice(Some(1)),
+        "1 indexed alignment on this contig — zoom in to view individual reads"
+    );
+    assert_eq!(index_only_read_notice(None), INDEX_ONLY_READ_NOTICE);
 }
 
 #[test]
@@ -1732,6 +1782,49 @@ fn feature_picking_uses_the_same_packed_row_as_rendering() {
             FeatureDisplayMode::Collapsed
         ),
         Some(1)
+    );
+}
+
+#[test]
+fn pinned_gene_picking_uses_the_rendered_row_count() {
+    let height = 154.386_72;
+    let layout_maximum_rows = pinned_gene_layout_maximum_rows(height);
+    let rendered_rows = feature_layout_row_count(layout_maximum_rows, FeatureDisplayMode::Expanded);
+    let third_row_pointer = 2.5 * height / rendered_rows as f32;
+    let picked_row = (third_row_pointer / (height / rendered_rows as f32)).floor() as usize;
+    let records = (0..7)
+        .map(|index| rgv_hts::FeatureRecord {
+            contig: "chr1".to_owned(),
+            start: 100,
+            end: 300,
+            name: Some(format!("row-{index}")),
+            feature_type: Some("transcript".to_owned()),
+            score: None,
+            strand: rgv_hts::Strand::Forward,
+            blocks: vec![(100, 300)],
+            coding_interval: None,
+            peak: None,
+            attributes: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 300).unwrap(),
+        1_000.0,
+    )
+    .unwrap();
+
+    assert_eq!(layout_maximum_rows, 7);
+    assert_eq!(picked_row, 2);
+    assert_eq!(
+        feature_record_index_at_position_and_row(
+            &records,
+            viewport,
+            200,
+            picked_row,
+            rendered_rows,
+            FeatureDisplayMode::Expanded,
+        ),
+        Some(2)
     );
 }
 

@@ -58,9 +58,23 @@ impl ApplicationHandler for Application {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && is_exit_shortcut(&event.logical_key, viewer.modifiers) =>
+            {
+                if confirm_or_exit(&mut viewer.exit_confirmation_open) {
+                    event_loop.exit();
+                } else {
+                    viewer.window.request_redraw();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
                     && event.logical_key == Key::Named(NamedKey::Escape) =>
             {
-                if viewer.open_panel.take().is_some() {
+                if viewer.exit_confirmation_open {
+                    viewer.exit_confirmation_open = false;
+                    viewer.window.request_redraw();
+                } else if viewer.open_panel.take().is_some() {
                     viewer.command_search.clear();
                     viewer.window.request_redraw();
                 } else {
@@ -187,7 +201,7 @@ impl ApplicationHandler for Application {
             let now = Instant::now();
             viewer.maybe_start_autosave(now);
             viewer.advance_automation(now);
-            if viewer.automation_exit_requested {
+            if viewer.automation_exit_requested || viewer.user_exit_requested {
                 event_loop.exit();
                 return;
             }
@@ -251,6 +265,20 @@ const fn should_request_egui_redraw(event: &WindowEvent, repaint: bool) -> bool 
     repaint && !matches!(event, WindowEvent::RedrawRequested)
 }
 
+fn is_exit_shortcut(key: &Key, modifiers: ModifiersState) -> bool {
+    (modifiers.control_key() || modifiers.super_key())
+        && matches!(key, Key::Character(character) if character.eq_ignore_ascii_case("w"))
+}
+
+fn confirm_or_exit(confirmation_open: &mut bool) -> bool {
+    if *confirmation_open {
+        true
+    } else {
+        *confirmation_open = true;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +300,28 @@ mod tests {
         assert!(!should_request_egui_redraw(
             &WindowEvent::Focused(true),
             false,
+        ));
+    }
+
+    #[test]
+    fn exit_shortcut_requires_confirmation_before_exit() {
+        let mut confirmation_open = false;
+
+        assert!(!confirm_or_exit(&mut confirmation_open));
+        assert!(confirmation_open);
+        assert!(confirm_or_exit(&mut confirmation_open));
+    }
+
+    #[test]
+    fn exit_shortcut_accepts_primary_modifiers_only() {
+        let w = Key::Character("w".into());
+
+        assert!(is_exit_shortcut(&w, ModifiersState::SUPER));
+        assert!(is_exit_shortcut(&w, ModifiersState::CONTROL));
+        assert!(!is_exit_shortcut(&w, ModifiersState::empty()));
+        assert!(!is_exit_shortcut(
+            &Key::Character("x".into()),
+            ModifiersState::SUPER,
         ));
     }
 }

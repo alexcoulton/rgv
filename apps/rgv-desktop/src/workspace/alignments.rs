@@ -54,12 +54,30 @@ pub(crate) struct AlignmentPanelProjection {
     pub(crate) clock: GenerationClock,
     pub(crate) settled_generation: Option<u64>,
     pub(crate) unavailable: Option<String>,
+    /// The viewport is at overview detail and is intentionally represented by
+    /// the alignment index rather than a BAM/CRAM record query.
+    pub(crate) index_only_overview: bool,
     pub(crate) pending_query: bool,
     pub(crate) current_query: Option<Arc<AlignmentQuery>>,
     pub(crate) query_stats: Option<QueryStats>,
     pub(crate) alignment_rows: Option<CachedAlignmentRows>,
     pub(crate) cached_layout: Option<(LayoutTileKey, Arc<AlignmentLayout>)>,
     pub(crate) last_query_resolution: Option<AlignmentQueryResolution>,
+}
+
+impl AlignmentPanelProjection {
+    pub(crate) fn settle_index_only_overview(&mut self, resolution: AlignmentQueryResolution) {
+        debug_assert!(!resolution.requires_alignment_records());
+        self.pending_query = false;
+        self.current_query = None;
+        self.query_stats = None;
+        self.alignment_rows = None;
+        self.cached_layout = None;
+        self.unavailable = None;
+        self.index_only_overview = true;
+        self.last_query_resolution = Some(resolution);
+        self.settled_generation = Some(self.clock.current().get());
+    }
 }
 
 const RESIZE_COVERAGE_BIN_STEP: usize = 64;
@@ -90,6 +108,10 @@ impl AlignmentQueryResolution {
         self.detail != previous.detail
             || self.collect_alleles != previous.collect_alleles
             || self.coverage_bucket() != previous.coverage_bucket()
+    }
+
+    pub(crate) const fn requires_alignment_records(self) -> bool {
+        !matches!(self.detail, DetailLevel::Overview)
     }
 
     const fn coverage_bucket(self) -> usize {
@@ -167,6 +189,7 @@ impl AlignmentTrackController {
         };
         if let Some(projection) = self.projections.get_mut(&panel_id) {
             projection.unavailable = None;
+            projection.index_only_overview = false;
         }
         Some(interval)
     }
@@ -178,6 +201,7 @@ impl AlignmentTrackController {
         projection.alignment_rows = None;
         projection.cached_layout = None;
         projection.unavailable = Some(message);
+        projection.index_only_overview = false;
         projection.settled_generation = Some(projection.clock.current().get());
     }
 

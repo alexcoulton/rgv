@@ -1,5 +1,9 @@
 /target/
 /fuzz/target/
+
+# Large public BAM/FASTA/GTF fixtures are shared between local worktrees and
+# are never repository content.
+/benchmark-data/large-public-alignments/
 .DS_Store
 
 # Local visual references supplied during GUI review.

@@ -801,7 +801,7 @@ impl Viewer {
                 let options = TrackLayoutOptions {
                     top: frame_top,
                     height,
-                    maximum_rows: ((height / 20.0).floor() as usize).clamp(1, 12),
+                    maximum_rows: pinned_gene_layout_maximum_rows(height),
                     selected_record: self
                         .panels
                         .active()
@@ -865,7 +865,8 @@ impl Viewer {
                 collapsed_annotation_group_members.contains(&primary_alignment_id)
             );
         }
-        if primary_source_available
+        if self.panels.active().viewport.detail_level() != DetailLevel::Overview
+            && primary_source_available
             && (primary_annotation_effective || primary_read_effective)
             && let Some(query) = self
                 .alignment_query_for_track(primary_alignment_id)
@@ -1134,6 +1135,7 @@ impl Viewer {
                 read_panel_displays.push(ReadPanelDisplayCache {
                     track_id: primary_alignment_id,
                     scrollable: primary_read_display,
+                    density_camera: true,
                     overview: ui::ScrollbarOverview::default(),
                     actual_content_bottom: actual_read_content_bottom,
                     clip_top: primary_read_bounds.top.max(read_clip_top),
@@ -1415,12 +1417,18 @@ impl Viewer {
         } else if self.primary_alignment_source().is_some()
             && !collapsed_annotation_group_members.contains(&primary_alignment_id)
         {
+            let index_only_overview = self
+                .alignment_tracks
+                .first()
+                .and_then(|track| track.projection(self.panels.active().id))
+                .is_some_and(|projection| projection.index_only_overview)
+                || self.panels.active().viewport.detail_level() == DetailLevel::Overview;
             if let Some(track) = self.alignment_tracks.first_mut() {
                 track.projection_mut(self.panels.active().id).cached_layout = None;
             }
             let visible = true;
             let collapsed = !primary_annotation_desired;
-            let natural_bottom = top + 26.0;
+            let natural_bottom = top + if index_only_overview { 48.0 } else { 26.0 };
             let bottom = natural_bottom;
             self.panels.active_mut().track_frames.push(TrackFrame {
                 key: TrackFrameKey::Alignment(primary_alignment_id),
@@ -1433,7 +1441,19 @@ impl Viewer {
                 visible,
                 collapsed,
                 frozen_bottom: None,
-                subtracks: Vec::new(),
+                subtracks: index_only_overview
+                    .then(|| TrackSubtrack {
+                        label: "Index-only overview".to_owned(),
+                        detail: Some(
+                            "BAI/CSI occupancy · no alignment records requested".to_owned(),
+                        ),
+                        top: top + 22.0,
+                        bottom,
+                        collapsed: false,
+                        composite_member: None,
+                    })
+                    .into_iter()
+                    .collect(),
             });
             top = bottom;
         }
@@ -1585,6 +1605,7 @@ impl Viewer {
                     read_panel_displays.push(ReadPanelDisplayCache {
                         track_id,
                         scrollable: read_display,
+                        density_camera: true,
                         overview: ui::ScrollbarOverview::default(),
                         actual_content_bottom: natural_bottom,
                         clip_top: read_bounds.top.max(read_clip_top),
@@ -1638,7 +1659,43 @@ impl Viewer {
                 .track_presentation
                 .pane_track_state(ui::TrackPane::Reads, track_id)
                 .is_some_and(|node| node.content_visible);
+            let index_only_overview = track
+                .projection(self.panels.active().id)
+                .is_some_and(|projection| projection.index_only_overview)
+                || self.panels.active().viewport.detail_level() == DetailLevel::Overview;
+            let mapped_record_count = track
+                .dictionary
+                .as_ref()
+                .and_then(|dictionary| dictionary.id_by_name(&self.panels.active().contig_name))
+                .and_then(|contig| {
+                    track
+                        .index_overview
+                        .as_ref()
+                        .and_then(|overview| overview.contig_mapped_record_count(contig))
+                });
             let bottom = bounds.bottom.max(bounds.top + READ_PANE_HEADER_HEIGHT);
+            let content_top = bounds.top + READ_PANE_HEADER_HEIGHT;
+            if index_only_overview
+                && desired
+                && bottom > content_top
+                && bottom > read_clip_top
+                && bounds.top < scroll_clip_bottom
+            {
+                read_panel_displays.push(ReadPanelDisplayCache {
+                    track_id,
+                    scrollable: alignment::index_only_read_display(
+                        self.active_panel_rect().width(),
+                        content_top,
+                        bottom,
+                        mapped_record_count,
+                    ),
+                    density_camera: false,
+                    overview: ui::ScrollbarOverview::default(),
+                    actual_content_bottom: bottom,
+                    clip_top: bounds.top.max(read_clip_top),
+                    clip_bottom: bottom.min(scroll_clip_bottom),
+                });
+            }
             self.panels.active_mut().track_frames.push(TrackFrame {
                 key: TrackFrameKey::Alignment(track_id),
                 channel: ui::TrackPane::Reads,
@@ -1649,8 +1706,23 @@ impl Viewer {
                 bottom,
                 visible: true,
                 collapsed: !desired,
-                frozen_bottom: Some(bottom),
-                subtracks: vec![collapsed_alignment_subtrack("Reads", bounds.top)],
+                frozen_bottom: Some(if index_only_overview && desired {
+                    content_top
+                } else {
+                    bottom
+                }),
+                subtracks: if index_only_overview && desired {
+                    vec![TrackSubtrack {
+                        label: "Reads".to_owned(),
+                        detail: None,
+                        top: content_top,
+                        bottom,
+                        collapsed: false,
+                        composite_member: None,
+                    }]
+                } else {
+                    vec![collapsed_alignment_subtrack("Reads", bounds.top)]
+                },
             });
         }
         let display_configs = effective_auxiliary_configs
@@ -2123,10 +2195,14 @@ impl Viewer {
         for read_panel in &mut read_panel_displays {
             let density = self
                 .alignment_density_for_panel_track(self.panels.active().id, read_panel.track_id);
-            let padding = vertical_density_camera_padding(
-                (read_panel.clip_bottom - read_panel.clip_top).max(1.0),
-                density,
-            );
+            let padding = if read_panel.density_camera {
+                vertical_density_camera_padding(
+                    (read_panel.clip_bottom - read_panel.clip_top).max(1.0),
+                    density,
+                )
+            } else {
+                0.0
+            };
             let content_bottom = read_panel.actual_content_bottom + padding;
             let state = self
                 .panels
@@ -2217,6 +2293,7 @@ impl Viewer {
                     read_panel.actual_content_bottom,
                     read_panel.clip_top,
                     read_panel.clip_bottom,
+                    read_panel.density_camera,
                     self.alignment_density_for_panel_track(
                         self.panels.active().id,
                         read_panel.track_id,
@@ -2250,7 +2327,9 @@ impl Viewer {
             content_bottom_points: panel.content_bottom_points,
             density: None,
         };
-        for (track_id, actual_bottom, clip_top, clip_bottom, density) in &read_panel_metrics {
+        for (track_id, actual_bottom, clip_top, clip_bottom, density_camera, density) in
+            &read_panel_metrics
+        {
             let state = panel
                 .read_panel_scrolls
                 .entry(*track_id)
@@ -2261,8 +2340,11 @@ impl Viewer {
                         ReadPanelScrollState::default()
                     }
                 });
-            let camera_padding =
-                vertical_density_camera_padding((clip_bottom - clip_top).max(1.0), *density);
+            let camera_padding = if *density_camera {
+                vertical_density_camera_padding((clip_bottom - clip_top).max(1.0), *density)
+            } else {
+                0.0
+            };
             state.content_origin_points = state.content_origin_points.clamp(0.0, camera_padding);
             let maximum_scroll = (actual_bottom + camera_padding - clip_bottom).max(0.0);
             let previous_maximum = (state.content_bottom_points - clip_bottom).max(0.0);

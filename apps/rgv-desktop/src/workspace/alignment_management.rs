@@ -24,6 +24,40 @@ impl Viewer {
             self.panels.active_mut().pending_queries.alignment = false;
             return;
         }
+        let viewport = self.panels.active().viewport;
+        let resolution = AlignmentQueryResolution::for_viewport(viewport);
+        let panel_id = self.panels.active().id;
+        if !resolution.requires_alignment_records() {
+            let mut settled = 0_usize;
+            for track in &mut self.alignment_tracks {
+                match &track.lifecycle {
+                    AlignmentTrackLifecycle::Opening => {}
+                    AlignmentTrackLifecycle::Ready => {
+                        track
+                            .projection_mut(panel_id)
+                            .settle_index_only_overview(resolution);
+                        settled = settled.saturating_add(1);
+                    }
+                    AlignmentTrackLifecycle::Failed(_) => {
+                        let projection = track.projection_mut(panel_id);
+                        projection.pending_query = false;
+                        projection.index_only_overview = false;
+                    }
+                }
+            }
+            self.panels.active_mut().pending_queries.alignment =
+                self.alignment_tracks.iter().any(|track| {
+                    track
+                        .projection(panel_id)
+                        .is_some_and(|projection| projection.pending_query)
+                });
+            if settled > 0 {
+                self.data_status = format!(
+                    "Index-only overview for {settled} alignment track(s); no records requested"
+                );
+            }
+            return;
+        }
         let record_requests = self
             .alignment_tracks
             .iter()
@@ -40,10 +74,7 @@ impl Viewer {
         let record_allocations = allocate_workspace_records(panel_record_budget, &record_requests);
         let viewport_interval = self.panels.active().viewport.interval();
         let contig_name = self.panels.active().contig_name.clone();
-        let viewport = self.panels.active().viewport;
-        let resolution = AlignmentQueryResolution::for_viewport(viewport);
         let mut sent = 0_usize;
-        let panel_id = self.panels.active().id;
         for (track, record_allocation) in self.alignment_tracks.iter_mut().zip(record_allocations) {
             let Some(interval) = track.prepare_query_interval(
                 panel_id,

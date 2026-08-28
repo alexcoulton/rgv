@@ -22,6 +22,7 @@ pub(crate) struct PanelScrollDisplayCache {
 pub(crate) struct ReadPanelDisplayCache {
     pub(crate) track_id: TrackId,
     pub(crate) scrollable: DisplayList,
+    pub(crate) density_camera: bool,
     pub(crate) overview: ScrollbarOverview,
     pub(crate) actual_content_bottom: f32,
     pub(crate) clip_top: f32,

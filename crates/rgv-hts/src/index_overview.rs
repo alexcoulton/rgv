@@ -18,6 +18,7 @@ pub const ALIGNMENT_INDEX_OVERVIEW_BINS: usize = 256;
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlignmentIndexOverview {
     contigs: Vec<Vec<u64>>,
+    mapped_record_counts: Vec<Option<u64>>,
 }
 
 impl AlignmentIndexOverview {
@@ -32,7 +33,24 @@ impl AlignmentIndexOverview {
                 index_density_bins(index, reference_sequence_id, contig.length())
             })
             .collect();
-        Self { contigs }
+        let mapped_record_counts = dictionary
+            .iter()
+            .enumerate()
+            .map(|(reference_sequence_id, _)| {
+                index
+                    .reference_sequences()
+                    .nth(reference_sequence_id)
+                    .and_then(|reference| {
+                        reference
+                            .metadata()
+                            .map(|metadata| metadata.mapped_record_count())
+                    })
+            })
+            .collect();
+        Self {
+            contigs,
+            mapped_record_counts,
+        }
     }
 
     pub fn contig_bins(&self, contig: ContigId) -> Option<&[u64]> {
@@ -40,6 +58,17 @@ impl AlignmentIndexOverview {
             .ok()
             .and_then(|index| self.contigs.get(index))
             .map(Vec::as_slice)
+    }
+
+    /// Exact mapped-record total stored in the BAI/CSI metadata for one
+    /// reference sequence. This is independent of any regional record query
+    /// and does not reflect viewer-side filters.
+    pub fn contig_mapped_record_count(&self, contig: ContigId) -> Option<u64> {
+        usize::try_from(contig.get())
+            .ok()
+            .and_then(|index| self.mapped_record_counts.get(index))
+            .copied()
+            .flatten()
     }
 }
 
@@ -170,6 +199,11 @@ mod tests {
         assert_eq!(bins.len(), ALIGNMENT_INDEX_OVERVIEW_BINS);
         assert!(bins.iter().any(|density| *density > 0));
         assert!(bins.iter().filter(|density| **density > 0).count() > 1);
+        assert!(
+            overview
+                .contig_mapped_record_count(ContigId::new(1))
+                .is_some()
+        );
     }
 
     #[test]

@@ -1,6 +1,48 @@
 use super::super::*;
 
 #[test]
+fn overview_resolution_is_index_only_and_regional_resolution_requests_records() {
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 1_000_000).unwrap();
+    let overview =
+        AlignmentQueryResolution::for_viewport(Viewport::new(interval, 1_000.0).unwrap());
+    let regional =
+        AlignmentQueryResolution::for_viewport(Viewport::new(interval, 1_001.0).unwrap());
+
+    assert_eq!(overview.detail, DetailLevel::Overview);
+    assert!(!overview.requires_alignment_records());
+    assert_eq!(regional.detail, DetailLevel::Regional);
+    assert!(regional.requires_alignment_records());
+}
+
+#[test]
+fn index_only_overview_settles_without_retaining_alignment_query_state() {
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 1_000_000).unwrap();
+    let resolution =
+        AlignmentQueryResolution::for_viewport(Viewport::new(interval, 1_000.0).unwrap());
+    let mut projection = AlignmentPanelProjection {
+        pending_query: true,
+        unavailable: Some("stale failure".to_owned()),
+        query_stats: Some(rgv_hts::QueryStats::default()),
+        ..AlignmentPanelProjection::default()
+    };
+
+    projection.settle_index_only_overview(resolution);
+
+    assert!(!projection.pending_query);
+    assert!(projection.current_query.is_none());
+    assert!(projection.query_stats.is_none());
+    assert!(projection.alignment_rows.is_none());
+    assert!(projection.cached_layout.is_none());
+    assert!(projection.unavailable.is_none());
+    assert!(projection.index_only_overview);
+    assert_eq!(projection.last_query_resolution, Some(resolution));
+    assert_eq!(
+        projection.settled_generation,
+        Some(projection.clock.current().get())
+    );
+}
+
+#[test]
 fn shell_resize_refreshes_only_after_crossing_a_query_resolution_boundary() {
     let interval = GenomicInterval::new(ContigId::new(0), 0, 20_000).unwrap();
     let previous =

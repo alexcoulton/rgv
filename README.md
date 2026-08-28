@@ -165,7 +165,7 @@ gutter, use the right-edge scrollbar, or hold Shift while scrolling to move vert
 a track label for settings and press Alt+Left/Right for locus history. Use `Escape` to exit.
 Application menus open alignments and tracks, save sessions, export PNG images, and clear the
 decoded-alignment cache. `Ctrl/Cmd+K` opens command search, `Ctrl/Cmd+D` toggles diagnostics, and
-`Ctrl/Cmd+,` opens settings.
+`Ctrl/Cmd+,` opens settings. `Ctrl/Cmd+W` asks for confirmation; press it again to exit.
 
 ### Ready-made manual-review workspaces
 

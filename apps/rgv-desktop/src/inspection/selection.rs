@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::display::primary_pinned_gene_id;
 
 impl Viewer {
     fn visible_track_frame_at_screen_y(
@@ -207,6 +208,10 @@ impl Viewer {
         if track.collapsed {
             return None;
         }
+        let display_mode = track.feature.display_mode;
+        let is_pinned_gene = track.kind == TrackKind::GeneModel
+            && primary_pinned_gene_id(&self.effective_auxiliary_presentation_configs())
+                == Some(track_id);
         let records = self
             .panels
             .active()
@@ -229,14 +234,12 @@ impl Viewer {
             .genomic_at_pixel(f64::from(x - panel_rect.left()))
             .floor()
             .max(0.0) as u64;
-        let maximum_rows = match track.feature.display_mode {
-            FeatureDisplayMode::Collapsed => 1,
-            FeatureDisplayMode::Squished => TrackLayoutOptions::default()
-                .maximum_rows
-                .saturating_mul(2)
-                .max(1),
-            FeatureDisplayMode::Expanded => TrackLayoutOptions::default().maximum_rows.max(1),
+        let layout_maximum_rows = if is_pinned_gene {
+            pinned_gene_layout_maximum_rows(frame.bottom - frame.top)
+        } else {
+            TrackLayoutOptions::default().maximum_rows
         };
+        let maximum_rows = feature_layout_row_count(layout_maximum_rows, display_mode);
         let row_height = (frame.bottom - frame.top) / maximum_rows as f32;
         let selected_row =
             ((content_y - frame.top) / row_height.max(f32::EPSILON)).floor() as usize;
@@ -246,7 +249,7 @@ impl Viewer {
             position,
             selected_row,
             maximum_rows,
-            track.feature.display_mode,
+            display_mode,
         )
         .map(|record_index| FeatureSelection {
             track_id,

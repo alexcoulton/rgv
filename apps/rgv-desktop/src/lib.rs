@@ -717,6 +717,8 @@ struct Viewer {
     automation: Option<AutomationRunner>,
     control_service: Option<ControlService>,
     automation_exit_requested: bool,
+    exit_confirmation_open: bool,
+    user_exit_requested: bool,
     cache_budgets: CacheBudgets,
     locus_editor: String,
     resizing_annotation_track: Option<(TrackFrameKey, f32)>,
