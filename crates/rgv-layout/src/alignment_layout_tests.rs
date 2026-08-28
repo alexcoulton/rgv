@@ -3195,6 +3195,13 @@ fn junction_lane_renders_bounded_strand_aware_full_evidence() {
     assert_eq!(layout.stats.rendered_junctions, 2);
     assert_eq!(layout.stats.hidden_junctions, 0);
     assert_eq!(layout.stats.maximum_junction_depth, 9);
+    assert_eq!(layout.junction_arc_targets.len(), 2);
+    for target in &layout.junction_arc_targets {
+        assert_eq!(
+            layout.display_list.rectangles[target.draw_order as usize], target.primitive,
+            "interaction geometry must be the exact emitted arc primitive"
+        );
+    }
     assert_eq!(
         layout
             .display_list
@@ -3275,20 +3282,145 @@ fn junction_lane_renders_bounded_strand_aware_full_evidence() {
         viewport,
         AlignmentLayoutOptions {
             minimum_junction_depth: 5,
-            selected_junction: [100, 180],
             ..options
         },
     );
     assert_eq!(filtered.display_list.rectangles.len(), 3);
     assert_eq!(filtered.stats.rendered_junctions, 1);
     assert_eq!(filtered.stats.hidden_junctions, 1);
-    assert!(
-        filtered
-            .display_list
-            .rectangles
+    assert_eq!(filtered.junction_arc_targets.len(), 1);
+    assert_eq!(
+        filtered.junction_arc_targets[0].component,
+        JunctionArcComponent::Negative
+    );
+    assert_eq!(
+        filtered.junction_arc_targets[0].primitive.color,
+        Rgba::new(0.25, 0.45, 0.82, 0.82),
+        "selection must preserve the component's biological strand colour"
+    );
+}
+
+#[test]
+fn sashimi_targets_match_only_rendered_components_and_are_deterministic() {
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 200).unwrap();
+    let viewport = Viewport::new(interval, 800.0).unwrap();
+    let mut query = row_test_query(&[]);
+    query.junctions = JunctionSummary {
+        junctions: vec![
+            JunctionEvidence {
+                start: 10,
+                end: 110,
+                depth: 7,
+                positive_depth: 4,
+                negative_depth: 2,
+                unknown_depth: 1,
+                ..JunctionEvidence::default()
+            },
+            JunctionEvidence {
+                start: 30,
+                end: 130,
+                depth: 1,
+                positive_depth: 1,
+                ..JunctionEvidence::default()
+            },
+        ],
+        ..JunctionSummary::default()
+    };
+    let options = AlignmentLayoutOptions {
+        show_reference: false,
+        show_coverage: false,
+        show_reads: false,
+        show_modification_frequency: false,
+        minimum_junction_depth: 2,
+        junction_top: 10.0,
+        junction_height: 40.0,
+        ..AlignmentLayoutOptions::default()
+    };
+
+    let first = layout_alignment_query(&query, viewport, options);
+    let second = layout_alignment_query(&query, viewport, options);
+    assert_eq!(first.junction_arc_targets, second.junction_arc_targets);
+    assert_eq!(first.junction_arc_targets.len(), 3);
+    assert_eq!(
+        first
+            .junction_arc_targets
             .iter()
-            .filter(|rectangle| rectangle.shape != RectShape::Rectangle)
-            .all(|rectangle| rectangle.color == Rgba::new(0.08, 0.08, 0.10, 1.0))
+            .map(|target| target.component)
+            .collect::<Vec<_>>(),
+        vec![
+            JunctionArcComponent::Positive,
+            JunctionArcComponent::Negative,
+            JunctionArcComponent::Unknown,
+        ]
+    );
+    assert!(first.junction_arc_targets.iter().all(|target| {
+        target.junction_index == 0
+            && target.start == 10
+            && target.end == 110
+            && first.display_list.rectangles[target.draw_order as usize] == target.primitive
+    }));
+
+    let expanded = layout_alignment_query(
+        &query,
+        viewport,
+        AlignmentLayoutOptions {
+            junction_display_mode: JunctionDisplayMode::Expanded,
+            ..options
+        },
+    );
+    assert_eq!(
+        first
+            .junction_arc_targets
+            .iter()
+            .map(|target| (target.start, target.end, target.component))
+            .collect::<Vec<_>>(),
+        expanded
+            .junction_arc_targets
+            .iter()
+            .map(|target| (target.start, target.end, target.component))
+            .collect::<Vec<_>>()
+    );
+    assert!(expanded.junction_arc_targets.iter().all(|target| {
+        expanded.display_list.rectangles[target.draw_order as usize] == target.primitive
+    }));
+}
+
+#[test]
+fn sashimi_targets_obey_the_rendered_junction_cap() {
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 200).unwrap();
+    let viewport = Viewport::new(interval, 800.0).unwrap();
+    let mut query = row_test_query(&[]);
+    query.junctions.junctions = (0..=MAX_RENDERED_JUNCTIONS)
+        .map(|index| JunctionEvidence {
+            start: 10,
+            end: 190,
+            depth: u32::try_from(index + 1).unwrap(),
+            positive_depth: u32::try_from(index + 1).unwrap(),
+            ..JunctionEvidence::default()
+        })
+        .collect();
+    let layout = layout_alignment_query(
+        &query,
+        viewport,
+        AlignmentLayoutOptions {
+            show_reference: false,
+            show_coverage: false,
+            show_reads: false,
+            show_modification_frequency: false,
+            show_junction_labels: false,
+            ..AlignmentLayoutOptions::default()
+        },
+    );
+
+    assert_eq!(layout.stats.rendered_junctions, MAX_RENDERED_JUNCTIONS);
+    assert_eq!(layout.stats.hidden_junctions, 1);
+    assert_eq!(layout.junction_arc_targets.len(), MAX_RENDERED_JUNCTIONS);
+    assert!(
+        layout
+            .junction_arc_targets
+            .iter()
+            .all(|target| target.junction_index != 0),
+        "the capped-out junction must not acquire an interaction target"
     );
 }
 

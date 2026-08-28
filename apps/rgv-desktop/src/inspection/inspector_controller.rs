@@ -1,5 +1,17 @@
 use super::super::*;
 
+pub(crate) fn focused_junction_component_value(
+    component: JunctionArcComponent,
+    junction: &rgv_hts::JunctionEvidence,
+) -> String {
+    let (label, depth) = match component {
+        JunctionArcComponent::Positive => ("positive strand", junction.positive_depth),
+        JunctionArcComponent::Negative => ("negative strand", junction.negative_depth),
+        JunctionArcComponent::Unknown => ("unknown strand", junction.unknown_depth),
+    };
+    format!("{label} · {depth} supporting reads")
+}
+
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn inspector_snapshot(&self) -> Option<InspectorSnapshot> {
@@ -760,17 +772,33 @@ impl Viewer {
         {
             return None;
         }
-        if let Some(retained) = &self.panels.active().retained_evidence
+        let hovered = match self.panels.active().hover_inspector_target {
+            Some(HoverInspectorTarget::Junction(track_id, start, end, component)) => {
+                Some((track_id, start, end, component))
+            }
+            _ => None,
+        };
+        if hovered.is_none()
+            && let Some(retained) = &self.panels.active().retained_evidence
             && retained.selection.kind == AutomationSelectionKind::Junction
         {
             return retained.inspector.clone();
         }
-        let (start, end) = self.panels.active().selected_junction?;
-        let track_id = self
-            .panels
-            .active()
-            .selected_alignment_track
-            .unwrap_or_else(|| self.primary_alignment_track_id());
+        let (track_id, start, end, focused_component) = hovered.map_or_else(
+            || {
+                let (start, end) = self.panels.active().selected_junction?;
+                Some((
+                    self.panels
+                        .active()
+                        .selected_alignment_track
+                        .unwrap_or_else(|| self.primary_alignment_track_id()),
+                    start,
+                    end,
+                    self.panels.active().selected_junction_component,
+                ))
+            },
+            |(track_id, start, end, component)| Some((track_id, start, end, Some(component))),
+        )?;
         let query = self.alignment_query_for_track(track_id)?;
         let junction = query
             .junctions
@@ -796,6 +824,8 @@ impl Viewer {
                 )
             }
         };
+        let focused_component = focused_component
+            .map(|component| focused_junction_component_value(component, junction));
         let annotation_context = junction_annotation_context(
             &self.tracks,
             &self.panels.active().track_snapshots,
@@ -816,100 +846,104 @@ impl Viewer {
             }
         };
         let annotation_labels = annotation_context.labels(start, end);
+        let mut fields = vec![
+            (
+                "Track".to_owned(),
+                self.alignment_track_name_for_id(track_id),
+            ),
+            (
+                "Skipped interval".to_owned(),
+                format!("{}:{}-{}", self.panels.active().contig_name, start + 1, end),
+            ),
+            ("Intron length".to_owned(), format!("{} bp", end - start)),
+            ("Depth".to_owned(), junction.depth.to_string()),
+            ("Sashimi count".to_owned(), sashimi_count),
+            ("Annotation status".to_owned(), annotation),
+            (
+                "Annotation evidence".to_owned(),
+                if annotation_labels.is_empty() {
+                    format!(
+                        "{} visible annotation tracks · complete interval {} · record cap reached {}",
+                        annotation_context.lookup.source_tracks,
+                        annotation_context.lookup.complete_for_interval,
+                        annotation_context.source_records_truncated
+                            || annotation_context.lookup.truncated,
+                    )
+                } else {
+                    annotation_labels.join(", ")
+                },
+            ),
+            (
+                "Aligned flanks".to_owned(),
+                format!(
+                    "left {}–{} bp · right {}–{} bp · query minimum {} bp each side",
+                    junction.minimum_left_flank,
+                    junction.maximum_left_flank,
+                    junction.minimum_right_flank,
+                    junction.maximum_right_flank,
+                    provenance.minimum_flank
+                ),
+            ),
+            (
+                "Strand support".to_owned(),
+                format!(
+                    "+ {} · − {} · unknown {}",
+                    junction.positive_depth, junction.negative_depth, junction.unknown_depth
+                ),
+            ),
+            (
+                "Evidence".to_owned(),
+                format!(
+                    "{} supporting / {} spliced / {} eligible reads · {} observations retained / {} examined · {} removed by flank filter{}",
+                    provenance.supporting_spliced_records,
+                    provenance.spliced_records,
+                    provenance.eligible_records,
+                    provenance.junction_observations_retained,
+                    provenance.junction_observations_examined,
+                    provenance.junction_observations_filtered_by_flank,
+                    if provenance.all_eligible_records {
+                        ""
+                    } else {
+                        " · incomplete"
+                    }
+                ),
+            ),
+            (
+                "Strand provenance".to_owned(),
+                format!(
+                    "selected junction: XS +{} / −{} / unknown {} · alignment fallback +{} / −{} · invalid XS {}. Query totals: XS {} · fallback {} · invalid XS {}",
+                    junction.tagged_positive_depth,
+                    junction.tagged_negative_depth,
+                    junction.tagged_unknown_depth,
+                    junction.fallback_positive_depth,
+                    junction.fallback_negative_depth,
+                    junction.invalid_strand_depth,
+                    provenance.xs_tagged_observations,
+                    provenance.alignment_strand_fallback_observations,
+                    provenance.invalid_xs_observations,
+                ),
+            ),
+            (
+                "Bounded aggregation".to_owned(),
+                if provenance.dropped_distinct_junctions == 0
+                    && provenance.dropped_record_junction_observations == 0
+                {
+                    "complete".to_owned()
+                } else {
+                    format!(
+                        "{} distinct junctions dropped at the {}-junction cap · {} excess splice operations dropped at the per-record cap",
+                        provenance.dropped_distinct_junctions,
+                        rgv_hts::MAX_JUNCTIONS,
+                        provenance.dropped_record_junction_observations,
+                    )
+                },
+            ),
+        ];
+        if let Some(focused_component) = focused_component {
+            fields.insert(4, ("Focused component".to_owned(), focused_component));
+        }
         Some(InspectorSnapshot {
-            fields: vec![
-                (
-                    "Track".to_owned(),
-                    self.alignment_track_name_for_id(track_id),
-                ),
-                (
-                    "Skipped interval".to_owned(),
-                    format!("{}:{}-{}", self.panels.active().contig_name, start + 1, end),
-                ),
-                ("Intron length".to_owned(), format!("{} bp", end - start)),
-                ("Depth".to_owned(), junction.depth.to_string()),
-                ("Sashimi count".to_owned(), sashimi_count),
-                ("Annotation status".to_owned(), annotation),
-                (
-                    "Annotation evidence".to_owned(),
-                    if annotation_labels.is_empty() {
-                        format!(
-                            "{} visible annotation tracks · complete interval {} · record cap reached {}",
-                            annotation_context.lookup.source_tracks,
-                            annotation_context.lookup.complete_for_interval,
-                            annotation_context.source_records_truncated
-                                || annotation_context.lookup.truncated,
-                        )
-                    } else {
-                        annotation_labels.join(", ")
-                    },
-                ),
-                (
-                    "Aligned flanks".to_owned(),
-                    format!(
-                        "left {}–{} bp · right {}–{} bp · query minimum {} bp each side",
-                        junction.minimum_left_flank,
-                        junction.maximum_left_flank,
-                        junction.minimum_right_flank,
-                        junction.maximum_right_flank,
-                        provenance.minimum_flank
-                    ),
-                ),
-                (
-                    "Strand support".to_owned(),
-                    format!(
-                        "+ {} · − {} · unknown {}",
-                        junction.positive_depth, junction.negative_depth, junction.unknown_depth
-                    ),
-                ),
-                (
-                    "Evidence".to_owned(),
-                    format!(
-                        "{} supporting / {} spliced / {} eligible reads · {} observations retained / {} examined · {} removed by flank filter{}",
-                        provenance.supporting_spliced_records,
-                        provenance.spliced_records,
-                        provenance.eligible_records,
-                        provenance.junction_observations_retained,
-                        provenance.junction_observations_examined,
-                        provenance.junction_observations_filtered_by_flank,
-                        if provenance.all_eligible_records {
-                            ""
-                        } else {
-                            " · incomplete"
-                        }
-                    ),
-                ),
-                (
-                    "Strand provenance".to_owned(),
-                    format!(
-                        "selected junction: XS +{} / −{} / unknown {} · alignment fallback +{} / −{} · invalid XS {}. Query totals: XS {} · fallback {} · invalid XS {}",
-                        junction.tagged_positive_depth,
-                        junction.tagged_negative_depth,
-                        junction.tagged_unknown_depth,
-                        junction.fallback_positive_depth,
-                        junction.fallback_negative_depth,
-                        junction.invalid_strand_depth,
-                        provenance.xs_tagged_observations,
-                        provenance.alignment_strand_fallback_observations,
-                        provenance.invalid_xs_observations,
-                    ),
-                ),
-                (
-                    "Bounded aggregation".to_owned(),
-                    if provenance.dropped_distinct_junctions == 0
-                        && provenance.dropped_record_junction_observations == 0
-                    {
-                        "complete".to_owned()
-                    } else {
-                        format!(
-                            "{} distinct junctions dropped at the {}-junction cap · {} excess splice operations dropped at the per-record cap",
-                            provenance.dropped_distinct_junctions,
-                            rgv_hts::MAX_JUNCTIONS,
-                            provenance.dropped_record_junction_observations,
-                        )
-                    },
-                ),
-            ],
+            fields,
             auxiliary: Vec::new(),
             event_sequence: None,
             cigar: None,

@@ -136,6 +136,72 @@ impl Viewer {
             counters
         });
         let diagnostic_now = Instant::now();
+        let (sashimi_median, sashimi_p95, sashimi_maximum) = self
+            .sashimi_interaction_diagnostics
+            .duration_summary_micros();
+        let latest_sashimi = &self.sashimi_interaction_diagnostics;
+        let latest_result = latest_sashimi.latest_result;
+        let pointer = latest_sashimi.latest_pointer.map_or_else(
+            || "cursor n/a".to_owned(),
+            |pointer| format!("cursor {:.1},{:.1}", pointer.x, pointer.y),
+        );
+        let phase = latest_sashimi.latest_phase.map_or_else(
+            || "phase n/a".to_owned(),
+            |phase| format!("phase {phase:?}"),
+        );
+        let lane = latest_result.lane_track_id.map_or_else(
+            || "lane none".to_owned(),
+            |track_id| format!("lane track {}", track_id.get()),
+        );
+        let distance = match (
+            latest_result.nearest_curve_distance,
+            latest_result.nearest_acquisition_radius,
+        ) {
+            (Some(distance), Some(radius)) => {
+                format!("nearest {distance:.2} pt / radius {radius:.2} pt")
+            }
+            _ => "nearest n/a".to_owned(),
+        };
+        let acquired = latest_result.hover.map_or_else(
+            || "acquired none".to_owned(),
+            |hover| {
+                format!(
+                    "acquired track {} [{}..{}) {:?}",
+                    hover.key.track_id.get(),
+                    hover.key.start,
+                    hover.key.end,
+                    hover.key.component,
+                )
+            },
+        );
+        let latest_sashimi_probe = format!(
+            "Sashimi latest · {pointer} · {phase} · gate {} · {lane} · targets {} total / {} lane / {} current revision · {} bounds / {} evaluated · {distance} · {acquired} · {} hover overlays",
+            latest_result.gate.label(),
+            latest_result.total_targets,
+            latest_result.track_targets,
+            latest_result.current_revision_targets,
+            latest_result.bounds_candidates,
+            latest_result.curve_evaluations,
+            latest_sashimi.latest_hover_overlay_count,
+        );
+        let sashimi_interaction = format!(
+            "{latest_sashimi_probe}\nSashimi totals · {} targets · {} hit tests / {} bounds candidates / {} curve evaluations · {} acquisitions / {} transfers / {} clears / {} hysteresis retentions / {} stale rejected · {} hover redraws / {} hover layout rebuilds · hit median/p95/max {}/{}/{} µs",
+            self.panels.active().junction_arc_targets.len(),
+            self.sashimi_interaction_diagnostics.hit_tests,
+            self.sashimi_interaction_diagnostics.bounds_candidates,
+            self.sashimi_interaction_diagnostics.curve_evaluations,
+            self.sashimi_interaction_diagnostics.acquisitions,
+            self.sashimi_interaction_diagnostics.transfers,
+            self.sashimi_interaction_diagnostics.clears,
+            self.sashimi_interaction_diagnostics.hysteresis_retentions,
+            self.sashimi_interaction_diagnostics
+                .stale_revision_rejections,
+            self.sashimi_interaction_diagnostics.hover_redraws,
+            self.sashimi_interaction_diagnostics.hover_layout_rebuilds,
+            sashimi_median,
+            sashimi_p95,
+            sashimi_maximum,
+        );
         DiagnosticsSnapshot {
             frame: format!(
                 "{:.2} ms · {:.0} FPS",
@@ -284,20 +350,23 @@ impl Viewer {
                 navigation_counters[9] as f64 / 1_000.0,
                 self.navigation_stale_result_rejections,
             ),
-            interaction: self.interaction_trace.snapshot().map(|trace| {
-                let maximum = trace
-                    .events
-                    .iter()
-                    .filter_map(|event| event.duration_ms)
-                    .fold(0.0_f64, f64::max);
-                format!(
-                    "scroll gesture {} · {} events{} · longest phase {:.2} ms",
-                    trace.gesture_id,
-                    trace.events.len(),
-                    if trace.active { " · recording" } else { "" },
-                    maximum,
-                )
-            }),
+            interaction: Some(self.interaction_trace.snapshot().map_or(
+                sashimi_interaction.clone(),
+                |trace| {
+                    let maximum = trace
+                        .events
+                        .iter()
+                        .filter_map(|event| event.duration_ms)
+                        .fold(0.0_f64, f64::max);
+                    format!(
+                        "scroll gesture {} · {} events{} · longest phase {:.2} ms · {sashimi_interaction}",
+                        trace.gesture_id,
+                        trace.events.len(),
+                        if trace.active { " · recording" } else { "" },
+                        maximum,
+                    )
+                },
+            )),
         }
     }
 }

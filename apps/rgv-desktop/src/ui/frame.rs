@@ -3694,7 +3694,8 @@ impl Viewer {
             let height = (f64::from(self.surface_config.height) / self.window.scale_factor())
                 .round()
                 .clamp(1.0, f64::from(u32::MAX)) as u32;
-            match export_png(&self.composite_display_list, width, height, &path) {
+            let export_display = semantic_export_display_list(&self.composite_display_list);
+            match export_png(&export_display, width, height, &path) {
                 Ok(()) => self.data_status = format!("Exported image to {}", path.display()),
                 Err(error) => self.data_status = error.to_string(),
             }
@@ -3853,6 +3854,7 @@ impl Viewer {
             self.primary_alignment_filters_mut().show_coverage = show_coverage;
             if !show_junctions {
                 self.panels.active_mut().selected_junction = None;
+                self.panels.active_mut().selected_junction_component = None;
             }
             self.primary_alignment_filters_mut().show_junctions = show_junctions;
             self.primary_alignment_filters_mut().minimum_junction_depth =

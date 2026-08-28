@@ -1713,6 +1713,7 @@ fn workspace_annotation_camera_uses_the_range_available_to_every_panel() {
     let cache = |content_bottom, clip_bottom| PanelScrollDisplayCache {
         annotations: DisplayList::default(),
         pinned: DisplayList::default(),
+        junction_arc_keys: BTreeMap::new(),
         annotation_overview: ui::ScrollbarOverview::default(),
         annotation_content_bottom: content_bottom,
         annotation_clip_top: 0.0,

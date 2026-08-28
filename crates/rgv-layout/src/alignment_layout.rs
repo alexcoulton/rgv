@@ -172,7 +172,6 @@ pub struct AlignmentLayoutOptions {
     pub show_junction_labels: bool,
     /// Identity of the derived annotation overlay supplied alongside the query.
     pub junction_annotation_fingerprint: u64,
-    pub selected_junction: [u64; 2],
     pub selected_pileup_position: Option<u64>,
     pub read_base_display_mode: ReadBaseDisplayMode,
     pub shade_read_bases_by_quality: bool,
@@ -228,7 +227,6 @@ impl Default for AlignmentLayoutOptions {
             junction_count_mode: SashimiCountMode::Raw,
             show_junction_labels: true,
             junction_annotation_fingerprint: 0,
-            selected_junction: [u64::MAX; 2],
             selected_pileup_position: None,
             read_base_display_mode: ReadBaseDisplayMode::Mismatches,
             shade_read_bases_by_quality: true,
@@ -286,6 +284,33 @@ pub struct AlignmentLayoutStats {
     /// Maximum number of alignment spans concurrent in the viewport before
     /// grouping/sorting constraints are applied.
     pub natural_stack_height: usize,
+}
+
+/// Strand-specific visual component of one biological splice junction.
+///
+/// The biological selection remains identified by `(start, end)`. This value
+/// preserves which independently rendered line the pointer acquired.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum JunctionArcComponent {
+    Positive,
+    Negative,
+    Unknown,
+}
+
+/// Exact semantic geometry emitted beside one visible Sashimi arc.
+///
+/// `primitive` is the same value appended to the display list. Consumers must
+/// carry it through composition rather than rebuilding curve geometry from the
+/// raw junction query.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JunctionArcTarget {
+    pub junction_index: usize,
+    pub start: u64,
+    pub end: u64,
+    pub component: JunctionArcComponent,
+    pub primitive: RectPrimitive,
+    pub stroke_width: f32,
+    pub draw_order: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -419,6 +444,8 @@ struct SbxRenderState {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AlignmentLayout {
     pub display_list: DisplayList,
+    /// Every and only rendered Sashimi component, in deterministic draw order.
+    pub junction_arc_targets: Vec<JunctionArcTarget>,
     /// Rectangle prefix belonging to the frozen reference and coverage lanes.
     pub pinned_rectangle_count: usize,
     /// Text prefix belonging to the frozen reference and coverage lanes.
@@ -740,13 +767,22 @@ pub fn layout_sashimi(
     annotations: Option<&JunctionAnnotationLookup>,
 ) -> AlignmentLayout {
     let mut display_list = DisplayList::default();
+    let mut junction_arc_targets = Vec::new();
     let (
         rendered_junctions,
         hidden_junctions,
         maximum_junction_value,
         junction_normalization_available,
-    ) = add_junctions(&mut display_list, summary, viewport, &options, annotations);
+    ) = add_junctions(
+        &mut display_list,
+        &mut junction_arc_targets,
+        summary,
+        viewport,
+        &options,
+        annotations,
+    );
     AlignmentLayout {
+        junction_arc_targets,
         pinned_rectangle_count: display_list.rectangles.len(),
         pinned_text_count: display_list.texts.len(),
         stats: AlignmentLayoutStats {
@@ -781,6 +817,7 @@ pub fn layout_alignment_query_with_rows_and_annotations(
 ) -> AlignmentLayout {
     debug_assert_eq!(query.batch.len(), rows.len());
     let mut display_list = DisplayList::default();
+    let mut junction_arc_targets = Vec::new();
     if options.show_reference
         && viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
         && let Some(reference) = &query.reference
@@ -812,6 +849,7 @@ pub fn layout_alignment_query_with_rows_and_annotations(
         junction_normalization_available,
     ) = add_junctions(
         &mut display_list,
+        &mut junction_arc_targets,
         &query.junctions,
         viewport,
         &options,
@@ -881,6 +919,7 @@ pub fn layout_alignment_query_with_rows_and_annotations(
         });
     AlignmentLayout {
         display_list,
+        junction_arc_targets,
         pinned_rectangle_count,
         pinned_text_count,
         stats: AlignmentLayoutStats {

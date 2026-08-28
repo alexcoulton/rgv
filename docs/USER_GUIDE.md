@@ -403,9 +403,20 @@ chevron marks pure positive-strand evidence and a left-facing chevron marks pure
 evidence; mixed evidence has both offset chevrons, while unknown evidence has neither. A small green
 marker means the endpoints match adjacent exons from one transcript in a visible GTF/GFF track;
 orange means novel relative to a complete loaded annotation interval; grey means annotation status
-cannot safely be decided. Click or hover an arc to inspect and copy its skipped interval, intron
-length, raw/normalized count, flank range, per-junction strand-source counts, annotation evidence,
-filter provenance, completeness, and aggregation caps.
+cannot safely be decided. Move the pointer onto the visible line of an arc to highlight that exact
+positive, negative, or unknown component. The cursor changes to a pointing hand and the stroke
+widens while retaining its strand colour. Acquisition follows the nearest drawn curve in screen
+space, including where shallow arcs overlap a prominent junction; support depth is not used to
+steal the pointer. Filtered, capped, hidden, clipped, and provisional navigation arcs are not
+interactive because no corresponding line is committed to the canvas.
+
+Hover is transient and does not replace a clicked selection. With hover-activated Properties it
+temporarily previews the junction under the pointer, then restores the clicked junction on exit;
+with click-activated Properties the visual hover cue still appears. Click a highlighted component
+to retain the whole biological junction and its focused strand component, then inspect or copy its
+skipped interval, intron length, raw/normalized count, flank range, per-junction strand-source
+counts, annotation evidence, filter provenance, completeness, and aggregation caps. Dragging from
+an arc continues to pan normally once it passes the click-motion threshold.
 
 RGV uses `XS:+` or `XS:-` when present. If `XS` is absent, it explicitly falls back to the
 alignment strand and reports how many observations used that fallback. An invalid `XS` value is

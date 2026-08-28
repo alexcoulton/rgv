@@ -4337,6 +4337,7 @@ impl Viewer {
             AutomationSnapshotScope::FullActivePanel => self.full_active_panel_export_display(),
             AutomationSnapshotScope::NativeWindow => unreachable!(),
         };
+        let display = semantic_export_display_list(&display);
         let mut metadata = automation_snapshot_metadata(
             &self.assembly_name,
             &self.panels,

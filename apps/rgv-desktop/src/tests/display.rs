@@ -16,6 +16,7 @@ use crate::display::{
     reflow_annotation_presentation_with_heights, synthetic_read_rows_for_bounds,
     synthetic_section_display, track_section_geometry,
 };
+use rgv_layout::RectShape;
 
 #[test]
 fn read_panels_tile_the_read_pane_with_independent_viewport_heights() {
@@ -961,6 +962,7 @@ fn alignment_layer_partition_keeps_the_header_out_of_the_read_scroll() {
         color: rgv_layout::Rgba::new(0.0, 0.0, 0.0, 1.0),
     };
     let layout = AlignmentLayout {
+        junction_arc_targets: Vec::new(),
         display_list: DisplayList {
             rectangles: vec![primitive(120.0, 0), primitive(280.0, 1)],
             texts: vec![text(120.0, "A"), text(280.0, "G")],
@@ -981,8 +983,206 @@ fn alignment_layer_partition_keeps_the_header_out_of_the_read_scroll() {
 }
 
 #[test]
+fn sashimi_composition_tags_exact_layout_primitives_with_typed_keys() {
+    let primitive = RectPrimitive {
+        x: 10.0,
+        y: 20.0,
+        width: 80.0,
+        height: 18.0,
+        color: Rgba::new(0.84, 0.30, 0.38, 0.82),
+        object_id: 0,
+        shape: RectShape::JunctionArcUp,
+    };
+    let layout = AlignmentLayout {
+        display_list: DisplayList {
+            rectangles: vec![primitive],
+            texts: Vec::new(),
+        },
+        junction_arc_targets: vec![rgv_layout::JunctionArcTarget {
+            junction_index: 3,
+            start: 100,
+            end: 200,
+            component: JunctionArcComponent::Positive,
+            primitive,
+            stroke_width: junction_arc_stroke_width(primitive.height),
+            draw_order: 0,
+        }],
+        pinned_rectangle_count: 1,
+        pinned_text_count: 0,
+        stats: AlignmentLayoutStats::default(),
+    };
+    let track = TrackId::new(7);
+    let mut rectangles = layout.display_list.rectangles.clone();
+    let mut next_token = 1;
+    let mut keys = BTreeMap::new();
+
+    crate::display::tag_layout_junction_arcs(
+        &mut rectangles,
+        &layout,
+        track,
+        &mut next_token,
+        &mut keys,
+    );
+
+    assert_eq!(rectangles[0].object_id, 1);
+    assert_eq!(next_token, 2);
+    assert_eq!(
+        keys.get(&1),
+        Some(&JunctionArcKey {
+            track_id: track,
+            start: 100,
+            end: 200,
+            component: JunctionArcComponent::Positive,
+        })
+    );
+    assert_eq!(
+        RectPrimitive {
+            object_id: 0,
+            ..rectangles[0]
+        },
+        primitive
+    );
+}
+
+#[test]
+fn sashimi_overlays_distinguish_hover_component_from_biological_selection() {
+    let track = TrackId::new(7);
+    let target = |component, shape, color, token| ComposedJunctionArcTarget {
+        key: JunctionArcKey {
+            track_id: track,
+            start: 100,
+            end: 200,
+            component,
+        },
+        primitive: RectPrimitive {
+            x: 10.0,
+            y: 20.0,
+            width: 80.0,
+            height: 18.0,
+            color,
+            object_id: 0,
+            shape,
+        },
+        stroke_width: junction_arc_stroke_width(18.0),
+        draw_order: token,
+        interaction_token: token,
+        content_revision: 4,
+    };
+    let positive = target(
+        JunctionArcComponent::Positive,
+        RectShape::JunctionArcUp,
+        Rgba::new(0.84, 0.30, 0.38, 0.82),
+        1,
+    );
+    let negative = target(
+        JunctionArcComponent::Negative,
+        RectShape::JunctionArcDown,
+        Rgba::new(0.25, 0.45, 0.82, 0.82),
+        2,
+    );
+    let unknown = target(
+        JunctionArcComponent::Unknown,
+        RectShape::JunctionArcUp,
+        Rgba::new(0.42, 0.45, 0.50, 0.76),
+        3,
+    );
+    let targets = [positive, negative, unknown];
+    let mut component_display = DisplayList::default();
+    crate::display::append_sashimi_interaction_overlays(
+        &mut component_display,
+        &targets,
+        Some(JunctionArcHover {
+            key: negative.key,
+            interaction_token: negative.interaction_token,
+            distance_points: 0.0,
+            content_revision: 4,
+        }),
+        Some(track),
+        Some((100, 200)),
+        Some(JunctionArcComponent::Positive),
+    );
+    assert_eq!(component_display.rectangles.len(), 2);
+    assert_eq!(
+        component_display.rectangles[0].shape,
+        RectShape::JunctionArcSelectedUp
+    );
+    assert_eq!(
+        component_display.rectangles[1].shape,
+        RectShape::JunctionArcHoverDown
+    );
+    assert_ne!(
+        component_display.rectangles[0].color,
+        Rgba::new(0.08, 0.08, 0.10, 1.0),
+        "selected interaction feedback must preserve strand identity rather than turn black"
+    );
+
+    let mut endpoint_display = DisplayList::default();
+    crate::display::append_sashimi_interaction_overlays(
+        &mut endpoint_display,
+        &targets,
+        None,
+        Some(track),
+        Some((100, 200)),
+        None,
+    );
+    assert_eq!(endpoint_display.rectangles.len(), 3);
+    assert!(endpoint_display.rectangles.iter().all(|rectangle| matches!(
+        rectangle.shape,
+        RectShape::JunctionArcSelectedUp | RectShape::JunctionArcSelectedDown
+    )));
+}
+
+#[test]
+fn settled_capture_revision_retags_targets_and_rebinds_hover_without_relayout() {
+    let key = JunctionArcKey {
+        track_id: TrackId::new(7),
+        start: 100,
+        end: 200,
+        component: JunctionArcComponent::Positive,
+    };
+    let primitive = RectPrimitive {
+        x: 10.0,
+        y: 20.0,
+        width: 80.0,
+        height: 18.0,
+        color: Rgba::new(0.84, 0.30, 0.38, 0.82),
+        object_id: 0,
+        shape: RectShape::JunctionArcUp,
+    };
+    let mut targets = vec![ComposedJunctionArcTarget {
+        key,
+        primitive,
+        stroke_width: junction_arc_stroke_width(primitive.height),
+        draw_order: 4,
+        interaction_token: 17,
+        content_revision: 3,
+    }];
+    let mut hovered = Some(JunctionArcHover {
+        key,
+        interaction_token: 9,
+        distance_points: 1.25,
+        content_revision: 3,
+    });
+
+    crate::display::synchronize_junction_interaction_revision(&mut targets, &mut hovered, 4);
+
+    assert_eq!(targets[0].content_revision, 4);
+    assert_eq!(targets[0].primitive, primitive);
+    assert_eq!(hovered.unwrap().content_revision, 4);
+    assert_eq!(hovered.unwrap().interaction_token, 17);
+
+    targets.clear();
+    crate::display::synchronize_junction_interaction_revision(&mut targets, &mut hovered, 5);
+    assert!(
+        hovered.is_none(),
+        "a missing semantic target must clear hover"
+    );
+}
+
+#[test]
 fn alignment_layer_partition_clips_reads_to_the_resized_group() {
     let layout = AlignmentLayout {
+        junction_arc_targets: Vec::new(),
         display_list: DisplayList {
             rectangles: vec![rgv_layout::RectPrimitive {
                 x: 0.0,

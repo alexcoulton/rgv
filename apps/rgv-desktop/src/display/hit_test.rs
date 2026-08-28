@@ -1,5 +1,147 @@
 use super::*;
 
+pub(crate) const JUNCTION_ARC_MINIMUM_ACQUISITION_RADIUS: f32 = 4.0;
+pub(crate) const JUNCTION_ARC_ACQUISITION_MARGIN: f32 = 3.0;
+pub(crate) const JUNCTION_ARC_EXIT_MARGIN: f32 = 2.0;
+const JUNCTION_ARC_TRANSFER_ADVANTAGE: f32 = 1.0;
+const JUNCTION_ARC_DISTANCE_TIE_EPSILON: f32 = 0.05;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct JunctionArcHitTestResult {
+    pub(crate) hover: Option<JunctionArcHover>,
+    pub(crate) gate: SashimiHitTestGate,
+    pub(crate) lane_track_id: Option<TrackId>,
+    pub(crate) total_targets: usize,
+    pub(crate) track_targets: usize,
+    pub(crate) current_revision_targets: usize,
+    pub(crate) bounds_candidates: usize,
+    pub(crate) curve_evaluations: usize,
+    pub(crate) stale_revision_rejections: usize,
+    pub(crate) nearest_curve_distance: Option<f32>,
+    pub(crate) nearest_acquisition_radius: Option<f32>,
+    pub(crate) hysteresis_retained: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn junction_arc_target_at_point(
+    targets: &[ComposedJunctionArcTarget],
+    track_id: TrackId,
+    point: egui::Pos2,
+    current: Option<JunctionArcHover>,
+    content_revision: u64,
+) -> Option<JunctionArcHover> {
+    junction_arc_hit_test_at_point(targets, track_id, point, current, content_revision).hover
+}
+
+pub(crate) fn junction_arc_hit_test_at_point(
+    targets: &[ComposedJunctionArcTarget],
+    track_id: TrackId,
+    point: egui::Pos2,
+    current: Option<JunctionArcHover>,
+    content_revision: u64,
+) -> JunctionArcHitTestResult {
+    let bounds_candidates = std::cell::Cell::new(0_usize);
+    let curve_evaluations = std::cell::Cell::new(0_usize);
+    let stale_revision_rejections = std::cell::Cell::new(0_usize);
+    let nearest_curve_distance = std::cell::Cell::new(None::<f32>);
+    let nearest_acquisition_radius = std::cell::Cell::new(None::<f32>);
+    let candidate = |target: &ComposedJunctionArcTarget, exit_margin: f32| {
+        if target.key.track_id != track_id {
+            return None;
+        }
+        if target.content_revision != content_revision {
+            stale_revision_rejections.set(stale_revision_rejections.get().saturating_add(1));
+            return None;
+        }
+        let radius = (target.stroke_width * 0.5 + JUNCTION_ARC_ACQUISITION_MARGIN)
+            .max(JUNCTION_ARC_MINIMUM_ACQUISITION_RADIUS)
+            + exit_margin;
+        let primitive = target.primitive;
+        if point.x < primitive.x - radius
+            || point.x > primitive.x + primitive.width + radius
+            || point.y < primitive.y - radius
+            || point.y > primitive.y + primitive.height + radius
+        {
+            return None;
+        }
+        bounds_candidates.set(bounds_candidates.get().saturating_add(1));
+        curve_evaluations.set(curve_evaluations.get().saturating_add(1));
+        let distance = junction_arc_distance_to_point(primitive, point.x, point.y)?;
+        if nearest_curve_distance
+            .get()
+            .is_none_or(|nearest| distance < nearest)
+        {
+            nearest_curve_distance.set(Some(distance));
+            nearest_acquisition_radius.set(Some(radius));
+        }
+        (distance <= radius).then_some(JunctionArcHover {
+            key: target.key,
+            interaction_token: target.interaction_token,
+            distance_points: distance,
+            content_revision,
+        })
+    };
+    let best = targets
+        .iter()
+        .filter_map(|target| candidate(target, 0.0).map(|hit| (hit, target.draw_order)))
+        .min_by(|(left, left_order), (right, right_order)| {
+            if (left.distance_points - right.distance_points).abs()
+                <= JUNCTION_ARC_DISTANCE_TIE_EPSILON
+            {
+                right_order
+                    .cmp(left_order)
+                    .then_with(|| left.key.cmp(&right.key))
+            } else {
+                left.distance_points.total_cmp(&right.distance_points)
+            }
+        })
+        .map(|(hit, _)| hit);
+    let retained = current
+        .filter(|hover| hover.content_revision == content_revision)
+        .and_then(|hover| {
+            targets
+                .iter()
+                .find(|target| target.key == hover.key)
+                .and_then(|target| candidate(target, JUNCTION_ARC_EXIT_MARGIN))
+        });
+    let (hover, hysteresis_retained) = match (retained, best) {
+        (Some(retained), Some(best))
+            if best.key != retained.key
+                && best.distance_points + JUNCTION_ARC_TRANSFER_ADVANTAGE
+                    < retained.distance_points =>
+        {
+            (Some(best), false)
+        }
+        (Some(retained), best) => (
+            Some(retained),
+            best.is_none_or(|best| best.key != retained.key),
+        ),
+        (None, best) => (best, false),
+    };
+    JunctionArcHitTestResult {
+        hover,
+        gate: SashimiHitTestGate::Tested,
+        lane_track_id: Some(track_id),
+        total_targets: targets.len(),
+        track_targets: targets
+            .iter()
+            .filter(|target| target.key.track_id == track_id)
+            .count(),
+        current_revision_targets: targets
+            .iter()
+            .filter(|target| {
+                target.key.track_id == track_id && target.content_revision == content_revision
+            })
+            .count(),
+        bounds_candidates: bounds_candidates.get(),
+        curve_evaluations: curve_evaluations.get(),
+        stale_revision_rejections: stale_revision_rejections.get(),
+        nearest_curve_distance: nearest_curve_distance.get(),
+        nearest_acquisition_radius: nearest_acquisition_radius.get(),
+        hysteresis_retained,
+    }
+}
+
 pub(crate) fn alignment_record_index(object_id: u32) -> Option<usize> {
     let record_id = record_object_id(object_id);
     (record_id > 0 && record_id < 1_000_000)
@@ -246,24 +388,4 @@ pub(crate) fn modification_position_from_pointer(
         .modifications
         .bin_index_at(query.interval, position)
         .map(|_| position)
-}
-
-pub(crate) fn junction_at_position(
-    summary: &rgv_hts::JunctionSummary,
-    minimum_depth: u32,
-    position: u64,
-) -> Option<(u64, u64)> {
-    summary
-        .junctions
-        .iter()
-        .filter(|junction| {
-            junction.depth >= minimum_depth && position >= junction.start && position < junction.end
-        })
-        .max_by_key(|junction| {
-            (
-                junction.depth,
-                u64::MAX.saturating_sub(junction.end.saturating_sub(junction.start)),
-            )
-        })
-        .map(|junction| (junction.start, junction.end))
 }

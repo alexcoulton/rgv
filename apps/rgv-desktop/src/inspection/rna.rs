@@ -425,20 +425,19 @@ pub(crate) fn sashimi_svg_export(
             let bottom = rectangle.y + rectangle.height;
             let shoulder = rectangle.width * 0.18;
             let stroke_width = rgv_layout::junction_arc_stroke_width(rectangle.height);
-            let (start_y, control_y, end_y) =
-                if rectangle.shape == rgv_layout::RectShape::JunctionArcUp {
-                    (
-                        bottom - stroke_width * 0.5,
-                        top + stroke_width * 0.5,
-                        bottom - stroke_width * 0.5,
-                    )
-                } else {
-                    (
-                        top + stroke_width * 0.5,
-                        bottom - stroke_width * 0.5,
-                        top + stroke_width * 0.5,
-                    )
-                };
+            let (start_y, control_y, end_y) = if rectangle.shape.is_junction_arc_up() {
+                (
+                    bottom - stroke_width * 0.5,
+                    top + stroke_width * 0.5,
+                    bottom - stroke_width * 0.5,
+                )
+            } else {
+                (
+                    top + stroke_width * 0.5,
+                    bottom - stroke_width * 0.5,
+                    top + stroke_width * 0.5,
+                )
+            };
             format!(
                 "<path d=\"M {left:.2} {start_y:.2} C {:.2} {control_y:.2}, {:.2} {control_y:.2}, {right:.2} {end_y:.2}\" fill=\"none\" stroke=\"rgb({red},{green},{blue})\" stroke-opacity=\"{opacity:.3}\" stroke-width=\"{stroke_width:.2}\" stroke-linecap=\"round\"/>\n",
                 left + shoulder,

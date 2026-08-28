@@ -569,6 +569,7 @@ impl Viewer {
             remote_source_editor: RemoteSourceEditor::default(),
             diagnostics_open: false,
             interaction_trace: InteractionTraceRecorder::default(),
+            sashimi_interaction_diagnostics: SashimiInteractionDiagnostics::default(),
             command_search: String::new(),
             annotation_search_generation: 0,
             annotation_navigation_generation: 0,
@@ -1041,16 +1042,35 @@ impl Viewer {
             self.navigation_texture_revisions
                 .insert(*panel_id, *content_revision);
         }
-        self.finish_navigation_commits();
+        let navigation_committed = self.finish_navigation_commits();
         for (panel_id, content_revision) in capture_revisions {
             if let Some(panel) = self.panels.get_mut(panel_id) {
-                panel.navigation_presentation.record_settled_capture(
+                let capture_settled = panel.navigation_presentation.record_settled_capture(
                     panel.viewport,
                     panel.generation_clock.current().get(),
                     content_revision,
                     self.workspace_layout.revision,
                     self.navigation_contract_revision,
                 );
+                if capture_settled {
+                    crate::display::synchronize_junction_interaction_revision(
+                        &mut panel.junction_arc_targets,
+                        &mut panel.hovered_junction_arc,
+                        content_revision,
+                    );
+                }
+            }
+        }
+        if navigation_committed {
+            // The submitted display was composed while the presentation was
+            // Committing, when semantic hit targets are intentionally
+            // suppressed. Republish those targets from the same settled
+            // display cache now that the frame is authoritative. Without this
+            // handoff, visible sashimi curves remain non-interactive until an
+            // unrelated layout or scroll rebuild happens.
+            if !self.refresh_active_panel_scroll_display() {
+                self.display_dirty = true;
+                self.window.request_redraw();
             }
         }
         if self.interaction_trace.is_active() {

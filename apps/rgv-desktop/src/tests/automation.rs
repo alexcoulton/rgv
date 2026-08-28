@@ -399,6 +399,45 @@ fn automation_svg_exports_junction_arcs_as_curved_paths() {
 }
 
 #[test]
+fn semantic_exports_omit_transient_sashimi_hover_overlays() {
+    let base = RectPrimitive {
+        x: 10.0,
+        y: 10.0,
+        width: 40.0,
+        height: 20.0,
+        color: Rgba::new(0.8, 0.2, 0.4, 0.8),
+        object_id: 0,
+        shape: rgv_layout::RectShape::JunctionArcUp,
+    };
+    let display = DisplayList {
+        rectangles: vec![
+            base,
+            RectPrimitive {
+                shape: rgv_layout::RectShape::JunctionArcHoverUp,
+                color: Rgba::new(0.7, 0.3, 0.5, 1.0),
+                ..base
+            },
+        ],
+        texts: Vec::new(),
+    };
+
+    assert_eq!(
+        semantic_export_display_list(&display).rectangles,
+        vec![base]
+    );
+    assert_eq!(
+        cropped_display_list(
+            &display,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 80.0)),
+        )
+        .rectangles,
+        vec![base]
+    );
+    let svg = display_list_svg_export(&display, 100, 80, "junction hover");
+    assert_eq!(svg.matches("<path").count(), 1);
+}
+
+#[test]
 fn automation_svg_exports_breakends_as_brackets_instead_of_arrows() {
     let display = DisplayList {
         rectangles: vec![RectPrimitive {

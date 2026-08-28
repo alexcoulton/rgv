@@ -46,6 +46,14 @@ pub enum RectShape {
     JunctionArcUp = 7,
     /// A smooth splice-junction arc whose endpoints meet the top edge.
     JunctionArcDown = 8,
+    /// Transient upward Sashimi hover overlay.
+    JunctionArcHoverUp = 9,
+    /// Transient downward Sashimi hover overlay.
+    JunctionArcHoverDown = 10,
+    /// Persistent upward Sashimi selection overlay.
+    JunctionArcSelectedUp = 11,
+    /// Persistent downward Sashimi selection overlay.
+    JunctionArcSelectedDown = 12,
 }
 
 impl RectShape {
@@ -57,12 +65,65 @@ impl RectShape {
             Self::DirectionalTerminalRight | Self::ChevronRight | Self::BreakendJoinAfter => {
                 Some(Direction::Right)
             }
-            Self::Rectangle | Self::JunctionArcUp | Self::JunctionArcDown => None,
+            Self::Rectangle
+            | Self::JunctionArcUp
+            | Self::JunctionArcDown
+            | Self::JunctionArcHoverUp
+            | Self::JunctionArcHoverDown
+            | Self::JunctionArcSelectedUp
+            | Self::JunctionArcSelectedDown => None,
         }
     }
 
     pub const fn is_junction_arc(self) -> bool {
-        matches!(self, Self::JunctionArcUp | Self::JunctionArcDown)
+        matches!(
+            self,
+            Self::JunctionArcUp
+                | Self::JunctionArcDown
+                | Self::JunctionArcHoverUp
+                | Self::JunctionArcHoverDown
+                | Self::JunctionArcSelectedUp
+                | Self::JunctionArcSelectedDown
+        )
+    }
+
+    pub const fn is_junction_arc_up(self) -> bool {
+        matches!(
+            self,
+            Self::JunctionArcUp | Self::JunctionArcHoverUp | Self::JunctionArcSelectedUp
+        )
+    }
+
+    pub const fn junction_arc_interaction_expansion(self) -> f32 {
+        match self {
+            Self::JunctionArcHoverUp | Self::JunctionArcHoverDown => 1.5,
+            Self::JunctionArcSelectedUp | Self::JunctionArcSelectedDown => 2.0,
+            _ => 0.0,
+        }
+    }
+
+    pub const fn as_junction_arc_hover(self) -> Self {
+        match self {
+            Self::JunctionArcUp | Self::JunctionArcHoverUp | Self::JunctionArcSelectedUp => {
+                Self::JunctionArcHoverUp
+            }
+            Self::JunctionArcDown | Self::JunctionArcHoverDown | Self::JunctionArcSelectedDown => {
+                Self::JunctionArcHoverDown
+            }
+            _ => self,
+        }
+    }
+
+    pub const fn as_junction_arc_selected(self) -> Self {
+        match self {
+            Self::JunctionArcUp | Self::JunctionArcHoverUp | Self::JunctionArcSelectedUp => {
+                Self::JunctionArcSelectedUp
+            }
+            Self::JunctionArcDown | Self::JunctionArcHoverDown | Self::JunctionArcSelectedDown => {
+                Self::JunctionArcSelectedDown
+            }
+            _ => self,
+        }
     }
 }
 
@@ -71,6 +132,77 @@ impl RectShape {
 /// without expanding the dominant rectangle instance format.
 pub fn junction_arc_stroke_width(height: f32) -> f32 {
     (1.0 + height.max(0.0) * 0.075).clamp(1.25, 4.5)
+}
+
+/// One screen-space sample of the exact Sashimi curve used for rendering and picking.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JunctionArcGeometrySample {
+    /// Logical screen-space Y coordinate of the sampled curve centre.
+    pub curve_y: f32,
+    /// Local `dy/dx` slope at the sample or bounded endpoint.
+    pub slope: f32,
+    /// Normalised stroke distance, or Euclidean distance beyond an endpoint.
+    pub distance: f32,
+    pub bounded_to_endpoint: bool,
+}
+
+/// Samples the Sashimi centre line at a logical point. Points beyond either
+/// endpoint use bounded Euclidean endpoint distance; the parabola is never
+/// extended outside the rendered primitive.
+pub fn junction_arc_geometry_at_point(
+    rectangle: RectPrimitive,
+    point_x: f32,
+    point_y: f32,
+) -> Option<JunctionArcGeometrySample> {
+    if !rectangle.shape.is_junction_arc()
+        || !rectangle.x.is_finite()
+        || !rectangle.y.is_finite()
+        || !rectangle.width.is_finite()
+        || !rectangle.height.is_finite()
+        || !point_x.is_finite()
+        || !point_y.is_finite()
+        || rectangle.width <= 0.0
+        || rectangle.height <= 0.0
+    {
+        return None;
+    }
+    let local_x = point_x - rectangle.x;
+    let local_y = point_y - rectangle.y;
+    let stroke = junction_arc_stroke_width(rectangle.height);
+    let inner_height = (rectangle.height - stroke).max(0.0);
+    let curve_y_at = |fraction: f32| {
+        let parabola = 4.0 * (fraction - 0.5).powi(2);
+        if rectangle.shape.is_junction_arc_up() {
+            stroke * 0.5 + inner_height * parabola
+        } else {
+            rectangle.height - stroke * 0.5 - inner_height * parabola
+        }
+    };
+    let bounded_to_endpoint = local_x < 0.0 || local_x > rectangle.width;
+    let fraction = (local_x / rectangle.width).clamp(0.0, 1.0);
+    let curve_y = curve_y_at(fraction);
+    let slope = 8.0 * inner_height * (fraction - 0.5) / rectangle.width.max(1.0);
+    let distance = if local_x < 0.0 {
+        local_x.hypot(local_y - curve_y)
+    } else if local_x > rectangle.width {
+        (local_x - rectangle.width).hypot(local_y - curve_y)
+    } else {
+        (local_y - curve_y).abs() / (1.0 + slope * slope).sqrt()
+    };
+    Some(JunctionArcGeometrySample {
+        curve_y: rectangle.y + curve_y,
+        slope,
+        distance,
+        bounded_to_endpoint,
+    })
+}
+
+pub fn junction_arc_distance_to_point(
+    rectangle: RectPrimitive,
+    point_x: f32,
+    point_y: f32,
+) -> Option<f32> {
+    junction_arc_geometry_at_point(rectangle, point_x, point_y).map(|sample| sample.distance)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -308,6 +440,86 @@ impl DisplayList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn junction_arc_distance_matches_up_down_curves_and_bounded_endpoints() {
+        let up = RectPrimitive {
+            x: 10.0,
+            y: 20.0,
+            width: 20.0,
+            height: 10.0,
+            color: Rgba::new(1.0, 0.0, 0.0, 1.0),
+            object_id: 0,
+            shape: RectShape::JunctionArcUp,
+        };
+        let stroke = junction_arc_stroke_width(up.height);
+        let up_apex_y = up.y + stroke * 0.5;
+        let up_endpoint_y = up.y + up.height - stroke * 0.5;
+        assert!(
+            junction_arc_distance_to_point(up, up.x + up.width * 0.5, up_apex_y).unwrap()
+                < f32::EPSILON
+        );
+        assert!(junction_arc_distance_to_point(up, up.x, up_endpoint_y).unwrap() < f32::EPSILON);
+        let bounded = junction_arc_geometry_at_point(up, up.x - 3.0, up_endpoint_y).unwrap();
+        assert!(
+            (bounded.distance - 3.0).abs() < f32::EPSILON,
+            "distance beyond an endpoint must be Euclidean, not an extended parabola"
+        );
+        assert!(bounded.bounded_to_endpoint);
+        assert!((bounded.curve_y - up_endpoint_y).abs() < f32::EPSILON);
+
+        let down = RectPrimitive {
+            shape: RectShape::JunctionArcDown,
+            ..up
+        };
+        let down_apex_y = down.y + down.height - stroke * 0.5;
+        let down_endpoint_y = down.y + stroke * 0.5;
+        assert!(
+            junction_arc_distance_to_point(down, down.x + down.width * 0.5, down_apex_y).unwrap()
+                < f32::EPSILON
+        );
+        assert!(
+            junction_arc_distance_to_point(down, down.x + down.width, down_endpoint_y).unwrap()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn junction_arc_distance_is_style_independent_and_rejects_invalid_geometry() {
+        let base = RectPrimitive {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 3.0,
+            color: Rgba::new(1.0, 1.0, 1.0, 1.0),
+            object_id: 0,
+            shape: RectShape::JunctionArcUp,
+        };
+        let styled = RectPrimitive {
+            shape: RectShape::JunctionArcSelectedUp,
+            ..base
+        };
+        assert_eq!(
+            junction_arc_distance_to_point(base, 0.5, 1.5),
+            junction_arc_distance_to_point(styled, 0.5, 1.5)
+        );
+        assert_eq!(
+            junction_arc_distance_to_point(RectPrimitive { width: 0.0, ..base }, 0.0, 0.0),
+            None
+        );
+        assert_eq!(
+            junction_arc_distance_to_point(
+                RectPrimitive {
+                    shape: RectShape::Rectangle,
+                    ..base
+                },
+                0.0,
+                0.0
+            ),
+            None
+        );
+        assert_eq!(junction_arc_distance_to_point(base, f32::NAN, 0.0), None);
+    }
 
     #[test]
     fn synthetic_layout_is_deterministic_and_bounded() {

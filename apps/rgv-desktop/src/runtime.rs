@@ -101,6 +101,19 @@ impl ApplicationHandler for Application {
                     viewer.window.request_redraw();
                 }
                 viewer.panels.active_mut().hover_inspector_target = None;
+                if viewer
+                    .panels
+                    .active_mut()
+                    .hovered_junction_arc
+                    .take()
+                    .is_some()
+                {
+                    viewer.window.set_cursor(CursorIcon::Default);
+                    if viewer.synthetic || !viewer.refresh_active_panel_scroll_display() {
+                        viewer.display_dirty = true;
+                    }
+                    viewer.window.request_redraw();
+                }
             }
             WindowEvent::Focused(false) => {
                 viewer.finish_overview_capture();
@@ -109,6 +122,28 @@ impl ApplicationHandler for Application {
                 viewer.dragging = false;
                 viewer.last_cursor = None;
                 viewer.press_cursor = None;
+                let cleared_junction_hover = viewer
+                    .panels
+                    .active_mut()
+                    .hovered_junction_arc
+                    .take()
+                    .is_some();
+                viewer.panels.active_mut().hover_inspector_target = None;
+                viewer.window.set_cursor(CursorIcon::Default);
+                if cleared_junction_hover {
+                    viewer.sashimi_interaction_diagnostics.clears = viewer
+                        .sashimi_interaction_diagnostics
+                        .clears
+                        .saturating_add(1);
+                    viewer.sashimi_interaction_diagnostics.hover_redraws = viewer
+                        .sashimi_interaction_diagnostics
+                        .hover_redraws
+                        .saturating_add(1);
+                    if viewer.synthetic || !viewer.refresh_active_panel_scroll_display() {
+                        viewer.display_dirty = true;
+                    }
+                    viewer.window.request_redraw();
+                }
                 if let Some(origin) = viewer.drag_origin_interval.take() {
                     let interval = viewer.panels.active().viewport.interval();
                     if origin != interval {

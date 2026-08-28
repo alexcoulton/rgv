@@ -87,18 +87,84 @@ impl Viewer {
             self.display_dirty = true;
             self.window.request_redraw();
         }
+        let cursor_in_genomic_canvas = self.cursor_in_genomic_canvas();
+        let should_hit_test_junction_arc = !consumed && !self.dragging && cursor_in_genomic_canvas;
+        let junction_hit_started = self.diagnostics_open.then(Instant::now);
+        let junction_hit = if should_hit_test_junction_arc {
+            self.junction_arc_hit_test_at_cursor()
+        } else {
+            JunctionArcHitTestResult {
+                gate: if self.dragging {
+                    SashimiHitTestGate::Dragging
+                } else if !cursor_in_genomic_canvas {
+                    SashimiHitTestGate::OutsideCanvas
+                } else {
+                    SashimiHitTestGate::PointerConsumed
+                },
+                total_targets: self.panels.active().junction_arc_targets.len(),
+                ..JunctionArcHitTestResult::default()
+            }
+        };
+        let junction_hit_duration = junction_hit_started.map(|started| started.elapsed());
+        let hovered_junction_arc = junction_hit.hover;
+        let previous_junction_arc = self.panels.active().hovered_junction_arc;
+        let junction_arc_changed = hovered_junction_arc
+            .map(|hover| (hover.key, hover.interaction_token, hover.content_revision))
+            != previous_junction_arc
+                .map(|hover| (hover.key, hover.interaction_token, hover.content_revision));
+        let scale = self.window.scale_factor();
+        self.sashimi_interaction_diagnostics.record_latest_probe(
+            egui::pos2((position.x / scale) as f32, (position.y / scale) as f32),
+            self.panels.active().navigation_presentation.phase,
+            junction_hit,
+        );
+        if should_hit_test_junction_arc {
+            self.sashimi_interaction_diagnostics.record_hit_test(
+                junction_hit,
+                previous_junction_arc,
+                hovered_junction_arc,
+                junction_hit_duration,
+                junction_arc_changed,
+            );
+        } else if junction_arc_changed {
+            self.sashimi_interaction_diagnostics.clears = self
+                .sashimi_interaction_diagnostics
+                .clears
+                .saturating_add(1);
+            self.sashimi_interaction_diagnostics.hover_redraws = self
+                .sashimi_interaction_diagnostics
+                .hover_redraws
+                .saturating_add(1);
+        }
+        if junction_arc_changed {
+            self.panels.active_mut().hovered_junction_arc = hovered_junction_arc;
+            self.window.set_cursor(if hovered_junction_arc.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            });
+            if self.synthetic || !self.refresh_active_panel_scroll_display() {
+                self.display_dirty = true;
+            }
+            self.window.request_redraw();
+        }
         if self.inspector_activation_at_cursor() == InspectorActivation::Hover
             && !consumed
             && !self.dragging
         {
             let target = self.hover_inspector_target_at_cursor();
-            if target.is_some() && target != self.panels.active_mut().hover_inspector_target {
+            if target != self.panels.active().hover_inspector_target {
                 self.panels.active_mut().hover_inspector_target = target;
-                self.select_at_cursor();
+                if target.is_some_and(|target| {
+                    !matches!(target, HoverInspectorTarget::Junction(_, _, _, _))
+                }) {
+                    self.select_at_cursor();
+                }
                 self.window.request_redraw();
             }
-        } else if consumed || self.dragging {
+        } else if self.panels.active().hover_inspector_target.is_some() {
             self.panels.active_mut().hover_inspector_target = None;
+            self.window.request_redraw();
         }
     }
 
@@ -109,8 +175,10 @@ impl Viewer {
         if let Some((track_id, position)) = self.pileup_position_at_cursor() {
             return Some(HoverInspectorTarget::Pileup(track_id, position));
         }
-        if let Some((track_id, start, end)) = self.junction_at_cursor() {
-            return Some(HoverInspectorTarget::Junction(track_id, start, end));
+        if let Some((track_id, start, end, component)) = self.junction_at_cursor() {
+            return Some(HoverInspectorTarget::Junction(
+                track_id, start, end, component,
+            ));
         }
         let (track_id, index) = self.record_at_cursor()?;
         let event = self.read_event_at_cursor(track_id, index);
@@ -311,6 +379,9 @@ impl Viewer {
         self.remember_current_locus();
         self.panels.active_mut().hovered_record = None;
         self.panels.active_mut().hover_inspector_target = None;
+        self.panels.active_mut().hovered_junction_arc = None;
+        self.panels.active_mut().junction_arc_targets.clear();
+        self.window.set_cursor(CursorIcon::Default);
         self.begin_viewport_navigation(false, false);
     }
 
@@ -318,6 +389,9 @@ impl Viewer {
         self.remember_current_locus();
         self.panels.active_mut().hovered_record = None;
         self.panels.active_mut().hover_inspector_target = None;
+        self.panels.active_mut().hovered_junction_arc = None;
+        self.panels.active_mut().junction_arc_targets.clear();
+        self.window.set_cursor(CursorIcon::Default);
         let hold_commit_until_end = self.dragging
             || self.horizontal_overview_drag.is_some()
             || self.overview_capture == Some(OverviewCapture::Horizontal);
@@ -1076,8 +1150,17 @@ impl Viewer {
 
     pub(crate) fn activate_view_panel(&mut self, id: PanelId) -> bool {
         let changed = id != self.panels.active().id;
+        if changed {
+            self.panels.active_mut().hovered_junction_arc = None;
+            self.panels.active_mut().hover_inspector_target = None;
+        }
         if !self.panels.activate(id) {
             return false;
+        }
+        if changed {
+            self.panels.active_mut().hovered_junction_arc = None;
+            self.panels.active_mut().hover_inspector_target = None;
+            self.window.set_cursor(CursorIcon::Default);
         }
         self.refresh_active_panel_context();
         self.display_dirty = true;

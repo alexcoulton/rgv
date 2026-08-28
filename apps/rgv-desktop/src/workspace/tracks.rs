@@ -589,6 +589,7 @@ impl Viewer {
                         panel.selected_pileup_position = None;
                         panel.selected_modification_position = None;
                         panel.selected_junction = None;
+                        panel.selected_junction_component = None;
                     }
                     panel.selected_feature = panel
                         .selected_feature

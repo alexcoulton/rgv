@@ -11,6 +11,7 @@ pub(crate) struct PendingQueries {
 pub(crate) struct PanelScrollDisplayCache {
     pub(crate) annotations: DisplayList,
     pub(crate) pinned: DisplayList,
+    pub(crate) junction_arc_keys: BTreeMap<u32, JunctionArcKey>,
     pub(crate) annotation_overview: ScrollbarOverview,
     pub(crate) annotation_content_bottom: f32,
     pub(crate) annotation_clip_top: f32,
@@ -85,6 +86,7 @@ pub(crate) struct ViewPanelController {
     pub(crate) selected_pileup_position: Option<u64>,
     pub(crate) selected_modification_position: Option<u64>,
     pub(crate) selected_junction: Option<(u64, u64)>,
+    pub(crate) selected_junction_component: Option<JunctionArcComponent>,
     pub(crate) selected_feature: Option<FeatureSelection>,
     pub(crate) selected_variant: Option<VariantSelection>,
     pub(crate) selected_gwas: Option<GwasSelection>,
@@ -97,6 +99,8 @@ pub(crate) struct ViewPanelController {
     pub(crate) pending_read_selection: Option<(TrackId, Vec<u8>)>,
     pub(crate) hovered_record: Option<(TrackId, usize)>,
     pub(crate) hover_inspector_target: Option<HoverInspectorTarget>,
+    pub(crate) hovered_junction_arc: Option<JunctionArcHover>,
+    pub(crate) junction_arc_targets: Vec<ComposedJunctionArcTarget>,
     pub(crate) display_list: DisplayList,
     /// Non-evidentiary read geometry derived from a complete canonical horizon.
     /// It is rendered above the retained texture with zero object IDs only.
@@ -434,6 +438,7 @@ impl ViewPanelController {
             selected_pileup_position: None,
             selected_modification_position: None,
             selected_junction: None,
+            selected_junction_component: None,
             selected_feature: None,
             selected_variant: None,
             selected_gwas: None,
@@ -446,6 +451,8 @@ impl ViewPanelController {
             pending_read_selection: None,
             hovered_record: None,
             hover_inspector_target: None,
+            hovered_junction_arc: None,
+            junction_arc_targets: Vec::new(),
             display_list: DisplayList::default(),
             navigation_provisional_display: None,
             scroll_display_cache: None,
@@ -504,6 +511,7 @@ impl ViewPanelController {
         self.selected_pileup_position = None;
         self.selected_modification_position = None;
         self.selected_junction = None;
+        self.selected_junction_component = None;
         self.selected_feature = None;
         self.selected_variant = None;
         self.selected_gwas = None;
@@ -516,6 +524,8 @@ impl ViewPanelController {
         self.pending_read_selection = None;
         self.hovered_record = None;
         self.hover_inspector_target = None;
+        self.hovered_junction_arc = None;
+        self.junction_arc_targets.clear();
     }
 }
 

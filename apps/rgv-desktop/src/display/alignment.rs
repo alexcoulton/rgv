@@ -1083,8 +1083,6 @@ pub(crate) fn alignment_layout_key(
     layout_bytes.push(options.junction_count_mode as u8);
     layout_bytes.push(u8::from(options.show_junction_labels));
     layout_bytes.extend_from_slice(&options.junction_annotation_fingerprint.to_le_bytes());
-    layout_bytes.extend_from_slice(&options.selected_junction[0].to_le_bytes());
-    layout_bytes.extend_from_slice(&options.selected_junction[1].to_le_bytes());
     layout_bytes.extend_from_slice(
         &options
             .coverage_scale_maximum

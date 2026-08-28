@@ -26,6 +26,7 @@ The remaining documents preserve detailed implementation, remediation, and desig
 - [Modularisation](MODULARISATION_PLAN.md)
 - [ONT–IGV parity remediation](ONT_IGV_PARITY_REMEDIATION_PLAN.md)
 - [Persistent read-stack stability](READ_STACK_STABILITY_PLAN.md)
+- [Sashimi arc interaction](SASHIMI_ARC_INTERACTION_PLAN.md)
 - [MCP gap remediation](RGV_MCP_GAP_REMEDIATION_PLAN.md)
 - [MCP implementation](RGV_MCP_IMPLEMENTATION_PLAN.md)
 - [Track-channel architecture remediation](TRACK_CHANNEL_ARCHITECTURE_REMEDIATION_PLAN.md)

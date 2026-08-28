@@ -56,14 +56,21 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     var output_color = input.color;
-    if input.shape == 7u || input.shape == 8u {
-        let stroke = clamp(1.0 + input.size.y * 0.075, 1.25, 4.5);
-        let inner_height = max(input.size.y - stroke, 0.0);
+    if input.shape >= 7u && input.shape <= 12u {
+        let base_stroke = clamp(1.0 + input.size.y * 0.075, 1.25, 4.5);
+        var expansion = 0.0;
+        if input.shape == 9u || input.shape == 10u {
+            expansion = 1.5;
+        } else if input.shape == 11u || input.shape == 12u {
+            expansion = 2.0;
+        }
+        let stroke = base_stroke + expansion * 2.0;
+        let inner_height = max(input.size.y - base_stroke, 0.0);
         let fraction = clamp(input.local_point.x / max(input.size.x, 0.0001), 0.0, 1.0);
         let parabola = 4.0 * (fraction - 0.5) * (fraction - 0.5);
-        var curve_y = stroke * 0.5 + inner_height * parabola;
-        if input.shape == 8u {
-            curve_y = input.size.y - stroke * 0.5 - inner_height * parabola;
+        var curve_y = base_stroke * 0.5 + inner_height * parabola;
+        if input.shape == 8u || input.shape == 10u || input.shape == 12u {
+            curve_y = input.size.y - base_stroke * 0.5 - inner_height * parabola;
         }
         let slope = 8.0 * inner_height * (fraction - 0.5) / max(input.size.x, 1.0);
         let distance = abs(input.local_point.y - curve_y) / sqrt(1.0 + slope * slope);

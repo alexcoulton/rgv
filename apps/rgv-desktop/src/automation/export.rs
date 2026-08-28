@@ -4,9 +4,31 @@ use rgv_layout::{
     read_arrow_head_width,
 };
 
+const fn is_transient_sashimi_hover(shape: RectShape) -> bool {
+    matches!(
+        shape,
+        RectShape::JunctionArcHoverUp | RectShape::JunctionArcHoverDown
+    )
+}
+
+pub(crate) fn semantic_export_display_list(display: &DisplayList) -> DisplayList {
+    DisplayList {
+        rectangles: display
+            .rectangles
+            .iter()
+            .filter(|rectangle| !is_transient_sashimi_hover(rectangle.shape))
+            .copied()
+            .collect(),
+        texts: display.texts.clone(),
+    }
+}
+
 pub(crate) fn cropped_display_list(display: &DisplayList, bounds: egui::Rect) -> DisplayList {
     let mut cropped = DisplayList::default();
     for rectangle in &display.rectangles {
+        if is_transient_sashimi_hover(rectangle.shape) {
+            continue;
+        }
         let left = rectangle.x.max(bounds.left());
         let top = rectangle.y.max(bounds.top());
         let right = (rectangle.x + rectangle.width).min(bounds.right());
@@ -138,6 +160,9 @@ pub(crate) fn display_list_svg_export(
     );
     let mut truncated = false;
     for rectangle in &display.rectangles {
+        if is_transient_sashimi_hover(rectangle.shape) {
+            continue;
+        }
         let red = (rectangle.color.red.clamp(0.0, 1.0) * 255.0).round() as u8;
         let green = (rectangle.color.green.clamp(0.0, 1.0) * 255.0).round() as u8;
         let blue = (rectangle.color.blue.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -149,7 +174,7 @@ pub(crate) fn display_list_svg_export(
             let bottom = rectangle.y + rectangle.height;
             let shoulder = rectangle.width * 0.18;
             let stroke_width = junction_arc_stroke_width(rectangle.height);
-            let (start_y, control_y, end_y) = if rectangle.shape == RectShape::JunctionArcUp {
+            let (start_y, control_y, end_y) = if rectangle.shape.is_junction_arc_up() {
                 (
                     bottom - stroke_width * 0.5,
                     top + stroke_width * 0.5,

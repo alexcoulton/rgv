@@ -192,6 +192,7 @@ pub(crate) fn add_coverage_navigation_markers(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn add_junctions(
     display_list: &mut DisplayList,
+    junction_arc_targets: &mut Vec<JunctionArcTarget>,
     summary: &JunctionSummary,
     viewport: Viewport,
     options: &AlignmentLayoutOptions,
@@ -268,7 +269,7 @@ pub(crate) fn add_junctions(
     }
     let mut rendered_labels = 0_usize;
     let mut occupied_label_bounds = Vec::<(f32, f32, f32, f32)>::new();
-    for ((_, junction), row) in visible.iter().zip(expanded_rows) {
+    for ((junction_index, junction), row) in visible.iter().zip(expanded_rows) {
         let left = (viewport.pixel_at_genomic(junction.start) as f32).clamp(0.0, width);
         let right = (viewport.pixel_at_genomic(junction.end) as f32).clamp(0.0, width);
         if right <= left {
@@ -285,30 +286,31 @@ pub(crate) fn add_junctions(
             1.5
         };
         let available_height = (band_height * 0.5 - apex_clearance).max(3.0);
-        let selected = options.selected_junction == [junction.start, junction.end];
-        let selected_color = Rgba::new(0.08, 0.08, 0.10, 1.0);
         let components = [
             (
                 junction.positive_depth,
+                JunctionArcComponent::Positive,
                 RectShape::JunctionArcUp,
                 Rgba::new(0.84, 0.30, 0.38, 0.82),
                 Some(RectShape::ChevronRight),
             ),
             (
                 junction.negative_depth,
+                JunctionArcComponent::Negative,
                 RectShape::JunctionArcDown,
                 Rgba::new(0.25, 0.45, 0.82, 0.82),
                 Some(RectShape::ChevronLeft),
             ),
             (
                 junction.unknown_depth,
+                JunctionArcComponent::Unknown,
                 RectShape::JunctionArcUp,
                 Rgba::new(0.42, 0.45, 0.50, 0.76),
                 None,
             ),
         ];
         let mut component_apices = Vec::with_capacity(3);
-        for (depth, arc_shape, strand_color, direction_shape) in components {
+        for (depth, component, arc_shape, strand_color, direction_shape) in components {
             if depth == 0 {
                 continue;
             }
@@ -322,12 +324,8 @@ pub(crate) fn add_junctions(
             } else {
                 baseline
             };
-            let color = if selected {
-                selected_color
-            } else {
-                strand_color
-            };
-            display_list.rectangles.push(RectPrimitive {
+            let color = strand_color;
+            let primitive = RectPrimitive {
                 x: left,
                 y: arc_top,
                 width: right - left,
@@ -335,6 +333,17 @@ pub(crate) fn add_junctions(
                 color,
                 object_id: 0,
                 shape: arc_shape,
+            };
+            let draw_order = u32::try_from(display_list.rectangles.len()).unwrap_or(u32::MAX);
+            display_list.rectangles.push(primitive);
+            junction_arc_targets.push(JunctionArcTarget {
+                junction_index: *junction_index,
+                start: junction.start,
+                end: junction.end,
+                component,
+                primitive,
+                stroke_width: junction_arc_stroke_width(arc_height),
+                draw_order,
             });
             if let Some(direction_shape) = direction_shape {
                 add_junction_direction_marker(

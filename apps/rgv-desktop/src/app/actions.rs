@@ -697,6 +697,7 @@ impl Viewer {
                 }
                 AlignmentSubtrack::Sashimi => {
                     self.panels.active_mut().selected_junction = None;
+                    self.panels.active_mut().selected_junction_component = None;
                 }
                 AlignmentSubtrack::Modifications => {
                     self.panels.active_mut().selected_modification_position = None;

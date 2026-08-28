@@ -56,6 +56,7 @@ impl Viewer {
         self.clear_promoted_read();
         self.panels.active_mut().retained_evidence = None;
         self.panels.active_mut().pending_read_selection = None;
+        self.panels.active_mut().selected_junction_component = None;
         self.panels.active_mut().selected_feature = None;
         self.panels.active_mut().selected_variant = None;
         self.panels.active_mut().selected_gwas = None;
@@ -142,9 +143,10 @@ impl Viewer {
             self.panels.active_mut().selected_record = None;
             self.panels.active_mut().selected_read_event = None;
             self.panels.active_mut().selected_chain = None;
-        } else if let Some((track_id, start, end)) = self.junction_at_cursor() {
+        } else if let Some((track_id, start, end, component)) = self.junction_at_cursor() {
             self.panels.active_mut().selected_alignment_track = Some(track_id);
             self.panels.active_mut().selected_junction = Some((start, end));
+            self.panels.active_mut().selected_junction_component = Some(component);
             self.panels.active_mut().selected_pileup_position = None;
             self.panels.active_mut().selected_modification_position = None;
             self.panels.active_mut().selected_record = None;
@@ -1005,6 +1007,7 @@ impl Viewer {
         self.panels.active_mut().selected_record = None;
         self.panels.active_mut().selected_read_event = None;
         self.panels.active_mut().selected_junction = None;
+        self.panels.active_mut().selected_junction_component = None;
         self.panels.active_mut().selected_chain = None;
         self.panels.active_mut().selected_pileup_position = (!modification).then_some(position);
         self.panels.active_mut().selected_modification_position = modification.then_some(position);
@@ -1058,32 +1061,58 @@ impl Viewer {
         .map(|position| (track_id, position))
     }
 
-    pub(crate) fn junction_at_cursor(&self) -> Option<(TrackId, u64, u64)> {
+    pub(crate) fn junction_at_cursor(&self) -> Option<(TrackId, u64, u64, JunctionArcComponent)> {
+        self.junction_arc_hover_at_cursor().map(|hover| {
+            (
+                hover.key.track_id,
+                hover.key.start,
+                hover.key.end,
+                hover.key.component,
+            )
+        })
+    }
+
+    pub(crate) fn junction_arc_hover_at_cursor(&self) -> Option<JunctionArcHover> {
+        self.junction_arc_hit_test_at_cursor().hover
+    }
+
+    pub(crate) fn junction_arc_hit_test_at_cursor(&self) -> JunctionArcHitTestResult {
+        let panel = self.panels.active();
+        let total_targets = panel.junction_arc_targets.len();
+        if !panel.navigation_presentation.is_interactive() {
+            return JunctionArcHitTestResult {
+                gate: SashimiHitTestGate::PresentationUnsettled,
+                total_targets,
+                ..JunctionArcHitTestResult::default()
+            };
+        }
         let scale = self.window.scale_factor();
         let x = (self.cursor.x / scale) as f32;
         let y = (self.cursor.y / scale) as f32;
         let panel_rect = self.active_panel_rect();
         if x < panel_rect.left() || x >= panel_rect.right() {
-            return None;
+            return JunctionArcHitTestResult {
+                gate: SashimiHitTestGate::OutsidePanel,
+                total_targets,
+                ..JunctionArcHitTestResult::default()
+            };
         }
-        let track_id = alignment_lane_in_pane_layout(
-            &self.panels.active().pane_layout.annotation,
-            "Sashimi",
-            y,
-        )?;
-        let query = self.alignment_query_for_track(track_id)?;
-        let local_x = f64::from(x - panel_rect.left());
-        let position = self
-            .panels
-            .active()
-            .viewport
-            .genomic_at_pixel(local_x)
-            .floor() as u64;
-        let minimum_depth = self
-            .alignment_filters_for_track(track_id)
-            .minimum_junction_depth;
-        junction_at_position(&query.junctions, minimum_depth, position)
-            .map(|(start, end)| (track_id, start, end))
+        let Some(track_id) =
+            alignment_lane_in_pane_layout(&panel.pane_layout.annotation, "Sashimi", y)
+        else {
+            return JunctionArcHitTestResult {
+                gate: SashimiHitTestGate::OutsideSashimiLane,
+                total_targets,
+                ..JunctionArcHitTestResult::default()
+            };
+        };
+        junction_arc_hit_test_at_point(
+            &panel.junction_arc_targets,
+            track_id,
+            egui::pos2(x, y),
+            panel.hovered_junction_arc,
+            panel.navigation_presentation.committed_content_revision,
+        )
     }
 
     pub(crate) fn record_at_cursor(&self) -> Option<(TrackId, usize)> {
@@ -1209,6 +1238,7 @@ impl Viewer {
         self.panels.active_mut().selected_pileup_position = None;
         self.panels.active_mut().selected_modification_position = None;
         self.panels.active_mut().selected_junction = None;
+        self.panels.active_mut().selected_junction_component = None;
         let selected_chain = self
             .complete_read_query_for_track(self.primary_alignment_track_id())
             .and_then(|query| {
@@ -1232,6 +1262,7 @@ impl Viewer {
         self.panels.active_mut().selected_pileup_position = None;
         self.panels.active_mut().selected_modification_position = None;
         self.panels.active_mut().selected_junction = None;
+        self.panels.active_mut().selected_junction_component = None;
         self.panels.active_mut().selected_feature = None;
         self.panels.active_mut().selected_variant = None;
         self.panels.active_mut().selected_gwas = None;
@@ -1510,6 +1541,7 @@ impl Viewer {
         self.panels.active_mut().selected_pileup_position = None;
         self.panels.active_mut().selected_modification_position = None;
         self.panels.active_mut().selected_junction = None;
+        self.panels.active_mut().selected_junction_component = None;
         self.panels.active_mut().selected_chain = chain;
         self.display_dirty = true;
         true

@@ -7,7 +7,7 @@ use std::path::Path;
 use image::{ImageError, RgbaImage};
 use rgv_layout::{
     Direction, DisplayList, RectPrimitive, RectShape, TextPrimitive, breakend_bracket_dimensions,
-    junction_arc_stroke_width, read_arrow_head_width,
+    junction_arc_distance_to_point, junction_arc_stroke_width, read_arrow_head_width,
 };
 use wgpu::util::DeviceExt;
 
@@ -937,18 +937,10 @@ fn rectangle_contains_pixel(rectangle: RectPrimitive, x: u32, y: u32) -> bool {
     let local_x = x as f32 + 0.5 - rectangle.x;
     let local_y = y as f32 + 0.5 - rectangle.y;
     if rectangle.shape.is_junction_arc() {
-        let stroke = junction_arc_stroke_width(rectangle.height);
-        let inner_height = (rectangle.height - stroke).max(0.0);
-        let fraction = (local_x / rectangle.width.max(f32::EPSILON)).clamp(0.0, 1.0);
-        let parabola = 4.0 * (fraction - 0.5).powi(2);
-        let curve_y = if rectangle.shape == RectShape::JunctionArcUp {
-            stroke * 0.5 + inner_height * parabola
-        } else {
-            rectangle.height - stroke * 0.5 - inner_height * parabola
-        };
-        let slope = 8.0 * inner_height * (fraction - 0.5) / rectangle.width.max(1.0);
-        let distance = (local_y - curve_y).abs() / (1.0 + slope * slope).sqrt();
-        return distance <= stroke * 0.5;
+        let stroke = junction_arc_stroke_width(rectangle.height)
+            + rectangle.shape.junction_arc_interaction_expansion() * 2.0;
+        return junction_arc_distance_to_point(rectangle, x as f32 + 0.5, y as f32 + 0.5)
+            .is_some_and(|distance| distance <= stroke * 0.5);
     }
     if matches!(
         rectangle.shape,
@@ -1349,6 +1341,61 @@ mod tests {
         assert!(rectangle_contains_pixel(down, 0, 1));
         assert!(rectangle_contains_pixel(down, 9, 9));
         assert!(!rectangle_contains_pixel(down, 9, 1));
+    }
+
+    #[test]
+    fn sashimi_hover_and_selection_expand_only_the_arc_stroke() {
+        let base = RectPrimitive {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 10.0,
+            color: Rgba::new(0.84, 0.30, 0.38, 0.82),
+            object_id: 17,
+            shape: RectShape::JunctionArcUp,
+        };
+        let hover = RectPrimitive {
+            shape: base.shape.as_junction_arc_hover(),
+            ..base
+        };
+        let selected = RectPrimitive {
+            shape: base.shape.as_junction_arc_selected(),
+            ..base
+        };
+
+        assert!(!rectangle_contains_pixel(base, 9, 2));
+        assert!(rectangle_contains_pixel(hover, 9, 2));
+        assert!(rectangle_contains_pixel(selected, 9, 2));
+        assert!(!rectangle_contains_pixel(hover, 9, 3));
+        assert!(rectangle_contains_pixel(selected, 9, 3));
+
+        let ordinary = RectPrimitive {
+            shape: RectShape::Rectangle,
+            ..base
+        };
+        assert!(rectangle_contains_pixel(ordinary, 9, 3));
+        assert_eq!(ordinary.object_id, base.object_id);
+        assert_eq!(ordinary.shape.junction_arc_interaction_expansion(), 0.0);
+    }
+
+    #[test]
+    fn sashimi_interaction_shapes_preserve_curve_direction() {
+        assert_eq!(
+            RectShape::JunctionArcUp.as_junction_arc_hover(),
+            RectShape::JunctionArcHoverUp
+        );
+        assert_eq!(
+            RectShape::JunctionArcDown.as_junction_arc_hover(),
+            RectShape::JunctionArcHoverDown
+        );
+        assert_eq!(
+            RectShape::JunctionArcUp.as_junction_arc_selected(),
+            RectShape::JunctionArcSelectedUp
+        );
+        assert_eq!(
+            RectShape::JunctionArcDown.as_junction_arc_selected(),
+            RectShape::JunctionArcSelectedDown
+        );
     }
 
     #[test]

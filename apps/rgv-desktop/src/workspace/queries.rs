@@ -229,18 +229,21 @@ impl Viewer {
         changed
     }
 
-    pub(crate) fn finish_navigation_commits(&mut self) {
+    pub(crate) fn finish_navigation_commits(&mut self) -> bool {
         let now = Instant::now();
+        let mut committed = false;
         for panel in self.panels.iter_mut() {
             let elapsed = now.saturating_duration_since(panel.navigation_presentation.started_at);
             if panel.navigation_presentation.finish_commit(
                 self.workspace_layout.revision,
                 self.navigation_contract_revision,
             ) {
+                committed = true;
                 panel.navigation_provisional_display = None;
                 panel.navigation_query_schedule.record_commit(elapsed);
             }
         }
+        committed
     }
 
     pub(crate) fn invalidate_navigation_preview_contract(&mut self, reason: &str) {

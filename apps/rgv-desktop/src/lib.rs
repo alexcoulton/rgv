@@ -104,15 +104,16 @@ use rgv_layout::{
     AlignmentLayoutStats, AlignmentOrderDirection, AlignmentRowHistory, AlignmentRowLayout,
     AlignmentRowReconciliationStats, AlignmentSortMode, COPY_NUMBER_HEADER_HEIGHT, DisplayList,
     IndividualReadRefusal, IndividualReadRefusalScope, JunctionAnnotationLookup,
-    JunctionAnnotationStatus, MAX_HIDDEN_MODIFICATION_CODES, MINIMUM_BASE_GLYPH_PIXEL_WIDTH,
-    MUTATION_HEADER_HEIGHT, QuantitativeRange, RectPrimitive, Rgba, TrackLayoutOptions,
-    alignment_read_name_hash, assign_alignment_rows, compose_quantitative_records,
-    copy_number_sample_order, gwas_point_y, junction_count_value, layout_alignment_query_with_rows,
-    layout_alignment_query_with_rows_and_annotations, layout_copy_number, layout_features,
-    layout_gwas, layout_interactions, layout_mutations, layout_quantitative,
-    layout_reference_slice_oriented, layout_reference_translation, layout_sashimi, layout_variants,
-    modification_code_color, quantitative_data_range, reconcile_alignment_rows_with_horizon,
-    record_object_id, ultima_quality_color,
+    JunctionAnnotationStatus, JunctionArcComponent, MAX_HIDDEN_MODIFICATION_CODES,
+    MINIMUM_BASE_GLYPH_PIXEL_WIDTH, MUTATION_HEADER_HEIGHT, QuantitativeRange, RectPrimitive, Rgba,
+    TrackLayoutOptions, alignment_read_name_hash, assign_alignment_rows,
+    compose_quantitative_records, copy_number_sample_order, gwas_point_y,
+    junction_arc_distance_to_point, junction_arc_stroke_width, junction_count_value,
+    layout_alignment_query_with_rows, layout_alignment_query_with_rows_and_annotations,
+    layout_copy_number, layout_features, layout_gwas, layout_interactions, layout_mutations,
+    layout_quantitative, layout_reference_slice_oriented, layout_reference_translation,
+    layout_sashimi, layout_variants, modification_code_color, quantitative_data_range,
+    reconcile_alignment_rows_with_horizon, record_object_id, ultima_quality_color,
 };
 use rgv_render::{
     NavigationPreviewInstance, NavigationPreviewRenderer, PrepareStats, RectangleRenderer,
@@ -133,7 +134,7 @@ use winit::{
     event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, ModifiersState, NamedKey},
-    window::{CursorGrabMode, Theme, Window, WindowAttributes, WindowId},
+    window::{CursorGrabMode, CursorIcon, Theme, Window, WindowAttributes, WindowId},
 };
 use workspace::{
     alignments::*, lists::*, navigation::*, navigation_preview::*, panels::*,
@@ -418,7 +419,7 @@ enum OverviewCapture {
 enum HoverInspectorTarget {
     Modification(TrackId, u64),
     Pileup(TrackId, u64),
-    Junction(TrackId, u64, u64),
+    Junction(TrackId, u64, u64, JunctionArcComponent),
     Record {
         track_id: TrackId,
         index: usize,
@@ -432,9 +433,181 @@ impl HoverInspectorTarget {
         match self {
             Self::Modification(track_id, _)
             | Self::Pileup(track_id, _)
-            | Self::Junction(track_id, _, _)
+            | Self::Junction(track_id, _, _, _)
             | Self::Record { track_id, .. } => track_id,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct JunctionArcKey {
+    track_id: TrackId,
+    start: u64,
+    end: u64,
+    component: JunctionArcComponent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ComposedJunctionArcTarget {
+    key: JunctionArcKey,
+    primitive: RectPrimitive,
+    stroke_width: f32,
+    draw_order: u32,
+    interaction_token: u32,
+    content_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct JunctionArcHover {
+    key: JunctionArcKey,
+    interaction_token: u32,
+    distance_points: f32,
+    content_revision: u64,
+}
+
+const SASHIMI_HIT_DURATION_SAMPLE_CAPACITY: usize = 128;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SashimiHitTestGate {
+    #[default]
+    NotObserved,
+    PointerConsumed,
+    Dragging,
+    OutsideCanvas,
+    PresentationUnsettled,
+    OutsidePanel,
+    OutsideSashimiLane,
+    Tested,
+}
+
+impl SashimiHitTestGate {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not observed",
+            Self::PointerConsumed => "pointer consumed",
+            Self::Dragging => "dragging",
+            Self::OutsideCanvas => "outside canvas",
+            Self::PresentationUnsettled => "presentation unsettled",
+            Self::OutsidePanel => "outside active panel",
+            Self::OutsideSashimiLane => "outside Sashimi lane",
+            Self::Tested => "curve tested",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SashimiInteractionDiagnostics {
+    hit_tests: u64,
+    bounds_candidates: u64,
+    curve_evaluations: u64,
+    acquisitions: u64,
+    transfers: u64,
+    clears: u64,
+    hysteresis_retentions: u64,
+    stale_revision_rejections: u64,
+    hover_redraws: u64,
+    hover_layout_rebuilds: u64,
+    hit_duration_micros: [u64; SASHIMI_HIT_DURATION_SAMPLE_CAPACITY],
+    hit_duration_count: usize,
+    next_hit_duration: usize,
+    latest_pointer: Option<egui::Pos2>,
+    latest_phase: Option<NavigationPresentationPhase>,
+    latest_result: JunctionArcHitTestResult,
+    latest_hover_overlay_count: usize,
+}
+
+impl Default for SashimiInteractionDiagnostics {
+    fn default() -> Self {
+        Self {
+            hit_tests: 0,
+            bounds_candidates: 0,
+            curve_evaluations: 0,
+            acquisitions: 0,
+            transfers: 0,
+            clears: 0,
+            hysteresis_retentions: 0,
+            stale_revision_rejections: 0,
+            hover_redraws: 0,
+            hover_layout_rebuilds: 0,
+            hit_duration_micros: [0; SASHIMI_HIT_DURATION_SAMPLE_CAPACITY],
+            hit_duration_count: 0,
+            next_hit_duration: 0,
+            latest_pointer: None,
+            latest_phase: None,
+            latest_result: JunctionArcHitTestResult::default(),
+            latest_hover_overlay_count: 0,
+        }
+    }
+}
+
+impl SashimiInteractionDiagnostics {
+    fn record_latest_probe(
+        &mut self,
+        pointer: egui::Pos2,
+        phase: NavigationPresentationPhase,
+        result: JunctionArcHitTestResult,
+    ) {
+        self.latest_pointer = Some(pointer);
+        self.latest_phase = Some(phase);
+        self.latest_result = result;
+        if result.hover.is_none() {
+            self.latest_hover_overlay_count = 0;
+        }
+    }
+
+    fn record_hit_test(
+        &mut self,
+        result: JunctionArcHitTestResult,
+        previous: Option<JunctionArcHover>,
+        current: Option<JunctionArcHover>,
+        duration: Option<Duration>,
+        hover_redraw: bool,
+    ) {
+        self.hit_tests = self.hit_tests.saturating_add(1);
+        self.bounds_candidates = self
+            .bounds_candidates
+            .saturating_add(result.bounds_candidates as u64);
+        self.curve_evaluations = self
+            .curve_evaluations
+            .saturating_add(result.curve_evaluations as u64);
+        self.stale_revision_rejections = self
+            .stale_revision_rejections
+            .saturating_add(result.stale_revision_rejections as u64);
+        self.hysteresis_retentions = self
+            .hysteresis_retentions
+            .saturating_add(u64::from(result.hysteresis_retained));
+        match (previous, current) {
+            (None, Some(_)) => self.acquisitions = self.acquisitions.saturating_add(1),
+            (Some(previous), Some(current)) if previous.key != current.key => {
+                self.transfers = self.transfers.saturating_add(1);
+            }
+            (Some(_), None) => self.clears = self.clears.saturating_add(1),
+            (None, None) | (Some(_), Some(_)) => {}
+        }
+        self.hover_redraws = self.hover_redraws.saturating_add(u64::from(hover_redraw));
+        if let Some(duration) = duration {
+            self.hit_duration_micros[self.next_hit_duration] =
+                u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+            self.next_hit_duration =
+                (self.next_hit_duration + 1) % SASHIMI_HIT_DURATION_SAMPLE_CAPACITY;
+            self.hit_duration_count = self
+                .hit_duration_count
+                .saturating_add(1)
+                .min(SASHIMI_HIT_DURATION_SAMPLE_CAPACITY);
+        }
+    }
+
+    fn duration_summary_micros(&self) -> (u64, u64, u64) {
+        if self.hit_duration_count == 0 {
+            return (0, 0, 0);
+        }
+        let mut samples = self.hit_duration_micros;
+        let samples = &mut samples[..self.hit_duration_count];
+        samples.sort_unstable();
+        let median = samples[(samples.len() - 1) / 2];
+        let p95 = samples[((samples.len() - 1) * 95) / 100];
+        let maximum = samples[samples.len() - 1];
+        (median, p95, maximum)
     }
 }
 
@@ -486,6 +659,7 @@ fn clear_removed_alignment_panel_state(
         panel.selected_pileup_position = None;
         panel.selected_modification_position = None;
         panel.selected_junction = None;
+        panel.selected_junction_component = None;
         panel.selected_chain = None;
     }
     if panel
@@ -501,6 +675,17 @@ fn clear_removed_alignment_panel_state(
     panel.hover_inspector_target = panel
         .hover_inspector_target
         .filter(|target| target.track_id() != removed);
+    panel.hovered_junction_arc = panel
+        .hovered_junction_arc
+        .filter(|hover| hover.key.track_id != removed);
+    panel
+        .junction_arc_targets
+        .retain(|target| target.key.track_id != removed);
+    if let Some(cache) = panel.scroll_display_cache.as_mut() {
+        cache
+            .junction_arc_keys
+            .retain(|_, key| key.track_id != removed);
+    }
     if panel.selected_track == Some(TrackFrameKey::Alignment(removed)) {
         panel.selected_track = panel
             .selected_alignment_tracks
@@ -711,6 +896,7 @@ struct Viewer {
     remote_source_editor: RemoteSourceEditor,
     diagnostics_open: bool,
     interaction_trace: InteractionTraceRecorder,
+    sashimi_interaction_diagnostics: SashimiInteractionDiagnostics,
     command_search: String,
     annotation_search_generation: u64,
     annotation_navigation_generation: u64,

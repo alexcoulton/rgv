@@ -222,6 +222,106 @@ fn translate_track_frame(frame: &mut TrackFrame, delta: f32) {
     }
 }
 
+pub(crate) fn tag_layout_junction_arcs(
+    rectangles: &mut [RectPrimitive],
+    layout: &AlignmentLayout,
+    track_id: TrackId,
+    next_token: &mut u32,
+    keys: &mut BTreeMap<u32, JunctionArcKey>,
+) {
+    for target in &layout.junction_arc_targets {
+        let index = target.draw_order as usize;
+        let Some(rectangle) = rectangles.get_mut(index) else {
+            continue;
+        };
+        debug_assert_eq!(rectangle.shape, target.primitive.shape);
+        debug_assert_eq!(rectangle.x, target.primitive.x);
+        debug_assert_eq!(rectangle.y, target.primitive.y);
+        let token = *next_token;
+        if token == 0 {
+            continue;
+        }
+        *next_token = next_token.saturating_add(1);
+        rectangle.object_id = token;
+        keys.insert(
+            token,
+            JunctionArcKey {
+                track_id,
+                start: target.start,
+                end: target.end,
+                component: target.component,
+            },
+        );
+    }
+}
+
+fn sashimi_interaction_color(base: Rgba, accent_weight: f32) -> Rgba {
+    let weight = accent_weight.clamp(0.0, 1.0);
+    let accent = Rgba::new(0.16, 0.42, 0.92, 1.0);
+    Rgba::new(
+        base.red + (accent.red - base.red) * weight,
+        base.green + (accent.green - base.green) * weight,
+        base.blue + (accent.blue - base.blue) * weight,
+        1.0,
+    )
+}
+
+pub(crate) fn append_sashimi_interaction_overlays(
+    display: &mut DisplayList,
+    targets: &[ComposedJunctionArcTarget],
+    hovered: Option<JunctionArcHover>,
+    selected_track: Option<TrackId>,
+    selected_junction: Option<(u64, u64)>,
+    selected_component: Option<JunctionArcComponent>,
+) {
+    for target in targets {
+        let selected = selected_track == Some(target.key.track_id)
+            && selected_junction == Some((target.key.start, target.key.end))
+            && selected_component.is_none_or(|component| component == target.key.component);
+        let hovered = hovered.is_some_and(|hover| {
+            hover.content_revision == target.content_revision && hover.key == target.key
+        });
+        if !selected && !hovered {
+            continue;
+        }
+        let mut overlay = target.primitive;
+        overlay.object_id = 0;
+        if selected {
+            overlay.shape = overlay.shape.as_junction_arc_selected();
+            overlay.color =
+                sashimi_interaction_color(overlay.color, if hovered { 0.42 } else { 0.30 });
+        } else {
+            overlay.shape = overlay.shape.as_junction_arc_hover();
+            overlay.color = sashimi_interaction_color(overlay.color, 0.18);
+        }
+        display.rectangles.push(overlay);
+    }
+}
+
+/// Advances semantic Sashimi targets alongside the settled surface they
+/// describe. A preview-texture capture creates a new presentation revision
+/// without changing the already composed arc geometry, so rebuilding layout
+/// here would be both unnecessary and liable to introduce frame churn.
+pub(crate) fn synchronize_junction_interaction_revision(
+    targets: &mut [ComposedJunctionArcTarget],
+    hovered: &mut Option<JunctionArcHover>,
+    content_revision: u64,
+) {
+    for target in targets.iter_mut() {
+        target.content_revision = content_revision;
+    }
+    *hovered = hovered.and_then(|hover| {
+        targets
+            .iter()
+            .find(|target| target.key == hover.key)
+            .map(|target| JunctionArcHover {
+                interaction_token: target.interaction_token,
+                content_revision,
+                ..hover
+            })
+    });
+}
+
 /// Reconciles renderer output with the canonical annotation tree. Renderers
 /// are allowed to omit data content while a source opens, is unavailable at
 /// the locus, or changes implementation; they are not allowed to erase that
@@ -607,6 +707,8 @@ impl Viewer {
             .map(TrackSource::redacted_label);
         let mut annotation_display = DisplayList::default();
         let mut pinned_display = DisplayList::default();
+        let mut junction_arc_keys = BTreeMap::new();
+        let mut next_junction_arc_token = 1_u32;
         let geometry = self.canvas_geometry();
         let annotation_section_expanded = self.track_presentation.annotation_section_expanded;
         let read_section_expanded = self.track_presentation.read_section_expanded;
@@ -1122,16 +1224,6 @@ impl Viewer {
                         }
                     }
                 };
-            options.selected_junction = if self.panels.active_mut().selected_alignment_track
-                == Some(primary_alignment_id)
-            {
-                self.panels
-                    .active()
-                    .selected_junction
-                    .map_or([u64::MAX; 2], |(start, end)| [start, end])
-            } else {
-                [u64::MAX; 2]
-            };
             if show_junctions {
                 lane_top += options.junction_height + 6.0;
             } else if junctions_available {
@@ -1269,11 +1361,16 @@ impl Viewer {
                     &rows.layout,
                     Some(&junction_annotations.lookup),
                 ));
-                let weight = layout
+                let rectangle_weight = layout
                     .display_list
                     .rectangles
                     .len()
                     .saturating_mul(std::mem::size_of::<rgv_layout::RectPrimitive>());
+                let target_weight = layout
+                    .junction_arc_targets
+                    .len()
+                    .saturating_mul(std::mem::size_of::<rgv_layout::JunctionArcTarget>());
+                let weight = rectangle_weight.saturating_add(target_weight);
                 let _ = self.layout_cache.insert(key, Arc::clone(&layout), weight);
                 layout
             };
@@ -1310,16 +1407,29 @@ impl Viewer {
             };
             let mut primary_read_display = DisplayList::default();
             let mut suppressed_annotation_display = DisplayList::default();
-            extend_alignment_layers(
-                if !primary_annotation_effective {
-                    &mut suppressed_annotation_display
-                } else {
-                    &mut pinned_display
-                },
-                &mut primary_read_display,
-                &layout,
-                None,
-            );
+            if primary_annotation_effective {
+                let rectangle_base = pinned_display.rectangles.len();
+                extend_alignment_layers(
+                    &mut pinned_display,
+                    &mut primary_read_display,
+                    &layout,
+                    None,
+                );
+                tag_layout_junction_arcs(
+                    &mut pinned_display.rectangles[rectangle_base..],
+                    &layout,
+                    primary_alignment_id,
+                    &mut next_junction_arc_token,
+                    &mut junction_arc_keys,
+                );
+            } else {
+                extend_alignment_layers(
+                    &mut suppressed_annotation_display,
+                    &mut primary_read_display,
+                    &layout,
+                    None,
+                );
+            }
             if primary_read_effective
                 && primary_read_bounds.bottom > read_clip_top
                 && primary_read_bounds.top < scroll_clip_bottom
@@ -1757,6 +1867,7 @@ impl Viewer {
                 // Keep GPU object IDs clear because they are only unique within
                 // one alignment query, not across the complete workspace.
                 if annotation_effective {
+                    let rectangle_base = annotation_display.rectangles.len();
                     annotation_display.rectangles.extend(
                         layout
                             .display_list
@@ -1776,6 +1887,13 @@ impl Viewer {
                             .iter()
                             .take(layout.pinned_text_count)
                             .cloned(),
+                    );
+                    tag_layout_junction_arcs(
+                        &mut annotation_display.rectangles[rectangle_base..],
+                        &layout,
+                        track_id,
+                        &mut next_junction_arc_token,
+                        &mut junction_arc_keys,
                     );
                 }
                 let read_display = DisplayList {
@@ -2532,6 +2650,7 @@ impl Viewer {
         self.panels.active_mut().scroll_display_cache = Some(PanelScrollDisplayCache {
             annotations: annotation_display,
             pinned: pinned_display,
+            junction_arc_keys,
             annotation_overview,
             annotation_content_bottom,
             annotation_clip_top,
@@ -2740,6 +2859,96 @@ impl Viewer {
             panel_rect.left(),
             panel_rect.right(),
         );
+        let (interaction_enabled, content_revision) = {
+            let presentation = &self.panels.active().navigation_presentation;
+            (
+                presentation.is_interactive(),
+                presentation.committed_content_revision,
+            )
+        };
+        let mut junction_arc_targets =
+            std::mem::take(&mut self.panels.active_mut().junction_arc_targets);
+        junction_arc_targets.clear();
+        let junction_arc_keys = &self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .expect("scroll display cache was observed above")
+            .junction_arc_keys;
+        for (draw_order, rectangle) in display.rectangles.iter_mut().enumerate() {
+            if !rectangle.shape.is_junction_arc() {
+                continue;
+            }
+            let interaction_token = std::mem::take(&mut rectangle.object_id);
+            if !interaction_enabled || interaction_token == 0 {
+                continue;
+            }
+            let Some(key) = junction_arc_keys.get(&interaction_token).copied() else {
+                continue;
+            };
+            junction_arc_targets.push(ComposedJunctionArcTarget {
+                key,
+                primitive: *rectangle,
+                stroke_width: junction_arc_stroke_width(rectangle.height),
+                draw_order: u32::try_from(draw_order).unwrap_or(u32::MAX),
+                interaction_token,
+                content_revision,
+            });
+        }
+        let previous_hover = self.panels.active().hovered_junction_arc;
+        let valid_hover = previous_hover.and_then(|hover| {
+            if hover.content_revision != content_revision {
+                return None;
+            }
+            junction_arc_targets
+                .iter()
+                .find(|target| target.key == hover.key)
+                .map(|target| JunctionArcHover {
+                    interaction_token: target.interaction_token,
+                    ..hover
+                })
+        });
+        if valid_hover != previous_hover {
+            self.panels.active_mut().hovered_junction_arc = valid_hover;
+            self.window.set_cursor(if valid_hover.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            });
+            if valid_hover.is_none()
+                && matches!(
+                    self.panels.active().hover_inspector_target,
+                    Some(HoverInspectorTarget::Junction(..))
+                )
+            {
+                self.panels.active_mut().hover_inspector_target = None;
+            }
+        }
+        let panel = self.panels.active();
+        let hovered_junction_arc = panel.hovered_junction_arc;
+        let hover_overlay_count = hovered_junction_arc.map_or(0, |hover| {
+            junction_arc_targets
+                .iter()
+                .filter(|target| {
+                    hover.content_revision == target.content_revision && hover.key == target.key
+                })
+                .count()
+        });
+        let selected_alignment_track = panel.selected_alignment_track;
+        let selected_junction = panel.selected_junction;
+        let selected_junction_component = panel.selected_junction_component;
+        append_sashimi_interaction_overlays(
+            &mut display,
+            &junction_arc_targets,
+            hovered_junction_arc,
+            selected_alignment_track,
+            selected_junction,
+            selected_junction_component,
+        );
+        self.sashimi_interaction_diagnostics
+            .latest_hover_overlay_count = hover_overlay_count;
+        self.panels.active_mut().junction_arc_targets = junction_arc_targets;
         self.add_region_overlays(&mut display);
         let capacity_grew = display.rectangles.capacity() > rectangle_capacity
             || display.texts.capacity() > text_capacity;

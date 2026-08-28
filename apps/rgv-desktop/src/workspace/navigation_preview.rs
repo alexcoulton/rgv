@@ -252,9 +252,9 @@ impl NavigationPresentation {
         content_revision: u64,
         layout_revision: u64,
         contract_revision: u64,
-    ) {
+    ) -> bool {
         if self.phase != NavigationPresentationPhase::Settled {
-            return;
+            return false;
         }
         let interval = viewport.interval();
         self.target_interval = interval;
@@ -269,6 +269,7 @@ impl NavigationPresentation {
         self.committed_layout_revision = layout_revision;
         self.committed_contract_revision = contract_revision;
         self.invalidation_reason = None;
+        true
     }
 
     pub(crate) fn is_interactive(&self) -> bool {
