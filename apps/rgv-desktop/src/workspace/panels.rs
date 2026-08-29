@@ -119,16 +119,15 @@ impl PendingReadSelection {
             query.batch.read_name(*index) == Some(self.read_name.as_slice())
                 && self
                     .target_contig
-                    .is_none_or(|contig| query.batch.contigs.get(*index) == Some(&contig))
+                    .is_none_or(|contig| query.batch.contig(*index) == Some(contig))
                 && self
                     .target_start
-                    .is_none_or(|start| query.batch.starts.get(*index) == Some(&start))
+                    .is_none_or(|start| query.batch.start(*index) == Some(start))
                 && self.template_end.is_none_or(|read_end| {
                     query
                         .batch
-                        .flags
-                        .get(*index)
-                        .is_some_and(|flags| template_read_end(*flags) == Some(read_end))
+                        .flags(*index)
+                        .is_some_and(|flags| template_read_end(flags) == Some(read_end))
                 })
         })
     }

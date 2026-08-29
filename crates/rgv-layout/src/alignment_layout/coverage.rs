@@ -744,6 +744,24 @@ pub(crate) fn add_spans(
     options: &AlignmentLayoutOptions,
     rows: &AlignmentRowLayout,
 ) -> ReadRenderStats {
+    add_spans_sequential(
+        display_list,
+        query,
+        viewport,
+        options,
+        rows,
+        MAX_RENDERED_REGIONAL_INSERTIONS,
+    )
+}
+
+fn add_spans_sequential(
+    display_list: &mut DisplayList,
+    query: &AlignmentQuery,
+    viewport: Viewport,
+    options: &AlignmentLayoutOptions,
+    rows: &AlignmentRowLayout,
+    insertion_limit: usize,
+) -> ReadRenderStats {
     #[derive(Clone, Copy, Debug)]
     struct RegionalInsertion {
         index: usize,
@@ -755,21 +773,23 @@ pub(crate) fn add_spans(
     let batch = &query.batch;
     let mut stats = ReadRenderStats::default();
     let mut insertions = BTreeMap::<(usize, i32), RegionalInsertion>::new();
-    for index in 0..batch.len() {
-        let blocks =
-            aligned_reference_blocks(batch.starts[index], batch.ends[index], batch.cigar(index));
-        if blocks.iter().all(|&(start, end)| {
-            let (_, width) = clipped_geometry(start, end, viewport);
-            width <= 0.0
-        }) {
-            continue;
-        }
-        let Some(row) = rows.rows[index] else {
+    let materialized_indices = rows.materialized_record_indices(options.materialized_row_range);
+    if let Some(indices) = &materialized_indices {
+        stats.virtualized = batch.len().saturating_sub(indices.len());
+    }
+    let candidate_count = materialized_indices.as_ref().map_or(batch.len(), Vec::len);
+    for candidate in 0..candidate_count {
+        let index = materialized_indices
+            .as_ref()
+            .map_or(candidate, |indices| indices[candidate]);
+        let Some(row) = rows.row(index) else {
             stats.hidden += 1;
             continue;
         };
         if !options.materializes_row(row) {
-            stats.virtualized += 1;
+            if materialized_indices.is_none() {
+                stats.virtualized += 1;
+            }
             continue;
         }
         let representative = rows.representative(index);
@@ -781,48 +801,60 @@ pub(crate) fn add_spans(
             0.78,
         );
         let object_id = u32::try_from(representative + 1).unwrap_or(u32::MAX);
-        let first_primitive = display_list.rectangles.len();
         let y = options.reads_top + row as f32 * options.row_height;
-        for &(start, end) in &blocks {
-            let (x, width) = clipped_geometry(start, end, viewport);
-            if width > 0.0 {
-                add_read_body(
-                    display_list,
-                    x,
-                    y,
-                    width.max(1.0),
-                    options.read_height,
-                    read_fill,
-                    object_id,
-                );
-            }
-        }
-        for pair in blocks.windows(2) {
-            let (x, width) = clipped_geometry(pair[0].1, pair[1].0, viewport);
-            if width > 0.0 {
-                display_list.rectangles.push(RectPrimitive {
-                    x,
-                    y: y + options.read_height * 0.48,
-                    width: width.max(1.0),
-                    height: 1.0,
-                    color: Rgba::new(0.26, 0.36, 0.52, 0.92),
-                    object_id: read_detail_object_id(object_id),
-                    shape: RectShape::Rectangle,
-                });
-            }
-        }
-        add_read_direction_terminals(
-            display_list,
-            first_primitive,
-            viewport,
-            batch.starts[index],
-            batch.ends[index],
+        let reverse = batch.flags(index).expect("validated flags").is_reverse();
+        let mut previous_block_end = None;
+        let mut body_rendered = false;
+        for_each_aligned_reference_block(
+            batch.start(index).expect("validated start"),
+            batch.end(index).expect("validated end"),
             batch.cigar(index),
-            batch.flags[index].is_reverse(),
-            y,
-            options.read_height,
-            object_id,
+            |start, end, _, _| {
+                if let Some(previous_end) = previous_block_end {
+                    let (x, width) = clipped_geometry(previous_end, start, viewport);
+                    if width > 0.0 {
+                        display_list.rectangles.push(RectPrimitive {
+                            x,
+                            y: y + options.read_height * 0.48,
+                            width: width.max(1.0),
+                            height: 1.0,
+                            color: Rgba::new(0.26, 0.36, 0.52, 0.92),
+                            object_id: read_detail_object_id(object_id),
+                            shape: RectShape::Rectangle,
+                        });
+                    }
+                }
+                previous_block_end = Some(end);
+                let (x, width) = clipped_geometry(start, end, viewport);
+                if width > 0.0 {
+                    add_read_body(
+                        display_list,
+                        x,
+                        y,
+                        width.max(1.0),
+                        options.read_height,
+                        read_fill,
+                        object_id,
+                    );
+                    let terminal_is_visible = if reverse {
+                        start >= viewport.interval().start() && start < viewport.interval().end()
+                    } else {
+                        end > viewport.interval().start() && end <= viewport.interval().end()
+                    };
+                    if terminal_is_visible && let Some(body) = display_list.rectangles.last_mut() {
+                        body.shape = if reverse {
+                            RectShape::DirectionalTerminalLeft
+                        } else {
+                            RectShape::DirectionalTerminalRight
+                        };
+                    }
+                    body_rendered = true;
+                }
+            },
         );
+        if !body_rendered {
+            continue;
+        }
         if options
             .selected_chain_read_name_hash
             .is_some_and(|selected| {
@@ -833,8 +865,8 @@ pub(crate) fn add_spans(
         {
             add_chain_highlight(
                 display_list,
-                batch.starts[index],
-                batch.ends[index],
+                batch.start(index).expect("validated start"),
+                batch.end(index).expect("validated end"),
                 viewport,
                 y,
                 options.read_height,
@@ -845,7 +877,7 @@ pub(crate) fn add_spans(
         let Some(cigar) = batch.cigar(index) else {
             continue;
         };
-        let mut reference_position = batch.starts[index];
+        let mut reference_position = batch.start(index).expect("validated start");
         for operation in cigar {
             match operation.kind {
                 CigarOpKind::Match
@@ -877,7 +909,7 @@ pub(crate) fn add_spans(
                         {
                             *previous = candidate;
                         }
-                    } else if insertions.len() < MAX_RENDERED_REGIONAL_INSERTIONS {
+                    } else if insertions.len() < insertion_limit {
                         insertions.insert(key, candidate);
                     } else {
                         stats.regional_insertions_omitted =

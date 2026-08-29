@@ -30,7 +30,7 @@ pub(crate) fn bisulfite_observation(
     classify_bisulfite_observation(
         reference,
         position,
-        bisulfite_strand_is_reverse(query.batch.flags[index]),
+        bisulfite_strand_is_reverse(query.batch.flags(index).expect("validated flags")),
         context,
         observed_base,
     )
@@ -51,7 +51,7 @@ pub(crate) fn bisulfite_conversion_mismatch(
         return false;
     };
     let observed_base = observed_base.to_ascii_uppercase();
-    if bisulfite_strand_is_reverse(query.batch.flags[index]) {
+    if bisulfite_strand_is_reverse(query.batch.flags(index).expect("validated flags")) {
         reference_base == b'G' && observed_base == b'A'
     } else {
         reference_base == b'C' && observed_base == b'T'
@@ -344,7 +344,9 @@ pub(crate) fn alignment_color(
     alpha: f32,
 ) -> Rgba {
     let batch = &query.batch;
-    let mapq_fraction = batch.mapping_qualities[index]
+    let mapq_fraction = batch
+        .mapping_quality(index)
+        .flatten()
         .map_or(0.45, |value| (f32::from(value) / 60.0).clamp(0.2, 1.0));
     match mode {
         AlignmentColorMode::None => {
@@ -352,7 +354,7 @@ pub(crate) fn alignment_color(
             Rgba::new(grey, grey, grey, alpha.max(0.92))
         }
         AlignmentColorMode::Strand => {
-            if batch.flags[index].is_reverse() {
+            if batch.flags(index).expect("validated flags").is_reverse() {
                 Rgba::new(0.58, 0.36, 0.67, alpha)
             } else {
                 Rgba::new(0.92, 0.55, 0.64, alpha)
@@ -421,12 +423,14 @@ pub(crate) fn alignment_color(
                 Some(_) => Rgba::new(0.91, 0.29, 0.24, alpha),
             }
         }
-        AlignmentColorMode::MateContig => batch.mate_contigs[index]
+        AlignmentColorMode::MateContig => batch
+            .mate_contig(index)
+            .flatten()
             .map_or(Rgba::new(0.56, 0.60, 0.68, alpha), |contig| {
                 palette_color(&format!("tid {}", contig.get()), alpha)
             }),
         AlignmentColorMode::FirstOfPairStrand => {
-            let flags = batch.flags[index];
+            let flags = batch.flags(index).expect("validated flags");
             let reverse = if flags.is_first_in_template() {
                 Some(flags.is_reverse())
             } else if flags.is_last_in_template() {
@@ -441,8 +445,8 @@ pub(crate) fn alignment_color(
             }
         }
         AlignmentColorMode::Bisulfite(_) => {
-            let reverse = first_of_pair_reverse(batch.flags[index])
-                .unwrap_or_else(|| batch.flags[index].is_reverse());
+            let reverse = first_of_pair_reverse(batch.flags(index).expect("validated flags"))
+                .unwrap_or_else(|| batch.flags(index).expect("validated flags").is_reverse());
             if reverse {
                 // A muted sage body keeps the protected/converted red and blue marks dominant.
                 Rgba::new(0.68, 0.75, 0.62, alpha.max(0.92))

@@ -137,6 +137,18 @@ pub struct RemoteIoStats {
     pub cancellations: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteTransferBudget {
+    pub maximum_requests: u64,
+    pub maximum_response_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveRemoteTransferBudget {
+    baseline: RemoteIoStats,
+    budget: RemoteTransferBudget,
+}
+
 pub type RemoteCancellation = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Clone, Debug)]
@@ -170,6 +182,7 @@ pub struct HttpRangeReader {
     redirect_count: Arc<AtomicU64>,
     cancellation: Option<RemoteCancellation>,
     cancellation_reported: bool,
+    transfer_budget: Option<ActiveRemoteTransferBudget>,
 }
 
 impl HttpRangeReader {
@@ -252,6 +265,7 @@ impl HttpRangeReader {
             redirect_count,
             cancellation: None,
             cancellation_reported: false,
+            transfer_budget: None,
         })
     }
 
@@ -274,6 +288,31 @@ impl HttpRangeReader {
     pub fn set_cancellation(&mut self, cancellation: Option<RemoteCancellation>) {
         self.cancellation = cancellation;
         self.cancellation_reported = false;
+    }
+
+    pub fn set_transfer_budget(&mut self, budget: Option<RemoteTransferBudget>) {
+        self.transfer_budget = budget.map(|budget| ActiveRemoteTransferBudget {
+            baseline: self.stats,
+            budget,
+        });
+    }
+
+    fn check_transfer_budget(&self, expected_response_bytes: u64) -> Result<(), RemoteError> {
+        let Some(active) = self.transfer_budget else {
+            return Ok(());
+        };
+        let requests = self.stats.requests.saturating_sub(active.baseline.requests);
+        let response_bytes = self
+            .stats
+            .response_bytes
+            .saturating_sub(active.baseline.response_bytes);
+        if requests >= active.budget.maximum_requests
+            || response_bytes.saturating_add(expected_response_bytes)
+                > active.budget.maximum_response_bytes
+        {
+            return Err(RemoteError::TransferBudgetExceeded);
+        }
+        Ok(())
     }
 
     fn check_cancellation(&mut self) -> Result<(), RemoteError> {
@@ -372,8 +411,10 @@ impl HttpRangeReader {
         start: u64,
         end: u64,
     ) -> Result<reqwest::blocking::Response, RemoteError> {
+        let expected_response_bytes = end.saturating_sub(start).saturating_add(1);
         for attempt in 0..=self.config.maximum_retries {
             self.check_cancellation()?;
+            self.check_transfer_budget(expected_response_bytes)?;
             let mut request = self.config.authentication.apply(
                 self.client
                     .get(self.url.clone())
@@ -699,6 +740,8 @@ pub enum RemoteError {
     ResponseTooLarge(u64),
     #[error("remote request was cancelled because the view changed")]
     Cancelled,
+    #[error("remote speculative transfer reached its request or response-byte budget")]
+    TransferBudgetExceeded,
 }
 
 impl From<reqwest::Error> for RemoteError {
@@ -988,6 +1031,40 @@ mod tests {
         assert!(error.to_string().contains("cancelled"));
         assert_eq!(reader.stats().cancellations, 1);
         assert_eq!(reader.stats().requests, 1);
+    }
+
+    #[test]
+    fn transfer_budget_stops_speculative_ranges_before_the_hard_limit() {
+        let Some(fixture) = RangeFixture::start((0_u8..=255).cycle().take(4_096).collect()) else {
+            return;
+        };
+        let mut reader = HttpRangeReader::open(
+            &fixture.url,
+            HttpRangeConfig {
+                chunk_size: NonZeroUsize::new(256).unwrap(),
+                maximum_cache_bytes: NonZeroUsize::new(1_024).unwrap(),
+                minimum_coalesced_chunks: NonZeroUsize::MIN,
+                maximum_coalesced_chunks: NonZeroUsize::MIN,
+                ..HttpRangeConfig::default()
+            },
+        )
+        .unwrap();
+        let baseline = reader.stats();
+        reader.set_transfer_budget(Some(RemoteTransferBudget {
+            maximum_requests: 1,
+            maximum_response_bytes: 256,
+        }));
+        let mut first = [0_u8; 1];
+        reader.read_exact(&mut first).unwrap();
+        reader.seek(SeekFrom::Start(512)).unwrap();
+        let error = reader.read_exact(&mut first).unwrap_err();
+        assert!(error.to_string().contains("transfer reached"));
+        let delta = reader.stats();
+        assert_eq!(delta.requests.saturating_sub(baseline.requests), 1);
+        assert_eq!(
+            delta.response_bytes.saturating_sub(baseline.response_bytes),
+            256
+        );
     }
 
     #[test]

@@ -9,6 +9,9 @@ pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_CACHE_BUDGET_MIB: usize = 512;
 pub const MINIMUM_CACHE_BUDGET_MIB: usize = 128;
 pub const MAXIMUM_CACHE_BUDGET_MIB: usize = 4_096;
+pub const DEFAULT_READ_BROWSING_BUFFER_PERCENT: u16 = 100;
+pub const MINIMUM_READ_BROWSING_BUFFER_PERCENT: u16 = 0;
+pub const MAXIMUM_READ_BROWSING_BUFFER_PERCENT: u16 = 400;
 pub const DEFAULT_AUTOSAVE_INTERVAL_SECONDS: u64 = 120;
 pub const MINIMUM_AUTOSAVE_INTERVAL_SECONDS: u64 = 30;
 pub const MAXIMUM_AUTOSAVE_INTERVAL_SECONDS: u64 = 3_600;
@@ -31,6 +34,8 @@ pub struct DesktopSettings {
     pub recent_sessions: Vec<String>,
     pub recent_loci: Vec<String>,
     pub cache_budget_mib: usize,
+    /// Desired decoded-read margin on each side, as a percentage of the viewport span.
+    pub read_browsing_buffer_percent: u16,
     pub diagnostics_opt_in: bool,
     /// Periodic recovery snapshots are disabled until the user opts in.
     pub autosave_enabled: bool,
@@ -50,6 +55,7 @@ impl Default for DesktopSettings {
             recent_sessions: Vec::new(),
             recent_loci: Vec::new(),
             cache_budget_mib: DEFAULT_CACHE_BUDGET_MIB,
+            read_browsing_buffer_percent: DEFAULT_READ_BROWSING_BUFFER_PERCENT,
             diagnostics_opt_in: false,
             autosave_enabled: false,
             autosave_interval_seconds: DEFAULT_AUTOSAVE_INTERVAL_SECONDS,
@@ -120,6 +126,13 @@ impl DesktopSettings {
         if !(MINIMUM_CACHE_BUDGET_MIB..=MAXIMUM_CACHE_BUDGET_MIB).contains(&self.cache_budget_mib) {
             return Err(SettingsError::InvalidCacheBudget(self.cache_budget_mib));
         }
+        if !(MINIMUM_READ_BROWSING_BUFFER_PERCENT..=MAXIMUM_READ_BROWSING_BUFFER_PERCENT)
+            .contains(&self.read_browsing_buffer_percent)
+        {
+            return Err(SettingsError::InvalidReadBrowsingBuffer(
+                self.read_browsing_buffer_percent,
+            ));
+        }
         if !(MINIMUM_AUTOSAVE_INTERVAL_SECONDS..=MAXIMUM_AUTOSAVE_INTERVAL_SECONDS)
             .contains(&self.autosave_interval_seconds)
         {
@@ -165,6 +178,8 @@ pub enum SettingsError {
     UnsupportedVersion(u32),
     #[error("cache budget {0} MiB is outside the supported range")]
     InvalidCacheBudget(usize),
+    #[error("read browsing buffer {0}% is outside the supported range")]
+    InvalidReadBrowsingBuffer(u16),
     #[error("autosave interval {0} seconds is outside the supported range")]
     InvalidAutosaveInterval(u64),
     #[error("autosave retention {0} is outside the supported range")]
@@ -234,6 +249,10 @@ mod tests {
             defaults.interface_scale_percent,
             DEFAULT_INTERFACE_SCALE_PERCENT
         );
+        assert_eq!(
+            defaults.read_browsing_buffer_percent,
+            DEFAULT_READ_BROWSING_BUFFER_PERCENT
+        );
         assert!(!defaults.high_contrast);
         assert!(!defaults.reduced_motion);
 
@@ -273,6 +292,29 @@ mod tests {
         assert!(matches!(
             invalid.to_json(),
             Err(SettingsError::InvalidInterfaceScale(_))
+        ));
+    }
+
+    #[test]
+    fn read_browsing_buffer_is_bounded_and_backward_compatible() {
+        let settings = DesktopSettings {
+            read_browsing_buffer_percent: 250,
+            ..DesktopSettings::default()
+        };
+        assert_eq!(
+            DesktopSettings::from_json(&settings.to_json().unwrap())
+                .unwrap()
+                .read_browsing_buffer_percent,
+            250
+        );
+
+        let invalid = DesktopSettings {
+            read_browsing_buffer_percent: MAXIMUM_READ_BROWSING_BUFFER_PERCENT + 1,
+            ..DesktopSettings::default()
+        };
+        assert!(matches!(
+            invalid.to_json(),
+            Err(SettingsError::InvalidReadBrowsingBuffer(_))
         ));
     }
 }

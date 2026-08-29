@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     fs::{self, File},
     io::{BufReader, Read},
@@ -14,10 +15,14 @@ use rgv_core::{
     DetailLevel, GenerationClock, GenomicInterval, PanelGeneration, PanelId, ReferenceDictionary,
     Viewport,
 };
-use rgv_engine::{AlignmentEngine, AlignmentEngineEvent};
+use rgv_engine::{
+    AlignmentBrowsingPolicy, AlignmentEngine, AlignmentEngineEvent, AlignmentWorkingSetStats,
+};
 use rgv_hts::{AlignmentOpenOptions, QueryOptions};
 use rgv_layout::{
-    AlignmentLayout, AlignmentLayoutOptions, alignment_read_name_hash, layout_alignment_query,
+    AlignmentLayout, AlignmentLayoutOptions, AlignmentRowLayout, AlignmentRowScene,
+    alignment_read_name_hash, assign_alignment_rows, layout_alignment_query,
+    layout_alignment_query_with_rows,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -44,6 +49,12 @@ struct Arguments {
     decoded_cache_mib: usize,
     #[arg(long, default_value_t = 10)]
     iterations: usize,
+    /// Desired decoded-read margin on each side, as a viewport percentage.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=400))]
+    read_browsing_buffer_percent: u16,
+    /// Run narrow/broad/return and bidirectional-pan working-set qualification.
+    #[arg(long)]
+    working_set_navigation: bool,
     #[arg(long)]
     view_as_pairs: bool,
     #[arg(long)]
@@ -81,6 +92,7 @@ struct Report {
     per_track_maximum_alignments: usize,
     per_projection_maximum_alignments: usize,
     decoded_cache_mib: usize,
+    read_browsing_buffer_percent: u16,
     view_as_pairs: bool,
     open_ms: f64,
     first_useful_ms: f64,
@@ -123,6 +135,65 @@ struct Report {
     workspace_records_retained: usize,
     workspace_rendered_alignments: usize,
     workspace_primitives: usize,
+    working_set_navigation: Option<WorkingSetNavigationReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkingSetNavigationReport {
+    buffer_percent: u16,
+    stages: Vec<WorkingSetNavigationStage>,
+    source_queries: u64,
+    source_queries_avoided: u64,
+    decoded_bytes_avoided: u64,
+    final_resident_bytes: usize,
+    final_cache_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkingSetNavigationStage {
+    name: String,
+    start: u64,
+    end: u64,
+    foreground_ms: f64,
+    foreground_cache_outcome: String,
+    foreground_source_queries: u64,
+    buffer_settled_ms: f64,
+    layout_ms: f64,
+    row_scene_hit: bool,
+    row_scene_path: String,
+    row_scene_projection_ms: f64,
+    row_scene_extension_ms: f64,
+    row_scene_query_projection_ms: f64,
+    resident_scene_prepare_ms: f64,
+    render_list_cache_hit: bool,
+    render_list_ms: f64,
+    cache_outcome: String,
+    lookup_micros: u64,
+    projection_micros: u64,
+    summary_micros: u64,
+    summary_tile_hits: usize,
+    summary_index_bytes: usize,
+    resident_start: Option<u64>,
+    resident_end: Option<u64>,
+    resident_records: usize,
+    resident_bytes: usize,
+    cache_bytes: usize,
+    cache_maximum_bytes: usize,
+    requested_margin_left: u64,
+    requested_margin_right: u64,
+    effective_margin_left: u64,
+    effective_margin_right: u64,
+    clamp_reason: Option<String>,
+    extensions_requested: u64,
+    extensions_completed: u64,
+    extensions_cancelled: u64,
+    extensions_too_dense: u64,
+    extensions_failed: u64,
+    source_queries: u64,
+    source_queries_avoided: u64,
+    decoded_bytes_avoided: u64,
+    speculative_remote_bytes: u64,
+    speculative_remote_requests: u64,
 }
 
 struct BenchmarkTrack {
@@ -195,8 +266,11 @@ fn main() -> Result<()> {
     )?;
 
     let cold_started = Instant::now();
-    let (cold_queries, cold_cache_hits) =
-        query_benchmark_tracks(&tracks, per_projection_maximum_alignments)?;
+    let (cold_queries, cold_cache_hits) = query_benchmark_tracks(
+        &tracks,
+        per_projection_maximum_alignments,
+        arguments.read_browsing_buffer_percent,
+    )?;
     anyhow::ensure!(
         cold_cache_hits == 0,
         "first query unexpectedly came from cache"
@@ -216,8 +290,11 @@ fn main() -> Result<()> {
     for _ in 0..arguments.iterations {
         let total_started = Instant::now();
         let query_started = Instant::now();
-        let (queries, iteration_cache_hits) =
-            query_benchmark_tracks(&tracks, per_projection_maximum_alignments)?;
+        let (queries, iteration_cache_hits) = query_benchmark_tracks(
+            &tracks,
+            per_projection_maximum_alignments,
+            arguments.read_browsing_buffer_percent,
+        )?;
         cache_hits = cache_hits.saturating_add(iteration_cache_hits);
         query_ms.push(milliseconds(query_started));
 
@@ -288,6 +365,19 @@ fn main() -> Result<()> {
                 .map(alignment_read_name_hash);
         },
     );
+    let working_set_navigation = arguments
+        .working_set_navigation
+        .then(|| {
+            benchmark_working_set_navigation(
+                tracks
+                    .first()
+                    .context("working-set benchmark has no track")?,
+                per_projection_maximum_alignments,
+                arguments.read_browsing_buffer_percent,
+                arguments.view_as_pairs,
+            )
+        })
+        .transpose()?;
     let report = Report {
         input: arguments.input.clone(),
         locus: arguments.locus,
@@ -303,6 +393,7 @@ fn main() -> Result<()> {
         per_track_maximum_alignments,
         per_projection_maximum_alignments,
         decoded_cache_mib: arguments.decoded_cache_mib,
+        read_browsing_buffer_percent: arguments.read_browsing_buffer_percent,
         view_as_pairs: arguments.view_as_pairs,
         open_ms,
         first_useful_ms,
@@ -349,6 +440,7 @@ fn main() -> Result<()> {
         workspace_records_retained,
         workspace_rendered_alignments,
         workspace_primitives,
+        working_set_navigation,
     };
     let json = serde_json::to_string_pretty(&report)?;
     if let Some(output) = arguments.output {
@@ -448,6 +540,7 @@ fn open_benchmark_tracks(
 fn query_benchmark_tracks(
     tracks: &[BenchmarkTrack],
     per_projection_maximum_alignments: usize,
+    read_browsing_buffer_percent: u16,
 ) -> Result<(Vec<Vec<Arc<rgv_hts::AlignmentQuery>>>, usize)> {
     let mut cache_hits = 0_usize;
     let queries = tracks
@@ -458,11 +551,14 @@ fn query_benchmark_tracks(
                 .iter()
                 .map(|panel| {
                     let request = PanelGeneration::new(panel.id, panel.clock.advance());
-                    track.engine.try_query(
+                    track.engine.try_query_with_browsing(
                         request,
                         panel.clock.clone(),
                         panel.interval,
                         query_options_for_panel(panel, per_projection_maximum_alignments),
+                        AlignmentBrowsingPolicy {
+                            buffer_percent: read_browsing_buffer_percent,
+                        },
                     )?;
                     Ok(request)
                 })
@@ -486,6 +582,332 @@ fn query_options_for_panel(
         coverage_bins: NonZeroUsize::new(
             (panel.viewport.pixel_width().round() as usize)
                 .min(usize::try_from(panel.interval.len()).unwrap_or(usize::MAX))
+                .max(1),
+        )
+        .unwrap(),
+        collect_alleles: detail == DetailLevel::Bases,
+        collect_modifications: detail != DetailLevel::Overview,
+        ..QueryOptions::default()
+    }
+}
+
+fn benchmark_working_set_navigation(
+    track: &BenchmarkTrack,
+    maximum_alignments: usize,
+    buffer_percent: u16,
+    view_as_pairs: bool,
+) -> Result<WorkingSetNavigationReport> {
+    let panel = track
+        .panels
+        .first()
+        .context("working-set benchmark has no panel")?;
+    track.engine.try_clear_cache()?;
+    let mut source_query_baseline = 0_u64;
+    loop {
+        match track.engine.receive_timeout(Duration::from_secs(30))? {
+            Some(AlignmentEngineEvent::WorkingSetUpdated { working_set, .. }) => {
+                source_query_baseline = source_query_baseline.max(working_set.source_queries);
+            }
+            Some(AlignmentEngineEvent::CacheCleared { .. }) => break,
+            Some(AlignmentEngineEvent::Error { message, .. }) => anyhow::bail!(message),
+            Some(_) | None => continue,
+        }
+    }
+
+    let broad = panel.interval;
+    let narrow_length = (broad.len() / 2).max(1);
+    let narrow_start = broad
+        .start()
+        .saturating_add((broad.len().saturating_sub(narrow_length)) / 2);
+    let narrow = GenomicInterval::new(
+        broad.contig(),
+        narrow_start,
+        narrow_start.saturating_add(narrow_length),
+    )?;
+    let pan_step = (narrow.len() / 10).max(1);
+    let forward = GenomicInterval::new(
+        narrow.contig(),
+        narrow.start().saturating_add(pan_step),
+        narrow.end().saturating_add(pan_step),
+    )?;
+    let sequence = [
+        ("narrow", narrow),
+        ("pan_forward", forward),
+        ("pan_backward", narrow),
+        ("broad", broad),
+        ("narrow_return", narrow),
+        ("broad_return", broad),
+    ];
+    let mut stages = Vec::with_capacity(sequence.len());
+    let mut final_working_set = AlignmentWorkingSetStats::default();
+    let mut last_settled_source_queries = source_query_baseline;
+    let mut final_cache_bytes = 0_usize;
+    // Model desktop ownership faithfully: the committed foreground and row
+    // horizon remain alive until the next current-generation result replaces
+    // them. The engine deliberately keeps only Weak references to these.
+    let mut _retained_foreground = None;
+    let mut _retained_layout = None;
+    let mut row_scenes = Vec::<(AlignmentRowScene, AlignmentLayoutOptions)>::new();
+    let mut exact_row_projections =
+        HashMap::<(u64, u64), (AlignmentRowLayout, AlignmentLayoutOptions)>::new();
+    let mut render_scenes = HashMap::<(u64, u64), Arc<AlignmentLayout>>::new();
+    for (name, interval) in sequence {
+        let request = PanelGeneration::new(panel.id, panel.clock.advance());
+        let viewport = Viewport::new(interval, panel.viewport.pixel_width())?;
+        let options = query_options_for_interval(viewport, maximum_alignments);
+        let started = Instant::now();
+        track.engine.try_query_with_browsing(
+            request,
+            panel.clock.clone(),
+            interval,
+            options,
+            AlignmentBrowsingPolicy { buffer_percent },
+        )?;
+        let mut query = None;
+        let mut foreground_ms = None;
+        let mut foreground_working_set = None;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let (working_set, cache_stats, settled_ms, resident_query) = loop {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "working-set stage {name} timed out"
+            );
+            match track.engine.receive_timeout(Duration::from_millis(100))? {
+                Some(AlignmentEngineEvent::QueryCompleted {
+                    request: seen,
+                    query: completed,
+                    layout_query,
+                    working_set,
+                    ..
+                }) if seen == request => {
+                    foreground_ms = Some(milliseconds(started));
+                    _retained_foreground = Some(Arc::clone(&completed));
+                    _retained_layout = Some(layout_query);
+                    query = Some(completed);
+                    foreground_working_set = Some(working_set);
+                }
+                Some(AlignmentEngineEvent::WorkingSetUpdated {
+                    request: seen,
+                    resident_query,
+                    cache_stats,
+                    working_set,
+                    ..
+                }) if seen == request => {
+                    break (
+                        working_set,
+                        cache_stats,
+                        milliseconds(started),
+                        resident_query,
+                    );
+                }
+                Some(AlignmentEngineEvent::Error { message, .. }) => anyhow::bail!(message),
+                Some(_) | None => continue,
+            }
+        };
+        let query = query.context("working-set update arrived before its foreground")?;
+        let foreground_working_set = foreground_working_set
+            .context("working-set update arrived without foreground statistics")?;
+        let layout_started = Instant::now();
+        let layout_query = _retained_layout
+            .as_ref()
+            .expect("working-set stage retained its layout query");
+        let scene_projection_started = Instant::now();
+        let mut row_scene_extension_ms = 0.0;
+        let mut row_scene_query_projection_ms = 0.0;
+        let render_key = (interval.start(), interval.end());
+        let mut projected_rows = exact_row_projections
+            .get(&render_key)
+            .cloned()
+            .map(|(layout, options)| {
+                (
+                    layout,
+                    rgv_layout::AlignmentRowSceneProjection::ExactCamera,
+                    options,
+                )
+            })
+            .or_else(|| {
+                row_scenes
+                    .iter()
+                    .rev()
+                    .find_map(|(scene, options)| {
+                        scene.project_physical(&query, options).map(|layout| {
+                            (
+                                layout,
+                                rgv_layout::AlignmentRowSceneProjection::Physical,
+                                *options,
+                            )
+                        })
+                    })
+                    .or_else(|| {
+                        row_scenes.iter().rev().find_map(|(scene, options)| {
+                            scene
+                                .project_with_outcome(&query, options)
+                                .map(|(layout, outcome)| (layout, outcome, *options))
+                        })
+                    })
+            });
+        if projected_rows.is_none() {
+            let mut extension_options = pair_layout_options(layout_query, view_as_pairs);
+            extension_options.max_rows = maximum_alignments.max(1);
+            extension_options.materialized_row_range = Some((0, 128));
+            if let Some((extended, rows)) = row_scenes.iter().rev().find_map(|(scene, options)| {
+                let extension_started = Instant::now();
+                let extended = scene.extend_edges(layout_query, &extension_options);
+                row_scene_extension_ms += milliseconds(extension_started);
+                extended
+                    .and_then(|extended| {
+                        let projection_started = Instant::now();
+                        let rows = extended.project(&query, &extension_options);
+                        row_scene_query_projection_ms += milliseconds(projection_started);
+                        Some((extended, rows?))
+                    })
+                    .or_else(|| {
+                        // Keep the stored policy as the authoritative comparison;
+                        // the explicit options above only stabilize the initial
+                        // Complete-read capacity across horizon growth.
+                        let extension_started = Instant::now();
+                        let extended = scene.extend_edges(layout_query, options);
+                        row_scene_extension_ms += milliseconds(extension_started);
+                        extended.and_then(|extended| {
+                            let projection_started = Instant::now();
+                            let rows = extended.project(&query, options);
+                            row_scene_query_projection_ms += milliseconds(projection_started);
+                            Some((extended, rows?))
+                        })
+                    })
+            }) {
+                row_scenes.push((extended, extension_options));
+                projected_rows = Some((
+                    rows,
+                    rgv_layout::AlignmentRowSceneProjection::EdgeExtension,
+                    extension_options,
+                ));
+            }
+        }
+        let row_scene_hit = projected_rows.is_some();
+        let row_scene_path = projected_rows.as_ref().map_or_else(
+            || "miss".to_owned(),
+            |(_, outcome, _)| format!("{outcome:?}"),
+        );
+        let row_scene_projection_ms = milliseconds(scene_projection_started);
+        let (rows, options) = if let Some((rows, _, options)) = projected_rows {
+            (rows, options)
+        } else {
+            let mut options = pair_layout_options(layout_query, view_as_pairs);
+            options.max_rows = maximum_alignments.max(1);
+            // Match the desktop's vertically virtualized read pane. Row
+            // assignment remains complete, while render-list work covers the
+            // visible rows plus a generous overscan rather than an imaginary
+            // million-row-tall window.
+            options.materialized_row_range = Some((0, 128));
+            let horizon_rows = assign_alignment_rows(layout_query, options, None);
+            let scene = AlignmentRowScene::new(layout_query, &horizon_rows, &options)
+                .context("layout horizon could not form a persistent row scene")?;
+            let rows = scene
+                .project(&query, &options)
+                .context("foreground records were absent from their layout horizon")?;
+            row_scenes.push((scene, options));
+            (rows, options)
+        };
+        exact_row_projections.insert(render_key, (rows.clone(), options));
+        let render_list_started = Instant::now();
+        let (layout, render_list_cache_hit) = render_scenes.get(&render_key).cloned().map_or_else(
+            || {
+                let layout = Arc::new(layout_alignment_query_with_rows(
+                    &query, viewport, options, &rows,
+                ));
+                render_scenes.insert(render_key, Arc::clone(&layout));
+                (layout, false)
+            },
+            |layout| (layout, true),
+        );
+        std::hint::black_box(layout);
+        let render_list_ms = milliseconds(render_list_started);
+        let layout_ms = milliseconds(layout_started);
+        let prepare_started = Instant::now();
+        if let Some(resident_query) = resident_query
+            && let Some((prepared, options)) = row_scenes.last().and_then(|(scene, options)| {
+                scene
+                    .prepare_resident_extension(&resident_query)
+                    .map(|prepared| (prepared, *options))
+            })
+        {
+            row_scenes.push((prepared, options));
+        }
+        let resident_scene_prepare_ms = milliseconds(prepare_started);
+        stages.push(WorkingSetNavigationStage {
+            name: name.to_owned(),
+            start: interval.start(),
+            end: interval.end(),
+            foreground_ms: foreground_ms.unwrap_or(settled_ms),
+            foreground_cache_outcome: format!("{:?}", foreground_working_set.cache_outcome),
+            foreground_source_queries: foreground_working_set
+                .source_queries
+                .saturating_sub(last_settled_source_queries),
+            buffer_settled_ms: settled_ms,
+            layout_ms,
+            row_scene_hit,
+            row_scene_path,
+            row_scene_projection_ms,
+            row_scene_extension_ms,
+            row_scene_query_projection_ms,
+            resident_scene_prepare_ms,
+            render_list_cache_hit,
+            render_list_ms,
+            cache_outcome: format!("{:?}", working_set.cache_outcome),
+            lookup_micros: working_set.lookup_micros,
+            projection_micros: working_set.projection_micros,
+            summary_micros: working_set.summary_micros,
+            summary_tile_hits: working_set.summary_tile_hits,
+            summary_index_bytes: working_set.summary_index_bytes,
+            resident_start: working_set.resident_start,
+            resident_end: working_set.resident_end,
+            resident_records: working_set.resident_records,
+            resident_bytes: working_set.resident_bytes,
+            cache_bytes: cache_stats.resident_weight,
+            cache_maximum_bytes: cache_stats.maximum_weight,
+            requested_margin_left: working_set.requested_margin_left,
+            requested_margin_right: working_set.requested_margin_right,
+            effective_margin_left: working_set.effective_margin_left,
+            effective_margin_right: working_set.effective_margin_right,
+            clamp_reason: working_set.clamp_reason.map(|reason| format!("{reason:?}")),
+            extensions_requested: working_set.extensions_requested,
+            extensions_completed: working_set.extensions_completed,
+            extensions_cancelled: working_set.extensions_cancelled,
+            extensions_too_dense: working_set.extensions_too_dense,
+            extensions_failed: working_set.extensions_failed,
+            source_queries: working_set
+                .source_queries
+                .saturating_sub(source_query_baseline),
+            source_queries_avoided: working_set.source_queries_avoided,
+            decoded_bytes_avoided: working_set.decoded_bytes_avoided,
+            speculative_remote_bytes: working_set.speculative_remote_bytes,
+            speculative_remote_requests: working_set.speculative_remote_requests,
+        });
+        final_working_set = working_set;
+        last_settled_source_queries = working_set.source_queries;
+        final_cache_bytes = cache_stats.resident_weight;
+    }
+    Ok(WorkingSetNavigationReport {
+        buffer_percent,
+        source_queries: final_working_set
+            .source_queries
+            .saturating_sub(source_query_baseline),
+        source_queries_avoided: final_working_set.source_queries_avoided,
+        decoded_bytes_avoided: final_working_set.decoded_bytes_avoided,
+        final_resident_bytes: final_working_set.resident_bytes,
+        final_cache_bytes,
+        stages,
+    })
+}
+
+fn query_options_for_interval(viewport: Viewport, maximum_alignments: usize) -> QueryOptions {
+    let detail = viewport.detail_level();
+    QueryOptions {
+        max_records: NonZeroUsize::new(maximum_alignments).unwrap(),
+        coverage_bins: NonZeroUsize::new(
+            (viewport.pixel_width().round() as usize)
+                .min(usize::try_from(viewport.interval().len()).unwrap_or(usize::MAX))
                 .max(1),
         )
         .unwrap(),

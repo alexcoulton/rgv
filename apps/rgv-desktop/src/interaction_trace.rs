@@ -164,6 +164,7 @@ impl InteractionTraceRecorder {
         uploaded_bytes: usize,
         buffer_reallocated: bool,
         cpu_capacity_grew: bool,
+        slab_cache_hit: bool,
     ) {
         self.push(InteractionTraceEvent {
             duration: Some(duration),
@@ -171,7 +172,11 @@ impl InteractionTraceRecorder {
             uploaded_bytes: Some(uploaded_bytes),
             buffer_reallocated: Some(buffer_reallocated),
             cpu_capacity_grew: Some(cpu_capacity_grew),
-            detail: cpu_capacity_grew.then_some("cpu_instance_capacity_grew"),
+            detail: if slab_cache_hit {
+                Some("gpu_slab_hit")
+            } else {
+                cpu_capacity_grew.then_some("cpu_instance_capacity_grew")
+            },
             ..InteractionTraceEvent::simple(InteractionTraceStage::RendererPrepareFinished)
         });
     }

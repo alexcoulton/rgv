@@ -899,7 +899,10 @@ fn verify_alignment_review_semantics(source: &mut LocalAlignmentSource) -> Resul
     let paired = query_alignment_review_locus(source, ALIGNMENT_REVIEW_LOCI[0])?;
     anyhow::ensure!(
         paired.pairs.eligible_proper_templates > 0
-            && paired.batch.flags.iter().any(|flags| flags.is_paired()),
+            && paired
+                .batch
+                .records()
+                .any(|record| record.flags().is_paired()),
         "paired-read review panel contains no proper paired templates"
     );
 
@@ -913,9 +916,8 @@ fn verify_alignment_review_semantics(source: &mut LocalAlignmentSource) -> Resul
     let long = query_alignment_review_locus(source, ALIGNMENT_REVIEW_LOCI[4])?;
     anyhow::ensure!(
         long.batch
-            .flags
-            .iter()
-            .any(|flags| flags.is_supplementary()),
+            .records()
+            .any(|record| record.flags().is_supplementary()),
         "long-read review panel contains no supplementary alignment"
     );
     anyhow::ensure!(

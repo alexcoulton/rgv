@@ -65,6 +65,30 @@ fn checking_notice_is_debounced_without_delaying_the_truth_state() {
 }
 
 #[test]
+fn alignment_query_phases_have_truthful_user_facing_status() {
+    assert_eq!(
+        AlignmentQueryPhase::FetchingReads.status_text(),
+        "Fetching reads…"
+    );
+    assert_eq!(
+        AlignmentQueryPhase::SelectingResidentReads.status_text(),
+        "Selecting resident reads…"
+    );
+    assert_eq!(
+        AlignmentQueryPhase::BuildingSummaries.status_text(),
+        "Building summaries…"
+    );
+    assert_eq!(
+        AlignmentQueryPhase::PreparingReadLayout.status_text(),
+        "Preparing read layout…"
+    );
+    assert_eq!(
+        AlignmentQueryPhase::ExtendingBrowsingBuffer.status_text(),
+        "Extending browsing buffer…"
+    );
+}
+
+#[test]
 fn navigation_preview_keeps_one_committed_source_across_superseded_targets() {
     let source = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
     let first_target = GenomicInterval::new(ContigId::new(0), 75, 225).unwrap();
@@ -2006,6 +2030,33 @@ fn alignment_workspace_budgets_are_divided_across_live_tracks() {
 }
 
 #[test]
+fn adaptive_alignment_cache_shares_preserve_residency_and_lend_free_capacity() {
+    let shares = adaptive_alignment_cache_shares(1_000, &[600, 100, 0])
+        .into_iter()
+        .map(NonZeroUsize::get)
+        .collect::<Vec<_>>();
+
+    assert_eq!(shares.iter().sum::<usize>(), 1_000);
+    assert!(shares[0] >= 600);
+    assert!(shares[1] >= 100);
+    assert!(shares[2] > 0);
+    assert!(shares[0] > shares[1]);
+}
+
+#[test]
+fn adaptive_alignment_cache_shares_trim_proportionally_under_pressure() {
+    let shares = adaptive_alignment_cache_shares(400, &[600, 300, 100])
+        .into_iter()
+        .map(NonZeroUsize::get)
+        .collect::<Vec<_>>();
+
+    assert_eq!(shares.iter().sum::<usize>(), 400);
+    assert!(shares[0] > shares[1]);
+    assert!(shares[1] > shares[2]);
+    assert!(shares.iter().all(|share| *share > 0));
+}
+
+#[test]
 fn alignment_ordering_can_promote_or_demote_the_primary_track() {
     let mut order = vec![TrackId::new(1), TrackId::new(2), TrackId::new(3)];
 
@@ -2378,21 +2429,26 @@ fn failed_fourth_controller_does_not_block_three_healthy_queries() {
     for track in controllers.iter().take(3) {
         let generation = track.projection(INITIAL_PANEL_ID).unwrap().clock.current();
         let expected = PanelGeneration::new(PanelId::new(1), generation);
-        match track
-            .engine
-            .receive_timeout(Duration::from_secs(10))
-            .unwrap()
-        {
-            Some(AlignmentEngineEvent::QueryCompleted {
-                request: completed,
-                query,
-                ..
-            }) => {
-                assert_eq!(completed, expected);
-                assert!(query.stats.records_seen > 0);
-                assert!(query.stats.records_emitted <= 100);
+        loop {
+            match track
+                .engine
+                .receive_timeout(Duration::from_secs(10))
+                .unwrap()
+            {
+                Some(AlignmentEngineEvent::QueryCompleted {
+                    request: completed,
+                    query,
+                    ..
+                }) => {
+                    assert_eq!(completed, expected);
+                    assert!(query.stats.records_seen > 0);
+                    assert!(query.stats.records_emitted <= 100);
+                    break;
+                }
+                Some(AlignmentEngineEvent::QueryPhaseChanged { .. })
+                | Some(AlignmentEngineEvent::WorkingSetUpdated { .. }) => {}
+                event => panic!("unexpected healthy query event: {event:?}"),
             }
-            event => panic!("unexpected healthy query event: {event:?}"),
         }
     }
 }
@@ -2459,7 +2515,7 @@ fn two_alignment_controllers_route_two_panel_queries_independently() {
     for (controller, dictionary) in controllers.iter().zip(&dictionaries) {
         let expected = two_panel_test_intervals(dictionary, panel_ids);
         let mut completed = HashMap::new();
-        for _ in 0..expected.len() {
+        while completed.len() < expected.len() {
             match controller
                 .engine
                 .receive_timeout(Duration::from_secs(10))
@@ -2468,6 +2524,8 @@ fn two_alignment_controllers_route_two_panel_queries_independently() {
                 Some(AlignmentEngineEvent::QueryCompleted { request, query, .. }) => {
                     completed.insert(request.panel_id(), query);
                 }
+                Some(AlignmentEngineEvent::WorkingSetUpdated { .. })
+                | Some(AlignmentEngineEvent::QueryPhaseChanged { .. }) => {}
                 event => panic!("unexpected two-panel query event: {event:?}"),
             }
         }

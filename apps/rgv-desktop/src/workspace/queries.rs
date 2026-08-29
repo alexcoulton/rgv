@@ -537,6 +537,7 @@ impl Viewer {
         self.poll_reference_events();
         self.poll_alignment_events();
         self.poll_alignment_row_layout_tasks();
+        self.poll_alignment_row_scene_tasks();
         self.poll_track_events();
         self.poll_alignment_retirement_tasks();
         self.poll_session_load_tasks();
@@ -792,6 +793,7 @@ impl Viewer {
                         layout_cache_hit,
                         cache_stats,
                         remote_io_stats,
+                        working_set,
                         ..
                     } => {
                         let projection = track.projection_mut(request.panel_id());
@@ -804,11 +806,35 @@ impl Viewer {
                             projection.layout_query_contract_revision =
                                 self.navigation_contract_revision;
                             projection.layout_query_cache_hit = *layout_cache_hit;
+                            projection.working_set = *working_set;
                             projection.unavailable = None;
                             projection.index_only_overview = false;
                             projection.settled_generation = Some(request.generation().get());
                             track.cache_stats = Some(*cache_stats);
                             track.remote_io_stats = *remote_io_stats;
+                        }
+                    }
+                    AlignmentEngineEvent::WorkingSetUpdated {
+                        request,
+                        resident_query,
+                        cache_stats,
+                        remote_io_stats,
+                        working_set,
+                    } => {
+                        let projection = track.projection_mut(request.panel_id());
+                        event_is_current = projection.clock.is_current(request.generation());
+                        if event_is_current {
+                            projection.working_set = *working_set;
+                            projection.resident_query = resident_query.clone();
+                            track.cache_stats = Some(*cache_stats);
+                            track.remote_io_stats = *remote_io_stats;
+                        }
+                    }
+                    AlignmentEngineEvent::QueryPhaseChanged { request, phase } => {
+                        let projection = track.projection_mut(request.panel_id());
+                        event_is_current = projection.clock.is_current(request.generation());
+                        if event_is_current {
+                            projection.query_phase = *phase;
                         }
                     }
                     AlignmentEngineEvent::Error { request, message } => {
@@ -826,7 +852,8 @@ impl Viewer {
                             track.lifecycle = AlignmentTrackLifecycle::Failed(message.clone());
                         }
                     }
-                    AlignmentEngineEvent::CacheCleared { cache_stats } => {
+                    AlignmentEngineEvent::CacheCleared { cache_stats }
+                    | AlignmentEngineEvent::CacheBudgetChanged { cache_stats } => {
                         track.cache_stats = Some(*cache_stats);
                     }
                 }
@@ -835,6 +862,7 @@ impl Viewer {
                 && matches!(
                     &event,
                     AlignmentEngineEvent::QueryCompleted { .. }
+                        | AlignmentEngineEvent::WorkingSetUpdated { .. }
                         | AlignmentEngineEvent::Error {
                             request: Some(_),
                             ..
@@ -1000,11 +1028,33 @@ impl Viewer {
                 AlignmentEngineEvent::CacheCleared { .. } => {
                     "Alignment cache cleared".clone_into(&mut self.data_status);
                 }
+                AlignmentEngineEvent::CacheBudgetChanged { .. } => {
+                    "Cache budget updated".clone_into(&mut self.data_status);
+                }
+                AlignmentEngineEvent::QueryPhaseChanged { request, phase }
+                    if event_is_current
+                        && request.panel_id() == active_panel_id
+                        && phase != AlignmentQueryPhase::Ready
+                        && self.alignment_tracks.first().is_some_and(|track| {
+                            track
+                                .projection(request.panel_id())
+                                .is_some_and(AlignmentPanelProjection::query_is_checking)
+                        }) =>
+                {
+                    phase.status_text().clone_into(&mut self.data_status);
+                }
+                AlignmentEngineEvent::WorkingSetUpdated { .. } => {}
                 AlignmentEngineEvent::QueryCompleted { .. }
+                | AlignmentEngineEvent::QueryPhaseChanged { .. }
                 | AlignmentEngineEvent::Error { .. } => {}
             }
         }
         if had_events {
+            // Cache statistics arrive asynchronously from each alignment
+            // actor. Recompute borrowing only after consuming the batch so a
+            // settled trim cannot leave stale per-track allowances in place.
+            self.rebalance_live_cache_coordinator();
+            self.schedule_alignment_row_scene_preparations();
             self.window.request_redraw();
         }
     }

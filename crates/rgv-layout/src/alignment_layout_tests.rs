@@ -935,7 +935,7 @@ fn stable_rows_survive_viewport_zoom_and_detail_transition() {
     ]);
     let options = AlignmentLayoutOptions::default();
     let rows = assign_alignment_rows(&query, options, None);
-    assert_eq!(rows.rows, vec![Some(0), Some(1)]);
+    assert_eq!(rows.materialized_rows(), vec![Some(0), Some(1)]);
 
     let broad = Viewport::new(
         GenomicInterval::new(ContigId::new(0), 0, 120).unwrap(),
@@ -1029,7 +1029,7 @@ fn chimeric_grouping_and_clip_sorting_use_normalized_evidence() {
         },
         None,
     );
-    assert_eq!(rows.rows, vec![Some(1), Some(0)]);
+    assert_eq!(rows.materialized_rows(), vec![Some(1), Some(0)]);
 }
 
 #[test]
@@ -1098,7 +1098,7 @@ fn sparse_alignment_groups_are_packed_without_reserved_empty_rows() {
 
     let rows = assign_alignment_rows(&query, options, None);
 
-    assert_eq!(rows.rows, vec![Some(0), Some(1)]);
+    assert_eq!(rows.materialized_rows(), vec![Some(0), Some(1)]);
 }
 
 #[test]
@@ -1139,12 +1139,15 @@ fn history_preserves_local_rows_while_compacting_following_groups() {
         ..AlignmentLayoutOptions::default()
     };
     let broad_rows = assign_alignment_rows(&broad_query, options, None);
-    assert_eq!(broad_rows.rows, vec![Some(0), Some(1), Some(2)]);
+    assert_eq!(
+        broad_rows.materialized_rows(),
+        vec![Some(0), Some(1), Some(2)]
+    );
 
     let refined_query = row_test_query(&[row_test_record(b"retained", 20, 50), reverse]);
     let refined_rows = assign_alignment_rows(&refined_query, options, Some(&broad_rows));
 
-    assert_eq!(refined_rows.rows, vec![Some(1), Some(2)]);
+    assert_eq!(refined_rows.materialized_rows(), vec![Some(1), Some(2)]);
 }
 
 #[test]
@@ -1750,7 +1753,7 @@ fn chromosome_scale_start_establishes_rows_before_reads_appear() {
     };
     let options = AlignmentLayoutOptions::default();
     let rows = assign_alignment_rows(&query, options, None);
-    assert_eq!(rows.rows, vec![Some(0), Some(1)]);
+    assert_eq!(rows.materialized_rows(), vec![Some(0), Some(1)]);
 
     let chromosome = Viewport::new(query.interval, 1_000.0).unwrap();
     assert_eq!(chromosome.detail_level(), DetailLevel::Overview);
@@ -1806,8 +1809,8 @@ fn refined_query_preserves_rows_for_shared_read_identities() {
     let refined_query = row_test_query(&[row_test_record(b"retained", 50, 110)]);
     let scratch_rows = assign_alignment_rows(&refined_query, options, None);
     let carried_rows = assign_alignment_rows(&refined_query, options, Some(&broad_rows));
-    assert_eq!(scratch_rows.rows, vec![Some(0)]);
-    assert_eq!(carried_rows.rows, vec![Some(1)]);
+    assert_eq!(scratch_rows.materialized_rows(), vec![Some(0)]);
+    assert_eq!(carried_rows.materialized_rows(), vec![Some(1)]);
 }
 
 #[test]
@@ -1824,7 +1827,7 @@ fn uncapped_query_refresh_preserves_rows_when_loaded_read_count_changes() {
         },
         None,
     );
-    assert_eq!(broad_rows.rows, vec![Some(0), Some(1)]);
+    assert_eq!(broad_rows.materialized_rows(), vec![Some(0), Some(1)]);
 
     let refined_query = row_test_query(&[
         row_test_record(b"selected", 50, 110),
@@ -1899,6 +1902,275 @@ fn persistent_history_restores_broad_narrow_broad_rows() {
     assert_eq!(narrowed.reservations, 2);
     assert_eq!(returned.restored, 2);
     assert_eq!(returned.moved, 0);
+}
+
+#[test]
+fn persistent_row_scene_projects_shared_resident_records_without_repacking() {
+    let broad = row_test_query(&[
+        row_test_record(b"leading", 0, 70),
+        row_test_record(b"retained", 50, 110),
+        row_test_record(b"trailing", 105, 150),
+    ]);
+    let options = AlignmentLayoutOptions {
+        max_rows: broad.batch.len(),
+        ..AlignmentLayoutOptions::default()
+    };
+    let broad_layout = assign_alignment_rows(&broad, options, None);
+    let scene = AlignmentRowScene::new(&broad, &broad_layout, &options).unwrap();
+    let mut narrow = broad.clone();
+    narrow.interval = GenomicInterval::new(ContigId::new(0), 50, 111).unwrap();
+    narrow.batch = broad.batch.project(&[1, 2]).unwrap();
+    narrow.stats.records_seen = 2;
+    narrow.stats.records_eligible = 2;
+    narrow.stats.records_emitted = 2;
+
+    let projected = scene.project(&narrow, &options).unwrap();
+
+    assert_eq!(projected.row(0), broad_layout.row(1));
+    assert_eq!(projected.row(1), broad_layout.row(2));
+    assert_eq!(projected.identity(0), broad_layout.identity(1));
+    assert!(scene.estimated_bytes() > 0);
+
+    let mut direct_rows = projected.clone();
+    direct_rows.rows = projected.materialized_rows().into();
+    direct_rows.physical_indices = None;
+    direct_rows.logical_indices_by_physical = None;
+    direct_rows.records_by_row = None;
+    let render_options = AlignmentLayoutOptions {
+        show_reference: false,
+        show_coverage: false,
+        show_junctions: false,
+        show_modification_frequency: false,
+        show_modified_bases: false,
+        materialized_row_range: Some((0, projected.row_capacity())),
+        ..options
+    };
+    let viewport = Viewport::new(narrow.interval, 400.0).unwrap();
+    let projected_render =
+        layout_alignment_query_with_rows(&narrow, viewport, render_options, &projected);
+    let direct_render =
+        layout_alignment_query_with_rows(&narrow, viewport, render_options, &direct_rows);
+    assert_eq!(projected_render, direct_render);
+
+    let mut independently_decoded = row_test_query(&[
+        row_test_record(b"retained", 50, 110),
+        row_test_record(b"trailing", 105, 150),
+    ]);
+    independently_decoded.interval = narrow.interval;
+    let residency_revision = scene.residency_revision();
+    let (first, first_path) = scene
+        .project_with_outcome(&independently_decoded, &options)
+        .unwrap();
+    assert!(scene.residency_revision() > residency_revision);
+    let registered_revision = scene.residency_revision();
+    let (second, second_path) = scene
+        .project_with_outcome(&independently_decoded, &options)
+        .unwrap();
+    assert_eq!(scene.residency_revision(), registered_revision);
+    assert_eq!(first_path, AlignmentRowSceneProjection::StableIdentity);
+    assert_eq!(second_path, AlignmentRowSceneProjection::Physical);
+    assert_eq!(first, second);
+
+    let incompatible_scale = AlignmentLayoutOptions {
+        row_scale_class: options.row_scale_class.saturating_add(1),
+        ..options
+    };
+    assert!(scene.project(&narrow, &incompatible_scale).is_none());
+}
+
+#[test]
+fn row_scene_ignores_template_bounds_unless_the_row_policy_uses_them() {
+    let query = row_test_query(&[
+        row_test_record(b"first", 0, 40),
+        row_test_record(b"second", 50, 90),
+    ]);
+    let initial = AlignmentLayoutOptions {
+        max_rows: 16,
+        pair_length_bounds: TemplateLengthBounds {
+            minimum: Some(100),
+            maximum: Some(500),
+        },
+        ..AlignmentLayoutOptions::default()
+    };
+    let layout = assign_alignment_rows(&query, initial, None);
+    let scene = AlignmentRowScene::new(&query, &layout, &initial).unwrap();
+    let changed = AlignmentLayoutOptions {
+        pair_length_bounds: TemplateLengthBounds {
+            minimum: Some(1_000),
+            maximum: Some(5_000),
+        },
+        ..initial
+    };
+    assert!(scene.project(&query, &changed).is_some());
+
+    let pair_policy = AlignmentLayoutOptions {
+        group_mode: AlignmentGroupMode::UnexpectedPair,
+        ..initial
+    };
+    let pair_layout = assign_alignment_rows(&query, pair_policy, None);
+    let pair_scene = AlignmentRowScene::new(&query, &pair_layout, &pair_policy).unwrap();
+    let changed_pair_policy = AlignmentLayoutOptions {
+        pair_length_bounds: changed.pair_length_bounds,
+        ..pair_policy
+    };
+    assert!(pair_scene.project(&query, &changed_pair_policy).is_none());
+}
+
+#[test]
+fn stable_row_history_is_independent_between_horizontal_scale_classes() {
+    let broad = row_test_query(&[
+        row_test_record(b"leading", 0, 100),
+        row_test_record(b"visible-a", 50, 60),
+        row_test_record(b"visible-b", 61, 70),
+    ]);
+    let mut narrow = row_test_query(&[
+        row_test_record(b"visible-a", 50, 60),
+        row_test_record(b"visible-b", 61, 70),
+    ]);
+    narrow.interval = GenomicInterval::new(ContigId::new(0), 50, 71).unwrap();
+    let broad_options = AlignmentLayoutOptions {
+        max_rows: broad.batch.len(),
+        row_scale_class: 7,
+        ..AlignmentLayoutOptions::default()
+    };
+    let narrow_options = AlignmentLayoutOptions {
+        max_rows: broad.batch.len(),
+        row_scale_class: 8,
+        ..AlignmentLayoutOptions::default()
+    };
+    let mut history = AlignmentRowHistory::default();
+
+    let (broad_rows, _) = reconcile_alignment_rows(
+        &broad,
+        broad_options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+    let (narrow_rows, stats) = reconcile_alignment_rows(
+        &narrow,
+        narrow_options,
+        &mut history,
+        ReadStackingMode::Stable,
+        false,
+    );
+
+    assert_eq!(broad_rows.row(1), Some(1));
+    assert_eq!(narrow_rows.row(0), Some(0));
+    assert_eq!(narrow_rows.row(1), Some(0));
+    assert_eq!(stats.contexts, 2);
+    assert_eq!(
+        stats.transition_reason,
+        ReadStackingTransitionReason::PolicyContext
+    );
+}
+
+#[test]
+fn persistent_row_scene_extends_only_new_edge_storage() {
+    let mut incumbent = row_test_query(&[
+        row_test_record(b"middle-a", 50, 90),
+        row_test_record(b"middle-b", 70, 120),
+        row_test_record(b"middle-c", 125, 145),
+    ]);
+    incumbent.interval = GenomicInterval::new(ContigId::new(0), 50, 150).unwrap();
+    let options = AlignmentLayoutOptions {
+        max_rows: 16,
+        ..AlignmentLayoutOptions::default()
+    };
+    let incumbent_rows = assign_alignment_rows(&incumbent, options, None);
+    let scene = AlignmentRowScene::new(&incumbent, &incumbent_rows, &options).unwrap();
+
+    let mut left = row_test_query(&[
+        row_test_record(b"left-a", 0, 20),
+        row_test_record(b"left-b", 10, 45),
+    ]);
+    left.interval = GenomicInterval::new(ContigId::new(0), 0, 50).unwrap();
+    let mut right = row_test_query(&[
+        row_test_record(b"right-a", 150, 180),
+        row_test_record(b"right-b", 160, 195),
+    ]);
+    right.interval = GenomicInterval::new(ContigId::new(0), 150, 200).unwrap();
+    let mut extended = incumbent.clone();
+    extended.interval = GenomicInterval::new(ContigId::new(0), 0, 200).unwrap();
+    extended.batch = incumbent
+        .batch
+        .merge_complete(&left.batch)
+        .unwrap()
+        .merge_complete(&right.batch)
+        .unwrap();
+    extended.stats.records_seen = extended.batch.len();
+    extended.stats.records_eligible = extended.batch.len();
+    extended.stats.records_emitted = extended.batch.len();
+
+    let extended_scene = scene.extend_edges(&extended, &options).unwrap();
+    let independent_total = scene
+        .estimated_bytes()
+        .saturating_add(extended_scene.estimated_bytes());
+    let shared_total =
+        AlignmentRowScene::estimated_resident_bytes([&scene, &extended_scene, &scene]);
+    assert!(shared_total >= scene.estimated_bytes());
+    assert!(shared_total < independent_total);
+    let projected = extended_scene
+        .project_physical(&extended, &options)
+        .unwrap();
+    let clean = assign_alignment_rows(&extended, options, None);
+    assert_eq!(
+        projected.assignment_fingerprint(),
+        clean.assignment_fingerprint(),
+        "edge extension must equal a clean canonical row build"
+    );
+    let incumbent_projected = extended_scene
+        .project_physical(&incumbent, &options)
+        .unwrap();
+    for index in 0..incumbent.batch.len() {
+        assert_eq!(incumbent_projected.row(index), incumbent_rows.row(index));
+    }
+    for left_index in 0..extended.batch.len() {
+        let Some(left_row) = projected.row(left_index) else {
+            continue;
+        };
+        for right_index in left_index + 1..extended.batch.len() {
+            if projected.row(right_index) != Some(left_row) {
+                continue;
+            }
+            let disjoint = extended.batch.end(left_index).unwrap()
+                <= extended.batch.start(right_index).unwrap()
+                || extended.batch.end(right_index).unwrap()
+                    <= extended.batch.start(left_index).unwrap();
+            assert!(
+                disjoint,
+                "edge extension placed overlapping reads on one row"
+            );
+        }
+    }
+
+    let independently_decoded = row_test_query(&[
+        row_test_record(b"left-a", 0, 20),
+        row_test_record(b"left-b", 10, 45),
+        row_test_record(b"middle-a", 50, 90),
+        row_test_record(b"middle-b", 70, 120),
+        row_test_record(b"middle-c", 125, 145),
+        row_test_record(b"right-a", 150, 180),
+        row_test_record(b"right-b", 160, 195),
+    ]);
+    let independent_scene = scene
+        .extend_edges(&independently_decoded, &options)
+        .unwrap();
+    let independent_rows = independent_scene
+        .project(&independently_decoded, &options)
+        .unwrap();
+    for index in 0..independently_decoded.batch.len() {
+        assert_eq!(independent_rows.row(index), projected.row(index));
+    }
+
+    let prepared_scene = scene
+        .prepare_resident_extension(&independently_decoded)
+        .unwrap();
+    let (prepared_rows, prepared_path) = prepared_scene
+        .project_with_outcome(&independently_decoded, &options)
+        .unwrap();
+    assert_eq!(prepared_path, AlignmentRowSceneProjection::Physical);
+    assert_eq!(prepared_rows, independent_rows);
 }
 
 #[test]
@@ -1993,7 +2265,7 @@ fn complete_foreground_rows_survive_a_truncated_empty_horizon() {
         false,
     );
 
-    assert_eq!(layout.rows, vec![Some(0), Some(1)]);
+    assert_eq!(layout.materialized_rows(), vec![Some(0), Some(1)]);
     assert_eq!(stats.horizon_records, 0);
     assert!(stats.horizon_truncated);
     assert_eq!(stats.assignments, visible.batch.len());
@@ -2093,8 +2365,11 @@ fn monotonic_history_extension_reuses_an_indexed_historical_gap() {
         false,
     );
 
-    assert_eq!(initial_layout.rows, vec![Some(0), Some(0)]);
-    assert_eq!(extended_layout.rows, vec![Some(0), Some(0), Some(0)]);
+    assert_eq!(initial_layout.materialized_rows(), vec![Some(0), Some(0)]);
+    assert_eq!(
+        extended_layout.materialized_rows(),
+        vec![Some(0), Some(0), Some(0)]
+    );
     assert_eq!(stats.rows_reused, 1);
     assert_eq!(stats.rows_appended, 0);
     assert!(stats.compatibility_probes > 0);
@@ -2174,7 +2449,7 @@ fn rich_visible_payload_maps_to_layout_only_horizon_identities() {
         false,
     );
 
-    assert_eq!(layout.rows, vec![Some(0), Some(1)]);
+    assert_eq!(layout.materialized_rows(), vec![Some(0), Some(1)]);
     assert_eq!(stats.added, layout_query.batch.len());
     assert_eq!(stats.assignments, layout_query.batch.len());
 }
@@ -2214,7 +2489,10 @@ fn horizon_extension_is_additive_and_typed() {
         false,
     );
 
-    assert_eq!(&after.rows[..2], &before.rows);
+    assert_eq!(
+        &after.materialized_rows()[..2],
+        before.materialized_rows().as_slice()
+    );
     assert_eq!(after.rows[2], Some(0));
     assert_eq!(
         stats.transition_reason,
@@ -2293,7 +2571,7 @@ fn compact_projection_does_not_destroy_stable_history() {
         false,
     );
 
-    assert_eq!(compact.rows, vec![Some(0)]);
+    assert_eq!(compact.materialized_rows(), vec![Some(0)]);
     assert_eq!(history.revision(), revision + 1);
     assert_eq!(restored.rows[0], stable.rows[1]);
     assert!(compact_stats.compact);
@@ -2334,7 +2612,7 @@ fn one_shot_repack_establishes_a_new_stable_baseline() {
         false,
     );
 
-    assert_eq!(repacked.rows, vec![Some(0)]);
+    assert_eq!(repacked.materialized_rows(), vec![Some(0)]);
     assert_eq!(again.rows, repacked.rows);
     assert!(stats.repacked);
     assert_eq!(
@@ -2546,8 +2824,10 @@ fn overlapping_navigation_sequences_never_move_known_identities_or_collide() {
         for left in 0..query.batch.len() {
             for right in left + 1..query.batch.len() {
                 if layout.rows[left] == layout.rows[right]
-                    && query.batch.starts[left] < query.batch.ends[right]
-                    && query.batch.starts[right] < query.batch.ends[left]
+                    && query.batch.start(left).expect("validated start")
+                        < query.batch.end(right).expect("validated end")
+                    && query.batch.start(right).expect("validated start")
+                        < query.batch.end(left).expect("validated end")
                 {
                     panic!("overlapping records shared a row at navigation step {step}");
                 }

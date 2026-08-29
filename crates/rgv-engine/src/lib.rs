@@ -7,7 +7,10 @@ mod reference_engine;
 mod scheduler;
 mod track_engine;
 
-pub use alignment_engine::{AlignmentEngine, AlignmentEngineEvent, EngineQueueError};
+pub use alignment_engine::{
+    AlignmentBrowsingPolicy, AlignmentBufferClampReason, AlignmentCacheOutcome, AlignmentEngine,
+    AlignmentEngineEvent, AlignmentQueryPhase, AlignmentWorkingSetStats, EngineQueueError,
+};
 pub use cache::{
     AlignmentTileKey, CacheBudgets, CacheInsertError, CacheStats, CoverageTileKey, GpuTileKey,
     LayoutTileKey, SourceFingerprint, WeightedLruCache,

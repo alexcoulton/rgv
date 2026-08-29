@@ -3,6 +3,32 @@ use crate::display::alignment;
 
 const MAXIMUM_AUTOMATION_SUPPLEMENTARY_SEGMENTS: usize = 64;
 
+fn automation_alignment_cache_outcome(outcome: AlignmentCacheOutcome) -> String {
+    match outcome {
+        AlignmentCacheOutcome::Exact => "exact",
+        AlignmentCacheOutcome::ResidentExactReturn => "resident_exact_return",
+        AlignmentCacheOutcome::ResidentContainment => "resident_containment",
+        AlignmentCacheOutcome::ResidentExtension => "resident_extension",
+        AlignmentCacheOutcome::SourceQuery => "source_query",
+    }
+    .to_owned()
+}
+
+fn automation_alignment_buffer_clamp(reason: Option<AlignmentBufferClampReason>) -> Option<String> {
+    reason.map(|reason| {
+        match reason {
+            AlignmentBufferClampReason::Disabled => "disabled",
+            AlignmentBufferClampReason::CacheBudget => "cache_budget",
+            AlignmentBufferClampReason::CompleteReadLimit => "complete_read_limit",
+            AlignmentBufferClampReason::RemoteTransferLimit => "remote_transfer_limit",
+            AlignmentBufferClampReason::ContigBoundary => "contig_boundary",
+            AlignmentBufferClampReason::TooDense => "too_dense",
+            AlignmentBufferClampReason::SourceError => "source_error",
+        }
+        .to_owned()
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AutomationReadPresentationFields {
     pub(crate) state: AutomationReadPresentationState,
@@ -155,7 +181,12 @@ fn automation_query_supplementary_chain(
         }
         let candidate_name = query.batch.read_name(index).unwrap_or_default();
         if candidate_name != record.read_name
-            || (!record.flags.is_supplementary() && !query.batch.flags[index].is_supplementary())
+            || (!record.flags.is_supplementary()
+                && !query
+                    .batch
+                    .flags(index)
+                    .expect("validated flags")
+                    .is_supplementary())
         {
             continue;
         }
@@ -229,6 +260,39 @@ pub(crate) fn automation_viewport_after_operation(
 }
 
 impl Viewer {
+    pub(crate) fn automation_navigation_state(
+        &self,
+        panel_id: PanelId,
+    ) -> AutomationNavigationState {
+        let mut state = AutomationNavigationState::default();
+        let mut outcomes = Vec::new();
+        for track in &self.alignment_tracks {
+            let Some(projection) = track.projection(panel_id) else {
+                continue;
+            };
+            let working_set = projection.working_set;
+            state.source_queries = state
+                .source_queries
+                .saturating_add(working_set.source_queries);
+            state.foreground_source_queries = state
+                .foreground_source_queries
+                .saturating_add(working_set.foreground_source_queries);
+            state.speculative_source_queries = state
+                .speculative_source_queries
+                .saturating_add(working_set.speculative_source_queries);
+            outcomes.push(format!("{:?}", working_set.cache_outcome));
+            if let Some(rows) = projection.alignment_rows.as_ref() {
+                state.row_scene_hit |= rows.reconciliation.scene_hit;
+                state.row_scene_physical_hit |= rows.reconciliation.scene_physical_hit;
+                state.row_scene_projection_micros = state
+                    .row_scene_projection_micros
+                    .saturating_add(rows.reconciliation.scene_projection_micros);
+            }
+        }
+        state.cache_outcome = outcomes.join(",");
+        state
+    }
+
     pub(crate) fn automation_is_settled(&self) -> bool {
         !self.display_dirty && self.next_egui_repaint.is_none() && self.automation_data_is_settled()
     }
@@ -243,6 +307,8 @@ impl Viewer {
             || !self.session_save_tasks.is_empty()
             || !self.session_load_tasks.is_empty()
             || !self.workspace_list_import_tasks.is_empty()
+            || !self.alignment_row_layout_tasks.is_empty()
+            || !self.alignment_row_scene_tasks.is_empty()
         {
             return false;
         }
@@ -285,6 +351,7 @@ impl Viewer {
                             return false;
                         };
                         if projection.pending_query
+                            || projection.query_phase != AlignmentQueryPhase::Ready
                             || projection.settled_generation
                                 != Some(projection.clock.current().get())
                             || (projection.current_query.is_none()
@@ -299,6 +366,146 @@ impl Viewer {
             }
         }
         true
+    }
+
+    fn automation_unsettled_reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.display_dirty {
+            reasons.push("display_dirty".to_owned());
+        }
+        if self.next_egui_repaint.is_some() {
+            reasons.push("egui_repaint_pending".to_owned());
+        }
+        for (label, count) in [
+            ("exports", self.export_tasks.len()),
+            ("session_saves", self.session_save_tasks.len()),
+            ("session_loads", self.session_load_tasks.len()),
+            ("list_imports", self.workspace_list_import_tasks.len()),
+            ("row_layouts", self.alignment_row_layout_tasks.len()),
+            ("row_scenes", self.alignment_row_scene_tasks.len()),
+        ] {
+            if count > 0 {
+                reasons.push(format!("{label}={count}"));
+            }
+        }
+        if self.pending_native_window_capture.is_some() {
+            reasons.push("native_capture_pending".to_owned());
+        }
+        if self.pending_resolution_query_refresh.is_some() {
+            reasons.push("resolution_refresh_pending".to_owned());
+        }
+        if self.reference_engine.is_some() && self.reference_dictionary.is_none() {
+            reasons.push("reference_opening".to_owned());
+        }
+        for panel in self.panels.iter() {
+            if panel.navigation_presentation.is_unsettled() {
+                reasons.push(format!(
+                    "panel{}_presentation={:?}",
+                    panel.id.get(),
+                    panel.navigation_presentation.phase
+                ));
+            }
+            if panel.navigation_query_schedule.pending.is_some() {
+                reasons.push(format!("panel{}_navigation_query", panel.id.get()));
+            }
+            if panel.pending_queries.alignment {
+                reasons.push(format!("panel{}_alignments", panel.id.get()));
+            }
+            if panel.pending_queries.reference {
+                reasons.push(format!("panel{}_reference", panel.id.get()));
+            }
+            if panel.pending_queries.tracks {
+                reasons.push(format!("panel{}_tracks", panel.id.get()));
+            }
+            for track in &self.alignment_tracks {
+                let Some(projection) = track.projection(panel.id) else {
+                    reasons.push(format!(
+                        "panel{}_track{}_projection",
+                        panel.id.get(),
+                        track.config.id.get()
+                    ));
+                    continue;
+                };
+                if projection.pending_query {
+                    reasons.push(format!(
+                        "panel{}_track{}_query",
+                        panel.id.get(),
+                        track.config.id.get()
+                    ));
+                }
+                if projection.query_phase != AlignmentQueryPhase::Ready {
+                    reasons.push(format!(
+                        "panel{}_track{}_phase={:?}",
+                        panel.id.get(),
+                        track.config.id.get(),
+                        projection.query_phase
+                    ));
+                }
+                if projection.settled_generation != Some(projection.clock.current().get()) {
+                    reasons.push(format!(
+                        "panel{}_track{}_generation",
+                        panel.id.get(),
+                        track.config.id.get()
+                    ));
+                }
+                match projection.alignment_rows.as_ref() {
+                    None => reasons.push(format!(
+                        "panel{}_track{}_rows_missing",
+                        panel.id.get(),
+                        track.config.id.get()
+                    )),
+                    Some(rows) => {
+                        if projection
+                            .current_query
+                            .as_ref()
+                            .is_none_or(|query| !Arc::ptr_eq(query, &rows.query))
+                        {
+                            reasons.push(format!(
+                                "panel{}_track{}_row_query",
+                                panel.id.get(),
+                                track.config.id.get()
+                            ));
+                        }
+                        if projection
+                            .layout_query
+                            .as_ref()
+                            .or(projection.current_query.as_ref())
+                            .is_none_or(|query| !Arc::ptr_eq(query, &rows.layout_query))
+                        {
+                            reasons.push(format!(
+                                "panel{}_track{}_row_horizon",
+                                panel.id.get(),
+                                track.config.id.get()
+                            ));
+                        }
+                        if rows.max_rows != track.config.maximum_alignments.max(1) {
+                            reasons.push(format!(
+                                "panel{}_track{}_row_capacity={}/{}",
+                                panel.id.get(),
+                                track.config.id.get(),
+                                rows.max_rows,
+                                track.config.maximum_alignments.max(1)
+                            ));
+                        }
+                        let scale_class =
+                            alignment::alignment_row_scale_class(panel.viewport.bases_per_pixel());
+                        if rows.row_scale_class != scale_class {
+                            reasons.push(format!(
+                                "panel{}_track{}_row_scale={}/{}",
+                                panel.id.get(),
+                                track.config.id.get(),
+                                rows.row_scale_class,
+                                scale_class
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if reasons.is_empty() {
+            reasons.push("unclassified".to_owned());
+        }
+        reasons
     }
 
     #[allow(clippy::too_many_lines)]
@@ -357,11 +564,14 @@ impl Viewer {
                         )),
                     );
                 } else if now >= deadline {
+                    let reasons = self.automation_unsettled_reasons().join(", ");
                     self.finish_automation_command(
                         command_index,
                         Err((
                             AutomationErrorCode::Timeout,
-                            "Workspace did not settle before the declared timeout".to_owned(),
+                            format!(
+                                "Workspace did not settle before the declared timeout: {reasons}"
+                            ),
                         )),
                     );
                 }
@@ -1770,6 +1980,10 @@ impl Viewer {
                     .map_or_else(AlignmentRowReconciliationStats::default, |cached| {
                         cached.reconciliation
                     });
+                let working_set = projection
+                    .map_or_else(AlignmentWorkingSetStats::default, |projection| {
+                        projection.working_set
+                    });
                 let (lifecycle, failure) = match &track.lifecycle {
                     AlignmentTrackLifecycle::Opening => (AutomationTrackLifecycle::Opening, None),
                     AlignmentTrackLifecycle::Ready => (AutomationTrackLifecycle::Ready, None),
@@ -1833,6 +2047,33 @@ impl Viewer {
                         row_layout_history_commit_micros: reconciliation.history_commit_micros,
                         row_layout_canonical_metrics_micros: reconciliation
                             .canonical_metrics_micros,
+                        row_layout_canonical_metrics_deferred: reconciliation
+                            .canonical_metrics_deferred,
+                        row_layout_scene_projection_micros: reconciliation.scene_projection_micros,
+                        row_layout_scene_hit: reconciliation.scene_hit,
+                        row_layout_scene_physical_hit: reconciliation.scene_physical_hit,
+                        row_layout_scene_extended: reconciliation.scene_extended,
+                        row_layout_exact_camera_hit: reconciliation.exact_camera_hit,
+                        row_scene_entries: projection
+                            .map_or(0, |projection| projection.row_scenes.len()),
+                        row_scene_bytes: projection.map_or(0, |projection| {
+                            AlignmentRowScene::estimated_resident_bytes(
+                                projection.row_scenes.iter().map(Arc::as_ref),
+                            )
+                        }),
+                        row_scene_resident_prepared: projection.is_some_and(|projection| {
+                            projection.resident_query.as_ref().is_some_and(|resident| {
+                                projection.row_scenes.iter().any(|scene| {
+                                    scene.interval().contains_interval(resident.interval)
+                                })
+                            })
+                        }),
+                        row_scene_preparation_pending: self.alignment_row_scene_tasks.iter().any(
+                            |task| {
+                                task.track_id == track.config.id
+                                    && task.panel_id == self.panels.active().id
+                            },
+                        ),
                         row_layout_compatibility_probes: reconciliation.compatibility_probes,
                         row_layout_rows_reused: reconciliation.rows_reused,
                         row_layout_rows_appended: reconciliation.rows_appended,
@@ -1846,6 +2087,9 @@ impl Viewer {
                         row_layout_evictions: reconciliation.evictions,
                         row_layout_transition_reason: reconciliation.transition_reason,
                         row_layout_policy_fingerprint: reconciliation.policy_fingerprint,
+                        row_layout_scale_class: projection
+                            .and_then(|projection| projection.alignment_rows.as_ref())
+                            .map_or(0, |cached| cached.row_scale_class),
                         row_layout_projection_fingerprint: reconciliation.projection_fingerprint,
                         row_layout_stable_rows: reconciliation.stable_rows,
                         row_layout_canonical_rows: reconciliation.canonical_rows,
@@ -1864,6 +2108,48 @@ impl Viewer {
                         row_layout_horizon_truncated: reconciliation.horizon_truncated,
                         row_layout_horizon_cache_hit: projection
                             .is_some_and(|projection| projection.layout_query_cache_hit),
+                        browsing_cache_outcome: automation_alignment_cache_outcome(
+                            working_set.cache_outcome,
+                        ),
+                        alignment_query_phase: format!(
+                            "{:?}",
+                            projection.map_or(AlignmentQueryPhase::Queued, |projection| {
+                                projection.query_phase
+                            })
+                        ),
+                        resident_start: working_set.resident_start,
+                        resident_end: working_set.resident_end,
+                        resident_records: working_set.resident_records,
+                        resident_bytes: working_set.resident_bytes,
+                        requested_buffer_left: working_set.requested_margin_left,
+                        requested_buffer_right: working_set.requested_margin_right,
+                        effective_buffer_left: working_set.effective_margin_left,
+                        effective_buffer_right: working_set.effective_margin_right,
+                        buffer_clamp_reason: automation_alignment_buffer_clamp(
+                            working_set.clamp_reason,
+                        ),
+                        resident_contract_revision: working_set.resident_contract_revision,
+                        resident_contains_target: working_set.target_contained,
+                        resident_lookup_micros: working_set.lookup_micros,
+                        resident_projection_micros: working_set.projection_micros,
+                        resident_summary_micros: working_set.summary_micros,
+                        resident_summary_tile_hits: working_set.summary_tile_hits,
+                        resident_summary_index_bytes: working_set.summary_index_bytes,
+                        resident_extensions_requested: working_set.extensions_requested,
+                        resident_extensions_completed: working_set.extensions_completed,
+                        resident_extensions_cancelled: working_set.extensions_cancelled,
+                        resident_extensions_too_dense: working_set.extensions_too_dense,
+                        resident_extensions_failed: working_set.extensions_failed,
+                        alignment_source_queries: working_set.source_queries,
+                        alignment_foreground_source_queries: working_set.foreground_source_queries,
+                        alignment_speculative_source_queries: working_set
+                            .speculative_source_queries,
+                        alignment_source_queries_avoided: working_set.source_queries_avoided,
+                        decoded_alignment_bytes_avoided: working_set.decoded_bytes_avoided,
+                        speculative_alignment_records: working_set.speculative_records,
+                        speculative_remote_bytes: working_set.speculative_remote_bytes,
+                        speculative_remote_requests: working_set.speculative_remote_requests,
+                        resident_evictions: working_set.resident_evictions,
                         stable_architecture_rebuild_pending: projection
                             .is_some_and(|projection| projection.pending_row_repack),
                         overlapping_mate_policy: track.config.filters.overlapping_mate_policy,
@@ -2185,6 +2471,10 @@ impl Viewer {
             || tracks.len() > MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS;
         panels.truncate(MAXIMUM_AUTOMATION_LOCI);
         tracks.truncate(MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS);
+        let alignment_cache_resident_bytes = self.cache_coordinator.decoded_resident_bytes;
+        let layout_cache_resident_bytes = self.cache_coordinator.layout_resident_bytes;
+        let row_scene_resident_bytes = self.cache_coordinator.row_scene_resident_bytes;
+        let gpu_slab_resident_bytes = self.cache_coordinator.gpu_slab_resident_bytes;
         AutomationWorkspaceSnapshot {
             application_version: env!("CARGO_PKG_VERSION").to_owned(),
             schema_version: AUTOMATION_SCHEMA_VERSION,
@@ -2219,6 +2509,19 @@ impl Viewer {
             active_panel_id: self.panels.active().id,
             panels,
             tracks,
+            read_browsing_buffer_percent: self.settings.read_browsing_buffer_percent,
+            total_cache_budget_mib: self.settings.cache_budget_mib,
+            alignment_cache_resident_bytes,
+            layout_cache_resident_bytes,
+            row_scene_resident_bytes,
+            gpu_slab_resident_bytes,
+            measured_cache_resident_bytes: self.cache_coordinator.measured_resident_bytes,
+            decoded_cache_allowance_bytes: self.cache_coordinator.decoded_allowance_bytes,
+            layout_cache_allowance_bytes: self.cache_coordinator.layout_allowance_bytes,
+            row_scene_cache_allowance_bytes: self.cache_coordinator.row_scene_allowance_bytes,
+            gpu_slab_cache_allowance_bytes: self.cache_coordinator.gpu_slab_allowance_bytes,
+            cache_over_budget_bytes: self.cache_coordinator.over_budget_bytes,
+            cache_clamp_reason: self.cache_coordinator.clamp_reason.map(str::to_owned),
             read_pane_height: self.track_presentation.read_pane_height,
             annotation_section_expanded: self.track_presentation.annotation_section_expanded,
             read_section_expanded: self.track_presentation.read_section_expanded,
@@ -2633,11 +2936,13 @@ impl Viewer {
         panel_id: PanelId,
         operation: AutomationViewportOperation,
     ) -> Result<serde_json::Value> {
+        let navigation_started = Instant::now();
         anyhow::ensure!(
             self.panels.activate(panel_id),
             "panel {} was not found",
             panel_id.get()
         );
+        let navigation_state = self.automation_navigation_state(panel_id);
         let panel = self.panels.active();
         let current = panel.viewport;
         let contig_length = panel.contig_length;
@@ -2648,6 +2953,14 @@ impl Viewer {
             .navigation_history
             .visit(next.interval());
         self.viewport_changed();
+        if let Some(runner) = self.automation.as_mut() {
+            runner.begin_navigation(
+                panel_id,
+                next.interval(),
+                &navigation_state,
+                navigation_started,
+            );
+        }
         self.bump_workspace_revision();
         let interval = next.interval();
         Ok(serde_json::json!({
@@ -2966,6 +3279,23 @@ impl Viewer {
                 self.egui_context.set_zoom_factor(scale);
                 self.egui_context.request_repaint();
                 self.window.request_redraw();
+            }
+            AutomationSetting::ReadBrowsingBufferPercent { value } => {
+                deferred_shell_change = self.settings.read_browsing_buffer_percent != *value;
+                self.settings.read_browsing_buffer_percent = *value;
+                if deferred_shell_change {
+                    self.persist_settings();
+                    self.request_all_panel_queries();
+                }
+            }
+            AutomationSetting::TotalCacheBudgetMib { value } => {
+                deferred_shell_change = self.settings.cache_budget_mib != *value;
+                self.settings.cache_budget_mib = *value;
+                if deferred_shell_change {
+                    self.apply_live_cache_budget(*value);
+                    self.persist_settings();
+                    self.request_all_panel_queries();
+                }
             }
             AutomationSetting::PropertiesPanelExpanded { value } => {
                 let id = egui::Id::new("properties-panel-expanded");
@@ -3559,7 +3889,12 @@ impl Viewer {
                 continue;
             };
             *read_name_counts.entry(read_name.to_vec()).or_default() += 1;
-            if query.batch.flags[index].is_supplementary() {
+            if query
+                .batch
+                .flags(index)
+                .expect("validated flags")
+                .is_supplementary()
+            {
                 supplementary_names.insert(read_name.to_vec());
             }
         }

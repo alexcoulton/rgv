@@ -1,6 +1,186 @@
 use super::super::*;
 
 impl Viewer {
+    pub(crate) fn apply_live_cache_budget(&mut self, cache_budget_mib: usize) {
+        let total_bytes = cache_budget_mib.saturating_mul(1024 * 1024).max(1);
+        self.cache_coordinator.total_budget_bytes = total_bytes;
+        self.rebalance_live_cache_coordinator();
+    }
+
+    /// Reconciles every currently measurable alignment-scene tier against one
+    /// user-selected ceiling. Each tier may borrow all presently unused
+    /// capacity; decoded engines divide their pool from observed residency
+    /// rather than retaining a startup-time equal split.
+    pub(crate) fn rebalance_live_cache_coordinator(&mut self) {
+        let total_budget_bytes = self
+            .settings
+            .cache_budget_mib
+            .saturating_mul(1024 * 1024)
+            .max(1);
+        self.cache_coordinator.total_budget_bytes = total_budget_bytes;
+
+        let mut layout_resident_bytes = self.layout_cache.stats().resident_weight;
+        let mut row_scene_resident_bytes = self.row_scene_resident_bytes();
+        let mut gpu_slab_resident_bytes = self
+            .rectangle_renderer
+            .last_prepare_stats()
+            .slab_resident_bytes;
+
+        // Derived state alone can exceed a newly lowered ceiling. Retire only
+        // inactive/LRU objects here; active layout and GPU state remain held by
+        // their presentation owners even if their cache entries are removed.
+        let derived_resident_bytes = layout_resident_bytes
+            .saturating_add(row_scene_resident_bytes)
+            .saturating_add(gpu_slab_resident_bytes);
+        if derived_resident_bytes > total_budget_bytes {
+            let layout_ceiling = total_budget_bytes
+                .saturating_sub(row_scene_resident_bytes)
+                .saturating_sub(gpu_slab_resident_bytes)
+                .max(1);
+            self.layout_cache.set_maximum_weight(
+                NonZeroUsize::new(layout_ceiling).expect("layout ceiling is non-zero"),
+            );
+            layout_resident_bytes = self.layout_cache.stats().resident_weight;
+
+            let gpu_ceiling = total_budget_bytes
+                .saturating_sub(row_scene_resident_bytes)
+                .saturating_sub(layout_resident_bytes)
+                .max(1);
+            self.rectangle_renderer.set_maximum_slab_bytes(gpu_ceiling);
+            gpu_slab_resident_bytes = self
+                .rectangle_renderer
+                .last_prepare_stats()
+                .slab_resident_bytes;
+
+            let row_ceiling = total_budget_bytes
+                .saturating_sub(layout_resident_bytes)
+                .saturating_sub(gpu_slab_resident_bytes);
+            self.trim_inactive_row_scenes(row_ceiling);
+            row_scene_resident_bytes = self.row_scene_resident_bytes();
+        }
+
+        let non_decoded_resident_bytes = layout_resident_bytes
+            .saturating_add(row_scene_resident_bytes)
+            .saturating_add(gpu_slab_resident_bytes);
+        let decoded_allowance_bytes = total_budget_bytes
+            .saturating_sub(non_decoded_resident_bytes)
+            .max(self.alignment_tracks.len().max(1));
+        let track_residency = self
+            .alignment_tracks
+            .iter()
+            .map(|track| track.cache_stats.map_or(0, |stats| stats.resident_weight))
+            .collect::<Vec<_>>();
+        let track_allowances =
+            adaptive_alignment_cache_shares(decoded_allowance_bytes, &track_residency);
+        let mut first_error = None;
+        for (track, allowance) in self.alignment_tracks.iter_mut().zip(track_allowances) {
+            if track.cache_budget_bytes == allowance {
+                continue;
+            }
+            match track.engine.try_set_cache_budget(allowance) {
+                Ok(()) => track.cache_budget_bytes = allowance,
+                Err(error) => {
+                    first_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+
+        // When current residency fits, every derived tier can borrow the same
+        // free headroom. A growth is observed and rebalanced before the next
+        // display admission. Under pressure, current derived state is pinned
+        // while decoded actors first discard speculative margins.
+        let decoded_resident_bytes = self.decoded_cache_resident_bytes();
+        let measured_resident_bytes = decoded_resident_bytes
+            .saturating_add(layout_resident_bytes)
+            .saturating_add(row_scene_resident_bytes)
+            .saturating_add(gpu_slab_resident_bytes);
+        let free_bytes = total_budget_bytes.saturating_sub(measured_resident_bytes);
+        let layout_allowance_bytes = layout_resident_bytes.saturating_add(free_bytes).max(1);
+        let row_scene_allowance_bytes = row_scene_resident_bytes.saturating_add(free_bytes).max(1);
+        let gpu_slab_allowance_bytes = gpu_slab_resident_bytes.saturating_add(free_bytes).max(1);
+        self.layout_cache.set_maximum_weight(
+            NonZeroUsize::new(layout_allowance_bytes).expect("layout allowance is non-zero"),
+        );
+        self.rectangle_renderer
+            .set_maximum_slab_bytes(gpu_slab_allowance_bytes);
+        self.cache_budgets = CacheBudgets {
+            remote_blocks: 0,
+            decoded_alignments: decoded_allowance_bytes,
+            coverage_summaries: 0,
+            layouts: layout_allowance_bytes,
+            gpu_buffers: gpu_slab_allowance_bytes,
+        };
+        self.cache_coordinator = LiveCacheCoordinatorSnapshot {
+            total_budget_bytes,
+            measured_resident_bytes,
+            decoded_resident_bytes,
+            layout_resident_bytes,
+            row_scene_resident_bytes,
+            gpu_slab_resident_bytes,
+            decoded_allowance_bytes,
+            layout_allowance_bytes,
+            row_scene_allowance_bytes,
+            gpu_slab_allowance_bytes,
+            over_budget_bytes: measured_resident_bytes.saturating_sub(total_budget_bytes),
+            clamp_reason: (measured_resident_bytes > total_budget_bytes)
+                .then_some("decoded eviction settling or authoritative foreground pinned"),
+            rebalances: self.cache_coordinator.rebalances.saturating_add(1),
+        };
+        if let Some(error) = first_error {
+            self.data_status = format!("Could not apply cache budget: {error}");
+        }
+    }
+
+    pub(crate) fn decoded_cache_resident_bytes(&self) -> usize {
+        self.alignment_tracks
+            .iter()
+            .filter_map(|track| track.cache_stats)
+            .fold(0_usize, |total, stats| {
+                total.saturating_add(stats.resident_weight)
+            })
+    }
+
+    pub(crate) fn row_scene_resident_bytes(&mut self) -> usize {
+        let mut scenes = self
+            .alignment_tracks
+            .iter()
+            .flat_map(|track| track.projections.values())
+            .flat_map(|projection| projection.row_scenes.iter().cloned())
+            .collect::<Vec<_>>();
+        scenes.sort_unstable_by_key(|scene| Arc::as_ptr(scene) as usize);
+        scenes.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let key = scenes
+            .iter()
+            .map(|scene| (Arc::as_ptr(scene) as usize, scene.residency_revision()))
+            .collect::<Vec<_>>();
+        if let Some((cached_key, bytes)) = self.row_scene_residency_cache.as_ref()
+            && cached_key == &key
+        {
+            return *bytes;
+        }
+        let bytes = AlignmentRowScene::estimated_resident_bytes(scenes.iter().map(Arc::as_ref));
+        self.row_scene_residency_cache = Some((key, bytes));
+        bytes
+    }
+
+    fn trim_inactive_row_scenes(&mut self, maximum_bytes: usize) {
+        while self.row_scene_resident_bytes() > maximum_bytes {
+            let mut removed = false;
+            'tracks: for track in &mut self.alignment_tracks {
+                for projection in track.projections.values_mut() {
+                    if projection.row_scenes.len() > 1 {
+                        projection.row_scenes.remove(0);
+                        removed = true;
+                        break 'tracks;
+                    }
+                }
+            }
+            if !removed {
+                break;
+            }
+        }
+    }
+
     pub(crate) fn request_alignment_query(&mut self) {
         let panel_id = self.panels.active().id;
         for track in &mut self.alignment_tracks {
@@ -74,6 +254,9 @@ impl Viewer {
         let record_allocations = allocate_workspace_records(panel_record_budget, &record_requests);
         let viewport_interval = self.panels.active().viewport.interval();
         let contig_name = self.panels.active().contig_name.clone();
+        let browsing = AlignmentBrowsingPolicy {
+            buffer_percent: self.settings.read_browsing_buffer_percent,
+        };
         let mut sent = 0_usize;
         for (track, record_allocation) in self.alignment_tracks.iter_mut().zip(record_allocations) {
             let Some(interval) = track.prepare_query_interval(
@@ -99,7 +282,10 @@ impl Viewer {
                     projection.clock.clone(),
                 )
             };
-            match track.engine.try_query(request, clock, interval, options) {
+            match track
+                .engine
+                .try_query_with_browsing(request, clock, interval, options, browsing)
+            {
                 Ok(()) => {
                     let projection = track.projection_mut(panel_id);
                     projection.pending_query = false;

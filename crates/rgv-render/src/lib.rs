@@ -2,7 +2,7 @@
 
 use ab_glyph::{Font, FontRef, ScaleFont, point};
 use bytemuck::{Pod, Zeroable};
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use image::{ImageError, RgbaImage};
 use rgv_layout::{
@@ -67,6 +67,10 @@ impl RectangleInstance {
     }
 }
 
+fn rectangle_instance_bytes(instances: &[RectangleInstance]) -> usize {
+    std::mem::size_of_val(instances)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct ScreenUniform {
@@ -87,7 +91,17 @@ pub struct RectangleRenderer {
     instance_count: u32,
     cached_instances: Vec<RectangleInstance>,
     scratch_instances: Vec<RectangleInstance>,
+    cached_slabs: HashMap<u64, CachedRectangleSlab>,
+    active_slab_key: Option<u64>,
+    slab_revision: u64,
     last_prepare_stats: PrepareStats,
+}
+
+struct CachedRectangleSlab {
+    buffer: wgpu::Buffer,
+    instance_count: u32,
+    allocated_bytes: usize,
+    last_used_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -98,6 +112,9 @@ pub struct PrepareStats {
     pub buffer_reallocated: bool,
     pub cpu_capacity_grew: bool,
     pub truncated: bool,
+    pub slab_cache_hit: bool,
+    pub slab_entries: usize,
+    pub slab_resident_bytes: usize,
 }
 
 impl RectangleRenderer {
@@ -197,6 +214,9 @@ impl RectangleRenderer {
             instance_count: 0,
             cached_instances: Vec::new(),
             scratch_instances: Vec::new(),
+            cached_slabs: HashMap::new(),
+            active_slab_key: None,
+            slab_revision: 0,
             last_prepare_stats: PrepareStats::default(),
         }
     }
@@ -209,6 +229,30 @@ impl RectangleRenderer {
         display_list: &DisplayList,
         selected_object_id: Option<u32>,
         hovered_object_id: Option<u32>,
+    ) {
+        self.prepare_with_slab_key(
+            device,
+            queue,
+            screen_size_points,
+            display_list,
+            selected_object_id,
+            hovered_object_id,
+            None,
+            0,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_slab_key(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        screen_size_points: [f32; 2],
+        display_list: &DisplayList,
+        selected_object_id: Option<u32>,
+        hovered_object_id: Option<u32>,
+        slab_key: Option<u64>,
+        maximum_slab_bytes: usize,
     ) {
         let screen = ScreenUniform {
             size: [
@@ -228,6 +272,24 @@ impl RectangleRenderer {
                 hovered_object_id: 0,
             }),
         );
+
+        self.slab_revision = self.slab_revision.saturating_add(1);
+        if let Some(key) = slab_key
+            && let Some(slab) = self.cached_slabs.get_mut(&key)
+        {
+            slab.last_used_revision = self.slab_revision;
+            self.active_slab_key = Some(key);
+            self.instance_count = slab.instance_count;
+            self.trim_cached_slabs(maximum_slab_bytes);
+            self.last_prepare_stats = PrepareStats {
+                total_instances: self.instance_count as usize,
+                slab_cache_hit: true,
+                slab_entries: self.cached_slabs.len(),
+                slab_resident_bytes: self.slab_resident_bytes(),
+                ..PrepareStats::default()
+            };
+            return;
+        }
 
         let maximum_instances =
             MAX_UPLOAD_BYTES_PER_FRAME / std::mem::size_of::<RectangleInstance>();
@@ -255,6 +317,40 @@ impl RectangleRenderer {
             cpu_capacity_grew: instances.capacity() > previous_cpu_capacity,
             ..PrepareStats::default()
         };
+        let allocated_bytes = instances
+            .len()
+            .max(1)
+            .next_power_of_two()
+            .saturating_mul(std::mem::size_of::<RectangleInstance>());
+        if let Some(key) = slab_key.filter(|_| allocated_bytes <= maximum_slab_bytes.max(1)) {
+            let capacity = instances.len().max(1).next_power_of_two();
+            let uploaded_instances = instances.len();
+            let uploaded_bytes = rectangle_instance_bytes(instances);
+            let buffer = create_instance_buffer(device, capacity);
+            if !instances.is_empty() {
+                queue.write_buffer(&buffer, 0, bytemuck::cast_slice(instances));
+            }
+            self.instance_count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
+            self.cached_slabs.insert(
+                key,
+                CachedRectangleSlab {
+                    buffer,
+                    instance_count: self.instance_count,
+                    allocated_bytes,
+                    last_used_revision: self.slab_revision,
+                },
+            );
+            self.active_slab_key = Some(key);
+            stats.uploaded_instances = uploaded_instances;
+            stats.uploaded_bytes = uploaded_bytes;
+            stats.buffer_reallocated = true;
+            self.trim_cached_slabs(maximum_slab_bytes);
+            stats.slab_entries = self.cached_slabs.len();
+            stats.slab_resident_bytes = self.slab_resident_bytes();
+            self.last_prepare_stats = stats;
+            return;
+        }
+        self.active_slab_key = None;
         if instances.len() > self.instance_capacity {
             self.instance_capacity = instances.len().next_power_of_two();
             self.instance_buffer = create_instance_buffer(device, self.instance_capacity);
@@ -274,7 +370,7 @@ impl RectangleRenderer {
                 bytemuck::cast_slice(changed),
             );
             stats.uploaded_instances = changed.len();
-            stats.uploaded_bytes = std::mem::size_of_val(changed);
+            stats.uploaded_bytes = rectangle_instance_bytes(changed);
         }
         self.instance_count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
         std::mem::swap(&mut self.cached_instances, &mut self.scratch_instances);
@@ -282,23 +378,25 @@ impl RectangleRenderer {
     }
 
     pub fn render<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        if self.instance_count == 0 {
+        let (instance_buffer, instance_count) = self.active_buffer_and_count();
+        if instance_count == 0 {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.screen_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        pass.draw(0..6, 0..self.instance_count);
+        pass.set_vertex_buffer(0, instance_buffer.slice(..));
+        pass.draw(0..6, 0..instance_count);
     }
 
     pub fn render_unhighlighted<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        if self.instance_count == 0 {
+        let (instance_buffer, instance_count) = self.active_buffer_and_count();
+        if instance_count == 0 {
             return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.neutral_screen_bind_group, &[]);
-        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        pass.draw(0..6, 0..self.instance_count);
+        pass.set_vertex_buffer(0, instance_buffer.slice(..));
+        pass.draw(0..6, 0..instance_count);
     }
 
     pub const fn instance_count(&self) -> u32 {
@@ -307,6 +405,44 @@ impl RectangleRenderer {
 
     pub const fn last_prepare_stats(&self) -> PrepareStats {
         self.last_prepare_stats
+    }
+
+    /// Applies a live GPU slab ceiling. Inactive least-recent slabs are
+    /// released immediately; the active slab remains pinned until another
+    /// authoritative frame replaces it.
+    pub fn set_maximum_slab_bytes(&mut self, maximum_slab_bytes: usize) {
+        self.trim_cached_slabs(maximum_slab_bytes.max(1));
+        self.last_prepare_stats.slab_entries = self.cached_slabs.len();
+        self.last_prepare_stats.slab_resident_bytes = self.slab_resident_bytes();
+    }
+
+    fn active_buffer_and_count(&self) -> (&wgpu::Buffer, u32) {
+        self.active_slab_key
+            .and_then(|key| self.cached_slabs.get(&key))
+            .map_or((&self.instance_buffer, self.instance_count), |slab| {
+                (&slab.buffer, slab.instance_count)
+            })
+    }
+
+    fn slab_resident_bytes(&self) -> usize {
+        self.cached_slabs.values().fold(0_usize, |total, slab| {
+            total.saturating_add(slab.allocated_bytes)
+        })
+    }
+
+    fn trim_cached_slabs(&mut self, maximum_slab_bytes: usize) {
+        while self.slab_resident_bytes() > maximum_slab_bytes {
+            let Some(key) = self
+                .cached_slabs
+                .iter()
+                .filter(|(key, _)| Some(**key) != self.active_slab_key)
+                .min_by_key(|(_, slab)| slab.last_used_revision)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.cached_slabs.remove(&key);
+        }
     }
 }
 
@@ -1185,6 +1321,8 @@ mod tests {
     #[test]
     fn instance_size_is_aligned_for_vertex_uploads() {
         assert_eq!(std::mem::size_of::<RectangleInstance>(), 48);
+        let instances = [RectangleInstance::zeroed(); 3];
+        assert_eq!(rectangle_instance_bytes(&instances), 144);
     }
 
     #[test]

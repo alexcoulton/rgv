@@ -116,8 +116,16 @@ impl Viewer {
             settings.remember_session(path.display().to_string());
         }
         let total_cache_bytes = settings.cache_budget_mib.saturating_mul(1024 * 1024).max(1);
-        let cache_budgets =
-            CacheBudgets::from_total_bytes(NonZeroUsize::new(total_cache_bytes).unwrap());
+        // The desktop coordinates these as borrowing ceilings, not fixed
+        // partitions. Empty derived tiers must not strand most of the user's
+        // selected budget before the first alignment query even starts.
+        let cache_budgets = CacheBudgets {
+            remote_blocks: 0,
+            decoded_alignments: total_cache_bytes,
+            coverage_summaries: 0,
+            layouts: total_cache_bytes,
+            gpu_buffers: total_cache_bytes,
+        };
         let (track_specifications, tracks) = build_track_specs(&options);
         let contig_aliases = launch_contig_aliases(&options)?;
         let session_workspace = options.loaded_session.is_some();
@@ -452,6 +460,14 @@ impl Viewer {
             &alignment_row_layout_scheduler_clock,
             process_alignment_row_layout_work,
         );
+        let alignment_row_scene_scheduler_clock = GenerationClock::default();
+        let alignment_row_scene_scheduler = Scheduler::new(
+            NonZeroUsize::new(alignment_row_layout_worker_count.min(2))
+                .expect("row-scene worker count is nonzero"),
+            NonZeroUsize::new(16).expect("row-scene queue capacity is nonzero"),
+            &alignment_row_scene_scheduler_clock,
+            process_alignment_row_scene_work,
+        );
 
         Ok(Self {
             application_instance_id,
@@ -493,6 +509,9 @@ impl Viewer {
             alignment_row_layout_tasks: Vec::new(),
             alignment_row_layout_scheduler_clock,
             alignment_row_layout_scheduler,
+            alignment_row_scene_tasks: Vec::new(),
+            alignment_row_scene_scheduler_clock,
+            alignment_row_scene_scheduler,
             reference_engine,
             reference_open_error: None,
             track_engine,
@@ -623,6 +642,15 @@ impl Viewer {
             exit_confirmation_open: false,
             user_exit_requested: false,
             cache_budgets,
+            cache_coordinator: LiveCacheCoordinatorSnapshot {
+                total_budget_bytes: total_cache_bytes,
+                decoded_allowance_bytes: total_cache_bytes,
+                layout_allowance_bytes: total_cache_bytes,
+                row_scene_allowance_bytes: total_cache_bytes,
+                gpu_slab_allowance_bytes: total_cache_bytes,
+                ..LiveCacheCoordinatorSnapshot::default()
+            },
+            row_scene_residency_cache: None,
             locus_editor,
             resizing_annotation_track: None,
             resizing_read_track: None,
@@ -791,10 +819,10 @@ impl Viewer {
         });
         let surface_started = Instant::now();
         let surface_frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Success(frame) => Some(frame),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 self.reconfigure_surface();
-                frame
+                Some(frame)
             }
             wgpu::CurrentSurfaceTexture::Timeout => {
                 self.pending_native_window_capture = capture_task;
@@ -802,8 +830,15 @@ impl Viewer {
                 return;
             }
             wgpu::CurrentSurfaceTexture::Occluded => {
-                self.pending_native_window_capture = capture_task;
-                return;
+                if self.automation.is_none() {
+                    self.pending_native_window_capture = capture_task;
+                    return;
+                }
+                // Native automation may be fully covered by the controlling
+                // application. Render the same authoritative frame to a
+                // private target so transactional navigation and deterministic
+                // GPU captures can progress without stealing focus.
+                None
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.pending_native_window_capture = capture_task;
@@ -831,10 +866,29 @@ impl Viewer {
                 return;
             }
         };
+        let automation_surface_texture = surface_frame.is_none().then(|| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("RGV occluded automation frame"),
+                size: wgpu::Extent3d {
+                    width: self.surface_config.width,
+                    height: self.surface_config.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.surface_config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+        });
         let surface_view = surface_frame
-            .texture
+            .as_ref()
+            .map(|frame| &frame.texture)
+            .or(automation_surface_texture.as_ref())
+            .expect("presented or automation frame target exists")
             .create_view(&wgpu::TextureViewDescriptor::default());
-        if self.interaction_trace.is_active() {
+        if self.interaction_trace.is_active() && automation_surface_texture.is_none() {
             self.interaction_trace.record_phase(
                 InteractionTraceStage::SurfaceAcquired,
                 surface_started.elapsed(),
@@ -1107,8 +1161,10 @@ impl Viewer {
             );
         }
         let present_started = Instant::now();
-        surface_frame.present();
-        if self.interaction_trace.is_active() {
+        if let Some(surface_frame) = surface_frame {
+            surface_frame.present();
+        }
+        if self.interaction_trace.is_active() && automation_surface_texture.is_none() {
             self.interaction_trace.record_phase(
                 InteractionTraceStage::PresentCalled,
                 present_started.elapsed(),
@@ -1123,7 +1179,28 @@ impl Viewer {
         self.interaction_trace
             .frame_finished(frame_started.elapsed());
         self.smoothed_frame_ms = self.smoothed_frame_ms * 0.9 + frame_ms * 0.1;
+        let navigation_frame = self
+            .automation
+            .as_ref()
+            .and_then(AutomationRunner::pending_navigation_target)
+            .and_then(|(panel_id, target)| {
+                let panel = self.panels.get(panel_id)?;
+                (panel.viewport.interval() == target).then(|| {
+                    let authoritative = panel.navigation_presentation.is_interactive()
+                        && self.panel_navigation_data_is_settled(panel_id);
+                    (authoritative, self.automation_navigation_state(panel_id))
+                })
+            });
         if let Some(runner) = self.automation.as_mut().filter(|runner| !runner.finished) {
+            if let Some((authoritative, state)) = navigation_frame {
+                runner.record_navigation_frame(
+                    Instant::now(),
+                    frame_ms,
+                    prepared_stats,
+                    authoritative,
+                    &state,
+                );
+            }
             runner.record_frame(
                 Instant::now(),
                 frame_ms,

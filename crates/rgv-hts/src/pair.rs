@@ -152,6 +152,19 @@ impl PairSummaryBuilder {
         }
     }
 
+    pub(crate) fn add_precomputed_eligible_count(&mut self, count: usize) {
+        self.eligible_proper_templates = self.eligible_proper_templates.saturating_add(count);
+    }
+
+    pub(crate) fn add_precomputed_sample(&mut self, score: u64, length: u64) {
+        if self.samples.len() < MAX_TEMPLATE_LENGTH_SAMPLES {
+            self.samples.push((score, length));
+        } else if self.samples.peek().is_some_and(|&(worst, _)| score < worst) {
+            self.samples.pop();
+            self.samples.push((score, length));
+        }
+    }
+
     pub(crate) fn finish(self, all_eligible_records: bool) -> PairSummary {
         let mut lengths = self
             .samples
@@ -223,12 +236,12 @@ pub fn pair_evidence_at(
 ) -> Option<PairEvidence> {
     Some(classify_pair(
         batch.read_name(index)?,
-        *batch.contigs.get(index)?,
-        *batch.starts.get(index)?,
-        *batch.flags.get(index)?,
-        *batch.mate_contigs.get(index)?,
-        *batch.mate_starts.get(index)?,
-        *batch.template_lengths.get(index)?,
+        batch.contig(index)?,
+        batch.start(index)?,
+        batch.flags(index)?,
+        batch.mate_contig(index)?,
+        batch.mate_start(index)?,
+        batch.template_length(index)?,
         visible_interval,
         bounds,
     ))

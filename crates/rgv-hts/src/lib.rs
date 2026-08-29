@@ -15,6 +15,7 @@ mod remote;
 mod remote_alignment;
 mod sbx;
 mod smrt_kinetics;
+mod summary_index;
 mod supplementary;
 mod tdf;
 mod tracks;
@@ -22,8 +23,9 @@ mod ultima;
 
 pub use alignment::{
     AlignedBaseClassification, AlignmentBatch, AlignmentFlags, AlignmentHeaderMetadata,
-    AlignmentReadGroup, AlignmentRecord, AlignmentReferenceSequence, AuxField, AuxValue, CigarOp,
-    CigarOpKind, MAX_ALIGNMENT_READ_GROUPS, PackedRecordError, SequenceData, SequenceView,
+    AlignmentOverlapIndex, AlignmentReadGroup, AlignmentRecord, AlignmentRecordView,
+    AlignmentReferenceSequence, AlignmentStableId, AlignmentStorageRecordId, AuxField, AuxValue,
+    CigarOp, CigarOpKind, MAX_ALIGNMENT_READ_GROUPS, PackedRecordError, SequenceData, SequenceView,
     UltimaTagOrientation, classify_aligned_base, resolve_assembly_from_header,
 };
 pub use bisulfite::{
@@ -37,8 +39,11 @@ pub use junction::{
     MAX_JUNCTIONS_PER_RECORD,
 };
 pub use local::{
-    AlignmentError, AlignmentOpenOptions, AlignmentQuery, AlignmentSource, IndividualReadStatus,
-    LocalAlignmentSource, QueryDetail, QueryOptions, QueryStats,
+    AlignmentDerivationMetrics, AlignmentDerivationPhase, AlignmentError, AlignmentOpenOptions,
+    AlignmentQuery, AlignmentSource, IndividualReadStatus, LocalAlignmentSource, QueryDetail,
+    QueryOptions, QueryStats, derive_alignment_query, derive_alignment_query_with_metrics,
+    derive_alignment_query_with_metrics_and_phase,
+    derive_alignment_query_with_summary_index_and_phase,
 };
 pub use modification_summary::{
     MAX_MODIFICATION_SERIES, ModificationBin, ModificationProvenance, ModificationSeries,
@@ -61,8 +66,8 @@ pub use pileup::{
 pub use reference::{FastaOpenOptions, FastaReference, ReferenceSlice};
 pub use remote::{
     HttpRangeConfig, HttpRangeReader, RemoteAuthentication, RemoteCancellation, RemoteError,
-    RemoteHttpError, RemoteIoStats, associated_remote_url, read_remote_object_bounded, redact_url,
-    remote_url_with_extension,
+    RemoteHttpError, RemoteIoStats, RemoteTransferBudget, associated_remote_url,
+    read_remote_object_bounded, redact_url, remote_url_with_extension,
 };
 pub use remote_alignment::{
     ProductionAlignmentSource, RemoteBamAlignmentSource, RemoteCramAlignmentSource,
@@ -76,6 +81,7 @@ pub use smrt_kinetics::{
     SmrtKineticsSummary, SmrtKineticsValues, decode_smrt_kinetics, smrt_kinetics_series,
     smrt_kinetics_tag,
 };
+pub use summary_index::{ALIGNMENT_SUMMARY_TILE_BASES, AlignmentSummaryIndex};
 pub use supplementary::{
     MAX_SUPPLEMENTARY_CIGAR_OPERATIONS, MAX_SUPPLEMENTARY_SEGMENTS, SupplementaryChain,
     SupplementarySegment, decode_supplementary_chain,

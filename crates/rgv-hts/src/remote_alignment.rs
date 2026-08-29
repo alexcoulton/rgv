@@ -29,7 +29,9 @@ use crate::{
     AuxValue, CigarOp, CigarOpKind, FastaOpenOptions, FastaReference, HttpRangeConfig,
     HttpRangeReader, JunctionSummary, LocalAlignmentSource, MAX_ALIGNMENT_READ_GROUPS,
     PileupProvenance, PileupSummary, QueryDetail, QueryOptions, QueryStats, RemoteCancellation,
-    RemoteError, RemoteIoStats, SequenceData, associated_remote_url, bisulfite_strand_is_reverse,
+    RemoteError, RemoteIoStats, RemoteTransferBudget, SequenceData,
+    alignment::FilteredRecordReason,
+    associated_remote_url, bisulfite_strand_is_reverse,
     junction::{
         JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
     },
@@ -141,6 +143,14 @@ impl ProductionAlignmentSource {
             Self::Htslib(_) => None,
             Self::RemoteBam(source) => Some(source.remote_io_stats()),
             Self::RemoteCram(source) => Some(source.remote_io_stats()),
+        }
+    }
+
+    pub fn set_remote_transfer_budget(&mut self, budget: Option<RemoteTransferBudget>) {
+        match self {
+            Self::Htslib(_) => {}
+            Self::RemoteBam(source) => source.set_transfer_budget(budget),
+            Self::RemoteCram(source) => source.set_transfer_budget(budget),
         }
     }
 
@@ -258,6 +268,10 @@ impl RemoteBamAlignmentSource {
             .get_mut()
             .set_cancellation(cancellation);
     }
+
+    fn set_transfer_budget(&mut self, budget: Option<RemoteTransferBudget>) {
+        self.reader.get_mut().get_mut().set_transfer_budget(budget);
+    }
 }
 
 /// Indexed remote CRAM source backed by the same observable, bounded range cache as remote BAM.
@@ -348,6 +362,48 @@ impl RemoteCramAlignmentSource {
             reference.set_remote_cancellation(cancellation);
         }
     }
+
+    fn set_transfer_budget(&mut self, budget: Option<RemoteTransferBudget>) {
+        let reference_is_remote = self.reference.as_ref().is_some_and(|reference| {
+            reference
+                .lock()
+                .ok()
+                .is_some_and(|reference| reference.remote_io_stats().is_some())
+        });
+        let (alignment_budget, reference_budget) = if reference_is_remote {
+            budget.map_or((None, None), |budget| {
+                let (alignment, reference) = split_remote_transfer_budget(budget);
+                (Some(alignment), Some(reference))
+            })
+        } else {
+            (budget, None)
+        };
+        self.reader.get_mut().set_transfer_budget(alignment_budget);
+        if let Some(reference) = &self.reference
+            && let Ok(reference) = reference.lock()
+        {
+            reference.set_remote_transfer_budget(reference_budget);
+        }
+    }
+}
+
+fn split_remote_transfer_budget(
+    budget: RemoteTransferBudget,
+) -> (RemoteTransferBudget, RemoteTransferBudget) {
+    let reference_requests = budget.maximum_requests / 2;
+    let reference_bytes = budget.maximum_response_bytes / 2;
+    (
+        RemoteTransferBudget {
+            maximum_requests: budget.maximum_requests.saturating_sub(reference_requests),
+            maximum_response_bytes: budget
+                .maximum_response_bytes
+                .saturating_sub(reference_bytes),
+        },
+        RemoteTransferBudget {
+            maximum_requests: reference_requests,
+            maximum_response_bytes: reference_bytes,
+        },
+    )
 }
 
 struct CramReferenceAdapter {
@@ -535,6 +591,7 @@ where
     let mut overlap_collapser = OverlapCollapser::new(options.overlapping_mate_policy);
     let maximum_records = options.max_records.get();
     let mut retained = Vec::new();
+    let mut filtered_records = AlignmentBatch::default();
     let mut too_dense = false;
     let mut stats = QueryStats {
         complete_read_limit: maximum_records,
@@ -551,20 +608,42 @@ where
             stats.cancelled = true;
             break;
         }
+        let record_span = record
+            .alignment_start()
+            .transpose()
+            .ok()
+            .flatten()
+            .map(|position| position.get() as u64 - 1)
+            .and_then(|start| {
+                record_reference_end(&record, start)
+                    .ok()
+                    .filter(|end| *end > start)
+                    .map(|end| (start, end))
+            });
+        let mut note_filtered = |reason| {
+            if let Some((start, end)) = record_span {
+                filtered_records.push_filtered_record(start, end, reason);
+            } else {
+                filtered_records.mark_filtered_record_spans_incomplete();
+            }
+        };
         match eligibility(&record, header, options)? {
             Eligibility::Eligible => {}
             Eligibility::Unmapped => {
                 stats.records_filtered_unmapped = stats.records_filtered_unmapped.saturating_add(1);
+                note_filtered(FilteredRecordReason::Unmapped);
                 continue;
             }
             Eligibility::Secondary => {
                 stats.records_filtered_secondary =
                     stats.records_filtered_secondary.saturating_add(1);
+                note_filtered(FilteredRecordReason::Secondary);
                 continue;
             }
             Eligibility::Supplementary => {
                 stats.records_filtered_supplementary =
                     stats.records_filtered_supplementary.saturating_add(1);
+                note_filtered(FilteredRecordReason::Supplementary);
                 continue;
             }
             Eligibility::UserFilter {
@@ -578,6 +657,10 @@ where
                 stats.records_filtered_qc_failed = stats
                     .records_filtered_qc_failed
                     .saturating_add(usize::from(qc_failed));
+                note_filtered(FilteredRecordReason::User {
+                    duplicate,
+                    qc_failed,
+                });
                 continue;
             }
         }
@@ -661,6 +744,7 @@ where
     for record in &retained {
         batch.push(record).map_err(AlignmentError::BatchOverflow)?;
     }
+    batch.absorb_filtered_records(filtered_records);
     stats.records_emitted = retained.len();
     stats.truncated = too_dense;
     stats.individual_reads = if too_dense {
@@ -1400,6 +1484,31 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn cram_alignment_and_reference_share_one_transfer_budget() {
+        let total = RemoteTransferBudget {
+            maximum_requests: 65,
+            maximum_response_bytes: 33,
+        };
+        let (alignment, reference) = split_remote_transfer_budget(total);
+        assert_eq!(alignment.maximum_requests, 33);
+        assert_eq!(reference.maximum_requests, 32);
+        assert_eq!(
+            alignment
+                .maximum_requests
+                .saturating_add(reference.maximum_requests),
+            total.maximum_requests
+        );
+        assert_eq!(alignment.maximum_response_bytes, 17);
+        assert_eq!(reference.maximum_response_bytes, 16);
+        assert_eq!(
+            alignment
+                .maximum_response_bytes
+                .saturating_add(reference.maximum_response_bytes),
+            total.maximum_response_bytes
+        );
+    }
+
     struct BamFixture {
         bam_url: String,
         index_url: String,
@@ -1818,7 +1927,13 @@ mod tests {
             .unwrap();
         assert_eq!(query.stats.records_seen, 2_000);
         assert!(query.batch.validate());
-        assert!((0..query.batch.len()).any(|index| query.batch.flags[index].is_supplementary()));
+        assert!((0..query.batch.len()).any(|index| {
+            query
+                .batch
+                .flags(index)
+                .expect("validated flags")
+                .is_supplementary()
+        }));
         assert!((0..query.batch.len()).any(|index| query.batch.has_auxiliary_tag(index, *b"MM")));
         let mut local =
             LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();

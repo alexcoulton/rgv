@@ -1,6 +1,12 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Canonical repack comparison is diagnostic validation, not part of the
+/// authoritative row result. Sorting and repacking a million-record horizon a
+/// second time on every extension can dominate the interaction by hundreds of
+/// milliseconds, so large comparisons are left to qualification jobs.
+pub(super) const MAXIMUM_LIVE_CANONICAL_METRIC_RECORDS: usize = 100_000;
+
 pub fn assign_alignment_rows(
     query: &AlignmentQuery,
     options: AlignmentLayoutOptions,
@@ -69,9 +75,15 @@ fn assign_alignment_rows_internal(
     copy_pair_rows(&pairs, &mut rows);
 
     AlignmentRowLayout {
-        rows,
-        identities,
-        pair_representatives: pairs.representatives,
+        rows: rows.into(),
+        identities: identities.into(),
+        physical_indices: None,
+        logical_indices_by_physical: None,
+        records_by_row: None,
+        pair_representatives: options
+            .view_as_pairs
+            .then_some(pairs.representatives)
+            .unwrap_or_default(),
         group_starts,
         group_mode: options.group_mode,
         group_order: options.group_order,
@@ -129,6 +141,7 @@ pub fn reconcile_alignment_rows_with_horizon(
         repack_stable,
         &|| false,
     )
+    .map(|(layout, stats, _)| (layout, stats))
     .expect("non-cancellable alignment reconciliation completes")
 }
 
@@ -160,7 +173,36 @@ where
         repack_stable,
         &is_cancelled,
     )
-    .map(|(layout, stats)| (layout, stats, candidate_history))
+    .map(|(layout, stats, _)| (layout, stats, candidate_history))
+}
+
+pub fn reconcile_alignment_rows_with_horizon_scene_cancellable<F>(
+    query: &AlignmentQuery,
+    layout_query: &AlignmentQuery,
+    options: AlignmentLayoutOptions,
+    mut candidate_history: AlignmentRowHistory,
+    stacking_mode: ReadStackingMode,
+    repack_stable: bool,
+    is_cancelled: F,
+) -> Option<(
+    AlignmentRowLayout,
+    AlignmentRowReconciliationStats,
+    AlignmentRowHistory,
+    Option<AlignmentRowScene>,
+)>
+where
+    F: Fn() -> bool,
+{
+    reconcile_alignment_rows_with_horizon_internal(
+        query,
+        layout_query,
+        options,
+        &mut candidate_history,
+        stacking_mode,
+        repack_stable,
+        &is_cancelled,
+    )
+    .map(|(layout, stats, scene)| (layout, stats, candidate_history, scene))
 }
 
 fn reconcile_alignment_rows_with_horizon_internal(
@@ -171,7 +213,11 @@ fn reconcile_alignment_rows_with_horizon_internal(
     stacking_mode: ReadStackingMode,
     repack_stable: bool,
     is_cancelled: &impl Fn() -> bool,
-) -> Option<(AlignmentRowLayout, AlignmentRowReconciliationStats)> {
+) -> Option<(
+    AlignmentRowLayout,
+    AlignmentRowReconciliationStats,
+    Option<AlignmentRowScene>,
+)> {
     let reconciliation_started = std::time::Instant::now();
     if is_cancelled() {
         return None;
@@ -184,7 +230,12 @@ fn reconcile_alignment_rows_with_horizon_internal(
         }
         let row_allocation_micros = elapsed_micros(allocation_started);
         let metrics_started = std::time::Instant::now();
-        let organization = alignment_row_organization_metrics(query, options, &layout);
+        let canonical_metrics_deferred = query.batch.len() > MAXIMUM_LIVE_CANONICAL_METRIC_RECORDS;
+        let organization = if canonical_metrics_deferred {
+            alignment_row_organization_metrics_from_layout(&layout)
+        } else {
+            alignment_row_organization_metrics(query, options, &layout)
+        };
         let canonical_metrics_micros = elapsed_micros(metrics_started);
         let stats = AlignmentRowReconciliationStats {
             revision: history.revision(),
@@ -192,6 +243,7 @@ fn reconcile_alignment_rows_with_horizon_internal(
             reconciliation_micros: elapsed_micros(reconciliation_started),
             row_allocation_micros,
             canonical_metrics_micros,
+            canonical_metrics_deferred,
             rows_appended: representative_row_count(&layout),
             added: representative_row_count(&layout),
             contexts: history.context_count(),
@@ -218,7 +270,8 @@ fn reconcile_alignment_rows_with_horizon_internal(
             horizon_truncated: !query.individual_reads_complete(),
             ..AlignmentRowReconciliationStats::default()
         };
-        return (!is_cancelled()).then_some((layout, stats));
+        let scene = AlignmentRowScene::new(query, &layout, &options);
+        return (!is_cancelled()).then_some((layout, stats, scene));
     }
 
     history.revision = history.revision.saturating_add(1);
@@ -338,6 +391,8 @@ fn reconcile_alignment_rows_with_horizon_internal(
         }
     };
 
+    let scene = AlignmentRowScene::new(layout_query, &layout, &options);
+
     if !std::ptr::eq(query, layout_query) {
         let context = &mut history.contexts[context_index];
         let island_index = context
@@ -393,7 +448,13 @@ fn reconcile_alignment_rows_with_horizon_internal(
         ReadStackingTransitionReason::InitialCanonical
     };
     let metrics_started = std::time::Instant::now();
-    let organization = alignment_row_organization_metrics(query, options, &layout);
+    let canonical_metrics_deferred =
+        layout_query.batch.len() > MAXIMUM_LIVE_CANONICAL_METRIC_RECORDS;
+    let organization = if canonical_metrics_deferred {
+        alignment_row_organization_metrics_from_layout(&layout)
+    } else {
+        alignment_row_organization_metrics(query, options, &layout)
+    };
     if is_cancelled() {
         return None;
     }
@@ -408,6 +469,12 @@ fn reconcile_alignment_rows_with_horizon_internal(
         row_allocation_micros: work.row_allocation_micros,
         history_commit_micros: work.history_commit_micros,
         canonical_metrics_micros,
+        canonical_metrics_deferred,
+        scene_projection_micros: 0,
+        scene_hit: false,
+        scene_physical_hit: false,
+        scene_extended: false,
+        exact_camera_hit: false,
         compatibility_probes: work.compatibility_probes,
         rows_reused: work.rows_reused,
         rows_appended: work.rows_appended,
@@ -442,7 +509,7 @@ fn reconcile_alignment_rows_with_horizon_internal(
         horizon_bytes: layout_query.estimated_bytes(),
         horizon_truncated,
     };
-    Some((layout, stats))
+    Some((layout, stats, scene))
 }
 
 pub fn alignment_row_organization_metrics(
@@ -452,17 +519,11 @@ pub fn alignment_row_organization_metrics(
 ) -> AlignmentRowOrganizationMetrics {
     let canonical = assign_alignment_rows_internal(query, options, None, true);
     let canonical_rows_by_identity = canonical
-        .identities
-        .iter()
-        .copied()
-        .zip(canonical.rows.iter().copied())
+        .identity_rows()
         .filter_map(|(identity, row)| row.map(|row| (identity, row)))
         .collect::<HashMap<_, _>>();
     let (canonical_displacement, top_first_violations) = layout
-        .identities
-        .iter()
-        .copied()
-        .zip(layout.rows.iter().copied())
+        .identity_rows()
         .filter_map(|(identity, row)| row.map(|row| (identity, row)))
         .fold((0_usize, 0_usize), |(displaced, lower), (identity, row)| {
             let canonical_row = canonical_rows_by_identity.get(&identity).copied();
@@ -471,12 +532,9 @@ pub fn alignment_row_organization_metrics(
                 lower + usize::from(canonical_row.is_some_and(|canonical| row > canonical)),
             )
         });
-    let occupied = layout
-        .pair_representatives
-        .iter()
-        .enumerate()
-        .filter(|(index, representative)| **representative == *index)
-        .filter_map(|(index, _)| layout.rows[index])
+    let occupied = (0..layout.len())
+        .filter(|index| layout.representative(*index) == *index)
+        .filter_map(|index| layout.row(index))
         .collect::<BTreeSet<_>>();
     let occupied_row_span = occupied
         .first()
@@ -505,6 +563,47 @@ pub fn alignment_row_organization_metrics(
             .saturating_sub(canonical.used_row_count()),
         canonical_displacement,
         top_first_violations,
+        occupied_row_span,
+        empty_rows,
+        empty_ratio_ppm,
+    }
+}
+
+fn alignment_row_organization_metrics_from_layout(
+    layout: &AlignmentRowLayout,
+) -> AlignmentRowOrganizationMetrics {
+    let occupied = (0..layout.len())
+        .filter(|index| layout.representative(*index) == *index)
+        .filter_map(|index| layout.row(index))
+        .collect::<BTreeSet<_>>();
+    let occupied_row_span = occupied
+        .first()
+        .zip(occupied.last())
+        .map_or(0, |(first, last)| {
+            last.saturating_sub(*first).saturating_add(1)
+        });
+    let empty_rows = occupied_row_span.saturating_sub(occupied.len());
+    let empty_ratio_ppm = if occupied_row_span == 0 {
+        0
+    } else {
+        u32::try_from(
+            empty_rows
+                .saturating_mul(1_000_000)
+                .checked_div(occupied_row_span)
+                .unwrap_or_default(),
+        )
+        .unwrap_or(u32::MAX)
+    };
+    let stable_rows = layout.used_row_count();
+    AlignmentRowOrganizationMetrics {
+        architecture_version: ALIGNMENT_ROW_ARCHITECTURE_VERSION,
+        // Deferred values are explicitly marked on reconciliation telemetry.
+        // Use the committed organization as the neutral comparison baseline.
+        canonical_rows: stable_rows,
+        stable_rows,
+        row_inflation: 0,
+        canonical_displacement: 0,
+        top_first_violations: 0,
         occupied_row_span,
         empty_rows,
         empty_ratio_ppm,
@@ -548,7 +647,7 @@ impl HistoryReconciliationWork {
     }
 }
 
-fn alignment_row_policy_fingerprint(options: &AlignmentLayoutOptions) -> u64 {
+pub fn alignment_row_policy_fingerprint(options: &AlignmentLayoutOptions) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     ALIGNMENT_ROW_ARCHITECTURE_VERSION.hash(&mut hasher);
     AlignmentRowPolicy::from_options(options).hash(&mut hasher);
@@ -587,13 +686,8 @@ fn enforce_history_budget(history: &mut AlignmentRowHistory, protected_revision:
 }
 
 fn representative_row_count(layout: &AlignmentRowLayout) -> usize {
-    layout
-        .pair_representatives
-        .iter()
-        .enumerate()
-        .filter(|(index, representative)| {
-            **representative == *index && layout.rows[*index].is_some()
-        })
+    (0..layout.len())
+        .filter(|index| layout.representative(*index) == *index && layout.row(*index).is_some())
         .count()
 }
 
@@ -667,7 +761,7 @@ fn seed_history_island(
         if pairs.representatives[index] != index {
             continue;
         }
-        let Some(row) = layout.rows[index] else {
+        let Some(row) = layout.row(index) else {
             continue;
         };
         let group = group_by_index[index].clone();
@@ -848,9 +942,15 @@ fn reconcile_history_island(
             .map_or(1, |(&row, _)| row.saturating_add(1));
         return Some((
             AlignmentRowLayout {
-                rows,
-                identities,
-                pair_representatives: pairs.representatives,
+                rows: rows.into(),
+                identities: identities.into(),
+                physical_indices: None,
+                logical_indices_by_physical: None,
+                records_by_row: None,
+                pair_representatives: options
+                    .view_as_pairs
+                    .then_some(pairs.representatives)
+                    .unwrap_or_default(),
                 group_starts,
                 group_mode: options.group_mode,
                 group_order: options.group_order,
@@ -987,9 +1087,15 @@ fn reconcile_history_island(
         .len()
         .saturating_sub(current_identities.len());
     let layout = AlignmentRowLayout {
-        rows,
-        identities,
-        pair_representatives: pairs.representatives,
+        rows: rows.into(),
+        identities: identities.into(),
+        physical_indices: None,
+        logical_indices_by_physical: None,
+        records_by_row: None,
+        pair_representatives: options
+            .view_as_pairs
+            .then_some(pairs.representatives)
+            .unwrap_or_default(),
         group_starts,
         group_mode: options.group_mode,
         group_order: options.group_order,
@@ -1270,8 +1376,8 @@ pub(crate) fn pair_layout_metadata(
 ) -> PairLayoutMetadata {
     let batch = &query.batch;
     let mut representatives = (0..batch.len()).collect::<Vec<_>>();
-    let mut starts = batch.starts.clone();
-    let mut ends = batch.ends.clone();
+    let mut starts = batch.starts().collect::<Vec<_>>();
+    let mut ends = batch.ends().collect::<Vec<_>>();
     if !view_as_pairs {
         return PairLayoutMetadata {
             enabled: false,
@@ -1283,7 +1389,7 @@ pub(crate) fn pair_layout_metadata(
 
     let mut first_by_name = HashMap::<Vec<u8>, usize>::new();
     for (index, representative_slot) in representatives.iter_mut().enumerate() {
-        let flags = batch.flags[index];
+        let flags = batch.flags(index).expect("validated flags");
         let name = batch.read_name(index).unwrap_or_default();
         if !flags.is_paired() || flags.is_secondary() || flags.is_supplementary() || name.is_empty()
         {
@@ -1291,11 +1397,12 @@ pub(crate) fn pair_layout_metadata(
         }
         let representative = *first_by_name.entry(name.to_vec()).or_insert(index);
         *representative_slot = representative;
-        starts[representative] = starts[representative].min(batch.starts[index]);
-        ends[representative] = ends[representative].max(batch.ends[index]);
+        starts[representative] =
+            starts[representative].min(batch.start(index).expect("validated start"));
+        ends[representative] = ends[representative].max(batch.end(index).expect("validated end"));
         if !flags.is_mate_unmapped()
-            && batch.mate_contigs[index] == Some(batch.contigs[index])
-            && let Some(mate_start) = batch.mate_starts[index]
+            && batch.mate_contig(index).flatten() == batch.contig(index)
+            && let Some(mate_start) = batch.mate_start(index).flatten()
         {
             starts[representative] = starts[representative].min(mate_start);
             ends[representative] = ends[representative].max(mate_start.saturating_add(1));
@@ -1304,13 +1411,23 @@ pub(crate) fn pair_layout_metadata(
         // only one mate is present in the current query. Reserving it at first
         // sight prevents a later-arriving mate from expanding a historical
         // span into a row that has meanwhile been given to another template.
-        let template_length = batch.template_lengths[index];
+        let template_length = batch
+            .template_length(index)
+            .expect("validated template length");
         if template_length > 0 {
-            ends[representative] = ends[representative]
-                .max(batch.starts[index].saturating_add(template_length.unsigned_abs()));
+            ends[representative] = ends[representative].max(
+                batch
+                    .start(index)
+                    .expect("validated start")
+                    .saturating_add(template_length.unsigned_abs()),
+            );
         } else if template_length < 0 {
-            starts[representative] = starts[representative]
-                .min(batch.ends[index].saturating_sub(template_length.unsigned_abs()));
+            starts[representative] = starts[representative].min(
+                batch
+                    .end(index)
+                    .expect("validated end")
+                    .saturating_sub(template_length.unsigned_abs()),
+            );
         }
     }
     for index in 0..batch.len() {
@@ -1470,10 +1587,7 @@ pub(crate) fn assign_rows_with_history(
     group_starts: &mut BTreeMap<AlignmentGroupKey, usize>,
 ) {
     let previous_rows = previous
-        .identities
-        .iter()
-        .copied()
-        .zip(previous.rows.iter().copied())
+        .identity_rows()
         .filter_map(|(identity, row)| row.map(|row| (identity, row)))
         .collect::<HashMap<_, _>>();
     let mut next_group_row = 0_usize;
@@ -1575,19 +1689,33 @@ pub(crate) fn alignment_row_identities(
     query: &AlignmentQuery,
     pairs: &PairLayoutMetadata,
 ) -> Vec<AlignmentRowIdentity> {
+    alignment_row_identities_for_mode(query, pairs.enabled)
+}
+
+/// Builds the stable identities needed to address an existing row scene.
+///
+/// Unlike fresh row assignment, scene projection does not need template spans or a
+/// read-name-to-representative map. Both primary mates deliberately share the hash of
+/// their own (identical) read name, which is the same identity produced after pair
+/// representatives have been resolved. Keeping this path independent from
+/// `pair_layout_metadata` avoids allocating and hashing a `Vec<u8>` key for every
+/// record merely to look up rows that already exist.
+pub(crate) fn alignment_row_identities_for_mode(
+    query: &AlignmentQuery,
+    view_as_pairs: bool,
+) -> Vec<AlignmentRowIdentity> {
     let batch = &query.batch;
     let mut occurrences = HashMap::<(u64, u64), u32>::new();
     (0..batch.len())
         .map(|index| {
-            let representative = pairs.representatives[index];
-            let flags = batch.flags[index];
-            if pairs.enabled
+            let flags = batch.flags(index).expect("validated flags");
+            if view_as_pairs
                 && flags.is_paired()
                 && !flags.is_secondary()
                 && !flags.is_supplementary()
                 && !batch.read_name(index).unwrap_or_default().is_empty()
             {
-                let name = batch.read_name(representative).unwrap_or_default();
+                let name = batch.read_name(index).unwrap_or_default();
                 return AlignmentRowIdentity {
                     primary: fnv_mix(0xcbf2_9ce4_8422_2325_u64, name),
                     secondary: fnv_mix(0x6c62_272e_07bb_0142_u64, name),
@@ -1703,49 +1831,59 @@ fn grouped_indices_internal(
     }
     for indices in groups.values_mut() {
         indices.sort_by(|left, right| match sort_mode {
-            AlignmentSortMode::Start => {
-                (batch.starts[*left], batch.ends[*left], stable_ties[*left]).cmp(&(
-                    batch.starts[*right],
-                    batch.ends[*right],
-                    stable_ties[*right],
-                ))
-            }
-            AlignmentSortMode::Strand => (
-                batch.flags[*left].is_reverse(),
-                batch.starts[*left],
+            AlignmentSortMode::Start => (
+                batch.start(*left).expect("validated start"),
+                batch.end(*left).expect("validated end"),
                 stable_ties[*left],
             )
                 .cmp(&(
-                    batch.flags[*right].is_reverse(),
-                    batch.starts[*right],
+                    batch.start(*right).expect("validated start"),
+                    batch.end(*right).expect("validated end"),
+                    stable_ties[*right],
+                )),
+            AlignmentSortMode::Strand => (
+                batch.flags(*left).expect("validated flags").is_reverse(),
+                batch.start(*left).expect("validated start"),
+                stable_ties[*left],
+            )
+                .cmp(&(
+                    batch.flags(*right).expect("validated flags").is_reverse(),
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::FirstOfPairStrand => (
-                first_of_pair_reverse(batch.flags[*left]).is_none(),
-                first_of_pair_reverse(batch.flags[*left]).unwrap_or_default(),
-                batch.starts[*left],
+                first_of_pair_reverse(batch.flags(*left).expect("validated flags")).is_none(),
+                first_of_pair_reverse(batch.flags(*left).expect("validated flags"))
+                    .unwrap_or_default(),
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
-                    first_of_pair_reverse(batch.flags[*right]).is_none(),
-                    first_of_pair_reverse(batch.flags[*right]).unwrap_or_default(),
-                    batch.starts[*right],
+                    first_of_pair_reverse(batch.flags(*right).expect("validated flags")).is_none(),
+                    first_of_pair_reverse(batch.flags(*right).expect("validated flags"))
+                        .unwrap_or_default(),
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::MappingQuality => (
-                Reverse(batch.mapping_qualities[*left].unwrap_or_default()),
-                batch.starts[*left],
+                Reverse(batch.mapping_quality(*left).flatten().unwrap_or_default()),
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
-                    Reverse(batch.mapping_qualities[*right].unwrap_or_default()),
-                    batch.starts[*right],
+                    Reverse(batch.mapping_quality(*right).flatten().unwrap_or_default()),
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::ReadName => batch
                 .read_name(*left)
                 .cmp(&batch.read_name(*right))
-                .then_with(|| batch.starts[*left].cmp(&batch.starts[*right]))
+                .then_with(|| {
+                    batch
+                        .start(*left)
+                        .expect("validated start")
+                        .cmp(&batch.start(*right).expect("validated start"))
+                })
                 .then_with(|| stable_ties[*left].cmp(&stable_ties[*right])),
             AlignmentSortMode::ReadGroup
             | AlignmentSortMode::Haplotype
@@ -1756,109 +1894,119 @@ fn grouped_indices_internal(
                 (
                     labels[*left].is_none(),
                     labels[*left].as_deref(),
-                    batch.starts[*left],
+                    batch.start(*left).expect("validated start"),
                     stable_ties[*left],
                 )
                     .cmp(&(
                         labels[*right].is_none(),
                         labels[*right].as_deref(),
-                        batch.starts[*right],
+                        batch.start(*right).expect("validated start"),
                         stable_ties[*right],
                     ))
             }
             AlignmentSortMode::AlignedLength => (
                 Reverse(aligned_length(batch.cigar(*left).unwrap_or_default())),
-                batch.starts[*left],
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
                     Reverse(aligned_length(batch.cigar(*right).unwrap_or_default())),
-                    batch.starts[*right],
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::LeftClip => (
                 Reverse(left_clip(batch.cigar(*left).unwrap_or_default())),
-                batch.starts[*left],
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
                     Reverse(left_clip(batch.cigar(*right).unwrap_or_default())),
-                    batch.starts[*right],
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::RightClip => (
                 Reverse(right_clip(batch.cigar(*left).unwrap_or_default())),
-                batch.starts[*left],
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
                     Reverse(right_clip(batch.cigar(*right).unwrap_or_default())),
-                    batch.starts[*right],
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::TemplateLength => (
-                Reverse(batch.template_lengths[*left].unsigned_abs()),
-                batch.starts[*left],
+                Reverse(
+                    batch
+                        .template_length(*left)
+                        .expect("validated template length")
+                        .unsigned_abs(),
+                ),
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
-                    Reverse(batch.template_lengths[*right].unsigned_abs()),
-                    batch.starts[*right],
+                    Reverse(
+                        batch
+                            .template_length(*right)
+                            .expect("validated template length")
+                            .unsigned_abs(),
+                    ),
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::PairOrientation => (
                 pair_evidence[*left].map_or(u8::MAX, |pair| orientation_rank(pair.orientation)),
-                batch.starts[*left],
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
                     pair_evidence[*right]
                         .map_or(u8::MAX, |pair| orientation_rank(pair.orientation)),
-                    batch.starts[*right],
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::MateContig => (
-                batch.mate_contigs[*left],
-                batch.mate_starts[*left],
-                batch.starts[*left],
+                batch.mate_contig(*left).flatten(),
+                batch.mate_start(*left).flatten(),
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
-                    batch.mate_contigs[*right],
-                    batch.mate_starts[*right],
-                    batch.starts[*right],
+                    batch.mate_contig(*right).flatten(),
+                    batch.mate_start(*right).flatten(),
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::PairStatus => (
                 pair_evidence[*left]
                     .map_or(u8::MAX, |pair| classification_rank(pair.classification)),
-                batch.starts[*left],
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
                     pair_evidence[*right]
                         .map_or(u8::MAX, |pair| classification_rank(pair.classification)),
-                    batch.starts[*right],
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::ReadOrder => (
                 pair_evidence[*left].map_or(u8::MAX, |pair| read_order_rank(pair.read_order)),
-                batch.starts[*left],
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
                     pair_evidence[*right].map_or(u8::MAX, |pair| read_order_rank(pair.read_order)),
-                    batch.starts[*right],
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
             AlignmentSortMode::Base => (
                 base_sort_keys.as_ref().expect("base sort keys exist")[*left],
-                batch.starts[*left],
+                batch.start(*left).expect("validated start"),
                 stable_ties[*left],
             )
                 .cmp(&(
                     base_sort_keys.as_ref().expect("base sort keys exist")[*right],
-                    batch.starts[*right],
+                    batch.start(*right).expect("validated start"),
                     stable_ties[*right],
                 )),
         });
@@ -1877,57 +2025,8 @@ fn grouped_indices_internal(
 }
 
 fn stable_record_tie_breaker(batch: &rgv_hts::AlignmentBatch, index: usize) -> (u64, u64) {
-    let mut primary = 0xcbf2_9ce4_8422_2325_u64;
-    let mut secondary = 0x6c62_272e_07bb_0142_u64;
-    for bytes in [
-        batch.contigs[index].get().to_le_bytes().as_slice(),
-        batch.starts[index].to_le_bytes().as_slice(),
-        batch.ends[index].to_le_bytes().as_slice(),
-        batch.flags[index].bits().to_le_bytes().as_slice(),
-        batch.mapping_qualities[index]
-            .unwrap_or(u8::MAX)
-            .to_le_bytes()
-            .as_slice(),
-        batch.mate_contigs[index]
-            .map_or(u32::MAX, rgv_core::ContigId::get)
-            .to_le_bytes()
-            .as_slice(),
-        batch.mate_starts[index]
-            .unwrap_or(u64::MAX)
-            .to_le_bytes()
-            .as_slice(),
-        batch.template_lengths[index].to_le_bytes().as_slice(),
-        batch.read_name(index).unwrap_or_default(),
-    ] {
-        primary = fnv_mix(primary, bytes);
-        secondary = fnv_mix(secondary, bytes);
-    }
-    if let Some(cigar) = batch.cigar(index) {
-        for operation in cigar {
-            let kind = match operation.kind {
-                CigarOpKind::Match => 0,
-                CigarOpKind::Insertion => 1,
-                CigarOpKind::Deletion => 2,
-                CigarOpKind::ReferenceSkip => 3,
-                CigarOpKind::SoftClip => 4,
-                CigarOpKind::HardClip => 5,
-                CigarOpKind::Padding => 6,
-                CigarOpKind::SequenceMatch => 7,
-                CigarOpKind::SequenceMismatch => 8,
-            };
-            primary = fnv_mix(primary, &[kind]);
-            primary = fnv_mix(primary, &operation.len.to_le_bytes());
-            secondary = fnv_mix(secondary, &[kind]);
-            secondary = fnv_mix(secondary, &operation.len.to_le_bytes());
-        }
-    }
-    // Stable row identity deliberately excludes arbitrary auxiliary payload.
-    // Layout-horizon queries retain only policy-required tags, while the
-    // visible query may contain every tag; coordinates, flags, MAPQ, mate
-    // fields, read name, and CIGAR must therefore be sufficient and identical
-    // across both detail levels. Exact duplicates retain their deterministic
-    // occurrence within the same fixed horizon.
-    (primary, secondary)
+    let stable = batch.stable_id(index).expect("validated stable record id");
+    (stable.primary(), stable.secondary())
 }
 
 pub(crate) fn first_of_pair_reverse(flags: AlignmentFlags) -> Option<bool> {
@@ -1974,13 +2073,15 @@ pub(crate) fn alignment_base_sort_key(
     let Some(target) = sort_position else {
         return (7, 0);
     };
-    if target < query.batch.starts[index] || target >= query.batch.ends[index] {
+    if target < query.batch.start(index).expect("validated start")
+        || target >= query.batch.end(index).expect("validated end")
+    {
         return (7, 0);
     }
     let Some(cigar) = query.batch.cigar(index) else {
         return (6, 0);
     };
-    let mut reference_position = query.batch.starts[index];
+    let mut reference_position = query.batch.start(index).expect("validated start");
     let mut read_position = 0_usize;
     for operation in cigar {
         let length = operation.len as usize;
@@ -2042,7 +2143,12 @@ pub(crate) fn group_key(
     match mode {
         AlignmentGroupMode::None => AlignmentGroupKey::All,
         AlignmentGroupMode::Strand => {
-            if query.batch.flags[index].is_reverse() {
+            if query
+                .batch
+                .flags(index)
+                .expect("validated flags")
+                .is_reverse()
+            {
                 AlignmentGroupKey::Reverse
             } else {
                 AlignmentGroupKey::Forward
@@ -2061,7 +2167,12 @@ pub(crate) fn group_key(
             .to_owned(),
         ),
         AlignmentGroupMode::Supplementary => AlignmentGroupKey::Tagged(
-            if query.batch.flags[index].is_supplementary() {
+            if query
+                .batch
+                .flags(index)
+                .expect("validated flags")
+                .is_supplementary()
+            {
                 "Supplementary"
             } else {
                 "Primary/secondary"
@@ -2100,7 +2211,7 @@ pub(crate) fn group_key(
                 .to_owned(),
         ),
         AlignmentGroupMode::MateContig => {
-            AlignmentGroupKey::Tagged(query.batch.mate_contigs[index].map_or_else(
+            AlignmentGroupKey::Tagged(query.batch.mate_contig(index).flatten().map_or_else(
                 || "Missing".to_owned(),
                 |contig| format!("tid {}", contig.get()),
             ))
@@ -2112,7 +2223,7 @@ pub(crate) fn group_key(
             ),
         ),
         AlignmentGroupMode::FirstOfPairStrand => {
-            let flags = query.batch.flags[index];
+            let flags = query.batch.flags(index).expect("validated flags");
             AlignmentGroupKey::Tagged(
                 if flags.is_first_in_template() {
                     if flags.is_reverse() {

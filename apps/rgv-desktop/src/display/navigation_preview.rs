@@ -26,6 +26,7 @@ struct HorizonPaneInput {
     sort_position: Option<u64>,
     promoted_read_name_hash: Option<u64>,
     pair_length_bounds: TemplateLengthBounds,
+    row_scale_class: u8,
     scroll: f32,
     clip_top: f32,
     clip_bottom: f32,
@@ -175,6 +176,8 @@ impl Viewer {
                     track.config.filters.alignment_sort_anchor,
                     panel.viewport,
                 );
+                let target_row_scale_class =
+                    alignment::alignment_row_scale_class(panel.viewport.bases_per_pixel());
                 if !complete_horizon_preview_eligible(
                     &query,
                     panel.viewport.interval(),
@@ -192,6 +195,7 @@ impl Viewer {
                     || cached_rows.sort_mode != track.config.filters.alignment_sort_mode
                     || cached_rows.sort_order != track.config.filters.alignment_sort_order
                     || cached_rows.sort_position != target_sort_position
+                    || cached_rows.row_scale_class != target_row_scale_class
                     || cached_rows.view_as_pairs != track.config.filters.view_as_pairs
                     || cached_rows.stacking_mode != track.config.filters.read_stacking_mode
                 {
@@ -225,6 +229,7 @@ impl Viewer {
                     sort_position: cached_rows.sort_position,
                     promoted_read_name_hash: cached_rows.promoted_read_name_hash,
                     pair_length_bounds: cached_rows.pair_length_bounds,
+                    row_scale_class: cached_rows.row_scale_class,
                     scroll: panel
                         .read_panel_scroll_state(read_panel.track_id)
                         .effective_scroll_points(),
@@ -258,6 +263,7 @@ impl Viewer {
                 row_height,
                 read_height: (5.0 * density).clamp(1.5, (row_height - 1.0).max(1.5)),
                 max_rows: pane.query.batch.len().max(1),
+                row_scale_class: pane.row_scale_class,
                 row_layout_revision: pane.row_revision,
                 color_mode: filters.alignment_color_mode,
                 group_mode: filters.alignment_group_mode,

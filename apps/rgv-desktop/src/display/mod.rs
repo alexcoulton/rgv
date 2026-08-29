@@ -615,7 +615,13 @@ impl Viewer {
             .unwrap_or_else(|| Arc::clone(&query));
         let read_refusal =
             alignment::individual_read_refusal(&query, &layout_query, filters.read_stacking_mode);
-        let max_rows = query.batch.len().max(layout_query.batch.len()).max(1);
+        // Complete-read capacity is a policy, not a property of the current
+        // horizon population. Keeping it stable lets a row scene extend when
+        // new edge slabs arrive instead of appearing policy-incompatible.
+        let max_rows = self.alignment_tracks[track_index]
+            .config
+            .maximum_alignments
+            .max(1);
         let observed_pair_length_bounds =
             effective_template_length_bounds_for_filters(&filters, &layout_query);
         let pair_length_bounds = self
@@ -638,6 +644,7 @@ impl Viewer {
             .promoted_read
             .filter(|(promoted_track_id, _)| *promoted_track_id == track_id)
             .map(|(_, hash)| hash);
+        let row_scale_class = alignment::alignment_row_scale_class(viewport.bases_per_pixel());
         let pair_bounds_relevant = alignment_row_pair_bounds_relevant(
             filters.alignment_group_mode,
             filters.alignment_sort_mode,
@@ -657,6 +664,7 @@ impl Viewer {
                     && cached.sort_position == sort_position
                     && cached.promoted_read_name_hash == promoted_read_name_hash
                     && cached.max_rows == max_rows
+                    && cached.row_scale_class == row_scale_class
                     && cached.view_as_pairs == filters.view_as_pairs
                     && cached.stacking_mode == filters.read_stacking_mode
                     && (!pair_bounds_relevant || cached.pair_length_bounds == pair_length_bounds)
@@ -677,11 +685,175 @@ impl Viewer {
             sort_position,
             promoted_read_name_hash,
             max_rows,
+            row_scale_class,
             view_as_pairs: filters.view_as_pairs,
             pair_length_bounds,
             ..AlignmentLayoutOptions::default()
         };
         let repack = pending_repack && filters.read_stacking_mode == ReadStackingMode::Stable;
+        if !repack && filters.read_stacking_mode == ReadStackingMode::Stable {
+            let cached_rows = self.alignment_tracks[track_index]
+                .projection(panel_id)
+                .and_then(|projection| {
+                    projection.row_layout_cache.iter().rev().find(|cached| {
+                        Arc::ptr_eq(&cached.query, &query)
+                            && cached.layout_query.interval == layout_query.interval
+                            && cached.group_mode == filters.alignment_group_mode
+                            && cached.group_order == filters.alignment_group_order
+                            && cached.sort_mode == filters.alignment_sort_mode
+                            && cached.sort_order == filters.alignment_sort_order
+                            && cached.sort_position == sort_position
+                            && cached.promoted_read_name_hash == promoted_read_name_hash
+                            && cached.max_rows == max_rows
+                            && cached.row_scale_class == row_scale_class
+                            && cached.view_as_pairs == filters.view_as_pairs
+                            && (!pair_bounds_relevant
+                                || cached.pair_length_bounds == pair_length_bounds)
+                    })
+                })
+                .cloned();
+            if let Some(mut cached) = cached_rows {
+                cached.layout_query = Arc::clone(&layout_query);
+                cached.reconciliation.exact_camera_hit = true;
+                cached.reconciliation.transition_reason = ReadStackingTransitionReason::Navigation;
+                let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+                projection.row_layout_request_revision =
+                    projection.row_layout_request_revision.saturating_add(1);
+                projection.row_layout_clock.advance();
+                projection.commit_alignment_rows(cached);
+                projection.cached_layout = None;
+                return true;
+            }
+        }
+        if !repack && filters.read_stacking_mode == ReadStackingMode::Stable {
+            let scenes = self.alignment_tracks[track_index]
+                .projection(panel_id)
+                .map(|projection| projection.row_scenes.clone())
+                .unwrap_or_default();
+            let layout_interval = layout_query.interval;
+            let started = Instant::now();
+            let mut extended_scene = None;
+            let scene_projection = scenes
+                .iter()
+                .rev()
+                .find_map(|scene| {
+                    let scene_interval = scene.interval();
+                    if scene_interval.contig() != layout_interval.contig()
+                        || scene_interval.start() > layout_interval.start()
+                        || scene_interval.end() < layout_interval.end()
+                    {
+                        return None;
+                    }
+                    scene
+                        .project_physical(&query, &options)
+                        .map(|layout| (layout, rgv_layout::AlignmentRowSceneProjection::Physical))
+                })
+                .or_else(|| {
+                    scenes.iter().rev().find_map(|scene| {
+                        let scene_interval = scene.interval();
+                        (scene_interval.contig() == layout_interval.contig()
+                            && scene_interval.start() <= layout_interval.start()
+                            && scene_interval.end() >= layout_interval.end())
+                        .then(|| scene.project_with_outcome(&query, &options))
+                        .flatten()
+                    })
+                })
+                .or_else(|| {
+                    scenes.iter().rev().find_map(|scene| {
+                        let scene_interval = scene.interval();
+                        if scene_interval.contig() != layout_interval.contig()
+                            || layout_interval.start() > scene_interval.start()
+                            || layout_interval.end() < scene_interval.end()
+                        {
+                            return None;
+                        }
+                        let extended = scene.extend_edges(&layout_query, &options)?;
+                        let layout = extended.project(&query, &options)?;
+                        extended_scene = Some(Arc::new(extended));
+                        Some((
+                            layout,
+                            rgv_layout::AlignmentRowSceneProjection::EdgeExtension,
+                        ))
+                    })
+                });
+            if let Some((layout, scene_outcome)) = scene_projection {
+                let scene_projection_micros =
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+                if let Some(scene) = extended_scene {
+                    projection.admit_row_scene(scene);
+                }
+                projection.row_layout_request_revision =
+                    projection.row_layout_request_revision.saturating_add(1);
+                projection.row_layout_clock.advance();
+                let (stable_rows, occupied_rows, occupied_span) =
+                    layout.indexed_row_metrics().unwrap_or_else(|| {
+                        let stable_rows = layout.used_row_count();
+                        (stable_rows, stable_rows, stable_rows)
+                    });
+                let empty_rows = occupied_span.saturating_sub(occupied_rows);
+                let empty_ratio_ppm = if occupied_span == 0 {
+                    0
+                } else {
+                    u32::try_from(empty_rows.saturating_mul(1_000_000) / occupied_span)
+                        .unwrap_or(u32::MAX)
+                };
+                let reconciliation = AlignmentRowReconciliationStats {
+                    revision: projection.row_history.revision(),
+                    architecture_version: rgv_layout::ALIGNMENT_ROW_ARCHITECTURE_VERSION,
+                    reconciliation_micros: scene_projection_micros,
+                    scene_projection_micros,
+                    scene_hit: true,
+                    scene_physical_hit: scene_outcome
+                        != rgv_layout::AlignmentRowSceneProjection::StableIdentity,
+                    scene_extended: scene_outcome
+                        == rgv_layout::AlignmentRowSceneProjection::EdgeExtension,
+                    transition_reason: if scene_outcome
+                        == rgv_layout::AlignmentRowSceneProjection::EdgeExtension
+                    {
+                        ReadStackingTransitionReason::HorizonExtension
+                    } else {
+                        ReadStackingTransitionReason::Navigation
+                    },
+                    policy_fingerprint: alignment_row_policy_fingerprint(&options),
+                    projection_fingerprint: layout.assignment_fingerprint(),
+                    stable_rows,
+                    canonical_rows: stable_rows,
+                    query_occupied_row_span: occupied_span,
+                    query_empty_rows: empty_rows,
+                    query_empty_ratio_ppm: empty_ratio_ppm,
+                    horizon_start: layout_query.interval.start(),
+                    horizon_end: layout_query.interval.end(),
+                    horizon_records: layout_query.batch.len(),
+                    horizon_bytes: layout_query.estimated_bytes(),
+                    horizon_truncated: !layout_query.individual_reads_complete(),
+                    history_bytes: projection.row_history.estimated_bytes(),
+                    contexts: projection.row_history.context_count(),
+                    islands: projection.row_history.island_count(),
+                    assignments: projection.row_history.assignment_count(),
+                    ..AlignmentRowReconciliationStats::default()
+                };
+                projection.commit_alignment_rows(CachedAlignmentRows {
+                    query,
+                    layout_query,
+                    layout: Arc::new(layout),
+                    group_mode: filters.alignment_group_mode,
+                    group_order: filters.alignment_group_order,
+                    sort_mode: filters.alignment_sort_mode,
+                    sort_order: filters.alignment_sort_order,
+                    sort_position,
+                    promoted_read_name_hash,
+                    max_rows,
+                    row_scale_class,
+                    view_as_pairs: filters.view_as_pairs,
+                    pair_length_bounds,
+                    stacking_mode: filters.read_stacking_mode,
+                    reconciliation,
+                });
+                projection.cached_layout = None;
+                return true;
+            }
+        }
         let key = AlignmentRowLayoutTaskKey {
             query_identity: Arc::as_ptr(&query) as usize,
             layout_query_identity: Arc::as_ptr(&layout_query) as usize,
@@ -692,6 +864,7 @@ impl Viewer {
             sort_position: options.sort_position,
             promoted_read_name_hash: options.promoted_read_name_hash,
             max_rows: options.max_rows,
+            row_scale_class: options.row_scale_class,
             view_as_pairs: options.view_as_pairs,
             pair_length_bounds: options.pair_length_bounds,
             stacking_mode: filters.read_stacking_mode,
@@ -764,8 +937,9 @@ impl Viewer {
             };
             if repack {
                 projection.pending_row_repack = false;
+                projection.row_layout_cache.clear();
             }
-            projection.alignment_rows = Some(CachedAlignmentRows {
+            projection.commit_alignment_rows(CachedAlignmentRows {
                 query,
                 layout_query,
                 layout: Arc::new(layout),
@@ -776,6 +950,7 @@ impl Viewer {
                 sort_position,
                 promoted_read_name_hash,
                 max_rows,
+                row_scale_class,
                 view_as_pairs: filters.view_as_pairs,
                 pair_length_bounds,
                 stacking_mode: filters.read_stacking_mode,
@@ -2257,7 +2432,13 @@ impl Viewer {
                                         projection.checking_notice_visible
                                     }) =>
                             {
-                                Some("Checking current viewport for complete reads…".to_owned())
+                                Some(
+                                    projection
+                                        .expect("checking projection exists")
+                                        .query_phase
+                                        .status_text()
+                                        .to_owned(),
+                                )
                             }
                             AlignmentTrackLifecycle::Ready
                                 if projection
@@ -3664,6 +3845,10 @@ impl Viewer {
     }
 
     fn prepare_rectangle_renderer(&mut self) {
+        // Layout and row-scene residency may have changed while rebuilding the
+        // display. Give the GPU tier precisely the currently unused headroom
+        // before admitting or reusing a slab.
+        self.rebalance_live_cache_coordinator();
         let trace_started = self.interaction_trace.is_active().then(Instant::now);
         if trace_started.is_some() {
             self.interaction_trace
@@ -3672,6 +3857,7 @@ impl Viewer {
         let logical_height = self.surface_config.height as f32 / self.window.scale_factor() as f32;
         let logical_width = self.surface_config.width as f32 / self.window.scale_factor() as f32;
         let mut render_display = DisplayList::default();
+        let mut rectangle_slab_key = 0xcbf2_9ce4_8422_2325_u64;
         let primary_track_id = self.primary_alignment_track_id();
         let active_panel_id = self.panels.active().id;
         for panel in self.panels.iter() {
@@ -3705,18 +3891,24 @@ impl Viewer {
                             .is_some_and(|object_id| rectangle.object_id == object_id);
                         rectangle.color =
                             read_interaction_highlight_color(rectangle.color, selected, hovered);
+                        mix_rectangle_slab_key(&mut rectangle_slab_key, rectangle);
                         rectangle
                     }));
             }
         }
-        self.rectangle_renderer.prepare(
+        self.rectangle_renderer.prepare_with_slab_key(
             &self.device,
             &self.queue,
             [logical_width, logical_height],
             &render_display,
             None,
             None,
+            Some(rectangle_slab_key),
+            self.cache_budgets.gpu_buffers,
         );
+        // A newly admitted slab becomes part of the next decoded/layout
+        // allowance immediately rather than waiting for another interaction.
+        self.rebalance_live_cache_coordinator();
         if let Some(started) = trace_started {
             let stats = self.rectangle_renderer.last_prepare_stats();
             self.interaction_trace.record_renderer_prepare(
@@ -3725,9 +3917,30 @@ impl Viewer {
                 stats.uploaded_bytes,
                 stats.buffer_reallocated,
                 stats.cpu_capacity_grew,
+                stats.slab_cache_hit,
             );
         }
         self.display_upload_pending_metrics = true;
+    }
+}
+
+fn mix_rectangle_slab_key(hash: &mut u64, rectangle: RectPrimitive) {
+    for bytes in [
+        rectangle.x.to_bits().to_le_bytes().as_slice(),
+        rectangle.y.to_bits().to_le_bytes().as_slice(),
+        rectangle.width.to_bits().to_le_bytes().as_slice(),
+        rectangle.height.to_bits().to_le_bytes().as_slice(),
+        rectangle.color.red.to_bits().to_le_bytes().as_slice(),
+        rectangle.color.green.to_bits().to_le_bytes().as_slice(),
+        rectangle.color.blue.to_bits().to_le_bytes().as_slice(),
+        rectangle.color.alpha.to_bits().to_le_bytes().as_slice(),
+        rectangle.object_id.to_le_bytes().as_slice(),
+        (rectangle.shape as u32).to_le_bytes().as_slice(),
+    ] {
+        for &byte in bytes {
+            *hash ^= u64::from(byte);
+            *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
 }
 

@@ -1,0 +1,64 @@
+{
+  "schema_version": 4,
+  "commands": [
+    {
+      "command": "new_workspace"
+    },
+    {
+      "command": "configure",
+      "setting": {
+        "setting": "total_cache_budget_mib",
+        "value": 2048
+      }
+    },
+    {
+      "command": "configure",
+      "setting": {
+        "setting": "read_browsing_buffer_percent",
+        "value": 0
+      }
+    },
+    {
+      "command": "load_track",
+      "source": {
+        "Local": {
+          "path": "../benchmark-data/large-public-alignments/ENCFF686MTA.bam"
+        }
+      },
+      "kind": "Alignment",
+      "name": "ACTB RNA-seq"
+    },
+    {
+      "command": "configure",
+      "setting": {
+        "setting": "complete_read_limit",
+        "track_ids": [
+          1
+        ],
+        "value": 10000000
+      }
+    },
+    {
+      "command": "goto",
+      "loci": [
+        "chr7:5460671-5702330"
+      ]
+    },
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 120000
+    },
+    {
+      "command": "describe_workspace"
+    },
+    {
+      "command": "snapshot",
+      "path": "../benchmark-results/resident-scene-actb-broad-clean.png",
+      "scope": "native_window",
+      "format": "png"
+    },
+    {
+      "command": "exit"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 use super::super::*;
 
+const MAXIMUM_ALIGNMENT_ROW_SCENES: usize = 4;
+
 pub(crate) fn expanded_workspace_alignment_limit(
     current_workspace_limit: usize,
     requested_track_limit: usize,
@@ -40,6 +42,7 @@ pub(crate) struct EmptyAlignmentState {
     pub(crate) maximum_alignments: usize,
 }
 
+#[derive(Clone)]
 pub(crate) struct CachedAlignmentRows {
     pub(crate) query: Arc<AlignmentQuery>,
     pub(crate) layout_query: Arc<AlignmentQuery>,
@@ -51,6 +54,7 @@ pub(crate) struct CachedAlignmentRows {
     pub(crate) sort_position: Option<u64>,
     pub(crate) promoted_read_name_hash: Option<u64>,
     pub(crate) max_rows: usize,
+    pub(crate) row_scale_class: u8,
     pub(crate) view_as_pairs: bool,
     pub(crate) pair_length_bounds: TemplateLengthBounds,
     pub(crate) stacking_mode: ReadStackingMode,
@@ -73,21 +77,31 @@ pub(crate) struct AlignmentPanelProjection {
     /// the alignment index rather than a BAM/CRAM record query.
     pub(crate) index_only_overview: bool,
     pub(crate) pending_query: bool,
+    /// Truthful engine phase for the current query generation.
+    pub(crate) query_phase: AlignmentQueryPhase,
     /// Generation and start time of the in-flight exact viewport check. Its
     /// visible notice is delayed so fast queries do not flash a banner during
     /// ordinary panning.
     pub(crate) checking_started: Option<(u64, Instant)>,
     pub(crate) checking_notice_visible: bool,
     pub(crate) current_query: Option<Arc<AlignmentQuery>>,
-    /// Fixed-neighbourhood, layout-detail query used to establish a canonical
-    /// row architecture independently of the visible query scale.
+    /// Scale-appropriate fixed-neighbourhood query used to establish a canonical
+    /// row architecture without coupling row density to the full decoded buffer.
     pub(crate) layout_query: Option<Arc<AlignmentQuery>>,
+    /// Settled decoded browsing-buffer resident used to prepare derived scene
+    /// state speculatively before the camera enters it.
+    pub(crate) resident_query: Option<Arc<AlignmentQuery>>,
     /// Presentation contract under which `layout_query` was accepted. This
     /// makes provisional horizon reuse reject stale policy/configuration data.
     pub(crate) layout_query_contract_revision: u64,
     pub(crate) layout_query_cache_hit: bool,
+    pub(crate) working_set: AlignmentWorkingSetStats,
     pub(crate) query_stats: Option<QueryStats>,
     pub(crate) alignment_rows: Option<CachedAlignmentRows>,
+    /// Bounded exact-camera row projections. These retain only compact index
+    /// arrays and shared scene/query Arcs, allowing an exact return to bypass
+    /// even the linear physical projection over a dense target.
+    pub(crate) row_layout_cache: Vec<CachedAlignmentRows>,
     /// Monotonic identity for transactional off-thread row-layout requests.
     /// A completed worker may commit only when this value still matches.
     pub(crate) row_layout_request_revision: u64,
@@ -98,6 +112,9 @@ pub(crate) struct AlignmentPanelProjection {
     /// Query-independent stable row assignments. Ordinary query replacement,
     /// Overview LOD, filters, and rendering changes must not clear this.
     pub(crate) row_history: AlignmentRowHistory,
+    /// Bounded persistent immutable-storage row scenes. Multiple entries preserve
+    /// exact-return physical mappings across real layout-horizon transitions.
+    pub(crate) row_scenes: Vec<Arc<AlignmentRowScene>>,
     pub(crate) pending_row_repack: bool,
     /// Frozen inferred bounds used only by pair-classification-dependent row
     /// policies. Live query statistics may continue to change independently.
@@ -108,6 +125,43 @@ pub(crate) struct AlignmentPanelProjection {
 }
 
 impl AlignmentPanelProjection {
+    pub(crate) fn commit_alignment_rows(&mut self, rows: CachedAlignmentRows) {
+        self.row_layout_cache.retain(|cached| {
+            !Arc::ptr_eq(&cached.query, &rows.query)
+                || cached.group_mode != rows.group_mode
+                || cached.group_order != rows.group_order
+                || cached.sort_mode != rows.sort_mode
+                || cached.sort_order != rows.sort_order
+                || cached.sort_position != rows.sort_position
+                || cached.promoted_read_name_hash != rows.promoted_read_name_hash
+                || cached.max_rows != rows.max_rows
+                || cached.row_scale_class != rows.row_scale_class
+                || cached.view_as_pairs != rows.view_as_pairs
+                || cached.pair_length_bounds != rows.pair_length_bounds
+                || cached.stacking_mode != rows.stacking_mode
+        });
+        self.row_layout_cache.push(rows.clone());
+        if self.row_layout_cache.len() > MAXIMUM_ALIGNMENT_ROW_SCENES {
+            let excess = self
+                .row_layout_cache
+                .len()
+                .saturating_sub(MAXIMUM_ALIGNMENT_ROW_SCENES);
+            self.row_layout_cache.drain(..excess);
+        }
+        self.alignment_rows = Some(rows);
+    }
+
+    pub(crate) fn admit_row_scene(&mut self, scene: Arc<AlignmentRowScene>) {
+        self.row_scenes.push(scene);
+        if self.row_scenes.len() > MAXIMUM_ALIGNMENT_ROW_SCENES {
+            let excess = self
+                .row_scenes
+                .len()
+                .saturating_sub(MAXIMUM_ALIGNMENT_ROW_SCENES);
+            self.row_scenes.drain(..excess);
+        }
+    }
+
     /// Starts a new query generation and immediately invalidates any row
     /// candidate that was derived from the previous settled query.
     pub(crate) fn advance_query_generation(&self) -> ViewportGeneration {
@@ -133,6 +187,7 @@ impl AlignmentPanelProjection {
         if self.checking_started.map(|(seen, _)| seen) != Some(generation) {
             self.checking_started = Some((generation, now));
             self.checking_notice_visible = false;
+            self.query_phase = AlignmentQueryPhase::Queued;
         }
     }
 
@@ -156,6 +211,7 @@ impl AlignmentPanelProjection {
     pub(crate) fn finish_checking(&mut self) {
         self.checking_started = None;
         self.checking_notice_visible = false;
+        self.query_phase = AlignmentQueryPhase::Ready;
     }
 
     pub(crate) fn row_policy_pair_bounds(
@@ -186,6 +242,7 @@ impl AlignmentPanelProjection {
         self.pending_query = false;
         self.current_query = None;
         self.layout_query = None;
+        self.resident_query = None;
         self.layout_query_cache_hit = false;
         self.query_stats = None;
         self.alignment_rows = None;
@@ -247,6 +304,10 @@ pub(crate) struct AlignmentTrackController {
     pub(crate) active_filters: ActiveFilters,
     pub(crate) projections: HashMap<PanelId, AlignmentPanelProjection>,
     pub(crate) cache_stats: Option<CacheStats>,
+    /// Last decoded-cache allowance accepted by the engine actor. Keeping the
+    /// applied value here prevents a frame-by-frame rebalance from flooding
+    /// the bounded actor queue while its statistics event is in flight.
+    pub(crate) cache_budget_bytes: NonZeroUsize,
     pub(crate) remote_io_stats: Option<RemoteIoStats>,
 }
 
@@ -318,6 +379,7 @@ impl AlignmentTrackController {
         projection.pending_query = false;
         projection.current_query = None;
         projection.layout_query = None;
+        projection.resident_query = None;
         projection.layout_query_cache_hit = false;
         projection.alignment_rows = None;
         projection.cached_layout = None;
@@ -527,6 +589,97 @@ impl Viewer {
 
 pub(crate) fn alignment_cache_share(total_bytes: usize, track_count: usize) -> NonZeroUsize {
     NonZeroUsize::new((total_bytes.max(1) / track_count.max(1)).max(1)).unwrap()
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LiveCacheCoordinatorSnapshot {
+    pub(crate) total_budget_bytes: usize,
+    pub(crate) measured_resident_bytes: usize,
+    pub(crate) decoded_resident_bytes: usize,
+    pub(crate) layout_resident_bytes: usize,
+    pub(crate) row_scene_resident_bytes: usize,
+    pub(crate) gpu_slab_resident_bytes: usize,
+    pub(crate) decoded_allowance_bytes: usize,
+    pub(crate) layout_allowance_bytes: usize,
+    pub(crate) row_scene_allowance_bytes: usize,
+    pub(crate) gpu_slab_allowance_bytes: usize,
+    /// Measured bytes temporarily above the selected ceiling while actor-side
+    /// eviction settles or an authoritative foreground object remains pinned.
+    pub(crate) over_budget_bytes: usize,
+    pub(crate) clamp_reason: Option<&'static str>,
+    pub(crate) rebalances: u64,
+}
+
+/// Divides a live decoded-read pool without an irrevocable equal split.
+/// Existing residency is preserved when it fits; remaining capacity follows
+/// observed per-track demand. Under pressure, every track receives a
+/// proportional non-zero allowance and its engine evicts speculation first.
+pub(crate) fn adaptive_alignment_cache_shares(
+    total_bytes: usize,
+    resident_bytes: &[usize],
+) -> Vec<NonZeroUsize> {
+    if resident_bytes.is_empty() {
+        return Vec::new();
+    }
+    let track_count = resident_bytes.len();
+    let total_bytes = total_bytes.max(track_count);
+    let resident_total = resident_bytes
+        .iter()
+        .fold(0_usize, |total, resident| total.saturating_add(*resident));
+    let mut shares = vec![1_usize; track_count];
+
+    if resident_total <= total_bytes {
+        shares.clone_from_slice(resident_bytes);
+        let assigned = shares.iter().sum::<usize>();
+        let free = total_bytes.saturating_sub(assigned);
+        let demand_floor = (total_bytes / track_count / 4).max(1);
+        let weights = resident_bytes
+            .iter()
+            .map(|resident| (*resident).max(demand_floor))
+            .collect::<Vec<_>>();
+        distribute_cache_bytes(&mut shares, free, &weights);
+    } else {
+        let weights = resident_bytes
+            .iter()
+            .map(|resident| (*resident).max(1))
+            .collect::<Vec<_>>();
+        distribute_cache_bytes(
+            &mut shares,
+            total_bytes.saturating_sub(track_count),
+            &weights,
+        );
+    }
+
+    shares
+        .into_iter()
+        .map(|share| NonZeroUsize::new(share.max(1)).unwrap())
+        .collect()
+}
+
+fn distribute_cache_bytes(shares: &mut [usize], bytes: usize, weights: &[usize]) {
+    if bytes == 0 || shares.is_empty() {
+        return;
+    }
+    let weight_total = weights
+        .iter()
+        .fold(0_u128, |total, weight| {
+            total.saturating_add(*weight as u128)
+        })
+        .max(1);
+    let mut distributed = 0_usize;
+    for (share, weight) in shares.iter_mut().zip(weights) {
+        let portion = ((bytes as u128).saturating_mul(*weight as u128) / weight_total)
+            .min(usize::MAX as u128) as usize;
+        *share = share.saturating_add(portion);
+        distributed = distributed.saturating_add(portion);
+    }
+    let mut remainder = bytes.saturating_sub(distributed);
+    let mut index = 0_usize;
+    while remainder > 0 {
+        shares[index] = shares[index].saturating_add(1);
+        remainder -= 1;
+        index = (index + 1) % shares.len();
+    }
 }
 
 pub(crate) fn alignment_panel_projections(
@@ -876,6 +1029,7 @@ pub(crate) fn spawn_alignment_track_controller(
         active_filters,
         projections: alignment_panel_projections(panel_ids),
         cache_stats: None,
+        cache_budget_bytes: cache_bytes,
         remote_io_stats: None,
     })
 }

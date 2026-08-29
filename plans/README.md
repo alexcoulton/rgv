@@ -16,6 +16,8 @@ The remaining documents preserve detailed implementation, remediation, and desig
 
 ## Focused plans
 
+- [Resident alignment scene and instant navigation](RESIDENT_ALIGNMENT_SCENE_PLAN.md)
+- [Alignment browsing working set](ALIGNMENT_BROWSING_WORKING_SET_PLAN.md)
 - [Canonical stable read architecture](CANONICAL_STABLE_READ_ARCHITECTURE_PLAN.md)
 - [Complete read presentation and resource admission](COMPLETE_READ_PRESENTATION_PLAN.md)
 - [Dense-alignment layout performance](DENSE_ALIGNMENT_LAYOUT_PERFORMANCE_PLAN.md)

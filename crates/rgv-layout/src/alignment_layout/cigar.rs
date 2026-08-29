@@ -82,10 +82,14 @@ pub(crate) fn add_cigar(
     let Some(cigar) = batch.cigar(index) else {
         return;
     };
-    let mut reference_position = batch.starts[index];
+    let mut reference_position = batch.start(index).expect("validated start");
     let mut read_position = 0_usize;
     if cigar.is_empty() {
-        let (x, width) = clipped_geometry(batch.starts[index], batch.ends[index], viewport);
+        let (x, width) = clipped_geometry(
+            batch.start(index).expect("validated start"),
+            batch.end(index).expect("validated end"),
+            viewport,
+        );
         add_read_body(
             display_list,
             x,
@@ -412,16 +416,17 @@ pub(crate) fn add_mate_connector(
     object_id: u32,
 ) {
     let batch = &query.batch;
-    let (Some(mate_contig), Some(mate_start)) =
-        (batch.mate_contigs[index], batch.mate_starts[index])
-    else {
+    let (Some(mate_contig), Some(mate_start)) = (
+        batch.mate_contig(index).flatten(),
+        batch.mate_start(index).flatten(),
+    ) else {
         return;
     };
-    if mate_contig != batch.contigs[index] {
+    if Some(mate_contig) != batch.contig(index) {
         return;
     }
-    let start = batch.ends[index].min(mate_start);
-    let end = batch.ends[index].max(mate_start);
+    let start = batch.end(index).expect("validated end").min(mate_start);
+    let end = batch.end(index).expect("validated end").max(mate_start);
     let (x, width) = clipped_geometry(start, end, viewport);
     if width <= 0.0 {
         return;
@@ -472,7 +477,7 @@ pub(crate) fn add_modified_base_calls(
         .or_else(|| batch.auxiliary_field(index, *b"Ml").ok().flatten());
     let Ok(calls) = decode_modified_bases_parts(
         bases,
-        batch.flags[index],
+        batch.flags(index).expect("validated flags"),
         &mm.value,
         ml.as_ref().map(|field| &field.value),
     ) else {
@@ -492,7 +497,7 @@ pub(crate) fn add_modified_base_calls(
         }
         let Some(aligned_position) = aligned_position_for_sequencer_position(
             bases.len(),
-            batch.flags[index],
+            batch.flags(index).expect("validated flags"),
             call.sequencer_position,
         ) else {
             continue;
@@ -500,9 +505,11 @@ pub(crate) fn add_modified_base_calls(
         if sbx_hides_read_position(sbx_state, aligned_position) {
             continue;
         }
-        let Some(reference_position) =
-            reference_position_for_read_position(batch.starts[index], cigar, aligned_position)
-        else {
+        let Some(reference_position) = reference_position_for_read_position(
+            batch.start(index).expect("validated start"),
+            cigar,
+            aligned_position,
+        ) else {
             continue;
         };
         if !viewport.interval().contains(reference_position) {
@@ -540,8 +547,8 @@ pub(crate) fn add_modified_base_calls(
             &calls,
             bases,
             cigar,
-            batch.starts[index],
-            batch.flags[index],
+            batch.start(index).expect("validated start"),
+            batch.flags(index).expect("validated flags"),
             viewport,
             y,
             height,

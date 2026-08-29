@@ -1,3 +1,8 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
 use rgv_core::ContigId;
 use thiserror::Error;
 
@@ -361,6 +366,187 @@ pub struct AlignmentRecord {
     pub auxiliary_fields: Vec<AuxField>,
 }
 
+/// A zero-allocation view over one record in a packed [`AlignmentBatch`].
+///
+/// Resident-window projection uses this form so selecting a smaller viewport
+/// does not first recreate an allocation graph for every retained read.
+#[derive(Clone, Copy, Debug)]
+pub struct AlignmentRecordView<'a> {
+    batch: &'a AlignmentBatch,
+    index: usize,
+}
+
+impl<'a> AlignmentRecordView<'a> {
+    pub fn contig(self) -> ContigId {
+        self.batch
+            .contig(self.index)
+            .expect("a validated packed record has a contig")
+    }
+
+    pub fn start(self) -> u64 {
+        self.batch
+            .start(self.index)
+            .expect("a validated packed record has a start")
+    }
+
+    pub fn end(self) -> u64 {
+        self.batch
+            .end(self.index)
+            .expect("a validated packed record has an end")
+    }
+
+    pub fn flags(self) -> AlignmentFlags {
+        self.batch
+            .flags(self.index)
+            .expect("a validated packed record has flags")
+    }
+
+    pub fn mapping_quality(self) -> Option<u8> {
+        self.batch.mapping_quality(self.index).flatten()
+    }
+
+    pub fn mate_contig(self) -> Option<ContigId> {
+        self.batch.mate_contig(self.index).flatten()
+    }
+
+    pub fn mate_start(self) -> Option<u64> {
+        self.batch.mate_start(self.index).flatten()
+    }
+
+    pub fn template_length(self) -> i64 {
+        self.batch
+            .template_length(self.index)
+            .expect("a validated packed record has a template length")
+    }
+
+    pub fn read_name(self) -> &'a [u8] {
+        self.batch
+            .read_name(self.index)
+            .expect("a validated packed record has a read name")
+    }
+
+    pub fn cigar(self) -> &'a [CigarOp] {
+        self.batch
+            .cigar(self.index)
+            .expect("a validated packed record has a CIGAR")
+    }
+
+    pub fn sequence(self) -> SequenceView<'a> {
+        self.batch
+            .sequence(self.index)
+            .expect("a validated packed record has a sequence state")
+    }
+
+    pub fn has_auxiliary_tag(self, tag: [u8; 2]) -> bool {
+        self.batch.has_auxiliary_tag(self.index, tag)
+    }
+
+    pub fn auxiliary_field(self, tag: [u8; 2]) -> Result<Option<AuxField>, PackedRecordError> {
+        self.batch.auxiliary_field(self.index, tag)
+    }
+
+    pub fn materialize(self) -> Result<AlignmentRecord, PackedRecordError> {
+        self.batch.materialize_record(self.index)
+    }
+
+    fn auxiliary_bytes(self) -> Option<&'a [u8]> {
+        self.batch.auxiliary_bytes(self.index)
+    }
+
+    fn primary_order(self) -> (u64, u64, &'a [u8]) {
+        (self.start(), self.end(), self.read_name())
+    }
+
+    fn stable_fingerprint(self) -> (u64, u64) {
+        self.batch.stable_fingerprint(self.index)
+    }
+
+    fn exactly_matches(self, other: Self) -> bool {
+        self.batch
+            .records_exactly_match(self.index, other.batch, other.index)
+    }
+}
+
+const ALIGNMENT_OVERLAP_INDEX_BLOCK_RECORDS: usize = 256;
+
+/// A compact block-max index for selecting every record that overlaps a
+/// contained target, including reads that start far before it because of a
+/// long alignment or RNA splice.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentOverlapIndex {
+    maximum_end_by_block: Vec<u64>,
+}
+
+impl AlignmentOverlapIndex {
+    pub fn new(batch: &AlignmentBatch) -> Self {
+        let maximum_end_by_block = (0..batch.len())
+            .step_by(ALIGNMENT_OVERLAP_INDEX_BLOCK_RECORDS)
+            .map(|first| {
+                let last = first
+                    .saturating_add(ALIGNMENT_OVERLAP_INDEX_BLOCK_RECORDS)
+                    .min(batch.len());
+                (first..last)
+                    .filter_map(|index| batch.end(index))
+                    .max()
+                    .unwrap_or_default()
+            })
+            .collect();
+        Self {
+            maximum_end_by_block,
+        }
+    }
+
+    pub fn select(
+        &self,
+        batch: &AlignmentBatch,
+        interval: rgv_core::GenomicInterval,
+    ) -> Vec<usize> {
+        let upper = batch.partition_point_start(|start| start < interval.end());
+        let mut selected = Vec::new();
+        for (block, maximum_end) in self.maximum_end_by_block.iter().copied().enumerate() {
+            let first = block.saturating_mul(ALIGNMENT_OVERLAP_INDEX_BLOCK_RECORDS);
+            if first >= upper {
+                break;
+            }
+            if maximum_end <= interval.start() {
+                continue;
+            }
+            let last = first
+                .saturating_add(ALIGNMENT_OVERLAP_INDEX_BLOCK_RECORDS)
+                .min(upper);
+            selected.extend((first..last).filter(|index| {
+                batch.contig(*index) == Some(interval.contig())
+                    && batch
+                        .start(*index)
+                        .is_some_and(|start| start < interval.end())
+                    && batch.end(*index).is_some_and(|end| end > interval.start())
+            }));
+        }
+        selected
+    }
+
+    pub fn estimated_bytes(&self) -> usize {
+        self.maximum_end_by_block
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum FilteredRecordReason {
+    Unmapped,
+    Secondary,
+    Supplementary,
+    User { duplicate: bool, qc_failed: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FilteredRecordSpan {
+    start: u64,
+    end: u64,
+    reason: FilteredRecordReason,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackedSequenceState {
     NotLoaded,
@@ -375,19 +561,19 @@ enum PackedSequenceState {
 /// without decoding it, decode one selected tag for colouring, or materialize one complete record
 /// for the inspector. This avoids a second heap allocation graph for every displayed alignment.
 #[derive(Clone, Debug, PartialEq)]
-pub struct AlignmentBatch {
-    pub contigs: Vec<ContigId>,
-    pub starts: Vec<u64>,
-    pub ends: Vec<u64>,
-    pub flags: Vec<AlignmentFlags>,
-    pub mapping_qualities: Vec<Option<u8>>,
-    pub mate_contigs: Vec<Option<ContigId>>,
-    pub mate_starts: Vec<Option<u64>>,
-    pub template_lengths: Vec<i64>,
-    pub read_name_offsets: Vec<u32>,
-    pub read_names: Vec<u8>,
-    pub cigar_offsets: Vec<u32>,
-    pub cigar_ops: Vec<CigarOp>,
+struct AlignmentBatchStorage {
+    contigs: Vec<ContigId>,
+    starts: Vec<u64>,
+    ends: Vec<u64>,
+    flags: Vec<AlignmentFlags>,
+    mapping_qualities: Vec<Option<u8>>,
+    mate_contigs: Vec<Option<ContigId>>,
+    mate_starts: Vec<Option<u64>>,
+    template_lengths: Vec<i64>,
+    read_name_offsets: Vec<u32>,
+    read_names: Vec<u8>,
+    cigar_offsets: Vec<u32>,
+    cigar_ops: Vec<CigarOp>,
     sequence_states: Vec<PackedSequenceState>,
     sequence_offsets: Vec<u32>,
     sequences: Vec<u8>,
@@ -395,9 +581,22 @@ pub struct AlignmentBatch {
     qualities: Vec<u8>,
     auxiliary_offsets: Vec<u32>,
     auxiliary_data: Vec<u8>,
+    stable_ids: Vec<AlignmentStableId>,
 }
 
-impl Default for AlignmentBatch {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompositeRecordIndex {
+    storage: u32,
+    record: u32,
+}
+
+#[derive(Clone, Debug)]
+struct CompositeAlignmentStorage {
+    storages: Arc<[Arc<AlignmentBatchStorage>]>,
+    records: Arc<[CompositeRecordIndex]>,
+}
+
+impl Default for AlignmentBatchStorage {
     fn default() -> Self {
         Self {
             contigs: Vec::new(),
@@ -419,41 +618,321 @@ impl Default for AlignmentBatch {
             qualities: Vec::new(),
             auxiliary_offsets: vec![0],
             auxiliary_data: Vec::new(),
+            stable_ids: Vec::new(),
+        }
+    }
+}
+
+/// Immutable packed alignment storage with an optional zero-copy logical projection.
+///
+/// Source queries own one packed storage allocation. A resident viewport keeps an Arc to that
+/// allocation plus compact physical indices, so deriving a contained target does not duplicate
+/// fixed columns or variable-width read arenas.
+#[derive(Clone, Debug)]
+pub struct AlignmentBatch {
+    storage: Arc<AlignmentBatchStorage>,
+    physical_indices: Option<Arc<[u32]>>,
+    composite: Option<Arc<CompositeAlignmentStorage>>,
+    /// Compact spatial provenance for records rejected by the active query
+    /// contract. It lets a contained resident projection rebuild exact filter
+    /// counters without retaining those records' sequence or auxiliary data.
+    filtered_record_spans: Vec<FilteredRecordSpan>,
+    filtered_record_spans_complete: bool,
+}
+
+/// Process-local identity for one immutable packed record allocation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AlignmentStorageRecordId {
+    storage: usize,
+    record: u32,
+}
+
+/// Source-independent identity for one immutable alignment record.
+///
+/// The identity deliberately excludes sequence, qualities, and arbitrary auxiliary tags so a
+/// layout-only horizon and a full-detail foreground query produce the same value. Exact duplicate
+/// records are disambiguated by their deterministic occurrence at the layout layer.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AlignmentStableId {
+    primary: u64,
+    secondary: u64,
+}
+
+impl AlignmentStableId {
+    pub const fn primary(self) -> u64 {
+        self.primary
+    }
+
+    pub const fn secondary(self) -> u64 {
+        self.secondary
+    }
+}
+
+impl AlignmentStorageRecordId {
+    pub const fn storage(self) -> usize {
+        self.storage
+    }
+
+    pub const fn record(self) -> u32 {
+        self.record
+    }
+}
+
+impl PartialEq for AlignmentBatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self.filtered_record_spans == other.filtered_record_spans
+            && self.filtered_record_spans_complete == other.filtered_record_spans_complete
+            && (0..self.len()).all(|index| self.records_exactly_match(index, other, index))
+    }
+}
+
+impl Default for AlignmentBatch {
+    fn default() -> Self {
+        Self {
+            storage: Arc::new(AlignmentBatchStorage::default()),
+            physical_indices: None,
+            composite: None,
+            filtered_record_spans: Vec::new(),
+            filtered_record_spans_complete: true,
         }
     }
 }
 
 impl AlignmentBatch {
     pub fn len(&self) -> usize {
-        self.starts.len()
+        self.composite.as_ref().map_or_else(
+            || {
+                self.physical_indices
+                    .as_ref()
+                    .map_or(self.storage.starts.len(), |indices| indices.len())
+            },
+            |composite| composite.records.len(),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
-        self.starts.is_empty()
+        self.len() == 0
+    }
+
+    pub fn is_projection(&self) -> bool {
+        self.physical_indices.is_some() || self.composite.is_some()
+    }
+
+    pub fn projection_indices_bytes(&self) -> usize {
+        self.composite.as_ref().map_or_else(
+            || {
+                self.physical_indices.as_ref().map_or(0, |indices| {
+                    indices.len().saturating_mul(std::mem::size_of::<u32>())
+                })
+            },
+            |composite| {
+                composite
+                    .records
+                    .len()
+                    .saturating_mul(std::mem::size_of::<CompositeRecordIndex>())
+            },
+        )
+    }
+
+    /// Whether this batch retains every packed storage allocation referenced by `other`.
+    pub fn retains_all_storage_from(&self, other: &Self) -> bool {
+        let retained = self.backing_storages();
+        other.backing_storages().iter().all(|required| {
+            retained
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, required))
+        })
+    }
+
+    pub fn storage_record_id(&self, index: usize) -> Option<AlignmentStorageRecordId> {
+        if let Some(composite) = &self.composite {
+            let location = composite.records.get(index)?;
+            let storage = composite.storages.get(location.storage as usize)?;
+            return Some(AlignmentStorageRecordId {
+                storage: Arc::as_ptr(storage) as usize,
+                record: location.record,
+            });
+        }
+        Some(AlignmentStorageRecordId {
+            storage: Arc::as_ptr(&self.storage) as usize,
+            record: u32::try_from(self.physical_index(index)?).ok()?,
+        })
+    }
+
+    /// Process-local identities of the immutable packed allocations retained
+    /// by this batch. Resident consumers use this small set to distinguish a
+    /// zero-copy slab extension from an independently decoded equivalent
+    /// query without walking every logical record first.
+    pub fn storage_ids(&self) -> Vec<usize> {
+        self.backing_storages()
+            .iter()
+            .map(|storage| Arc::as_ptr(storage) as usize)
+            .collect()
+    }
+
+    pub fn stable_id(&self, index: usize) -> Option<AlignmentStableId> {
+        let (storage, physical) = self.record_location(index)?;
+        storage.stable_ids.get(physical).copied()
+    }
+
+    /// Creates a zero-copy logical projection over this batch.
+    pub fn project(&self, indices: &[usize]) -> Result<Self, BatchOverflow> {
+        if let Some(composite) = &self.composite {
+            let records = indices
+                .iter()
+                .map(|index| composite.records.get(*index).copied().ok_or(BatchOverflow))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(Self {
+                storage: Arc::clone(&self.storage),
+                physical_indices: None,
+                composite: Some(Arc::new(CompositeAlignmentStorage {
+                    storages: Arc::clone(&composite.storages),
+                    records: records.into(),
+                })),
+                filtered_record_spans: Vec::new(),
+                filtered_record_spans_complete: self.filtered_record_spans_complete,
+            });
+        }
+        let mut physical = Vec::with_capacity(indices.len());
+        for index in indices {
+            let physical_index = self.physical_index(*index).ok_or(BatchOverflow)?;
+            physical.push(u32::try_from(physical_index).map_err(|_| BatchOverflow)?);
+        }
+        Ok(Self {
+            storage: Arc::clone(&self.storage),
+            physical_indices: Some(physical.into()),
+            composite: None,
+            filtered_record_spans: Vec::new(),
+            filtered_record_spans_complete: self.filtered_record_spans_complete,
+        })
+    }
+
+    fn physical_index(&self, index: usize) -> Option<usize> {
+        if self.composite.is_some() {
+            return None;
+        }
+        self.physical_indices.as_ref().map_or_else(
+            || (index < self.storage.starts.len()).then_some(index),
+            |indices| indices.get(index).map(|value| *value as usize),
+        )
+    }
+
+    fn storage_mut(&mut self) -> Result<&mut AlignmentBatchStorage, BatchOverflow> {
+        if self.physical_indices.is_some() || self.composite.is_some() {
+            return Err(BatchOverflow);
+        }
+        Ok(Arc::make_mut(&mut self.storage))
+    }
+
+    fn record_location(&self, index: usize) -> Option<(&AlignmentBatchStorage, usize)> {
+        if let Some(composite) = &self.composite {
+            let location = composite.records.get(index)?;
+            let storage = composite.storages.get(location.storage as usize)?;
+            let record = location.record as usize;
+            return (record < storage.starts.len()).then_some((storage, record));
+        }
+        let physical = self.physical_index(index)?;
+        Some((&self.storage, physical))
+    }
+
+    pub fn contig(&self, index: usize) -> Option<ContigId> {
+        let (storage, physical) = self.record_location(index)?;
+        storage.contigs.get(physical).copied()
+    }
+
+    pub fn start(&self, index: usize) -> Option<u64> {
+        let (storage, physical) = self.record_location(index)?;
+        storage.starts.get(physical).copied()
+    }
+
+    pub fn end(&self, index: usize) -> Option<u64> {
+        let (storage, physical) = self.record_location(index)?;
+        storage.ends.get(physical).copied()
+    }
+
+    pub fn flags(&self, index: usize) -> Option<AlignmentFlags> {
+        let (storage, physical) = self.record_location(index)?;
+        storage.flags.get(physical).copied()
+    }
+
+    pub fn mapping_quality(&self, index: usize) -> Option<Option<u8>> {
+        let (storage, physical) = self.record_location(index)?;
+        storage.mapping_qualities.get(physical).copied()
+    }
+
+    pub fn mate_contig(&self, index: usize) -> Option<Option<ContigId>> {
+        let (storage, physical) = self.record_location(index)?;
+        storage.mate_contigs.get(physical).copied()
+    }
+
+    pub fn mate_start(&self, index: usize) -> Option<Option<u64>> {
+        let (storage, physical) = self.record_location(index)?;
+        storage.mate_starts.get(physical).copied()
+    }
+
+    pub fn template_length(&self, index: usize) -> Option<i64> {
+        let (storage, physical) = self.record_location(index)?;
+        storage.template_lengths.get(physical).copied()
+    }
+
+    pub fn starts(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        (0..self.len()).map(|index| self.start(index).expect("validated start"))
+    }
+
+    pub fn ends(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        (0..self.len()).map(|index| self.end(index).expect("validated end"))
+    }
+
+    /// First logical record whose coordinate-sorted start does not satisfy
+    /// `predicate`.
+    pub fn partition_point_start(&self, mut predicate: impl FnMut(u64) -> bool) -> usize {
+        let (mut left, mut right) = (0_usize, self.len());
+        while left < right {
+            let middle = left + (right - left) / 2;
+            if self.start(middle).is_some_and(&mut predicate) {
+                left = middle.saturating_add(1);
+            } else {
+                right = middle;
+            }
+        }
+        left
     }
 
     pub fn validate(&self) -> bool {
         let len = self.len();
-        self.contigs.len() == len
-            && self.ends.len() == len
-            && self.flags.len() == len
-            && self.mapping_qualities.len() == len
-            && self.mate_contigs.len() == len
-            && self.mate_starts.len() == len
-            && self.template_lengths.len() == len
-            && self.sequence_states.len() == len
-            && valid_offsets(&self.read_name_offsets, len, self.read_names.len())
-            && valid_offsets(&self.cigar_offsets, len, self.cigar_ops.len())
-            && valid_offsets(&self.sequence_offsets, len, self.sequences.len())
-            && valid_offsets(&self.quality_offsets, len, self.qualities.len())
-            && valid_offsets(&self.auxiliary_offsets, len, self.auxiliary_data.len())
+        let storage_len = self.storage.starts.len();
+        valid_alignment_storage(&self.storage)
+            && self
+                .physical_indices
+                .as_ref()
+                .is_none_or(|indices| indices.iter().all(|index| (*index as usize) < storage_len))
+            && self.composite.as_ref().is_none_or(|composite| {
+                composite
+                    .storages
+                    .iter()
+                    .all(|storage| valid_alignment_storage(storage))
+                    && composite.records.iter().all(|location| {
+                        composite
+                            .storages
+                            .get(location.storage as usize)
+                            .is_some_and(|storage| {
+                                (location.record as usize) < storage.starts.len()
+                            })
+                    })
+            })
             && (0..len).all(|index| self.sequence(index).is_some())
             && (0..len).all(|index| self.auxiliary_fields(index).is_ok())
+            && self
+                .filtered_record_spans
+                .windows(2)
+                .all(|pair| pair[0].start <= pair[1].start)
     }
 
     pub fn push(&mut self, record: &AlignmentRecord) -> Result<(), BatchOverflow> {
-        let read_name_end = arena_end(self.read_names.len(), record.read_name.len())?;
-        let cigar_end = arena_end(self.cigar_ops.len(), record.cigar.len())?;
+        let storage = self.storage_mut()?;
+        let read_name_end = arena_end(storage.read_names.len(), record.read_name.len())?;
+        let cigar_end = arena_end(storage.cigar_ops.len(), record.cigar.len())?;
         let (sequence_state, bases, qualities) = match &record.sequence {
             SequenceData::NotLoaded => (PackedSequenceState::NotLoaded, &[][..], None),
             SequenceData::Missing => (PackedSequenceState::Missing, &[][..], None),
@@ -467,8 +946,8 @@ impl AlignmentBatch {
                 qualities.as_deref(),
             ),
         };
-        let sequence_end = arena_end(self.sequences.len(), bases.len())?;
-        let quality_end = arena_end(self.qualities.len(), qualities.map_or(0, <[u8]>::len))?;
+        let sequence_end = arena_end(storage.sequences.len(), bases.len())?;
+        let quality_end = arena_end(storage.qualities.len(), qualities.map_or(0, <[u8]>::len))?;
         let auxiliary_bytes =
             record
                 .auxiliary_fields
@@ -478,46 +957,411 @@ impl AlignmentBatch {
                         .checked_add(encoded_auxiliary_len(field)?)
                         .ok_or(BatchOverflow)
                 })?;
-        let auxiliary_end = arena_end(self.auxiliary_data.len(), auxiliary_bytes)?;
+        let auxiliary_end = arena_end(storage.auxiliary_data.len(), auxiliary_bytes)?;
         for field in &record.auxiliary_fields {
-            encode_auxiliary_field(&mut self.auxiliary_data, field)?;
+            encode_auxiliary_field(&mut storage.auxiliary_data, field)?;
         }
 
-        self.contigs.push(record.contig);
-        self.starts.push(record.start);
-        self.ends.push(record.end);
-        self.flags.push(record.flags);
-        self.mapping_qualities.push(record.mapping_quality);
-        self.mate_contigs.push(record.mate_contig);
-        self.mate_starts.push(record.mate_start);
-        self.template_lengths.push(record.template_length);
-        self.read_names.extend_from_slice(&record.read_name);
-        self.read_name_offsets.push(read_name_end);
-        self.cigar_ops.extend_from_slice(&record.cigar);
-        self.cigar_offsets.push(cigar_end);
-        self.sequence_states.push(sequence_state);
-        self.sequences.extend_from_slice(bases);
-        self.sequence_offsets.push(sequence_end);
+        storage.contigs.push(record.contig);
+        storage.starts.push(record.start);
+        storage.ends.push(record.end);
+        storage.flags.push(record.flags);
+        storage.mapping_qualities.push(record.mapping_quality);
+        storage.mate_contigs.push(record.mate_contig);
+        storage.mate_starts.push(record.mate_start);
+        storage.template_lengths.push(record.template_length);
+        storage.read_names.extend_from_slice(&record.read_name);
+        storage.read_name_offsets.push(read_name_end);
+        storage.cigar_ops.extend_from_slice(&record.cigar);
+        storage.cigar_offsets.push(cigar_end);
+        storage.sequence_states.push(sequence_state);
+        storage.sequences.extend_from_slice(bases);
+        storage.sequence_offsets.push(sequence_end);
         if let Some(qualities) = qualities {
-            self.qualities.extend_from_slice(qualities);
+            storage.qualities.extend_from_slice(qualities);
         }
-        self.quality_offsets.push(quality_end);
-        self.auxiliary_offsets.push(auxiliary_end);
+        storage.quality_offsets.push(quality_end);
+        storage.auxiliary_offsets.push(auxiliary_end);
+        let physical = storage.starts.len().checked_sub(1).ok_or(BatchOverflow)?;
+        storage
+            .stable_ids
+            .push(alignment_storage_stable_id(storage, physical)?);
         Ok(())
     }
 
+    /// Copies one packed record into this batch without materializing any of
+    /// its variable-width fields.
+    pub fn push_view(&mut self, record: AlignmentRecordView<'_>) -> Result<(), BatchOverflow> {
+        let read_name = record.read_name();
+        let cigar = record.cigar();
+        let (sequence_state, bases, qualities) = match record.sequence() {
+            SequenceView::NotLoaded => (PackedSequenceState::NotLoaded, &[][..], None),
+            SequenceView::Missing => (PackedSequenceState::Missing, &[][..], None),
+            SequenceView::Present { bases, qualities } => (
+                if qualities.is_some() {
+                    PackedSequenceState::PresentWithQualities
+                } else {
+                    PackedSequenceState::PresentWithoutQualities
+                },
+                bases,
+                qualities,
+            ),
+        };
+        let auxiliary = record.auxiliary_bytes().ok_or(BatchOverflow)?;
+        let storage = self.storage_mut()?;
+        let read_name_end = arena_end(storage.read_names.len(), read_name.len())?;
+        let cigar_end = arena_end(storage.cigar_ops.len(), cigar.len())?;
+        let sequence_end = arena_end(storage.sequences.len(), bases.len())?;
+        let quality_end = arena_end(storage.qualities.len(), qualities.map_or(0, <[u8]>::len))?;
+        let auxiliary_end = arena_end(storage.auxiliary_data.len(), auxiliary.len())?;
+
+        storage.contigs.push(record.contig());
+        storage.starts.push(record.start());
+        storage.ends.push(record.end());
+        storage.flags.push(record.flags());
+        storage.mapping_qualities.push(record.mapping_quality());
+        storage.mate_contigs.push(record.mate_contig());
+        storage.mate_starts.push(record.mate_start());
+        storage.template_lengths.push(record.template_length());
+        storage.read_names.extend_from_slice(read_name);
+        storage.read_name_offsets.push(read_name_end);
+        storage.cigar_ops.extend_from_slice(cigar);
+        storage.cigar_offsets.push(cigar_end);
+        storage.sequence_states.push(sequence_state);
+        storage.sequences.extend_from_slice(bases);
+        storage.sequence_offsets.push(sequence_end);
+        if let Some(qualities) = qualities {
+            storage.qualities.extend_from_slice(qualities);
+        }
+        storage.quality_offsets.push(quality_end);
+        storage.auxiliary_data.extend_from_slice(auxiliary);
+        storage.auxiliary_offsets.push(auxiliary_end);
+        let physical = storage.starts.len().checked_sub(1).ok_or(BatchOverflow)?;
+        storage
+            .stable_ids
+            .push(alignment_storage_stable_id(storage, physical)?);
+        Ok(())
+    }
+
+    pub fn record_view(&self, index: usize) -> Option<AlignmentRecordView<'_>> {
+        (index < self.len()).then_some(AlignmentRecordView { batch: self, index })
+    }
+
+    pub fn records(&self) -> impl ExactSizeIterator<Item = AlignmentRecordView<'_>> {
+        (0..self.len()).map(|index| AlignmentRecordView { batch: self, index })
+    }
+
+    pub(crate) fn push_filtered_record(
+        &mut self,
+        start: u64,
+        end: u64,
+        reason: FilteredRecordReason,
+    ) {
+        if start < end {
+            self.filtered_record_spans
+                .push(FilteredRecordSpan { start, end, reason });
+        }
+    }
+
+    pub(crate) fn mark_filtered_record_spans_incomplete(&mut self) {
+        self.filtered_record_spans_complete = false;
+    }
+
+    pub fn filtered_record_spans_complete(&self) -> bool {
+        self.filtered_record_spans_complete
+    }
+
+    pub(crate) fn sort_filtered_records(&mut self) {
+        self.filtered_record_spans
+            .sort_unstable_by_key(|record| record.start);
+    }
+
+    pub(crate) fn absorb_filtered_records(&mut self, mut source: Self) {
+        self.filtered_record_spans
+            .append(&mut source.filtered_record_spans);
+        self.filtered_record_spans_complete &= source.filtered_record_spans_complete;
+        self.sort_filtered_records();
+    }
+
+    pub fn filtered_record_count(&self) -> usize {
+        self.filtered_record_spans.len()
+    }
+
+    /// Merges two complete start-sorted query batches and removes only the
+    /// duplicate copies introduced by indexed overlap at the query boundary.
+    /// Genuine byte-identical duplicate records are retained at the maximum
+    /// multiplicity present in either input.
+    pub fn merge_complete(&self, other: &Self) -> Result<Self, BatchOverflow> {
+        if !self.filtered_record_spans_complete || !other.filtered_record_spans_complete {
+            return Err(BatchOverflow);
+        }
+        let mut left_by_fingerprint = HashMap::<(u64, u64), Vec<usize>>::new();
+        for record in self.records() {
+            left_by_fingerprint
+                .entry(record.stable_fingerprint())
+                .or_default()
+                .push(record.index);
+        }
+        let mut matched_left = HashSet::new();
+        let mut storages = Vec::<Arc<AlignmentBatchStorage>>::new();
+        for storage in self
+            .backing_storages()
+            .into_iter()
+            .chain(other.backing_storages())
+        {
+            if !storages
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, &storage))
+            {
+                storages.push(storage);
+            }
+        }
+        let storage_slots = storages
+            .iter()
+            .enumerate()
+            .map(|(index, storage)| {
+                Ok((
+                    Arc::as_ptr(storage) as usize,
+                    u32::try_from(index).map_err(|_| BatchOverflow)?,
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, BatchOverflow>>()?;
+        let mut merged_records = Vec::with_capacity(self.len().saturating_add(other.len()));
+        let (mut left, mut right) = (0_usize, 0_usize);
+        while left < self.len() || right < other.len() {
+            let take_left = match (self.record_view(left), other.record_view(right)) {
+                (Some(left), Some(right)) => left.primary_order() <= right.primary_order(),
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_left {
+                merged_records.push(self.composite_record_index(left, &storage_slots)?);
+                left = left.saturating_add(1);
+                continue;
+            }
+            let record = other.record_view(right).ok_or(BatchOverflow)?;
+            let duplicate = left_by_fingerprint
+                .get(&record.stable_fingerprint())
+                .and_then(|candidates| {
+                    candidates.iter().copied().find(|candidate| {
+                        !matched_left.contains(candidate)
+                            && self
+                                .record_view(*candidate)
+                                .is_some_and(|left| left.exactly_matches(record))
+                    })
+                });
+            if let Some(duplicate) = duplicate {
+                matched_left.insert(duplicate);
+            } else {
+                merged_records.push(other.composite_record_index(right, &storage_slots)?);
+            }
+            right = right.saturating_add(1);
+        }
+        let mut filtered_record_spans = self.filtered_record_spans.clone();
+        let mut unmatched_left = self.filtered_record_spans.iter().copied().fold(
+            HashMap::<FilteredRecordSpan, usize>::new(),
+            |mut counts, record| {
+                *counts.entry(record).or_default() += 1;
+                counts
+            },
+        );
+        for record in other.filtered_record_spans.iter().copied() {
+            let retained_overlap = unmatched_left.get_mut(&record).is_some_and(|count| {
+                if *count == 0 {
+                    false
+                } else {
+                    *count -= 1;
+                    true
+                }
+            });
+            if !retained_overlap {
+                filtered_record_spans.push(record);
+            }
+        }
+        filtered_record_spans.sort_unstable_by_key(|record| record.start);
+        let storage = storages.first().cloned().unwrap_or_default();
+        Ok(Self {
+            storage,
+            physical_indices: None,
+            composite: Some(Arc::new(CompositeAlignmentStorage {
+                storages: storages.into(),
+                records: merged_records.into(),
+            })),
+            filtered_record_spans,
+            filtered_record_spans_complete: true,
+        })
+    }
+
+    fn backing_storages(&self) -> Vec<Arc<AlignmentBatchStorage>> {
+        self.composite.as_ref().map_or_else(
+            || vec![Arc::clone(&self.storage)],
+            |composite| composite.storages.iter().cloned().collect(),
+        )
+    }
+
+    fn composite_record_index(
+        &self,
+        index: usize,
+        storage_slots: &HashMap<usize, u32>,
+    ) -> Result<CompositeRecordIndex, BatchOverflow> {
+        let (storage, record) = if let Some(composite) = &self.composite {
+            let location = composite.records.get(index).ok_or(BatchOverflow)?;
+            (
+                composite
+                    .storages
+                    .get(location.storage as usize)
+                    .ok_or(BatchOverflow)?,
+                location.record,
+            )
+        } else {
+            (
+                &self.storage,
+                u32::try_from(self.physical_index(index).ok_or(BatchOverflow)?)
+                    .map_err(|_| BatchOverflow)?,
+            )
+        };
+        let storage = storage_slots
+            .get(&(Arc::as_ptr(storage) as usize))
+            .copied()
+            .ok_or(BatchOverflow)?;
+        Ok(CompositeRecordIndex { storage, record })
+    }
+
+    fn stable_fingerprint(&self, index: usize) -> (u64, u64) {
+        let mut left = 0xcbf2_9ce4_8422_2325_u64;
+        let mut right = 0x6c62_272e_07bb_0142_u64;
+        let mut mix = |bytes: &[u8]| {
+            for byte in bytes {
+                left ^= u64::from(*byte);
+                left = left.wrapping_mul(0x0000_0100_0000_01b3);
+                right ^= u64::from(*byte);
+                right = right.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        mix(&self
+            .contig(index)
+            .expect("validated contig")
+            .get()
+            .to_le_bytes());
+        mix(&self.start(index).expect("validated start").to_le_bytes());
+        mix(&self.end(index).expect("validated end").to_le_bytes());
+        mix(&self
+            .flags(index)
+            .expect("validated flags")
+            .bits()
+            .to_le_bytes());
+        mix(&[self.mapping_quality(index).flatten().unwrap_or(u8::MAX)]);
+        mix(&self
+            .mate_contig(index)
+            .flatten()
+            .map_or(u32::MAX, ContigId::get)
+            .to_le_bytes());
+        mix(&self
+            .mate_start(index)
+            .flatten()
+            .unwrap_or(u64::MAX)
+            .to_le_bytes());
+        mix(&self
+            .template_length(index)
+            .expect("validated template length")
+            .to_le_bytes());
+        mix(self.read_name(index).unwrap_or_default());
+        for operation in self.cigar(index).unwrap_or_default() {
+            mix(&[operation.kind as u8]);
+            mix(&operation.len.to_le_bytes());
+        }
+        match self.sequence(index) {
+            Some(SequenceView::NotLoaded) => mix(&[0]),
+            Some(SequenceView::Missing) => mix(&[1]),
+            Some(SequenceView::Present { bases, qualities }) => {
+                mix(&[2]);
+                mix(bases);
+                mix(qualities.unwrap_or_default());
+            }
+            None => mix(&[u8::MAX]),
+        }
+        if let Some(auxiliary) = self.auxiliary_bytes(index) {
+            mix(auxiliary);
+        }
+        (left, right)
+    }
+
+    fn records_exactly_match(&self, left: usize, other: &Self, right: usize) -> bool {
+        self.contig(left) == other.contig(right)
+            && self.start(left) == other.start(right)
+            && self.end(left) == other.end(right)
+            && self.flags(left) == other.flags(right)
+            && self.mapping_quality(left) == other.mapping_quality(right)
+            && self.mate_contig(left) == other.mate_contig(right)
+            && self.mate_start(left) == other.mate_start(right)
+            && self.template_length(left) == other.template_length(right)
+            && self.read_name(left) == other.read_name(right)
+            && self.cigar(left) == other.cigar(right)
+            && self.sequence(left) == other.sequence(right)
+            && self.auxiliary_bytes(left) == other.auxiliary_bytes(right)
+    }
+
+    pub(crate) fn copy_filtered_records_within(
+        &self,
+        interval: rgv_core::GenomicInterval,
+        target: &mut Self,
+    ) -> crate::QueryStats {
+        let mut stats = crate::QueryStats::default();
+        for record in self
+            .filtered_record_spans
+            .iter()
+            .take_while(|record| record.start < interval.end())
+            .filter(|record| record.end > interval.start())
+        {
+            stats.records_seen = stats.records_seen.saturating_add(1);
+            match record.reason {
+                FilteredRecordReason::Unmapped => {
+                    stats.records_filtered_unmapped =
+                        stats.records_filtered_unmapped.saturating_add(1);
+                }
+                FilteredRecordReason::Secondary => {
+                    stats.records_filtered_secondary =
+                        stats.records_filtered_secondary.saturating_add(1);
+                }
+                FilteredRecordReason::Supplementary => {
+                    stats.records_filtered_supplementary =
+                        stats.records_filtered_supplementary.saturating_add(1);
+                }
+                FilteredRecordReason::User {
+                    duplicate,
+                    qc_failed,
+                } => {
+                    stats.records_filtered_user = stats.records_filtered_user.saturating_add(1);
+                    stats.records_filtered_duplicate = stats
+                        .records_filtered_duplicate
+                        .saturating_add(usize::from(duplicate));
+                    stats.records_filtered_qc_failed = stats
+                        .records_filtered_qc_failed
+                        .saturating_add(usize::from(qc_failed));
+                }
+            }
+            target.filtered_record_spans.push(*record);
+        }
+        target.filtered_record_spans_complete = self.filtered_record_spans_complete;
+        stats
+    }
+
     pub fn read_name(&self, index: usize) -> Option<&[u8]> {
-        arena_slice(&self.read_name_offsets, &self.read_names, index)
+        let (storage, physical) = self.record_location(index)?;
+        arena_slice(&storage.read_name_offsets, &storage.read_names, physical)
     }
 
     pub fn cigar(&self, index: usize) -> Option<&[CigarOp]> {
-        arena_slice(&self.cigar_offsets, &self.cigar_ops, index)
+        let (storage, physical) = self.record_location(index)?;
+        arena_slice(&storage.cigar_offsets, &storage.cigar_ops, physical)
     }
 
     pub fn sequence(&self, index: usize) -> Option<SequenceView<'_>> {
-        let state = *self.sequence_states.get(index)?;
-        let bases = arena_slice(&self.sequence_offsets, &self.sequences, index)?;
-        let qualities = arena_slice(&self.quality_offsets, &self.qualities, index)?;
+        let (storage, physical) = self.record_location(index)?;
+        let state = *storage.sequence_states.get(physical)?;
+        let bases = arena_slice(&storage.sequence_offsets, &storage.sequences, physical)?;
+        let qualities = arena_slice(&storage.quality_offsets, &storage.qualities, physical)?;
         match state {
             PackedSequenceState::NotLoaded if bases.is_empty() && qualities.is_empty() => {
                 Some(SequenceView::NotLoaded)
@@ -542,7 +1386,7 @@ impl AlignmentBatch {
     }
 
     pub fn has_auxiliary_tag(&self, index: usize, tag: [u8; 2]) -> bool {
-        let Some(data) = arena_slice(&self.auxiliary_offsets, &self.auxiliary_data, index) else {
+        let Some(data) = self.auxiliary_bytes(index) else {
             return false;
         };
         let mut cursor = 0;
@@ -559,7 +1403,8 @@ impl AlignmentBatch {
         index: usize,
         tag: [u8; 2],
     ) -> Result<Option<AuxField>, PackedRecordError> {
-        let data = arena_slice(&self.auxiliary_offsets, &self.auxiliary_data, index)
+        let data = self
+            .auxiliary_bytes(index)
             .ok_or(PackedRecordError::InvalidIndex(index))?;
         let mut cursor = 0;
         while let Some((field_tag, kind, payload)) = next_auxiliary(data, &mut cursor)? {
@@ -574,7 +1419,8 @@ impl AlignmentBatch {
     }
 
     pub fn auxiliary_fields(&self, index: usize) -> Result<Vec<AuxField>, PackedRecordError> {
-        let data = arena_slice(&self.auxiliary_offsets, &self.auxiliary_data, index)
+        let data = self
+            .auxiliary_bytes(index)
             .ok_or(PackedRecordError::InvalidIndex(index))?;
         let mut fields = Vec::new();
         let mut cursor = 0;
@@ -591,7 +1437,7 @@ impl AlignmentBatch {
     /// disambiguation without materialising the record or exposing the
     /// private arena encoding.
     pub fn auxiliary_fingerprint(&self, index: usize) -> Option<(u64, u64)> {
-        let data = arena_slice(&self.auxiliary_offsets, &self.auxiliary_data, index)?;
+        let data = self.auxiliary_bytes(index)?;
         let mix = |mut hash: u64| {
             for &byte in data {
                 hash ^= u64::from(byte);
@@ -605,10 +1451,18 @@ impl AlignmentBatch {
         ))
     }
 
+    fn auxiliary_bytes(&self, index: usize) -> Option<&[u8]> {
+        let (storage, physical) = self.record_location(index)?;
+        arena_slice(
+            &storage.auxiliary_offsets,
+            &storage.auxiliary_data,
+            physical,
+        )
+    }
+
     pub fn materialize_record(&self, index: usize) -> Result<AlignmentRecord, PackedRecordError> {
-        let contig = *self
-            .contigs
-            .get(index)
+        let contig = self
+            .contig(index)
             .ok_or(PackedRecordError::InvalidIndex(index))?;
         let sequence = match self
             .sequence(index)
@@ -623,13 +1477,27 @@ impl AlignmentBatch {
         };
         Ok(AlignmentRecord {
             contig,
-            start: self.starts[index],
-            end: self.ends[index],
-            flags: self.flags[index],
-            mapping_quality: self.mapping_qualities[index],
-            mate_contig: self.mate_contigs[index],
-            mate_start: self.mate_starts[index],
-            template_length: self.template_lengths[index],
+            start: self
+                .start(index)
+                .ok_or(PackedRecordError::InvalidIndex(index))?,
+            end: self
+                .end(index)
+                .ok_or(PackedRecordError::InvalidIndex(index))?,
+            flags: self
+                .flags(index)
+                .ok_or(PackedRecordError::InvalidIndex(index))?,
+            mapping_quality: self
+                .mapping_quality(index)
+                .ok_or(PackedRecordError::InvalidIndex(index))?,
+            mate_contig: self
+                .mate_contig(index)
+                .ok_or(PackedRecordError::InvalidIndex(index))?,
+            mate_start: self
+                .mate_start(index)
+                .ok_or(PackedRecordError::InvalidIndex(index))?,
+            template_length: self
+                .template_length(index)
+                .ok_or(PackedRecordError::InvalidIndex(index))?,
             read_name: self
                 .read_name(index)
                 .ok_or(PackedRecordError::InvalidIndex(index))?
@@ -643,26 +1511,88 @@ impl AlignmentBatch {
         })
     }
 
+    /// Memory retained by this batch, including packed storage shared by a projection.
+    ///
+    /// Cache admission must use this conservative weight unless its coordinator explicitly
+    /// deduplicates Arc-backed storage identities across entries.
     pub fn estimated_bytes(&self) -> usize {
-        self.contigs.len() * std::mem::size_of::<ContigId>()
-            + self.starts.len() * std::mem::size_of::<u64>()
-            + self.ends.len() * std::mem::size_of::<u64>()
-            + self.flags.len() * std::mem::size_of::<AlignmentFlags>()
-            + self.mapping_qualities.len() * std::mem::size_of::<Option<u8>>()
-            + self.mate_contigs.len() * std::mem::size_of::<Option<ContigId>>()
-            + self.mate_starts.len() * std::mem::size_of::<Option<u64>>()
-            + self.template_lengths.len() * std::mem::size_of::<i64>()
-            + self.read_name_offsets.len() * std::mem::size_of::<u32>()
-            + self.read_names.len()
-            + self.cigar_offsets.len() * std::mem::size_of::<u32>()
-            + self.cigar_ops.len() * std::mem::size_of::<CigarOp>()
-            + self.sequence_states.len() * std::mem::size_of::<PackedSequenceState>()
-            + self.sequence_offsets.len() * std::mem::size_of::<u32>()
-            + self.sequences.len()
-            + self.quality_offsets.len() * std::mem::size_of::<u32>()
-            + self.qualities.len()
-            + self.auxiliary_offsets.len() * std::mem::size_of::<u32>()
-            + self.auxiliary_data.len()
+        self.storage_estimated_bytes()
+            .saturating_add(self.projection_indices_bytes())
+            .saturating_add(self.filtered_provenance_estimated_bytes())
+    }
+
+    /// Bytes newly allocated for this batch rather than retained through shared storage.
+    pub fn incremental_estimated_bytes(&self) -> usize {
+        let storage = (!self.is_projection())
+            .then(|| self.storage_estimated_bytes())
+            .unwrap_or_default();
+        storage
+            .saturating_add(self.projection_indices_bytes())
+            .saturating_add(self.filtered_provenance_estimated_bytes())
+    }
+
+    /// Per-view bytes when packed storage is already charged to a resident scene.
+    pub fn shared_view_estimated_bytes(&self) -> usize {
+        self.projection_indices_bytes()
+            .saturating_add(self.filtered_provenance_estimated_bytes())
+    }
+
+    /// Packed bytes attributable to the logical records in this batch.
+    ///
+    /// A zero-copy projection retains a potentially much larger immutable
+    /// arena, so `estimated_bytes` remains the correct conservative cache
+    /// ownership weight. Density forecasting for a *new* decoded interval,
+    /// however, must use the selected records' fixed columns and variable
+    /// slices rather than charging every unselected backing record.
+    pub fn logical_decoded_estimated_bytes(&self) -> usize {
+        const FIXED_RECORD_BYTES: usize = std::mem::size_of::<ContigId>()
+            + std::mem::size_of::<u64>()
+            + std::mem::size_of::<u64>()
+            + std::mem::size_of::<AlignmentFlags>()
+            + std::mem::size_of::<Option<u8>>()
+            + std::mem::size_of::<Option<ContigId>>()
+            + std::mem::size_of::<Option<u64>>()
+            + std::mem::size_of::<i64>()
+            + std::mem::size_of::<PackedSequenceState>()
+            + std::mem::size_of::<AlignmentStableId>()
+            + 5 * std::mem::size_of::<u32>();
+
+        let records = (0..self.len()).fold(0_usize, |total, index| {
+            let Some((storage, physical)) = self.record_location(index) else {
+                return total;
+            };
+            let variable = arena_record_len(&storage.read_name_offsets, physical)
+                .saturating_add(
+                    arena_record_len(&storage.cigar_offsets, physical)
+                        .saturating_mul(std::mem::size_of::<CigarOp>()),
+                )
+                .saturating_add(arena_record_len(&storage.sequence_offsets, physical))
+                .saturating_add(arena_record_len(&storage.quality_offsets, physical))
+                .saturating_add(arena_record_len(&storage.auxiliary_offsets, physical));
+            total
+                .saturating_add(FIXED_RECORD_BYTES)
+                .saturating_add(variable)
+        });
+        records
+            // Each packed arena owns one terminal offset even for an empty
+            // batch. Amortize that constant exactly once per logical view.
+            .saturating_add(5 * std::mem::size_of::<u32>())
+            .saturating_add(self.filtered_provenance_estimated_bytes())
+    }
+
+    fn storage_estimated_bytes(&self) -> usize {
+        self.composite.as_ref().map_or_else(
+            || alignment_storage_estimated_bytes(&self.storage),
+            |composite| {
+                composite.storages.iter().fold(0_usize, |total, storage| {
+                    total.saturating_add(alignment_storage_estimated_bytes(storage))
+                })
+            },
+        )
+    }
+
+    fn filtered_provenance_estimated_bytes(&self) -> usize {
+        self.filtered_record_spans.len() * std::mem::size_of::<FilteredRecordSpan>()
     }
 }
 
@@ -671,6 +1601,130 @@ fn valid_offsets(offsets: &[u32], records: usize, arena_len: usize) -> bool {
         && offsets.first() == Some(&0)
         && offsets.windows(2).all(|pair| pair[0] <= pair[1])
         && offsets.last().copied().map(|value| value as usize) == Some(arena_len)
+}
+
+fn valid_alignment_storage(storage: &AlignmentBatchStorage) -> bool {
+    let len = storage.starts.len();
+    storage.contigs.len() == len
+        && storage.ends.len() == len
+        && storage.flags.len() == len
+        && storage.mapping_qualities.len() == len
+        && storage.mate_contigs.len() == len
+        && storage.mate_starts.len() == len
+        && storage.template_lengths.len() == len
+        && storage.stable_ids.len() == len
+        && storage.sequence_states.len() == len
+        && valid_offsets(&storage.read_name_offsets, len, storage.read_names.len())
+        && valid_offsets(&storage.cigar_offsets, len, storage.cigar_ops.len())
+        && valid_offsets(&storage.sequence_offsets, len, storage.sequences.len())
+        && valid_offsets(&storage.quality_offsets, len, storage.qualities.len())
+        && valid_offsets(
+            &storage.auxiliary_offsets,
+            len,
+            storage.auxiliary_data.len(),
+        )
+}
+
+fn alignment_storage_estimated_bytes(storage: &AlignmentBatchStorage) -> usize {
+    storage.contigs.len() * std::mem::size_of::<ContigId>()
+        + storage.starts.len() * std::mem::size_of::<u64>()
+        + storage.ends.len() * std::mem::size_of::<u64>()
+        + storage.flags.len() * std::mem::size_of::<AlignmentFlags>()
+        + storage.mapping_qualities.len() * std::mem::size_of::<Option<u8>>()
+        + storage.mate_contigs.len() * std::mem::size_of::<Option<ContigId>>()
+        + storage.mate_starts.len() * std::mem::size_of::<Option<u64>>()
+        + storage.template_lengths.len() * std::mem::size_of::<i64>()
+        + storage.read_name_offsets.len() * std::mem::size_of::<u32>()
+        + storage.read_names.len()
+        + storage.cigar_offsets.len() * std::mem::size_of::<u32>()
+        + storage.cigar_ops.len() * std::mem::size_of::<CigarOp>()
+        + storage.sequence_states.len() * std::mem::size_of::<PackedSequenceState>()
+        + storage.sequence_offsets.len() * std::mem::size_of::<u32>()
+        + storage.sequences.len()
+        + storage.quality_offsets.len() * std::mem::size_of::<u32>()
+        + storage.qualities.len()
+        + storage.auxiliary_offsets.len() * std::mem::size_of::<u32>()
+        + storage.auxiliary_data.len()
+        + storage.stable_ids.len() * std::mem::size_of::<AlignmentStableId>()
+}
+
+fn arena_record_len(offsets: &[u32], index: usize) -> usize {
+    offsets
+        .get(index)
+        .zip(offsets.get(index.saturating_add(1)))
+        .map_or(0, |(start, end)| end.saturating_sub(*start) as usize)
+}
+
+fn alignment_storage_stable_id(
+    storage: &AlignmentBatchStorage,
+    index: usize,
+) -> Result<AlignmentStableId, BatchOverflow> {
+    let mut primary = 0xcbf2_9ce4_8422_2325_u64;
+    let mut secondary = 0x6c62_272e_07bb_0142_u64;
+    let contig = storage.contigs.get(index).ok_or(BatchOverflow)?.get();
+    let start = *storage.starts.get(index).ok_or(BatchOverflow)?;
+    let end = *storage.ends.get(index).ok_or(BatchOverflow)?;
+    let flags = storage.flags.get(index).ok_or(BatchOverflow)?.bits();
+    let mapping_quality = storage
+        .mapping_qualities
+        .get(index)
+        .ok_or(BatchOverflow)?
+        .unwrap_or(u8::MAX);
+    let mate_contig = storage
+        .mate_contigs
+        .get(index)
+        .ok_or(BatchOverflow)?
+        .map_or(u32::MAX, ContigId::get);
+    let mate_start = storage
+        .mate_starts
+        .get(index)
+        .ok_or(BatchOverflow)?
+        .unwrap_or(u64::MAX);
+    let template_length = *storage.template_lengths.get(index).ok_or(BatchOverflow)?;
+    let read_name =
+        arena_slice(&storage.read_name_offsets, &storage.read_names, index).ok_or(BatchOverflow)?;
+    for bytes in [
+        contig.to_le_bytes().as_slice(),
+        start.to_le_bytes().as_slice(),
+        end.to_le_bytes().as_slice(),
+        flags.to_le_bytes().as_slice(),
+        mapping_quality.to_le_bytes().as_slice(),
+        mate_contig.to_le_bytes().as_slice(),
+        mate_start.to_le_bytes().as_slice(),
+        template_length.to_le_bytes().as_slice(),
+        read_name,
+    ] {
+        primary = stable_id_fnv_mix(primary, bytes);
+        secondary = stable_id_fnv_mix(secondary, bytes);
+    }
+    let cigar =
+        arena_slice(&storage.cigar_offsets, &storage.cigar_ops, index).ok_or(BatchOverflow)?;
+    for operation in cigar {
+        let kind = match operation.kind {
+            CigarOpKind::Match => 0,
+            CigarOpKind::Insertion => 1,
+            CigarOpKind::Deletion => 2,
+            CigarOpKind::ReferenceSkip => 3,
+            CigarOpKind::SoftClip => 4,
+            CigarOpKind::HardClip => 5,
+            CigarOpKind::Padding => 6,
+            CigarOpKind::SequenceMatch => 7,
+            CigarOpKind::SequenceMismatch => 8,
+        };
+        primary = stable_id_fnv_mix(primary, &[kind]);
+        primary = stable_id_fnv_mix(primary, &operation.len.to_le_bytes());
+        secondary = stable_id_fnv_mix(secondary, &[kind]);
+        secondary = stable_id_fnv_mix(secondary, &operation.len.to_le_bytes());
+    }
+    Ok(AlignmentStableId { primary, secondary })
+}
+
+fn stable_id_fnv_mix(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn arena_end(current: usize, added: usize) -> Result<u32, BatchOverflow> {
@@ -1000,6 +2054,165 @@ mod tests {
             })
         );
         assert_eq!(batch.materialize_record(0).unwrap(), record);
+    }
+
+    #[test]
+    fn projection_shares_packed_arenas_and_preserves_logical_record_order() {
+        let mut first = complete_record();
+        first.read_name = b"first".to_vec();
+        first.start = 10;
+        first.end = 20;
+        let mut second = complete_record();
+        second.read_name = b"second-with-a-longer-name".to_vec();
+        second.start = 30;
+        second.end = 40;
+        let mut third = complete_record();
+        third.read_name = b"third".to_vec();
+        third.start = 50;
+        third.end = 60;
+
+        let mut resident = AlignmentBatch::default();
+        resident.push(&first).unwrap();
+        resident.push(&second).unwrap();
+        resident.push(&third).unwrap();
+
+        let mut projection = resident.project(&[2, 0]).unwrap();
+
+        assert!(projection.is_projection());
+        assert!(projection.validate());
+        assert_eq!(projection.projection_indices_bytes(), 2 * size_of::<u32>());
+        assert_eq!(
+            projection.incremental_estimated_bytes(),
+            2 * size_of::<u32>()
+        );
+        assert_eq!(
+            projection.estimated_bytes(),
+            resident.estimated_bytes() + 2 * size_of::<u32>()
+        );
+        assert_eq!(projection.starts().collect::<Vec<_>>(), vec![50, 10]);
+        assert_eq!(projection.read_name(0), Some(b"third".as_slice()));
+        assert_eq!(projection.read_name(1), Some(b"first".as_slice()));
+        assert_eq!(projection.materialize_record(0).unwrap(), third);
+        assert_eq!(projection.materialize_record(1).unwrap(), first);
+        let mut independently_decoded = AlignmentBatch::default();
+        independently_decoded.push(&third).unwrap();
+        independently_decoded.push(&first).unwrap();
+        assert_eq!(
+            projection.logical_decoded_estimated_bytes(),
+            independently_decoded.logical_decoded_estimated_bytes()
+        );
+        assert!(projection.logical_decoded_estimated_bytes() < resident.estimated_bytes());
+        assert!(projection.push(&second).is_err());
+        assert_eq!(projection.len(), 2);
+        assert_eq!(resident.len(), 3);
+    }
+
+    #[test]
+    fn complete_batch_merge_deduplicates_boundary_copies_not_genuine_duplicates() {
+        let duplicate = complete_record();
+        let mut left_tail = complete_record();
+        left_tail.start = 30;
+        left_tail.end = 40;
+        left_tail.read_name = b"left-tail".to_vec();
+        let mut right_unique = complete_record();
+        right_unique.start = 15;
+        right_unique.end = 25;
+        right_unique.read_name = b"right-unique".to_vec();
+
+        let mut left = AlignmentBatch::default();
+        left.push(&duplicate).unwrap();
+        left.push(&duplicate).unwrap();
+        left.push(&left_tail).unwrap();
+        let mut right = AlignmentBatch::default();
+        right.push(&duplicate).unwrap();
+        right.push(&duplicate).unwrap();
+        right.push(&right_unique).unwrap();
+
+        let merged = left.merge_complete(&right).unwrap();
+        assert!(merged.validate());
+        assert!(merged.is_projection());
+        assert_eq!(merged.len(), 4);
+        assert_eq!(
+            merged.incremental_estimated_bytes(),
+            4 * size_of::<CompositeRecordIndex>()
+        );
+        assert_eq!(
+            merged.estimated_bytes(),
+            left.estimated_bytes()
+                + right.estimated_bytes()
+                + 4 * size_of::<CompositeRecordIndex>()
+        );
+        assert_eq!(
+            merged
+                .records()
+                .filter(|record| record.read_name() == b"read-1")
+                .count(),
+            2
+        );
+        assert_eq!(merged.starts().collect::<Vec<_>>(), vec![10, 10, 15, 30]);
+        let projected = merged.project(&[3, 0]).unwrap();
+        assert!(projected.validate());
+        assert_eq!(projected.starts().collect::<Vec<_>>(), vec![30, 10]);
+        assert_eq!(
+            projected.incremental_estimated_bytes(),
+            2 * size_of::<CompositeRecordIndex>()
+        );
+        assert_eq!(projected.materialize_record(0).unwrap(), left_tail);
+    }
+
+    #[test]
+    fn complete_batch_merge_preserves_exact_filtered_provenance_without_boundary_copies() {
+        let duplicate = FilteredRecordReason::User {
+            duplicate: true,
+            qc_failed: false,
+        };
+        let mut left = AlignmentBatch::default();
+        left.push_filtered_record(10, 20, duplicate);
+        left.push_filtered_record(10, 20, duplicate);
+        left.push_filtered_record(30, 40, FilteredRecordReason::Secondary);
+        left.sort_filtered_records();
+        let mut right = AlignmentBatch::default();
+        right.push_filtered_record(10, 20, duplicate);
+        right.push_filtered_record(10, 20, duplicate);
+        right.push_filtered_record(50, 60, FilteredRecordReason::Supplementary);
+        right.sort_filtered_records();
+
+        let merged = left.merge_complete(&right).unwrap();
+
+        assert!(merged.filtered_record_spans_complete());
+        assert_eq!(merged.filtered_record_count(), 4);
+        let mut target = AlignmentBatch::default();
+        let stats = merged.copy_filtered_records_within(
+            rgv_core::GenomicInterval::new(ContigId::new(0), 0, 100).unwrap(),
+            &mut target,
+        );
+        assert_eq!(stats.records_filtered_user, 2);
+        assert_eq!(stats.records_filtered_secondary, 1);
+        assert_eq!(stats.records_filtered_supplementary, 1);
+    }
+
+    #[test]
+    fn overlap_index_keeps_a_long_record_crossing_earlier_blocks() {
+        let mut batch = AlignmentBatch::default();
+        let mut long = complete_record();
+        long.start = 0;
+        long.end = 1_000;
+        long.read_name = b"long-crossing-read".to_vec();
+        batch.push(&long).unwrap();
+        for position in 1_u64..600 {
+            let mut short = complete_record();
+            short.start = position;
+            short.end = position.saturating_add(1);
+            short.read_name = format!("short-{position}").into_bytes();
+            batch.push(&short).unwrap();
+        }
+        assert!(batch.validate());
+
+        let selected = AlignmentOverlapIndex::new(&batch).select(
+            &batch,
+            rgv_core::GenomicInterval::new(ContigId::new(2), 900, 901).unwrap(),
+        );
+        assert_eq!(selected, vec![0]);
     }
 
     #[test]

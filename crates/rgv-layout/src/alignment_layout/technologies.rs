@@ -77,7 +77,7 @@ pub(crate) fn add_smrt_kinetics_marks(
             continue;
         }
         let Some(value) = series.value_at_aligned_read_position(
-            query.batch.flags[index],
+            query.batch.flags(index).expect("validated flags"),
             read_start.saturating_add(offset),
         ) else {
             continue;
@@ -203,7 +203,7 @@ pub(crate) fn sbx_insertion_color(
         return concordant;
     };
     match classify_sbx_insertion(
-        query.batch.flags[index],
+        query.batch.flags(index).expect("validated flags"),
         bases,
         qualities,
         insertion_start,
@@ -343,7 +343,10 @@ pub(crate) fn add_aligned_bases(
             _ => None,
         };
         let smrt_kinetics = smrt_series.and_then(|series| {
-            series.value_at_aligned_read_position(query.batch.flags[index], aligned_read_position)
+            series.value_at_aligned_read_position(
+                query.batch.flags(index).expect("validated flags"),
+                aligned_read_position,
+            )
         });
         let sbx_tail = highlights_sbx_tails
             && sbx_state.is_some_and(|state| state.tails.is_tail(aligned_read_position));

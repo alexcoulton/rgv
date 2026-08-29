@@ -377,9 +377,10 @@ fn observe(query: &AlignmentQuery) -> ObservedSemantics {
                 .iter()
                 .any(|operation| operation.kind == CigarOpKind::ReferenceSkip),
         );
-        observed.secondary += usize::from(batch.flags[index].is_secondary());
-        observed.supplementary += usize::from(batch.flags[index].is_supplementary());
-        observed.paired += usize::from(batch.flags[index].bits() & 0x1 != 0);
+        let flags = batch.flags(index).expect("validated flags");
+        observed.secondary += usize::from(flags.is_secondary());
+        observed.supplementary += usize::from(flags.is_supplementary());
+        observed.paired += usize::from(flags.bits() & 0x1 != 0);
         observed.long_cigar += usize::from(cigar.len() > u16::MAX as usize);
         observed.modified_bases += usize::from(
             batch.has_auxiliary_tag(index, *b"MM") || batch.has_auxiliary_tag(index, *b"Mm"),

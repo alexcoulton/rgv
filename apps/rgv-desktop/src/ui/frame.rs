@@ -540,6 +540,7 @@ impl Viewer {
         let mut recovery_requested = None;
         let mut dismiss_recovery = false;
         let mut cache_budget_mib = self.settings.cache_budget_mib;
+        let mut read_browsing_buffer_percent = self.settings.read_browsing_buffer_percent;
         let mut diagnostics_opt_in = self.settings.diagnostics_opt_in;
         let mut autosave_enabled = self.settings.autosave_enabled;
         let mut autosave_interval_seconds = self.settings.autosave_interval_seconds;
@@ -2864,6 +2865,7 @@ impl Viewer {
                 settings_requested,
                 settings_open,
                 cache_budget_mib,
+                read_browsing_buffer_percent,
                 diagnostics_opt_in,
                 autosave_enabled,
                 autosave_interval_seconds,
@@ -2893,6 +2895,7 @@ impl Viewer {
             settings_requested = system_dialogs.settings_requested;
             settings_open = system_dialogs.settings_open;
             cache_budget_mib = system_dialogs.cache_budget_mib;
+            read_browsing_buffer_percent = system_dialogs.read_browsing_buffer_percent;
             diagnostics_opt_in = system_dialogs.diagnostics_opt_in;
             autosave_enabled = system_dialogs.autosave_enabled;
             autosave_interval_seconds = system_dialogs.autosave_interval_seconds;
@@ -3652,12 +3655,17 @@ impl Viewer {
             != interface_scale_percent
             || self.settings.high_contrast != high_contrast
             || self.settings.reduced_motion != reduced_motion;
-        let settings_changed = self.settings.cache_budget_mib != cache_budget_mib
+        let read_browsing_buffer_changed =
+            self.settings.read_browsing_buffer_percent != read_browsing_buffer_percent;
+        let cache_budget_changed = self.settings.cache_budget_mib != cache_budget_mib;
+        let settings_changed = cache_budget_changed
+            || read_browsing_buffer_changed
             || self.settings.diagnostics_opt_in != diagnostics_opt_in
             || autosave_schedule_changed
             || self.settings.autosave_retention != autosave_retention
             || accessibility_changed;
         self.settings.cache_budget_mib = cache_budget_mib;
+        self.settings.read_browsing_buffer_percent = read_browsing_buffer_percent;
         self.settings.diagnostics_opt_in = diagnostics_opt_in;
         self.settings.autosave_enabled = autosave_enabled;
         self.settings.autosave_interval_seconds = autosave_interval_seconds;
@@ -3671,6 +3679,12 @@ impl Viewer {
         }
         if autosave_schedule_changed {
             self.schedule_next_autosave();
+        }
+        if cache_budget_changed {
+            self.apply_live_cache_budget(cache_budget_mib);
+        }
+        if read_browsing_buffer_changed || cache_budget_changed {
+            self.request_all_panel_queries();
         }
         if clear_recent_requested {
             self.settings.clear_recent();

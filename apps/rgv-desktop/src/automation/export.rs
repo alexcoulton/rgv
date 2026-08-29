@@ -401,8 +401,8 @@ pub(crate) fn automation_alignments_export(
             ),
         );
         for index in 0..query.batch.len() {
-            let start = query.batch.starts[index];
-            let end = query.batch.ends[index];
+            let start = query.batch.start(index).expect("validated start");
+            let end = query.batch.end(index).expect("validated end");
             if start >= interval.end() || end <= interval.start() {
                 continue;
             }
@@ -417,17 +417,26 @@ pub(crate) fn automation_alignments_export(
                     &String::from_utf8_lossy(query.batch.read_name(index).unwrap_or_default()),
                     1_024,
                 ),
-                query.batch.flags[index].bits(),
-                query.batch.mapping_qualities[index]
+                query.batch.flags(index).expect("validated flags").bits(),
+                query
+                    .batch
+                    .mapping_quality(index)
+                    .flatten()
                     .map_or_else(|| ".".to_owned(), |value| value.to_string()),
                 format_cigar(query.batch.cigar(index).unwrap_or_default()),
-                query.batch.mate_contigs[index]
+                query
+                    .batch
+                    .mate_contig(index)
+                    .flatten()
                     .map_or_else(|| ".".to_owned(), |value| value.get().to_string()),
-                query.batch.mate_starts[index].map_or_else(
+                query.batch.mate_start(index).flatten().map_or_else(
                     || ".".to_owned(),
                     |value| value.saturating_add(1).to_string()
                 ),
-                query.batch.template_lengths[index],
+                query
+                    .batch
+                    .template_length(index)
+                    .expect("validated template length"),
             );
             if !push_automation_export_line(&mut output, &line) {
                 return output;

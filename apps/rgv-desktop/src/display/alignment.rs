@@ -2,6 +2,39 @@ use super::*;
 
 pub(crate) const INDEX_ONLY_READ_NOTICE: &str = "zoom in to see read data";
 
+/// Quantizes horizontal scale into four-fold presentation bands whose boundaries are centred at
+/// 2×4ⁿ bases per pixel. A normal two-fold zoom therefore usually remains in one class, while a
+/// genuinely different read-packing scale receives independent stable row history.
+pub(crate) fn alignment_row_scale_class(bases_per_pixel: f64) -> u8 {
+    if !bases_per_pixel.is_finite() || bases_per_pixel <= 0.0 {
+        return 0;
+    }
+    let exponent = bases_per_pixel.log2().floor().clamp(-126.0, 126.0) as i32;
+    let class = (exponent - 1).div_euclid(2) + 64;
+    u8::try_from(class.clamp(0, i32::from(u8::MAX))).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod scale_class_tests {
+    use super::alignment_row_scale_class;
+
+    #[test]
+    fn row_scale_classes_keep_motivating_two_fold_zoom_together() {
+        assert_eq!(
+            alignment_row_scale_class(161.0),
+            alignment_row_scale_class(322.0)
+        );
+        assert_ne!(
+            alignment_row_scale_class(6.5),
+            alignment_row_scale_class(161.0)
+        );
+        assert_ne!(
+            alignment_row_scale_class(127.0),
+            alignment_row_scale_class(128.0)
+        );
+    }
+}
+
 pub(crate) fn index_only_read_notice(mapped_record_count: Option<u64>) -> String {
     mapped_record_count.map_or_else(
         || INDEX_ONLY_READ_NOTICE.to_owned(),
@@ -433,7 +466,7 @@ pub(crate) fn secondary_alignment_track_layout(
             match &lifecycle {
                 AlignmentTrackLifecycle::Opening => "Opening…".to_owned(),
                 AlignmentTrackLifecycle::Ready if projection.checking_notice_visible => {
-                    "Checking current viewport for complete reads…".to_owned()
+                    projection.query_phase.status_text().to_owned()
                 }
                 AlignmentTrackLifecycle::Ready => String::new(),
                 AlignmentTrackLifecycle::Failed(message) => format!("Error: {message}"),
@@ -546,6 +579,7 @@ pub(crate) fn secondary_alignment_track_layout(
         filters.alignment_sort_anchor,
         viewport,
     );
+    options.row_scale_class = alignment_row_scale_class(viewport.bases_per_pixel());
     options.promoted_read_name_hash = promoted_read_name_hash;
     options.selected_chain_read_name_hash = selected_read_name_hash.or(promoted_read_name_hash);
     options.view_as_pairs = filters.view_as_pairs;
@@ -573,7 +607,7 @@ pub(crate) fn secondary_alignment_track_layout(
     // track's read panel must give each complete record a row opportunity; the
     // pane scrollbar, rather than an annotation-track height, limits what is
     // visible at once.
-    options.max_rows = query.batch.len().max(layout_query.batch.len()).max(1);
+    options.max_rows = config.maximum_alignments.max(1);
 
     let rows_match = projection.alignment_rows.as_ref().is_some_and(|cached| {
         Arc::ptr_eq(&cached.query, &query)
@@ -585,6 +619,7 @@ pub(crate) fn secondary_alignment_track_layout(
             && cached.sort_position == options.sort_position
             && cached.promoted_read_name_hash == options.promoted_read_name_hash
             && cached.max_rows == options.max_rows
+            && cached.row_scale_class == options.row_scale_class
             && cached.view_as_pairs == options.view_as_pairs
             && cached.stacking_mode == filters.read_stacking_mode
             && (!alignment_row_pair_bounds_relevant(options.group_mode, options.sort_mode)
@@ -1096,6 +1131,7 @@ pub(crate) fn alignment_layout_key(
         layout_bytes.extend_from_slice(&value.to_bits().to_le_bytes());
     }
     layout_bytes.extend_from_slice(&options.max_rows.to_le_bytes());
+    layout_bytes.push(options.row_scale_class);
     layout_bytes.extend_from_slice(&options.row_layout_revision.to_le_bytes());
     if let Some((start, end)) = options.materialized_row_range {
         layout_bytes.push(1);

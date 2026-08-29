@@ -219,6 +219,67 @@ fn automation_runner_rejects_a_completion_for_a_different_waiting_command() {
 }
 
 #[test]
+fn automation_navigation_telemetry_separates_foreground_and_speculative_work() {
+    let batch = AutomationBatch {
+        schema_version: AUTOMATION_SCHEMA_VERSION,
+        commands: vec![AutomationCommand::Exit],
+    };
+    let mut runner = AutomationRunner::new(batch, PathBuf::from("report.json"));
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let started = Instant::now();
+    runner.begin_navigation(
+        PanelId::new(1),
+        interval,
+        &AutomationNavigationState {
+            source_queries: 7,
+            speculative_source_queries: 3,
+            ..AutomationNavigationState::default()
+        },
+        started,
+    );
+    runner.record_navigation_frame(
+        started + Duration::from_millis(8),
+        5.0,
+        Some(PrepareStats {
+            uploaded_bytes: 144,
+            buffer_reallocated: true,
+            ..PrepareStats::default()
+        }),
+        false,
+        &AutomationNavigationState::default(),
+    );
+    runner.record_navigation_frame(
+        started + Duration::from_millis(21),
+        7.0,
+        Some(PrepareStats {
+            slab_cache_hit: true,
+            ..PrepareStats::default()
+        }),
+        true,
+        &AutomationNavigationState {
+            source_queries: 9,
+            foreground_source_queries: 0,
+            speculative_source_queries: 5,
+            cache_outcome: "ResidentExtension".to_owned(),
+            row_scene_hit: true,
+            row_scene_physical_hit: true,
+            row_scene_projection_micros: 3_100,
+        },
+    );
+
+    let sample = runner.navigation.first().unwrap();
+    assert!(sample.complete);
+    assert_eq!(sample.input_to_first_presented_frame_ms, Some(8.0));
+    assert_eq!(sample.input_to_authoritative_frame_ms, Some(21.0));
+    assert_eq!(sample.foreground_source_queries, 0);
+    assert_eq!(sample.speculative_source_queries, 2);
+    assert_eq!(sample.total_source_queries, 2);
+    assert_eq!(sample.gpu_uploaded_bytes, 144);
+    assert_eq!(sample.gpu_buffer_reallocations, 1);
+    assert_eq!(sample.gpu_slab_cache_hits, 1);
+}
+
+#[test]
 fn retained_evidence_is_immutable_when_the_viewport_changes() {
     let retained = AutomationSelectionSnapshot {
         selection_id: "immutable-selection".to_owned(),

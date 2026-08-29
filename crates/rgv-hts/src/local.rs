@@ -2,6 +2,7 @@ use std::{
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use rgv_core::{ContigId, GenomicInterval, OverlappingMatePolicy, ReferenceDictionary};
@@ -12,11 +13,12 @@ use rust_htslib::{
 use thiserror::Error;
 
 use crate::{
-    AlignmentBatch, AlignmentFilter, AlignmentFlags, AlignmentHeaderMetadata, AlignmentReadGroup,
-    AlignmentRecord, AuxField, AuxValue, CigarOp, CigarOpKind, HttpRangeConfig, JunctionSummary,
-    PairSummary, PileupProvenance, PileupSummary, ReferenceSlice, RemoteError, SequenceData,
-    alignment::BatchOverflow,
+    AlignmentBatch, AlignmentFilter, AlignmentFlags, AlignmentHeaderMetadata,
+    AlignmentOverlapIndex, AlignmentReadGroup, AlignmentRecord, AlignmentRecordView, AuxField,
+    AuxValue, CigarOp, CigarOpKind, HttpRangeConfig, JunctionSummary, PairSummary,
+    PileupProvenance, PileupSummary, ReferenceSlice, RemoteError, SequenceData, SequenceView,
     alignment::alignment_header_metadata_from_sam,
+    alignment::{BatchOverflow, FilteredRecordReason},
     bisulfite_strand_is_reverse,
     index_overview::load_local_alignment_index_overview,
     junction::{
@@ -223,6 +225,50 @@ impl AlignmentQuery {
             )
     }
 
+    /// Bytes newly allocated by this query beyond any Arc-backed packed storage it references.
+    pub fn incremental_estimated_bytes(&self) -> usize {
+        self.batch
+            .incremental_estimated_bytes()
+            .saturating_add(self.pileup.estimated_bytes())
+            .saturating_add(self.junctions.estimated_bytes())
+            .saturating_add(self.pairs.estimated_bytes())
+            .saturating_add(
+                self.reference
+                    .as_ref()
+                    .map_or(0, |reference| reference.bases.len()),
+            )
+    }
+
+    /// Per-query evidence and projection bytes when its packed arenas are charged elsewhere.
+    pub fn shared_view_estimated_bytes(&self) -> usize {
+        self.batch
+            .shared_view_estimated_bytes()
+            .saturating_add(self.pileup.estimated_bytes())
+            .saturating_add(self.junctions.estimated_bytes())
+            .saturating_add(self.pairs.estimated_bytes())
+            .saturating_add(
+                self.reference
+                    .as_ref()
+                    .map_or(0, |reference| reference.bases.len()),
+            )
+    }
+
+    /// Expected packed/evidence bytes if this logical population were decoded
+    /// into its own resident interval. Unlike `estimated_bytes`, this does not
+    /// charge unrelated records retained by a zero-copy backing arena.
+    pub fn logical_decoded_estimated_bytes(&self) -> usize {
+        self.batch
+            .logical_decoded_estimated_bytes()
+            .saturating_add(self.pileup.estimated_bytes())
+            .saturating_add(self.junctions.estimated_bytes())
+            .saturating_add(self.pairs.estimated_bytes())
+            .saturating_add(
+                self.reference
+                    .as_ref()
+                    .map_or(0, |reference| reference.bases.len()),
+            )
+    }
+
     pub fn materialize_record(
         &self,
         index: usize,
@@ -237,6 +283,445 @@ impl AlignmentQuery {
         };
         self.header.read_group(id.as_bytes())
     }
+}
+
+/// Rebuilds an exact target query from a complete compatible resident query.
+/// All interval-specific summaries are regenerated; the broad query's
+/// aggregates are never relabelled as target evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentDerivationMetrics {
+    pub lookup_micros: u64,
+    pub projection_micros: u64,
+    pub summary_micros: u64,
+    pub summary_tile_hits: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlignmentDerivationPhase {
+    SelectingResidentReads,
+    BuildingSummaries,
+}
+
+pub fn derive_alignment_query(
+    resident: &AlignmentQuery,
+    overlap_index: &AlignmentOverlapIndex,
+    interval: GenomicInterval,
+    options: &QueryOptions,
+    reference: Option<ReferenceSlice>,
+    keep_going: &dyn Fn() -> bool,
+) -> Result<AlignmentQuery, AlignmentError> {
+    derive_alignment_query_with_metrics(
+        resident,
+        overlap_index,
+        interval,
+        options,
+        reference,
+        keep_going,
+    )
+    .map(|(query, _)| query)
+}
+
+pub fn derive_alignment_query_with_metrics(
+    resident: &AlignmentQuery,
+    overlap_index: &AlignmentOverlapIndex,
+    interval: GenomicInterval,
+    options: &QueryOptions,
+    reference: Option<ReferenceSlice>,
+    keep_going: &dyn Fn() -> bool,
+) -> Result<(AlignmentQuery, AlignmentDerivationMetrics), AlignmentError> {
+    derive_alignment_query_with_metrics_and_phase(
+        resident,
+        overlap_index,
+        interval,
+        options,
+        reference,
+        keep_going,
+        &mut |_| {},
+    )
+}
+
+pub fn derive_alignment_query_with_metrics_and_phase(
+    resident: &AlignmentQuery,
+    overlap_index: &AlignmentOverlapIndex,
+    interval: GenomicInterval,
+    options: &QueryOptions,
+    reference: Option<ReferenceSlice>,
+    keep_going: &dyn Fn() -> bool,
+    on_phase: &mut dyn FnMut(AlignmentDerivationPhase),
+) -> Result<(AlignmentQuery, AlignmentDerivationMetrics), AlignmentError> {
+    derive_alignment_query_with_summary_index_and_phase(
+        resident,
+        overlap_index,
+        None,
+        interval,
+        options,
+        reference,
+        keep_going,
+        on_phase,
+    )
+}
+
+pub fn derive_alignment_query_with_summary_index_and_phase(
+    resident: &AlignmentQuery,
+    overlap_index: &AlignmentOverlapIndex,
+    summary_index: Option<&crate::AlignmentSummaryIndex>,
+    interval: GenomicInterval,
+    options: &QueryOptions,
+    reference: Option<ReferenceSlice>,
+    keep_going: &dyn Fn() -> bool,
+    on_phase: &mut dyn FnMut(AlignmentDerivationPhase),
+) -> Result<(AlignmentQuery, AlignmentDerivationMetrics), AlignmentError> {
+    if !resident.individual_reads_complete()
+        || resident.interval.contig() != interval.contig()
+        || resident.interval.start() > interval.start()
+        || resident.interval.end() < interval.end()
+        || !resident.batch.filtered_record_spans_complete()
+    {
+        return Err(AlignmentError::IncompatibleResidentQuery);
+    }
+
+    on_phase(AlignmentDerivationPhase::SelectingResidentReads);
+    let lookup_started = Instant::now();
+    let selected = overlap_index.select(&resident.batch, interval);
+    let lookup_micros = duration_micros(lookup_started.elapsed());
+    let projection_started = Instant::now();
+    let maximum_records = options.max_records.get();
+    let too_dense = selected.len() > maximum_records;
+    if !keep_going() {
+        return Ok((
+            cancelled_query(interval, Arc::clone(&resident.header)),
+            AlignmentDerivationMetrics {
+                lookup_micros,
+                ..AlignmentDerivationMetrics::default()
+            },
+        ));
+    }
+    let mut batch = if too_dense {
+        AlignmentBatch::default()
+    } else {
+        resident
+            .batch
+            .project(&selected)
+            .map_err(AlignmentError::BatchOverflow)?
+    };
+    let mut stats = resident
+        .batch
+        .copy_filtered_records_within(interval, &mut batch);
+    stats.records_seen = stats.records_seen.saturating_add(selected.len());
+    stats.records_eligible = selected.len();
+    stats.complete_read_limit = maximum_records;
+    stats.records_emitted = if too_dense { 0 } else { selected.len() };
+    stats.truncated = too_dense;
+    stats.individual_reads = if too_dense {
+        IndividualReadStatus::TooDense {
+            limit: maximum_records,
+        }
+    } else {
+        IndividualReadStatus::Complete
+    };
+    if !keep_going() {
+        return Ok((
+            cancelled_query(interval, Arc::clone(&resident.header)),
+            AlignmentDerivationMetrics {
+                lookup_micros,
+                projection_micros: duration_micros(projection_started.elapsed()),
+                ..AlignmentDerivationMetrics::default()
+            },
+        ));
+    }
+    let projection_micros = duration_micros(projection_started.elapsed());
+
+    on_phase(AlignmentDerivationPhase::BuildingSummaries);
+    let summary_started = Instant::now();
+    let indexed = summary_index.filter(|index| {
+        !options.collect_alleles
+            && index.supports(
+                interval,
+                resident.batch.len(),
+                options.overlapping_mate_policy,
+            )
+    });
+    let mut pileup = indexed.is_none().then(|| {
+        PileupBuilder::new(
+            interval,
+            options.coverage_bins.get(),
+            options.minimum_base_quality,
+        )
+    });
+    let indexed_modifications_absent = indexed
+        .is_some_and(|index| options.collect_modifications && !index.modification_tags_present());
+    let mut modifications =
+        (options.collect_modifications && !indexed_modifications_absent).then(|| {
+            crate::modification_summary::ModificationSummaryBuilder::new(
+                interval,
+                options.coverage_bins.get(),
+            )
+        });
+    let mut junctions = JunctionSummaryBuilder::new(
+        interval,
+        options.minimum_junction_flank,
+        resident.junctions.provenance.normalization_mapped_records,
+    );
+    let mut pairs = indexed.is_none().then(crate::pair::PairSummaryBuilder::new);
+    let mut overlap_collapser = indexed
+        .is_none()
+        .then(|| OverlapCollapser::new(options.overlapping_mate_policy));
+    if let Some(indexed) = indexed {
+        indexed.add_selected_junctions(&selected, &mut junctions);
+        if let Some(modifications) = &mut modifications {
+            for (ordinal, index) in selected.iter().copied().enumerate() {
+                if ordinal.is_multiple_of(options.cancellation_chunk.get()) && !keep_going() {
+                    return Ok((
+                        cancelled_query(interval, Arc::clone(&resident.header)),
+                        AlignmentDerivationMetrics {
+                            lookup_micros,
+                            projection_micros,
+                            summary_micros: duration_micros(summary_started.elapsed()),
+                            ..AlignmentDerivationMetrics::default()
+                        },
+                    ));
+                }
+                let record = resident
+                    .batch
+                    .record_view(index)
+                    .ok_or(crate::PackedRecordError::InvalidIndex(index))?;
+                if record.has_auxiliary_tag(*b"MM") || record.has_auxiliary_tag(*b"Mm") {
+                    modifications.add_record(&record.materialize()?);
+                }
+            }
+        }
+    } else {
+        for (ordinal, index) in selected.iter().copied().enumerate() {
+            if ordinal.is_multiple_of(options.cancellation_chunk.get()) && !keep_going() {
+                return Ok((
+                    cancelled_query(interval, Arc::clone(&resident.header)),
+                    AlignmentDerivationMetrics {
+                        lookup_micros,
+                        projection_micros,
+                        summary_micros: duration_micros(summary_started.elapsed()),
+                        ..AlignmentDerivationMetrics::default()
+                    },
+                ));
+            }
+            let record = resident
+                .batch
+                .record_view(index)
+                .ok_or(crate::PackedRecordError::InvalidIndex(index))?;
+            let pairs = pairs.as_mut().expect("unindexed pair builder exists");
+            pairs.add_fields(
+                record.read_name(),
+                record.contig(),
+                record.flags(),
+                record.mate_contig(),
+                record.template_length(),
+            );
+            let overlap_collapser = overlap_collapser
+                .as_mut()
+                .expect("unindexed overlap collapser exists");
+            let overlap_mask = overlap_collapser.mask_for(
+                record.read_name(),
+                record.contig(),
+                record.start(),
+                record.end(),
+                record.flags(),
+                record.mate_contig(),
+                record.mate_start(),
+            );
+            let collapsed = add_record_view_pileup(
+                record,
+                pileup.as_mut().expect("unindexed pileup builder exists"),
+                &mut junctions,
+                options.collect_alleles,
+                overlap_mask,
+            )?;
+            overlap_collapser.note_collapsed(collapsed);
+            if let Some(modifications) = &mut modifications
+                && (record.has_auxiliary_tag(*b"MM") || record.has_auxiliary_tag(*b"Mm"))
+            {
+                modifications.add_record(&record.materialize()?);
+            }
+        }
+    }
+
+    let mut pileup = if let Some(indexed) = indexed {
+        indexed.pileup(
+            interval,
+            options.coverage_bins.get(),
+            options.minimum_base_quality,
+            &selected,
+            stats.records_emitted,
+        )
+    } else {
+        let overlap_collapser = overlap_collapser.expect("unindexed overlap collapser exists");
+        pileup
+            .expect("unindexed pileup builder exists")
+            .finish(PileupProvenance {
+                eligible_records: stats.records_eligible,
+                rendered_records: stats.records_emitted,
+                all_eligible_records: true,
+                allele_observations_available: options.collect_alleles,
+                overlapping_mate_policy: overlap_collapser.policy(),
+                overlap_collapse_complete: overlap_collapser.complete(),
+                collapsed_mate_bases: overlap_collapser.collapsed_mate_bases(),
+                ..PileupProvenance::default()
+            })
+    };
+    if options.collect_modifications {
+        pileup.modifications = modifications.map_or_else(
+            || {
+                crate::modification_summary::ModificationSummaryBuilder::new(
+                    interval,
+                    options.coverage_bins.get(),
+                )
+                .finish(stats.records_eligible, true)
+            },
+            |modifications| modifications.finish(stats.records_eligible, true),
+        );
+    }
+    debug_assert!(batch.validate());
+    let query = AlignmentQuery {
+        interval,
+        header: Arc::clone(&resident.header),
+        batch,
+        pileup,
+        junctions: junctions.finish(stats.records_eligible, true),
+        pairs: indexed.map_or_else(
+            || pairs.expect("unindexed pair builder exists").finish(true),
+            |indexed| indexed.pair_summary(&selected),
+        ),
+        reference,
+        stats,
+    };
+    Ok((
+        query,
+        AlignmentDerivationMetrics {
+            lookup_micros,
+            projection_micros,
+            summary_micros: duration_micros(summary_started.elapsed()),
+            summary_tile_hits: indexed.map_or(0, |index| index.tile_count_for(interval)),
+        },
+    ))
+}
+
+fn duration_micros(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn add_record_view_pileup(
+    record: AlignmentRecordView<'_>,
+    pileup: &mut PileupBuilder,
+    junctions: &mut JunctionSummaryBuilder,
+    collect_alleles: bool,
+    overlap_mask: Option<OverlapMask>,
+) -> Result<u64, AlignmentError> {
+    let mut reference_position = record.start();
+    let mut read_position = 0_usize;
+    let (sequence, qualities) = match record.sequence() {
+        SequenceView::Present { bases, qualities } => (bases, qualities.unwrap_or(&[])),
+        SequenceView::NotLoaded | SequenceView::Missing => (&[][..], &[][..]),
+    };
+    let flags = record.flags();
+    let reverse = flags.is_reverse();
+    let bisulfite_reverse = bisulfite_strand_is_reverse(flags);
+    let mut collapsed_bases = 0_u64;
+    let mut aligned_segments = Vec::new();
+    let mut record_junctions = RecordJunctionCollector::default();
+    for operation in record.cigar() {
+        match operation.kind {
+            CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
+                record_junctions.add_aligned(operation.len);
+                let end = reference_position.saturating_add(u64::from(operation.len));
+                collapsed_bases = collapsed_bases.saturating_add(add_unmasked_range(
+                    reference_position,
+                    end,
+                    overlap_mask,
+                    |start, end| aligned_segments.push((start, end)),
+                ));
+                if collect_alleles {
+                    for offset in 0..operation.len as usize {
+                        let position = reference_position.saturating_add(offset as u64);
+                        if overlap_mask.is_some_and(|mask| mask.contains(position)) {
+                            continue;
+                        }
+                        let sequence_index = read_position.saturating_add(offset);
+                        let Some((base, quality)) =
+                            aligned_observation(sequence, qualities, sequence_index)
+                        else {
+                            continue;
+                        };
+                        pileup.add_base_with_bisulfite_strand(
+                            position,
+                            base,
+                            quality,
+                            reverse,
+                            bisulfite_reverse,
+                        );
+                    }
+                }
+                read_position = read_position.saturating_add(operation.len as usize);
+                reference_position = end;
+            }
+            CigarOpKind::Deletion => {
+                let end = reference_position.saturating_add(u64::from(operation.len));
+                collapsed_bases = collapsed_bases.saturating_add(add_unmasked_range(
+                    reference_position,
+                    end,
+                    overlap_mask,
+                    |start, end| pileup.add_deletion(start, end, reverse),
+                ));
+                reference_position = end;
+            }
+            CigarOpKind::ReferenceSkip => {
+                let end = reference_position.saturating_add(u64::from(operation.len));
+                record_junctions.add_skip(reference_position, end);
+                reference_position = end;
+            }
+            CigarOpKind::Insertion => {
+                if !overlap_mask.is_some_and(|mask| mask.contains(reference_position)) {
+                    pileup.add_insertion(reference_position, reverse);
+                }
+                read_position = read_position.saturating_add(operation.len as usize);
+            }
+            CigarOpKind::SoftClip => {
+                read_position = read_position.saturating_add(operation.len as usize);
+            }
+            CigarOpKind::HardClip | CigarOpKind::Padding => {}
+        }
+    }
+    pileup.add_aligned_record(aligned_segments, reverse, record.mapping_quality());
+    let (record_junctions, dropped_record_junctions) = record_junctions.finish();
+    junctions.add_record_junctions(
+        &record_junctions,
+        dropped_record_junctions,
+        reverse,
+        record_view_junction_strand(record)?,
+    );
+    Ok(collapsed_bases)
+}
+
+fn record_view_junction_strand(
+    record: AlignmentRecordView<'_>,
+) -> Result<JunctionStrandInput, AlignmentError> {
+    Ok(match record.auxiliary_field(*b"XS")? {
+        Some(AuxField {
+            value: AuxValue::Character(b'+'),
+            ..
+        }) => JunctionStrandInput::Tagged(JunctionStrand::Positive),
+        Some(AuxField {
+            value: AuxValue::String(value),
+            ..
+        }) if value == "+" => JunctionStrandInput::Tagged(JunctionStrand::Positive),
+        Some(AuxField {
+            value: AuxValue::Character(b'-'),
+            ..
+        }) => JunctionStrandInput::Tagged(JunctionStrand::Negative),
+        Some(AuxField {
+            value: AuxValue::String(value),
+            ..
+        }) if value == "-" => JunctionStrandInput::Tagged(JunctionStrand::Negative),
+        Some(_) => JunctionStrandInput::Invalid,
+        None => JunctionStrandInput::Missing,
+    })
 }
 
 pub trait AlignmentSource {
@@ -365,6 +850,7 @@ impl AlignmentSource for LocalAlignmentSource {
             ..QueryStats::default()
         };
         let mut retained = Vec::new();
+        let mut filtered_records = AlignmentBatch::default();
         let mut too_dense = false;
         let mut pileup = PileupBuilder::new(
             interval,
@@ -397,22 +883,42 @@ impl AlignmentSource for LocalAlignmentSource {
                 break;
             }
             let flags = AlignmentFlags::from_bits(record.flags());
+            let record_span = u64::try_from(record.pos()).ok().and_then(|start| {
+                u64::try_from(record.cigar().end_pos())
+                    .ok()
+                    .filter(|end| *end > start)
+                    .map(|end| (start, end))
+            });
+            let mut note_filtered = |reason| {
+                if let Some((start, end)) = record_span {
+                    filtered_records.push_filtered_record(start, end, reason);
+                } else {
+                    filtered_records.mark_filtered_record_spans_incomplete();
+                }
+            };
             if flags.is_unmapped() {
                 stats.records_filtered_unmapped += 1;
+                note_filtered(FilteredRecordReason::Unmapped);
                 continue;
             }
             if !options.include_secondary && flags.is_secondary() {
                 stats.records_filtered_secondary += 1;
+                note_filtered(FilteredRecordReason::Secondary);
                 continue;
             }
             if !options.include_supplementary && flags.is_supplementary() {
                 stats.records_filtered_supplementary += 1;
+                note_filtered(FilteredRecordReason::Supplementary);
                 continue;
             }
             if !options.filter.matches(&record)? {
                 stats.records_filtered_user += 1;
                 stats.records_filtered_duplicate += usize::from(flags.is_duplicate());
                 stats.records_filtered_qc_failed += usize::from(flags.is_qc_failed());
+                note_filtered(FilteredRecordReason::User {
+                    duplicate: flags.is_duplicate(),
+                    qc_failed: flags.is_qc_failed(),
+                });
                 continue;
             }
             stats.records_eligible += 1;
@@ -475,6 +981,7 @@ impl AlignmentSource for LocalAlignmentSource {
         for record in &retained {
             batch.push(record).map_err(AlignmentError::BatchOverflow)?;
         }
+        batch.absorb_filtered_records(filtered_records);
         stats.records_emitted = retained.len();
         stats.truncated = too_dense;
         stats.individual_reads = if too_dense {
@@ -759,6 +1266,10 @@ pub enum AlignmentError {
     InvalidAlignmentHeader,
     #[error("alignment batch exceeded its packed 32-bit arena offsets")]
     BatchOverflow(BatchOverflow),
+    #[error(transparent)]
+    PackedRecord(#[from] crate::PackedRecordError),
+    #[error("resident alignment data cannot authoritatively answer this target")]
+    IncompatibleResidentQuery,
     #[error("auxiliary tag was not exactly two bytes")]
     InvalidAuxTag,
     #[error("reference dictionary has no contig id {0}")]
@@ -971,6 +1482,154 @@ mod tests {
         );
         assert_eq!(query.pileup.maximum_depth(), 1);
         assert!(query.junctions.junctions.is_empty());
+    }
+
+    #[test]
+    fn contained_projection_matches_an_independent_indexed_query() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
+        if !path.exists() {
+            return;
+        }
+        let broad = GenomicInterval::new(ContigId::new(0), 9_950, 10_050).unwrap();
+        let target = GenomicInterval::new(ContigId::new(0), 9_999, 10_001).unwrap();
+        let options = QueryOptions {
+            detail: QueryDetail::Full,
+            max_records: NonZeroUsize::new(1_000).unwrap(),
+            coverage_bins: NonZeroUsize::new(2).unwrap(),
+            collect_alleles: true,
+            collect_modifications: true,
+            ..QueryOptions::default()
+        };
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let resident = source.query(broad, options.clone(), &|| true).unwrap();
+        let index = AlignmentOverlapIndex::new(&resident.batch);
+        let derived =
+            derive_alignment_query(&resident, &index, target, &options, None, &|| true).unwrap();
+        let exact = source.query(target, options, &|| true).unwrap();
+
+        assert_eq!(derived.stats, exact.stats);
+        assert_eq!(derived.batch, exact.batch);
+        assert_eq!(derived.pileup, exact.pileup);
+        assert_eq!(derived.junctions, exact.junctions);
+        assert_eq!(derived.pairs, exact.pairs);
+    }
+
+    #[test]
+    fn resident_summary_index_matches_an_independent_regional_query() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
+        if !path.exists() {
+            return;
+        }
+        let broad = GenomicInterval::new(ContigId::new(0), 9_950, 10_050).unwrap();
+        let target = GenomicInterval::new(ContigId::new(0), 9_999, 10_001).unwrap();
+        let options = QueryOptions {
+            detail: QueryDetail::Full,
+            max_records: NonZeroUsize::new(1_000).unwrap(),
+            coverage_bins: NonZeroUsize::new(2).unwrap(),
+            collect_alleles: false,
+            collect_modifications: true,
+            ..QueryOptions::default()
+        };
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let resident = source.query(broad, options.clone(), &|| true).unwrap();
+        let overlap = AlignmentOverlapIndex::new(&resident.batch);
+        let summaries = crate::AlignmentSummaryIndex::build(
+            &resident.batch,
+            resident.interval,
+            options.overlapping_mate_policy,
+        )
+        .unwrap();
+        let indexed = derive_alignment_query_with_summary_index_and_phase(
+            &resident,
+            &overlap,
+            Some(&summaries),
+            target,
+            &options,
+            None,
+            &|| true,
+            &mut |_| {},
+        )
+        .unwrap()
+        .0;
+        let exact = source.query(target, options, &|| true).unwrap();
+
+        assert_eq!(indexed, exact);
+    }
+
+    #[test]
+    fn contained_projection_refuses_reads_over_the_target_limit() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
+        if !path.exists() {
+            return;
+        }
+        let broad = GenomicInterval::new(ContigId::new(0), 9_950, 10_050).unwrap();
+        let target = GenomicInterval::new(ContigId::new(0), 9_999, 10_001).unwrap();
+        let resident_options = QueryOptions {
+            detail: QueryDetail::Full,
+            max_records: NonZeroUsize::new(1_000).unwrap(),
+            coverage_bins: NonZeroUsize::new(2).unwrap(),
+            collect_alleles: true,
+            ..QueryOptions::default()
+        };
+        let target_options = QueryOptions {
+            max_records: NonZeroUsize::new(1).unwrap(),
+            ..resident_options.clone()
+        };
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let resident = source.query(broad, resident_options, &|| true).unwrap();
+        let derived = derive_alignment_query(
+            &resident,
+            &AlignmentOverlapIndex::new(&resident.batch),
+            target,
+            &target_options,
+            None,
+            &|| true,
+        )
+        .unwrap();
+        let exact = source.query(target, target_options, &|| true).unwrap();
+
+        assert_eq!(derived.stats, exact.stats);
+        assert!(matches!(
+            derived.stats.individual_reads,
+            IndividualReadStatus::TooDense { limit: 1 }
+        ));
+        assert!(derived.batch.is_empty());
+        assert_eq!(derived.pileup, exact.pileup);
+        assert_eq!(derived.junctions, exact.junctions);
+        assert_eq!(derived.pairs, exact.pairs);
+    }
+
+    #[test]
+    fn contained_projection_rebuilds_filtered_record_counts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("placed-unmapped.bam");
+        write_placed_unmapped_fixture(&path);
+        let options = QueryOptions::default();
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let resident = source
+            .query(
+                GenomicInterval::new(ContigId::new(0), 90, 150).unwrap(),
+                options.clone(),
+                &|| true,
+            )
+            .unwrap();
+        let target = GenomicInterval::new(ContigId::new(0), 108, 135).unwrap();
+        let derived = derive_alignment_query(
+            &resident,
+            &AlignmentOverlapIndex::new(&resident.batch),
+            target,
+            &options,
+            None,
+            &|| true,
+        )
+        .unwrap();
+        let exact = source.query(target, options, &|| true).unwrap();
+
+        assert_eq!(derived.stats, exact.stats);
     }
 
     #[test]

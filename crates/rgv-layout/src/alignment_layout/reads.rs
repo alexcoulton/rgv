@@ -17,26 +17,40 @@ pub(crate) fn add_reads(
     let mut smrt_kinetics_budget = SmrtKineticsRenderBudget::new(MAX_RENDERED_SMRT_KINETICS_MARKS);
     let mut sbx_budget = SbxRenderBudget::new(MAX_RENDERED_SBX_TAIL_MARKS);
     let mut ultima_budget = UltimaRenderBudget::new(MAX_RENDERED_ULTIMA_QUALITY_MARKS);
-    for index in 0..batch.len() {
-        if batch.ends[index] <= viewport.interval().start()
-            || batch.starts[index] >= viewport.interval().end()
+    let materialized_indices = rows.materialized_record_indices(options.materialized_row_range);
+    if let Some(indices) = &materialized_indices {
+        stats.virtualized = batch.len().saturating_sub(indices.len());
+    }
+    let candidate_count = materialized_indices.as_ref().map_or(batch.len(), Vec::len);
+    for candidate in 0..candidate_count {
+        let index = materialized_indices
+            .as_ref()
+            .map_or(candidate, |indices| indices[candidate]);
+        if batch.end(index).expect("validated end") <= viewport.interval().start()
+            || batch.start(index).expect("validated start") >= viewport.interval().end()
         {
             continue;
         }
-        let Some(row) = rows.rows[index] else {
+        let Some(row) = rows.row(index) else {
             stats.hidden += 1;
             continue;
         };
         if !options.materializes_row(row) {
-            stats.virtualized += 1;
+            if materialized_indices.is_none() {
+                stats.virtualized += 1;
+            }
             continue;
         }
         let smrt_mode = match options.color_mode {
             AlignmentColorMode::SmrtKinetics(mode) => Some(mode),
             _ => None,
         };
-        let smrt_tag =
-            smrt_mode.map(|mode| smrt_kinetics_tag(mode, batch.flags[index].is_reverse()));
+        let smrt_tag = smrt_mode.map(|mode| {
+            smrt_kinetics_tag(
+                mode,
+                batch.flags(index).expect("validated flags").is_reverse(),
+            )
+        });
         let smrt_field = smrt_tag.and_then(|tag| match batch.auxiliary_field(index, tag) {
             Ok(Some(field)) => Some(field),
             Ok(None) => {
@@ -72,7 +86,7 @@ pub(crate) fn add_reads(
                 }),
             ) => {
                 if let Ok(tails) = sbx_tail_bounds(
-                    batch.flags[index],
+                    batch.flags(index).expect("validated flags"),
                     bases,
                     qualities,
                     sbx_options.simplex_tail_quality_maximum,
@@ -169,10 +183,10 @@ pub(crate) fn add_reads(
             display_list,
             first_read_primitive,
             viewport,
-            batch.starts[index],
-            batch.ends[index],
+            batch.start(index).expect("validated start"),
+            batch.end(index).expect("validated end"),
             batch.cigar(index),
-            batch.flags[index].is_reverse(),
+            batch.flags(index).expect("validated flags").is_reverse(),
             y,
             options.read_height,
             object_id,
@@ -190,7 +204,7 @@ pub(crate) fn add_reads(
                 .filter(|state| state.options.simplex_tail_mode == SbxSimplexTailMode::Hide)
                 .and_then(|state| {
                     sbx_retained_reference_span(
-                        batch.starts[index],
+                        batch.start(index).expect("validated start"),
                         batch.cigar(index)?,
                         state.tails,
                     )
@@ -200,7 +214,10 @@ pub(crate) fn add_reads(
                         .is_none_or(|state| {
                             state.options.simplex_tail_mode != SbxSimplexTailMode::Hide
                         })
-                        .then_some((batch.starts[index], batch.ends[index]))
+                        .then_some((
+                            batch.start(index).expect("validated start"),
+                            batch.end(index).expect("validated end"),
+                        ))
                 });
             if let Some((start, end)) = highlighted_span {
                 add_chain_highlight(display_list, start, end, viewport, y, options.read_height);
@@ -222,17 +239,37 @@ pub(crate) fn aligned_reference_blocks(
     alignment_end: u64,
     cigar: Option<&[CigarOp]>,
 ) -> Vec<(u64, u64)> {
+    let mut blocks = Vec::new();
+    for_each_aligned_reference_block(alignment_start, alignment_end, cigar, |start, end, _, _| {
+        blocks.push((start, end))
+    });
+    blocks
+}
+
+pub(crate) fn for_each_aligned_reference_block(
+    alignment_start: u64,
+    alignment_end: u64,
+    cigar: Option<&[CigarOp]>,
+    mut visit: impl FnMut(u64, u64, bool, bool),
+) {
     let Some(cigar) = cigar.filter(|cigar| !cigar.is_empty()) else {
-        return (alignment_start < alignment_end)
-            .then_some((alignment_start, alignment_end))
-            .into_iter()
-            .collect();
+        if alignment_start < alignment_end {
+            visit(alignment_start, alignment_end, true, true);
+        }
+        return;
     };
 
-    let mut blocks = Vec::new();
     let mut reference_position = alignment_start;
     let mut block_start = None;
     let mut block_end = None;
+    let mut pending = None::<(u64, u64)>;
+    let mut next_is_first = true;
+    let mut queue = |block: (u64, u64)| {
+        if let Some((start, end)) = pending.replace(block) {
+            visit(start, end, next_is_first, false);
+            next_is_first = false;
+        }
+    };
     for operation in cigar {
         let length = u64::from(operation.len);
         match operation.kind {
@@ -248,7 +285,7 @@ pub(crate) fn aligned_reference_blocks(
                 if let (Some(start), Some(end)) = (block_start.take(), block_end.take())
                     && start < end
                 {
-                    blocks.push((start, end));
+                    queue((start, end));
                 }
                 reference_position = reference_position.saturating_add(length);
             }
@@ -261,9 +298,12 @@ pub(crate) fn aligned_reference_blocks(
     if let (Some(start), Some(end)) = (block_start, block_end)
         && start < end
     {
-        blocks.push((start, end));
+        queue((start, end));
     }
-    blocks
+    drop(queue);
+    if let Some((start, end)) = pending {
+        visit(start, end, next_is_first, true);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

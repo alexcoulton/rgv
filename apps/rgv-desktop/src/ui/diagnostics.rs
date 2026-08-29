@@ -11,6 +11,7 @@ pub struct DiagnosticsSnapshot {
     pub alignment_tracks: Vec<String>,
     pub layout: Option<String>,
     pub data_cache: Option<String>,
+    pub cache_coordinator: Option<String>,
     pub remote: Option<String>,
     pub layout_cache: String,
     pub gpu_upload: String,
@@ -72,7 +73,10 @@ impl Viewer {
                     AlignmentTrackLifecycle::Ready
                         if projection.is_some_and(AlignmentPanelProjection::query_is_checking) =>
                     {
-                        "checking".to_owned()
+                        format!(
+                            "checking ({:?})",
+                            projection.expect("checking projection exists").query_phase
+                        )
                     }
                     AlignmentTrackLifecycle::Ready => "ready".to_owned(),
                     AlignmentTrackLifecycle::Failed(message) => format!("failed: {message}"),
@@ -113,9 +117,108 @@ impl Viewer {
                 || "cache n/a".to_owned(),
                 |stats| format!("cache {} MiB", stats.resident_weight / (1024 * 1024)),
             );
+            let working_set = projection.map_or_else(
+                || "working set n/a".to_owned(),
+                |projection| {
+                    let stats = projection.working_set;
+                    let resident = stats.resident_start.zip(stats.resident_end).map_or_else(
+                        || "resident none".to_owned(),
+                        |(start, end)| {
+                            format!(
+                                "resident {}-{} · {} records · {:.1} MiB",
+                                start.saturating_add(1),
+                                end,
+                                stats.resident_records,
+                                stats.resident_bytes as f64 / (1024.0 * 1024.0),
+                            )
+                        },
+                    );
+                    format!(
+                        "{:?} · {resident} · buffer L {}/{} bp R {}/{} bp{} · derive lookup/projection/summary {}/{}/{} µs · summary tiles {} hit / {:.1} MiB · source queries {} foreground / {} speculative / {} total · extensions {}/{} complete, {} cancelled, {} dense, {} failed · {} source queries avoided · {:.1} MiB decode avoided",
+                        stats.cache_outcome,
+                        stats.effective_margin_left,
+                        stats.requested_margin_left,
+                        stats.effective_margin_right,
+                        stats.requested_margin_right,
+                        stats.clamp_reason.map_or_else(String::new, |reason| format!(" · clamp {reason:?}")),
+                        stats.lookup_micros,
+                        stats.projection_micros,
+                        stats.summary_micros,
+                        stats.summary_tile_hits,
+                        stats.summary_index_bytes as f64 / (1024.0 * 1024.0),
+                        stats.foreground_source_queries,
+                        stats.speculative_source_queries,
+                        stats.source_queries,
+                        stats.extensions_completed,
+                        stats.extensions_requested,
+                        stats.extensions_cancelled,
+                        stats.extensions_too_dense,
+                        stats.extensions_failed,
+                        stats.source_queries_avoided,
+                        stats.decoded_bytes_avoided as f64 / (1024.0 * 1024.0),
+                    )
+                },
+            );
+            let row_scenes = projection.map_or_else(
+                || "row scenes n/a".to_owned(),
+                |projection| {
+                    let bytes = AlignmentRowScene::estimated_resident_bytes(
+                        projection.row_scenes.iter().map(Arc::as_ref),
+                    );
+                    let reconciliation = projection
+                        .alignment_rows
+                        .as_ref()
+                        .map(|rows| rows.reconciliation)
+                        .unwrap_or_default();
+                    format!(
+                        "row scenes {} / {:.1} MiB · {}{} · {}{}{}{} · {} µs",
+                        projection.row_scenes.len(),
+                        bytes as f64 / (1024.0 * 1024.0),
+                        if projection.resident_query.as_ref().is_some_and(|resident| {
+                            projection
+                                .row_scenes
+                                .iter()
+                                .any(|scene| scene.interval().contains_interval(resident.interval))
+                        }) {
+                            "resident prepared"
+                        } else {
+                            "resident unprepared"
+                        },
+                        if self.alignment_row_scene_tasks.iter().any(|task| {
+                            task.track_id == track.config.id
+                                && task.panel_id == self.panels.active().id
+                        }) {
+                            " (preparing)"
+                        } else {
+                            ""
+                        },
+                        if reconciliation.scene_hit {
+                            "hit"
+                        } else {
+                            "miss"
+                        },
+                        if reconciliation.scene_physical_hit {
+                            " physical"
+                        } else {
+                            ""
+                        },
+                        if reconciliation.scene_extended {
+                            " extended"
+                        } else {
+                            ""
+                        },
+                        if reconciliation.exact_camera_hit {
+                            " exact-camera"
+                        } else {
+                            ""
+                        },
+                        reconciliation.scene_projection_micros,
+                    )
+                },
+            );
             alignment_tracks.push(format!(
-                "{} · {} · {} · {}",
-                track.config.name, lifecycle, records, cache
+                "{} · {} · {} · {} · {} · {}",
+                track.config.name, lifecycle, records, cache, working_set, row_scenes
             ));
         }
 
@@ -211,7 +314,7 @@ impl Viewer {
             ),
             workspace: (!self.alignment_tracks.is_empty()).then(|| {
                 format!(
-                    "{} alignment tracks · {} visible · {} complete-read ceiling",
+                    "{} alignment tracks · {} visible · {} complete-read ceiling · {:.2}× browsing buffer/side",
                     self.alignment_tracks.len(),
                     self.alignment_tracks
                         .iter()
@@ -231,7 +334,8 @@ impl Viewer {
                                     .unwrap_or(false)
                         })
                         .count(),
-                    self.workspace_alignment_limit
+                    self.workspace_alignment_limit,
+                    f32::from(self.settings.read_browsing_buffer_percent) / 100.0,
                 )
             }),
             panels: self
@@ -306,6 +410,32 @@ impl Viewer {
                     cache_misses
                 )
             }),
+            cache_coordinator: (!self.alignment_tracks.is_empty()).then(|| {
+                let cache = self.cache_coordinator;
+                format!(
+                    "cache coordinator {:.1}/{:.1} MiB · decoded {:.1}/{:.1} · layout {:.1}/{:.1} · rows {:.1}/{:.1} · GPU {:.1}/{:.1}{} · {} rebalances",
+                    cache.measured_resident_bytes as f64 / (1024.0 * 1024.0),
+                    cache.total_budget_bytes as f64 / (1024.0 * 1024.0),
+                    cache.decoded_resident_bytes as f64 / (1024.0 * 1024.0),
+                    cache.decoded_allowance_bytes as f64 / (1024.0 * 1024.0),
+                    cache.layout_resident_bytes as f64 / (1024.0 * 1024.0),
+                    cache.layout_allowance_bytes as f64 / (1024.0 * 1024.0),
+                    cache.row_scene_resident_bytes as f64 / (1024.0 * 1024.0),
+                    cache.row_scene_allowance_bytes as f64 / (1024.0 * 1024.0),
+                    cache.gpu_slab_resident_bytes as f64 / (1024.0 * 1024.0),
+                    cache.gpu_slab_allowance_bytes as f64 / (1024.0 * 1024.0),
+                    if cache.over_budget_bytes > 0 {
+                        format!(
+                            " · {:.1} MiB over ({})",
+                            cache.over_budget_bytes as f64 / (1024.0 * 1024.0),
+                            cache.clamp_reason.unwrap_or("foreground pinned")
+                        )
+                    } else {
+                        String::new()
+                    },
+                    cache.rebalances,
+                )
+            }),
             remote: (remote_requests > 0).then(|| {
                 format!(
                     "remote {remote_requests} requests · {:.2} MiB · {remote_cache_hits} range-cache hits · {remote_cancellations} cancelled",
@@ -319,9 +449,12 @@ impl Viewer {
                 layout_cache.misses
             ),
             gpu_upload: format!(
-                "GPU upload {} KiB{} · preview {}x{} px @ {:.2}x · {} MiB · {} captures / {} composites / {} invalidations / {} fallbacks · horizon {} checks / {} hits / {} misses / {} budget fallbacks · {} µs / {} rectangles",
+                "GPU upload {} KiB{} · slabs {} entries / {} MiB / {} · preview {}x{} px @ {:.2}x · {} MiB · {} captures / {} composites / {} invalidations / {} fallbacks · horizon {} checks / {} hits / {} misses / {} budget fallbacks · {} µs / {} rectangles",
                 upload.uploaded_bytes / 1024,
                 if upload.truncated { " · capped" } else { "" },
+                upload.slab_entries,
+                upload.slab_resident_bytes / (1024 * 1024),
+                if upload.slab_cache_hit { "hit" } else { "miss" },
                 navigation_preview.width,
                 navigation_preview.height,
                 self.window.scale_factor(),
@@ -434,6 +567,9 @@ pub fn show_diagnostics(context: &Context, open: &mut bool, snapshot: &Diagnosti
                 ui.monospace(layout);
             }
             if let Some(cache) = &snapshot.data_cache {
+                ui.monospace(cache);
+            }
+            if let Some(cache) = &snapshot.cache_coordinator {
                 ui.monospace(cache);
             }
             if let Some(remote) = &snapshot.remote {

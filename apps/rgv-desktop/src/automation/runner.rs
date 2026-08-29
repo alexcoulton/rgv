@@ -19,12 +19,41 @@ pub(crate) struct AutomationRunner {
     pub(crate) frame_samples_ms: Vec<f64>,
     pub(crate) frame_samples_dropped: u64,
     pub(crate) gpu: AutomationGpuTelemetry,
+    pub(crate) navigation: Vec<AutomationNavigationTelemetry>,
+    pending_navigation: Option<PendingAutomationNavigation>,
 }
 
 pub(crate) struct ActiveAutomationCommand {
     pub(crate) index: usize,
     pub(crate) name: &'static str,
     pub(crate) started: Instant,
+}
+
+const MAXIMUM_AUTOMATION_NAVIGATION_SAMPLES: usize = 1_024;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AutomationNavigationState {
+    pub(crate) source_queries: u64,
+    pub(crate) foreground_source_queries: u64,
+    pub(crate) speculative_source_queries: u64,
+    pub(crate) cache_outcome: String,
+    pub(crate) row_scene_hit: bool,
+    pub(crate) row_scene_physical_hit: bool,
+    pub(crate) row_scene_projection_micros: u64,
+}
+
+struct PendingAutomationNavigation {
+    panel_id: PanelId,
+    interval: GenomicInterval,
+    started: Instant,
+    source_queries_before: u64,
+    speculative_source_queries_before: u64,
+    first_presented_frame_ms: Option<f64>,
+    presented_frames: u64,
+    maximum_frame_ms: Option<f64>,
+    gpu_uploaded_bytes: u64,
+    gpu_buffer_reallocations: u64,
+    gpu_slab_cache_hits: u64,
 }
 
 #[derive(Clone)]
@@ -115,6 +144,8 @@ impl AutomationRunner {
             frame_samples_ms: Vec::new(),
             frame_samples_dropped: 0,
             gpu: AutomationGpuTelemetry::default(),
+            navigation: Vec::new(),
+            pending_navigation: None,
         }
     }
 
@@ -138,6 +169,8 @@ impl AutomationRunner {
             frame_samples_ms: Vec::new(),
             frame_samples_dropped: 0,
             gpu: AutomationGpuTelemetry::default(),
+            navigation: Vec::new(),
+            pending_navigation: None,
         }
     }
 
@@ -201,6 +234,93 @@ impl AutomationRunner {
             .gpu
             .truncated_frames
             .saturating_add(u64::from(prepared.truncated));
+        self.gpu.slab_cache_hits = self
+            .gpu
+            .slab_cache_hits
+            .saturating_add(u64::from(prepared.slab_cache_hit));
+        self.gpu.peak_slab_entries = self.gpu.peak_slab_entries.max(prepared.slab_entries);
+        self.gpu.peak_slab_resident_bytes = self
+            .gpu
+            .peak_slab_resident_bytes
+            .max(prepared.slab_resident_bytes);
+    }
+
+    pub(crate) fn begin_navigation(
+        &mut self,
+        panel_id: PanelId,
+        interval: GenomicInterval,
+        state: &AutomationNavigationState,
+        now: Instant,
+    ) {
+        if let Some(previous) = self.pending_navigation.take() {
+            self.push_navigation(previous.finish(now, state, false));
+        }
+        self.pending_navigation = Some(PendingAutomationNavigation {
+            panel_id,
+            interval,
+            started: now,
+            source_queries_before: state.source_queries,
+            speculative_source_queries_before: state.speculative_source_queries,
+            first_presented_frame_ms: None,
+            presented_frames: 0,
+            maximum_frame_ms: None,
+            gpu_uploaded_bytes: 0,
+            gpu_buffer_reallocations: 0,
+            gpu_slab_cache_hits: 0,
+        });
+    }
+
+    pub(crate) fn pending_navigation_target(&self) -> Option<(PanelId, GenomicInterval)> {
+        self.pending_navigation
+            .as_ref()
+            .map(|pending| (pending.panel_id, pending.interval))
+    }
+
+    pub(crate) fn record_navigation_frame(
+        &mut self,
+        now: Instant,
+        frame_ms: f64,
+        prepared: Option<PrepareStats>,
+        authoritative: bool,
+        state: &AutomationNavigationState,
+    ) {
+        let Some(pending) = self.pending_navigation.as_mut() else {
+            return;
+        };
+        pending.presented_frames = pending.presented_frames.saturating_add(1);
+        pending.first_presented_frame_ms.get_or_insert_with(|| {
+            now.saturating_duration_since(pending.started).as_secs_f64() * 1_000.0
+        });
+        pending.maximum_frame_ms = Some(
+            pending
+                .maximum_frame_ms
+                .map_or(frame_ms, |maximum| maximum.max(frame_ms)),
+        );
+        if let Some(prepared) = prepared {
+            pending.gpu_uploaded_bytes = pending
+                .gpu_uploaded_bytes
+                .saturating_add(prepared.uploaded_bytes as u64);
+            pending.gpu_buffer_reallocations = pending
+                .gpu_buffer_reallocations
+                .saturating_add(u64::from(prepared.buffer_reallocated));
+            pending.gpu_slab_cache_hits = pending
+                .gpu_slab_cache_hits
+                .saturating_add(u64::from(prepared.slab_cache_hit));
+        }
+        if authoritative {
+            let completed = self
+                .pending_navigation
+                .take()
+                .expect("pending navigation exists");
+            self.push_navigation(completed.finish(now, state, true));
+        }
+    }
+
+    fn push_navigation(&mut self, sample: AutomationNavigationTelemetry) {
+        if self.navigation.len() == MAXIMUM_AUTOMATION_NAVIGATION_SAMPLES {
+            self.navigation.remove(0);
+        }
+        self.navigation.push(sample);
     }
 
     pub(crate) fn report(&self, now: Instant) -> AutomationRunReport {
@@ -226,6 +346,7 @@ impl AutomationRunner {
                     maximum_ms,
                 },
                 gpu: self.gpu.clone(),
+                navigation: self.navigation.clone(),
             },
         }
     }
@@ -293,6 +414,41 @@ impl AutomationRunner {
             }
         }
         true
+    }
+}
+
+impl PendingAutomationNavigation {
+    fn finish(
+        self,
+        now: Instant,
+        state: &AutomationNavigationState,
+        complete: bool,
+    ) -> AutomationNavigationTelemetry {
+        AutomationNavigationTelemetry {
+            panel_id: self.panel_id.get(),
+            start: self.interval.start(),
+            end: self.interval.end(),
+            input_to_first_presented_frame_ms: self.first_presented_frame_ms,
+            input_to_authoritative_frame_ms: complete
+                .then(|| now.saturating_duration_since(self.started).as_secs_f64() * 1_000.0),
+            presented_frames: self.presented_frames,
+            maximum_frame_ms: self.maximum_frame_ms,
+            cache_outcome: state.cache_outcome.clone(),
+            foreground_source_queries: state.foreground_source_queries,
+            speculative_source_queries: state
+                .speculative_source_queries
+                .saturating_sub(self.speculative_source_queries_before),
+            total_source_queries: state
+                .source_queries
+                .saturating_sub(self.source_queries_before),
+            row_scene_hit: state.row_scene_hit,
+            row_scene_physical_hit: state.row_scene_physical_hit,
+            row_scene_projection_micros: state.row_scene_projection_micros,
+            gpu_uploaded_bytes: self.gpu_uploaded_bytes,
+            gpu_buffer_reallocations: self.gpu_buffer_reallocations,
+            gpu_slab_cache_hits: self.gpu_slab_cache_hits,
+            complete,
+        }
     }
 }
 

@@ -906,7 +906,11 @@ mod tests {
                     peak_instances: 20,
                     buffer_reallocations: 0,
                     truncated_frames: 0,
+                    slab_cache_hits: 0,
+                    peak_slab_entries: 0,
+                    peak_slab_resident_bytes: 0,
                 },
+                navigation: Vec::new(),
             },
         };
         std::fs::write(report, run_report.to_json().unwrap()).unwrap();

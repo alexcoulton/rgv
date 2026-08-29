@@ -18,6 +18,7 @@ pub(crate) struct SystemDialogDraft {
     pub(crate) settings_requested: bool,
     pub(crate) settings_open: bool,
     pub(crate) cache_budget_mib: usize,
+    pub(crate) read_browsing_buffer_percent: u16,
     pub(crate) diagnostics_opt_in: bool,
     pub(crate) autosave_enabled: bool,
     pub(crate) autosave_interval_seconds: u64,
@@ -226,7 +227,105 @@ pub(crate) fn show_system_dialogs(
                             )
                             .labelled_by(label.id);
                         });
-                        ui.small("A changed cache budget takes effect after RGV restarts.");
+                        ui.small(
+                            "Changes apply live. Current views stay visible while speculative and least-recent cache entries are rebalanced.",
+                        );
+                        ui.horizontal(|ui| {
+                            let label = ui.label("Read browsing buffer");
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut draft.read_browsing_buffer_percent,
+                                    MINIMUM_READ_BROWSING_BUFFER_PERCENT
+                                        ..=MAXIMUM_READ_BROWSING_BUFFER_PERCENT,
+                                )
+                                .step_by(25.0)
+                                .custom_formatter(|value, _| {
+                                    format!("{:.2}× / side", value / 100.0)
+                                }),
+                            )
+                            .labelled_by(label.id)
+                            .on_hover_text(
+                                "Desired decoded-read margin on each side of the viewport. RGV may reduce it to respect memory, density, Complete read-limit, or remote-transfer bounds.",
+                            );
+                        });
+                        ui.small(
+                            "The 1× default targets one viewport of decoded reads on each side. 0× disables speculative adjacent fetching but keeps ordinary cache reuse. Remote sources acquire margins conservatively and stop at hard transfer bounds.",
+                        );
+                        let cache = viewer.cache_coordinator;
+                        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+                        ui.group(|ui| {
+                            ui.label(format!(
+                                "Resident cache: {:.1} / {:.1} MiB",
+                                mib(cache.measured_resident_bytes),
+                                mib(cache.total_budget_bytes),
+                            ));
+                            ui.small(format!(
+                                "Decoded reads + summaries {:.1} MiB (allowance {:.1}) · layouts {:.1} MiB (allowance {:.1})",
+                                mib(cache.decoded_resident_bytes),
+                                mib(cache.decoded_allowance_bytes),
+                                mib(cache.layout_resident_bytes),
+                                mib(cache.layout_allowance_bytes),
+                            ));
+                            ui.small(format!(
+                                "Row scenes {:.1} MiB (allowance {:.1}) · GPU slabs {:.1} MiB (allowance {:.1})",
+                                mib(cache.row_scene_resident_bytes),
+                                mib(cache.row_scene_allowance_bytes),
+                                mib(cache.gpu_slab_resident_bytes),
+                                mib(cache.gpu_slab_allowance_bytes),
+                            ));
+                            if cache.over_budget_bytes > 0 {
+                                ui.colored_label(
+                                    egui::Color32::DARK_RED,
+                                    format!(
+                                        "Settling {:.1} MiB above budget: {}",
+                                        mib(cache.over_budget_bytes),
+                                        cache.clamp_reason.unwrap_or("current evidence is pinned"),
+                                    ),
+                                );
+                            }
+
+                            let active_panel_id = viewer.panels.active().id;
+                            if let Some(projection) = viewer
+                                .alignment_tracks
+                                .first()
+                                .and_then(|track| track.projection(active_panel_id))
+                            {
+                                let working_set = projection.working_set;
+                                let viewport_bases = viewer
+                                    .panels
+                                    .active()
+                                    .viewport
+                                    .interval()
+                                    .len()
+                                    .max(1) as f64;
+                                ui.small(format!(
+                                    "Effective read margin: {:.2}× left / {:.2}× right (requested {:.2}× / {:.2}×)",
+                                    working_set.effective_margin_left as f64 / viewport_bases,
+                                    working_set.effective_margin_right as f64 / viewport_bases,
+                                    working_set.requested_margin_left as f64 / viewport_bases,
+                                    working_set.requested_margin_right as f64 / viewport_bases,
+                                ));
+                                if projection.query_phase
+                                    == AlignmentQueryPhase::ExtendingBrowsingBuffer
+                                {
+                                    ui.small(format!(
+                                        "Prefetch active · {} completed / {} requested · {} cancelled",
+                                        working_set.extensions_completed,
+                                        working_set.extensions_requested,
+                                        working_set.extensions_cancelled,
+                                    ));
+                                }
+                                if let Some(reason) = working_set.clamp_reason {
+                                    ui.small(format!(
+                                        "Browsing buffer clamped by {reason:?}: requested {} + {} bp, admitted {} + {} bp",
+                                        working_set.requested_margin_left,
+                                        working_set.requested_margin_right,
+                                        working_set.effective_margin_left,
+                                        working_set.effective_margin_right,
+                                    ));
+                                }
+                            }
+                        });
                         ui.separator();
                         ui.heading("Recovery autosave");
                         ui.checkbox(

@@ -142,6 +142,20 @@ where
         }
     }
 
+    /// Updates the budget and immediately evicts least-recent entries until
+    /// the resident weight fits. This is used when decoded resident windows
+    /// temporarily reserve part of a shared cache allocation.
+    pub fn set_maximum_weight(&mut self, maximum_weight: NonZeroUsize) {
+        self.maximum_weight = maximum_weight;
+        while self.resident_weight > self.maximum_weight.get() {
+            let Some((_, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.resident_weight = self.resident_weight.saturating_sub(evicted.weight);
+            self.evictions = self.evictions.saturating_add(1);
+        }
+    }
+
     pub fn insert(
         &mut self,
         key: K,
@@ -237,6 +251,24 @@ mod tests {
         cache.insert("kept", 1, 4).unwrap();
         assert!(cache.insert("too-large", 2, 5).is_err());
         assert_eq!(cache.get(&"kept"), Some(&1));
+    }
+
+    #[test]
+    fn lowering_the_budget_evicts_lru_entries_immediately() {
+        let mut cache = WeightedLruCache::new(NonZeroUsize::new(12).unwrap());
+        cache.insert("old", 1, 4).unwrap();
+        cache.insert("kept", 2, 4).unwrap();
+        cache.insert("new", 3, 4).unwrap();
+        assert_eq!(cache.get(&"kept"), Some(&2));
+
+        cache.set_maximum_weight(NonZeroUsize::new(8).unwrap());
+
+        assert_eq!(cache.stats().maximum_weight, 8);
+        assert_eq!(cache.stats().resident_weight, 8);
+        assert_eq!(cache.stats().evictions, 1);
+        assert_eq!(cache.get(&"old"), None);
+        assert_eq!(cache.get(&"kept"), Some(&2));
+        assert_eq!(cache.get(&"new"), Some(&3));
     }
 
     #[test]

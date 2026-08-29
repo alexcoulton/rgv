@@ -9,7 +9,7 @@ use rust_htslib::faidx;
 
 use crate::{
     AlignmentError, HttpRangeConfig, HttpRangeReader, RemoteCancellation, RemoteIoStats,
-    associated_remote_url, read_remote_object_bounded,
+    RemoteTransferBudget, associated_remote_url, read_remote_object_bounded,
 };
 
 const MAX_REMOTE_FASTA_INDEX_BYTES: usize = 16 * 1024 * 1024;
@@ -155,6 +155,14 @@ impl FastaReference {
             && let Ok(mut reader) = remote.reader.lock()
         {
             reader.set_cancellation(cancellation);
+        }
+    }
+
+    pub fn set_remote_transfer_budget(&self, budget: Option<RemoteTransferBudget>) {
+        if let FastaReader::Remote(remote) = &self.reader
+            && let Ok(mut reader) = remote.reader.lock()
+        {
+            reader.set_transfer_budget(budget);
         }
     }
 

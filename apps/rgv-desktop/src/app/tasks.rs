@@ -60,6 +60,7 @@ pub(crate) struct AlignmentRowLayoutTaskKey {
     pub(crate) sort_position: Option<u64>,
     pub(crate) promoted_read_name_hash: Option<u64>,
     pub(crate) max_rows: usize,
+    pub(crate) row_scale_class: u8,
     pub(crate) view_as_pairs: bool,
     pub(crate) pair_length_bounds: TemplateLengthBounds,
     pub(crate) stacking_mode: ReadStackingMode,
@@ -76,6 +77,7 @@ pub(crate) struct AlignmentRowLayoutTask {
 pub(crate) struct AlignmentRowLayoutTaskResult {
     pub(crate) rows: CachedAlignmentRows,
     pub(crate) history: AlignmentRowHistory,
+    pub(crate) scene: Option<Arc<AlignmentRowScene>>,
 }
 
 pub(crate) struct AlignmentRowLayoutWork {
@@ -100,6 +102,31 @@ pub(crate) struct CompletedAlignmentRowLayoutWork {
     request_revision: u64,
     key: AlignmentRowLayoutTaskKey,
     result: Option<AlignmentRowLayoutTaskResult>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AlignmentRowSceneTask {
+    pub(crate) panel_id: PanelId,
+    pub(crate) track_id: TrackId,
+    pub(crate) base_scene_identity: usize,
+    pub(crate) resident_query_identity: usize,
+}
+
+pub(crate) struct AlignmentRowSceneWork {
+    panel_id: PanelId,
+    track_id: TrackId,
+    base_scene: Arc<AlignmentRowScene>,
+    resident_query: Arc<AlignmentQuery>,
+    cancellation_clock: GenerationClock,
+    cancellation_generation: ViewportGeneration,
+}
+
+pub(crate) struct CompletedAlignmentRowSceneWork {
+    panel_id: PanelId,
+    track_id: TrackId,
+    base_scene: Arc<AlignmentRowScene>,
+    resident_query: Arc<AlignmentQuery>,
+    scene: Option<Arc<AlignmentRowScene>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,10 +163,15 @@ pub(crate) fn process_alignment_row_layout_work(
             let layout = assign_alignment_rows(&query, options, None);
             cancellation_clock
                 .is_current(cancellation_generation)
-                .then_some((layout, AlignmentRowReconciliationStats::default(), history))
+                .then_some((
+                    layout,
+                    AlignmentRowReconciliationStats::default(),
+                    history,
+                    None,
+                ))
         }
     } else {
-        reconcile_alignment_rows_with_horizon_cancellable(
+        reconcile_alignment_rows_with_horizon_scene_cancellable(
             &query,
             &layout_query,
             options,
@@ -149,8 +181,12 @@ pub(crate) fn process_alignment_row_layout_work(
             || !cancellation_clock.is_current(cancellation_generation),
         )
     }
-    .map(
-        |(layout, reconciliation, history)| AlignmentRowLayoutTaskResult {
+    .map(|(layout, reconciliation, history, scene)| {
+        let layout = scene
+            .as_ref()
+            .and_then(|scene| scene.project(&query, &options))
+            .unwrap_or(layout);
+        AlignmentRowLayoutTaskResult {
             rows: CachedAlignmentRows {
                 query,
                 layout_query,
@@ -162,14 +198,16 @@ pub(crate) fn process_alignment_row_layout_work(
                 sort_position: options.sort_position,
                 promoted_read_name_hash: options.promoted_read_name_hash,
                 max_rows: options.max_rows,
+                row_scale_class: options.row_scale_class,
                 view_as_pairs: options.view_as_pairs,
                 pair_length_bounds: options.pair_length_bounds,
                 stacking_mode,
                 reconciliation,
             },
             history,
-        },
-    );
+            scene: scene.map(Arc::new),
+        }
+    });
     Some(CompletedAlignmentRowLayoutWork {
         panel_id,
         track_id,
@@ -179,7 +217,166 @@ pub(crate) fn process_alignment_row_layout_work(
     })
 }
 
+pub(crate) fn process_alignment_row_scene_work(
+    work: AlignmentRowSceneWork,
+    _scheduler_clock: &GenerationClock,
+    _scheduler_generation: ViewportGeneration,
+) -> Option<CompletedAlignmentRowSceneWork> {
+    let AlignmentRowSceneWork {
+        panel_id,
+        track_id,
+        base_scene,
+        resident_query,
+        cancellation_clock,
+        cancellation_generation,
+    } = work;
+    if !cancellation_clock.is_current(cancellation_generation) {
+        return None;
+    }
+    let scene = base_scene
+        .prepare_resident_extension(&resident_query)
+        .map(Arc::new);
+    cancellation_clock
+        .is_current(cancellation_generation)
+        .then_some(CompletedAlignmentRowSceneWork {
+            panel_id,
+            track_id,
+            base_scene,
+            resident_query,
+            scene,
+        })
+}
+
 impl Viewer {
+    pub(crate) fn schedule_alignment_row_scene_preparations(&mut self) {
+        let candidates = self
+            .alignment_tracks
+            .iter()
+            .flat_map(|track| {
+                track
+                    .projections
+                    .iter()
+                    .filter_map(|(panel_id, projection)| {
+                        let resident_query = projection.resident_query.as_ref()?;
+                        if !resident_query.individual_reads_complete() {
+                            return None;
+                        }
+                        let layout_query = projection.layout_query.as_ref()?;
+                        // Decoded residency and row-scene scale are separate contracts. Extending
+                        // a fine-scale row scene across the entire speculative buffer makes local
+                        // rows sparse and effectively hides reads near the top of the stack.
+                        if resident_query.interval != layout_query.interval {
+                            return None;
+                        }
+                        let base_scene = projection.row_scenes.last()?;
+                        let base_interval = base_scene.interval();
+                        if resident_query.interval.contig() != base_interval.contig()
+                            || resident_query.interval.start() > base_interval.start()
+                            || resident_query.interval.end() < base_interval.end()
+                            || resident_query.interval == base_interval
+                        {
+                            return None;
+                        }
+                        let task = AlignmentRowSceneTask {
+                            panel_id: *panel_id,
+                            track_id: track.config.id,
+                            base_scene_identity: Arc::as_ptr(base_scene) as usize,
+                            resident_query_identity: Arc::as_ptr(resident_query) as usize,
+                        };
+                        (!self.alignment_row_scene_tasks.contains(&task)).then_some((
+                            task,
+                            Arc::clone(base_scene),
+                            Arc::clone(resident_query),
+                            projection.clock.clone(),
+                            projection.clock.current(),
+                        ))
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        for (task, base_scene, resident_query, cancellation_clock, cancellation_generation) in
+            candidates
+        {
+            let work = AlignmentRowSceneWork {
+                panel_id: task.panel_id,
+                track_id: task.track_id,
+                base_scene,
+                resident_query,
+                cancellation_clock,
+                cancellation_generation,
+            };
+            if self
+                .alignment_row_scene_scheduler
+                .try_submit(WorkItem {
+                    generation: self.alignment_row_scene_scheduler_clock.current(),
+                    payload: work,
+                })
+                .is_ok()
+            {
+                self.alignment_row_scene_tasks.push(task);
+            }
+        }
+    }
+
+    pub(crate) fn poll_alignment_row_scene_tasks(&mut self) {
+        let mut committed = false;
+        loop {
+            let completed = match self.alignment_row_scene_scheduler.try_receive() {
+                Ok(Some(completed)) => completed.output,
+                Ok(None) => break,
+                Err(_) => {
+                    self.data_status = "Resident row-scene worker pool disconnected".to_owned();
+                    self.display_dirty = true;
+                    break;
+                }
+            };
+            let task = AlignmentRowSceneTask {
+                panel_id: completed.panel_id,
+                track_id: completed.track_id,
+                base_scene_identity: Arc::as_ptr(&completed.base_scene) as usize,
+                resident_query_identity: Arc::as_ptr(&completed.resident_query) as usize,
+            };
+            self.alignment_row_scene_tasks
+                .retain(|candidate| *candidate != task);
+            let Some(scene) = completed.scene else {
+                continue;
+            };
+            let Some(track) = self
+                .alignment_tracks
+                .iter_mut()
+                .find(|track| track.config.id == completed.track_id)
+            else {
+                continue;
+            };
+            let projection = track.projection_mut(completed.panel_id);
+            let current = projection
+                .resident_query
+                .as_ref()
+                .is_some_and(|query| Arc::ptr_eq(query, &completed.resident_query))
+                && projection
+                    .row_scenes
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &completed.base_scene));
+            if current {
+                projection.admit_row_scene(scene);
+                committed = true;
+            } else {
+                self.navigation_stale_result_rejections =
+                    self.navigation_stale_result_rejections.saturating_add(1);
+            }
+        }
+        if committed {
+            self.rebalance_live_cache_coordinator();
+            self.display_dirty = true;
+            self.window.request_redraw();
+        }
+    }
+
+    pub(crate) fn finish_alignment_row_scene_tasks(&mut self) {
+        self.alignment_row_scene_scheduler_clock.advance();
+        self.alignment_row_scene_tasks.clear();
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_alignment_row_layout_task(
         &mut self,
@@ -284,7 +481,14 @@ impl Viewer {
             match completed.result {
                 Some(result) if result_is_current => {
                     projection.row_history = result.history;
-                    projection.alignment_rows = Some(result.rows);
+                    if let Some(scene) = result.scene {
+                        if completed.key.repack {
+                            projection.row_scenes.clear();
+                            projection.row_layout_cache.clear();
+                        }
+                        projection.admit_row_scene(scene);
+                    }
+                    projection.commit_alignment_rows(result.rows);
                     projection.cached_layout = None;
                     if completed.key.repack {
                         projection.pending_row_repack = false;
@@ -305,6 +509,9 @@ impl Viewer {
             self.layout_cache.clear();
             self.display_dirty = true;
             self.window.request_redraw();
+        }
+        if committed {
+            self.schedule_alignment_row_scene_preparations();
         }
     }
 

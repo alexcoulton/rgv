@@ -544,6 +544,12 @@ pub enum AutomationSetting {
     InterfaceScalePercent {
         value: u16,
     },
+    ReadBrowsingBufferPercent {
+        value: u16,
+    },
+    TotalCacheBudgetMib {
+        value: usize,
+    },
     PropertiesPanelExpanded {
         value: bool,
     },
@@ -701,6 +707,30 @@ impl AutomationSetting {
                 .contains(value)
                 .then_some(())
                 .ok_or_else(|| "interface scale must be between 75 and 200 percent".to_owned()),
+            Self::ReadBrowsingBufferPercent { value } => {
+                (crate::MINIMUM_READ_BROWSING_BUFFER_PERCENT
+                    ..=crate::MAXIMUM_READ_BROWSING_BUFFER_PERCENT)
+                    .contains(value)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        format!(
+                            "read browsing buffer must be between {} and {} percent",
+                            crate::MINIMUM_READ_BROWSING_BUFFER_PERCENT,
+                            crate::MAXIMUM_READ_BROWSING_BUFFER_PERCENT
+                        )
+                    })
+            }
+            Self::TotalCacheBudgetMib { value } => (crate::MINIMUM_CACHE_BUDGET_MIB
+                ..=crate::MAXIMUM_CACHE_BUDGET_MIB)
+                .contains(value)
+                .then_some(())
+                .ok_or_else(|| {
+                    format!(
+                        "total cache budget must be between {} and {} MiB",
+                        crate::MINIMUM_CACHE_BUDGET_MIB,
+                        crate::MAXIMUM_CACHE_BUDGET_MIB
+                    )
+                }),
             Self::PropertiesPanelWidth { value } => (value.is_finite()
                 && (280.0..=520.0).contains(value))
             .then_some(())
@@ -944,6 +974,10 @@ fn default_alignment_result_limit() -> usize {
     25
 }
 
+const fn default_read_browsing_buffer_percent() -> u16 {
+    crate::DEFAULT_READ_BROWSING_BUFFER_PERCENT
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationWorkspaceSnapshot {
     pub application_version: String,
@@ -957,6 +991,32 @@ pub struct AutomationWorkspaceSnapshot {
     pub active_panel_id: PanelId,
     pub panels: Vec<AutomationPanelSnapshot>,
     pub tracks: Vec<AutomationTrackSnapshot>,
+    #[serde(default = "default_read_browsing_buffer_percent")]
+    pub read_browsing_buffer_percent: u16,
+    #[serde(default)]
+    pub total_cache_budget_mib: usize,
+    #[serde(default)]
+    pub alignment_cache_resident_bytes: usize,
+    #[serde(default)]
+    pub layout_cache_resident_bytes: usize,
+    #[serde(default)]
+    pub row_scene_resident_bytes: usize,
+    #[serde(default)]
+    pub gpu_slab_resident_bytes: usize,
+    #[serde(default)]
+    pub measured_cache_resident_bytes: usize,
+    #[serde(default)]
+    pub decoded_cache_allowance_bytes: usize,
+    #[serde(default)]
+    pub layout_cache_allowance_bytes: usize,
+    #[serde(default)]
+    pub row_scene_cache_allowance_bytes: usize,
+    #[serde(default)]
+    pub gpu_slab_cache_allowance_bytes: usize,
+    #[serde(default)]
+    pub cache_over_budget_bytes: usize,
+    #[serde(default)]
+    pub cache_clamp_reason: Option<String>,
     #[serde(default)]
     pub read_pane_height: f32,
     #[serde(default = "automation_default_true")]
@@ -1428,6 +1488,26 @@ pub struct AutomationAlignmentTrackSnapshot {
     #[serde(default)]
     pub row_layout_canonical_metrics_micros: u64,
     #[serde(default)]
+    pub row_layout_canonical_metrics_deferred: bool,
+    #[serde(default)]
+    pub row_layout_scene_projection_micros: u64,
+    #[serde(default)]
+    pub row_layout_scene_hit: bool,
+    #[serde(default)]
+    pub row_layout_scene_physical_hit: bool,
+    #[serde(default)]
+    pub row_layout_scene_extended: bool,
+    #[serde(default)]
+    pub row_layout_exact_camera_hit: bool,
+    #[serde(default)]
+    pub row_scene_entries: usize,
+    #[serde(default)]
+    pub row_scene_bytes: usize,
+    #[serde(default)]
+    pub row_scene_resident_prepared: bool,
+    #[serde(default)]
+    pub row_scene_preparation_pending: bool,
+    #[serde(default)]
     pub row_layout_compatibility_probes: usize,
     #[serde(default)]
     pub row_layout_rows_reused: usize,
@@ -1453,6 +1533,8 @@ pub struct AutomationAlignmentTrackSnapshot {
     pub row_layout_transition_reason: ReadStackingTransitionReason,
     #[serde(default)]
     pub row_layout_policy_fingerprint: u64,
+    #[serde(default)]
+    pub row_layout_scale_class: u8,
     #[serde(default)]
     pub row_layout_projection_fingerprint: u64,
     #[serde(default)]
@@ -1487,6 +1569,70 @@ pub struct AutomationAlignmentTrackSnapshot {
     pub row_layout_horizon_truncated: bool,
     #[serde(default)]
     pub row_layout_horizon_cache_hit: bool,
+    #[serde(default)]
+    pub browsing_cache_outcome: String,
+    #[serde(default)]
+    pub alignment_query_phase: String,
+    #[serde(default)]
+    pub resident_start: Option<u64>,
+    #[serde(default)]
+    pub resident_end: Option<u64>,
+    #[serde(default)]
+    pub resident_records: usize,
+    #[serde(default)]
+    pub resident_bytes: usize,
+    #[serde(default)]
+    pub requested_buffer_left: u64,
+    #[serde(default)]
+    pub requested_buffer_right: u64,
+    #[serde(default)]
+    pub effective_buffer_left: u64,
+    #[serde(default)]
+    pub effective_buffer_right: u64,
+    #[serde(default)]
+    pub buffer_clamp_reason: Option<String>,
+    #[serde(default)]
+    pub resident_contract_revision: u64,
+    #[serde(default)]
+    pub resident_contains_target: bool,
+    #[serde(default)]
+    pub resident_lookup_micros: u64,
+    #[serde(default)]
+    pub resident_projection_micros: u64,
+    #[serde(default)]
+    pub resident_summary_micros: u64,
+    #[serde(default)]
+    pub resident_summary_tile_hits: usize,
+    #[serde(default)]
+    pub resident_summary_index_bytes: usize,
+    #[serde(default)]
+    pub resident_extensions_requested: u64,
+    #[serde(default)]
+    pub resident_extensions_completed: u64,
+    #[serde(default)]
+    pub resident_extensions_cancelled: u64,
+    #[serde(default)]
+    pub resident_extensions_too_dense: u64,
+    #[serde(default)]
+    pub resident_extensions_failed: u64,
+    #[serde(default)]
+    pub alignment_source_queries: u64,
+    #[serde(default)]
+    pub alignment_foreground_source_queries: u64,
+    #[serde(default)]
+    pub alignment_speculative_source_queries: u64,
+    #[serde(default)]
+    pub alignment_source_queries_avoided: u64,
+    #[serde(default)]
+    pub decoded_alignment_bytes_avoided: u64,
+    #[serde(default)]
+    pub speculative_alignment_records: usize,
+    #[serde(default)]
+    pub speculative_remote_bytes: u64,
+    #[serde(default)]
+    pub speculative_remote_requests: u64,
+    #[serde(default)]
+    pub resident_evictions: u64,
     #[serde(default, alias = "compact_repack_pending")]
     pub stable_architecture_rebuild_pending: bool,
     #[serde(default)]
@@ -1885,6 +2031,52 @@ pub struct AutomationGpuTelemetry {
     pub buffer_reallocations: u64,
     #[serde(default)]
     pub truncated_frames: u64,
+    #[serde(default)]
+    pub slab_cache_hits: u64,
+    #[serde(default)]
+    pub peak_slab_entries: usize,
+    #[serde(default)]
+    pub peak_slab_resident_bytes: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AutomationNavigationTelemetry {
+    #[serde(default)]
+    pub panel_id: u64,
+    #[serde(default)]
+    pub start: u64,
+    #[serde(default)]
+    pub end: u64,
+    #[serde(default)]
+    pub input_to_first_presented_frame_ms: Option<f64>,
+    #[serde(default)]
+    pub input_to_authoritative_frame_ms: Option<f64>,
+    #[serde(default)]
+    pub presented_frames: u64,
+    #[serde(default)]
+    pub maximum_frame_ms: Option<f64>,
+    #[serde(default)]
+    pub cache_outcome: String,
+    #[serde(default)]
+    pub foreground_source_queries: u64,
+    #[serde(default)]
+    pub speculative_source_queries: u64,
+    #[serde(default)]
+    pub total_source_queries: u64,
+    #[serde(default)]
+    pub row_scene_hit: bool,
+    #[serde(default)]
+    pub row_scene_physical_hit: bool,
+    #[serde(default)]
+    pub row_scene_projection_micros: u64,
+    #[serde(default)]
+    pub gpu_uploaded_bytes: u64,
+    #[serde(default)]
+    pub gpu_buffer_reallocations: u64,
+    #[serde(default)]
+    pub gpu_slab_cache_hits: u64,
+    #[serde(default)]
+    pub complete: bool,
 }
 
 /// A bounded, privacy-preserving timeline for the most recent vertical
@@ -1935,6 +2127,8 @@ pub struct AutomationRunTelemetry {
     pub frames: AutomationFrameTelemetry,
     #[serde(default)]
     pub gpu: AutomationGpuTelemetry,
+    #[serde(default)]
+    pub navigation: Vec<AutomationNavigationTelemetry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2316,6 +2510,19 @@ mod tests {
                 presentation_selection_anchor: None,
             }],
             tracks: Vec::new(),
+            read_browsing_buffer_percent: crate::DEFAULT_READ_BROWSING_BUFFER_PERCENT,
+            total_cache_budget_mib: crate::DEFAULT_CACHE_BUDGET_MIB,
+            alignment_cache_resident_bytes: 0,
+            layout_cache_resident_bytes: 0,
+            row_scene_resident_bytes: 0,
+            gpu_slab_resident_bytes: 0,
+            measured_cache_resident_bytes: 0,
+            decoded_cache_allowance_bytes: 0,
+            layout_cache_allowance_bytes: 0,
+            row_scene_cache_allowance_bytes: 0,
+            gpu_slab_cache_allowance_bytes: 0,
+            cache_over_budget_bytes: 0,
+            cache_clamp_reason: None,
             read_pane_height: 360.0,
             annotation_section_expanded: true,
             read_section_expanded: true,
@@ -2582,6 +2789,12 @@ mod tests {
                     setting: AutomationSetting::InterfaceScalePercent { value: 150 },
                 },
                 AutomationCommand::Configure {
+                    setting: AutomationSetting::ReadBrowsingBufferPercent { value: 200 },
+                },
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::TotalCacheBudgetMib { value: 2_048 },
+                },
+                AutomationCommand::Configure {
                     setting: AutomationSetting::PropertiesPanelExpanded { value: false },
                 },
                 AutomationCommand::Configure {
@@ -2593,6 +2806,31 @@ mod tests {
             ],
         };
         assert!(valid.to_json().is_ok());
+
+        let invalid_buffer = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::Configure {
+                setting: AutomationSetting::ReadBrowsingBufferPercent {
+                    value: crate::MAXIMUM_READ_BROWSING_BUFFER_PERCENT + 1,
+                },
+            }],
+        };
+        assert!(matches!(
+            invalid_buffer.to_json(),
+            Err(AutomationError::InvalidCommand { index: 0, .. })
+        ));
+        let invalid_cache = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::Configure {
+                setting: AutomationSetting::TotalCacheBudgetMib {
+                    value: crate::MAXIMUM_CACHE_BUDGET_MIB + 1,
+                },
+            }],
+        };
+        assert!(matches!(
+            invalid_cache.to_json(),
+            Err(AutomationError::InvalidCommand { index: 0, .. })
+        ));
     }
 
     #[test]

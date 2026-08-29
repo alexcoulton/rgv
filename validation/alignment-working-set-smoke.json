@@ -1,0 +1,94 @@
+{
+  "schema_version": 4,
+  "commands": [
+    {
+      "command": "new_workspace"
+    },
+    {
+      "command": "load_track",
+      "source": {
+        "Local": {
+          "path": "../benchmark-data/mixed.bam"
+        }
+      },
+      "kind": "Alignment",
+      "name": "Working-set smoke"
+    },
+    {
+      "command": "goto",
+      "loci": [
+        "chr1:900001-920000"
+      ]
+    },
+    {
+      "command": "configure",
+      "setting": {
+        "setting": "complete_read_limit",
+        "track_ids": [
+          1
+        ],
+        "value": 1000000
+      }
+    },
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 30000
+    },
+    {
+      "command": "configure",
+      "setting": {
+        "setting": "read_browsing_buffer_percent",
+        "value": 50
+      }
+    },
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 30000
+    },
+    {
+      "command": "describe_workspace"
+    },
+    {
+      "command": "change_viewport",
+      "panel_id": 1,
+      "operation": {
+        "operation": "zoom",
+        "factor": 2.0
+      }
+    },
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 30000
+    },
+    {
+      "command": "change_viewport",
+      "panel_id": 1,
+      "operation": {
+        "operation": "pan_fraction",
+        "fraction": 0.1
+      }
+    },
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 30000
+    },
+    {
+      "command": "change_viewport",
+      "panel_id": 1,
+      "operation": {
+        "operation": "zoom",
+        "factor": 0.5
+      }
+    },
+    {
+      "command": "wait_until_settled",
+      "timeout_millis": 30000
+    },
+    {
+      "command": "describe_workspace"
+    },
+    {
+      "command": "exit"
+    }
+  ]
+}

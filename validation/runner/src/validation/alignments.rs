@@ -227,9 +227,8 @@ pub(crate) fn verify_mixed_long_truth(path: &Path) -> Result<()> {
     let long = query_alignment(path, None, "chr2", 0, 2_000_000)?;
     ensure!(
         long.batch
-            .flags
-            .iter()
-            .any(|flags| flags.is_supplementary())
+            .records()
+            .any(|record| record.flags().is_supplementary())
             && (0..long.batch.len()).any(|index| long.batch.has_auxiliary_tag(index, *b"MM")),
         "MF-01 long-read locus lacks supplementary or modified-base evidence"
     );
@@ -333,7 +332,10 @@ pub(crate) fn verify_mixed_alignment_truth(root: &Path, manifest: &FixtureManife
     let paired = query_alignment(&path, None, "chr1", 0, 200_000)?;
     ensure!(
         paired.pairs.eligible_proper_templates > 0
-            && paired.batch.flags.iter().any(|flags| flags.is_paired()),
+            && paired
+                .batch
+                .records()
+                .any(|record| record.flags().is_paired()),
         "MF-01 has no proper paired templates"
     );
     let project = project_document(root, manifest, "mf-01-alignment-core")?;
