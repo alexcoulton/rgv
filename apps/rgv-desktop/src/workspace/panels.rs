@@ -56,6 +56,9 @@ pub(crate) struct ReadPanelScrollState {
     /// Stable row at the top of the viewport plus the fractional offset into
     /// it. This survives changes in total stack height and row density.
     pub(crate) stable_row_anchor: Option<StableRowCameraAnchor>,
+    /// Contig whose row coordinates currently own this scroll state. A row number has no
+    /// meaning on another contig and must never leak into its scene camera.
+    pub(crate) scene_contig: Option<ContigId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +164,46 @@ impl ReadPanelScrollState {
     pub(crate) fn effective_scroll_points(self) -> f32 {
         (self.scroll_points - self.content_origin_points).max(0.0)
     }
+
+    /// Binds this state to a scene-row authority. Density is a user preference and survives;
+    /// row coordinates, content bounds, and latent scrollbar fractions do not.
+    pub(crate) fn bind_scene_contig(
+        &mut self,
+        contig: ContigId,
+        force_discontinuity: bool,
+    ) -> bool {
+        let changed =
+            force_discontinuity || self.scene_contig.is_some_and(|current| current != contig);
+        if changed {
+            let density = self.density;
+            *self = Self {
+                density,
+                scene_contig: Some(contig),
+                ..Self::default()
+            };
+        } else {
+            self.scene_contig = Some(contig);
+        }
+        changed
+    }
+
+    /// Ends the row-coordinate authority owned by a detailed read scene. Density is a user
+    /// preference and survives the transition, but an index-only overview has no read rows,
+    /// content extent, or latent scrollbar position to retain.
+    pub(crate) fn retire_scene_authority(&mut self) -> bool {
+        let changed = self.scroll_points != 0.0
+            || self.content_origin_points != 0.0
+            || self.latent_scroll_fraction.is_some()
+            || self.content_bottom_points != 0.0
+            || self.stable_row_anchor.is_some()
+            || self.scene_contig.is_some();
+        let density = self.density;
+        *self = Self {
+            density,
+            ..Self::default()
+        };
+        changed
+    }
 }
 
 /// Runtime state owned by one genomic view panel.
@@ -204,6 +247,9 @@ pub(crate) struct ViewPanelController {
     pub(crate) pending_read_selection: Option<PendingReadSelection>,
     pub(crate) pending_read_reveal: Option<(TrackId, usize)>,
     pub(crate) hovered_record: Option<(TrackId, usize)>,
+    /// Stable scene hit captured from the same immutable panel frame used for rendering.
+    pub(crate) hovered_alignment_hit: Option<AlignmentHit>,
+    pub(crate) selected_alignment_hit: Option<AlignmentHit>,
     pub(crate) hover_inspector_target: Option<HoverInspectorTarget>,
     pub(crate) hovered_junction_arc: Option<JunctionArcHover>,
     pub(crate) junction_arc_targets: Vec<ComposedJunctionArcTarget>,
@@ -213,6 +259,16 @@ pub(crate) struct ViewPanelController {
     pub(crate) navigation_provisional_display: Option<DisplayList>,
     pub(crate) scroll_display_cache: Option<PanelScrollDisplayCache>,
     pub(crate) reference_slice: Option<Arc<ReferenceSlice>>,
+    pub(crate) reference_slice_revision: Option<ReferenceRevision>,
+    /// Exact authority requested from the FASTA actor for this panel generation. Alignment Base
+    /// scenes can require a wider interval than the ordinary visible reference row.
+    pub(crate) reference_request_revision: Option<ReferenceRevision>,
+    pub(crate) reference_request_interval: Option<GenomicInterval>,
+    /// Owner-specific FASTA installs accepted by bounded alignment-engine control queues. These
+    /// distinguish an authority already queued for one live lane from another lane which still
+    /// needs either a wider slice or its own sequential query.
+    pub(crate) reference_installs_queued:
+        BTreeMap<SourceOwnerId, (ReferenceRevision, GenomicInterval)>,
     pub(crate) reference_settled_generation: Option<u64>,
     pub(crate) pending_queries: PendingQueries,
     pub(crate) track_snapshots: Vec<TrackSnapshot>,
@@ -342,6 +398,7 @@ impl PanelWorkspace {
                                 content_bottom_points: state.content_bottom_points,
                                 density: state.density,
                                 stable_row_anchor: None,
+                                scene_contig: None,
                             },
                         )
                     })
@@ -557,6 +614,8 @@ impl ViewPanelController {
             pending_read_selection: None,
             pending_read_reveal: None,
             hovered_record: None,
+            hovered_alignment_hit: None,
+            selected_alignment_hit: None,
             hover_inspector_target: None,
             hovered_junction_arc: None,
             junction_arc_targets: Vec::new(),
@@ -564,6 +623,10 @@ impl ViewPanelController {
             navigation_provisional_display: None,
             scroll_display_cache: None,
             reference_slice: None,
+            reference_slice_revision: None,
+            reference_request_revision: None,
+            reference_request_interval: None,
+            reference_installs_queued: BTreeMap::new(),
             reference_settled_generation: None,
             pending_queries: PendingQueries::default(),
             track_snapshots: Vec::new(),
@@ -604,6 +667,20 @@ impl ViewPanelController {
         self.owns(request) && self.generation_clock.is_current(request.generation())
     }
 
+    /// Settles the current panel generation after the FASTA actor fails to establish any open
+    /// revision. No prior slice or request can remain authoritative after that terminal failure.
+    pub(crate) fn settle_reference_open_failure(&mut self) {
+        self.reference_slice = None;
+        self.reference_slice_revision = None;
+        self.reference_request_revision = None;
+        self.reference_request_interval = None;
+        self.reference_installs_queued.clear();
+        self.pending_queries.reference = false;
+        let generation = self.generation_clock.current().get();
+        self.reference_settled_generation = Some(generation);
+        self.reference_query_error_generation = Some(generation);
+    }
+
     pub(crate) fn clear_selection(&mut self) {
         self.selected_track = None;
         self.selected_presentation_nodes.clear();
@@ -631,6 +708,8 @@ impl ViewPanelController {
         self.pending_read_selection = None;
         self.pending_read_reveal = None;
         self.hovered_record = None;
+        self.hovered_alignment_hit = None;
+        self.selected_alignment_hit = None;
         self.hover_inspector_target = None;
         self.hovered_junction_arc = None;
         self.junction_arc_targets.clear();

@@ -1,6 +1,13 @@
 use super::super::*;
+use crate::display::alignment;
 
 const MAXIMUM_ALIGNMENT_ROW_SCENES: usize = 4;
+/// Canonical presentation partition used by the first desktop qualification slice. This is a
+/// cache/page granularity, never an evidence or display cap. It deliberately matches the proven
+/// legacy layout tile scale so comparative traces have one fewer independent variable; Phase 6
+/// measurements may replace it without changing scene identity or completeness semantics.
+const DESKTOP_ALIGNMENT_SCENE_TILE_BASES: u64 = 32_768;
+const DESKTOP_ALIGNMENT_SCENE_ROW_BLOCK_ROWS: u32 = 256;
 
 pub(crate) fn expanded_workspace_alignment_limit(
     current_workspace_limit: usize,
@@ -122,9 +129,34 @@ pub(crate) struct AlignmentPanelProjection {
     pub(crate) row_pair_policy_override: (Option<u64>, Option<u64>),
     pub(crate) cached_layout: Option<(LayoutTileKey, Arc<AlignmentLayout>)>,
     pub(crate) last_query_resolution: Option<AlignmentQueryResolution>,
+    /// Unified-scene lane identity and latest immutable worker publication. The worker camera is
+    /// acquisition intent only; rendering captures this snapshot against the UI's current camera.
+    pub(crate) scene_owner: Option<SourceOwnerId>,
+    pub(crate) scene_contig: Option<ContigId>,
+    pub(crate) scene_contract: Option<AlignmentSceneBuildContract>,
+    pub(crate) scene_policy: Option<AlignmentScenePreparationPolicy>,
+    pub(crate) desired_scene_camera: Option<AlignmentCamera>,
+    pub(crate) desired_scene_request_token: Option<AlignmentSceneRequestToken>,
+    pub(crate) scene_frame: Option<AlignmentCoordinatorFrame>,
+    pub(crate) scene_frame_request_token: Option<AlignmentSceneRequestToken>,
+    pub(crate) scene_interaction: AlignmentInteractionState,
 }
 
 impl AlignmentPanelProjection {
+    pub(crate) fn settle_unavailable(&mut self, message: String) {
+        self.finish_checking();
+        self.pending_query = false;
+        self.current_query = None;
+        self.layout_query = None;
+        self.resident_query = None;
+        self.layout_query_cache_hit = false;
+        self.alignment_rows = None;
+        self.cached_layout = None;
+        self.unavailable = Some(message);
+        self.index_only_overview = false;
+        self.settled_generation = Some(self.clock.current().get());
+    }
+
     pub(crate) fn commit_alignment_rows(&mut self, rows: CachedAlignmentRows) {
         self.row_layout_cache.retain(|cached| {
             !Arc::ptr_eq(&cached.query, &rows.query)
@@ -296,7 +328,12 @@ impl AlignmentQueryResolution {
 
 pub(crate) struct AlignmentTrackController {
     pub(crate) config: SessionAlignmentTrack,
-    pub(crate) engine: AlignmentEngine,
+    /// New source-scoped immutable-scene authority.
+    pub(crate) scene_engine: Option<AlignmentSceneEngine<LocalBamCanonicalBackend>>,
+    pub(crate) scene_metadata: Option<AlignmentSceneSourceMetadata>,
+    /// Last Complete-read admission policy submitted to the source actor. This avoids flooding
+    /// the bounded control mailbox while still making the user setting live and retryable.
+    pub(crate) scene_complete_read_limit: usize,
     pub(crate) lifecycle: AlignmentTrackLifecycle,
     pub(crate) dictionary: Option<ReferenceDictionary>,
     pub(crate) index_overview: Option<Arc<rgv_hts::AlignmentIndexOverview>>,
@@ -375,17 +412,7 @@ impl AlignmentTrackController {
 
     pub(crate) fn mark_unavailable(&mut self, panel_id: PanelId, message: String) {
         let projection = self.projections.entry(panel_id).or_default();
-        projection.finish_checking();
-        projection.pending_query = false;
-        projection.current_query = None;
-        projection.layout_query = None;
-        projection.resident_query = None;
-        projection.layout_query_cache_hit = false;
-        projection.alignment_rows = None;
-        projection.cached_layout = None;
-        projection.unavailable = Some(message);
-        projection.index_only_overview = false;
-        projection.settled_generation = Some(projection.clock.current().get());
+        projection.settle_unavailable(message);
     }
 
     pub(crate) fn projection(&self, panel_id: PanelId) -> Option<&AlignmentPanelProjection> {
@@ -755,6 +782,223 @@ pub(crate) fn alignment_query_options(
     }
 }
 
+/// Source-level options for the unified scene. Presentation and summary contracts remain typed
+/// and independent; these options contain only source eligibility, resumable decode policy, and
+/// the richest payload currently required by desktop alignment consumers.
+fn alignment_scene_source_query_options(
+    config: &SessionAlignmentTrack,
+    active_filters: &ActiveFilters,
+) -> QueryOptions {
+    let filters = &config.filters;
+    let mut retained_auxiliary_tags = alignment_row_policy_auxiliary_tags(filters);
+    retained_auxiliary_tags.push(*b"XS");
+    if let AlignmentColorMode::Tag(tag) = filters.alignment_color_mode {
+        retained_auxiliary_tags.push(tag);
+    }
+    retained_auxiliary_tags.sort_unstable();
+    retained_auxiliary_tags.dedup();
+    QueryOptions {
+        detail: QueryDetail::Full,
+        retained_auxiliary_tags,
+        layout_requires_sequence: true,
+        max_records: NonZeroUsize::new(config.maximum_alignments.max(1))
+            .expect("the complete read limit is non-zero"),
+        collect_alleles: false,
+        collect_modifications: false,
+        overlapping_mate_policy: filters.overlapping_mate_policy,
+        minimum_base_quality: filters.minimum_base_quality,
+        minimum_junction_flank: filters.minimum_junction_flank,
+        include_secondary: active_filters.include_secondary,
+        include_supplementary: active_filters.include_supplementary,
+        include_reference: true,
+        filter: active_filters.alignment.clone(),
+        ..QueryOptions::default()
+    }
+}
+
+pub(crate) fn alignment_scene_build_contract(
+    config: &SessionAlignmentTrack,
+    metadata: &AlignmentSceneSourceMetadata,
+    contig: ContigId,
+    contig_length: u64,
+    viewport: Viewport,
+    promoted_template: Option<u64>,
+    reference_revision: Option<ReferenceRevision>,
+) -> AlignmentSceneBuildContract {
+    let filters = &config.filters;
+    let detail = viewport.detail_level();
+    let allele_detail = if viewport.bases_per_pixel() <= MAXIMUM_ALLELE_COVERAGE_BASES_PER_PIXEL
+        && viewport.interval().len() <= MAXIMUM_COVERAGE_BINS as u64
+    {
+        if filters.quality_weighted_alleles {
+            AlleleSummaryDetail::QualityWeighted
+        } else {
+            AlleleSummaryDetail::Counts
+        }
+    } else {
+        AlleleSummaryDetail::None
+    };
+    let mut hidden_modification_codes = [None; MAXIMUM_HIDDEN_MODIFICATION_CODES];
+    for (slot, code) in hidden_modification_codes.iter_mut().zip(
+        filters
+            .hidden_modification_codes
+            .iter()
+            .filter_map(|value| parse_modification_code(value)),
+    ) {
+        *slot = Some(code);
+    }
+    let geometry_lod = match detail {
+        DetailLevel::Overview => GeometryLod::Overview,
+        DetailLevel::Regional => GeometryLod::Span,
+        DetailLevel::Reads => GeometryLod::Read,
+        DetailLevel::Bases => GeometryLod::Base,
+    };
+    let scene_reference_revision =
+        alignment_scene_reference_revision(geometry_lod, reference_revision);
+    AlignmentSceneBuildContract {
+        source_revision: metadata.source_revision,
+        record_contract: metadata.record_contract,
+        contig,
+        contig_length,
+        // Complete record inspection/export is a product consumer. Retain the full payload once
+        // in canonical evidence rather than creating a second query authority on demand.
+        payload: PayloadContract::new_all_auxiliary(
+            CapabilityRequirement::Required,
+            CapabilityRequirement::Required,
+            None,
+        ),
+        summaries: SummaryContract {
+            overlapping_mate_policy: filters.overlapping_mate_policy,
+            minimum_base_quality: filters.minimum_base_quality,
+            minimum_junction_flank: filters.minimum_junction_flank,
+            allele_detail,
+            collect_modifications: filters.show_modification_frequency,
+        },
+        layout: LayoutContract {
+            row_scale_class: alignment::alignment_row_scale_class(viewport.bases_per_pixel()),
+            stacking: filters.read_stacking_mode,
+            grouping: filters.alignment_group_mode,
+            group_order: filters.alignment_group_order,
+            sorting: filters.alignment_sort_mode,
+            sort_order: filters.alignment_sort_order,
+            sort_anchor: alignment_sort_position(
+                filters.alignment_sort_mode,
+                filters.alignment_sort_anchor,
+                viewport,
+            ),
+            view_as_pairs: filters.view_as_pairs,
+            pair_length_bounds: TemplateLengthBounds {
+                minimum: filters.minimum_template_length,
+                maximum: filters.maximum_template_length,
+            },
+            promoted_template,
+        },
+        presentation: PresentationContract {
+            geometry_lod,
+            style: AlignmentStyleContract {
+                color_mode: filters.alignment_color_mode,
+                base_display: filters.read_base_display_mode,
+                shade_bases_by_quality: filters.shade_read_bases_by_quality,
+                minimum_indel_size: filters.minimum_indel_size,
+                minimum_event_label_size: filters.minimum_event_label_size,
+                read_labels: AlignmentReadLabelMode::Hidden,
+                show_direction_terminals: true,
+                show_modified_bases: filters.show_modified_bases,
+                minimum_modification_probability: filters.minimum_modification_probability,
+                modified_base_color_mode: filters.modified_base_color_mode,
+                hidden_modification_codes,
+            },
+            // Base semantics name the currently open immutable FASTA authority. The actual slice
+            // is installed asynchronously for the coordinator's exact requested horizon.
+            reference: scene_reference_revision,
+            annotation: None,
+        },
+        geometry_tile_bases: NonZeroU64::new(DESKTOP_ALIGNMENT_SCENE_TILE_BASES)
+            .expect("desktop scene tile size is non-zero"),
+        summary_tile_bases: NonZeroU64::new(DESKTOP_ALIGNMENT_SCENE_TILE_BASES)
+            .expect("desktop summary tile size is non-zero"),
+        row_block_rows: NonZeroU32::new(DESKTOP_ALIGNMENT_SCENE_ROW_BLOCK_ROWS)
+            .expect("desktop row block size is non-zero"),
+        normalization_mapped_records: metadata.normalization_mapped_records,
+        reference: None,
+        annotation: None,
+    }
+}
+
+/// Base geometry compares retained read sequence against an immutable FASTA authority. Coarser
+/// geometry stays reference-independent so opening or replacing a FASTA cannot invalidate the
+/// resident Span/Read stack.
+pub(crate) const fn alignment_scene_reference_revision(
+    geometry_lod: GeometryLod,
+    reference_revision: Option<ReferenceRevision>,
+) -> Option<ReferenceRevision> {
+    if matches!(geometry_lod, GeometryLod::Base) {
+        reference_revision
+    } else {
+        None
+    }
+}
+
+pub(crate) fn alignment_scene_preparation_policy(
+    buffer_percent: u16,
+    camera: AlignmentCamera,
+) -> AlignmentScenePreparationPolicy {
+    let side_viewports = f64::from(buffer_percent) / 100.0;
+    let visible_rows = camera.visible_rows().len().max(1);
+    let visible_rows = u32::try_from(visible_rows).unwrap_or(u32::MAX);
+    let scaled_rows = |denominator: u64| {
+        u64::from(visible_rows)
+            .saturating_mul(u64::from(buffer_percent))
+            .saturating_add(denominator.saturating_sub(1))
+            .checked_div(denominator)
+            .unwrap_or_default()
+            .min(u64::from(u32::MAX)) as u32
+    };
+    AlignmentScenePreparationPolicy::new(
+        side_viewports,
+        side_viewports,
+        side_viewports * 0.25,
+        scaled_rows(100),
+        scaled_rows(400).max(1),
+    )
+    .expect("desktop scene preparation policy is finite and non-negative")
+    .with_full_vertical_residency(true)
+}
+
+pub(crate) fn alignment_scene_contract_equivalent(
+    left: &AlignmentSceneBuildContract,
+    right: &AlignmentSceneBuildContract,
+) -> bool {
+    left.source_revision == right.source_revision
+        && left.record_contract == right.record_contract
+        && left.contig == right.contig
+        && left.contig_length == right.contig_length
+        && left.payload == right.payload
+        && left.summaries == right.summaries
+        && left.layout == right.layout
+        && left.presentation == right.presentation
+        && left.geometry_tile_bases == right.geometry_tile_bases
+        && left.summary_tile_bases == right.summary_tile_bases
+        && left.row_block_rows == right.row_block_rows
+        && left.normalization_mapped_records == right.normalization_mapped_records
+        && left
+            .reference
+            .as_ref()
+            .map(|authority| authority.revision())
+            == right
+                .reference
+                .as_ref()
+                .map(|authority| authority.revision())
+        && left
+            .annotation
+            .as_ref()
+            .map(|annotation| annotation.revision())
+            == right
+                .annotation
+                .as_ref()
+                .map(|annotation| annotation.revision())
+}
+
 fn alignment_row_policy_auxiliary_tags(filters: &SessionFilters) -> Vec<[u8; 2]> {
     let mut tags = Vec::new();
     match filters.alignment_group_mode {
@@ -1005,24 +1249,63 @@ pub(crate) fn alignment_row_pair_bounds_relevant(
 pub(crate) fn spawn_alignment_track_controller(
     config: SessionAlignmentTrack,
     cache_bytes: NonZeroUsize,
+    scene_ledger: AllocationLedger,
     reference_path: Option<PathBuf>,
     remote_reference_index_url: Option<String>,
     panel_ids: &[PanelId],
 ) -> Result<AlignmentTrackController> {
     let (filter_editor, active_filters) = filter_state_from_session(&config.filters)?;
-    let engine = AlignmentEngine::spawn_with_cache_budget(8, cache_bytes);
-    engine.try_open(
-        source_path(&config.source),
-        alignment_open_options(
-            reference_path,
-            config.remote_index_url.clone(),
-            remote_reference_index_url,
+    let (scene_engine, lifecycle) = match &config.source {
+        TrackSource::Local { path }
+            if Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("bam")) =>
+        {
+            let query_options = alignment_scene_source_query_options(&config, &active_filters);
+            (
+                Some(AlignmentSceneEngine::spawn_local_bam(
+                    LocalAlignmentSceneEngineConfig {
+                        path: PathBuf::from(path),
+                        open_options: alignment_open_options(
+                            reference_path,
+                            config.remote_index_url.clone(),
+                            remote_reference_index_url,
+                        ),
+                        query_options,
+                        ledger: scene_ledger,
+                        mailbox_control_capacity: NonZeroUsize::new(32)
+                            .expect("scene mailbox capacity is non-zero"),
+                        source_control_capacity: NonZeroUsize::new(8)
+                            .expect("scene source control capacity is non-zero"),
+                        maximum_source_control_burst: NonZeroUsize::new(4)
+                            .expect("scene source control burst is non-zero"),
+                    },
+                )),
+                AlignmentTrackLifecycle::Opening,
+            )
+        }
+        TrackSource::Local { .. } => (
+            None,
+            AlignmentTrackLifecycle::Failed(
+                "The unified alignment scene currently supports local BAM sources; this source was not opened and no legacy fallback was used"
+                    .to_owned(),
+            ),
         ),
-    )?;
+        TrackSource::Remote { .. } => (
+            None,
+            AlignmentTrackLifecycle::Failed(
+                "Remote alignment scene support is not qualified yet; this source was not opened and no legacy fallback was used"
+                    .to_owned(),
+            ),
+        ),
+    };
+    let scene_complete_read_limit = config.maximum_alignments.max(1);
     Ok(AlignmentTrackController {
         config,
-        engine,
-        lifecycle: AlignmentTrackLifecycle::Opening,
+        scene_engine,
+        scene_metadata: None,
+        scene_complete_read_limit,
+        lifecycle,
         dictionary: None,
         index_overview: None,
         filter_editor,

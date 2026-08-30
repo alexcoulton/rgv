@@ -5,6 +5,9 @@ impl Viewer {
     pub(crate) fn render(&mut self) {
         let frame_started = Instant::now();
         self.poll_background_work();
+        if self.alignment_gpu_prefetch_pending {
+            self.prepare_alignment_scene_frame();
+        }
         self.apply_captured_motion();
 
         self.rebuild_display_list();

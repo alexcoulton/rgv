@@ -14,19 +14,21 @@ use thiserror::Error;
 
 use crate::{
     AlignmentBatch, AlignmentFilter, AlignmentFlags, AlignmentHeaderMetadata,
-    AlignmentOverlapIndex, AlignmentReadGroup, AlignmentRecord, AlignmentRecordView, AuxField,
-    AuxValue, CigarOp, CigarOpKind, HttpRangeConfig, JunctionSummary, PairSummary,
-    PileupProvenance, PileupSummary, ReferenceSlice, RemoteError, SequenceData, SequenceView,
+    AlignmentOverlapIndex, AlignmentReadGroup, AlignmentRecord, AlignmentRecordView,
+    AlignmentSourceFormat, AlignmentSourceStamp, AuxField, AuxValue, CigarOp, CigarOpKind,
+    HttpRangeConfig, JunctionSummary, PairSummary, PileupProvenance, PileupSummary, ReferenceSlice,
+    RemoteError, SequenceData, SequenceView,
     alignment::alignment_header_metadata_from_sam,
     alignment::{BatchOverflow, FilteredRecordReason},
     bisulfite_strand_is_reverse,
-    index_overview::load_local_alignment_index_overview,
+    index_overview::{load_local_alignment_index_overview, local_alignment_index_candidates},
     junction::{
         JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
     },
     pileup::{
         OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, aligned_observation,
     },
+    source_revision::{LocalSourceGuard, local_source_stamp},
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -126,6 +128,11 @@ pub struct AlignmentOpenOptions {
     pub remote_index_url: Option<String>,
     pub remote_reference_index_url: Option<String>,
     pub remote_range: HttpRangeConfig,
+    /// Trusted identity override for a known immutable copy of the same source.
+    ///
+    /// Normal opens derive a conservative path/URL-specific stamp. Resource bundles may persist
+    /// and reuse a stamp when moving the exact BAM/CRAM and index between local and HTTP storage.
+    pub source_stamp_override: Option<AlignmentSourceStamp>,
 }
 
 impl Default for AlignmentOpenOptions {
@@ -141,6 +148,7 @@ impl Default for AlignmentOpenOptions {
                 maximum_coalesced_chunks: NonZeroUsize::new(8).unwrap(),
                 ..HttpRangeConfig::default()
             },
+            source_stamp_override: None,
         }
     }
 }
@@ -727,6 +735,11 @@ fn record_view_junction_strand(
 pub trait AlignmentSource {
     fn reference_dictionary(&self) -> &ReferenceDictionary;
 
+    /// Validated source generation used by immutable scene handles.
+    fn source_stamp(&self) -> Option<AlignmentSourceStamp> {
+        None
+    }
+
     fn index_overview(&self) -> Option<&crate::AlignmentIndexOverview> {
         None
     }
@@ -739,29 +752,171 @@ pub trait AlignmentSource {
     ) -> Result<AlignmentQuery, AlignmentError>;
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PositionedAlignmentRecord {
+    pub record: AlignmentRecord,
+    pub source_position: crate::AlignmentSourcePosition,
+}
+
+/// One bounded BGZF owner unit from a resumable indexed BAM transaction. The records are exactly
+/// the eligible records observed by this regional transaction in the physical unit; transaction
+/// completeness is reported separately and must never be inferred from this fragment alone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PositionedAlignmentBlock {
+    pub compressed_offset: u64,
+    pub records: Vec<PositionedAlignmentRecord>,
+    pub genomic_span: Option<GenomicInterval>,
+}
+
+impl PositionedAlignmentBlock {
+    /// Logical heap capacity retained by this completed decoder owner block. Source adapters use
+    /// this measured block size to reserve the duplicate packing/copy working set before creating
+    /// canonical scene allocations. HTSlib's internal decoder buffers remain separately reported
+    /// process overhead because they are allocated below this Rust ownership boundary.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.records
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PositionedAlignmentRecord>()),
+            )
+            .saturating_add(self.records.iter().fold(0_usize, |total, positioned| {
+                total.saturating_add(alignment_record_heap_bytes(&positioned.record))
+            }))
+    }
+}
+
+fn alignment_record_heap_bytes(record: &AlignmentRecord) -> usize {
+    let sequence_bytes = match &record.sequence {
+        SequenceData::Present { bases, qualities } => bases.capacity().saturating_add(
+            qualities
+                .as_ref()
+                .map_or(0, |qualities| qualities.capacity()),
+        ),
+        SequenceData::NotLoaded | SequenceData::Missing => 0,
+    };
+    record
+        .read_name
+        .capacity()
+        .saturating_add(
+            record
+                .cigar
+                .capacity()
+                .saturating_mul(std::mem::size_of::<crate::CigarOp>()),
+        )
+        .saturating_add(sequence_bytes)
+        .saturating_add(
+            record
+                .auxiliary_fields
+                .capacity()
+                .saturating_mul(std::mem::size_of::<crate::AuxField>()),
+        )
+        .saturating_add(
+            record
+                .auxiliary_fields
+                .iter()
+                .fold(0_usize, |total, field| {
+                    total.saturating_add(auxiliary_value_heap_bytes(&field.value))
+                }),
+        )
+}
+
+fn auxiliary_value_heap_bytes(value: &crate::AuxValue) -> usize {
+    match value {
+        crate::AuxValue::String(value) | crate::AuxValue::HexByteArray(value) => value.capacity(),
+        crate::AuxValue::SignedArray(value) => {
+            value.capacity().saturating_mul(std::mem::size_of::<i64>())
+        }
+        crate::AuxValue::UnsignedArray(value) => {
+            value.capacity().saturating_mul(std::mem::size_of::<u64>())
+        }
+        crate::AuxValue::FloatArray(value) => {
+            value.capacity().saturating_mul(std::mem::size_of::<f32>())
+        }
+        crate::AuxValue::Character(_)
+        | crate::AuxValue::Signed(_)
+        | crate::AuxValue::Unsigned(_)
+        | crate::AuxValue::Float(_)
+        | crate::AuxValue::Double(_) => 0,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PositionedAlignmentStreamCompletion {
+    pub interval: GenomicInterval,
+    pub stats: QueryStats,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PositionedAlignmentStreamCheckpoint {
+    Block(PositionedAlignmentBlock),
+    Complete(PositionedAlignmentStreamCompletion),
+    Cancelled(PositionedAlignmentStreamCompletion),
+}
+
+struct LocalPositionedStreamState {
+    interval: GenomicInterval,
+    options: QueryOptions,
+    stats: QueryStats,
+    current_block: Option<u64>,
+    current_records: Vec<PositionedAlignmentRecord>,
+    current_span: Option<(u64, u64)>,
+    pending: Option<(bam::Record, crate::AlignmentSourcePosition)>,
+    reached_end: bool,
+}
+
 pub struct LocalAlignmentSource {
     reader: bam::IndexedReader,
+    encoding: LocalAlignmentEncoding,
     dictionary: ReferenceDictionary,
     header: Arc<AlignmentHeaderMetadata>,
     normalization_mapped_records: Option<u64>,
     index_overview: Option<crate::AlignmentIndexOverview>,
+    source_stamp: Option<AlignmentSourceStamp>,
+    source_guard: Option<LocalSourceGuard>,
+    positioned_stream: Option<LocalPositionedStreamState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalAlignmentEncoding {
+    Bam,
+    Cram,
+    Unknown,
 }
 
 impl LocalAlignmentSource {
+    /// Exact mapped-record total obtained from constant-time local BAM index statistics when it
+    /// is available. Scene-owned CPM summaries carry this as an explicit source dependency.
+    #[must_use]
+    pub const fn normalization_mapped_records(&self) -> Option<u64> {
+        self.normalization_mapped_records
+    }
+
     pub fn open(
         path: impl AsRef<Path>,
         options: &AlignmentOpenOptions,
     ) -> Result<Self, AlignmentError> {
         let path = path.as_ref();
         let raw_path = path.to_string_lossy();
+        let encoding = match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("bam") => LocalAlignmentEncoding::Bam,
+            Some("cram") => LocalAlignmentEncoding::Cram,
+            _ => LocalAlignmentEncoding::Unknown,
+        };
         let remote_url = is_remote_url(&raw_path)
             .then(|| url::Url::parse(&raw_path))
             .transpose()?;
-        let mut reader = if let Some(url) = remote_url {
+        let mut reader = if let Some(url) = remote_url.as_ref() {
             if options.index_path.is_some() {
                 return Err(AlignmentError::RemoteIndexOverrideUnsupported);
             }
-            bam::IndexedReader::from_url(&url)?
+            bam::IndexedReader::from_url(url)?
         } else if let Some(index_path) = &options.index_path {
             bam::IndexedReader::from_path_and_index(path, index_path)?
         } else {
@@ -804,13 +959,228 @@ impl LocalAlignmentSource {
             ));
         let index_overview =
             load_local_alignment_index_overview(path, options.index_path.as_deref(), &dictionary);
+        let (source_stamp, source_guard) = if remote_url.is_none() {
+            let format = match encoding {
+                LocalAlignmentEncoding::Bam => Some(AlignmentSourceFormat::Bam),
+                LocalAlignmentEncoding::Cram => Some(AlignmentSourceFormat::Cram),
+                LocalAlignmentEncoding::Unknown => None,
+            };
+            if let Some(format) = format {
+                let index_path =
+                    local_alignment_index_candidates(path, options.index_path.as_deref(), format)
+                        .into_iter()
+                        .find(|candidate| candidate.is_file())
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "opened alignment index could not be resolved for revision capture",
+                            )
+                        })?;
+                let guard = LocalSourceGuard::capture(path, &index_path)?;
+                let stamp = options.source_stamp_override.map_or_else(
+                    || local_source_stamp(path, &index_path, format, &dictionary, &metadata),
+                    Ok,
+                )?;
+                (Some(stamp), Some(guard))
+            } else {
+                (options.source_stamp_override, None)
+            }
+        } else {
+            (options.source_stamp_override, None)
+        };
         Ok(Self {
             reader,
+            encoding,
             dictionary,
             header: metadata,
             normalization_mapped_records,
             index_overview,
+            source_stamp,
+            source_guard,
+            positioned_stream: None,
         })
+    }
+
+    /// Starts a resumable indexed BAM transaction. Calling this again retargets by discarding only
+    /// the unfinished transaction state; already returned blocks remain independently usable.
+    pub fn begin_positioned_stream(
+        &mut self,
+        interval: GenomicInterval,
+        options: QueryOptions,
+    ) -> Result<(), AlignmentError> {
+        if self.encoding != LocalAlignmentEncoding::Bam {
+            return Err(AlignmentError::PositionedStreamUnsupported);
+        }
+        if let Some(guard) = &self.source_guard
+            && !guard.validate()?
+        {
+            return Err(AlignmentError::SourceChanged);
+        }
+        let tid = i32::try_from(interval.contig().get())
+            .map_err(|_| AlignmentError::CoordinateOverflow)?;
+        let start =
+            i64::try_from(interval.start()).map_err(|_| AlignmentError::CoordinateOverflow)?;
+        let end = i64::try_from(interval.end()).map_err(|_| AlignmentError::CoordinateOverflow)?;
+        self.reader.fetch((tid, start, end))?;
+        self.positioned_stream = Some(LocalPositionedStreamState {
+            interval,
+            stats: QueryStats {
+                complete_read_limit: options.max_records.get(),
+                ..QueryStats::default()
+            },
+            options,
+            current_block: None,
+            current_records: Vec::new(),
+            current_span: None,
+            pending: None,
+            reached_end: false,
+        });
+        Ok(())
+    }
+
+    /// Abandons the unfinished positioned transaction without invalidating any blocks already
+    /// returned to its owner.
+    pub fn cancel_positioned_stream(&mut self) {
+        self.positioned_stream = None;
+    }
+
+    /// Performs at most one physical BAM owner unit of source work.
+    pub fn next_positioned_stream_checkpoint(
+        &mut self,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<PositionedAlignmentStreamCheckpoint, AlignmentError> {
+        if self.positioned_stream.is_none() {
+            return Err(AlignmentError::NoActivePositionedStream);
+        }
+        loop {
+            let reached_end = self
+                .positioned_stream
+                .as_ref()
+                .is_some_and(|state| state.reached_end);
+            if reached_end {
+                if self
+                    .positioned_stream
+                    .as_ref()
+                    .is_some_and(|state| state.current_block.is_some())
+                {
+                    return self.finish_positioned_block();
+                }
+                let mut state = self
+                    .positioned_stream
+                    .take()
+                    .expect("active positioned stream was checked");
+                finalize_positioned_stream_stats(&mut state.stats);
+                let completion = PositionedAlignmentStreamCompletion {
+                    interval: state.interval,
+                    stats: state.stats,
+                };
+                return Ok(if completion.stats.cancelled {
+                    PositionedAlignmentStreamCheckpoint::Cancelled(completion)
+                } else {
+                    PositionedAlignmentStreamCheckpoint::Complete(completion)
+                });
+            }
+
+            let pending = self
+                .positioned_stream
+                .as_mut()
+                .and_then(|state| state.pending.take());
+            let next = if let Some(pending) = pending {
+                Some(Ok(pending))
+            } else {
+                let mut record = bam::Record::new();
+                self.reader.read(&mut record).map(|result| {
+                    result.and_then(|()| {
+                        let position = u64::try_from(self.reader.tell())
+                            .map_err(|_| rust_htslib::errors::Error::FileSeek)?;
+                        Ok((
+                            record,
+                            crate::AlignmentSourcePosition::bam_virtual_offset(position),
+                        ))
+                    })
+                })
+            };
+            let Some(next) = next else {
+                self.positioned_stream
+                    .as_mut()
+                    .expect("active positioned stream was checked")
+                    .reached_end = true;
+                continue;
+            };
+            let (record, source_position) = next?;
+            let compressed_offset = match source_position {
+                crate::AlignmentSourcePosition::BamVirtualOffset(offset) => offset >> 16,
+                crate::AlignmentSourcePosition::CramRecord { .. } => {
+                    return Err(AlignmentError::PositionedStreamUnsupported);
+                }
+            };
+            let has_completed_block = self
+                .positioned_stream
+                .as_ref()
+                .and_then(|state| state.current_block)
+                .is_some_and(|current| current != compressed_offset);
+            if has_completed_block {
+                self.positioned_stream
+                    .as_mut()
+                    .expect("active positioned stream was checked")
+                    .pending = Some((record, source_position));
+                return self.finish_positioned_block();
+            }
+
+            let state = self
+                .positioned_stream
+                .as_mut()
+                .expect("active positioned stream was checked");
+            state.stats.records_seen = state.stats.records_seen.saturating_add(1);
+            if state
+                .stats
+                .records_seen
+                .is_multiple_of(state.options.cancellation_chunk.get())
+                && !keep_going()
+            {
+                state.stats.cancelled = true;
+                state.reached_end = true;
+                continue;
+            }
+            state.current_block = Some(compressed_offset);
+            process_positioned_bam_record(state, record, source_position)?;
+        }
+    }
+
+    fn finish_positioned_block(
+        &mut self,
+    ) -> Result<PositionedAlignmentStreamCheckpoint, AlignmentError> {
+        let state = self
+            .positioned_stream
+            .as_mut()
+            .ok_or(AlignmentError::NoActivePositionedStream)?;
+        let compressed_offset = state
+            .current_block
+            .take()
+            .ok_or(AlignmentError::NoActivePositionedStream)?;
+        state.current_records.sort_by(|left, right| {
+            (
+                left.record.start,
+                left.record.end,
+                &left.record.read_name,
+                left.source_position,
+            )
+                .cmp(&(
+                    right.record.start,
+                    right.record.end,
+                    &right.record.read_name,
+                    right.source_position,
+                ))
+        });
+        Ok(PositionedAlignmentStreamCheckpoint::Block(
+            PositionedAlignmentBlock {
+                compressed_offset,
+                records: std::mem::take(&mut state.current_records),
+                genomic_span: state.current_span.take().and_then(|(start, end)| {
+                    GenomicInterval::new(state.interval.contig(), start, end).ok()
+                }),
+            },
+        ))
     }
 }
 
@@ -821,6 +1191,10 @@ fn is_remote_url(value: &str) -> bool {
 impl AlignmentSource for LocalAlignmentSource {
     fn reference_dictionary(&self) -> &ReferenceDictionary {
         &self.dictionary
+    }
+
+    fn source_stamp(&self) -> Option<AlignmentSourceStamp> {
+        self.source_stamp
     }
 
     fn index_overview(&self) -> Option<&crate::AlignmentIndexOverview> {
@@ -834,6 +1208,12 @@ impl AlignmentSource for LocalAlignmentSource {
         options: QueryOptions,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<AlignmentQuery, AlignmentError> {
+        self.positioned_stream = None;
+        if let Some(guard) = &self.source_guard
+            && !guard.validate()?
+        {
+            return Err(AlignmentError::SourceChanged);
+        }
         if !keep_going() {
             return Ok(cancelled_query(interval, Arc::clone(&self.header)));
         }
@@ -873,6 +1253,10 @@ impl AlignmentSource for LocalAlignmentSource {
         let mut record = bam::Record::new();
         while let Some(result) = self.reader.read(&mut record) {
             result?;
+            let source_position = (self.encoding == LocalAlignmentEncoding::Bam)
+                .then(|| u64::try_from(self.reader.tell()).ok())
+                .flatten()
+                .map(crate::AlignmentSourcePosition::bam_virtual_offset);
             stats.records_seen += 1;
             if stats
                 .records_seen
@@ -961,7 +1345,7 @@ impl AlignmentSource for LocalAlignmentSource {
             };
 
             if !too_dense {
-                retained.push(match normalized_for_modifications {
+                let normalized = match normalized_for_modifications {
                     // Modification rendering, export, inspection, and MCP
                     // discovery must all observe the same complete record set.
                     // The summary already paid the cost to normalize the full
@@ -970,16 +1354,27 @@ impl AlignmentSource for LocalAlignmentSource {
                     None => {
                         normalize_record(&record, options.detail, &options.retained_auxiliary_tags)?
                     }
-                });
+                };
+                retained.push((normalized, source_position));
             }
         }
 
         retained.sort_by(|left, right| {
-            (left.start, left.end, &left.read_name).cmp(&(right.start, right.end, &right.read_name))
+            (left.0.start, left.0.end, &left.0.read_name).cmp(&(
+                right.0.start,
+                right.0.end,
+                &right.0.read_name,
+            ))
         });
         let mut batch = AlignmentBatch::default();
-        for record in &retained {
-            batch.push(record).map_err(AlignmentError::BatchOverflow)?;
+        for (record, source_position) in &retained {
+            if let Some(source_position) = source_position {
+                batch
+                    .push_with_source_position(record, *source_position)
+                    .map_err(AlignmentError::BatchOverflow)?;
+            } else {
+                batch.push(record).map_err(AlignmentError::BatchOverflow)?;
+            }
         }
         batch.absorb_filtered_records(filtered_records);
         stats.records_emitted = retained.len();
@@ -1015,6 +1410,95 @@ impl AlignmentSource for LocalAlignmentSource {
             reference: None,
             stats,
         })
+    }
+}
+
+fn process_positioned_bam_record(
+    state: &mut LocalPositionedStreamState,
+    record: bam::Record,
+    source_position: crate::AlignmentSourcePosition,
+) -> Result<(), AlignmentError> {
+    let flags = AlignmentFlags::from_bits(record.flags());
+    let record_span = u64::try_from(record.pos()).ok().and_then(|start| {
+        u64::try_from(record.cigar().end_pos())
+            .ok()
+            .filter(|end| *end > start)
+            .map(|end| (start, end))
+    });
+    if let Some((start, end)) = record_span {
+        state.current_span = Some(
+            state
+                .current_span
+                .map_or((start, end), |(minimum, maximum)| {
+                    (minimum.min(start), maximum.max(end))
+                }),
+        );
+    }
+    if flags.is_unmapped() {
+        state.stats.records_filtered_unmapped =
+            state.stats.records_filtered_unmapped.saturating_add(1);
+        return Ok(());
+    }
+    if !state.options.include_secondary && flags.is_secondary() {
+        state.stats.records_filtered_secondary =
+            state.stats.records_filtered_secondary.saturating_add(1);
+        return Ok(());
+    }
+    if !state.options.include_supplementary && flags.is_supplementary() {
+        state.stats.records_filtered_supplementary =
+            state.stats.records_filtered_supplementary.saturating_add(1);
+        return Ok(());
+    }
+    if !state.options.filter.matches(&record)? {
+        state.stats.records_filtered_user = state.stats.records_filtered_user.saturating_add(1);
+        state.stats.records_filtered_duplicate = state
+            .stats
+            .records_filtered_duplicate
+            .saturating_add(usize::from(flags.is_duplicate()));
+        state.stats.records_filtered_qc_failed = state
+            .stats
+            .records_filtered_qc_failed
+            .saturating_add(usize::from(flags.is_qc_failed()));
+        return Ok(());
+    }
+    state.stats.records_eligible = state.stats.records_eligible.saturating_add(1);
+    // Continue evaluating the exact filter population after the Complete admission limit is
+    // crossed, but do not retain an unbounded rejected individual-read candidate. Blocks already
+    // returned remain valid salvageable fragments for a later smaller target.
+    if state.stats.records_eligible > state.options.max_records.get() {
+        return Ok(());
+    }
+    let detail = if state.options.collect_modifications {
+        QueryDetail::Full
+    } else {
+        state.options.detail
+    };
+    let normalized = normalize_record(
+        &record,
+        detail,
+        if state.options.collect_modifications {
+            &[]
+        } else {
+            &state.options.retained_auxiliary_tags
+        },
+    )?;
+    state.current_records.push(PositionedAlignmentRecord {
+        record: normalized,
+        source_position,
+    });
+    state.stats.records_emitted = state.stats.records_emitted.saturating_add(1);
+    Ok(())
+}
+
+fn finalize_positioned_stream_stats(stats: &mut QueryStats) {
+    let limit = stats.complete_read_limit;
+    if stats.records_eligible > limit {
+        stats.records_emitted = 0;
+        stats.truncated = true;
+        stats.individual_reads = IndividualReadStatus::TooDense { limit };
+    } else {
+        stats.truncated = false;
+        stats.individual_reads = IndividualReadStatus::Complete;
     }
 }
 
@@ -1264,6 +1748,12 @@ pub enum AlignmentError {
     UnmappedRecord,
     #[error("alignment header is missing or invalid")]
     InvalidAlignmentHeader,
+    #[error("alignment source or its index changed after it was opened")]
+    SourceChanged,
+    #[error("resumable physical-unit streaming is available only for positioned BAM sources")]
+    PositionedStreamUnsupported,
+    #[error("no resumable positioned alignment transaction is active")]
+    NoActivePositionedStream,
     #[error("alignment batch exceeded its packed 32-bit arena offsets")]
     BatchOverflow(BatchOverflow),
     #[error(transparent)]
@@ -1336,6 +1826,94 @@ mod tests {
         drop(writer);
         let index = PathBuf::from(format!("{}.bai", path.display()));
         bam::index::build(path, Some(&index), bam::index::Type::Bai, 1).unwrap();
+    }
+
+    fn write_positioned_stream_fixture(path: &Path, record_count: usize) {
+        use rust_htslib::bam::{
+            Format, Header, Record, Writer,
+            header::HeaderRecord,
+            record::{Cigar, CigarString},
+        };
+
+        let mut header = Header::new();
+        header.push_record(
+            HeaderRecord::new(b"HD")
+                .push_tag(b"VN", "1.6")
+                .push_tag(b"SO", "coordinate"),
+        );
+        header.push_record(
+            HeaderRecord::new(b"SQ")
+                .push_tag(b"SN", "chr1")
+                .push_tag(b"LN", 1_000_000),
+        );
+        let mut writer = Writer::from_path(path, &header, Format::Bam).unwrap();
+        for index in 0..record_count {
+            let name = format!("positioned-{index:08}");
+            let mut record = Record::new();
+            record.set(
+                name.as_bytes(),
+                Some(&CigarString(vec![Cigar::Equal(75)])),
+                &[b'A'; 75],
+                &[35; 75],
+            );
+            record.set_tid(0);
+            record.set_pos(i64::try_from(index.saturating_mul(3)).unwrap());
+            record.set_mapq(60);
+            if index.is_multiple_of(101) {
+                record.set_flags(0x100);
+            } else if index.is_multiple_of(137) {
+                record.set_flags(0x800);
+            }
+            writer.write(&record).unwrap();
+        }
+        drop(writer);
+        let index = PathBuf::from(format!("{}.bai", path.display()));
+        bam::index::build(path, Some(&index), bam::index::Type::Bai, 1).unwrap();
+    }
+
+    fn collect_positioned_stream(
+        source: &mut LocalAlignmentSource,
+        interval: GenomicInterval,
+        options: QueryOptions,
+    ) -> (
+        Vec<PositionedAlignmentBlock>,
+        PositionedAlignmentStreamCompletion,
+    ) {
+        source.begin_positioned_stream(interval, options).unwrap();
+        let mut blocks = Vec::new();
+        loop {
+            match source.next_positioned_stream_checkpoint(&|| true).unwrap() {
+                PositionedAlignmentStreamCheckpoint::Block(block) => blocks.push(block),
+                PositionedAlignmentStreamCheckpoint::Complete(completion) => {
+                    return (blocks, completion);
+                }
+                PositionedAlignmentStreamCheckpoint::Cancelled(_) => {
+                    panic!("an uncancelled positioned stream was cancelled")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn open_local_source_rejects_an_index_changed_during_the_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("changed-index.bam");
+        write_placed_unmapped_fixture(&path);
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        assert!(source.source_stamp().is_some());
+
+        let index_path = PathBuf::from(format!("{}.bai", path.display()));
+        let mut bytes = fs::read(&index_path).unwrap();
+        bytes.push(0);
+        fs::write(index_path, bytes).unwrap();
+
+        let result = source.query(
+            GenomicInterval::new(ContigId::new(0), 0, 200).unwrap(),
+            QueryOptions::default(),
+            &|| true,
+        );
+        assert!(matches!(result, Err(AlignmentError::SourceChanged)));
     }
 
     #[test]
@@ -1513,6 +2091,192 @@ mod tests {
         assert_eq!(derived.pileup, exact.pileup);
         assert_eq!(derived.junctions, exact.junctions);
         assert_eq!(derived.pairs, exact.pairs);
+    }
+
+    #[test]
+    fn local_bam_positions_are_stable_across_independent_query_boundaries() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
+        if !path.exists() {
+            return;
+        }
+        let broad = GenomicInterval::new(ContigId::new(0), 9_950, 10_050).unwrap();
+        let target = GenomicInterval::new(ContigId::new(0), 9_999, 10_001).unwrap();
+        let options = QueryOptions {
+            max_records: NonZeroUsize::new(1_000).unwrap(),
+            ..QueryOptions::default()
+        };
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let resident = source.query(broad, options.clone(), &|| true).unwrap();
+        let exact = source.query(target, options, &|| true).unwrap();
+        let resident_positions = (0..resident.batch.len())
+            .map(|index| resident.batch.source_position(index).unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        let exact_positions = (0..exact.batch.len())
+            .map(|index| exact.batch.source_position(index).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            exact_positions.len(),
+            exact_positions
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
+        assert!(
+            exact_positions
+                .iter()
+                .all(|position| resident_positions.contains(position))
+        );
+    }
+
+    #[test]
+    fn positioned_stream_is_bounded_by_physical_owner_and_matches_fresh_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("positioned-stream.bam");
+        write_positioned_stream_fixture(&path, 4_000);
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 20_000).unwrap();
+        let options = QueryOptions {
+            detail: QueryDetail::Full,
+            max_records: NonZeroUsize::new(10_000).unwrap(),
+            ..QueryOptions::default()
+        };
+        let mut exact_source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let exact = exact_source
+            .query(interval, options.clone(), &|| true)
+            .unwrap();
+        let mut stream_source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let (blocks, completion) = collect_positioned_stream(&mut stream_source, interval, options);
+
+        assert!(blocks.len() > 1, "fixture must cross multiple BGZF owners");
+        assert_eq!(completion.stats, exact.stats);
+        let streamed = blocks
+            .iter()
+            .flat_map(|block| {
+                block.records.iter().map(|record| {
+                    let crate::AlignmentSourcePosition::BamVirtualOffset(offset) =
+                        record.source_position
+                    else {
+                        panic!("a local BAM stream returned a CRAM source position")
+                    };
+                    assert_eq!(offset >> 16, block.compressed_offset);
+                    (record.source_position, record.record.clone())
+                })
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(streamed.len(), exact.batch.len());
+        for index in 0..exact.batch.len() {
+            let position = exact.batch.source_position(index).unwrap();
+            assert_eq!(
+                streamed.get(&position),
+                Some(&exact.batch.materialize_record(index).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn positioned_stream_cancellation_never_reports_complete_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("positioned-cancel.bam");
+        write_positioned_stream_fixture(&path, 1_000);
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 10_000).unwrap();
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        source
+            .begin_positioned_stream(
+                interval,
+                QueryOptions {
+                    cancellation_chunk: NonZeroUsize::new(1).unwrap(),
+                    ..QueryOptions::default()
+                },
+            )
+            .unwrap();
+
+        loop {
+            match source.next_positioned_stream_checkpoint(&|| false).unwrap() {
+                PositionedAlignmentStreamCheckpoint::Block(_) => {}
+                PositionedAlignmentStreamCheckpoint::Cancelled(completion) => {
+                    assert!(completion.stats.cancelled);
+                    assert_eq!(completion.interval, interval);
+                    break;
+                }
+                PositionedAlignmentStreamCheckpoint::Complete(_) => {
+                    panic!("cancelled positioned work certified complete coverage")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn beginning_a_new_positioned_stream_discards_only_unfinished_transaction_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("positioned-retarget.bam");
+        write_positioned_stream_fixture(&path, 4_000);
+        let options = QueryOptions {
+            detail: QueryDetail::Full,
+            max_records: NonZeroUsize::new(10_000).unwrap(),
+            ..QueryOptions::default()
+        };
+        let first = GenomicInterval::new(ContigId::new(0), 0, 5_000).unwrap();
+        let target = GenomicInterval::new(ContigId::new(0), 8_000, 12_500).unwrap();
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        source
+            .begin_positioned_stream(first, options.clone())
+            .unwrap();
+        assert!(matches!(
+            source.next_positioned_stream_checkpoint(&|| true).unwrap(),
+            PositionedAlignmentStreamCheckpoint::Block(_)
+        ));
+        let (blocks, completion) = collect_positioned_stream(&mut source, target, options.clone());
+        let mut exact_source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let exact = exact_source.query(target, options, &|| true).unwrap();
+
+        assert_eq!(completion.stats, exact.stats);
+        let positions = blocks
+            .iter()
+            .flat_map(|block| block.records.iter().map(|record| record.source_position))
+            .collect::<std::collections::HashSet<_>>();
+        let exact_positions = (0..exact.batch.len())
+            .map(|index| exact.batch.source_position(index).unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(positions, exact_positions);
+    }
+
+    #[test]
+    fn positioned_stream_stops_retaining_records_after_explicit_complete_limit_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("positioned-refusal.bam");
+        write_positioned_stream_fixture(&path, 4_000);
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 20_000).unwrap();
+        let limit = 10;
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let (blocks, completion) = collect_positioned_stream(
+            &mut source,
+            interval,
+            QueryOptions {
+                detail: QueryDetail::Full,
+                max_records: NonZeroUsize::new(limit).unwrap(),
+                ..QueryOptions::default()
+            },
+        );
+        let retained = blocks
+            .iter()
+            .map(|block| block.records.len())
+            .sum::<usize>();
+
+        assert_eq!(retained, limit);
+        assert!(completion.stats.records_eligible > limit);
+        assert_eq!(completion.stats.records_emitted, 0);
+        assert_eq!(
+            completion.stats.individual_reads,
+            IndividualReadStatus::TooDense { limit }
+        );
     }
 
     #[test]

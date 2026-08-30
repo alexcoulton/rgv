@@ -60,18 +60,26 @@ fn panel_view_locus(panel: &ViewPanelController) -> String {
 }
 
 fn inspected_read_item(viewer: &Viewer, panel: &ViewPanelController) -> Option<InspectedPanelItem> {
-    let track_id = panel.selected_alignment_track.or_else(|| {
-        panel
-            .pending_read_selection
-            .as_ref()
-            .map(|pending| pending.track_id)
-    })?;
-    let resolved = panel.selected_record.and_then(|index| {
-        viewer
-            .complete_read_query_for_track_in_panel(track_id, panel.id)?
-            .materialize_record(index)
-            .ok()
-    });
+    let scene_hit = panel.selected_alignment_hit;
+    let track_id = scene_hit
+        .map(|hit| hit.track)
+        .or(panel.selected_alignment_track)
+        .or_else(|| {
+            panel
+                .pending_read_selection
+                .as_ref()
+                .map(|pending| pending.track_id)
+        })?;
+    let resolved = scene_hit
+        .and_then(|hit| viewer.alignment_scene_record_for_hit(panel.id, hit))
+        .or_else(|| {
+            panel.selected_record.and_then(|index| {
+                viewer
+                    .complete_read_query_for_track_in_panel(track_id, panel.id)?
+                    .materialize_record(index)
+                    .ok()
+            })
+        });
     let (read_name, template_end, locus) = if let Some(record) = resolved {
         let template_end = match (
             record.flags.is_first_in_template(),
@@ -91,13 +99,14 @@ fn inspected_read_item(viewer: &Viewer, panel: &ViewPanelController) -> Option<I
                 record.end
             ),
         )
-    } else {
-        let pending = panel.pending_read_selection.as_ref()?;
+    } else if let Some(pending) = panel.pending_read_selection.as_ref() {
         (
             pending.read_name.clone(),
             pending.template_end,
             panel_view_locus(panel),
         )
+    } else {
+        (Vec::new(), None, panel_view_locus(panel))
     };
     let kind = match template_end {
         Some(TemplateReadEnd::First) => "Read 1/2",
@@ -119,7 +128,10 @@ fn inspected_panel_item(
     viewer: &Viewer,
     panel: &ViewPanelController,
 ) -> Option<InspectedPanelItem> {
-    if panel.selected_record.is_some() || panel.pending_read_selection.is_some() {
+    if panel.selected_alignment_hit.is_some()
+        || panel.selected_record.is_some()
+        || panel.pending_read_selection.is_some()
+    {
         return inspected_read_item(viewer, panel);
     }
     let (kind, subject) = if let Some(position) = panel.selected_pileup_position {

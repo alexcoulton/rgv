@@ -8,6 +8,7 @@ members = [
     "benchmarks/comparison",
     "benchmarks/remote-range",
     "validation/runner",
+    "crates/rgv-alignment-scene",
     "crates/rgv-core",
     "crates/rgv-engine",
     "crates/rgv-hts",

@@ -2,6 +2,7 @@
 
 mod alignment;
 mod bisulfite;
+mod exact_depth;
 mod filter;
 mod index_overview;
 mod junction;
@@ -15,6 +16,8 @@ mod remote;
 mod remote_alignment;
 mod sbx;
 mod smrt_kinetics;
+mod source_position;
+mod source_revision;
 mod summary_index;
 mod supplementary;
 mod tdf;
@@ -23,31 +26,36 @@ mod ultima;
 
 pub use alignment::{
     AlignedBaseClassification, AlignmentBatch, AlignmentFlags, AlignmentHeaderMetadata,
-    AlignmentOverlapIndex, AlignmentReadGroup, AlignmentRecord, AlignmentRecordView,
-    AlignmentReferenceSequence, AlignmentStableId, AlignmentStorageRecordId, AuxField, AuxValue,
-    CigarOp, CigarOpKind, MAX_ALIGNMENT_READ_GROUPS, PackedRecordError, SequenceData, SequenceView,
-    UltimaTagOrientation, classify_aligned_base, resolve_assembly_from_header,
+    AlignmentOverlapIndex, AlignmentPayloadBatch, AlignmentPayloadError, AlignmentReadGroup,
+    AlignmentRecord, AlignmentRecordView, AlignmentReferenceSequence, AlignmentStableId,
+    AlignmentStorageRecordId, AuxField, AuxValue, CigarOp, CigarOpKind, MAX_ALIGNMENT_READ_GROUPS,
+    PackedRecordError, SequenceData, SequenceView, UltimaTagOrientation, classify_aligned_base,
+    resolve_assembly_from_header,
 };
 pub use bisulfite::{
     BisulfiteObservation, BisulfiteSummary, bisulfite_context_matches, bisulfite_strand_is_reverse,
     classify_bisulfite_observation, summarize_bisulfite_record,
 };
+pub use exact_depth::{ExactDepthRun, ExactDepthTile, ExactDepthTileBuilder};
 pub use filter::{AlignmentFilter, AuxComparison, AuxPredicate, FilterParseError, FilterValue};
 pub use index_overview::{ALIGNMENT_INDEX_OVERVIEW_BINS, AlignmentIndexOverview};
 pub use junction::{
-    JunctionEvidence, JunctionProvenance, JunctionStrand, JunctionSummary, MAX_JUNCTIONS,
-    MAX_JUNCTIONS_PER_RECORD,
+    JunctionEvidence, JunctionObservation, JunctionProvenance, JunctionStrand, JunctionStrandInput,
+    JunctionSummary, JunctionSummaryBuilder, MAX_JUNCTIONS, MAX_JUNCTIONS_PER_RECORD,
+    RecordJunctionCollector,
 };
 pub use local::{
     AlignmentDerivationMetrics, AlignmentDerivationPhase, AlignmentError, AlignmentOpenOptions,
-    AlignmentQuery, AlignmentSource, IndividualReadStatus, LocalAlignmentSource, QueryDetail,
-    QueryOptions, QueryStats, derive_alignment_query, derive_alignment_query_with_metrics,
+    AlignmentQuery, AlignmentSource, IndividualReadStatus, LocalAlignmentSource,
+    PositionedAlignmentBlock, PositionedAlignmentRecord, PositionedAlignmentStreamCheckpoint,
+    PositionedAlignmentStreamCompletion, QueryDetail, QueryOptions, QueryStats,
+    derive_alignment_query, derive_alignment_query_with_metrics,
     derive_alignment_query_with_metrics_and_phase,
     derive_alignment_query_with_summary_index_and_phase,
 };
 pub use modification_summary::{
     MAX_MODIFICATION_SERIES, ModificationBin, ModificationProvenance, ModificationSeries,
-    ModificationSeriesKey, ModificationSummary,
+    ModificationSeriesKey, ModificationSummary, ModificationSummaryBuilder,
 };
 pub use modified_bases::{
     BaseModificationStrand, ImplicitModificationMode, ModificationCode, ModifiedBaseCall,
@@ -56,12 +64,14 @@ pub use modified_bases::{
 };
 pub use pair::{
     MAX_TEMPLATE_LENGTH_SAMPLES, MIN_TEMPLATE_LENGTH_SAMPLES, MateVisibility, PairClassification,
-    PairEvidence, PairOrientation, PairSummary, ReadOrder, TemplateId, TemplateLengthBounds,
-    pair_evidence, pair_evidence_at, template_id,
+    PairEvidence, PairOrientation, PairSummary, PairSummaryBuilder, ReadOrder, TemplateId,
+    TemplateLengthBounds, pair_evidence, pair_evidence_at, pair_evidence_view, template_id,
 };
 pub use pileup::{
-    AlleleSupport, PileupBin, PileupProvenance, PileupSummary, QUALITY_WEIGHT_SCALE,
-    QualityWeightedAlleleSupport,
+    AlleleSupport, OverlapCollapser as AlignmentMateOverlapCollapser,
+    OverlapMask as AlignmentMateOverlapMask, PileupBin, PileupBuilder, PileupProvenance,
+    PileupSummary, QUALITY_WEIGHT_SCALE, QualityWeightedAlleleSupport, add_unmasked_range,
+    aligned_observation,
 };
 pub use reference::{FastaOpenOptions, FastaReference, ReferenceSlice};
 pub use remote::{
@@ -70,7 +80,8 @@ pub use remote::{
     read_remote_object_bounded, redact_url, remote_url_with_extension,
 };
 pub use remote_alignment::{
-    ProductionAlignmentSource, RemoteBamAlignmentSource, RemoteCramAlignmentSource,
+    LocalCramAlignmentSource, ProductionAlignmentSource, RemoteBamAlignmentSource,
+    RemoteCramAlignmentSource,
 };
 pub use sbx::{
     SbxEvidenceError, SbxInsertionState, SbxSummary, SbxTailBounds, classify_sbx_insertion,
@@ -81,6 +92,8 @@ pub use smrt_kinetics::{
     SmrtKineticsSummary, SmrtKineticsValues, decode_smrt_kinetics, smrt_kinetics_series,
     smrt_kinetics_tag,
 };
+pub use source_position::AlignmentSourcePosition;
+pub use source_revision::{AlignmentSourceFormat, AlignmentSourceStamp};
 pub use summary_index::{ALIGNMENT_SUMMARY_TILE_BASES, AlignmentSummaryIndex};
 pub use supplementary::{
     MAX_SUPPLEMENTARY_CIGAR_OPERATIONS, MAX_SUPPLEMENTARY_SEGMENTS, SupplementaryChain,

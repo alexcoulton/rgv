@@ -12,18 +12,86 @@ pub(crate) fn focused_junction_component_value(
     format!("{label} · {depth} supporting reads")
 }
 
+fn read_event_for_read_index(
+    record: &AlignmentRecord,
+    read_index: u32,
+) -> Option<(usize, Option<u32>)> {
+    let mut read_cursor = 0_u32;
+    for (operation_index, operation) in record.cigar.iter().enumerate() {
+        let consumes_read = matches!(
+            operation.kind,
+            CigarOpKind::Match
+                | CigarOpKind::SequenceMatch
+                | CigarOpKind::SequenceMismatch
+                | CigarOpKind::Insertion
+                | CigarOpKind::SoftClip
+        );
+        if !consumes_read {
+            continue;
+        }
+        let end = read_cursor.saturating_add(operation.len);
+        if read_index >= read_cursor && read_index < end {
+            let offset = matches!(
+                operation.kind,
+                CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch
+            )
+            .then_some(read_index - read_cursor);
+            return Some((operation_index, offset));
+        }
+        read_cursor = end;
+    }
+    None
+}
+
+fn alignment_component_event(
+    component: AlignmentComponent,
+    record: &AlignmentRecord,
+) -> Option<(usize, Option<u32>)> {
+    let cigar_event = |cigar_index: u32| {
+        let index = usize::try_from(cigar_index).ok()?;
+        record.cigar.get(index).map(|_| (index, None))
+    };
+    match component {
+        AlignmentComponent::Insertion { cigar_index, .. }
+        | AlignmentComponent::Deletion { cigar_index }
+        | AlignmentComponent::ReferenceSkip { cigar_index }
+        | AlignmentComponent::SoftClip { cigar_index, .. }
+        | AlignmentComponent::HardClip { cigar_index, .. }
+        | AlignmentComponent::Padding { cigar_index, .. }
+        | AlignmentComponent::UltimaIndel { cigar_index, .. }
+        | AlignmentComponent::SbxInsertion { cigar_index, .. } => cigar_event(cigar_index),
+        AlignmentComponent::Base {
+            cigar_index,
+            read_index,
+            ..
+        } => cigar_event(cigar_index).map(|(index, _)| {
+            read_event_for_read_index(record, read_index).unwrap_or((index, None))
+        }),
+        AlignmentComponent::ModifiedBase { read_index, .. }
+        | AlignmentComponent::BisulfiteBase { read_index, .. }
+        | AlignmentComponent::SmrtKinetics { read_index, .. }
+        | AlignmentComponent::SbxTailBase { read_index } => {
+            read_event_for_read_index(record, read_index)
+        }
+        AlignmentComponent::ReadSpan
+        | AlignmentComponent::AlignedSegment { .. }
+        | AlignmentComponent::DirectionTerminal
+        | AlignmentComponent::PairConnector { .. }
+        | AlignmentComponent::Label { .. }
+        | AlignmentComponent::SpecialistUnavailable { .. } => None,
+    }
+}
+
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn inspector_snapshot(&self) -> Option<InspectorSnapshot> {
-        if !self
-            .panels
-            .active()
-            .navigation_presentation
-            .is_interactive()
-        {
+        let panel = self.panels.active();
+        let scene_hit = panel.selected_alignment_hit;
+        if scene_hit.is_none() && !panel.navigation_presentation.is_interactive() {
             return None;
         }
-        if let Some(retained) = &self.panels.active().retained_evidence
+        if scene_hit.is_none()
+            && let Some(retained) = &panel.retained_evidence
             && matches!(
                 retained.selection.kind,
                 AutomationSelectionKind::Read | AutomationSelectionKind::ReadEvent
@@ -31,14 +99,31 @@ impl Viewer {
         {
             return retained.inspector.clone();
         }
-        let index = self.panels.active().selected_record?;
-        let track_id = self
-            .panels
-            .active()
-            .selected_alignment_track
-            .unwrap_or_else(|| self.primary_alignment_track_id());
-        let query = self.complete_read_query_for_track(track_id)?;
-        let record = query.materialize_record(index).ok()?;
+        let track_id = scene_hit.map_or_else(
+            || {
+                panel
+                    .selected_alignment_track
+                    .unwrap_or_else(|| self.primary_alignment_track_id())
+            },
+            |hit| hit.track,
+        );
+        let legacy_index = if scene_hit.is_none() {
+            Some(panel.selected_record?)
+        } else {
+            None
+        };
+        let query = legacy_index.and_then(|_| self.complete_read_query_for_track(track_id));
+        let scene_snapshot = scene_hit
+            .and_then(|_| self.alignment_scene_snapshot_for_panel_track(panel.id, track_id));
+        let record = if let Some(hit) = scene_hit {
+            scene_snapshot?
+                .inspect_retained(hit.handle)
+                .ok()
+                .flatten()?
+        } else {
+            query?.materialize_record(legacy_index?).ok()?
+        };
+        let reference = query.and_then(|query| query.reference.as_ref());
         let mate = match (record.mate_contig, record.mate_start) {
             (Some(contig_id), Some(position)) => {
                 let name = self
@@ -69,14 +154,34 @@ impl Viewer {
             |calls| calls.len().to_string(),
         );
         let selected_filters = self.alignment_filters_for_track(track_id);
-        let selected_event = self
-            .panels
-            .active()
-            .selected_read_event
-            .filter(|event| event.record_index == index)
-            .map(|event| (event.operation_index, event.operation_offset));
+        let selected_event = scene_hit
+            .and_then(|hit| alignment_component_event(hit.component, &record))
+            .or_else(|| {
+                let index = legacy_index?;
+                panel
+                    .selected_read_event
+                    .filter(|event| event.record_index == index)
+                    .map(|event| (event.operation_index, event.operation_offset))
+            });
         let selected_operation_index = selected_event.map(|(operation_index, _)| operation_index);
-        let pair_bounds = effective_template_length_bounds_for_filters(&selected_filters, query);
+        let pair_bounds = query.map_or_else(
+            || {
+                scene_snapshot.map_or(
+                    TemplateLengthBounds {
+                        minimum: selected_filters.minimum_template_length,
+                        maximum: selected_filters.maximum_template_length,
+                    },
+                    |snapshot| {
+                        snapshot
+                            .reads()
+                            .atlas()
+                            .layout_contract()
+                            .pair_length_bounds
+                    },
+                )
+            },
+            |query| effective_template_length_bounds_for_filters(&selected_filters, query),
+        );
         let pair = pair_evidence(
             &record,
             self.panels.active().viewport.interval(),
@@ -175,7 +280,7 @@ impl Viewer {
                     }
                 ),
             ));
-            if let Some(reference) = &query.reference {
+            if let Some(reference) = reference {
                 let summary = summarize_bisulfite_record(&record, reference, context);
                 let called = summary.protected.saturating_add(summary.converted);
                 fields.push((
@@ -241,7 +346,8 @@ impl Viewer {
             }
         }
         if let AlignmentColorMode::Ultima(options) = selected_filters.alignment_color_mode {
-            let read_group = query.read_group(index);
+            let read_group =
+                legacy_index.and_then(|index| query.and_then(|query| query.read_group(index)));
             let (maximum_homopolymer_length, maximum_source) =
                 options.maximum_homopolymer_length_override.map_or_else(
                     || {
@@ -289,7 +395,7 @@ impl Viewer {
             ));
             match analyze_ultima_record_with_tag_orientation(
                 &record,
-                query.reference.as_ref(),
+                reference,
                 options.quality_mode,
                 maximum_homopolymer_length,
                 tag_orientation,
@@ -427,7 +533,7 @@ impl Viewer {
                 &record,
                 operation_index,
                 operation_offset,
-                query.reference.as_ref(),
+                reference,
                 &self.panels.active().contig_name,
             )?;
             fields.extend(details.fields);
@@ -949,5 +1055,72 @@ impl Viewer {
             cigar: None,
             read_sequence: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod scene_inspection_tests {
+    use super::*;
+
+    fn record() -> AlignmentRecord {
+        AlignmentRecord {
+            contig: ContigId::new(0),
+            start: 100,
+            end: 110,
+            flags: rgv_hts::AlignmentFlags::from_bits(0),
+            mapping_quality: Some(60),
+            mate_contig: None,
+            mate_start: None,
+            template_length: 0,
+            read_name: b"scene-read".to_vec(),
+            cigar: vec![
+                rgv_hts::CigarOp {
+                    kind: CigarOpKind::Match,
+                    len: 5,
+                },
+                rgv_hts::CigarOp {
+                    kind: CigarOpKind::Insertion,
+                    len: 3,
+                },
+                rgv_hts::CigarOp {
+                    kind: CigarOpKind::SequenceMismatch,
+                    len: 5,
+                },
+            ],
+            sequence: SequenceData::Present {
+                bases: vec![b'A'; 13],
+                qualities: Some(vec![30; 13]),
+            },
+            auxiliary_fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scene_components_resolve_inspector_events_without_query_indices() {
+        let record = record();
+        assert_eq!(
+            alignment_component_event(
+                AlignmentComponent::Base {
+                    cigar_index: 2,
+                    read_index: 10,
+                    base: b'A',
+                    quality: Some(30),
+                    classification: AlignedBaseClassification::Substitution,
+                },
+                &record,
+            ),
+            Some((2, Some(2)))
+        );
+        assert_eq!(
+            alignment_component_event(
+                AlignmentComponent::Insertion {
+                    cigar_index: 1,
+                    read_start: 5,
+                    length: 3,
+                },
+                &record,
+            ),
+            Some((1, None))
+        );
     }
 }

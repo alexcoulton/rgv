@@ -14,6 +14,7 @@ noodles.workspace = true
 reqwest.workspace = true
 rgv-core = { version = "0.1.0", path = "../rgv-core" }
 rust-htslib.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 url.workspace = true

@@ -156,18 +156,18 @@ pub const MAX_PILEUP_DEPTH_EVENTS: usize = 2_000_000;
 pub(crate) const MAX_PENDING_PAIR_OVERLAPS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct OverlapMask {
+pub struct OverlapMask {
     pub start: u64,
     pub end: u64,
 }
 
 impl OverlapMask {
-    pub(crate) const fn contains(self, position: u64) -> bool {
+    pub const fn contains(self, position: u64) -> bool {
         position >= self.start && position < self.end
     }
 }
 
-pub(crate) fn add_unmasked_range(
+pub fn add_unmasked_range(
     start: u64,
     end: u64,
     mask: Option<OverlapMask>,
@@ -192,7 +192,7 @@ pub(crate) fn add_unmasked_range(
     overlap_end - overlap_start
 }
 
-pub(crate) struct OverlapCollapser {
+pub struct OverlapCollapser {
     policy: OverlappingMatePolicy,
     pending: HashMap<TemplateId, OverlapMask>,
     complete: bool,
@@ -200,7 +200,7 @@ pub(crate) struct OverlapCollapser {
 }
 
 impl OverlapCollapser {
-    pub(crate) fn new(policy: OverlappingMatePolicy) -> Self {
+    pub fn new(policy: OverlappingMatePolicy) -> Self {
         Self {
             policy,
             pending: HashMap::new(),
@@ -210,7 +210,7 @@ impl OverlapCollapser {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn mask_for(
+    pub fn mask_for(
         &mut self,
         read_name: &[u8],
         contig: ContigId,
@@ -257,19 +257,19 @@ impl OverlapCollapser {
         }
     }
 
-    pub(crate) fn note_collapsed(&mut self, bases: u64) {
+    pub fn note_collapsed(&mut self, bases: u64) {
         self.collapsed_mate_bases = self.collapsed_mate_bases.saturating_add(bases);
     }
 
-    pub(crate) const fn policy(&self) -> OverlappingMatePolicy {
+    pub const fn policy(&self) -> OverlappingMatePolicy {
         self.policy
     }
 
-    pub(crate) const fn complete(&self) -> bool {
+    pub const fn complete(&self) -> bool {
         self.complete
     }
 
-    pub(crate) const fn collapsed_mate_bases(&self) -> u64 {
+    pub const fn collapsed_mate_bases(&self) -> u64 {
         self.collapsed_mate_bases
     }
 }
@@ -406,7 +406,7 @@ impl PileupSummary {
     }
 }
 
-pub(crate) struct PileupBuilder {
+pub struct PileupBuilder {
     interval: GenomicInterval,
     bins: Vec<PileupBin>,
     minimum_base_quality: u8,
@@ -426,7 +426,7 @@ struct DepthEvent {
 }
 
 impl PileupBuilder {
-    pub(crate) fn new(interval: GenomicInterval, bins: usize, minimum_base_quality: u8) -> Self {
+    pub fn new(interval: GenomicInterval, bins: usize, minimum_base_quality: u8) -> Self {
         Self {
             interval,
             bins: vec![PileupBin::default(); bins],
@@ -437,7 +437,7 @@ impl PileupBuilder {
         }
     }
 
-    pub(crate) fn add_aligned_record(
+    pub fn add_aligned_record(
         &mut self,
         segments: impl IntoIterator<Item = (u64, u64)>,
         reverse: bool,
@@ -505,7 +505,7 @@ impl PileupBuilder {
         self.add_base_with_bisulfite_strand(position, base, quality, reverse, reverse);
     }
 
-    pub(crate) fn add_base_with_bisulfite_strand(
+    pub fn add_base_with_bisulfite_strand(
         &mut self,
         position: u64,
         base: u8,
@@ -549,7 +549,7 @@ impl PileupBuilder {
         }
     }
 
-    pub(crate) fn add_deletion(&mut self, start: u64, end: u64, reverse: bool) {
+    pub fn add_deletion(&mut self, start: u64, end: u64, reverse: bool) {
         let Some((first, last)) = self.bin_range(start, end) else {
             return;
         };
@@ -564,7 +564,7 @@ impl PileupBuilder {
         }
     }
 
-    pub(crate) fn add_insertion(&mut self, reference_position: u64, reverse: bool) {
+    pub fn add_insertion(&mut self, reference_position: u64, reverse: bool) {
         let anchor = reference_position.saturating_sub(1);
         let index = self
             .bin_index(anchor)
@@ -581,7 +581,18 @@ impl PileupBuilder {
         }
     }
 
-    pub(crate) fn finish(mut self, mut provenance: PileupProvenance) -> PileupSummary {
+    /// Returns exact allele/indel bins without deriving aligned-depth events.
+    ///
+    /// This is used by independently owned allele tiles whose depth lives in a different
+    /// allocation and contract. Callers must not add aligned-depth segments to this builder.
+    #[must_use]
+    pub fn finish_alleles(mut self) -> Vec<PileupBin> {
+        debug_assert!(self.depth_events.is_empty());
+        self.bins.shrink_to_fit();
+        self.bins
+    }
+
+    pub fn finish(mut self, mut provenance: PileupProvenance) -> PileupSummary {
         let mut depth = 0_i64;
         let mut forward = 0_i64;
         let mut reverse = 0_i64;
@@ -683,7 +694,7 @@ fn quality_weight(quality: u8) -> u64 {
     })[usize::from(quality)]
 }
 
-pub(crate) fn aligned_observation(
+pub fn aligned_observation(
     bases: &[u8],
     qualities: &[u8],
     read_position: usize,

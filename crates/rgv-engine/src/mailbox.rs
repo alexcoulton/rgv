@@ -35,6 +35,12 @@ pub(crate) struct CoalescingReceiver<T> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MailboxDisconnected;
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum TryMailboxSendError<T> {
+    Full(T),
+    Disconnected(T),
+}
+
 pub(crate) fn bounded_coalescing<T>(
     control_capacity: usize,
 ) -> (CoalescingSender<T>, CoalescingReceiver<T>) {
@@ -59,6 +65,22 @@ pub(crate) fn bounded_coalescing<T>(
 }
 
 impl<T> CoalescingSender<T> {
+    /// Enqueues a non-discardable control without ever waiting for capacity. UI and render
+    /// threads use this form so a saturated worker cannot stall input handling.
+    pub(crate) fn try_send_control(&self, value: T) -> Result<(), TryMailboxSendError<T>> {
+        let mut state = self.inner.state.lock().expect("mailbox mutex poisoned");
+        if !state.receiver_open {
+            return Err(TryMailboxSendError::Disconnected(value));
+        }
+        if state.controls.len() >= self.inner.control_capacity {
+            return Err(TryMailboxSendError::Full(value));
+        }
+        let stamped = stamp(&mut state, value);
+        state.controls.push_back(stamped);
+        self.inner.has_data.notify_one();
+        Ok(())
+    }
+
     /// Enqueues an event that must not be discarded. This applies backpressure
     /// when the bounded control queue is full and unblocks if the receiver is
     /// closed during shutdown.
@@ -240,6 +262,22 @@ mod tests {
         receiver.close();
 
         assert_eq!(blocked.join().unwrap(), Err(2));
+    }
+
+    #[test]
+    fn nonblocking_control_reports_full_and_disconnected_without_dropping_order() {
+        let (sender, receiver) = bounded_coalescing(1);
+        sender.try_send_control(1).unwrap();
+        assert_eq!(
+            sender.try_send_control(2),
+            Err(TryMailboxSendError::Full(2))
+        );
+        assert_eq!(receiver.try_receive().unwrap(), Some(1));
+        receiver.close();
+        assert_eq!(
+            sender.try_send_control(3),
+            Err(TryMailboxSendError::Disconnected(3))
+        );
     }
 
     #[test]

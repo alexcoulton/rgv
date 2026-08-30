@@ -3999,6 +3999,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rgv-alignment-scene"
+version = "0.1.0"
+dependencies = [
+ "rgv-core",
+ "rgv-hts",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "rgv-core"
 version = "0.1.0"
 dependencies = [
@@ -4037,6 +4047,7 @@ dependencies = [
  "image",
  "pollster",
  "rfd",
+ "rgv-alignment-scene",
  "rgv-core",
  "rgv-engine",
  "rgv-hts",
@@ -4059,6 +4070,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "lru",
+ "rgv-alignment-scene",
  "rgv-core",
  "rgv-hts",
  "tempfile",
@@ -4077,6 +4089,7 @@ dependencies = [
  "reqwest",
  "rgv-core",
  "rust-htslib",
+ "sha2",
  "tempfile",
  "thiserror 2.0.20",
  "tiny_http",
@@ -4159,10 +4172,13 @@ dependencies = [
  "bytemuck",
  "epaint_default_fonts",
  "image",
+ "pollster",
+ "rgv-alignment-scene",
  "rgv-core",
  "rgv-hts",
  "rgv-layout",
  "tempfile",
+ "thiserror 2.0.20",
  "wgpu",
 ]
 

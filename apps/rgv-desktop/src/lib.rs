@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fmt::Write as _,
     io::Write as _,
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
@@ -37,6 +37,14 @@ use egui_wgpu::{RendererOptions, ScreenDescriptor};
 use inspection::{auxiliary::*, document::*, model::*, read::*, rna::*, variant::*};
 use interaction_trace::{InteractionTraceRecorder, InteractionTraceStage};
 use launch::*;
+use rgv_alignment_scene::{
+    AlignmentCamera, AlignmentComponent, AlignmentHit, AlignmentInteractionState,
+    AlignmentPanelSceneFrame, AlignmentPanelSceneStore, AlignmentPresentationScene,
+    AlignmentReadLabelMode, AlignmentSceneSnapshot, AlignmentStyleContract, AlleleSummaryDetail,
+    AllocationLedger, CapabilityRequirement, CpuAlignmentProjector, CpuClipRect, GeometryLod,
+    LayoutContract, MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract,
+    ReferenceRevision, SummaryContract,
+};
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,
     AutomationAlignmentSelector, AutomationAlignmentState, AutomationAlignmentTrackSnapshot,
@@ -88,11 +96,16 @@ use rgv_core::{
     parse_ucsc_cytobands, resolve_contig_alias,
 };
 use rgv_engine::{
-    AlignmentBrowsingPolicy, AlignmentBufferClampReason, AlignmentCacheOutcome, AlignmentEngine,
-    AlignmentEngineEvent, AlignmentQueryPhase, AlignmentWorkingSetStats, CacheBudgets, CacheStats,
-    EngineQueueError, LayoutTileKey, ReferenceEngine, ReferenceEngineEvent, Scheduler,
-    SchedulerError, SourceFingerprint, TrackEngine, TrackEngineEvent, TrackSearchHit,
-    TrackSearchResults, TrackSnapshot, TrackSnapshotData, TrackSpec, TrackSpecKind,
+    AlignmentBufferClampReason, AlignmentCacheOutcome, AlignmentCoordinatorFrame,
+    AlignmentIndividualReadCapability, AlignmentQueryPhase, AlignmentReferenceAuthority,
+    AlignmentReferenceRequirement, AlignmentSceneBuildContract, AlignmentSceneEngine,
+    AlignmentSceneEngineEvent, AlignmentSceneFrameCause, AlignmentScenePreparationPolicy,
+    AlignmentSceneRequestToken, AlignmentSceneSourceMetadata, AlignmentVerticalResidency,
+    AlignmentWorkingSetStats, CacheBudgets, CacheStats, EngineQueueError, LayoutTileKey,
+    LocalAlignmentSceneEngineConfig, LocalBamCanonicalBackend, LocalBamSourceControl,
+    MAX_REFERENCE_QUERY_BASES, ReferenceEngine, ReferenceEngineEvent, ReferenceQueryIdentity,
+    Scheduler, SchedulerError, SourceFingerprint, SourceOwnerId, TrackEngine, TrackEngineEvent,
+    TrackSearchHit, TrackSearchResults, TrackSnapshot, TrackSnapshotData, TrackSpec, TrackSpecKind,
     WeightedLruCache, WorkItem,
 };
 use rgv_hts::{
@@ -127,8 +140,9 @@ use rgv_layout::{
     record_object_id, ultima_quality_color,
 };
 use rgv_render::{
-    NavigationPreviewInstance, NavigationPreviewRenderer, PrepareStats, RectangleRenderer,
-    export_png, navigation_preview_source_uv,
+    AlignmentGpuFrame, AlignmentGpuRenderer, AlignmentGpuResidencyLease, AlignmentGpuSceneRequest,
+    AlignmentGpuScissor, NavigationPreviewInstance, NavigationPreviewRenderer, PrepareStats,
+    RectangleRenderer, export_png, navigation_preview_source_uv,
 };
 use runtime::*;
 use sha2::{Digest as _, Sha256};
@@ -689,6 +703,12 @@ fn clear_removed_alignment_panel_state(
     panel.hovered_record = panel
         .hovered_record
         .filter(|(track_id, _)| *track_id != removed);
+    panel.hovered_alignment_hit = panel
+        .hovered_alignment_hit
+        .filter(|hit| hit.track != removed);
+    panel.selected_alignment_hit = panel
+        .selected_alignment_hit
+        .filter(|hit| hit.track != removed);
     panel.hover_inspector_target = panel
         .hover_inspector_target
         .filter(|target| target.track_id() != removed);
@@ -825,6 +845,16 @@ struct Viewer {
     queue: wgpu::Queue,
     surface_config: wgpu::SurfaceConfiguration,
     rectangle_renderer: RectangleRenderer,
+    alignment_scene_ledger: AllocationLedger,
+    alignment_gpu_renderer: AlignmentGpuRenderer,
+    alignment_gpu_frame: Option<AlignmentGpuFrame>,
+    alignment_gpu_residency: Option<AlignmentGpuResidencyLease>,
+    alignment_gpu_prefetch_pending: bool,
+    alignment_panel_scene_stores: HashMap<PanelId, AlignmentPanelSceneStore>,
+    alignment_panel_frames: HashMap<PanelId, AlignmentPanelSceneFrame>,
+    alignment_scene_owner_clock: u64,
+    alignment_scene_request_clock: u64,
+    alignment_scene_camera_revision: u64,
     navigation_preview_renderer: NavigationPreviewRenderer,
     navigation_texture_revisions: HashMap<PanelId, u64>,
     navigation_horizon_preview_stats: NavigationHorizonPreviewStats,
@@ -852,6 +882,9 @@ struct Viewer {
     alignment_row_scene_scheduler_clock: GenerationClock,
     alignment_row_scene_scheduler: Scheduler<AlignmentRowSceneWork, CompletedAlignmentRowSceneWork>,
     reference_engine: Option<ReferenceEngine>,
+    /// Identity of the currently open FASTA handle. A panel slice is usable only when it carries
+    /// this same revision; reopening an equivalent path still creates a distinct authority.
+    reference_revision: Option<ReferenceRevision>,
     reference_open_error: Option<String>,
     track_engine: Option<TrackEngine>,
     automation_auxiliary_open_state: HashMap<TrackId, AutomationAuxiliaryOpenState>,

@@ -1,5 +1,16 @@
 //! GPU rendering infrastructure for genomic display lists.
 
+mod alignment_scene;
+
+pub use alignment_scene::{
+    AlignmentGpuBatchAdmission, AlignmentGpuFrame, AlignmentGpuFrameBuildError,
+    AlignmentGpuInstance, AlignmentGpuPageAdmission, AlignmentGpuPageAdmissionError,
+    AlignmentGpuPrefetchProgress, AlignmentGpuPrepareError, AlignmentGpuPrepareStats,
+    AlignmentGpuProjectedBounds, AlignmentGpuRenderError, AlignmentGpuRenderer,
+    AlignmentGpuResidencyError, AlignmentGpuResidencyLease, AlignmentGpuSceneRequest,
+    AlignmentGpuScissor, AlignmentGpuShape, PackedAlignmentPage, project_alignment_gpu_instance,
+};
+
 use ab_glyph::{Font, FontRef, ScaleFont, point};
 use bytemuck::{Pod, Zeroable};
 use std::{collections::HashMap, path::Path};

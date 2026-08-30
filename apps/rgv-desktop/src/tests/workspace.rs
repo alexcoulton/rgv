@@ -2,6 +2,155 @@ use super::super::*;
 use crate::display::navigation_preview::{
     complete_horizon_preview_eligible, remove_navigation_preview_semantics,
 };
+use crate::display::panel_display_rebuild_allowed;
+use crate::workspace::alignment_management::{
+    alignment_scene_frame_for_ui_against_retained_interval,
+    alignment_scene_intervals_share_authority,
+};
+use crate::workspace::queries::{
+    AlignmentReferenceLanePlan, AlignmentReferenceLaneRequirement,
+    alignment_scene_event_token_is_current, alignment_scene_frame_is_current,
+    alignment_scene_refusal_is_current, plan_alignment_reference_lanes,
+    reference_dependency_is_settled, reference_failure_matches_requirement,
+    reference_query_completion_matches,
+};
+
+#[test]
+fn initial_scene_layout_bootstraps_without_weakening_later_navigation_gates() {
+    assert!(panel_display_rebuild_allowed(
+        NavigationPresentationPhase::CheckingWithoutPreview,
+        false,
+    ));
+    assert!(!panel_display_rebuild_allowed(
+        NavigationPresentationPhase::CheckingWithoutPreview,
+        true,
+    ));
+    assert!(!panel_display_rebuild_allowed(
+        NavigationPresentationPhase::Preview,
+        true,
+    ));
+    assert!(panel_display_rebuild_allowed(
+        NavigationPresentationPhase::Committing,
+        true,
+    ));
+    assert!(panel_display_rebuild_allowed(
+        NavigationPresentationPhase::Settled,
+        true,
+    ));
+}
+
+#[test]
+fn read_scroll_is_reset_only_when_its_scene_row_authority_changes() {
+    let mut state = ReadPanelScrollState {
+        scroll_points: 420.0,
+        content_origin_points: 20.0,
+        latent_scroll_fraction: Some(0.75),
+        content_bottom_points: 900.0,
+        density: Some(2.5),
+        stable_row_anchor: Some(StableRowCameraAnchor {
+            row: 40,
+            offset_fraction: 0.5,
+            layout_revision: 7,
+            row_height: 8.0,
+        }),
+        scene_contig: Some(ContigId::new(6)),
+    };
+
+    assert!(!state.bind_scene_contig(ContigId::new(6), false));
+    assert_eq!(state.scroll_points, 420.0);
+    assert!(state.bind_scene_contig(ContigId::new(2), false));
+    assert_eq!(state.scroll_points, 0.0);
+    assert_eq!(state.content_bottom_points, 0.0);
+    assert_eq!(state.latent_scroll_fraction, None);
+    assert_eq!(state.stable_row_anchor, None);
+    assert_eq!(state.density, Some(2.5));
+    assert_eq!(state.scene_contig, Some(ContigId::new(2)));
+}
+
+#[test]
+fn index_only_overview_retires_read_row_authority_but_preserves_density() {
+    let mut state = ReadPanelScrollState {
+        scroll_points: 420.0,
+        content_origin_points: 20.0,
+        latent_scroll_fraction: Some(0.75),
+        content_bottom_points: 900.0,
+        density: Some(2.5),
+        stable_row_anchor: Some(StableRowCameraAnchor {
+            row: 40,
+            offset_fraction: 0.5,
+            layout_revision: 7,
+            row_height: 8.0,
+        }),
+        scene_contig: Some(ContigId::new(6)),
+    };
+
+    assert!(state.retire_scene_authority());
+    assert_eq!(state.scroll_points, 0.0);
+    assert_eq!(state.content_origin_points, 0.0);
+    assert_eq!(state.content_bottom_points, 0.0);
+    assert_eq!(state.latent_scroll_fraction, None);
+    assert_eq!(state.stable_row_anchor, None);
+    assert_eq!(state.scene_contig, None);
+    assert_eq!(state.density, Some(2.5));
+    assert!(!state.retire_scene_authority());
+}
+
+#[test]
+fn stale_atlas_intervals_cannot_authorize_a_discontinuous_camera() {
+    let actb = GenomicInterval::new(ContigId::new(6), 5_500_000, 5_600_000).unwrap();
+    let actb_edge = GenomicInterval::new(ContigId::new(6), 5_590_000, 5_610_000).unwrap();
+    let same_contig_jump = GenomicInterval::new(ContigId::new(6), 10_000_000, 10_010_000).unwrap();
+    let bap1 = GenomicInterval::new(ContigId::new(2), 52_400_000, 52_410_000).unwrap();
+
+    assert!(alignment_scene_intervals_share_authority(actb, actb_edge));
+    assert!(!alignment_scene_intervals_share_authority(
+        actb,
+        same_contig_jump
+    ));
+    assert!(!alignment_scene_intervals_share_authority(actb, bap1));
+}
+
+#[test]
+fn stripping_a_discontinuous_snapshot_preserves_the_new_camera_reference_requirement() {
+    let actb = GenomicInterval::new(ContigId::new(6), 5_500_000, 5_600_000).unwrap();
+    let bap1 = GenomicInterval::new(ContigId::new(2), 52_400_000, 52_410_000).unwrap();
+    let revision = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
+    let requirement = AlignmentReferenceRequirement::Pending {
+        revision,
+        horizon: bap1,
+    };
+    let camera = AlignmentCamera::new(
+        bap1,
+        0.0,
+        7.0,
+        5.0,
+        CpuClipRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1_000.0,
+            height: 500.0,
+        },
+    )
+    .unwrap();
+    let frame = AlignmentCoordinatorFrame {
+        camera,
+        camera_sequence: 2,
+        snapshot: None,
+        covered_interval: Some(actb),
+        requested_rows: 0..10,
+        covered_rows: 0..10,
+        reference_requirement: requirement,
+        scene_contracts_current: true,
+        individual_reads: AlignmentIndividualReadCapability::Pending,
+        vertical_residency: AlignmentVerticalResidency::ViewportBounded,
+    };
+
+    let normalized = alignment_scene_frame_for_ui_against_retained_interval(frame, Some(actb));
+    assert_eq!(normalized.reference_requirement, requirement);
+    assert!(!normalized.scene_contracts_current);
+    assert_eq!(normalized.covered_interval, None);
+    assert!(!normalized.visible_complete());
+}
 
 #[test]
 fn overview_resolution_is_index_only_and_regional_resolution_requests_records() {
@@ -15,6 +164,48 @@ fn overview_resolution_is_index_only_and_regional_resolution_requests_records() 
     assert!(!overview.requires_alignment_records());
     assert_eq!(regional.detail, DetailLevel::Regional);
     assert!(regional.requires_alignment_records());
+}
+
+#[test]
+fn browsing_buffer_setting_controls_horizontal_and_vertical_scene_margins() {
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap();
+    let camera = AlignmentCamera::new(
+        interval,
+        0.0,
+        10.0,
+        8.0,
+        CpuClipRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1_000.0,
+            height: 100.0,
+        },
+    )
+    .unwrap();
+    let visible_rows = u32::try_from(camera.visible_rows().len()).unwrap();
+
+    let disabled = alignment_scene_preparation_policy(0, camera);
+    assert_eq!(disabled.behind_viewports, 0.0);
+    assert_eq!(disabled.vertical_margin_rows, 0);
+    assert_eq!(disabled.vertical_trigger_rows, 1);
+    assert!(disabled.full_vertical_residency);
+
+    let default = alignment_scene_preparation_policy(100, camera);
+    assert_eq!(default.behind_viewports, 1.0);
+    assert_eq!(default.vertical_margin_rows, visible_rows);
+    assert_eq!(
+        default.vertical_trigger_rows,
+        visible_rows.saturating_add(3) / 4
+    );
+
+    let expanded = alignment_scene_preparation_policy(400, camera);
+    assert_eq!(expanded.behind_viewports, 4.0);
+    assert_eq!(
+        expanded.vertical_margin_rows,
+        visible_rows.saturating_mul(4)
+    );
+    assert_eq!(expanded.vertical_trigger_rows, visible_rows);
+    assert!(expanded.full_vertical_residency);
 }
 
 #[test]
@@ -35,6 +226,23 @@ fn projection_is_checking_until_the_current_generation_settles() {
 
     projection.pending_query = false;
     assert!(projection.query_is_current());
+}
+
+#[test]
+fn terminal_scene_error_settles_generation_without_discarding_scene_authority() {
+    let mut projection = AlignmentPanelProjection::default();
+    projection.advance_query_generation();
+    projection.pending_query = true;
+    projection.begin_checking(Instant::now());
+    projection.scene_owner = Some(SourceOwnerId::new(7));
+
+    projection.settle_unavailable("row atlas failed".to_owned());
+
+    assert!(projection.query_is_current());
+    assert!(!projection.pending_query);
+    assert_eq!(projection.unavailable.as_deref(), Some("row atlas failed"));
+    assert_eq!(projection.scene_owner, Some(SourceOwnerId::new(7)));
+    assert!(projection.checking_started.is_none());
 }
 
 #[test]
@@ -846,6 +1054,368 @@ fn reference_aware_read_modes_request_context_before_base_detail() {
 }
 
 #[test]
+fn only_base_scene_geometry_depends_on_the_current_fasta_revision() {
+    let revision = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
+
+    assert_eq!(
+        alignment_scene_reference_revision(GeometryLod::Base, Some(revision)),
+        Some(revision)
+    );
+    for lod in [GeometryLod::Overview, GeometryLod::Span, GeometryLod::Read] {
+        assert_eq!(
+            alignment_scene_reference_revision(lod, Some(revision)),
+            None
+        );
+    }
+    assert_eq!(
+        alignment_scene_reference_revision(GeometryLod::Base, None),
+        None
+    );
+}
+
+#[test]
+fn fasta_completion_must_match_the_open_revision_and_exact_requested_horizon() {
+    let current = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
+    let stale = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 10));
+    let requested = GenomicInterval::new(ContigId::new(6), 100, 300).unwrap();
+    let superseded = GenomicInterval::new(ContigId::new(6), 125, 325).unwrap();
+
+    assert!(reference_query_completion_matches(
+        Some(current),
+        Some(current),
+        Some(requested),
+        current,
+        requested,
+    ));
+    assert!(!reference_query_completion_matches(
+        Some(current),
+        Some(stale),
+        Some(requested),
+        stale,
+        requested,
+    ));
+    assert!(!reference_query_completion_matches(
+        Some(current),
+        Some(current),
+        Some(superseded),
+        current,
+        requested,
+    ));
+}
+
+#[test]
+fn fasta_failure_settles_only_the_pending_dependency_it_attempted() {
+    let current = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
+    let stale = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 10));
+    let requested = GenomicInterval::new(ContigId::new(6), 100, 300).unwrap();
+    let horizon = GenomicInterval::new(ContigId::new(6), 125, 275).unwrap();
+    let outside = GenomicInterval::new(ContigId::new(6), 75, 325).unwrap();
+
+    assert!(reference_failure_matches_requirement(
+        current,
+        requested,
+        AlignmentReferenceRequirement::Pending {
+            revision: current,
+            horizon,
+        },
+    ));
+    assert!(!reference_failure_matches_requirement(
+        current,
+        requested,
+        AlignmentReferenceRequirement::Pending {
+            revision: stale,
+            horizon,
+        },
+    ));
+    assert!(!reference_failure_matches_requirement(
+        current,
+        requested,
+        AlignmentReferenceRequirement::Pending {
+            revision: current,
+            horizon: outside,
+        },
+    ));
+    assert!(!reference_failure_matches_requirement(
+        current,
+        requested,
+        AlignmentReferenceRequirement::Ready {
+            revision: current,
+            horizon,
+        },
+    ));
+}
+
+#[test]
+fn fasta_open_failure_clears_authority_and_settles_the_current_panel_generation() {
+    let mut panel = test_panel(1);
+    panel.generation_clock.advance();
+    let generation = panel.generation_clock.current().get();
+    let revision = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
+    let interval = panel.viewport.interval();
+    panel.reference_slice = Some(Arc::new(ReferenceSlice {
+        interval,
+        bases: vec![b'A'; interval.len() as usize],
+    }));
+    panel.reference_slice_revision = Some(revision);
+    panel.reference_request_revision = Some(revision);
+    panel.reference_request_interval = Some(interval);
+    panel.pending_queries.reference = true;
+
+    panel.settle_reference_open_failure();
+
+    assert!(panel.reference_slice.is_none());
+    assert_eq!(panel.reference_slice_revision, None);
+    assert_eq!(panel.reference_request_revision, None);
+    assert_eq!(panel.reference_request_interval, None);
+    assert!(!panel.pending_queries.reference);
+    assert_eq!(panel.reference_settled_generation, Some(generation));
+    assert_eq!(panel.reference_query_error_generation, Some(generation));
+}
+
+#[test]
+fn compatible_pending_reference_lanes_share_one_bounded_union_query() {
+    let revision = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
+    let left = GenomicInterval::new(ContigId::new(6), 100, 250).unwrap();
+    let right = GenomicInterval::new(ContigId::new(6), 200, 400).unwrap();
+    let requirements = [
+        AlignmentReferenceLaneRequirement {
+            owner: SourceOwnerId::new(2),
+            revision,
+            horizon: right,
+        },
+        AlignmentReferenceLaneRequirement {
+            owner: SourceOwnerId::new(1),
+            revision,
+            horizon: left,
+        },
+    ];
+
+    assert_eq!(
+        plan_alignment_reference_lanes(&requirements, &BTreeMap::new()),
+        AlignmentReferenceLanePlan::Query {
+            revision,
+            interval: GenomicInterval::new(ContigId::new(6), 100, 400).unwrap(),
+        }
+    );
+}
+
+#[test]
+fn queued_reference_lane_receipts_sequence_remaining_incompatible_owners() {
+    let revision = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
+    let first = AlignmentReferenceLaneRequirement {
+        owner: SourceOwnerId::new(1),
+        revision,
+        horizon: GenomicInterval::new(ContigId::new(6), 100, 250).unwrap(),
+    };
+    let second = AlignmentReferenceLaneRequirement {
+        owner: SourceOwnerId::new(2),
+        revision,
+        horizon: GenomicInterval::new(ContigId::new(2), 500, 700).unwrap(),
+    };
+    let requirements = [first, second];
+    assert_eq!(
+        plan_alignment_reference_lanes(&requirements, &BTreeMap::new()),
+        AlignmentReferenceLanePlan::Query {
+            revision,
+            interval: first.horizon,
+        }
+    );
+
+    let mut queued = BTreeMap::from([(first.owner, (first.revision, first.horizon))]);
+    assert_eq!(
+        plan_alignment_reference_lanes(&requirements, &queued),
+        AlignmentReferenceLanePlan::Query {
+            revision,
+            interval: second.horizon,
+        }
+    );
+    queued.insert(second.owner, (second.revision, second.horizon));
+    assert_eq!(
+        plan_alignment_reference_lanes(&requirements, &queued),
+        AlignmentReferenceLanePlan::AllQueued
+    );
+}
+
+#[test]
+fn automation_and_navigation_share_current_reference_error_settlement() {
+    let revision = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
+    let interval = GenomicInterval::new(ContigId::new(6), 100, 250).unwrap();
+    let secondary_lane_interval = GenomicInterval::new(ContigId::new(2), 100, 250).unwrap();
+
+    assert!(reference_dependency_is_settled(
+        true,
+        9,
+        Some(revision),
+        None,
+        None,
+        interval,
+        None,
+        Some(9),
+    ));
+    assert!(!reference_dependency_is_settled(
+        true,
+        9,
+        Some(revision),
+        None,
+        None,
+        interval,
+        None,
+        Some(8),
+    ));
+    assert!(!reference_dependency_is_settled(
+        true,
+        9,
+        Some(revision),
+        Some(revision),
+        Some(secondary_lane_interval),
+        interval,
+        Some(9),
+        None,
+    ));
+}
+
+#[test]
+fn scene_event_tokens_never_treat_absent_or_superseded_requests_as_current() {
+    let current = AlignmentSceneRequestToken::new(12);
+    let stale = AlignmentSceneRequestToken::new(11);
+
+    assert!(alignment_scene_event_token_is_current(
+        Some(current),
+        Some(current)
+    ));
+    assert!(!alignment_scene_event_token_is_current(None, None));
+    assert!(!alignment_scene_event_token_is_current(
+        Some(current),
+        Some(stale)
+    ));
+    assert!(!alignment_scene_event_token_is_current(None, Some(current)));
+}
+
+#[test]
+fn scene_frame_acceptance_waits_for_the_exact_transaction_camera() {
+    let current = AlignmentSceneRequestToken::new(12);
+    let stale = AlignmentSceneRequestToken::new(11);
+    let interval = GenomicInterval::new(ContigId::new(6), 100, 200).unwrap();
+    let shifted = GenomicInterval::new(ContigId::new(6), 150, 250).unwrap();
+    let camera = AlignmentCamera::new(
+        interval,
+        0.0,
+        7.0,
+        5.0,
+        CpuClipRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1_000.0,
+            height: 500.0,
+        },
+    )
+    .unwrap();
+    let shifted_camera = AlignmentCamera::new(
+        shifted,
+        0.0,
+        7.0,
+        5.0,
+        CpuClipRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1_000.0,
+            height: 500.0,
+        },
+    )
+    .unwrap();
+
+    assert!(alignment_scene_frame_is_current(
+        Some(current),
+        current,
+        Some(camera),
+        camera,
+    ));
+    assert!(!alignment_scene_frame_is_current(
+        Some(current),
+        stale,
+        Some(camera),
+        camera,
+    ));
+    assert!(!alignment_scene_frame_is_current(
+        Some(current),
+        current,
+        Some(camera),
+        shifted_camera,
+    ));
+    assert!(!alignment_scene_frame_is_current(
+        None,
+        current,
+        Some(camera),
+        camera,
+    ));
+}
+
+#[test]
+fn refusal_acceptance_requires_the_exact_request_camera_and_covering_horizon() {
+    let current = AlignmentSceneRequestToken::new(12);
+    let stale = AlignmentSceneRequestToken::new(11);
+    let interval = GenomicInterval::new(ContigId::new(6), 100, 200).unwrap();
+    let shifted = GenomicInterval::new(ContigId::new(6), 150, 250).unwrap();
+    let camera = AlignmentCamera::new(
+        interval,
+        0.0,
+        7.0,
+        5.0,
+        CpuClipRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1_000.0,
+            height: 500.0,
+        },
+    )
+    .unwrap();
+    let shifted_camera = AlignmentCamera::new(
+        shifted,
+        0.0,
+        7.0,
+        5.0,
+        CpuClipRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1_000.0,
+            height: 500.0,
+        },
+    )
+    .unwrap();
+    let horizon = GenomicInterval::new(ContigId::new(6), 50, 250).unwrap();
+    let short = GenomicInterval::new(ContigId::new(6), 125, 175).unwrap();
+
+    assert!(alignment_scene_refusal_is_current(
+        Some(current),
+        current,
+        Some(camera),
+        camera,
+        horizon,
+    ));
+    assert!(!alignment_scene_refusal_is_current(
+        Some(current),
+        stale,
+        Some(camera),
+        camera,
+        horizon,
+    ));
+    assert!(!alignment_scene_refusal_is_current(
+        Some(current),
+        current,
+        Some(camera),
+        shifted_camera,
+        horizon,
+    ));
+    assert!(!alignment_scene_refusal_is_current(
+        Some(current),
+        current,
+        Some(camera),
+        camera,
+        short,
+    ));
+}
+
+#[test]
 fn local_control_is_disabled_by_default_and_requires_a_secret_file() {
     let default = LaunchOptions::try_parse_from(["rgv-desktop"]).unwrap();
     assert!(default.control_port.is_none());
@@ -1241,22 +1811,6 @@ fn alignment_projections_keep_each_panel_query_independent() {
     ));
 }
 
-fn two_panel_test_intervals(
-    dictionary: &ReferenceDictionary,
-    panel_ids: [PanelId; 2],
-) -> [(PanelId, GenomicInterval); 2] {
-    [
-        (
-            panel_ids[0],
-            GenomicInterval::new(dictionary.id_by_name("chr1").unwrap(), 900_000, 920_000).unwrap(),
-        ),
-        (
-            panel_ids[1],
-            GenomicInterval::new(dictionary.id_by_name("chr2").unwrap(), 0, 200_000).unwrap(),
-        ),
-    ]
-}
-
 #[test]
 fn panel_accepts_only_its_current_generation() {
     let first = test_panel(1);
@@ -1555,6 +2109,7 @@ fn session_panel_workspace_restores_order_active_locus_and_width() {
             content_bottom_points: 900.0,
             density: Some(3.0),
             stable_row_anchor: None,
+            scene_contig: None,
         })
     );
     assert_eq!(workspace.active().contig_name, "chr2");
@@ -2366,175 +2921,4 @@ fn base_sort_position_captures_a_centre_then_keeps_the_fixed_anchor() {
         alignment_sort_position(AlignmentSortMode::MappingQuality, None, viewport),
         None
     );
-}
-
-#[test]
-fn failed_fourth_controller_does_not_block_three_healthy_queries() {
-    let mut session = SessionDocument::from_json(include_str!(
-        "../../../../validation/four-track-session-v2.json"
-    ))
-    .unwrap();
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for track in &mut session.alignment_tracks {
-        if let TrackSource::Local { path } = &mut track.source {
-            *path = repository.join(&*path).display().to_string();
-        }
-    }
-    let cache = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
-    let mut controllers = session
-        .alignment_tracks
-        .into_iter()
-        .map(|config| {
-            spawn_alignment_track_controller(config, cache, None, None, &[INITIAL_PANEL_ID])
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let mut opened = Vec::new();
-    let mut failures = 0_usize;
-    for track in &mut controllers {
-        match track
-            .engine
-            .receive_timeout(Duration::from_secs(10))
-            .unwrap()
-        {
-            Some(AlignmentEngineEvent::Opened { dictionary, .. }) => opened.push(dictionary),
-            Some(AlignmentEngineEvent::Error { .. }) => failures += 1,
-            event => panic!("unexpected controller-open event: {event:?}"),
-        }
-    }
-    assert_eq!(opened.len(), 3);
-    assert_eq!(failures, 1);
-
-    for (track, dictionary) in controllers.iter().take(3).zip(&opened) {
-        let contig = dictionary.id_by_name("chr1").unwrap();
-        let interval = GenomicInterval::new(contig, 900_000, 920_000).unwrap();
-        let clock = &track.projection(INITIAL_PANEL_ID).unwrap().clock;
-        let generation = clock.advance();
-        let request = PanelGeneration::new(PanelId::new(1), generation);
-        track
-            .engine
-            .try_query(
-                request,
-                clock.clone(),
-                interval,
-                QueryOptions {
-                    max_records: NonZeroUsize::new(100).unwrap(),
-                    coverage_bins: NonZeroUsize::new(64).unwrap(),
-                    collect_modifications: false,
-                    ..QueryOptions::default()
-                },
-            )
-            .unwrap();
-    }
-    for track in controllers.iter().take(3) {
-        let generation = track.projection(INITIAL_PANEL_ID).unwrap().clock.current();
-        let expected = PanelGeneration::new(PanelId::new(1), generation);
-        loop {
-            match track
-                .engine
-                .receive_timeout(Duration::from_secs(10))
-                .unwrap()
-            {
-                Some(AlignmentEngineEvent::QueryCompleted {
-                    request: completed,
-                    query,
-                    ..
-                }) => {
-                    assert_eq!(completed, expected);
-                    assert!(query.stats.records_seen > 0);
-                    assert!(query.stats.records_emitted <= 100);
-                    break;
-                }
-                Some(AlignmentEngineEvent::QueryPhaseChanged { .. })
-                | Some(AlignmentEngineEvent::WorkingSetUpdated { .. }) => {}
-                event => panic!("unexpected healthy query event: {event:?}"),
-            }
-        }
-    }
-}
-
-#[test]
-fn two_alignment_controllers_route_two_panel_queries_independently() {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let source = repository.join("benchmark-data/mixed.bam");
-    let panel_ids = [PanelId::new(7), PanelId::new(3)];
-    let controllers = (1..=2)
-        .map(|id| {
-            let config = SessionAlignmentTrack::new(
-                TrackId::new(id),
-                format!("Mixed {id}"),
-                TrackSource::Local {
-                    path: source.display().to_string(),
-                },
-            );
-            spawn_alignment_track_controller(
-                config,
-                NonZeroUsize::new(16 * 1024 * 1024).unwrap(),
-                None,
-                None,
-                &panel_ids,
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let dictionaries = controllers
-        .iter()
-        .map(|controller| {
-            match controller
-                .engine
-                .receive_timeout(Duration::from_secs(10))
-                .unwrap()
-            {
-                Some(AlignmentEngineEvent::Opened { dictionary, .. }) => dictionary,
-                event => panic!("unexpected controller-open event: {event:?}"),
-            }
-        })
-        .collect::<Vec<_>>();
-
-    for (controller, dictionary) in controllers.iter().zip(&dictionaries) {
-        for (panel_id, interval) in two_panel_test_intervals(dictionary, panel_ids) {
-            let clock = &controller.projection(panel_id).unwrap().clock;
-            let request = PanelGeneration::new(panel_id, clock.advance());
-            controller
-                .engine
-                .try_query(
-                    request,
-                    clock.clone(),
-                    interval,
-                    QueryOptions {
-                        max_records: NonZeroUsize::new(100).unwrap(),
-                        coverage_bins: NonZeroUsize::new(64).unwrap(),
-                        collect_modifications: false,
-                        ..QueryOptions::default()
-                    },
-                )
-                .unwrap();
-        }
-    }
-
-    for (controller, dictionary) in controllers.iter().zip(&dictionaries) {
-        let expected = two_panel_test_intervals(dictionary, panel_ids);
-        let mut completed = HashMap::new();
-        while completed.len() < expected.len() {
-            match controller
-                .engine
-                .receive_timeout(Duration::from_secs(10))
-                .unwrap()
-            {
-                Some(AlignmentEngineEvent::QueryCompleted { request, query, .. }) => {
-                    completed.insert(request.panel_id(), query);
-                }
-                Some(AlignmentEngineEvent::WorkingSetUpdated { .. })
-                | Some(AlignmentEngineEvent::QueryPhaseChanged { .. }) => {}
-                event => panic!("unexpected two-panel query event: {event:?}"),
-            }
-        }
-        assert_eq!(completed.len(), 2);
-        for (panel_id, interval) in expected {
-            let query = completed.get(&panel_id).unwrap();
-            assert_eq!(query.interval.contig(), interval.contig());
-            assert!(query.interval.contains_interval(interval));
-            assert!(query.stats.records_seen > 0);
-        }
-    }
 }

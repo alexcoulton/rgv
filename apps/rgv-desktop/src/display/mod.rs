@@ -545,6 +545,20 @@ pub(crate) fn pane_layout_snapshot(
     snapshot
 }
 
+/// An initial source-backed scene needs pane geometry before it can request data. Once geometry
+/// exists, the ordinary navigation transaction remains authoritative and blocks premature display
+/// rebuilds until it reaches its commit phase.
+pub(crate) const fn panel_display_rebuild_allowed(
+    phase: NavigationPresentationPhase,
+    has_existing_layout: bool,
+) -> bool {
+    !has_existing_layout
+        || matches!(
+            phase,
+            NavigationPresentationPhase::Committing | NavigationPresentationPhase::Settled
+        )
+}
+
 impl Viewer {
     pub(crate) fn ensure_alignment_rows(&mut self) -> bool {
         let track_ids = self
@@ -1232,6 +1246,9 @@ impl Viewer {
                     .active()
                     .reference_slice
                     .as_deref()
+                    .filter(|_| {
+                        self.panels.active().reference_slice_revision == self.reference_revision
+                    })
                     .filter(|slice| retained_data_overlaps(slice.interval, viewport_interval))
             {
                 let reference_display = layout_reference_slice_oriented(
@@ -2413,9 +2430,13 @@ impl Viewer {
                         .as_ref()
                         .and_then(|overview| overview.contig_mapped_record_count(contig))
                 });
+            let projection = track.projection(self.panels.active().id);
+            let scene_frame = projection.and_then(|projection| projection.scene_frame.as_ref());
+            let scene_snapshot = (!index_only_overview)
+                .then(|| scene_frame.and_then(|frame| frame.snapshot.as_ref()))
+                .flatten();
             let read_state_message = (!index_only_overview)
                 .then(|| {
-                    let projection = track.projection(self.panels.active().id);
                     if let Some(message) =
                         projection.and_then(|projection| projection.unavailable.as_deref())
                     {
@@ -2425,30 +2446,24 @@ impl Viewer {
                             AlignmentTrackLifecycle::Opening => {
                                 Some("Opening read source…".to_owned())
                             }
-                            AlignmentTrackLifecycle::Ready
-                                if projection
-                                    .is_some_and(AlignmentPanelProjection::query_is_checking)
-                                    && projection.is_some_and(|projection| {
-                                        projection.checking_notice_visible
-                                    }) =>
+                            AlignmentTrackLifecycle::Ready => match scene_frame
+                                .map(|frame| frame.individual_reads)
+                                .unwrap_or(AlignmentIndividualReadCapability::Pending)
                             {
-                                Some(
-                                    projection
-                                        .expect("checking projection exists")
-                                        .query_phase
-                                        .status_text()
-                                        .to_owned(),
-                                )
-                            }
-                            AlignmentTrackLifecycle::Ready
-                                if projection
-                                    .is_some_and(AlignmentPanelProjection::query_is_checking) =>
-                            {
-                                None
-                            }
-                            AlignmentTrackLifecycle::Ready => {
-                                Some("Complete reads are unavailable for this viewport".to_owned())
-                            }
+                                AlignmentIndividualReadCapability::Complete { .. } => None,
+                                AlignmentIndividualReadCapability::Pending
+                                    if scene_snapshot.is_some() => None,
+                                AlignmentIndividualReadCapability::Pending => {
+                                    Some("Preparing complete reads…".to_owned())
+                                }
+                                AlignmentIndividualReadCapability::Refused {
+                                    complete_read_limit,
+                                    eligible_records,
+                                    ..
+                                } => Some(format!(
+                                    "{eligible_records} eligible alignments exceed the Complete read limit of {complete_read_limit}"
+                                )),
+                            },
                             AlignmentTrackLifecycle::Failed(message) => {
                                 Some(format!("Read source failed: {message}"))
                             }
@@ -2458,40 +2473,47 @@ impl Viewer {
                 .flatten();
             let bottom = bounds.bottom.max(bounds.top + READ_PANE_HEADER_HEIGHT);
             let content_top = bounds.top + READ_PANE_HEADER_HEIGHT;
+            let density = self.alignment_density_for_panel_track(self.panels.active().id, track_id);
+            let row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
+            let total_rows = scene_snapshot.map(|snapshot| snapshot.reads().atlas().row_count());
+            let scene_content_bottom =
+                total_rows.map_or(bottom, |rows| content_top + rows as f32 * row_height + 6.0);
             if desired
                 && bottom > content_top
                 && bottom > read_clip_top
                 && bounds.top < scroll_clip_bottom
             {
+                let scrollable = if index_only_overview {
+                    alignment::index_only_read_display(
+                        self.active_panel_rect().width(),
+                        content_top,
+                        bottom,
+                        mapped_record_count,
+                    )
+                } else {
+                    read_state_message
+                        .clone()
+                        .map_or_else(DisplayList::default, |message| {
+                            alignment::read_state_display(
+                                self.active_panel_rect().width(),
+                                content_top,
+                                bottom,
+                                message,
+                            )
+                        })
+                };
                 read_panel_displays.push(ReadPanelDisplayCache {
                     track_id,
-                    scrollable: if index_only_overview {
-                        alignment::index_only_read_display(
-                            self.active_panel_rect().width(),
-                            content_top,
-                            bottom,
-                            mapped_record_count,
-                        )
-                    } else {
-                        read_state_message
-                            .clone()
-                            .map_or_else(DisplayList::default, |message| {
-                                alignment::read_state_display(
-                                    self.active_panel_rect().width(),
-                                    content_top,
-                                    bottom,
-                                    message,
-                                )
-                            })
-                    },
-                    density_camera: false,
-                    row_origin: None,
-                    row_height: None,
-                    row_layout_revision: None,
+                    scrollable,
+                    density_camera: scene_snapshot.is_some(),
+                    row_origin: scene_snapshot.is_some().then_some(content_top),
+                    row_height: scene_snapshot.is_some().then_some(row_height),
+                    row_layout_revision: scene_snapshot
+                        .map(|snapshot| snapshot.revision().fingerprint().low()),
                     materialized_row_range: None,
-                    total_rows: None,
+                    total_rows,
                     overview: ui::ScrollbarOverview::default(),
-                    actual_content_bottom: bottom,
+                    actual_content_bottom: scene_content_bottom.max(bottom),
                     clip_top: bounds.top.max(read_clip_top),
                     clip_bottom: bottom.min(scroll_clip_bottom),
                 });
@@ -3153,6 +3175,7 @@ impl Viewer {
             content_bottom_points: panel.content_bottom_points,
             density: None,
             stable_row_anchor: None,
+            scene_contig: None,
         };
         for (
             track_id,
@@ -3616,30 +3639,33 @@ impl Viewer {
     pub(crate) fn rebuild_all_panel_displays(&mut self) {
         let active_id = self.panels.active().id;
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        // Source-backed alignment cameras are derived from committed pane geometry. On the first
+        // load there is no retained presentation to preserve and no track-frame geometry yet, so
+        // refusing every display rebuild creates a cycle: navigation waits for data, data waits
+        // for a camera, and the camera waits for layout. Permit exactly that empty-layout
+        // bootstrap while retaining the normal transactional gate once a panel has a layout.
+        let rebuildable_panel_ids = panel_ids
+            .iter()
+            .copied()
+            .filter(|panel_id| {
+                self.panels.get(*panel_id).is_some_and(|panel| {
+                    panel_display_rebuild_allowed(
+                        panel.navigation_presentation.phase,
+                        !panel.track_frames.is_empty(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         let requested_annotation_scroll = self.panels.annotation_scroll_points;
         self.shared_annotation_frame_heights.clear();
-        for panel_id in &panel_ids {
-            if !self
-                .panels
-                .get(*panel_id)
-                .is_some_and(|panel| panel.navigation_presentation.permits_staged_display())
-            {
-                continue;
-            }
+        for panel_id in &rebuildable_panel_ids {
             self.panels.annotation_scroll_points = requested_annotation_scroll;
             self.panels.activate(*panel_id);
             self.rebuild_genomic_display();
         }
         if self.panels.len() > 1 {
             self.shared_annotation_frame_heights = maximum_annotation_frame_heights(&self.panels);
-            for panel_id in &panel_ids {
-                if !self
-                    .panels
-                    .get(*panel_id)
-                    .is_some_and(|panel| panel.navigation_presentation.permits_staged_display())
-                {
-                    continue;
-                }
+            for panel_id in &rebuildable_panel_ids {
                 self.panels.annotation_scroll_points = requested_annotation_scroll;
                 self.panels.activate(*panel_id);
                 self.rebuild_genomic_display();
@@ -3660,14 +3686,7 @@ impl Viewer {
         });
         self.panels.annotation_scroll_points = shared_annotation_scroll;
         if needs_scroll_reprojection {
-            for panel_id in &panel_ids {
-                if !self
-                    .panels
-                    .get(*panel_id)
-                    .is_some_and(|panel| panel.navigation_presentation.permits_staged_display())
-                {
-                    continue;
-                }
+            for panel_id in &rebuildable_panel_ids {
                 self.panels.activate(*panel_id);
                 let _ = self.rebuild_active_panel_from_scroll_cache();
             }
@@ -3842,6 +3861,7 @@ impl Viewer {
         }
         self.prepare_rectangle_renderer();
         self.display_dirty = false;
+        self.refresh_alignment_scene_cameras_after_layout();
     }
 
     fn prepare_rectangle_renderer(&mut self) {

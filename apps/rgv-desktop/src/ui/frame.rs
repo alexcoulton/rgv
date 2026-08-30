@@ -3839,9 +3839,22 @@ impl Viewer {
             }
         }
         if clear_cache_requested {
+            self.alignment_gpu_frame = None;
+            self.alignment_gpu_residency = None;
+            self.alignment_gpu_prefetch_pending = false;
+            self.alignment_gpu_renderer.discard_device_resources();
+            let budget = self
+                .settings
+                .cache_budget_mib
+                .saturating_mul(1024 * 1024)
+                .max(1);
             for track in &self.alignment_tracks {
-                if let Err(error) = track.engine.try_clear_cache() {
-                    self.data_status = error.to_string();
+                if let Some(engine) = &track.scene_engine {
+                    if let Err(error) = engine.try_reduce_budget(0) {
+                        self.data_status = error.to_string();
+                    } else if let Err(error) = engine.try_reduce_budget(budget) {
+                        self.data_status = error.to_string();
+                    }
                 }
             }
         }

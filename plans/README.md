@@ -16,6 +16,7 @@ The remaining documents preserve detailed implementation, remediation, and desig
 
 ## Focused plans
 
+- [Unified alignment scene and legacy removal](UNIFIED_ALIGNMENT_SCENE_IMPLEMENTATION_PLAN.md)
 - [Resident alignment scene and instant navigation](RESIDENT_ALIGNMENT_SCENE_PLAN.md)
 - [Alignment browsing working set](ALIGNMENT_BROWSING_WORKING_SET_PLAN.md)
 - [Canonical stable read architecture](CANONICAL_STABLE_READ_ARCHITECTURE_PLAN.md)

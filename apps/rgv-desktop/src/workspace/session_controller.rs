@@ -296,6 +296,7 @@ impl Viewer {
         // panel list in the committed layout.
         self.synchronize_panel_widths();
         self.reference_dictionary = None;
+        self.reference_revision = None;
         self.reference_engine = if let Some(source) = &self.reference_source {
             let engine = ReferenceEngine::spawn(8);
             engine.try_open_with_options(

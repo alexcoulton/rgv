@@ -1,5 +1,157 @@
 use super::super::*;
-use crate::display::alignment;
+use super::alignment_management::alignment_scene_frame_for_ui;
+
+/// A FASTA completion is authoritative only for the exact open handle and request it was sent
+/// for. Generation acceptance is checked separately by the owning panel.
+pub(crate) fn reference_query_completion_matches(
+    current_revision: Option<ReferenceRevision>,
+    requested_revision: Option<ReferenceRevision>,
+    requested_interval: Option<GenomicInterval>,
+    completed_revision: ReferenceRevision,
+    completed_interval: GenomicInterval,
+) -> bool {
+    current_revision == Some(completed_revision)
+        && requested_revision == Some(completed_revision)
+        && requested_interval == Some(completed_interval)
+}
+
+/// Whether a current FASTA request failure terminally satisfies the matching pending dependency.
+/// The scene remains intact; this predicate only permits the desktop transaction to stop waiting
+/// for an authority that the reference actor has explicitly failed to provide.
+pub(crate) fn reference_failure_matches_requirement(
+    failed_revision: ReferenceRevision,
+    failed_interval: GenomicInterval,
+    requirement: AlignmentReferenceRequirement,
+) -> bool {
+    matches!(
+        requirement,
+        AlignmentReferenceRequirement::Pending { revision, horizon }
+            if revision == failed_revision && failed_interval.contains_interval(horizon)
+    )
+}
+
+/// Shared settlement contract for interactive navigation and automation observation. A terminal
+/// error settles only its exact current panel generation; otherwise the current revision, slice
+/// coverage, and completion generation must all agree.
+pub(crate) fn reference_dependency_is_settled(
+    required: bool,
+    generation: u64,
+    current_revision: Option<ReferenceRevision>,
+    slice_revision: Option<ReferenceRevision>,
+    slice_interval: Option<GenomicInterval>,
+    required_interval: GenomicInterval,
+    settled_generation: Option<u64>,
+    error_generation: Option<u64>,
+) -> bool {
+    !required
+        || error_generation == Some(generation)
+        || (slice_revision == current_revision
+            && settled_generation == Some(generation)
+            && slice_interval.is_some_and(|slice| slice.contains_interval(required_interval)))
+}
+
+/// Owner-scoped scene results are current only when both sides carry the same explicit request
+/// token. In particular, `None == None` is not authority: it describes a lane with no live desktop
+/// request and an unversioned error/event.
+pub(crate) fn alignment_scene_event_token_is_current(
+    desired: Option<AlignmentSceneRequestToken>,
+    event: Option<AlignmentSceneRequestToken>,
+) -> bool {
+    desired.is_some() && desired == event
+}
+
+/// A published frame may update a projection only when it belongs to the exact desktop
+/// transaction and has reached that transaction's camera. Contract and policy controls share the
+/// request token with the following camera control, so the token alone does not make an interim
+/// old-camera frame current.
+pub(crate) fn alignment_scene_frame_is_current(
+    desired_token: Option<AlignmentSceneRequestToken>,
+    event_token: AlignmentSceneRequestToken,
+    desired_camera: Option<AlignmentCamera>,
+    frame_camera: AlignmentCamera,
+) -> bool {
+    alignment_scene_event_token_is_current(desired_token, Some(event_token))
+        && desired_camera == Some(frame_camera)
+}
+
+/// A refusal is terminal only for the exact request camera, and its source horizon must contain
+/// that camera. A token match alone is insufficient because one request token is deliberately
+/// shared by the ordered contract/policy/camera controls which form one desktop transaction.
+pub(crate) fn alignment_scene_refusal_is_current(
+    desired_token: Option<AlignmentSceneRequestToken>,
+    event_token: AlignmentSceneRequestToken,
+    desired_camera: Option<AlignmentCamera>,
+    frame_camera: AlignmentCamera,
+    refused_horizon: GenomicInterval,
+) -> bool {
+    alignment_scene_frame_is_current(desired_token, event_token, desired_camera, frame_camera)
+        && refused_horizon.contains_interval(frame_camera.interval())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AlignmentReferenceLaneRequirement {
+    pub(crate) owner: SourceOwnerId,
+    pub(crate) revision: ReferenceRevision,
+    pub(crate) horizon: GenomicInterval,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AlignmentReferenceLanePlan {
+    AllQueued,
+    Query {
+        revision: ReferenceRevision,
+        interval: GenomicInterval,
+    },
+}
+
+/// Plans the next FASTA operation across every current pending alignment lane. Compatible lanes
+/// share one bounded union query; incompatible or over-limit lanes are handled deterministically
+/// one at a time. An owner already accepted by its engine control queue is excluded only while the
+/// exact revision and horizon remain unchanged.
+pub(crate) fn plan_alignment_reference_lanes(
+    requirements: &[AlignmentReferenceLaneRequirement],
+    queued: &BTreeMap<SourceOwnerId, (ReferenceRevision, GenomicInterval)>,
+) -> AlignmentReferenceLanePlan {
+    let mut outstanding = requirements
+        .iter()
+        .copied()
+        .filter(|requirement| {
+            queued.get(&requirement.owner) != Some(&(requirement.revision, requirement.horizon))
+        })
+        .collect::<Vec<_>>();
+    outstanding.sort_unstable_by_key(|requirement| requirement.owner);
+    let Some(first) = outstanding.first().copied() else {
+        return AlignmentReferenceLanePlan::AllQueued;
+    };
+    let compatible = outstanding.iter().all(|requirement| {
+        requirement.revision == first.revision
+            && requirement.horizon.contig() == first.horizon.contig()
+    });
+    if compatible {
+        let start = outstanding
+            .iter()
+            .map(|requirement| requirement.horizon.start())
+            .min()
+            .expect("an outstanding reference lane exists");
+        let end = outstanding
+            .iter()
+            .map(|requirement| requirement.horizon.end())
+            .max()
+            .expect("an outstanding reference lane exists");
+        if end.saturating_sub(start) <= MAX_REFERENCE_QUERY_BASES {
+            let interval = GenomicInterval::new(first.horizon.contig(), start, end)
+                .expect("a union of non-empty reference horizons is non-empty");
+            return AlignmentReferenceLanePlan::Query {
+                revision: first.revision,
+                interval,
+            };
+        }
+    }
+    AlignmentReferenceLanePlan::Query {
+        revision: first.revision,
+        interval: first.horizon,
+    }
+}
 
 impl Viewer {
     fn mark_active_panel_navigation_queries_pending(&mut self) {
@@ -21,6 +173,9 @@ impl Viewer {
         panel.pending_queries.alignment = alignment_pending;
         panel.pending_queries.reference = reference_pending;
         panel.pending_queries.tracks = tracks_pending;
+        panel.reference_request_revision = None;
+        panel.reference_request_interval = None;
+        panel.reference_installs_queued.clear();
         panel.reference_query_error_generation = None;
         panel.track_query_error_generation = None;
     }
@@ -94,7 +249,12 @@ impl Viewer {
         panel
             .navigation_query_schedule
             .update(target, now, gesture_active, hold_commit_until_end);
-        if !gesture_active {
+        if gesture_active {
+            // Alignment cameras are not debounced with source queries. The bounded scene mailbox
+            // replaces unread camera intents per panel, while the UI immediately reprojects the
+            // resident immutable scene under this exact viewport.
+            self.dispatch_alignment_query();
+        } else {
             let target = self
                 .panels
                 .active_mut()
@@ -172,13 +332,17 @@ impl Viewer {
         }
         let panel_generation = panel.generation_clock.current().get();
         let alignments_settled = self.panel_alignment_queries_are_settled(panel_id);
-        let reference_settled = self.reference_engine.is_none()
-            || panel.viewport.bases_per_pixel() > MAXIMUM_BASE_MARK_BASES_PER_PIXEL
-            || panel.reference_query_error_generation == Some(panel_generation)
-            || (panel.reference_settled_generation == Some(panel_generation)
-                && panel.reference_slice.as_ref().is_some_and(|slice| {
-                    slice.interval.contains_interval(panel.viewport.interval())
-                }));
+        let reference_settled = reference_dependency_is_settled(
+            self.reference_engine.is_some()
+                && panel.viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL,
+            panel_generation,
+            self.reference_revision,
+            panel.reference_slice_revision,
+            panel.reference_slice.as_ref().map(|slice| slice.interval),
+            panel.viewport.interval(),
+            panel.reference_settled_generation,
+            panel.reference_query_error_generation,
+        );
         let tracks_settled = self.track_engine.is_none()
             || panel.track_query_error_generation == Some(panel_generation)
             || (panel.track_settled_generation == Some(panel_generation)
@@ -341,16 +505,17 @@ impl Viewer {
             let reference_missing = self.reference_engine.is_some()
                 && self.panels.active().viewport.bases_per_pixel()
                     <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
-                && self
-                    .panels
-                    .active()
-                    .reference_slice
-                    .as_ref()
-                    .is_none_or(|slice| {
-                        !slice
-                            .interval
-                            .contains_interval(self.panels.active().viewport.interval())
-                    });
+                && (self.panels.active().reference_slice_revision != self.reference_revision
+                    || self
+                        .panels
+                        .active()
+                        .reference_slice
+                        .as_ref()
+                        .is_none_or(|slice| {
+                            !slice
+                                .interval
+                                .contains_interval(self.panels.active().viewport.interval())
+                        }));
             if reference_missing {
                 self.request_reference_query();
                 source_refresh_requested = true;
@@ -375,22 +540,201 @@ impl Viewer {
         self.dispatch_reference_query();
     }
 
+    /// Returns every live current lane which still requires the currently open FASTA revision.
+    /// A terminal dependency failure settles the projection generation and therefore excludes it
+    /// until the next navigation advances that generation and retries.
+    fn current_alignment_reference_requirements(
+        &self,
+        panel_id: PanelId,
+        revision: ReferenceRevision,
+    ) -> Vec<AlignmentReferenceLaneRequirement> {
+        self.alignment_tracks
+            .iter()
+            .filter(|track| {
+                matches!(track.lifecycle, AlignmentTrackLifecycle::Ready)
+                    && track.scene_engine.is_some()
+            })
+            .filter_map(|track| {
+                let projection = track.projection(panel_id)?;
+                if projection.query_is_current() {
+                    return None;
+                }
+                let owner = projection.scene_owner?;
+                let frame = projection.scene_frame.as_ref()?;
+                if projection.desired_scene_camera != Some(frame.camera)
+                    || !alignment_scene_event_token_is_current(
+                        projection.desired_scene_request_token,
+                        projection.scene_frame_request_token,
+                    )
+                {
+                    return None;
+                }
+                match frame.reference_requirement {
+                    AlignmentReferenceRequirement::Pending {
+                        revision: required_revision,
+                        horizon,
+                    } if required_revision == revision => Some(AlignmentReferenceLaneRequirement {
+                        owner,
+                        revision,
+                        horizon,
+                    }),
+                    AlignmentReferenceRequirement::NotRequired
+                    | AlignmentReferenceRequirement::Pending { .. }
+                    | AlignmentReferenceRequirement::Ready { .. } => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Queues an already-fetched immutable FASTA slice into every current scene owner whose
+    /// pending requirement it satisfies. Success means every live current owner is either already
+    /// satisfied or has accepted its exact authority into the bounded engine control queue.
+    fn install_reference_authority_for_panel(
+        &mut self,
+        panel_id: PanelId,
+        revision: ReferenceRevision,
+        slice: &Arc<ReferenceSlice>,
+    ) -> bool {
+        let authority = AlignmentReferenceAuthority::new(revision, Arc::clone(slice));
+        let requirements = self.current_alignment_reference_requirements(panel_id, revision);
+        let mut queued = self
+            .panels
+            .get_mut(panel_id)
+            .map(|panel| std::mem::take(&mut panel.reference_installs_queued))
+            .unwrap_or_default();
+        queued.retain(|owner, queued_requirement| {
+            requirements.iter().any(|requirement| {
+                requirement.owner == *owner
+                    && *queued_requirement == (requirement.revision, requirement.horizon)
+            })
+        });
+        for requirement in &requirements {
+            if queued.get(&requirement.owner) == Some(&(requirement.revision, requirement.horizon))
+                || !slice.interval.contains_interval(requirement.horizon)
+            {
+                continue;
+            }
+            let Some(track_index) = self.alignment_tracks.iter().position(|track| {
+                track
+                    .projection(panel_id)
+                    .is_some_and(|projection| projection.scene_owner == Some(requirement.owner))
+            }) else {
+                continue;
+            };
+            let result = self.alignment_tracks[track_index]
+                .scene_engine
+                .as_ref()
+                .map(|engine| {
+                    engine.try_install_reference_authority(requirement.owner, authority.clone())
+                });
+            match result {
+                Some(Ok(())) => {
+                    queued.insert(
+                        requirement.owner,
+                        (requirement.revision, requirement.horizon),
+                    );
+                }
+                Some(Err(EngineQueueError::Full)) | None => {}
+                Some(Err(EngineQueueError::Disconnected)) => {
+                    // This lane is terminal and will no longer participate in the panel's
+                    // reference settlement. Do not leave the otherwise-successful panel retrying
+                    // an engine which has already disconnected.
+                    self.alignment_tracks[track_index].lifecycle =
+                        AlignmentTrackLifecycle::Failed(EngineQueueError::Disconnected.to_string());
+                }
+            }
+        }
+        let live = self.current_alignment_reference_requirements(panel_id, revision);
+        queued.retain(|owner, queued_requirement| {
+            live.iter().any(|requirement| {
+                requirement.owner == *owner
+                    && *queued_requirement == (requirement.revision, requirement.horizon)
+            })
+        });
+        let all_queued = matches!(
+            plan_alignment_reference_lanes(&live, &queued),
+            AlignmentReferenceLanePlan::AllQueued
+        );
+        if let Some(panel) = self.panels.get_mut(panel_id) {
+            panel.reference_installs_queued = queued;
+        }
+        all_queued
+    }
+
     pub(crate) fn dispatch_reference_query(&mut self) {
         if !self.panels.active().pending_queries.reference {
+            return;
+        }
+        let panel_id = self.panels.active().id;
+        let Some(revision) = self.reference_revision else {
+            self.panels.active_mut().pending_queries.reference = false;
+            return;
+        };
+        let cached = self.panels.get(panel_id).and_then(|panel| {
+            (panel.reference_slice_revision == Some(revision))
+                .then(|| panel.reference_slice.as_ref())
+                .flatten()
+                .cloned()
+        });
+        if let Some(slice) = &cached {
+            self.install_reference_authority_for_panel(panel_id, revision, slice);
+        }
+        let requirements = self.current_alignment_reference_requirements(panel_id, revision);
+        let lane_plan = self
+            .panels
+            .get(panel_id)
+            .map(|panel| {
+                plan_alignment_reference_lanes(&requirements, &panel.reference_installs_queued)
+            })
+            .unwrap_or(AlignmentReferenceLanePlan::AllQueued);
+        let viewport = self.panels.active().viewport.interval();
+        let cached_covers_viewport = cached
+            .as_ref()
+            .is_some_and(|slice| slice.interval.contains_interval(viewport));
+        if matches!(lane_plan, AlignmentReferenceLanePlan::AllQueued) && cached_covers_viewport {
+            let panel = self.panels.active_mut();
+            panel.pending_queries.reference = false;
+            panel.reference_settled_generation = Some(panel.generation_clock.current().get());
+            panel.reference_query_error_generation = None;
+            return;
+        }
+        let (revision, interval) = match lane_plan {
+            AlignmentReferenceLanePlan::Query { revision, interval } => (revision, interval),
+            AlignmentReferenceLanePlan::AllQueued => (revision, viewport),
+        };
+        if cached
+            .as_ref()
+            .is_some_and(|slice| slice.interval.contains_interval(interval))
+        {
+            // The bases are already resident, so an unqueued owner can only be waiting for bounded
+            // control-queue capacity. Keep the dispatch flag set and retry without duplicate I/O.
+            self.panels.active_mut().pending_queries.reference = true;
+            return;
+        }
+        let already_requested = self.panels.get(panel_id).is_some_and(|panel| {
+            panel.reference_request_revision == Some(revision)
+                && panel.reference_request_interval == Some(interval)
+        });
+        if already_requested {
+            self.panels.active_mut().pending_queries.reference = false;
             return;
         }
         let Some(engine) = &self.reference_engine else {
             self.panels.active_mut().pending_queries.reference = false;
             return;
         };
-        let request = self.panels.active().request();
+        let query = ReferenceQueryIdentity::new(self.panels.active().request(), revision, interval);
         match engine.try_query(
-            request,
+            query,
             self.panels.active_mut().generation_clock.clone(),
             self.panels.active_mut().contig_name.clone(),
-            self.panels.active_mut().viewport.interval(),
         ) {
-            Ok(()) => self.panels.active_mut().pending_queries.reference = false,
+            Ok(()) => {
+                let panel = self.panels.active_mut();
+                panel.reference_request_revision = Some(revision);
+                panel.reference_request_interval = Some(interval);
+                panel.pending_queries.reference = false;
+            }
             Err(EngineQueueError::Full) => {
                 "Reference queue busy; retrying the latest locus…"
                     .clone_into(&mut self.data_status);
@@ -612,16 +956,32 @@ impl Viewer {
             return;
         }
         let active_panel_id = self.panels.active().id;
+        let mut reference_panels_to_retry = BTreeSet::new();
         for event in events {
             match event {
                 ReferenceEngineEvent::Opened {
+                    revision,
                     dictionary,
                     remote_io_stats,
                 } => {
                     let reference_contig_count = dictionary.len();
                     self.reference_open_error = None;
+                    self.reference_revision = Some(revision);
                     self.reference_remote_io_stats = remote_io_stats;
                     self.reference_dictionary = Some(dictionary.clone());
+                    // Opening (including reopening the same path) establishes a new immutable
+                    // authority. No slice or in-flight request from the previous handle may be
+                    // paired with contracts carrying this revision.
+                    for panel in self.panels.iter_mut() {
+                        panel.reference_slice = None;
+                        panel.reference_slice_revision = None;
+                        panel.reference_request_revision = None;
+                        panel.reference_request_interval = None;
+                        panel.reference_installs_queued.clear();
+                        panel.reference_settled_generation = None;
+                        panel.reference_query_error_generation = None;
+                        panel.pending_queries.reference = false;
+                    }
                     if self.primary_alignment_dictionary().is_none() {
                         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
                         for id in ids {
@@ -659,7 +1019,6 @@ impl Viewer {
                                     panel.vertical_scroll_points = 0.0;
                                     panel.vertical_content_origin_points = 0.0;
                                     panel.latent_vertical_scroll_fraction = None;
-                                    panel.reference_slice = None;
                                 }
                                 Err(error) if id == active_panel_id => {
                                     self.data_status = error.to_string();
@@ -691,60 +1050,190 @@ impl Viewer {
                     self.display_dirty = true;
                 }
                 ReferenceEngineEvent::QueryCompleted {
-                    request,
+                    query,
                     slice,
                     remote_io_stats,
                 } => {
+                    let request = query.request();
+                    let revision = query.revision();
                     self.reference_remote_io_stats = remote_io_stats;
                     let is_active = request.panel_id() == active_panel_id;
                     let mut accepted = false;
+                    let current_revision = self.reference_revision;
                     if let Some(panel) = self.panels.get_mut(request.panel_id())
                         && panel.accepts(request)
-                        && slice.interval.contains_interval(panel.viewport.interval())
+                        && reference_query_completion_matches(
+                            current_revision,
+                            panel.reference_request_revision,
+                            panel.reference_request_interval,
+                            revision,
+                            query.interval(),
+                        )
+                        && query.interval() == slice.interval
                     {
                         accepted = true;
-                        panel.reference_slice = Some(slice);
-                        panel.reference_settled_generation = Some(request.generation().get());
+                        panel.reference_slice = Some(Arc::clone(&slice));
+                        panel.reference_slice_revision = Some(revision);
+                        panel.reference_request_revision = None;
+                        panel.reference_request_interval = None;
                         panel.reference_query_error_generation = None;
                         self.display_dirty = true;
                         if is_active && !self.has_alignment_engine() {
                             "Reference sequence loaded".clone_into(&mut self.data_status);
                         }
                     }
-                    if !accepted {
+                    if accepted {
+                        let installed = self.install_reference_authority_for_panel(
+                            request.panel_id(),
+                            revision,
+                            &slice,
+                        );
+                        let viewport_covered =
+                            self.panels.get(request.panel_id()).is_some_and(|panel| {
+                                slice.interval.contains_interval(panel.viewport.interval())
+                            });
+                        let settled = installed && viewport_covered;
+                        if let Some(panel) = self.panels.get_mut(request.panel_id()) {
+                            panel.pending_queries.reference = !settled;
+                            if settled {
+                                panel.reference_settled_generation =
+                                    Some(request.generation().get());
+                            }
+                        }
+                        if !settled {
+                            reference_panels_to_retry.insert(request.panel_id());
+                        }
+                    } else {
                         self.navigation_stale_result_rejections =
                             self.navigation_stale_result_rejections.saturating_add(1);
                     }
                 }
-                ReferenceEngineEvent::Error { request, message } => {
-                    if request.is_none() {
+                ReferenceEngineEvent::Error { query, message } => {
+                    if query.is_none() {
                         self.reference_open_error = Some(message.clone());
+                        self.reference_revision = None;
+                        self.reference_dictionary = None;
+                        // A failed open is terminal for this actor. Leaving it installed would
+                        // make every later Base navigation advertise reference work even though
+                        // no open revision exists and no query can be issued.
+                        self.reference_engine = None;
+                        for panel in self.panels.iter_mut() {
+                            panel.settle_reference_open_failure();
+                        }
                     }
-                    let current = request.is_none_or(|request| {
-                        self.panels
-                            .get(request.panel_id())
-                            .is_some_and(|panel| panel.accepts(request))
+                    let current = query.is_none_or(|query| {
+                        let request = query.request();
+                        self.panels.get(request.panel_id()).is_some_and(|panel| {
+                            panel.accepts(request)
+                                && reference_query_completion_matches(
+                                    self.reference_revision,
+                                    panel.reference_request_revision,
+                                    panel.reference_request_interval,
+                                    query.revision(),
+                                    query.interval(),
+                                )
+                        })
                     });
-                    if request.is_some() && !current {
+                    if query.is_some() && !current {
                         self.navigation_stale_result_rejections =
                             self.navigation_stale_result_rejections.saturating_add(1);
                     }
                     if current {
-                        if let Some(request) = request
-                            && let Some(panel) = self.panels.get_mut(request.panel_id())
-                        {
-                            panel.reference_settled_generation = Some(request.generation().get());
-                            panel.reference_query_error_generation =
-                                Some(request.generation().get());
+                        let mut failed_authority = None;
+                        if let Some(query) = query {
+                            let request = query.request();
+                            if let Some(panel) = self.panels.get_mut(request.panel_id()) {
+                                failed_authority =
+                                    Some((request.panel_id(), query.revision(), query.interval()));
+                                panel.reference_request_revision = None;
+                                panel.reference_request_interval = None;
+                                panel.reference_settled_generation =
+                                    Some(request.generation().get());
+                                panel.reference_query_error_generation =
+                                    Some(request.generation().get());
+                            }
+                        }
+                        if let Some((panel_id, revision, interval)) = failed_authority {
+                            let mut failed_owners = Vec::new();
+                            for track in &mut self.alignment_tracks {
+                                let projection = track.projection_mut(panel_id);
+                                let matching_current_requirement =
+                                    projection.scene_frame.as_ref().is_some_and(|frame| {
+                                        projection.desired_scene_camera == Some(frame.camera)
+                                            && alignment_scene_event_token_is_current(
+                                                projection.desired_scene_request_token,
+                                                projection.scene_frame_request_token,
+                                            )
+                                            && reference_failure_matches_requirement(
+                                                revision,
+                                                interval,
+                                                frame.reference_requirement,
+                                            )
+                                    });
+                                if matching_current_requirement {
+                                    // A terminal FASTA dependency failure is not an alignment
+                                    // source failure. Keep the immutable scene and its reads, but
+                                    // let this transaction settle with the explicit reference
+                                    // error already recorded on the panel.
+                                    projection.finish_checking();
+                                    projection.pending_query = false;
+                                    projection.settled_generation =
+                                        Some(projection.clock.current().get());
+                                    if let Some(owner) = projection.scene_owner {
+                                        failed_owners.push(owner);
+                                    }
+                                }
+                            }
+                            let alignment_pending = self.alignment_tracks.iter().any(|track| {
+                                !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_))
+                                    && track
+                                        .projection(panel_id)
+                                        .is_some_and(|projection| projection.pending_query)
+                            });
+                            if let Some(panel) = self.panels.get_mut(panel_id) {
+                                panel.pending_queries.alignment = alignment_pending;
+                                for owner in failed_owners {
+                                    panel.reference_installs_queued.remove(&owner);
+                                }
+                            }
+                            let remaining =
+                                self.current_alignment_reference_requirements(panel_id, revision);
+                            let needs_another_query =
+                                self.panels.get(panel_id).is_some_and(|panel| {
+                                    matches!(
+                                        plan_alignment_reference_lanes(
+                                            &remaining,
+                                            &panel.reference_installs_queued,
+                                        ),
+                                        AlignmentReferenceLanePlan::Query { .. }
+                                    )
+                                });
+                            if needs_another_query {
+                                if let Some(panel) = self.panels.get_mut(panel_id) {
+                                    panel.pending_queries.reference = true;
+                                }
+                                reference_panels_to_retry.insert(panel_id);
+                            }
                         }
                         self.data_status = message;
                     }
                 }
             }
         }
+        if !reference_panels_to_retry.is_empty() {
+            let restore = self.panels.active().id;
+            for panel_id in reference_panels_to_retry {
+                self.panels.activate(panel_id);
+                self.dispatch_reference_query();
+            }
+            self.panels.activate(restore);
+        }
         self.window.request_redraw();
     }
 
+    // Preserved only as a deletion oracle until the first desktop scene slice passes manual
+    // acceptance. It is not compiled and cannot become a runtime fallback.
+    #[cfg(any())]
     #[allow(clippy::too_many_lines)]
     pub(crate) fn poll_alignment_events(&mut self) {
         let mut events = Vec::new();
@@ -1057,6 +1546,408 @@ impl Viewer {
             self.schedule_alignment_row_scene_preparations();
             self.window.request_redraw();
         }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn poll_alignment_events(&mut self) {
+        let active_panel_id = self.panels.active().id;
+        let primary_id = self.alignment_tracks.first().map(|track| track.config.id);
+        let mut events = Vec::new();
+        for track in &mut self.alignment_tracks {
+            let track_id = track.config.id;
+            let Some(engine) = &track.scene_engine else {
+                continue;
+            };
+            loop {
+                match engine.try_receive() {
+                    Ok(Some(event)) => events.push((track_id, event)),
+                    Ok(None) => break,
+                    Err(error) => {
+                        track.lifecycle = AlignmentTrackLifecycle::Failed(error.to_string());
+                        if Some(track_id) == primary_id {
+                            self.data_status = error.to_string();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+
+        let mut opened_primary_dictionary = None;
+        let mut source_opened = false;
+        let mut rebuild_display = false;
+        let mut prepare_frame = false;
+        let mut reference_panels_to_request = BTreeSet::new();
+        for (track_id, event) in events {
+            let Some(track_index) = self
+                .alignment_tracks
+                .iter()
+                .position(|track| track.config.id == track_id)
+            else {
+                continue;
+            };
+            match event {
+                AlignmentSceneEngineEvent::SourceOpened { metadata } => {
+                    let dictionary = metadata.dictionary.clone();
+                    let track = &mut self.alignment_tracks[track_index];
+                    track.lifecycle = AlignmentTrackLifecycle::Ready;
+                    track.dictionary = Some(dictionary.clone());
+                    track.index_overview = metadata.index_overview.clone();
+                    track.scene_metadata = Some(metadata);
+                    for projection in track.projections.values_mut() {
+                        projection.pending_query = true;
+                    }
+                    source_opened = true;
+                    rebuild_display = true;
+                    if Some(track_id) == primary_id {
+                        opened_primary_dictionary = Some(dictionary);
+                    }
+                }
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner,
+                    request_token,
+                    cause,
+                    published_scene,
+                    frame,
+                    ..
+                } => {
+                    let frame = alignment_scene_frame_for_ui(frame);
+                    let panel_id = self.alignment_tracks[track_index]
+                        .projections
+                        .iter()
+                        .find_map(|(panel_id, projection)| {
+                            (projection.scene_owner == Some(owner)).then_some(*panel_id)
+                        });
+                    let Some(panel_id) = panel_id else {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    };
+                    if self.alignment_tracks[track_index]
+                        .projection(panel_id)
+                        .is_some_and(|projection| projection.index_only_overview)
+                    {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    }
+                    let track = &mut self.alignment_tracks[track_index];
+                    let projection = track.projection_mut(panel_id);
+                    if !alignment_scene_frame_is_current(
+                        projection.desired_scene_request_token,
+                        request_token,
+                        projection.desired_scene_camera,
+                        frame.camera,
+                    ) {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    }
+                    let monotonic = projection
+                        .scene_frame
+                        .as_ref()
+                        .is_none_or(|current| frame.camera_sequence >= current.camera_sequence);
+                    if !monotonic {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    }
+                    projection.scene_frame = Some(frame.clone());
+                    projection.scene_frame_request_token = Some(request_token);
+                    let current_target = projection.desired_scene_camera == Some(frame.camera);
+                    if current_target {
+                        projection.pending_query = false;
+                        projection.unavailable = None;
+                        projection.index_only_overview = false;
+                        if matches!(
+                            frame.reference_requirement,
+                            AlignmentReferenceRequirement::Pending { .. }
+                        ) {
+                            // Source/layout work is complete, but Base pages cannot become the
+                            // current generation until the exact versioned FASTA horizon is
+                            // installed and a reference-backed frame is published.
+                            reference_panels_to_request.insert(panel_id);
+                        } else if frame.visible_complete() {
+                            projection.finish_checking();
+                            projection.settled_generation = Some(projection.clock.current().get());
+                        }
+                    }
+                    if Some(track_id) == primary_id && panel_id == active_panel_id && current_target
+                    {
+                        match frame.individual_reads {
+                            AlignmentIndividualReadCapability::Complete { .. } => {
+                                let records = frame.snapshot.as_ref().map_or(0, |snapshot| {
+                                    snapshot.reads().evidence().record_count()
+                                });
+                                self.data_status = match frame.vertical_residency {
+                                    AlignmentVerticalResidency::Preparing {
+                                        prepared_rows,
+                                        total_rows,
+                                    } => format!(
+                                        "{records} complete alignments · preparing instant vertical browsing ({prepared_rows}/{total_rows} rows)"
+                                    ),
+                                    AlignmentVerticalResidency::Complete { total_rows } => {
+                                        format!(
+                                            "{records} complete alignments · all {total_rows} rows prepared"
+                                        )
+                                    }
+                                    AlignmentVerticalResidency::BudgetLimited {
+                                        prepared_rows,
+                                        total_rows,
+                                    } => format!(
+                                        "{records} complete alignments · {prepared_rows}/{total_rows} rows resident (cache budget reached)"
+                                    ),
+                                    AlignmentVerticalResidency::ViewportBounded => {
+                                        format!("{records} complete alignments")
+                                    }
+                                };
+                            }
+                            AlignmentIndividualReadCapability::Pending => {
+                                "Preparing surrounding alignment scene…"
+                                    .clone_into(&mut self.data_status);
+                            }
+                            AlignmentIndividualReadCapability::Refused {
+                                complete_read_limit,
+                                eligible_records,
+                                ..
+                            } => {
+                                self.data_status = format!(
+                                    "{eligible_records} eligible alignments exceed the Complete read limit of {complete_read_limit}"
+                                );
+                            }
+                        }
+                    }
+                    rebuild_display |= published_scene.is_some()
+                        && cause != AlignmentSceneFrameCause::VerticalResidency;
+                    prepare_frame = true;
+                }
+                AlignmentSceneEngineEvent::IndividualReadsRefused {
+                    owner,
+                    request_token,
+                    target,
+                    complete_read_limit,
+                    eligible_records,
+                    frame,
+                    ..
+                } => {
+                    let frame = alignment_scene_frame_for_ui(frame);
+                    let panel_id = self.alignment_tracks[track_index]
+                        .projections
+                        .iter()
+                        .find_map(|(panel_id, projection)| {
+                            (projection.scene_owner == Some(owner)).then_some(*panel_id)
+                        });
+                    let Some(panel_id) = panel_id else {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    };
+                    if self.alignment_tracks[track_index]
+                        .projection(panel_id)
+                        .is_some_and(|projection| projection.index_only_overview)
+                    {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    }
+                    let track = &mut self.alignment_tracks[track_index];
+                    let projection = track.projection_mut(panel_id);
+                    if !alignment_scene_refusal_is_current(
+                        projection.desired_scene_request_token,
+                        request_token,
+                        projection.desired_scene_camera,
+                        frame.camera,
+                        target,
+                    ) {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    }
+                    let monotonic = projection
+                        .scene_frame
+                        .as_ref()
+                        .is_none_or(|current| frame.camera_sequence >= current.camera_sequence);
+                    if !monotonic {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    }
+                    projection.scene_frame = Some(frame.clone());
+                    projection.scene_frame_request_token = Some(request_token);
+                    if projection.desired_scene_camera == Some(frame.camera) {
+                        projection.finish_checking();
+                        projection.pending_query = false;
+                        projection.settled_generation = Some(projection.clock.current().get());
+                    }
+                    if Some(track_id) == primary_id && panel_id == active_panel_id {
+                        self.data_status = format!(
+                            "{eligible_records} eligible alignments exceed the Complete read limit of {complete_read_limit}"
+                        );
+                    }
+                    rebuild_display = true;
+                    prepare_frame = true;
+                }
+                AlignmentSceneEngineEvent::Error {
+                    owner,
+                    request_token,
+                    operation,
+                    message,
+                } => {
+                    let panel_id = owner.and_then(|owner| {
+                        self.alignment_tracks[track_index]
+                            .projections
+                            .iter()
+                            .find_map(|(panel_id, projection)| {
+                                (projection.scene_owner == Some(owner)).then_some(*panel_id)
+                            })
+                    });
+                    if let Some(panel_id) = panel_id {
+                        let projection =
+                            self.alignment_tracks[track_index].projection_mut(panel_id);
+                        if !alignment_scene_event_token_is_current(
+                            projection.desired_scene_request_token,
+                            request_token,
+                        ) {
+                            self.navigation_stale_result_rejections =
+                                self.navigation_stale_result_rejections.saturating_add(1);
+                            continue;
+                        }
+                        projection.settle_unavailable(message.to_string());
+                    } else if owner.is_some() {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    } else if matches!(
+                        operation,
+                        rgv_engine::AlignmentSceneEngineOperation::OpenSource
+                    ) {
+                        self.alignment_tracks[track_index].lifecycle =
+                            AlignmentTrackLifecycle::Failed(message.to_string());
+                        for projection in
+                            self.alignment_tracks[track_index].projections.values_mut()
+                        {
+                            projection.pending_query = false;
+                        }
+                    } else {
+                        // Source pumping is shared by every lane and therefore has no owner in its
+                        // error event. It is nevertheless terminal for each currently requested
+                        // panel generation. Settle those generations explicitly so a truthful
+                        // error cannot be hidden forever behind "Updating view…"; the next camera
+                        // or contract request may retry using the last immutable scene.
+                        for projection in
+                            self.alignment_tracks[track_index].projections.values_mut()
+                        {
+                            projection.settle_unavailable(message.to_string());
+                        }
+                    }
+                    if Some(track_id) == primary_id
+                        && panel_id.is_none_or(|panel_id| panel_id == active_panel_id)
+                    {
+                        self.data_status = message.to_string();
+                    }
+                    rebuild_display = true;
+                }
+                AlignmentSceneEngineEvent::LaneInserted { .. }
+                | AlignmentSceneEngineEvent::LaneRemoved { .. }
+                | AlignmentSceneEngineEvent::PresentationPrewarmed { .. }
+                | AlignmentSceneEngineEvent::SourceControlQueued
+                | AlignmentSceneEngineEvent::BudgetReduced { .. } => {}
+            }
+        }
+
+        if !reference_panels_to_request.is_empty() {
+            let restore = self.panels.active().id;
+            for panel_id in reference_panels_to_request {
+                self.panels.activate(panel_id);
+                self.panels.active_mut().pending_queries.reference = true;
+                self.dispatch_reference_query();
+            }
+            self.panels.activate(restore);
+        }
+
+        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        for panel_id in panel_ids {
+            let pending = self.alignment_tracks.iter().any(|track| {
+                !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_))
+                    && track
+                        .projection(panel_id)
+                        .is_some_and(|projection| projection.pending_query)
+            });
+            if let Some(panel) = self.panels.get_mut(panel_id) {
+                panel.pending_queries.alignment = pending;
+            }
+        }
+
+        if let Some(dictionary) = opened_primary_dictionary {
+            if let Some(source) = self.primary_alignment_source().cloned() {
+                self.settings.remember_alignment(&source);
+                self.persist_settings();
+            }
+            let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+            for id in ids {
+                let (requested, pixel_width) = self
+                    .panels
+                    .get(id)
+                    .map(|panel| (panel.requested_locus.clone(), panel.viewport.pixel_width()))
+                    .expect("panel id came from the panel collection");
+                match resolve_initial_locus(&dictionary, &self.contig_aliases, requested.as_deref())
+                    .and_then(|(interval, name, length)| {
+                        Ok((
+                            Viewport::new(interval, pixel_width)?,
+                            interval,
+                            name,
+                            length,
+                        ))
+                    }) {
+                    Ok((viewport, interval, name, length)) => {
+                        let panel = self
+                            .panels
+                            .get_mut(id)
+                            .expect("panel id came from the panel collection");
+                        panel.viewport = viewport;
+                        panel.contig_name = name;
+                        panel.contig_length = length;
+                        panel.home_interval = interval;
+                        panel.navigation_history = NavigationHistory::new(interval);
+                        panel.vertical_scroll_points = 0.0;
+                        panel.vertical_content_origin_points = 0.0;
+                        panel.latent_vertical_scroll_fraction = None;
+                    }
+                    Err(error) if id == active_panel_id => self.data_status = error.to_string(),
+                    Err(_) => {}
+                }
+            }
+            let default_annotation_count = self.assembly.default_annotation_count;
+            self.assembly = load_assembly(
+                &self.assembly_name,
+                dictionary.clone(),
+                self.cytoband_path.as_deref(),
+            );
+            self.assembly.default_annotation_count = default_annotation_count;
+            self.assembly.reference_contig_count = self
+                .reference_dictionary
+                .as_ref()
+                .map_or(dictionary.len(), ReferenceDictionary::len);
+            self.assembly.identity.clone_from(&self.assembly_identity);
+        }
+        if source_opened {
+            // Rebuild first so dispatch can derive the read-pane clip from committed layout.
+            self.rebuild_all_panel_displays();
+            self.request_all_panel_queries();
+            rebuild_display = false;
+            prepare_frame = true;
+        }
+        if rebuild_display {
+            self.rebuild_all_panel_displays();
+            prepare_frame = true;
+        }
+        if prepare_frame {
+            self.prepare_alignment_scene_frame();
+        }
+        self.window.request_redraw();
     }
 
     #[allow(clippy::too_many_lines)]

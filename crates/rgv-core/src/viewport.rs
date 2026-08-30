@@ -76,6 +76,24 @@ impl Viewport {
         })
     }
 
+    /// Re-expresses the same fractional camera on an equivalent contig identity. Alignment
+    /// sources commonly assign a different numeric `ContigId` than the workspace assembly even
+    /// when both dictionaries resolve the same contig name. The integer query enclosure, exact
+    /// start, exact span, and pixel width are preserved subject only to the target contig bound.
+    pub fn remapped_contig(
+        self,
+        contig: crate::ContigId,
+        contig_length: u64,
+    ) -> Result<Self, ViewportError> {
+        Self::from_exact(
+            contig,
+            self.exact_start(),
+            self.span(),
+            self.pixel_width,
+            contig_length,
+        )
+    }
+
     pub fn pan_pixels(self, delta_x: f64, contig_length: u64) -> Result<Self, ViewportError> {
         let delta_bases = delta_x * self.bases_per_pixel();
         Self::from_exact(
@@ -228,6 +246,18 @@ mod tests {
         }
         assert!((view.genomic_at_pixel(anchor_x) - anchor).abs() < 1.0e-9);
         assert!(view.span() < 1.0 + f64::EPSILON);
+    }
+
+    #[test]
+    fn contig_remap_preserves_fractional_camera_geometry() {
+        let original = viewport().pan_pixels(0.375, 10_000).unwrap();
+        let remapped = original.remapped_contig(ContigId::new(17), 10_000).unwrap();
+        assert_eq!(remapped.interval().contig(), ContigId::new(17));
+        assert!((remapped.exact_start() - original.exact_start()).abs() < f64::EPSILON);
+        assert!((remapped.span() - original.span()).abs() < f64::EPSILON);
+        assert_eq!(remapped.pixel_width(), original.pixel_width());
+        assert_eq!(remapped.interval().start(), original.interval().start());
+        assert_eq!(remapped.interval().end(), original.interval().end());
     }
 
     #[test]

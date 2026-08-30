@@ -76,6 +76,16 @@ impl Viewer {
         } else if !self.dragging {
             self.last_cursor = None;
         }
+        let hovered_scene = (!consumed && !self.dragging && self.cursor_in_genomic_canvas())
+            .then(|| self.alignment_scene_hit_at_cursor())
+            .flatten();
+        if hovered_scene != self.panels.active().hovered_alignment_hit {
+            self.panels.active_mut().hovered_alignment_hit = hovered_scene;
+            let panel_id = self.panels.active().id;
+            self.synchronize_alignment_scene_interactions(panel_id);
+            self.prepare_alignment_scene_frame();
+            self.window.request_redraw();
+        }
         let hovered = (!consumed && !self.dragging && self.cursor_in_genomic_canvas())
             .then(|| self.record_at_cursor())
             .flatten();
@@ -275,6 +285,7 @@ impl Viewer {
         if self.synthetic || !self.refresh_active_panel_scroll_display() {
             self.display_dirty = true;
         }
+        self.request_alignment_scene_camera_update(track_id);
         self.window.request_redraw();
     }
 
@@ -375,20 +386,24 @@ impl Viewer {
     pub(crate) fn viewport_changed(&mut self) {
         self.remember_current_locus();
         self.panels.active_mut().hovered_record = None;
+        self.panels.active_mut().hovered_alignment_hit = None;
         self.panels.active_mut().hover_inspector_target = None;
         self.panels.active_mut().hovered_junction_arc = None;
         self.panels.active_mut().junction_arc_targets.clear();
         self.window.set_cursor(CursorIcon::Default);
+        self.synchronize_alignment_scene_interactions(self.panels.active().id);
         self.begin_viewport_navigation(false, false);
     }
 
     pub(crate) fn viewport_gesture_changed(&mut self) {
         self.remember_current_locus();
         self.panels.active_mut().hovered_record = None;
+        self.panels.active_mut().hovered_alignment_hit = None;
         self.panels.active_mut().hover_inspector_target = None;
         self.panels.active_mut().hovered_junction_arc = None;
         self.panels.active_mut().junction_arc_targets.clear();
         self.window.set_cursor(CursorIcon::Default);
+        self.synchronize_alignment_scene_interactions(self.panels.active().id);
         let hold_commit_until_end = self.dragging
             || self.horizontal_overview_drag.is_some()
             || self.overview_capture == Some(OverviewCapture::Horizontal);
@@ -944,6 +959,9 @@ impl Viewer {
             }
         } else if (drag.virtual_scroll_fraction - previous_fraction).abs() > f32::EPSILON {
             self.window.request_redraw();
+        }
+        if density_changed || scroll_changed {
+            self.request_alignment_scene_camera_update(drag.track_id);
         }
     }
 

@@ -245,11 +245,11 @@ pub(crate) fn show_system_dialogs(
                             )
                             .labelled_by(label.id)
                             .on_hover_text(
-                                "Desired decoded-read margin on each side of the viewport. RGV may reduce it to respect memory, density, Complete read-limit, or remote-transfer bounds.",
+                                "Desired prepared margin on each genomic side and above/below the visible read rows. RGV may reduce it to respect memory, density, Complete read-limit, or remote-transfer bounds.",
                             );
                         });
                         ui.small(
-                            "The 1× default targets one viewport of decoded reads on each side. 0× disables speculative adjacent fetching but keeps ordinary cache reuse. Remote sources acquire margins conservatively and stop at hard transfer bounds.",
+                            "The 1× default targets one viewport or visible row-window on each side. 0× disables speculative adjacent preparation but keeps canonical page reuse. Remote sources acquire genomic margins conservatively and stop at hard transfer bounds.",
                         );
                         let cache = viewer.cache_coordinator;
                         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);

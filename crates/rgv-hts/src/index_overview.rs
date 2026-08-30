@@ -10,6 +10,8 @@ use noodles::{
 };
 use rgv_core::{ContigId, ReferenceDictionary};
 
+use crate::AlignmentSourceFormat;
+
 /// A navigation-oriented alignment density map derived only from index
 /// metadata. Values estimate compressed alignment occupancy rather than exact
 /// base coverage, which keeps source opening independent of file size.
@@ -77,7 +79,7 @@ pub(crate) fn load_local_alignment_index_overview(
     index_override: Option<&Path>,
     dictionary: &ReferenceDictionary,
 ) -> Option<AlignmentIndexOverview> {
-    local_index_candidates(alignment_path, index_override)
+    local_alignment_index_candidates(alignment_path, index_override, AlignmentSourceFormat::Bam)
         .into_iter()
         .find_map(|path| read_index_overview(&path, dictionary))
 }
@@ -107,12 +109,20 @@ fn read_index_overview(
     }
 }
 
-fn local_index_candidates(alignment_path: &Path, index_override: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn local_alignment_index_candidates(
+    alignment_path: &Path,
+    index_override: Option<&Path>,
+    format: AlignmentSourceFormat,
+) -> Vec<PathBuf> {
     if let Some(index) = index_override {
         return vec![index.to_owned()];
     }
-    let mut candidates = Vec::with_capacity(4);
-    for suffix in [".bai", ".csi"] {
+    let suffixes: &[&str] = match format {
+        AlignmentSourceFormat::Bam => &[".bai", ".csi"],
+        AlignmentSourceFormat::Cram => &[".crai"],
+    };
+    let mut candidates = Vec::with_capacity(suffixes.len().saturating_mul(2));
+    for suffix in suffixes {
         let mut appended = OsString::from(alignment_path.as_os_str());
         appended.push(suffix);
         candidates.push(PathBuf::from(appended));
@@ -208,7 +218,11 @@ mod tests {
 
     #[test]
     fn conventional_index_candidates_cover_appended_and_replaced_extensions() {
-        let candidates = local_index_candidates(Path::new("reads.bam"), None);
+        let candidates = local_alignment_index_candidates(
+            Path::new("reads.bam"),
+            None,
+            AlignmentSourceFormat::Bam,
+        );
         assert_eq!(
             candidates,
             [
@@ -216,6 +230,17 @@ mod tests {
                 PathBuf::from("reads.bai"),
                 PathBuf::from("reads.bam.csi"),
                 PathBuf::from("reads.csi"),
+            ]
+        );
+        assert_eq!(
+            local_alignment_index_candidates(
+                Path::new("reads.cram"),
+                None,
+                AlignmentSourceFormat::Cram,
+            ),
+            [
+                PathBuf::from("reads.cram.crai"),
+                PathBuf::from("reads.crai")
             ]
         );
     }

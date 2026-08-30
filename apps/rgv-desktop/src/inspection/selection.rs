@@ -45,11 +45,13 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn select_at_cursor(&mut self) {
-        if !self
-            .panels
-            .active()
-            .navigation_presentation
-            .is_interactive()
+        let scene_selection = self.alignment_scene_hit_at_cursor();
+        if scene_selection.is_none()
+            && !self
+                .panels
+                .active()
+                .navigation_presentation
+                .is_interactive()
         {
             return;
         }
@@ -64,6 +66,7 @@ impl Viewer {
         self.panels.active_mut().selected_copy_number = None;
         self.panels.active_mut().selected_mutation = None;
         self.panels.active_mut().selected_interaction = None;
+        self.panels.active_mut().selected_alignment_hit = None;
         if let Some(selection) = self.feature_at_cursor() {
             self.panels.active_mut().selected_feature = Some(selection);
             self.panels.active_mut().selected_alignment_track = None;
@@ -152,6 +155,15 @@ impl Viewer {
             self.panels.active_mut().selected_record = None;
             self.panels.active_mut().selected_read_event = None;
             self.panels.active_mut().selected_chain = None;
+        } else if let Some(hit) = scene_selection {
+            self.panels.active_mut().selected_alignment_track = Some(hit.track);
+            self.panels.active_mut().selected_alignment_hit = Some(hit);
+            self.panels.active_mut().selected_record = None;
+            self.panels.active_mut().selected_read_event = None;
+            self.panels.active_mut().selected_pileup_position = None;
+            self.panels.active_mut().selected_modification_position = None;
+            self.panels.active_mut().selected_junction = None;
+            self.panels.active_mut().selected_chain = None;
         } else {
             let selected_record = self.record_at_cursor();
             let selected_chain = selected_record.and_then(|(track_id, index)| {
@@ -194,6 +206,9 @@ impl Viewer {
             .selected_pileup_position
             .map(|_| AutomationSelectionGranularity::VisibleBin);
         self.retain_active_selection(granularity);
+        let panel_id = self.panels.active().id;
+        self.synchronize_alignment_scene_interactions(panel_id);
+        self.prepare_alignment_scene_frame();
         self.display_dirty = true;
     }
 
@@ -1163,6 +1178,22 @@ impl Viewer {
         }
         let index = alignment_record_at_point(&self.panels.active().display_list, x, y)?;
         Some((track_id, index))
+    }
+
+    pub(crate) fn alignment_scene_hit_at_cursor(&self) -> Option<AlignmentHit> {
+        let scale = self.window.scale_factor().max(f64::EPSILON);
+        let x = self.cursor.x / scale;
+        let y = self.cursor.y / scale;
+        let frame = self.alignment_panel_frames.get(&self.panels.active().id)?;
+        frame
+            .lanes
+            .iter()
+            .filter_map(|lane| {
+                CpuAlignmentProjector::pick_panel_lane(lane, x, y)
+                    .ok()
+                    .flatten()
+            })
+            .next()
     }
 
     pub(crate) fn read_event_at_cursor(

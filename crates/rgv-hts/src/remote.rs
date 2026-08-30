@@ -157,6 +157,17 @@ struct Validator {
     last_modified: Option<HeaderValue>,
 }
 
+/// Validator snapshot captured by the opening range probe.
+///
+/// Header values remain opaque bytes. They are used only as revision material and are never
+/// exposed through diagnostics, which avoids leaking signed object metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteObjectVersion {
+    pub(crate) length: u64,
+    pub(crate) etag: Option<Vec<u8>>,
+    pub(crate) last_modified: Option<Vec<u8>>,
+}
+
 impl Validator {
     fn if_range(&self) -> Option<HeaderValue> {
         self.etag.clone().or_else(|| self.last_modified.clone())
@@ -275,6 +286,22 @@ impl HttpRangeReader {
 
     pub const fn is_empty(&self) -> bool {
         self.length == 0
+    }
+
+    pub(crate) fn object_version(&self) -> RemoteObjectVersion {
+        RemoteObjectVersion {
+            length: self.length,
+            etag: self
+                .validator
+                .etag
+                .as_ref()
+                .map(|value| value.as_bytes().to_vec()),
+            last_modified: self
+                .validator
+                .last_modified
+                .as_ref()
+                .map(|value| value.as_bytes().to_vec()),
+        }
     }
 
     pub const fn stats(&self) -> RemoteIoStats {

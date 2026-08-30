@@ -1,5 +1,6 @@
 use super::super::*;
 use crate::display::alignment;
+use crate::workspace::queries::reference_dependency_is_settled;
 
 const MAXIMUM_AUTOMATION_SUPPLEMENTARY_SEGMENTS: usize = 64;
 
@@ -334,13 +335,17 @@ impl Viewer {
             {
                 return false;
             }
-            if self.reference_engine.is_some()
-                && panel.viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
-                && (panel.reference_slice.as_ref().is_none_or(|slice| {
-                    !slice.interval.contains_interval(panel.viewport.interval())
-                }) || panel.reference_settled_generation
-                    != Some(panel.generation_clock.current().get()))
-            {
+            if !reference_dependency_is_settled(
+                self.reference_engine.is_some()
+                    && panel.viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL,
+                panel.generation_clock.current().get(),
+                self.reference_revision,
+                panel.reference_slice_revision,
+                panel.reference_slice.as_ref().map(|slice| slice.interval),
+                panel.viewport.interval(),
+                panel.reference_settled_generation,
+                panel.reference_query_error_generation,
+            ) {
                 return false;
             }
             for track in &self.alignment_tracks {

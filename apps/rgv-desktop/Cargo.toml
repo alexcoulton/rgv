@@ -16,6 +16,7 @@ flate2.workspace = true
 image.workspace = true
 pollster.workspace = true
 rfd.workspace = true
+rgv-alignment-scene = { version = "0.1.0", path = "../../crates/rgv-alignment-scene" }
 rgv-core = { version = "0.1.0", path = "../../crates/rgv-core" }
 rgv-engine = { version = "0.1.0", path = "../../crates/rgv-engine" }
 rgv-hts = { version = "0.1.0", path = "../../crates/rgv-hts" }

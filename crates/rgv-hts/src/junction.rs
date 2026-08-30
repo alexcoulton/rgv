@@ -84,7 +84,7 @@ impl JunctionSummary {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct JunctionObservation {
+pub struct JunctionObservation {
     pub start: u64,
     pub end: u64,
     pub left_flank: u32,
@@ -95,24 +95,45 @@ pub(crate) struct JunctionObservation {
 ///
 /// A flank is the number of aligned `M`, `=` or `X` bases in the adjacent exon block. Insertions,
 /// deletions and clipping do not add support, while another reference skip starts the next block.
-#[derive(Default)]
-pub(crate) struct RecordJunctionCollector {
+pub struct RecordJunctionCollector {
     observations: Vec<JunctionObservation>,
     aligned_flank: u32,
     pending_observation: Option<usize>,
     dropped_observations: usize,
+    unbounded: bool,
+}
+
+impl Default for RecordJunctionCollector {
+    fn default() -> Self {
+        Self {
+            observations: Vec::new(),
+            aligned_flank: 0,
+            pending_observation: None,
+            dropped_observations: 0,
+            unbounded: false,
+        }
+    }
 }
 
 impl RecordJunctionCollector {
-    pub(crate) fn add_aligned(&mut self, length: u32) {
+    /// Exact collector used after a resource reservation has bounded the source CIGAR work.
+    #[must_use]
+    pub fn exact() -> Self {
+        Self {
+            unbounded: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn add_aligned(&mut self, length: u32) {
         self.aligned_flank = self.aligned_flank.saturating_add(length);
     }
 
-    pub(crate) fn add_skip(&mut self, start: u64, end: u64) {
+    pub fn add_skip(&mut self, start: u64, end: u64) {
         if let Some(index) = self.pending_observation {
             self.observations[index].right_flank = self.aligned_flank;
         }
-        if self.observations.len() < MAX_JUNCTIONS_PER_RECORD {
+        if self.unbounded || self.observations.len() < MAX_JUNCTIONS_PER_RECORD {
             self.observations.push(JunctionObservation {
                 start,
                 end,
@@ -127,7 +148,7 @@ impl RecordJunctionCollector {
         self.aligned_flank = 0;
     }
 
-    pub(crate) fn finish(mut self) -> (Vec<JunctionObservation>, usize) {
+    pub fn finish(mut self) -> (Vec<JunctionObservation>, usize) {
         if let Some(index) = self.pending_observation {
             self.observations[index].right_flank = self.aligned_flank;
         }
@@ -136,7 +157,7 @@ impl RecordJunctionCollector {
 }
 
 #[derive(Default)]
-pub(crate) struct JunctionSummaryBuilder {
+pub struct JunctionSummaryBuilder {
     interval: Option<GenomicInterval>,
     minimum_flank: u32,
     normalization_mapped_records: Option<u64>,
@@ -151,10 +172,11 @@ pub(crate) struct JunctionSummaryBuilder {
     invalid_xs_observations: usize,
     dropped_record_junction_observations: usize,
     dropped_distinct_junctions: usize,
+    unbounded: bool,
 }
 
 impl JunctionSummaryBuilder {
-    pub(crate) fn new(
+    pub fn new(
         interval: GenomicInterval,
         minimum_flank: u32,
         normalization_mapped_records: Option<u64>,
@@ -167,8 +189,24 @@ impl JunctionSummaryBuilder {
         }
     }
 
+    /// Exact aggregator used after the caller has reserved capacity for all candidate events.
+    #[must_use]
+    pub fn exact(
+        interval: GenomicInterval,
+        minimum_flank: u32,
+        normalization_mapped_records: Option<u64>,
+    ) -> Self {
+        Self {
+            interval: Some(interval),
+            minimum_flank,
+            normalization_mapped_records,
+            unbounded: true,
+            ..Self::default()
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn add_record_junctions(
+    pub fn add_record_junctions(
         &mut self,
         junctions: &[JunctionObservation],
         dropped_record_junctions: usize,
@@ -201,9 +239,10 @@ impl JunctionSummaryBuilder {
                     .saturating_add(1);
                 continue;
             }
-            if !self
-                .junctions
-                .contains_key(&(observation.start, observation.end))
+            if !self.unbounded
+                && !self
+                    .junctions
+                    .contains_key(&(observation.start, observation.end))
                 && self.junctions.len() >= MAX_JUNCTIONS
             {
                 self.dropped_distinct_junctions = self.dropped_distinct_junctions.saturating_add(1);
@@ -280,11 +319,7 @@ impl JunctionSummaryBuilder {
         }
     }
 
-    pub(crate) fn finish(
-        self,
-        eligible_records: usize,
-        all_eligible_records: bool,
-    ) -> JunctionSummary {
+    pub fn finish(self, eligible_records: usize, all_eligible_records: bool) -> JunctionSummary {
         JunctionSummary {
             junctions: self.junctions.into_values().collect(),
             provenance: JunctionProvenance {

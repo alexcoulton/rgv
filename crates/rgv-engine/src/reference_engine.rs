@@ -1,10 +1,14 @@
 use std::{
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use rgv_alignment_scene::{ReferenceRevision, RevisionFingerprint};
 use rgv_core::{GenerationClock, GenomicInterval, PanelGeneration, ReferenceDictionary};
 use rgv_hts::{
     FastaOpenOptions, FastaReference, ReferenceSlice, RemoteCancellation, RemoteIoStats,
@@ -17,32 +21,81 @@ use crate::{
 
 pub const MAX_REFERENCE_QUERY_BASES: u64 = 1_000_000;
 
+/// Complete identity of one reference query. Panel generation alone is not sufficient because
+/// one scene-camera generation may request several successive buffered horizons. Carrying the
+/// expected open-instance revision and exact interval lets consumers reject an older completion
+/// or failure without consulting mutable side state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferenceQueryIdentity {
+    request: PanelGeneration,
+    revision: ReferenceRevision,
+    interval: GenomicInterval,
+}
+
+impl ReferenceQueryIdentity {
+    #[must_use]
+    pub const fn new(
+        request: PanelGeneration,
+        revision: ReferenceRevision,
+        interval: GenomicInterval,
+    ) -> Self {
+        Self {
+            request,
+            revision,
+            interval,
+        }
+    }
+
+    #[must_use]
+    pub const fn request(self) -> PanelGeneration {
+        self.request
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> ReferenceRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn interval(self) -> GenomicInterval {
+        self.interval
+    }
+}
+
+/// Process-local identity for the next successfully opened reference authority. Reference scene
+/// caches are process-local, so an open-instance revision is sufficient to prevent two live or
+/// successively opened FASTA handles from sharing semantic pages accidentally. This is
+/// deliberately not presented as a content hash.
+static NEXT_REFERENCE_OPEN_INSTANCE: AtomicU64 = AtomicU64::new(1);
+const REFERENCE_OPEN_INSTANCE_DOMAIN: u64 = u64::from_le_bytes(*b"RGVREF01");
+
 enum ReferenceEngineRequest {
     Open {
         path: PathBuf,
         options: FastaOpenOptions,
     },
     Query {
-        request: PanelGeneration,
+        query: ReferenceQueryIdentity,
         clock: GenerationClock,
         contig_name: String,
-        interval: GenomicInterval,
     },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReferenceEngineEvent {
     Opened {
+        revision: ReferenceRevision,
         dictionary: ReferenceDictionary,
         remote_io_stats: Option<RemoteIoStats>,
     },
     QueryCompleted {
-        request: PanelGeneration,
+        query: ReferenceQueryIdentity,
         slice: Arc<ReferenceSlice>,
         remote_io_stats: Option<RemoteIoStats>,
     },
     Error {
-        request: Option<PanelGeneration>,
+        /// `None` identifies an open failure; every query failure carries its complete identity.
+        query: Option<ReferenceQueryIdentity>,
         message: String,
     },
 }
@@ -85,16 +138,14 @@ impl ReferenceEngine {
 
     pub fn try_query(
         &self,
-        request: PanelGeneration,
+        query: ReferenceQueryIdentity,
         clock: GenerationClock,
         contig_name: String,
-        interval: GenomicInterval,
     ) -> Result<(), EngineQueueError> {
         self.try_send(ReferenceEngineRequest::Query {
-            request,
+            query,
             clock,
             contig_name,
-            interval,
         })
     }
 
@@ -131,7 +182,7 @@ fn worker_loop(
     input: &Receiver<ReferenceEngineRequest>,
     output: &CoalescingSender<ReferenceEngineEvent>,
 ) {
-    let mut reference = None;
+    let mut reference: Option<(FastaReference, ReferenceRevision)> = None;
     while let Ok(request) = input.recv() {
         let event = match request {
             ReferenceEngineRequest::Open { path, options } => {
@@ -139,66 +190,78 @@ fn worker_loop(
                     Ok(opened) => {
                         let dictionary = opened.reference_dictionary().clone();
                         let remote_io_stats = opened.remote_io_stats();
-                        reference = Some(opened);
-                        ReferenceEngineEvent::Opened {
-                            dictionary,
-                            remote_io_stats,
+                        if let Some(revision) = next_reference_open_instance_revision() {
+                            reference = Some((opened, revision));
+                            ReferenceEngineEvent::Opened {
+                                revision,
+                                dictionary,
+                                remote_io_stats,
+                            }
+                        } else {
+                            ReferenceEngineEvent::Error {
+                                query: None,
+                                message: "reference open-instance revision authority is exhausted"
+                                    .to_owned(),
+                            }
                         }
                     }
                     Err(error) => ReferenceEngineEvent::Error {
-                        request: None,
+                        query: None,
                         message: error.to_string(),
                     },
                 }
             }
             ReferenceEngineRequest::Query {
-                request,
+                query,
                 clock,
                 contig_name,
-                interval,
             } => {
-                let Some(reference) = reference.as_ref() else {
+                let Some((reference, revision)) = reference.as_ref() else {
                     send_event(
                         output,
                         ReferenceEngineEvent::Error {
-                            request: Some(request),
+                            query: Some(query),
                             message: "reference FASTA is not open".to_owned(),
                         },
                     );
                     continue;
                 };
+                if query.revision != *revision {
+                    continue;
+                }
+                let interval = query.interval;
                 if interval.len() > MAX_REFERENCE_QUERY_BASES {
                     ReferenceEngineEvent::Error {
-                        request: Some(request),
+                        query: Some(query),
                         message: format!(
                             "reference query exceeds the {MAX_REFERENCE_QUERY_BASES}-base limit"
                         ),
                     }
                 } else {
                     let query_clock = clock.clone();
-                    let generation = request.generation();
+                    let generation = query.request.generation();
                     let cancellation: RemoteCancellation =
                         Arc::new(move || query_clock.is_current(generation));
                     reference.set_remote_cancellation(Some(cancellation));
                     match reference.fetch_slice_by_name(&contig_name, interval) {
-                        Ok(Some(slice)) if clock.is_current(request.generation()) => {
+                        Ok(Some(slice)) if clock.is_current(query.request.generation()) => {
                             ReferenceEngineEvent::QueryCompleted {
-                                request,
+                                query,
                                 slice: Arc::new(slice),
                                 remote_io_stats: reference.remote_io_stats(),
                             }
                         }
-                        Ok(None) if clock.is_current(request.generation()) => {
+                        Ok(None) if clock.is_current(query.request.generation()) => {
                             ReferenceEngineEvent::Error {
-                                request: Some(request),
+                                query: Some(query),
                                 message: format!(
                                     "reference FASTA does not contain contig {contig_name}"
                                 ),
                             }
                         }
-                        Err(error) if clock.is_current(request.generation()) => {
+                        Err(error) if clock.is_current(query.request.generation()) => {
                             ReferenceEngineEvent::Error {
-                                request: Some(request),
+                                query: Some(query),
                                 message: error.to_string(),
                             }
                         }
@@ -211,9 +274,21 @@ fn worker_loop(
     }
 }
 
+fn next_reference_open_instance_revision() -> Option<ReferenceRevision> {
+    let sequence = NEXT_REFERENCE_OPEN_INSTANCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()?;
+    Some(ReferenceRevision::new(RevisionFingerprint::new(
+        REFERENCE_OPEN_INSTANCE_DOMAIN,
+        sequence,
+    )))
+}
+
 fn send_event(output: &CoalescingSender<ReferenceEngineEvent>, event: ReferenceEngineEvent) {
-    let result = if let ReferenceEngineEvent::QueryCompleted { request, .. } = &event {
-        output.send_latest_for(request.panel_id().get(), event)
+    let result = if let ReferenceEngineEvent::QueryCompleted { query, .. } = &event {
+        output.send_latest_for(query.request.panel_id().get(), event)
     } else {
         output.send_control(event)
     };
@@ -251,20 +326,20 @@ mod tests {
                 break event;
             }
         };
-        let ReferenceEngineEvent::Opened { dictionary, .. } = opened else {
+        let ReferenceEngineEvent::Opened {
+            revision: opened_revision,
+            dictionary,
+            ..
+        } = opened
+        else {
             panic!("reference did not open");
         };
         assert_eq!(dictionary.len(), 2);
         let clock = GenerationClock::default();
         let request = PanelGeneration::new(PanelId::new(7), ViewportGeneration::new(0));
-        engine
-            .try_query(
-                request,
-                clock,
-                "chr1".to_owned(),
-                GenomicInterval::new(ContigId::new(0), 1, 5).unwrap(),
-            )
-            .unwrap();
+        let interval = GenomicInterval::new(ContigId::new(0), 1, 5).unwrap();
+        let query = ReferenceQueryIdentity::new(request, opened_revision, interval);
+        engine.try_query(query, clock, "chr1".to_owned()).unwrap();
         let completed = loop {
             if let Some(event) = engine
                 .output
@@ -274,9 +349,282 @@ mod tests {
                 break event;
             }
         };
-        let ReferenceEngineEvent::QueryCompleted { slice, .. } = completed else {
+        let ReferenceEngineEvent::QueryCompleted {
+            query: completed_query,
+            slice,
+            ..
+        } = completed
+        else {
             panic!("reference query did not complete");
         };
+        assert_eq!(completed_query, query);
+        assert_eq!(slice.interval, interval);
         assert_eq!(slice.bases, b"CGTA");
+    }
+
+    #[test]
+    fn reference_revision_is_stable_within_an_open_and_changes_on_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genome.fa");
+        fs::write(&path, b">chr1\nACGTACGT\n").unwrap();
+        fs::write(path.with_extension("fa.fai"), b"chr1\t8\t6\t8\t9\n").unwrap();
+        let engine = ReferenceEngine::spawn(4);
+
+        engine.try_open(path.clone()).unwrap();
+        let first_open = loop {
+            if let Some(event) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break event;
+            }
+        };
+        let ReferenceEngineEvent::Opened {
+            revision: first_revision,
+            ..
+        } = first_open
+        else {
+            panic!("first reference did not open");
+        };
+
+        let clock = GenerationClock::default();
+        for panel in [11, 12] {
+            let request = PanelGeneration::new(PanelId::new(panel), ViewportGeneration::new(0));
+            let interval = GenomicInterval::new(ContigId::new(0), 0, 4).unwrap();
+            let query = ReferenceQueryIdentity::new(request, first_revision, interval);
+            engine
+                .try_query(query, clock.clone(), "chr1".to_owned())
+                .unwrap();
+            let completed = loop {
+                if let Some(event) = engine
+                    .output
+                    .receive_timeout(Duration::from_secs(2))
+                    .unwrap()
+                {
+                    break event;
+                }
+            };
+            let ReferenceEngineEvent::QueryCompleted {
+                query: completed_query,
+                ..
+            } = completed
+            else {
+                panic!("reference query did not complete");
+            };
+            assert_eq!(completed_query, query);
+        }
+
+        engine.try_open(path).unwrap();
+        let second_open = loop {
+            if let Some(event) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break event;
+            }
+        };
+        let ReferenceEngineEvent::Opened {
+            revision: second_revision,
+            ..
+        } = second_open
+        else {
+            panic!("second reference did not open");
+        };
+        assert_ne!(second_revision, first_revision);
+
+        let request = PanelGeneration::new(PanelId::new(13), ViewportGeneration::new(0));
+        let interval = GenomicInterval::new(ContigId::new(0), 4, 8).unwrap();
+        let query = ReferenceQueryIdentity::new(request, second_revision, interval);
+        engine.try_query(query, clock, "chr1".to_owned()).unwrap();
+        let completed = loop {
+            if let Some(event) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break event;
+            }
+        };
+        let ReferenceEngineEvent::QueryCompleted {
+            query: completed_query,
+            ..
+        } = completed
+        else {
+            panic!("reopened reference query did not complete");
+        };
+        assert_eq!(completed_query, query);
+    }
+
+    #[test]
+    fn query_for_an_obsolete_open_revision_is_silently_discarded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genome.fa");
+        fs::write(&path, b">chr1\nACGTACGT\n").unwrap();
+        fs::write(path.with_extension("fa.fai"), b"chr1\t8\t6\t8\t9\n").unwrap();
+        let engine = ReferenceEngine::spawn(4);
+
+        engine.try_open(path.clone()).unwrap();
+        let first_revision = loop {
+            if let Some(ReferenceEngineEvent::Opened { revision, .. }) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break revision;
+            }
+        };
+        engine.try_open(path).unwrap();
+        let second_revision = loop {
+            if let Some(ReferenceEngineEvent::Opened { revision, .. }) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break revision;
+            }
+        };
+        assert_ne!(first_revision, second_revision);
+
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 4).unwrap();
+        let stale = ReferenceQueryIdentity::new(
+            PanelGeneration::new(PanelId::new(21), ViewportGeneration::new(0)),
+            first_revision,
+            interval,
+        );
+        let current = ReferenceQueryIdentity::new(
+            PanelGeneration::new(PanelId::new(22), ViewportGeneration::new(0)),
+            second_revision,
+            interval,
+        );
+        let clock = GenerationClock::default();
+        engine
+            .try_query(stale, clock.clone(), "chr1".to_owned())
+            .unwrap();
+        engine.try_query(current, clock, "chr1".to_owned()).unwrap();
+
+        let completed = loop {
+            if let Some(event) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break event;
+            }
+        };
+        assert!(matches!(
+            completed,
+            ReferenceEngineEvent::QueryCompleted { query, .. } if query == current
+        ));
+        assert_eq!(
+            engine
+                .output
+                .receive_timeout(Duration::from_millis(100))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn same_generation_query_errors_retain_revision_and_exact_interval_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genome.fa");
+        fs::write(&path, b">chr1\nACGTACGT\n").unwrap();
+        fs::write(path.with_extension("fa.fai"), b"chr1\t8\t6\t8\t9\n").unwrap();
+        let engine = ReferenceEngine::spawn(4);
+        engine.try_open(path).unwrap();
+        let revision = loop {
+            if let Some(ReferenceEngineEvent::Opened { revision, .. }) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break revision;
+            }
+        };
+
+        let request = PanelGeneration::new(PanelId::new(31), ViewportGeneration::new(7));
+        let first = ReferenceQueryIdentity::new(
+            request,
+            revision,
+            GenomicInterval::new(ContigId::new(0), 0, MAX_REFERENCE_QUERY_BASES + 1).unwrap(),
+        );
+        let second = ReferenceQueryIdentity::new(
+            request,
+            revision,
+            GenomicInterval::new(ContigId::new(0), 1, MAX_REFERENCE_QUERY_BASES + 2).unwrap(),
+        );
+        let clock = GenerationClock::default();
+        engine
+            .try_query(first, clock.clone(), "chr1".to_owned())
+            .unwrap();
+        engine.try_query(second, clock, "chr1".to_owned()).unwrap();
+
+        for expected in [first, second] {
+            let event = loop {
+                if let Some(event) = engine
+                    .output
+                    .receive_timeout(Duration::from_secs(2))
+                    .unwrap()
+                {
+                    break event;
+                }
+            };
+            assert!(matches!(
+                event,
+                ReferenceEngineEvent::Error {
+                    query: Some(query),
+                    ..
+                } if query == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn open_errors_remain_identity_less_while_query_errors_are_identified() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = ReferenceEngine::spawn(4);
+        engine
+            .try_open(directory.path().join("missing.fa"))
+            .unwrap();
+        let open_error = loop {
+            if let Some(event) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break event;
+            }
+        };
+        assert!(matches!(
+            open_error,
+            ReferenceEngineEvent::Error { query: None, .. }
+        ));
+
+        let query = ReferenceQueryIdentity::new(
+            PanelGeneration::new(PanelId::new(41), ViewportGeneration::new(0)),
+            ReferenceRevision::new(RevisionFingerprint::new(9, 10)),
+            GenomicInterval::new(ContigId::new(0), 0, 1).unwrap(),
+        );
+        engine
+            .try_query(query, GenerationClock::default(), "chr1".to_owned())
+            .unwrap();
+        let query_error = loop {
+            if let Some(event) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break event;
+            }
+        };
+        assert!(matches!(
+            query_error,
+            ReferenceEngineEvent::Error {
+                query: Some(identity),
+                ..
+            } if identity == query
+        ));
     }
 }

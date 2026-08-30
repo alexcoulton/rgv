@@ -1,0 +1,136 @@
+//! Immutable semantic authority for alignment evidence and presentation.
+//!
+//! This crate is deliberately headless. It owns source-stable handles, factorised contracts,
+//! completeness certificates, canonical chunks, and immutable scene data. It does not perform
+//! source I/O, create GPU resources, or know about desktop widgets.
+
+mod acquisition;
+mod allele_summary;
+mod chunk;
+mod contract;
+mod coverage;
+mod cpu_projector;
+mod cpu_summary_projector;
+mod evidence;
+mod filter_summary;
+mod fingerprint;
+mod identity;
+mod interaction;
+mod junction_annotation;
+mod junction_summary;
+mod modification_summary;
+mod pair_summary;
+mod panel_scene;
+mod payload;
+mod presentation_scene;
+mod presentation_store;
+mod resource;
+mod revision;
+mod row_atlas;
+mod row_oracle;
+mod scene_snapshot;
+mod semantic_page;
+mod store;
+mod summary;
+mod summary_page;
+mod summary_root;
+mod tile;
+
+pub use acquisition::{EvidenceAcquisition, EvidenceAcquisitionError};
+pub use allele_summary::{ExactAlleleSummaryError, ExactAlleleSummaryKey, ExactAlleleSummaryTile};
+pub use chunk::{CanonicalRecordChunk, ChunkError, SourceChunkId};
+pub use contract::{
+    AdmissionPolicy, AlignmentPageFamily, AlignmentReadLabelMode, AlignmentStyleContract,
+    AlleleSummaryContract, AlleleSummaryDetail, CapabilityRequirement, DepthSummaryContract,
+    FilterSummaryContract, GeometryLod, JunctionSummaryContract, LayoutContract,
+    MAXIMUM_HIDDEN_MODIFICATION_CODES, ModificationSummaryContract, PairSummaryContract,
+    PayloadContract, PresentationContract, RecordContract, SummaryContract,
+};
+pub use coverage::{
+    CertifiedCoverageSet, CompleteCoverage, CoverageError, FilteredRecordProvenance,
+};
+pub use cpu_projector::{
+    AlignmentCamera, AlignmentHit, CpuAlignmentFrame, CpuAlignmentLabelFrame,
+    CpuAlignmentProjector, CpuClipRect, CpuFrameCoverage, CpuInteractionError, CpuPrimitiveShape,
+    CpuProjectedPrimitive, CpuProjectionError,
+};
+pub use cpu_summary_projector::{
+    CpuAlleleProjectionOptions, CpuAlleleToken, CpuDepthProjectionOptions,
+    CpuJunctionProjectionOptions, CpuJunctionStrandToken, CpuModificationProjectionOptions,
+    CpuSummaryCamera, CpuSummaryFrame, CpuSummaryPrimitiveShape, CpuSummaryProjectedComponent,
+    CpuSummaryProjectedPrimitive, CpuSummaryProjectionError, CpuSummaryProjectionOptions,
+    CpuSummaryProjector,
+};
+pub use evidence::{
+    EvidenceBuildError, EvidenceChunk, EvidenceChunkError, EvidenceChunkFootprint, EvidencePins,
+    EvidenceRecordRef, EvidenceRoot, EvidenceRootBuilder, EvidenceSelection,
+    EvidenceSelectionError,
+};
+pub use filter_summary::{ExactFilterSummaryError, ExactFilterSummaryKey, ExactFilterSummaryTile};
+pub use fingerprint::ContractFingerprint;
+pub use identity::AlignmentHandle;
+pub use interaction::{AlignmentInteractionState, AlignmentInteractionToken};
+pub use junction_annotation::{
+    JunctionAnnotationEvent, JunctionAnnotationIndex, JunctionAnnotationIndexError,
+    JunctionAnnotationInput, JunctionAnnotationPins, JunctionAnnotationStatus,
+};
+pub use junction_summary::{
+    ExactJunctionSummaryError, ExactJunctionSummaryKey, ExactJunctionSummaryTile,
+};
+pub use modification_summary::{
+    ExactModificationSummaryError, ExactModificationSummaryKey, ExactModificationSummaryTile,
+};
+pub use pair_summary::{
+    ExactPairSummaryError, ExactPairSummaryKey, ExactPairSummaryTile, PairCandidateEvent,
+    summarize_pair_candidates,
+};
+pub use panel_scene::{
+    AlignmentCoherenceGroupFrame, AlignmentCoherenceGroupId, AlignmentCoherenceGroupKind,
+    AlignmentCoherenceGroupSpec, AlignmentPanelLaneFrame, AlignmentPanelSceneAdmission,
+    AlignmentPanelSceneError, AlignmentPanelSceneFrame, AlignmentPanelSceneStore,
+};
+pub use payload::{PayloadSidecar, PayloadSidecarError};
+pub use presentation_scene::{
+    AlignmentExportError, AlignmentExportRecord, AlignmentPresentationScene,
+    AlignmentPresentationSceneError, AlignmentTraversalDirection,
+};
+pub use presentation_store::{
+    AlignmentPresentationOwner, AlignmentPresentationStore, AlignmentPresentationStoreError,
+    AlignmentSceneCandidate, PresentationCacheDiscard, PresentationStorePressure,
+};
+pub use resource::{
+    AllocationClass, AllocationId, AllocationLease, AllocationLedger, AllocationRecordSnapshot,
+    AllocationReservation, LedgerError, LedgerSnapshot, PinnedAllocationLease, ReservationKind,
+    TransientResourceClass, TransientResourceReservation, TransientResourceSnapshot,
+};
+pub use revision::{
+    AlignmentSourceRevision, AnnotationRevision, EvidenceRevision, ReferenceRevision,
+    RevisionFingerprint, RowAtlasRevision, SceneRevision, SourceFingerprint, SummaryRevision,
+};
+pub use row_atlas::{
+    AlignmentRowAtlas, AlignmentRowAtlasError, AlignmentRowAtlasPins, AlignmentRowConnector,
+    RowAtlasRecord, RowAtlasRecordHit, RowExtent,
+};
+pub use row_oracle::{AlignmentRowGroup, AlignmentRowGroupKey, RowOracleError};
+pub use scene_snapshot::{AlignmentSceneSnapshot, AlignmentSceneSnapshotError};
+pub use semantic_page::{
+    AlignmentBodyColorToken, AlignmentComponent, AlignmentGeometryToken, AlignmentLabelKind,
+    AlignmentOperation, AlignmentPageKey, AlignmentSemanticLabel, AlignmentSemanticPage,
+    AlignmentSemanticPrimitive, AlignmentStyleToken, BisulfiteObservationToken, CanonicalRowBlock,
+    ModificationState, SbxInsertionToken, SemanticPageError, SemanticPageHit, SpecialistMode,
+    SpecialistUnavailableReason, UltimaIndelToken, UltimaQualitySourceToken,
+    UltimaUnavailableToken,
+};
+pub use store::{
+    EvidenceCandidate, EvidenceStore, EvidenceStoreError, ExactSummaryCandidate, RowAtlasCandidate,
+    StorePressure,
+};
+pub use summary::{ExactDepthSummaryError, ExactDepthSummaryKey, ExactDepthSummaryTile};
+pub use summary_page::{
+    AnnotatedJunctionSemantic, SummaryPageFamily, SummaryPageKey, SummarySemanticComponent,
+    SummarySemanticPage, SummarySemanticPageError, SummarySemanticPrimitive,
+};
+pub use summary_root::{
+    ExactSummaryPins, ExactSummaryQueryError, ExactSummaryRoot, ExactSummaryRootError,
+};
+pub use tile::{CanonicalGenomicTile, CanonicalTileError};

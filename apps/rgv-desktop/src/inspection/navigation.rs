@@ -19,6 +19,7 @@ impl Viewer {
             .active()
             .reference_slice
             .as_deref()
+            .filter(|_| self.panels.active().reference_slice_revision == self.reference_revision)
             .or_else(|| {
                 self.primary_alignment_query()
                     .and_then(|query| query.reference.as_ref())

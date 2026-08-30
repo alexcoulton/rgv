@@ -2,7 +2,7 @@ use std::collections::BinaryHeap;
 
 use rgv_core::{ContigId, GenomicInterval};
 
-use crate::{AlignmentBatch, AlignmentFlags, AlignmentRecord};
+use crate::{AlignmentBatch, AlignmentFlags, AlignmentRecord, AlignmentRecordView};
 
 pub const MAX_TEMPLATE_LENGTH_SAMPLES: usize = 4_096;
 pub const MIN_TEMPLATE_LENGTH_SAMPLES: usize = 100;
@@ -107,20 +107,20 @@ impl PairSummary {
     }
 }
 
-pub(crate) struct PairSummaryBuilder {
+pub struct PairSummaryBuilder {
     samples: BinaryHeap<(u64, u64)>,
     eligible_proper_templates: usize,
 }
 
 impl PairSummaryBuilder {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             samples: BinaryHeap::with_capacity(MAX_TEMPLATE_LENGTH_SAMPLES),
             eligible_proper_templates: 0,
         }
     }
 
-    pub(crate) fn add_fields(
+    pub fn add_fields(
         &mut self,
         read_name: &[u8],
         contig: ContigId,
@@ -152,11 +152,11 @@ impl PairSummaryBuilder {
         }
     }
 
-    pub(crate) fn add_precomputed_eligible_count(&mut self, count: usize) {
+    pub fn add_precomputed_eligible_count(&mut self, count: usize) {
         self.eligible_proper_templates = self.eligible_proper_templates.saturating_add(count);
     }
 
-    pub(crate) fn add_precomputed_sample(&mut self, score: u64, length: u64) {
+    pub fn add_precomputed_sample(&mut self, score: u64, length: u64) {
         if self.samples.len() < MAX_TEMPLATE_LENGTH_SAMPLES {
             self.samples.push((score, length));
         } else if self.samples.peek().is_some_and(|&(worst, _)| score < worst) {
@@ -165,7 +165,7 @@ impl PairSummaryBuilder {
         }
     }
 
-    pub(crate) fn finish(self, all_eligible_records: bool) -> PairSummary {
+    pub fn finish(self, all_eligible_records: bool) -> PairSummary {
         let mut lengths = self
             .samples
             .into_iter()
@@ -245,6 +245,28 @@ pub fn pair_evidence_at(
         visible_interval,
         bounds,
     ))
+}
+
+/// Classifies pair evidence from a zero-allocation packed-record view.
+///
+/// Scene construction uses this entry point so row grouping, sorting, and styling never need to
+/// materialise a query-local [`AlignmentRecord`] merely to inspect topology fields.
+pub fn pair_evidence_view(
+    record: AlignmentRecordView<'_>,
+    visible_interval: GenomicInterval,
+    bounds: TemplateLengthBounds,
+) -> PairEvidence {
+    classify_pair(
+        record.read_name(),
+        record.contig(),
+        record.start(),
+        record.flags(),
+        record.mate_contig(),
+        record.mate_start(),
+        record.template_length(),
+        visible_interval,
+        bounds,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

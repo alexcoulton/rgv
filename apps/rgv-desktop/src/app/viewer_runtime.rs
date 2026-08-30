@@ -16,6 +16,63 @@ const fn frame_target_plan(capture_requested: bool) -> FrameTargetPlan {
     }
 }
 
+/// Removes scene-owned rectangles from a retained-preview destination. The returned rectangles
+/// exactly partition the truthful remainder, allowing contextual legacy lanes to keep their
+/// temporary preview without ever drawing old alignment pixels beneath the live read scene.
+fn subtract_physical_regions(
+    region: [u32; 4],
+    exclusions: impl IntoIterator<Item = [u32; 4]>,
+) -> Vec<[u32; 4]> {
+    let mut remainder = (region[2] > 0 && region[3] > 0)
+        .then_some(region)
+        .into_iter()
+        .collect::<Vec<_>>();
+    for exclusion in exclusions {
+        if exclusion[2] == 0 || exclusion[3] == 0 {
+            continue;
+        }
+        let mut next = Vec::with_capacity(remainder.len().saturating_mul(4));
+        for [x, y, width, height] in remainder {
+            let right = x.saturating_add(width);
+            let bottom = y.saturating_add(height);
+            let exclusion_right = exclusion[0].saturating_add(exclusion[2]);
+            let exclusion_bottom = exclusion[1].saturating_add(exclusion[3]);
+            let intersection_left = x.max(exclusion[0]);
+            let intersection_top = y.max(exclusion[1]);
+            let intersection_right = right.min(exclusion_right);
+            let intersection_bottom = bottom.min(exclusion_bottom);
+            if intersection_left >= intersection_right || intersection_top >= intersection_bottom {
+                next.push([x, y, width, height]);
+                continue;
+            }
+            if y < intersection_top {
+                next.push([x, y, width, intersection_top - y]);
+            }
+            if intersection_bottom < bottom {
+                next.push([x, intersection_bottom, width, bottom - intersection_bottom]);
+            }
+            if x < intersection_left {
+                next.push([
+                    x,
+                    intersection_top,
+                    intersection_left - x,
+                    intersection_bottom - intersection_top,
+                ]);
+            }
+            if intersection_right < right {
+                next.push([
+                    intersection_right,
+                    intersection_top,
+                    right - intersection_right,
+                    intersection_bottom - intersection_top,
+                ]);
+            }
+        }
+        remainder = next;
+    }
+    remainder
+}
+
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn new(
@@ -62,6 +119,7 @@ impl Viewer {
         surface.configure(&device, &surface_config);
 
         let rectangle_renderer = RectangleRenderer::new(&device, surface_config.format);
+        let alignment_gpu_renderer = AlignmentGpuRenderer::new(&device, surface_config.format);
         let navigation_preview_renderer =
             NavigationPreviewRenderer::new(&device, surface_config.format);
         let egui_context = egui::Context::default();
@@ -116,6 +174,14 @@ impl Viewer {
             settings.remember_session(path.display().to_string());
         }
         let total_cache_bytes = settings.cache_budget_mib.saturating_mul(1024 * 1024).max(1);
+        // One enforcing authority is shared by every alignment source, immutable scene layer, and
+        // derived GPU page. The explicit transition reserve permits one old and one candidate
+        // visible set; transient decoder/upload work is reported under its own equal ceiling.
+        let alignment_scene_ledger = AllocationLedger::new_with_transient_budget(
+            total_cache_bytes,
+            total_cache_bytes,
+            total_cache_bytes,
+        );
         // The desktop coordinates these as borrowing ceilings, not fixed
         // partitions. Empty derived tiers must not strand most of the user's
         // selected budget before the first alignment query even starts.
@@ -357,11 +423,27 @@ impl Viewer {
             alignment_tracks.push(spawn_alignment_track_controller(
                 config,
                 alignment_cache_bytes,
+                alignment_scene_ledger.clone(),
                 options.reference.clone(),
                 remote_reference_index_url.clone(),
                 &panel_ids,
             )?);
         }
+        let scene_track_ids = alignment_tracks
+            .iter()
+            .filter(|track| track.scene_engine.is_some())
+            .map(|track| track.config.id)
+            .collect::<Vec<_>>();
+        let alignment_panel_scene_stores = panel_ids
+            .iter()
+            .copied()
+            .map(|panel_id| {
+                (
+                    panel_id,
+                    AlignmentPanelSceneStore::new(scene_track_ids.iter().copied()),
+                )
+            })
+            .collect();
         let mut data_status = if !alignment_tracks.is_empty() {
             "Opening alignment source…".to_owned()
         } else if reference_engine.is_some() {
@@ -481,6 +563,16 @@ impl Viewer {
             queue,
             surface_config,
             rectangle_renderer,
+            alignment_scene_ledger,
+            alignment_gpu_renderer,
+            alignment_gpu_frame: None,
+            alignment_gpu_residency: None,
+            alignment_gpu_prefetch_pending: false,
+            alignment_panel_scene_stores,
+            alignment_panel_frames: HashMap::new(),
+            alignment_scene_owner_clock: 0,
+            alignment_scene_request_clock: 0,
+            alignment_scene_camera_revision: 0,
             navigation_preview_renderer,
             navigation_texture_revisions: HashMap::new(),
             navigation_horizon_preview_stats: NavigationHorizonPreviewStats::default(),
@@ -513,6 +605,7 @@ impl Viewer {
             alignment_row_scene_scheduler_clock,
             alignment_row_scene_scheduler,
             reference_engine,
+            reference_revision: None,
             reference_open_error: None,
             track_engine,
             automation_auxiliary_open_state,
@@ -734,6 +827,11 @@ impl Viewer {
                         self.rectangle_renderer.render(&mut pass);
                     }
                 }
+            }
+            if let Some(frame) = &self.alignment_gpu_frame
+                && let Err(error) = self.alignment_gpu_renderer.render(&mut pass, frame)
+            {
+                tracing::error!(%error, "could not render unified alignment scene frame");
             }
         }
         {
@@ -959,6 +1057,26 @@ impl Viewer {
         let mut live_regions = Vec::new();
         let mut preview_instances = Vec::new();
         let mut preview_frame_records = Vec::new();
+        let alignment_live_regions = self
+            .alignment_panel_frames
+            .iter()
+            .map(|(panel_id, frame)| {
+                let regions = frame
+                    .lanes
+                    .iter()
+                    .filter_map(|lane| {
+                        workspace::alignment_management::alignment_scene_gpu_scissor(
+                            lane.camera,
+                            scale_factor,
+                            self.surface_config.width,
+                            self.surface_config.height,
+                        )
+                    })
+                    .map(|scissor| [scissor.x, scissor.y, scissor.width, scissor.height])
+                    .collect::<Vec<_>>();
+                (*panel_id, regions)
+            })
+            .collect::<HashMap<_, _>>();
         for layout in &self.workspace_layout.panels {
             let Some(panel) = self.panels.get(layout.panel_id) else {
                 continue;
@@ -1002,23 +1120,33 @@ impl Viewer {
                         && preview_texture_available
                 })
                 .map(|source| (source.exact_start, source.exact_start + source.span));
-            let (source_origin, source_size) = navigation_preview_source_uv(
-                [scissor.x, scissor.y],
-                [scissor.width, scissor.height],
-                [self.surface_config.width, self.surface_config.height],
+            let preview_regions = subtract_physical_regions(
+                region,
+                alignment_live_regions
+                    .get(&panel.id)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
             );
-            preview_instances.push(NavigationPreviewInstance::new(
-                [scissor.x as f32, scissor.y as f32],
-                [scissor.width as f32, scissor.height as f32],
-                source_origin,
-                source_size,
-                source,
-                (
-                    panel.navigation_presentation.target_exact_start,
-                    panel.navigation_presentation.target_exact_start
-                        + panel.navigation_presentation.target_span,
-                ),
-            ));
+            for [x, y, width, height] in preview_regions {
+                let (source_origin, source_size) = navigation_preview_source_uv(
+                    [x, y],
+                    [width, height],
+                    [self.surface_config.width, self.surface_config.height],
+                );
+                preview_instances.push(NavigationPreviewInstance::new(
+                    [x as f32, y as f32],
+                    [width as f32, height as f32],
+                    source_origin,
+                    source_size,
+                    source,
+                    (
+                        panel.navigation_presentation.target_exact_start,
+                        panel.navigation_presentation.target_exact_start
+                            + panel.navigation_presentation.target_span,
+                    ),
+                ));
+            }
             preview_frame_records.push((
                 panel.id,
                 source.is_none() && panel.navigation_presentation.committed_interval.is_some(),
@@ -1029,6 +1157,15 @@ impl Viewer {
             ) && panel.navigation_provisional_display.is_some()
             {
                 live_regions.push(region);
+            }
+        }
+        // Alignment read lanes are camera-native even while contextual lanes in the same panel
+        // retain a preview. The preview destinations above exclude these exact regions.
+        for regions in alignment_live_regions.values() {
+            for region in regions.iter().copied() {
+                if !live_regions.contains(&region) {
+                    live_regions.push(region);
+                }
             }
         }
         for (panel_id, neutral_after_commit) in preview_frame_records {
@@ -1332,7 +1469,7 @@ fn decoded_capture_pixels(
 
 #[cfg(test)]
 mod capture_tests {
-    use super::{decoded_capture_pixels, frame_target_plan};
+    use super::{decoded_capture_pixels, frame_target_plan, subtract_physical_regions};
 
     #[test]
     fn native_capture_adds_a_target_without_replacing_the_presented_surface() {
@@ -1365,6 +1502,23 @@ mod capture_tests {
     fn readback_rejects_non_four_byte_surface_formats() {
         assert!(
             decoded_capture_pixels(&[0; 256], 1, 1, 256, wgpu::TextureFormat::Rgba16Float).is_err()
+        );
+    }
+
+    #[test]
+    fn scene_regions_are_removed_from_retained_preview_destinations() {
+        assert_eq!(
+            subtract_physical_regions([10, 20, 100, 100], [[10, 60, 100, 40]]),
+            vec![[10, 20, 100, 40], [10, 100, 100, 20]]
+        );
+        assert_eq!(
+            subtract_physical_regions([0, 0, 100, 100], [[25, 25, 50, 50]]),
+            vec![
+                [0, 0, 100, 25],
+                [0, 75, 100, 25],
+                [0, 25, 25, 50],
+                [75, 25, 25, 50],
+            ]
         );
     }
 }

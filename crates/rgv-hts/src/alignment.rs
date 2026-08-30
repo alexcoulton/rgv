@@ -6,6 +6,8 @@ use std::{
 use rgv_core::ContigId;
 use thiserror::Error;
 
+use crate::source_position::AlignmentSourcePosition;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AlignmentFlags(u16);
 
@@ -82,7 +84,7 @@ pub enum CigarOpKind {
 
 /// The result of reconciling an aligned read base with its CIGAR assertion
 /// and, when available, the loaded reference base.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AlignedBaseClassification {
     Match,
     Substitution,
@@ -377,6 +379,10 @@ pub struct AlignmentRecordView<'a> {
 }
 
 impl<'a> AlignmentRecordView<'a> {
+    pub fn source_position(self) -> Option<AlignmentSourcePosition> {
+        self.batch.source_position(self.index)
+    }
+
     pub fn contig(self) -> ContigId {
         self.batch
             .contig(self.index)
@@ -501,8 +507,26 @@ impl AlignmentOverlapIndex {
         batch: &AlignmentBatch,
         interval: rgv_core::GenomicInterval,
     ) -> Vec<usize> {
+        let mut selected = Vec::with_capacity(self.count(batch, interval));
+        self.visit(batch, interval, |index| selected.push(index));
+        selected
+    }
+
+    /// Counts overlapping physical records without allocating a temporary selection. Scene
+    /// builders use this as an exact upper bound before reserving transient selection capacity.
+    pub fn count(&self, batch: &AlignmentBatch, interval: rgv_core::GenomicInterval) -> usize {
+        let mut count = 0_usize;
+        self.visit(batch, interval, |_| count = count.saturating_add(1));
+        count
+    }
+
+    fn visit(
+        &self,
+        batch: &AlignmentBatch,
+        interval: rgv_core::GenomicInterval,
+        mut visit: impl FnMut(usize),
+    ) {
         let upper = batch.partition_point_start(|start| start < interval.end());
-        let mut selected = Vec::new();
         for (block, maximum_end) in self.maximum_end_by_block.iter().copied().enumerate() {
             let first = block.saturating_mul(ALIGNMENT_OVERLAP_INDEX_BLOCK_RECORDS);
             if first >= upper {
@@ -514,15 +538,17 @@ impl AlignmentOverlapIndex {
             let last = first
                 .saturating_add(ALIGNMENT_OVERLAP_INDEX_BLOCK_RECORDS)
                 .min(upper);
-            selected.extend((first..last).filter(|index| {
-                batch.contig(*index) == Some(interval.contig())
+            for index in first..last {
+                if batch.contig(index) == Some(interval.contig())
                     && batch
-                        .start(*index)
+                        .start(index)
                         .is_some_and(|start| start < interval.end())
-                    && batch.end(*index).is_some_and(|end| end > interval.start())
-            }));
+                    && batch.end(index).is_some_and(|end| end > interval.start())
+                {
+                    visit(index);
+                }
+            }
         }
-        selected
     }
 
     pub fn estimated_bytes(&self) -> usize {
@@ -582,6 +608,7 @@ struct AlignmentBatchStorage {
     auxiliary_offsets: Vec<u32>,
     auxiliary_data: Vec<u8>,
     stable_ids: Vec<AlignmentStableId>,
+    source_positions: Vec<Option<AlignmentSourcePosition>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -619,6 +646,7 @@ impl Default for AlignmentBatchStorage {
             auxiliary_offsets: vec![0],
             auxiliary_data: Vec::new(),
             stable_ids: Vec::new(),
+            source_positions: Vec::new(),
         }
     }
 }
@@ -638,6 +666,38 @@ pub struct AlignmentBatch {
     /// counters without retaining those records' sequence or auxiliary data.
     filtered_record_spans: Vec<FilteredRecordSpan>,
     filtered_record_spans_complete: bool,
+}
+
+/// Packed optional record payload keyed in the same physical order as an alignment core batch.
+///
+/// This deliberately contains no coordinates, names, flags, mates, or CIGAR operations. A scene
+/// can therefore evict sequence/quality/tag capability without retaining a duplicate core record
+/// allocation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlignmentPayloadBatch {
+    source_positions: Vec<Option<AlignmentSourcePosition>>,
+    sequence_states: Vec<PackedSequenceState>,
+    sequence_offsets: Vec<u32>,
+    sequences: Vec<u8>,
+    quality_offsets: Vec<u32>,
+    qualities: Vec<u8>,
+    auxiliary_offsets: Vec<u32>,
+    auxiliary_data: Vec<u8>,
+}
+
+impl Default for AlignmentPayloadBatch {
+    fn default() -> Self {
+        Self {
+            source_positions: Vec::new(),
+            sequence_states: Vec::new(),
+            sequence_offsets: vec![0],
+            sequences: Vec::new(),
+            quality_offsets: vec![0],
+            qualities: Vec::new(),
+            auxiliary_offsets: vec![0],
+            auxiliary_data: Vec::new(),
+        }
+    }
 }
 
 /// Process-local identity for one immutable packed record allocation.
@@ -774,6 +834,15 @@ impl AlignmentBatch {
     pub fn stable_id(&self, index: usize) -> Option<AlignmentStableId> {
         let (storage, physical) = self.record_location(index)?;
         storage.stable_ids.get(physical).copied()
+    }
+
+    /// Returns the stable physical source position captured while decoding this record.
+    ///
+    /// Hand-built records used by tests and compatibility callers can be unpositioned. The
+    /// alignment-scene ingestion boundary requires this to be `Some` for production evidence.
+    pub fn source_position(&self, index: usize) -> Option<AlignmentSourcePosition> {
+        let (storage, physical) = self.record_location(index)?;
+        storage.source_positions.get(physical).copied().flatten()
     }
 
     /// Creates a zero-copy logical projection over this batch.
@@ -930,6 +999,23 @@ impl AlignmentBatch {
     }
 
     pub fn push(&mut self, record: &AlignmentRecord) -> Result<(), BatchOverflow> {
+        self.push_with_optional_source_position(record, None)
+    }
+
+    /// Adds a decoded record together with its stable physical source position.
+    pub fn push_with_source_position(
+        &mut self,
+        record: &AlignmentRecord,
+        source_position: AlignmentSourcePosition,
+    ) -> Result<(), BatchOverflow> {
+        self.push_with_optional_source_position(record, Some(source_position))
+    }
+
+    fn push_with_optional_source_position(
+        &mut self,
+        record: &AlignmentRecord,
+        source_position: Option<AlignmentSourcePosition>,
+    ) -> Result<(), BatchOverflow> {
         let storage = self.storage_mut()?;
         let read_name_end = arena_end(storage.read_names.len(), record.read_name.len())?;
         let cigar_end = arena_end(storage.cigar_ops.len(), record.cigar.len())?;
@@ -986,6 +1072,7 @@ impl AlignmentBatch {
         storage
             .stable_ids
             .push(alignment_storage_stable_id(storage, physical)?);
+        storage.source_positions.push(source_position);
         Ok(())
     }
 
@@ -1040,6 +1127,64 @@ impl AlignmentBatch {
         storage
             .stable_ids
             .push(alignment_storage_stable_id(storage, physical)?);
+        storage.source_positions.push(record.source_position());
+        Ok(())
+    }
+
+    /// Copies only immutable core columns, deliberately replacing all optional payload with the
+    /// `NotLoaded` capability state. Stable IDs and physical source positions are preserved.
+    pub fn copy_core(&self) -> Result<Self, BatchOverflow> {
+        let mut core = Self::default();
+        for record in self.records() {
+            core.push_core_view(record)?;
+        }
+        core.filtered_record_spans = self.filtered_record_spans.clone();
+        core.filtered_record_spans_complete = self.filtered_record_spans_complete;
+        Ok(core)
+    }
+
+    /// True when no sequence, qualities, or auxiliary bytes are retained in this batch.
+    pub fn is_core_only(&self) -> bool {
+        (0..self.len()).all(|index| matches!(self.sequence(index), Some(SequenceView::NotLoaded)))
+            && (0..self.len()).all(|index| {
+                self.record_location(index).map(|(storage, physical)| {
+                    arena_record_len(&storage.auxiliary_offsets, physical)
+                }) == Some(0)
+            })
+    }
+
+    fn push_core_view(&mut self, record: AlignmentRecordView<'_>) -> Result<(), BatchOverflow> {
+        let read_name = record.read_name();
+        let cigar = record.cigar();
+        let storage = self.storage_mut()?;
+        let read_name_end = arena_end(storage.read_names.len(), read_name.len())?;
+        let cigar_end = arena_end(storage.cigar_ops.len(), cigar.len())?;
+        let sequence_end = u32::try_from(storage.sequences.len()).map_err(|_| BatchOverflow)?;
+        let quality_end = u32::try_from(storage.qualities.len()).map_err(|_| BatchOverflow)?;
+        let auxiliary_end =
+            u32::try_from(storage.auxiliary_data.len()).map_err(|_| BatchOverflow)?;
+
+        storage.contigs.push(record.contig());
+        storage.starts.push(record.start());
+        storage.ends.push(record.end());
+        storage.flags.push(record.flags());
+        storage.mapping_qualities.push(record.mapping_quality());
+        storage.mate_contigs.push(record.mate_contig());
+        storage.mate_starts.push(record.mate_start());
+        storage.template_lengths.push(record.template_length());
+        storage.read_names.extend_from_slice(read_name);
+        storage.read_name_offsets.push(read_name_end);
+        storage.cigar_ops.extend_from_slice(cigar);
+        storage.cigar_offsets.push(cigar_end);
+        storage.sequence_states.push(PackedSequenceState::NotLoaded);
+        storage.sequence_offsets.push(sequence_end);
+        storage.quality_offsets.push(quality_end);
+        storage.auxiliary_offsets.push(auxiliary_end);
+        let physical = storage.starts.len().checked_sub(1).ok_or(BatchOverflow)?;
+        storage
+            .stable_ids
+            .push(alignment_storage_stable_id(storage, physical)?);
+        storage.source_positions.push(record.source_position());
         Ok(())
     }
 
@@ -1102,6 +1247,18 @@ impl AlignmentBatch {
                 .or_default()
                 .push(record.index);
         }
+        let left_by_source_position = self
+            .records()
+            .map(|record| {
+                record
+                    .source_position()
+                    .map(|position| (position, record.index))
+            })
+            .collect::<Option<HashMap<_, _>>>();
+        let other_is_fully_positioned = other
+            .records()
+            .all(|record| record.source_position().is_some());
+        let use_source_positions = left_by_source_position.is_some() && other_is_fully_positioned;
         let mut matched_left = HashSet::new();
         let mut storages = Vec::<Arc<AlignmentBatchStorage>>::new();
         for storage in self
@@ -1141,16 +1298,32 @@ impl AlignmentBatch {
                 continue;
             }
             let record = other.record_view(right).ok_or(BatchOverflow)?;
-            let duplicate = left_by_fingerprint
-                .get(&record.stable_fingerprint())
-                .and_then(|candidates| {
-                    candidates.iter().copied().find(|candidate| {
-                        !matched_left.contains(candidate)
-                            && self
-                                .record_view(*candidate)
-                                .is_some_and(|left| left.exactly_matches(record))
+            let duplicate = if use_source_positions {
+                let position = record.source_position().ok_or(BatchOverflow)?;
+                let candidate = left_by_source_position
+                    .as_ref()
+                    .and_then(|positions| positions.get(&position))
+                    .copied();
+                if let Some(candidate) = candidate
+                    && !self
+                        .record_view(candidate)
+                        .is_some_and(|left| left.exactly_matches(record))
+                {
+                    return Err(BatchOverflow);
+                }
+                candidate
+            } else {
+                left_by_fingerprint
+                    .get(&record.stable_fingerprint())
+                    .and_then(|candidates| {
+                        candidates.iter().copied().find(|candidate| {
+                            !matched_left.contains(candidate)
+                                && self
+                                    .record_view(*candidate)
+                                    .is_some_and(|left| left.exactly_matches(record))
+                        })
                     })
-                });
+            };
             if let Some(duplicate) = duplicate {
                 matched_left.insert(duplicate);
             } else {
@@ -1385,6 +1558,28 @@ impl AlignmentBatch {
         }
     }
 
+    /// Sequence capability is present for every physical record. Records for which the source
+    /// itself has no sequence remain explicitly `Missing` and still satisfy it.
+    #[must_use]
+    pub fn has_complete_sequence_capability(&self) -> bool {
+        (0..self.len()).all(|index| !matches!(self.sequence(index), Some(SequenceView::NotLoaded)))
+    }
+
+    /// Every present sequence retains qualities; records with no source sequence remain Missing.
+    #[must_use]
+    pub fn has_complete_quality_capability(&self) -> bool {
+        (0..self.len()).all(|index| {
+            matches!(
+                self.sequence(index),
+                Some(SequenceView::Missing)
+                    | Some(SequenceView::Present {
+                        qualities: Some(_),
+                        ..
+                    })
+            )
+        })
+    }
+
     pub fn has_auxiliary_tag(&self, index: usize, tag: [u8; 2]) -> bool {
         let Some(data) = self.auxiliary_bytes(index) else {
             return false;
@@ -1396,6 +1591,28 @@ impl AlignmentBatch {
             }
         }
         false
+    }
+
+    #[must_use]
+    pub fn auxiliary_encoded_len(&self, index: usize) -> Option<usize> {
+        self.auxiliary_bytes(index).map(<[u8]>::len)
+    }
+
+    pub fn auxiliary_value_payload_len(
+        &self,
+        index: usize,
+        tag: [u8; 2],
+    ) -> Result<Option<usize>, PackedRecordError> {
+        let data = self
+            .auxiliary_bytes(index)
+            .ok_or(PackedRecordError::InvalidIndex(index))?;
+        let mut cursor = 0;
+        while let Some((field_tag, _, payload)) = next_auxiliary(data, &mut cursor)? {
+            if field_tag == tag {
+                return Ok(Some(payload.len()));
+            }
+        }
+        Ok(None)
     }
 
     pub fn auxiliary_field(
@@ -1555,6 +1772,7 @@ impl AlignmentBatch {
             + std::mem::size_of::<i64>()
             + std::mem::size_of::<PackedSequenceState>()
             + std::mem::size_of::<AlignmentStableId>()
+            + std::mem::size_of::<Option<AlignmentSourcePosition>>()
             + 5 * std::mem::size_of::<u32>();
 
         let records = (0..self.len()).fold(0_usize, |total, index| {
@@ -1596,6 +1814,268 @@ impl AlignmentBatch {
     }
 }
 
+impl AlignmentPayloadBatch {
+    pub fn from_batch(
+        batch: &AlignmentBatch,
+        retain_sequence: bool,
+        retain_qualities: bool,
+        retained_auxiliary_tags: Option<&[[u8; 2]]>,
+    ) -> Result<Self, AlignmentPayloadError> {
+        if retain_qualities && !retain_sequence {
+            return Err(AlignmentPayloadError::QualitiesRequireSequence);
+        }
+        let mut payload = Self::default();
+        payload.source_positions.reserve(batch.len());
+        payload.sequence_states.reserve(batch.len());
+        payload.sequence_offsets.reserve(batch.len());
+        payload.quality_offsets.reserve(batch.len());
+        payload.auxiliary_offsets.reserve(batch.len());
+        for record in batch.records() {
+            payload.source_positions.push(record.source_position());
+            let (state, bases, qualities) = if retain_sequence {
+                match record.sequence() {
+                    SequenceView::NotLoaded => (PackedSequenceState::NotLoaded, &[][..], None),
+                    SequenceView::Missing => (PackedSequenceState::Missing, &[][..], None),
+                    SequenceView::Present { bases, qualities } => {
+                        let qualities = retain_qualities.then_some(qualities).flatten();
+                        (
+                            if qualities.is_some() {
+                                PackedSequenceState::PresentWithQualities
+                            } else {
+                                PackedSequenceState::PresentWithoutQualities
+                            },
+                            bases,
+                            qualities,
+                        )
+                    }
+                }
+            } else {
+                (PackedSequenceState::NotLoaded, &[][..], None)
+            };
+            let sequence_end = arena_end(payload.sequences.len(), bases.len())?;
+            let quality_end = arena_end(payload.qualities.len(), qualities.map_or(0, <[u8]>::len))?;
+            payload.sequence_states.push(state);
+            payload.sequences.extend_from_slice(bases);
+            payload.sequence_offsets.push(sequence_end);
+            if let Some(qualities) = qualities {
+                payload.qualities.extend_from_slice(qualities);
+            }
+            payload.quality_offsets.push(quality_end);
+
+            let auxiliary = record
+                .auxiliary_bytes()
+                .ok_or(AlignmentPayloadError::InvalidRecord)?;
+            match retained_auxiliary_tags {
+                None => payload.auxiliary_data.extend_from_slice(auxiliary),
+                Some(tags) => {
+                    let mut cursor = 0;
+                    while cursor < auxiliary.len() {
+                        let field_start = cursor;
+                        let Some((tag, _, _)) = next_auxiliary(auxiliary, &mut cursor)? else {
+                            break;
+                        };
+                        if tags.contains(&tag) {
+                            payload
+                                .auxiliary_data
+                                .extend_from_slice(&auxiliary[field_start..cursor]);
+                        }
+                    }
+                }
+            }
+            payload
+                .auxiliary_offsets
+                .push(u32::try_from(payload.auxiliary_data.len())?);
+        }
+        debug_assert!(payload.validate());
+        Ok(payload)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.sequence_states.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sequence_states.is_empty()
+    }
+
+    #[must_use]
+    pub fn source_position(&self, index: usize) -> Option<AlignmentSourcePosition> {
+        self.source_positions.get(index).copied().flatten()
+    }
+
+    #[must_use]
+    pub fn sequence(&self, index: usize) -> Option<SequenceView<'_>> {
+        match self.sequence_states.get(index)? {
+            PackedSequenceState::NotLoaded => Some(SequenceView::NotLoaded),
+            PackedSequenceState::Missing => Some(SequenceView::Missing),
+            PackedSequenceState::PresentWithoutQualities => Some(SequenceView::Present {
+                bases: arena_slice(&self.sequence_offsets, &self.sequences, index)?,
+                qualities: None,
+            }),
+            PackedSequenceState::PresentWithQualities => {
+                let bases = arena_slice(&self.sequence_offsets, &self.sequences, index)?;
+                let qualities = arena_slice(&self.quality_offsets, &self.qualities, index)?;
+                (bases.len() == qualities.len()).then_some(SequenceView::Present {
+                    bases,
+                    qualities: Some(qualities),
+                })
+            }
+        }
+    }
+
+    /// The sidecar was decoded with sequence capability for every physical record. Records for
+    /// which the source itself has no sequence remain explicitly `Missing` and still satisfy it.
+    #[must_use]
+    pub fn has_complete_sequence_capability(&self) -> bool {
+        (0..self.len()).all(|index| !matches!(self.sequence(index), Some(SequenceView::NotLoaded)))
+    }
+
+    /// Every present sequence retains qualities; records with no source sequence remain Missing.
+    #[must_use]
+    pub fn has_complete_quality_capability(&self) -> bool {
+        (0..self.len()).all(|index| {
+            matches!(
+                self.sequence(index),
+                Some(SequenceView::Missing)
+                    | Some(SequenceView::Present {
+                        qualities: Some(_),
+                        ..
+                    })
+            )
+        })
+    }
+
+    pub fn has_auxiliary_tag(&self, index: usize, tag: [u8; 2]) -> bool {
+        let Some(data) = self.auxiliary_bytes(index) else {
+            return false;
+        };
+        let mut cursor = 0;
+        while let Ok(Some((field_tag, _, _))) = next_auxiliary(data, &mut cursor) {
+            if field_tag == tag {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[must_use]
+    pub fn auxiliary_encoded_len(&self, index: usize) -> Option<usize> {
+        self.auxiliary_bytes(index).map(<[u8]>::len)
+    }
+
+    pub fn auxiliary_value_payload_len(
+        &self,
+        index: usize,
+        tag: [u8; 2],
+    ) -> Result<Option<usize>, PackedRecordError> {
+        let data = self
+            .auxiliary_bytes(index)
+            .ok_or(PackedRecordError::InvalidIndex(index))?;
+        let mut cursor = 0;
+        while let Some((field_tag, _, payload)) = next_auxiliary(data, &mut cursor)? {
+            if field_tag == tag {
+                return Ok(Some(payload.len()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn auxiliary_field(
+        &self,
+        index: usize,
+        tag: [u8; 2],
+    ) -> Result<Option<AuxField>, PackedRecordError> {
+        let data = self
+            .auxiliary_bytes(index)
+            .ok_or(PackedRecordError::InvalidIndex(index))?;
+        let mut cursor = 0;
+        while let Some((field_tag, kind, value)) = next_auxiliary(data, &mut cursor)? {
+            if field_tag == tag {
+                return Ok(Some(AuxField {
+                    tag,
+                    value: decode_auxiliary_value(kind, value)?,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn auxiliary_fields(&self, index: usize) -> Result<Vec<AuxField>, PackedRecordError> {
+        let data = self
+            .auxiliary_bytes(index)
+            .ok_or(PackedRecordError::InvalidIndex(index))?;
+        let mut fields = Vec::new();
+        let mut cursor = 0;
+        while let Some((tag, kind, value)) = next_auxiliary(data, &mut cursor)? {
+            fields.push(AuxField {
+                tag,
+                value: decode_auxiliary_value(kind, value)?,
+            });
+        }
+        Ok(fields)
+    }
+
+    #[must_use]
+    pub fn validate(&self) -> bool {
+        let len = self.len();
+        self.source_positions.len() == len
+            && valid_offsets(&self.sequence_offsets, len, self.sequences.len())
+            && valid_offsets(&self.quality_offsets, len, self.qualities.len())
+            && valid_offsets(&self.auxiliary_offsets, len, self.auxiliary_data.len())
+            && (0..len).all(|index| self.sequence(index).is_some())
+            && (0..len).all(|index| {
+                let Some(data) = self.auxiliary_bytes(index) else {
+                    return false;
+                };
+                let mut cursor = 0;
+                loop {
+                    match next_auxiliary(data, &mut cursor) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break true,
+                        Err(_) => break false,
+                    }
+                }
+            })
+    }
+
+    /// Capacity charged when this sidecar is retained independently from core records.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        self.source_positions
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<AlignmentSourcePosition>>())
+            .saturating_add(
+                self.sequence_states
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PackedSequenceState>()),
+            )
+            .saturating_add(
+                self.sequence_offsets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(self.sequences.capacity())
+            .saturating_add(
+                self.quality_offsets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(self.qualities.capacity())
+            .saturating_add(
+                self.auxiliary_offsets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(self.auxiliary_data.capacity())
+    }
+
+    fn auxiliary_bytes(&self, index: usize) -> Option<&[u8]> {
+        arena_slice(&self.auxiliary_offsets, &self.auxiliary_data, index)
+    }
+}
+
 fn valid_offsets(offsets: &[u32], records: usize, arena_len: usize) -> bool {
     offsets.len() == records + 1
         && offsets.first() == Some(&0)
@@ -1613,6 +2093,7 @@ fn valid_alignment_storage(storage: &AlignmentBatchStorage) -> bool {
         && storage.mate_starts.len() == len
         && storage.template_lengths.len() == len
         && storage.stable_ids.len() == len
+        && storage.source_positions.len() == len
         && storage.sequence_states.len() == len
         && valid_offsets(&storage.read_name_offsets, len, storage.read_names.len())
         && valid_offsets(&storage.cigar_offsets, len, storage.cigar_ops.len())
@@ -1646,6 +2127,7 @@ fn alignment_storage_estimated_bytes(storage: &AlignmentBatchStorage) -> usize {
         + storage.auxiliary_offsets.len() * std::mem::size_of::<u32>()
         + storage.auxiliary_data.len()
         + storage.stable_ids.len() * std::mem::size_of::<AlignmentStableId>()
+        + storage.source_positions.len() * std::mem::size_of::<Option<AlignmentSourcePosition>>()
 }
 
 fn arena_record_len(offsets: &[u32], index: usize) -> usize {
@@ -1903,6 +2385,30 @@ fn decode_array<const N: usize, T>(
         .collect()
 }
 
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum AlignmentPayloadError {
+    #[error("alignment payload capacity exceeded its packed 32-bit offsets")]
+    Overflow,
+    #[error("qualities cannot be retained without retaining sequence")]
+    QualitiesRequireSequence,
+    #[error("alignment payload source record is internally inconsistent")]
+    InvalidRecord,
+    #[error(transparent)]
+    Packed(#[from] PackedRecordError),
+}
+
+impl From<BatchOverflow> for AlignmentPayloadError {
+    fn from(_: BatchOverflow) -> Self {
+        Self::Overflow
+    }
+}
+
+impl From<std::num::TryFromIntError> for AlignmentPayloadError {
+    fn from(_: std::num::TryFromIntError) -> Self {
+        Self::Overflow
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BatchOverflow;
 
@@ -2057,6 +2563,50 @@ mod tests {
     }
 
     #[test]
+    fn core_and_optional_payload_are_independent_allocations_with_the_same_identity() {
+        let mut batch = AlignmentBatch::default();
+        batch
+            .push_with_source_position(
+                &complete_record(),
+                AlignmentSourcePosition::bam_virtual_offset(123),
+            )
+            .unwrap();
+
+        let core = batch.copy_core().unwrap();
+        assert!(core.is_core_only());
+        assert_eq!(core.stable_id(0), batch.stable_id(0));
+        assert_eq!(core.source_position(0), batch.source_position(0));
+        assert_eq!(core.sequence(0), Some(SequenceView::NotLoaded));
+        assert!(!core.has_auxiliary_tag(0, *b"RG"));
+
+        let full = AlignmentPayloadBatch::from_batch(&batch, true, true, None).unwrap();
+        assert!(full.validate());
+        assert_eq!(full.source_position(0), batch.source_position(0));
+        assert_eq!(full.sequence(0), batch.sequence(0));
+        assert_eq!(
+            full.auxiliary_field(0, *b"NM").unwrap(),
+            batch.auxiliary_field(0, *b"NM").unwrap()
+        );
+        assert!(full.estimated_bytes() > 0);
+
+        let selective =
+            AlignmentPayloadBatch::from_batch(&batch, true, false, Some(&[*b"RG"])).unwrap();
+        assert_eq!(
+            selective.sequence(0),
+            Some(SequenceView::Present {
+                bases: b"ACGTACGTAA",
+                qualities: None,
+            })
+        );
+        assert!(selective.has_auxiliary_tag(0, *b"RG"));
+        assert!(!selective.has_auxiliary_tag(0, *b"NM"));
+        assert_eq!(
+            AlignmentPayloadBatch::from_batch(&batch, false, true, None).unwrap_err(),
+            AlignmentPayloadError::QualitiesRequireSequence
+        );
+    }
+
+    #[test]
     fn projection_shares_packed_arenas_and_preserves_logical_record_order() {
         let mut first = complete_record();
         first.read_name = b"first".to_vec();
@@ -2161,6 +2711,28 @@ mod tests {
     }
 
     #[test]
+    fn positioned_merge_uses_physical_identity_not_duplicate_multiplicity() {
+        let duplicate = complete_record();
+        let first = AlignmentSourcePosition::bam_virtual_offset(100);
+        let second = AlignmentSourcePosition::bam_virtual_offset(200);
+        let third = AlignmentSourcePosition::bam_virtual_offset(300);
+
+        let mut left = AlignmentBatch::default();
+        left.push_with_source_position(&duplicate, first).unwrap();
+        left.push_with_source_position(&duplicate, second).unwrap();
+        let mut right = AlignmentBatch::default();
+        right.push_with_source_position(&duplicate, second).unwrap();
+        right.push_with_source_position(&duplicate, third).unwrap();
+
+        let merged = left.merge_complete(&right).unwrap();
+        let positions = (0..merged.len())
+            .map(|index| merged.source_position(index).unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(merged.len(), 3);
+        assert_eq!(positions, HashSet::from([first, second, third]));
+    }
+
+    #[test]
     fn complete_batch_merge_preserves_exact_filtered_provenance_without_boundary_copies() {
         let duplicate = FilteredRecordReason::User {
             duplicate: true,
@@ -2208,11 +2780,11 @@ mod tests {
         }
         assert!(batch.validate());
 
-        let selected = AlignmentOverlapIndex::new(&batch).select(
-            &batch,
-            rgv_core::GenomicInterval::new(ContigId::new(2), 900, 901).unwrap(),
-        );
+        let interval = rgv_core::GenomicInterval::new(ContigId::new(2), 900, 901).unwrap();
+        let index = AlignmentOverlapIndex::new(&batch);
+        let selected = index.select(&batch, interval);
         assert_eq!(selected, vec![0]);
+        assert_eq!(index.count(&batch, interval), selected.len());
     }
 
     #[test]

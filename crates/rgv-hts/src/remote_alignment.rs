@@ -1,5 +1,6 @@
 use std::{
-    io::{self, Cursor, Read as _},
+    collections::{BTreeMap, BTreeSet},
+    io::{self, Cursor, Read as _, SeekFrom},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -25,13 +26,15 @@ use rgv_core::{ContigId, GenomicInterval, ReferenceDictionary};
 
 use crate::{
     AlignmentBatch, AlignmentError, AlignmentFlags, AlignmentHeaderMetadata, AlignmentOpenOptions,
-    AlignmentQuery, AlignmentReadGroup, AlignmentRecord, AlignmentSource, AuxComparison, AuxField,
-    AuxValue, CigarOp, CigarOpKind, FastaOpenOptions, FastaReference, HttpRangeConfig,
-    HttpRangeReader, JunctionSummary, LocalAlignmentSource, MAX_ALIGNMENT_READ_GROUPS,
-    PileupProvenance, PileupSummary, QueryDetail, QueryOptions, QueryStats, RemoteCancellation,
-    RemoteError, RemoteIoStats, RemoteTransferBudget, SequenceData,
+    AlignmentQuery, AlignmentReadGroup, AlignmentRecord, AlignmentSource, AlignmentSourceFormat,
+    AlignmentSourceStamp, AuxComparison, AuxField, AuxValue, CigarOp, CigarOpKind,
+    FastaOpenOptions, FastaReference, HttpRangeConfig, HttpRangeReader, JunctionSummary,
+    LocalAlignmentSource, MAX_ALIGNMENT_READ_GROUPS, PileupProvenance, PileupSummary, QueryDetail,
+    QueryOptions, QueryStats, RemoteCancellation, RemoteError, RemoteIoStats, RemoteTransferBudget,
+    SequenceData,
     alignment::FilteredRecordReason,
     associated_remote_url, bisulfite_strand_is_reverse,
+    index_overview::local_alignment_index_candidates,
     junction::{
         JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
     },
@@ -39,6 +42,7 @@ use crate::{
         OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, aligned_observation,
     },
     read_remote_object_bounded, remote_url_with_extension,
+    source_revision::{LocalSourceGuard, digest_bytes, local_source_stamp, remote_source_stamp},
 };
 
 type NoodlesReader = bam::io::IndexedReader<noodles::bgzf::io::Reader<HttpRangeReader>>;
@@ -102,13 +106,14 @@ fn alignment_header_metadata_from_noodles(header: &sam::Header) -> AlignmentHead
 /// observable pure-Rust range path.
 pub enum ProductionAlignmentSource {
     Htslib(LocalAlignmentSource),
+    LocalCram(Box<LocalCramAlignmentSource>),
     RemoteBam(Box<RemoteBamAlignmentSource>),
     RemoteCram(Box<RemoteCramAlignmentSource>),
 }
 
 impl ProductionAlignmentSource {
     pub fn is_remote(&self) -> bool {
-        !matches!(self, Self::Htslib(_))
+        matches!(self, Self::RemoteBam(_) | Self::RemoteCram(_))
     }
 
     pub fn open(
@@ -133,6 +138,14 @@ impl ProductionAlignmentSource {
             RemoteCramAlignmentSource::open(raw.as_ref(), options)
                 .map(Box::new)
                 .map(Self::RemoteCram)
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cram"))
+        {
+            LocalCramAlignmentSource::open(path, options)
+                .map(Box::new)
+                .map(Self::LocalCram)
         } else {
             LocalAlignmentSource::open(path, options).map(Self::Htslib)
         }
@@ -140,7 +153,7 @@ impl ProductionAlignmentSource {
 
     pub fn remote_io_stats(&self) -> Option<RemoteIoStats> {
         match self {
-            Self::Htslib(_) => None,
+            Self::Htslib(_) | Self::LocalCram(_) => None,
             Self::RemoteBam(source) => Some(source.remote_io_stats()),
             Self::RemoteCram(source) => Some(source.remote_io_stats()),
         }
@@ -148,7 +161,7 @@ impl ProductionAlignmentSource {
 
     pub fn set_remote_transfer_budget(&mut self, budget: Option<RemoteTransferBudget>) {
         match self {
-            Self::Htslib(_) => {}
+            Self::Htslib(_) | Self::LocalCram(_) => {}
             Self::RemoteBam(source) => source.set_transfer_budget(budget),
             Self::RemoteCram(source) => source.set_transfer_budget(budget),
         }
@@ -157,6 +170,7 @@ impl ProductionAlignmentSource {
     pub fn index_overview(&self) -> Option<&crate::AlignmentIndexOverview> {
         match self {
             Self::Htslib(source) => source.index_overview(),
+            Self::LocalCram(_) => None,
             Self::RemoteBam(source) => source.index_overview.as_ref(),
             Self::RemoteCram(_) => None,
         }
@@ -170,6 +184,7 @@ impl ProductionAlignmentSource {
     ) -> Result<AlignmentQuery, AlignmentError> {
         match self {
             Self::Htslib(source) => source.query(interval, options, cancellation.as_ref()),
+            Self::LocalCram(source) => source.query(interval, options, cancellation.as_ref()),
             Self::RemoteBam(source) => {
                 source.set_cancellation(Some(Arc::clone(cancellation)));
                 source.query(interval, options, cancellation.as_ref())
@@ -186,8 +201,18 @@ impl AlignmentSource for ProductionAlignmentSource {
     fn reference_dictionary(&self) -> &ReferenceDictionary {
         match self {
             Self::Htslib(source) => source.reference_dictionary(),
+            Self::LocalCram(source) => source.reference_dictionary(),
             Self::RemoteBam(source) => source.reference_dictionary(),
             Self::RemoteCram(source) => source.reference_dictionary(),
+        }
+    }
+
+    fn source_stamp(&self) -> Option<AlignmentSourceStamp> {
+        match self {
+            Self::Htslib(source) => source.source_stamp(),
+            Self::LocalCram(source) => source.source_stamp(),
+            Self::RemoteBam(source) => source.source_stamp(),
+            Self::RemoteCram(source) => source.source_stamp(),
         }
     }
 
@@ -199,9 +224,151 @@ impl AlignmentSource for ProductionAlignmentSource {
     ) -> Result<AlignmentQuery, AlignmentError> {
         match self {
             Self::Htslib(source) => source.query(interval, options, keep_going),
+            Self::LocalCram(source) => source.query(interval, options, keep_going),
             Self::RemoteBam(source) => source.query(interval, options, keep_going),
             Self::RemoteCram(source) => source.query(interval, options, keep_going),
         }
+    }
+}
+
+/// Indexed local CRAM source using the same positioned container/slice decoder as remote CRAM.
+pub struct LocalCramAlignmentSource {
+    reader: cram::io::IndexedReader<std::fs::File>,
+    header: sam::Header,
+    dictionary: ReferenceDictionary,
+    metadata: Arc<AlignmentHeaderMetadata>,
+    reference_query_bases: Arc<AtomicUsize>,
+    source_stamp: AlignmentSourceStamp,
+    source_guard: LocalSourceGuard,
+}
+
+impl LocalCramAlignmentSource {
+    pub fn open(
+        path: impl AsRef<std::path::Path>,
+        options: &AlignmentOpenOptions,
+    ) -> Result<Self, AlignmentError> {
+        let path = path.as_ref();
+        let reference = options
+            .reference_path
+            .as_ref()
+            .map(|path| {
+                FastaReference::open_with_options(
+                    path,
+                    &FastaOpenOptions {
+                        remote_index_url: options.remote_reference_index_url.clone(),
+                        remote_range: options.remote_range.clone(),
+                    },
+                )
+                .map(|reference| Arc::new(Mutex::new(reference)))
+            })
+            .transpose()?;
+        let reference_query_bases = Arc::new(AtomicUsize::new(0));
+        let repository = reference
+            .as_ref()
+            .map_or_else(fasta::Repository::default, |reference| {
+                fasta::Repository::new(CramReferenceAdapter {
+                    reference: Arc::clone(reference),
+                    query_bases: Arc::clone(&reference_query_bases),
+                })
+            });
+        let mut builder = cram::io::indexed_reader::Builder::default()
+            .set_reference_sequence_repository(repository);
+        if let Some(index_path) = &options.index_path {
+            builder = builder.set_index(cram::crai::fs::read(index_path)?);
+        }
+        let mut reader = builder.build_from_path(path)?;
+        let header = reader.read_header()?;
+        let metadata = Arc::new(alignment_header_metadata_from_noodles(&header));
+        let dictionary = ReferenceDictionary::from_contigs(
+            header
+                .reference_sequences()
+                .iter()
+                .map(|(name, reference)| {
+                    (
+                        String::from_utf8_lossy(name.as_ref()).into_owned(),
+                        reference.length().get() as u64,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let index_path = local_alignment_index_candidates(
+            path,
+            options.index_path.as_deref(),
+            AlignmentSourceFormat::Cram,
+        )
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "opened CRAM index could not be resolved for revision capture",
+            )
+        })?;
+        let source_guard = LocalSourceGuard::capture(path, &index_path)?;
+        let source_stamp = options.source_stamp_override.map_or_else(
+            || {
+                local_source_stamp(
+                    path,
+                    &index_path,
+                    AlignmentSourceFormat::Cram,
+                    &dictionary,
+                    &metadata,
+                )
+            },
+            Ok,
+        )?;
+        Ok(Self {
+            reader,
+            header,
+            dictionary,
+            metadata,
+            reference_query_bases,
+            source_stamp,
+            source_guard,
+        })
+    }
+}
+
+impl AlignmentSource for LocalCramAlignmentSource {
+    fn reference_dictionary(&self) -> &ReferenceDictionary {
+        &self.dictionary
+    }
+
+    fn source_stamp(&self) -> Option<AlignmentSourceStamp> {
+        Some(self.source_stamp)
+    }
+
+    fn query(
+        &mut self,
+        interval: GenomicInterval,
+        options: QueryOptions,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<AlignmentQuery, AlignmentError> {
+        if !self.source_guard.validate()? {
+            return Err(AlignmentError::SourceChanged);
+        }
+        if !keep_going() {
+            return Ok(cancelled_query(interval, Arc::clone(&self.metadata)));
+        }
+        if self.dictionary.get(interval.contig()).is_none() {
+            return Err(AlignmentError::UnknownContig(interval.contig().get()));
+        }
+        self.reference_query_bases.store(0, Ordering::Relaxed);
+        self.reader.reference_sequence_repository().clear();
+        let result = {
+            let records = positioned_cram_records(&mut self.reader, &self.header, interval)?;
+            query_positioned_noodles_records(
+                records,
+                &self.header,
+                interval,
+                &options,
+                None,
+                Arc::clone(&self.metadata),
+                keep_going,
+            )
+        };
+        self.reader.reference_sequence_repository().clear();
+        result
     }
 }
 
@@ -214,12 +381,14 @@ pub struct RemoteBamAlignmentSource {
     index_stats: RemoteIoStats,
     normalization_mapped_records: Option<u64>,
     index_overview: Option<crate::AlignmentIndexOverview>,
+    source_stamp: AlignmentSourceStamp,
 }
 
 impl RemoteBamAlignmentSource {
     pub fn open(url: &str, options: &AlignmentOpenOptions) -> Result<Self, AlignmentError> {
         let source = HttpRangeReader::open(url, options.remote_range.clone())?;
-        let (index, index_stats) = open_index(
+        let source_version = source.object_version();
+        let (index, index_stats, index_digest) = open_index(
             url,
             options.remote_index_url.as_deref(),
             options.remote_range.clone(),
@@ -247,6 +416,16 @@ impl RemoteBamAlignmentSource {
             reader.index(),
             &dictionary,
         ));
+        let source_stamp = options.source_stamp_override.unwrap_or_else(|| {
+            remote_source_stamp(
+                url,
+                &source_version,
+                AlignmentSourceFormat::Bam,
+                &dictionary,
+                &metadata,
+                &index_digest,
+            )
+        });
         Ok(Self {
             reader,
             header,
@@ -255,6 +434,7 @@ impl RemoteBamAlignmentSource {
             index_stats,
             normalization_mapped_records,
             index_overview,
+            source_stamp,
         })
     }
 
@@ -283,12 +463,14 @@ pub struct RemoteCramAlignmentSource {
     index_stats: RemoteIoStats,
     reference: Option<Arc<Mutex<FastaReference>>>,
     reference_query_bases: Arc<AtomicUsize>,
+    source_stamp: AlignmentSourceStamp,
 }
 
 impl RemoteCramAlignmentSource {
     pub fn open(url: &str, options: &AlignmentOpenOptions) -> Result<Self, AlignmentError> {
         let source = HttpRangeReader::open(url, options.remote_range.clone())?;
-        let (index, index_stats) = open_cram_index(
+        let source_version = source.object_version();
+        let (index, index_stats, index_digest) = open_cram_index(
             url,
             options.remote_index_url.as_deref(),
             options.remote_range.clone(),
@@ -335,6 +517,16 @@ impl RemoteCramAlignmentSource {
                 })
                 .collect::<Vec<_>>(),
         );
+        let source_stamp = options.source_stamp_override.unwrap_or_else(|| {
+            remote_source_stamp(
+                url,
+                &source_version,
+                AlignmentSourceFormat::Cram,
+                &dictionary,
+                &metadata,
+                &index_digest,
+            )
+        });
         Ok(Self {
             reader,
             header,
@@ -343,6 +535,7 @@ impl RemoteCramAlignmentSource {
             index_stats,
             reference,
             reference_query_bases,
+            source_stamp,
         })
     }
 
@@ -474,6 +667,10 @@ impl AlignmentSource for RemoteBamAlignmentSource {
         &self.dictionary
     }
 
+    fn source_stamp(&self) -> Option<AlignmentSourceStamp> {
+        Some(self.source_stamp)
+    }
+
     fn query(
         &mut self,
         interval: GenomicInterval,
@@ -497,9 +694,9 @@ impl AlignmentSource for RemoteBamAlignmentSource {
         )
         .map_err(|_| AlignmentError::CoordinateOverflow)?;
         let region = Region::new(contig.name(), start..=end);
-        let query = self.reader.query(&self.header, &region)?;
-        query_noodles_records(
-            query.records(),
+        let records = positioned_bam_records(&mut self.reader, &self.header, interval, &region)?;
+        query_positioned_noodles_records(
+            records,
             &self.header,
             interval,
             &options,
@@ -510,9 +707,54 @@ impl AlignmentSource for RemoteBamAlignmentSource {
     }
 }
 
+fn positioned_bam_records(
+    reader: &mut NoodlesReader,
+    header: &sam::Header,
+    interval: GenomicInterval,
+    region: &Region,
+) -> Result<Vec<io::Result<(bam::Record, Option<crate::AlignmentSourcePosition>)>>, AlignmentError>
+{
+    use noodles::bgzf::io::Seek as _;
+
+    let reference_sequence_id =
+        usize::try_from(interval.contig().get()).map_err(|_| AlignmentError::CoordinateOverflow)?;
+    let chunks = reader
+        .index()
+        .query(reference_sequence_id, region.interval())?;
+    let bgzf_reader = reader.get_mut();
+    let mut positioned = Vec::new();
+    let mut seen = BTreeSet::new();
+    for chunk in chunks {
+        bgzf_reader.seek_to_virtual_position(chunk.start())?;
+        let mut direct_reader = bam::io::Reader::from(&mut *bgzf_reader);
+        let mut record = bam::Record::default();
+        while direct_reader.get_ref().virtual_position() < chunk.end() {
+            if direct_reader.read_record(&mut record)? == 0 {
+                break;
+            }
+            let end_position = u64::from(direct_reader.get_ref().virtual_position());
+            if !seen.insert(end_position) || !noodles_record_intersects(&record, header, interval)?
+            {
+                continue;
+            }
+            positioned.push(Ok((
+                record.clone(),
+                Some(crate::AlignmentSourcePosition::bam_virtual_offset(
+                    end_position,
+                )),
+            )));
+        }
+    }
+    Ok(positioned)
+}
+
 impl AlignmentSource for RemoteCramAlignmentSource {
     fn reference_dictionary(&self) -> &ReferenceDictionary {
         &self.dictionary
+    }
+
+    fn source_stamp(&self) -> Option<AlignmentSourceStamp> {
+        Some(self.source_stamp)
     }
 
     fn query(
@@ -528,21 +770,12 @@ impl AlignmentSource for RemoteCramAlignmentSource {
             .dictionary
             .get(interval.contig())
             .ok_or(AlignmentError::UnknownContig(interval.contig().get()))?;
-        let start = Position::try_from(
-            usize::try_from(interval.start().saturating_add(1))
-                .map_err(|_| AlignmentError::CoordinateOverflow)?,
-        )
-        .map_err(|_| AlignmentError::CoordinateOverflow)?;
-        let end = Position::try_from(
-            usize::try_from(interval.end()).map_err(|_| AlignmentError::CoordinateOverflow)?,
-        )
-        .map_err(|_| AlignmentError::CoordinateOverflow)?;
-        let region = Region::new(contig.name(), start..=end);
+        let _ = contig;
         self.reference_query_bases.store(0, Ordering::Relaxed);
         self.reader.reference_sequence_repository().clear();
         let result = {
-            let records = self.reader.query(&self.header, &region)?.records();
-            query_noodles_records(
+            let records = positioned_cram_records(&mut self.reader, &self.header, interval)?;
+            query_positioned_noodles_records(
                 records,
                 &self.header,
                 interval,
@@ -557,8 +790,130 @@ impl AlignmentSource for RemoteCramAlignmentSource {
     }
 }
 
+/// Reads exact CRAM slices selected by CRAI and retains a physical record address which is stable
+/// across independent genomic query boundaries.
+fn positioned_cram_records<R>(
+    reader: &mut cram::io::IndexedReader<R>,
+    header: &sam::Header,
+    interval: GenomicInterval,
+) -> Result<
+    Vec<
+        io::Result<(
+            sam::alignment::RecordBuf,
+            Option<crate::AlignmentSourcePosition>,
+        )>,
+    >,
+    AlignmentError,
+>
+where
+    R: io::Read + io::Seek,
+{
+    let reference_sequence_id =
+        usize::try_from(interval.contig().get()).map_err(|_| AlignmentError::CoordinateOverflow)?;
+    let mut selected = BTreeMap::<u64, BTreeSet<u64>>::new();
+    for index_record in reader.index() {
+        if index_record.reference_sequence_id() != Some(reference_sequence_id) {
+            continue;
+        }
+        let Some(start) = index_record.alignment_start() else {
+            continue;
+        };
+        let start = u64::try_from(start.get())
+            .map_err(|_| AlignmentError::CoordinateOverflow)?
+            .saturating_sub(1);
+        let end = start.saturating_add(index_record.alignment_span() as u64);
+        if start < interval.end() && interval.start() < end {
+            selected
+                .entry(index_record.offset())
+                .or_default()
+                .insert(index_record.landmark());
+        }
+    }
+
+    let repository = reader.reference_sequence_repository().clone();
+    let raw_reader = reader.get_mut();
+    let mut positioned = Vec::new();
+    for (container_offset, selected_landmarks) in selected {
+        raw_reader.seek(SeekFrom::Start(container_offset))?;
+        let mut direct_reader = cram::io::reader::Builder::default()
+            .set_reference_sequence_repository(repository.clone())
+            .build_from_reader(&mut *raw_reader);
+        let mut container = cram::io::reader::Container::default();
+        if direct_reader.read_container(&mut container)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "CRAI points beyond the CRAM container stream",
+            )
+            .into());
+        }
+        let compression_header = container.compression_header()?;
+        let landmarks = container.header().landmarks().to_vec();
+        for (slice_index, result) in container.slices().enumerate() {
+            let slice = result?;
+            let landmark = u64::try_from(
+                *landmarks
+                    .get(slice_index)
+                    .ok_or_else(|| io::Error::other("CRAM slice has no container landmark"))?,
+            )
+            .map_err(|_| AlignmentError::CoordinateOverflow)?;
+            if !selected_landmarks.contains(&landmark) {
+                continue;
+            }
+            let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
+            let records = slice.records(
+                repository.clone(),
+                header,
+                &compression_header,
+                &core_data_src,
+                &external_data_srcs,
+            )?;
+            for (record_index, record) in records.iter().enumerate() {
+                let record_index =
+                    u32::try_from(record_index).map_err(|_| AlignmentError::CoordinateOverflow)?;
+                let record = sam::alignment::RecordBuf::try_from_alignment_record(header, record)?;
+                if !noodles_record_intersects(&record, header, interval)? {
+                    continue;
+                }
+                positioned.push(Ok((
+                    record,
+                    Some(crate::AlignmentSourcePosition::cram_record(
+                        container_offset,
+                        landmark,
+                        record_index,
+                    )),
+                )));
+            }
+        }
+    }
+    Ok(positioned)
+}
+
+fn noodles_record_intersects<R>(
+    record: &R,
+    header: &sam::Header,
+    interval: GenomicInterval,
+) -> Result<bool, AlignmentError>
+where
+    R: sam::alignment::Record,
+{
+    let Some(reference_sequence_id) = record.reference_sequence_id(header).transpose()? else {
+        return Ok(false);
+    };
+    if u32::try_from(reference_sequence_id).ok().map(ContigId::new) != Some(interval.contig()) {
+        return Ok(false);
+    }
+    let Some(start) = record.alignment_start().transpose()? else {
+        return Ok(false);
+    };
+    let start = u64::try_from(start.get())
+        .map_err(|_| AlignmentError::CoordinateOverflow)?
+        .saturating_sub(1);
+    let end = record_reference_end(record, start)?;
+    Ok(start < interval.end() && interval.start() < end)
+}
+
 #[allow(clippy::too_many_lines)]
-fn query_noodles_records<R, I>(
+fn query_positioned_noodles_records<R, I>(
     records: I,
     header: &sam::Header,
     interval: GenomicInterval,
@@ -569,7 +924,7 @@ fn query_noodles_records<R, I>(
 ) -> Result<AlignmentQuery, AlignmentError>
 where
     R: sam::alignment::Record,
-    I: IntoIterator<Item = io::Result<R>>,
+    I: IntoIterator<Item = io::Result<(R, Option<crate::AlignmentSourcePosition>)>>,
 {
     let mut pileup = PileupBuilder::new(
         interval,
@@ -598,7 +953,7 @@ where
         ..QueryStats::default()
     };
     for result in records {
-        let record = result?;
+        let (record, source_position) = result?;
         stats.records_seen = stats.records_seen.saturating_add(1);
         if stats
             .records_seen
@@ -719,7 +1074,7 @@ where
             None
         };
         if !too_dense {
-            retained.push(match normalized_for_modifications {
+            let normalized = match normalized_for_modifications {
                 // Keep the record used for modification aggregation so
                 // inspectors and automation cannot contradict the complete
                 // rendered/exported modification evidence.
@@ -730,7 +1085,8 @@ where
                     options.detail,
                     &options.retained_auxiliary_tags,
                 )?,
-            });
+            };
+            retained.push((normalized, source_position));
         }
     }
     if stats.cancelled {
@@ -738,11 +1094,21 @@ where
     }
 
     retained.sort_by(|left, right| {
-        (left.start, left.end, &left.read_name).cmp(&(right.start, right.end, &right.read_name))
+        (left.0.start, left.0.end, &left.0.read_name).cmp(&(
+            right.0.start,
+            right.0.end,
+            &right.0.read_name,
+        ))
     });
     let mut batch = AlignmentBatch::default();
-    for record in &retained {
-        batch.push(record).map_err(AlignmentError::BatchOverflow)?;
+    for (record, source_position) in &retained {
+        if let Some(source_position) = source_position {
+            batch
+                .push_with_source_position(record, *source_position)
+                .map_err(AlignmentError::BatchOverflow)?;
+        } else {
+            batch.push(record).map_err(AlignmentError::BatchOverflow)?;
+        }
     }
     batch.absorb_filtered_records(filtered_records);
     stats.records_emitted = retained.len();
@@ -807,7 +1173,7 @@ fn open_index(
     bam_url: &str,
     explicit_url: Option<&str>,
     config: HttpRangeConfig,
-) -> Result<(RemoteIndex, RemoteIoStats), AlignmentError> {
+) -> Result<(RemoteIndex, RemoteIoStats, [u8; 32]), AlignmentError> {
     if let Some(url) = explicit_url {
         return if url_path_has_extension(url, "csi") {
             read_index(url, config, Some(RemoteIndexKind::Csi))
@@ -856,7 +1222,7 @@ fn open_cram_index(
     explicit_url: Option<&str>,
     config: HttpRangeConfig,
     source_length: u64,
-) -> Result<(cram::crai::Index, RemoteIoStats), AlignmentError> {
+) -> Result<(cram::crai::Index, RemoteIoStats, [u8; 32]), AlignmentError> {
     if let Some(url) = explicit_url {
         return read_cram_index(url, config, source_length);
     }
@@ -884,11 +1250,12 @@ fn read_cram_index(
     url: &str,
     config: HttpRangeConfig,
     source_length: u64,
-) -> Result<(cram::crai::Index, RemoteIoStats), AlignmentError> {
+) -> Result<(cram::crai::Index, RemoteIoStats, [u8; 32]), AlignmentError> {
     let (compressed, stats) =
         read_remote_object_bounded(url, config, MAX_REMOTE_CRAI_COMPRESSED_BYTES)?;
     let index = parse_cram_index(&compressed, source_length)?;
-    Ok((index, stats))
+    let digest = digest_bytes(&compressed);
+    Ok((index, stats, digest))
 }
 
 fn parse_cram_index(
@@ -998,7 +1365,7 @@ fn read_index(
     url: &str,
     config: HttpRangeConfig,
     kind: Option<RemoteIndexKind>,
-) -> Result<(RemoteIndex, RemoteIoStats), AlignmentError> {
+) -> Result<(RemoteIndex, RemoteIoStats, [u8; 32]), AlignmentError> {
     let (bytes, stats) = read_remote_object_bounded(url, config, MAX_REMOTE_ALIGNMENT_INDEX_BYTES)?;
     let parse_bai = || {
         let mut reader = bam::bai::io::Reader::new(Cursor::new(bytes.as_slice()));
@@ -1013,7 +1380,8 @@ fn read_index(
         Some(RemoteIndexKind::Csi) => parse_csi()?,
         None => parse_bai().or_else(|_| parse_csi())?,
     };
-    Ok((index, stats))
+    let digest = digest_bytes(&bytes);
+    Ok((index, stats, digest))
 }
 
 fn remote_not_found(error: &AlignmentError) -> bool {
@@ -1914,6 +2282,9 @@ mod tests {
             ..AlignmentOpenOptions::default()
         };
         let mut source = RemoteBamAlignmentSource::open(&fixture.bam_url, &options).unwrap();
+        let remote_stamp = source
+            .source_stamp()
+            .expect("remote BAM has a validator stamp");
         let query = source
             .query(
                 GenomicInterval::new(ContigId::new(1), 0, 2_000_000).unwrap(),
@@ -1937,6 +2308,16 @@ mod tests {
         assert!((0..query.batch.len()).any(|index| query.batch.has_auxiliary_tag(index, *b"MM")));
         let mut local =
             LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        assert!(local.source_stamp().is_some());
+        let mirrored = LocalAlignmentSource::open(
+            &path,
+            &AlignmentOpenOptions {
+                source_stamp_override: Some(remote_stamp),
+                ..AlignmentOpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(mirrored.source_stamp(), Some(remote_stamp));
         let local_query = local
             .query(
                 query.interval,
@@ -1948,6 +2329,14 @@ mod tests {
                 &|| true,
             )
             .unwrap();
+        assert_eq!(
+            (0..query.batch.len())
+                .map(|index| query.batch.source_position(index))
+                .collect::<Vec<_>>(),
+            (0..local_query.batch.len())
+                .map(|index| local_query.batch.source_position(index))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(query.pileup, local_query.pileup);
         let pair_interval = GenomicInterval::new(ContigId::new(0), 0, 200_000).unwrap();
         let remote_pairs = source
@@ -2118,6 +2507,10 @@ mod tests {
         assert_eq!(remote_query.stats.records_seen, 2);
         assert_eq!(remote_query.stats.records_emitted, 2);
         assert_eq!(remote_query.batch.len(), 2);
+        let broad_positions = (0..remote_query.batch.len())
+            .map(|index| remote_query.batch.source_position(index).unwrap())
+            .collect::<Vec<_>>();
+        assert_ne!(broad_positions[0], broad_positions[1]);
         assert_eq!(
             remote_query.batch.materialize_record(0).unwrap().read_name,
             b"remote-cram-read"
@@ -2138,6 +2531,15 @@ mod tests {
         let mut local =
             ProductionAlignmentSource::open(&fixture.local_cram, &local_options).unwrap();
         let local_query = local.query(interval, query_options, &|| true).unwrap();
+        assert!(matches!(local, ProductionAlignmentSource::LocalCram(_)));
+        assert_eq!(
+            (0..remote_query.batch.len())
+                .map(|index| remote_query.batch.source_position(index))
+                .collect::<Vec<_>>(),
+            (0..local_query.batch.len())
+                .map(|index| local_query.batch.source_position(index))
+                .collect::<Vec<_>>()
+        );
         let mut remote_record = remote_query.batch.materialize_record(0).unwrap();
         let mut local_record = local_query.batch.materialize_record(0).unwrap();
         // HTSlib synthesizes an MD tag while decoding CRAM; Noodles exposes only the stored
@@ -2149,6 +2551,15 @@ mod tests {
         assert_eq!(remote_query.pileup, local_query.pileup);
         assert_eq!(remote_query.junctions, local_query.junctions);
         assert_eq!(remote_query.pairs, local_query.pairs);
+        let narrow = remote
+            .query(
+                GenomicInterval::new(ContigId::new(0), 20, 35).unwrap(),
+                QueryOptions::default(),
+                &|| true,
+            )
+            .unwrap();
+        assert_eq!(narrow.batch.len(), 1);
+        assert_eq!(narrow.batch.source_position(0), Some(broad_positions[0]));
         let refusal_options = QueryOptions {
             max_records: std::num::NonZeroUsize::new(1).unwrap(),
             ..QueryOptions::default()

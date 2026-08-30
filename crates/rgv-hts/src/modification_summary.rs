@@ -4,8 +4,8 @@ use rgv_core::GenomicInterval;
 
 use crate::{
     AlignmentFlags, AlignmentRecord, AuxValue, CigarOp, CigarOpKind, ImplicitModificationMode,
-    ModificationCode, SequenceData, aligned_position_for_sequencer_position, decode_modified_bases,
-    sequencer_base_matches,
+    ModificationCode, SequenceData, aligned_position_for_sequencer_position,
+    decode_modified_bases_parts, sequencer_base_matches,
 };
 
 /// Hard bound on independently rendered modification/canonical/strand/haplotype series.
@@ -134,7 +134,7 @@ impl ModificationSummary {
     }
 }
 
-pub(crate) struct ModificationSummaryBuilder {
+pub struct ModificationSummaryBuilder {
     interval: GenomicInterval,
     bins: usize,
     series: Vec<ModificationSeries>,
@@ -144,7 +144,7 @@ pub(crate) struct ModificationSummaryBuilder {
 }
 
 impl ModificationSummaryBuilder {
-    pub(crate) fn new(interval: GenomicInterval, bins: usize) -> Self {
+    pub fn new(interval: GenomicInterval, bins: usize) -> Self {
         Self {
             interval,
             bins,
@@ -155,25 +155,67 @@ impl ModificationSummaryBuilder {
         }
     }
 
-    pub(crate) fn add_record(&mut self, record: &AlignmentRecord) {
-        if !has_modification_tag(record) {
+    pub fn add_record(&mut self, record: &AlignmentRecord) {
+        let mm = record
+            .auxiliary_fields
+            .iter()
+            .find(|field| matches!(&field.tag, b"MM" | b"Mm"))
+            .map(|field| &field.value);
+        let ml = record
+            .auxiliary_fields
+            .iter()
+            .find(|field| matches!(&field.tag, b"ML" | b"Ml"))
+            .map(|field| &field.value);
+        let haplotype = record
+            .auxiliary_fields
+            .iter()
+            .find(|field| field.tag == *b"HP")
+            .map(|field| &field.value);
+        let sequence = match &record.sequence {
+            SequenceData::Present { bases, .. } => Some(bases.as_slice()),
+            SequenceData::NotLoaded | SequenceData::Missing => None,
+        };
+        self.add_record_parts(
+            record.start,
+            &record.cigar,
+            record.flags,
+            sequence,
+            mm,
+            ml,
+            haplotype,
+        );
+    }
+
+    /// Adds one packed record without materialising its sequence, CIGAR, or auxiliary fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_record_parts(
+        &mut self,
+        alignment_start: u64,
+        cigar: &[CigarOp],
+        flags: AlignmentFlags,
+        sequence: Option<&[u8]>,
+        mm: Option<&AuxValue>,
+        ml: Option<&AuxValue>,
+        haplotype: Option<&AuxValue>,
+    ) {
+        let Some(mm) = mm else {
             return;
-        }
+        };
         self.provenance.records_with_modification_tags = self
             .provenance
             .records_with_modification_tags
             .saturating_add(1);
-        let SequenceData::Present { bases, .. } = &record.sequence else {
+        let Some(bases) = sequence else {
             self.provenance.unavailable_records =
                 self.provenance.unavailable_records.saturating_add(1);
             return;
         };
-        let Ok(calls) = decode_modified_bases(record) else {
+        let Ok(calls) = decode_modified_bases_parts(bases, flags, mm, ml) else {
             self.provenance.malformed_records = self.provenance.malformed_records.saturating_add(1);
             return;
         };
         self.provenance.decoded_calls = self.provenance.decoded_calls.saturating_add(calls.len());
-        let haplotype = record_haplotype(record);
+        let haplotype = haplotype.and_then(haplotype_value);
         let groups = calls
             .iter()
             .map(|call| ModificationSeriesKey {
@@ -194,19 +236,14 @@ impl ModificationSummaryBuilder {
                 continue;
             };
             for sequencer_position in 0..bases.len() {
-                if !sequencer_base_matches(
-                    bases,
-                    record.flags,
-                    sequencer_position,
-                    key.canonical_base,
-                ) {
+                if !sequencer_base_matches(bases, flags, sequencer_position, key.canonical_base) {
                     continue;
                 }
                 let Some(position) = reference_position_for_sequencer_position(
-                    record.start,
-                    &record.cigar,
+                    alignment_start,
+                    cigar,
                     bases.len(),
-                    record.flags,
+                    flags,
                     sequencer_position,
                 ) else {
                     continue;
@@ -231,10 +268,10 @@ impl ModificationSummaryBuilder {
                 continue;
             };
             let Some(position) = reference_position_for_sequencer_position(
-                record.start,
-                &record.cigar,
+                alignment_start,
+                cigar,
                 bases.len(),
-                record.flags,
+                flags,
                 call.sequencer_position,
             ) else {
                 continue;
@@ -244,7 +281,7 @@ impl ModificationSummaryBuilder {
             };
             let bin = &mut self.series[series_index].bins[bin_index];
             bin.modified_calls = bin.modified_calls.saturating_add(1);
-            if record.flags.is_reverse() {
+            if flags.is_reverse() {
                 bin.reverse_modified_calls = bin.reverse_modified_calls.saturating_add(1);
             } else {
                 bin.forward_modified_calls = bin.forward_modified_calls.saturating_add(1);
@@ -258,7 +295,7 @@ impl ModificationSummaryBuilder {
         }
     }
 
-    pub(crate) fn finish(
+    pub fn finish(
         mut self,
         eligible_records: usize,
         all_eligible_records: bool,
@@ -302,19 +339,7 @@ impl ModificationSummaryBuilder {
     }
 }
 
-fn has_modification_tag(record: &AlignmentRecord) -> bool {
-    record
-        .auxiliary_fields
-        .iter()
-        .any(|field| matches!(&field.tag, b"MM" | b"Mm"))
-}
-
-fn record_haplotype(record: &AlignmentRecord) -> Option<i32> {
-    let value = &record
-        .auxiliary_fields
-        .iter()
-        .find(|field| field.tag == *b"HP")?
-        .value;
+fn haplotype_value(value: &AuxValue) -> Option<i32> {
     match value {
         AuxValue::Signed(value) => i32::try_from(*value).ok(),
         AuxValue::Unsigned(value) => i32::try_from(*value).ok(),

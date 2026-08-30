@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use rgv_core::{GenomicInterval, OverlappingMatePolicy};
 
 use crate::{
-    AlignmentBatch, AlignmentError, AuxValue, CigarOpKind, JunctionStrand, PairSummary, PileupBin,
-    PileupProvenance, PileupSummary,
+    AlignmentBatch, AlignmentError, AuxValue, CigarOpKind, ExactDepthTile, ExactDepthTileBuilder,
+    JunctionStrand, PairSummary, PileupBin, PileupProvenance, PileupSummary,
     alignment::BatchOverflow,
     junction::{
         JunctionObservation, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
@@ -16,33 +16,6 @@ use crate::{
 
 /// Canonical genomic width of one exact resident depth tile.
 pub const ALIGNMENT_SUMMARY_TILE_BASES: u64 = 4_096;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DepthEvent {
-    position: u64,
-    depth: i64,
-    forward: i64,
-    reverse: i64,
-    mapping_quality_sum: i64,
-    mapping_quality_count: i64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DepthRun {
-    start: u64,
-    end: u64,
-    depth: u32,
-    forward: u32,
-    reverse: u32,
-    mapping_quality_sum: u64,
-    mapping_quality_count: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DepthTile {
-    coordinate: u64,
-    runs: Vec<DepthRun>,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RangeEvent {
@@ -76,7 +49,7 @@ pub struct AlignmentSummaryIndex {
     record_count: usize,
     overlapping_mate_policy: OverlappingMatePolicy,
     overlap_collapse_complete: bool,
-    depth_tiles: Vec<DepthTile>,
+    depth_tiles: Vec<ExactDepthTile>,
     deletions: Vec<RangeEvent>,
     insertions: Vec<InsertionEvent>,
     junction_offsets: Vec<u32>,
@@ -99,7 +72,7 @@ impl AlignmentSummaryIndex {
         interval: GenomicInterval,
         overlapping_mate_policy: OverlappingMatePolicy,
     ) -> Result<Self, AlignmentError> {
-        let mut tile_events = BTreeMap::<u64, Vec<DepthEvent>>::new();
+        let mut depth_builders = BTreeMap::<u64, ExactDepthTileBuilder>::new();
         let mut deletions = Vec::new();
         let mut insertions = Vec::new();
         let mut junction_offsets = Vec::with_capacity(batch.len().saturating_add(1));
@@ -188,7 +161,7 @@ impl AlignmentSummaryIndex {
                     overlap_mask,
                     |start, end| {
                         add_depth_segment(
-                            &mut tile_events,
+                            &mut depth_builders,
                             interval,
                             start,
                             end,
@@ -227,12 +200,9 @@ impl AlignmentSummaryIndex {
 
         deletions.sort_unstable_by_key(|event| (event.start, event.end));
         insertions.sort_unstable_by_key(|event| event.position);
-        let depth_tiles = tile_events
-            .into_iter()
-            .map(|(coordinate, events)| DepthTile {
-                coordinate,
-                runs: finish_depth_tile(events),
-            })
+        let depth_tiles = depth_builders
+            .into_values()
+            .map(ExactDepthTileBuilder::finish)
             .collect();
         let mut pair_candidate_indices_by_score = pair_candidate_indices.clone();
         pair_candidate_indices_by_score.sort_unstable_by_key(|index| {
@@ -282,12 +252,12 @@ impl AlignmentSummaryIndex {
         rendered_records: usize,
     ) -> PileupSummary {
         let mut output = vec![PileupBin::default(); bins];
-        for tile in self.depth_tiles.iter().filter(|tile| {
-            let start = tile.coordinate.saturating_mul(ALIGNMENT_SUMMARY_TILE_BASES);
-            let end = start.saturating_add(ALIGNMENT_SUMMARY_TILE_BASES);
-            start < interval.end() && end > interval.start()
-        }) {
-            for run in &tile.runs {
+        for tile in self
+            .depth_tiles
+            .iter()
+            .filter(|tile| tile.interval().overlaps(interval))
+        {
+            for run in tile.runs() {
                 let start = run.start.max(interval.start());
                 let end = run.end.min(interval.end());
                 let Some((first, last)) = bin_range(interval, bins, start, end) else {
@@ -296,10 +266,10 @@ impl AlignmentSummaryIndex {
                 for bin in &mut output[first..last] {
                     if run.depth > bin.depth {
                         bin.depth = run.depth;
-                        bin.forward_depth = run.forward;
-                        bin.reverse_depth = run.reverse;
+                        bin.forward_depth = run.forward_depth;
+                        bin.reverse_depth = run.reverse_depth;
                         bin.mapping_quality_sum = run.mapping_quality_sum;
-                        bin.mapping_quality_observations = run.mapping_quality_count;
+                        bin.mapping_quality_observations = run.mapping_quality_observations;
                     }
                 }
             }
@@ -418,9 +388,7 @@ impl AlignmentSummaryIndex {
         self.depth_tiles
             .iter()
             .fold(0_usize, |total, tile| {
-                total
-                    .saturating_add(std::mem::size_of::<DepthTile>())
-                    .saturating_add(tile.runs.capacity() * std::mem::size_of::<DepthRun>())
+                total.saturating_add(tile.estimated_bytes())
             })
             .saturating_add(self.deletions.capacity() * std::mem::size_of::<RangeEvent>())
             .saturating_add(self.insertions.capacity() * std::mem::size_of::<InsertionEvent>())
@@ -444,11 +412,7 @@ impl AlignmentSummaryIndex {
     pub fn tile_count_for(&self, interval: GenomicInterval) -> usize {
         self.depth_tiles
             .iter()
-            .filter(|tile| {
-                let start = tile.coordinate.saturating_mul(ALIGNMENT_SUMMARY_TILE_BASES);
-                let end = start.saturating_add(ALIGNMENT_SUMMARY_TILE_BASES);
-                start < interval.end() && end > interval.start()
-            })
+            .filter(|tile| tile.interval().overlaps(interval))
             .count()
     }
 
@@ -546,7 +510,7 @@ fn record_junction_strand(
 }
 
 fn add_depth_segment(
-    tiles: &mut BTreeMap<u64, Vec<DepthEvent>>,
+    tiles: &mut BTreeMap<u64, ExactDepthTileBuilder>,
     interval: GenomicInterval,
     start: u64,
     end: u64,
@@ -561,81 +525,15 @@ fn add_depth_segment(
             .saturating_add(1)
             .saturating_mul(ALIGNMENT_SUMMARY_TILE_BASES)
             .min(end);
-        let forward = i64::from(!reverse);
-        let reverse = i64::from(reverse);
-        let mapping_quality_sum = mapping_quality.map_or(0, i64::from);
-        let mapping_quality_count = i64::from(mapping_quality.is_some());
-        let events = tiles.entry(coordinate).or_default();
-        events.push(DepthEvent {
-            position: start,
-            depth: 1,
-            forward,
-            reverse,
-            mapping_quality_sum,
-            mapping_quality_count,
-        });
-        events.push(DepthEvent {
-            position: tile_end,
-            depth: -1,
-            forward: -forward,
-            reverse: -reverse,
-            mapping_quality_sum: -mapping_quality_sum,
-            mapping_quality_count: -mapping_quality_count,
-        });
+        let tile_start = coordinate.saturating_mul(ALIGNMENT_SUMMARY_TILE_BASES);
+        let tile_interval = GenomicInterval::new(interval.contig(), tile_start, tile_end)
+            .expect("a non-empty depth segment creates a valid canonical tile interval");
+        tiles
+            .entry(coordinate)
+            .or_insert_with(|| ExactDepthTileBuilder::new(tile_interval))
+            .add_aligned_segment(start, tile_end, reverse, mapping_quality);
         start = tile_end;
     }
-}
-
-fn finish_depth_tile(mut events: Vec<DepthEvent>) -> Vec<DepthRun> {
-    events.sort_unstable_by_key(|event| event.position);
-    let mut runs = Vec::<DepthRun>::new();
-    let mut depth = 0_i64;
-    let mut forward = 0_i64;
-    let mut reverse = 0_i64;
-    let mut mapping_quality_sum = 0_i64;
-    let mut mapping_quality_count = 0_i64;
-    let mut cursor = 0;
-    while cursor < events.len() {
-        let position = events[cursor].position;
-        while cursor < events.len() && events[cursor].position == position {
-            let event = events[cursor];
-            depth = depth.saturating_add(event.depth);
-            forward = forward.saturating_add(event.forward);
-            reverse = reverse.saturating_add(event.reverse);
-            mapping_quality_sum = mapping_quality_sum.saturating_add(event.mapping_quality_sum);
-            mapping_quality_count =
-                mapping_quality_count.saturating_add(event.mapping_quality_count);
-            cursor += 1;
-        }
-        let Some(next_position) = events.get(cursor).map(|event| event.position) else {
-            continue;
-        };
-        if depth <= 0 || position >= next_position {
-            continue;
-        }
-        let run = DepthRun {
-            start: position,
-            end: next_position,
-            depth: nonnegative_u32(depth),
-            forward: nonnegative_u32(forward),
-            reverse: nonnegative_u32(reverse),
-            mapping_quality_sum: u64::try_from(mapping_quality_sum.max(0)).unwrap_or(u64::MAX),
-            mapping_quality_count: nonnegative_u32(mapping_quality_count),
-        };
-        if let Some(previous) = runs.last_mut()
-            && previous.end == run.start
-            && previous.depth == run.depth
-            && previous.forward == run.forward
-            && previous.reverse == run.reverse
-            && previous.mapping_quality_sum == run.mapping_quality_sum
-            && previous.mapping_quality_count == run.mapping_quality_count
-        {
-            previous.end = run.end;
-        } else {
-            runs.push(run);
-        }
-    }
-    runs
 }
 
 fn add_unmasked_ranges(
@@ -702,10 +600,6 @@ fn bin_range(
     let first = usize::try_from(first).ok()?.min(bins - 1);
     let last = usize::try_from(last).ok()?.clamp(first + 1, bins);
     Some((first, last))
-}
-
-fn nonnegative_u32(value: i64) -> u32 {
-    u32::try_from(value.max(0)).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
