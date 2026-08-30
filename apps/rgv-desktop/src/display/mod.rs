@@ -29,6 +29,125 @@ fn display_content_bottom(display: &DisplayList, fallback: f32) -> f32 {
         .fold(rectangle_bottom, f32::max)
 }
 
+/// Projects the camera-specific immutable row profile into the existing blue read navigator.
+/// Raw record/connector counts are intentionally retained until this UI boundary; logarithmic
+/// normalization keeps both sparse and extreme-depth loci legible without an architecture-tuned
+/// count threshold.
+pub(crate) fn alignment_row_activity_overview(
+    profile: &AlignmentRowActivityProfile,
+) -> ui::ScrollbarOverview {
+    alignment_activity_overview_from_counts(
+        profile
+            .bins()
+            .iter()
+            .map(|bin| bin.record_count().saturating_add(bin.connector_count())),
+    )
+}
+
+pub(crate) fn alignment_activity_overview_from_counts(
+    activity: impl IntoIterator<Item = usize>,
+) -> ui::ScrollbarOverview {
+    let activity = activity.into_iter().collect::<Vec<_>>();
+    let maximum = activity.iter().copied().max().unwrap_or(0);
+    let denominator = (maximum as f64).ln_1p();
+    let bins = activity
+        .into_iter()
+        .map(|value| ui::ScrollbarOverviewBin {
+            density: if maximum == 0 {
+                0.0
+            } else {
+                ((value as f64).ln_1p() / denominator).clamp(0.0, 1.0) as f32
+            },
+            kind: (value > 0).then_some(TrackKind::Alignment),
+        })
+        .collect();
+    ui::ScrollbarOverview {
+        bins,
+        boundaries: Vec::new(),
+    }
+}
+
+/// Returns the exclusive active row end and corresponding read-world bottom for the current
+/// genomic camera. The atlas may retain many more rows for immediate horizontal navigation; that
+/// broader residency is not a vertical scrollbar authority.
+pub(crate) fn alignment_scene_read_extent(
+    active_row_end: usize,
+    content_top: f32,
+    row_height: f32,
+    minimum_bottom: f32,
+) -> (usize, f32) {
+    let content_bottom = content_top + active_row_end as f32 * row_height + 6.0;
+    (active_row_end, content_bottom.max(minimum_bottom))
+}
+
+pub(crate) fn resolve_read_panel_overview(
+    authoritative: Option<&ui::ScrollbarOverview>,
+    legacy: impl FnOnce() -> ui::ScrollbarOverview,
+) -> ui::ScrollbarOverview {
+    authoritative.cloned().unwrap_or_else(legacy)
+}
+
+/// Reconciles one vertical read camera only when the current display cache has settled row
+/// authority. A compatible pending scene deliberately leaves every camera scalar untouched: the
+/// UI hides its extent separately, and the exact successor can therefore resume the same stable
+/// row rather than jumping to row zero at a prefetch boundary.
+pub(crate) fn reconcile_read_panel_scroll_for_authority(
+    state: &mut ReadPanelScrollState,
+    authority: ReadRowCoordinateAuthority,
+    row_height: Option<f32>,
+    actual_bottom: f32,
+    clip_bottom: f32,
+    camera_padding: f32,
+    density_drag_fraction: Option<f32>,
+) -> Option<(f32, ReadRowCoordinateSpace)> {
+    if authority.is_pending() {
+        return None;
+    }
+
+    state.content_origin_points = state
+        .content_origin_points
+        .clamp(0.0, camera_padding.max(0.0));
+    let exact = row_height.zip(authority.exact());
+    if let Some((row_height, coordinate_space)) = exact {
+        if let Some(anchor) = state.stable_row_anchor
+            && let Some(effective_scroll) =
+                reproject_stable_row_camera(anchor, row_height, coordinate_space)
+        {
+            state.scroll_points = state.content_origin_points + effective_scroll;
+        }
+    } else {
+        state.stable_row_anchor = None;
+    }
+
+    let maximum_scroll = (actual_bottom + camera_padding - clip_bottom).max(0.0);
+    let previous_maximum = (state.content_bottom_points - clip_bottom).max(0.0);
+    (state.scroll_points, state.latent_scroll_fraction) = reconcile_vertical_scroll(
+        state.scroll_points,
+        previous_maximum,
+        maximum_scroll,
+        state.latent_scroll_fraction,
+        density_drag_fraction,
+    );
+    state.content_bottom_points = clip_bottom + maximum_scroll;
+    exact
+}
+
+/// An unsettled read scene may retain its old content bound internally solely to preserve the
+/// camera. Neither pending nor absent row authority exposes that stale bound through the live
+/// scrollbar.
+pub(crate) fn read_panel_scrollbar_maximum(
+    state: ReadPanelScrollState,
+    clip_bottom: f32,
+    authority: ReadRowCoordinateAuthority,
+) -> f32 {
+    match authority {
+        ReadRowCoordinateAuthority::Exact(_) => {
+            (state.content_bottom_points - clip_bottom).max(0.0)
+        }
+        ReadRowCoordinateAuthority::Absent | ReadRowCoordinateAuthority::Pending => 0.0,
+    }
+}
+
 pub(crate) fn annotation_frame_content_height(frames: &[TrackFrame]) -> Option<f32> {
     let mut annotation_frames = frames
         .iter()
@@ -1797,14 +1916,20 @@ impl Viewer {
                     density_camera: true,
                     row_origin: Some(options.reads_top),
                     row_height: Some(options.row_height),
-                    row_layout_revision: self
+                    row_coordinate_authority: self
                         .alignment_tracks
                         .first()
                         .and_then(|track| track.projection(self.panels.active().id))
                         .and_then(|projection| projection.alignment_rows.as_ref())
-                        .map(|cached| cached.reconciliation.revision),
+                        .map(|cached| {
+                            ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Legacy(
+                                cached.reconciliation.revision,
+                            ))
+                        })
+                        .unwrap_or(ReadRowCoordinateAuthority::Absent),
                     materialized_row_range: options.materialized_row_range,
                     total_rows: Some(total_rows),
+                    authoritative_overview: None,
                     overview: ui::ScrollbarOverview::default(),
                     actual_content_bottom: actual_read_content_bottom,
                     clip_top: primary_read_bounds.top.max(read_clip_top),
@@ -2321,9 +2446,14 @@ impl Viewer {
                             )
                         })
                         .is_some();
-                    let row_revision = projection
+                    let row_authority = projection
                         .and_then(|projection| projection.alignment_rows.as_ref())
-                        .map(|cached| cached.reconciliation.revision);
+                        .map(|cached| {
+                            ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Legacy(
+                                cached.reconciliation.revision,
+                            ))
+                        })
+                        .unwrap_or(ReadRowCoordinateAuthority::Absent);
                     let total_rows = projection
                         .and_then(|projection| projection.alignment_rows.as_ref())
                         .map(|cached| {
@@ -2360,9 +2490,10 @@ impl Viewer {
                         density_camera: true,
                         row_origin: Some(read_bounds.top + READ_PANE_HEADER_HEIGHT),
                         row_height: Some(row_height),
-                        row_layout_revision: row_revision,
+                        row_coordinate_authority: row_authority,
                         materialized_row_range,
                         total_rows,
+                        authoritative_overview: None,
                         overview: ui::ScrollbarOverview::default(),
                         actual_content_bottom: natural_bottom.max(reserved_bottom),
                         clip_top: read_bounds.top.max(read_clip_top),
@@ -2435,6 +2566,16 @@ impl Viewer {
             let scene_snapshot = (!index_only_overview)
                 .then(|| scene_frame.and_then(|frame| frame.snapshot.as_ref()))
                 .flatten();
+            let row_activity = (!index_only_overview)
+                .then(|| scene_frame.and_then(|frame| frame.row_activity.as_deref()))
+                .flatten();
+            let row_coordinate_authority = match (scene_snapshot, row_activity) {
+                (_, Some(profile)) => ReadRowCoordinateAuthority::Exact(
+                    ReadRowCoordinateSpace::Unified(profile.row_coordinate_space()),
+                ),
+                (Some(_), None) => ReadRowCoordinateAuthority::Pending,
+                (None, None) => ReadRowCoordinateAuthority::Absent,
+            };
             let read_state_message = (!index_only_overview)
                 .then(|| {
                     if let Some(message) =
@@ -2475,9 +2616,16 @@ impl Viewer {
             let content_top = bounds.top + READ_PANE_HEADER_HEIGHT;
             let density = self.alignment_density_for_panel_track(self.panels.active().id, track_id);
             let row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
-            let total_rows = scene_snapshot.map(|snapshot| snapshot.reads().atlas().row_count());
-            let scene_content_bottom =
-                total_rows.map_or(bottom, |rows| content_top + rows as f32 * row_height + 6.0);
+            let (total_rows, scene_content_bottom) =
+                row_activity.map_or((None, bottom), |profile| {
+                    let (active_row_end, content_bottom) = alignment_scene_read_extent(
+                        profile.active_row_end(),
+                        content_top,
+                        row_height,
+                        bottom,
+                    );
+                    (Some(active_row_end), content_bottom)
+                });
             if desired
                 && bottom > content_top
                 && bottom > read_clip_top
@@ -2508,10 +2656,16 @@ impl Viewer {
                     density_camera: scene_snapshot.is_some(),
                     row_origin: scene_snapshot.is_some().then_some(content_top),
                     row_height: scene_snapshot.is_some().then_some(row_height),
-                    row_layout_revision: scene_snapshot
-                        .map(|snapshot| snapshot.revision().fingerprint().low()),
+                    row_coordinate_authority,
                     materialized_row_range: None,
                     total_rows,
+                    authoritative_overview: match row_activity {
+                        Some(profile) => Some(alignment_row_activity_overview(profile)),
+                        None if row_coordinate_authority.is_pending() => {
+                            Some(ui::ScrollbarOverview::default())
+                        }
+                        None => None,
+                    },
                     overview: ui::ScrollbarOverview::default(),
                     actual_content_bottom: scene_content_bottom.max(bottom),
                     clip_top: bounds.top.max(read_clip_top),
@@ -3040,16 +3194,19 @@ impl Viewer {
                 .filter(|frame| frame.key == TrackFrameKey::Alignment(read_panel.track_id))
                 .cloned()
                 .collect::<Vec<_>>();
-            read_panel.overview = ui::scrollbar_overview(
-                &frame,
-                &read_panel.scrollable,
-                read_panel.clip_top,
-                content_bottom,
-                read_panel.clip_top,
-                state.content_origin_points,
-                self.active_panel_rect().width(),
-                128,
-            );
+            read_panel.overview =
+                resolve_read_panel_overview(read_panel.authoritative_overview.as_ref(), || {
+                    ui::scrollbar_overview(
+                        &frame,
+                        &read_panel.scrollable,
+                        read_panel.clip_top,
+                        content_bottom,
+                        read_panel.clip_top,
+                        state.content_origin_points,
+                        self.active_panel_rect().width(),
+                        128,
+                    )
+                });
             for bin in &mut read_panel.overview.bins {
                 if bin.density > f32::EPSILON {
                     bin.kind = Some(TrackKind::Alignment);
@@ -3125,7 +3282,7 @@ impl Viewer {
                     read_panel.density_camera,
                     read_panel.row_origin,
                     read_panel.row_height,
-                    read_panel.row_layout_revision,
+                    read_panel.row_coordinate_authority,
                     self.alignment_density_for_panel_track(
                         self.panels.active().id,
                         read_panel.track_id,
@@ -3185,7 +3342,7 @@ impl Viewer {
             density_camera,
             row_origin,
             row_height,
-            row_layout_revision,
+            row_coordinate_authority,
             density,
         ) in &read_panel_metrics
         {
@@ -3204,30 +3361,22 @@ impl Viewer {
             } else {
                 0.0
             };
-            state.content_origin_points = state.content_origin_points.clamp(0.0, camera_padding);
-            if let (Some(row_height), Some(layout_revision)) = (*row_height, *row_layout_revision) {
-                if let Some(anchor) = state.stable_row_anchor
-                    && let Some(effective_scroll) =
-                        reproject_stable_row_camera(anchor, row_height, layout_revision)
-                {
-                    state.scroll_points = state.content_origin_points + effective_scroll;
-                }
-            } else {
-                state.stable_row_anchor = None;
-            }
-            let maximum_scroll = (actual_bottom + camera_padding - clip_bottom).max(0.0);
-            let previous_maximum = (state.content_bottom_points - clip_bottom).max(0.0);
             let density_drag_fraction = active_drag
                 .filter(|drag| drag.track_id == *track_id)
                 .map(|drag| drag.virtual_scroll_fraction);
-            (state.scroll_points, state.latent_scroll_fraction) = reconcile_vertical_scroll(
-                state.scroll_points,
-                previous_maximum,
-                maximum_scroll,
-                state.latent_scroll_fraction,
+            let exact_row_camera = reconcile_read_panel_scroll_for_authority(
+                state,
+                *row_coordinate_authority,
+                *row_height,
+                *actual_bottom,
+                *clip_bottom,
+                camera_padding,
                 density_drag_fraction,
             );
-            state.content_bottom_points = clip_bottom + maximum_scroll;
+            if row_coordinate_authority.is_pending() {
+                continue;
+            }
+            let maximum_scroll = (state.content_bottom_points - clip_bottom).max(0.0);
             if let (Some((reveal_track, row)), Some(row_origin), Some(row_height)) =
                 (pending_read_reveal, *row_origin, *row_height)
                 && reveal_track == *track_id
@@ -3246,13 +3395,13 @@ impl Viewer {
                     .then_some((state.scroll_points / maximum_scroll).clamp(0.0, 1.0));
                 panel.pending_read_reveal = None;
             }
-            if let (Some(row_height), Some(layout_revision)) = (*row_height, *row_layout_revision)
+            if let Some((row_height, coordinate_space)) = exact_row_camera
                 && row_height > f32::EPSILON
             {
                 state.stable_row_anchor = capture_stable_row_camera(
                     state.effective_scroll_points(),
                     row_height,
-                    layout_revision,
+                    coordinate_space,
                 );
             }
         }

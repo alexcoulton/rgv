@@ -257,8 +257,11 @@ impl Viewer {
         let Some((_, clip_bottom, _)) = self.read_panel_metrics(track_id) else {
             return;
         };
+        if !self.read_panel_row_authority(track_id).is_exact() {
+            return;
+        }
         let state = self.panels.active().read_panel_scroll_state(track_id);
-        let maximum = (state.content_bottom_points - clip_bottom).max(0.0);
+        let maximum = self.read_panel_presented_scroll_maximum(track_id, clip_bottom);
         let next = requested.clamp(0.0, maximum);
         if (next - state.scroll_points).abs() <= f32::EPSILON {
             return;
@@ -563,6 +566,9 @@ impl Viewer {
         interaction: ui::ScrollbarInteraction,
         requested_scroll: &mut f32,
     ) {
+        if !self.read_panel_row_authority(track_id).is_exact() {
+            return;
+        }
         if interaction.pointer_down {
             self.interaction_trace
                 .record_once(InteractionTraceStage::EguiPointerDown);
@@ -588,14 +594,8 @@ impl Viewer {
             }
             let maximum = self
                 .read_panel_metrics(track_id)
-                .map_or(0.0, |(_, clip_bottom, _)| {
-                    (self
-                        .panels
-                        .active()
-                        .read_panel_scroll_state(track_id)
-                        .content_bottom_points
-                        - clip_bottom)
-                        .max(0.0)
+                .map_or(0.0, |(_, bottom, _)| {
+                    self.read_panel_presented_scroll_maximum(track_id, bottom)
                 });
             *requested_scroll = scroll.clamp(0.0, maximum);
             self.display_dirty = true;
@@ -616,11 +616,7 @@ impl Viewer {
         );
         let target_panel = self.panels.iter().enumerate().find_map(|(index, panel)| {
             (self.panel_scrollbar_rect_at(index).contains(pointer)
-                && panel.scroll_display_cache.as_ref().is_some_and(|cache| {
-                    cache.read_panels.iter().any(|read_panel| {
-                        pointer.y >= read_panel.clip_top && pointer.y < read_panel.clip_bottom
-                    })
-                }))
+                && panel.live_read_panel_at_y(pointer.y).is_some())
             .then_some(panel.id)
         });
         let Some(target_panel) = target_panel else {
@@ -630,11 +626,14 @@ impl Viewer {
         let Some(track_id) = self.read_panel_at_screen_y(pointer.y) else {
             return false;
         };
+        if !self.read_panel_row_authority(track_id).is_exact() {
+            return false;
+        }
         let Some((clip_top, clip_bottom, _)) = self.read_panel_metrics(track_id) else {
             return false;
         };
         let state = self.panels.active().read_panel_scroll_state(track_id);
-        let maximum = (state.content_bottom_points - clip_bottom).max(0.0);
+        let maximum = self.read_panel_presented_scroll_maximum(track_id, clip_bottom);
         let camera_viewport_height = (clip_bottom - clip_top).max(1.0);
         let scrollbar_rect = self
             .read_panel_scrollbar_rect(track_id)
@@ -738,8 +737,11 @@ impl Viewer {
         let Some((clip_top, clip_bottom, _)) = self.read_panel_metrics(drag.track_id) else {
             return false;
         };
+        if !self.read_panel_row_authority(drag.track_id).is_exact() {
+            return true;
+        }
         let state = self.panels.active().read_panel_scroll_state(drag.track_id);
-        let maximum = (state.content_bottom_points - clip_bottom).max(0.0);
+        let maximum = self.read_panel_presented_scroll_maximum(drag.track_id, clip_bottom);
         let camera_viewport_height = (clip_bottom - clip_top).max(1.0);
         let density = self.alignment_density_for_panel_track(drag.panel_id, drag.track_id);
         let scrollbar_rect = self
@@ -882,6 +884,9 @@ impl Viewer {
             return;
         };
         if drag.panel_id != self.panels.active().id {
+            return;
+        }
+        if !self.read_panel_row_authority(drag.track_id).is_exact() {
             return;
         }
         let previous_density = self.alignment_density_for_panel_track(drag.panel_id, drag.track_id);
@@ -1314,40 +1319,49 @@ impl Viewer {
         );
         self.panels.iter().enumerate().any(|(index, panel)| {
             self.panel_scrollbar_rect_at(index).contains(point)
-                && panel.scroll_display_cache.as_ref().is_some_and(|cache| {
-                    cache.read_panels.iter().any(|read_panel| {
-                        point.y >= read_panel.clip_top && point.y < read_panel.clip_bottom
-                    })
-                })
+                && panel.live_read_panel_at_y(point.y).is_some()
         })
     }
 
     fn read_panel_at_screen_y(&self, screen_y: f32) -> Option<TrackId> {
-        self.panels
-            .active()
-            .scroll_display_cache
-            .as_ref()?
-            .read_panels
-            .iter()
-            .find(|panel| screen_y >= panel.clip_top && screen_y < panel.clip_bottom)
-            .map(|panel| panel.track_id)
+        self.panels.active().live_read_panel_at_y(screen_y)
     }
 
     fn read_panel_metrics(&self, track_id: TrackId) -> Option<(f32, f32, f32)> {
-        self.panels
-            .active()
+        let panel = self.panels.active();
+        let allocation = panel.live_read_panel_rect(track_id)?;
+        let actual_content_bottom = panel
             .scroll_display_cache
             .as_ref()?
             .read_panels
             .iter()
             .find(|panel| panel.track_id == track_id)
-            .map(|panel| {
-                (
-                    panel.clip_top,
-                    panel.clip_bottom,
-                    panel.actual_content_bottom,
-                )
+            .map(|panel| panel.actual_content_bottom)?;
+        Some((allocation.top(), allocation.bottom(), actual_content_bottom))
+    }
+
+    fn read_panel_row_authority(&self, track_id: TrackId) -> ReadRowCoordinateAuthority {
+        self.panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .and_then(|cache| {
+                cache
+                    .read_panels
+                    .iter()
+                    .find(|panel| panel.track_id == track_id)
             })
+            .map_or(ReadRowCoordinateAuthority::Absent, |panel| {
+                panel.row_coordinate_authority
+            })
+    }
+
+    fn read_panel_presented_scroll_maximum(&self, track_id: TrackId, clip_bottom: f32) -> f32 {
+        crate::display::read_panel_scrollbar_maximum(
+            self.panels.active().read_panel_scroll_state(track_id),
+            clip_bottom,
+            self.read_panel_row_authority(track_id),
+        )
     }
 
     fn read_panel_scrollbar_rect(&self, track_id: TrackId) -> Option<egui::Rect> {

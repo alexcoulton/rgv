@@ -88,6 +88,34 @@ pub(crate) fn alignment_scene_refusal_is_current(
         && refused_horizon.contains_interval(frame_camera.interval())
 }
 
+/// How a current, token-matched frame affects the desktop navigation transaction. A source
+/// refusal is already a terminal answer for individual reads, so it outranks a pending FASTA
+/// dependency which can no longer make those reads displayable. Complete scene frames still wait
+/// for their exact reference authority when the presentation contract requires one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AlignmentSceneFrameSettlement {
+    Settled,
+    WaitingForReference,
+    WaitingForScene,
+}
+
+pub(crate) fn alignment_scene_frame_settlement(
+    frame: &AlignmentCoordinatorFrame,
+) -> AlignmentSceneFrameSettlement {
+    if frame.individual_reads_refused_for_camera() {
+        AlignmentSceneFrameSettlement::Settled
+    } else if matches!(
+        frame.reference_requirement,
+        AlignmentReferenceRequirement::Pending { .. }
+    ) {
+        AlignmentSceneFrameSettlement::WaitingForReference
+    } else if frame.visible_complete() {
+        AlignmentSceneFrameSettlement::Settled
+    } else {
+        AlignmentSceneFrameSettlement::WaitingForScene
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AlignmentReferenceLaneRequirement {
     pub(crate) owner: SourceOwnerId,
@@ -1655,6 +1683,12 @@ impl Viewer {
                             self.navigation_stale_result_rejections.saturating_add(1);
                         continue;
                     }
+                    let row_activity_changed = projection
+                        .scene_frame
+                        .as_ref()
+                        .and_then(|current| current.row_activity.as_deref())
+                        != frame.row_activity.as_deref();
+                    let camera_refusal_is_terminal = frame.individual_reads_refused_for_camera();
                     projection.scene_frame = Some(frame.clone());
                     projection.scene_frame_request_token = Some(request_token);
                     let current_target = projection.desired_scene_camera == Some(frame.camera);
@@ -1662,17 +1696,22 @@ impl Viewer {
                         projection.pending_query = false;
                         projection.unavailable = None;
                         projection.index_only_overview = false;
-                        if matches!(
-                            frame.reference_requirement,
-                            AlignmentReferenceRequirement::Pending { .. }
-                        ) {
-                            // Source/layout work is complete, but Base pages cannot become the
-                            // current generation until the exact versioned FASTA horizon is
-                            // installed and a reference-backed frame is published.
-                            reference_panels_to_request.insert(panel_id);
-                        } else if frame.visible_complete() {
-                            projection.finish_checking();
-                            projection.settled_generation = Some(projection.clock.current().get());
+                        match alignment_scene_frame_settlement(&frame) {
+                            AlignmentSceneFrameSettlement::Settled => {
+                                // A later terminal frame in this same mailbox drain supersedes an
+                                // earlier progress frame which may have queued a FASTA request.
+                                reference_panels_to_request.remove(&panel_id);
+                                projection.finish_checking();
+                                projection.settled_generation =
+                                    Some(projection.clock.current().get());
+                            }
+                            AlignmentSceneFrameSettlement::WaitingForReference => {
+                                // Source/layout work is complete, but Base pages cannot become the
+                                // current generation until the exact versioned FASTA horizon is
+                                // installed and a reference-backed frame is published.
+                                reference_panels_to_request.insert(panel_id);
+                            }
+                            AlignmentSceneFrameSettlement::WaitingForScene => {}
                         }
                     }
                     if Some(track_id) == primary_id && panel_id == active_panel_id && current_target
@@ -1720,8 +1759,10 @@ impl Viewer {
                             }
                         }
                     }
-                    rebuild_display |= published_scene.is_some()
-                        && cause != AlignmentSceneFrameCause::VerticalResidency;
+                    rebuild_display |= camera_refusal_is_terminal
+                        || row_activity_changed
+                        || (published_scene.is_some()
+                            && cause != AlignmentSceneFrameCause::VerticalResidency);
                     prepare_frame = true;
                 }
                 AlignmentSceneEngineEvent::IndividualReadsRefused {
@@ -1778,6 +1819,7 @@ impl Viewer {
                     projection.scene_frame = Some(frame.clone());
                     projection.scene_frame_request_token = Some(request_token);
                     if projection.desired_scene_camera == Some(frame.camera) {
+                        reference_panels_to_request.remove(&panel_id);
                         projection.finish_checking();
                         projection.pending_query = false;
                         projection.settled_generation = Some(projection.clock.current().get());

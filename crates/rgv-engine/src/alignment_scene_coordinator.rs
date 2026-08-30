@@ -1,21 +1,22 @@
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
-    num::{NonZeroU32, NonZeroU64},
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     ops::Range,
     sync::Arc,
 };
 
 use rgv_alignment_scene::{
     AlignmentCamera, AlignmentPresentationOwner, AlignmentPresentationSceneError,
-    AlignmentPresentationStore, AlignmentPresentationStoreError, AlignmentRowAtlasError,
-    AlignmentSceneSnapshot, AlignmentSceneSnapshotError, AlignmentSourceRevision,
-    CanonicalGenomicTile, ContractFingerprint, EvidenceBuildError, EvidenceSelectionError,
-    EvidenceStoreError, ExactAlleleSummaryError, ExactDepthSummaryError, ExactFilterSummaryError,
-    ExactJunctionSummaryError, ExactModificationSummaryError, ExactPairSummaryError,
-    ExactSummaryRootError, GeometryLod, JunctionAnnotationIndex, LayoutContract, LedgerError,
-    PayloadContract, PresentationContract, PresentationStorePressure, ReferenceRevision,
-    ReservationKind, SceneRevision, SemanticPageError, StorePressure, SummaryContract,
-    SummarySemanticPageError,
+    AlignmentPresentationStore, AlignmentPresentationStoreError, AlignmentRowActivityProfile,
+    AlignmentRowAtlasError, AlignmentSceneSnapshot, AlignmentSceneSnapshotError,
+    AlignmentSourceRevision, CanonicalGenomicTile, ContractFingerprint, EvidenceBuildError,
+    EvidenceSelectionError, EvidenceStoreError, ExactAlleleSummaryError, ExactDepthSummaryError,
+    ExactFilterSummaryError, ExactJunctionSummaryError, ExactModificationSummaryError,
+    ExactPairSummaryError, ExactSummaryRootError, GeometryLod, JunctionAnnotationIndex,
+    LayoutContract, LedgerError, PayloadContract, PresentationContract, PresentationStorePressure,
+    ReferenceRevision, ReservationKind, RowAtlasRevision, SceneRevision, SemanticPageError,
+    StorePressure, SummaryContract, SummarySemanticPageError,
 };
 use rgv_core::{ContigId, GenomicInterval};
 use rgv_hts::ReferenceSlice;
@@ -234,6 +235,11 @@ pub struct AlignmentCoordinatorFrame {
     pub covered_interval: Option<GenomicInterval>,
     pub requested_rows: Range<u32>,
     pub covered_rows: Range<u32>,
+    /// A camera-exact, bounded vertical activity summary derived from the immutable row atlas in
+    /// `snapshot`. This is deliberately independent of atlas-wide vertical residency totals: the
+    /// scrollbar describes rows active at the live locus while the cache may retain many more
+    /// rows for immediate horizontal navigation.
+    pub row_activity: Option<Arc<AlignmentRowActivityProfile>>,
     pub reference_requirement: AlignmentReferenceRequirement,
     /// Whether the retained snapshot was built from the lane's currently desired presentation,
     /// summary, and layout contracts. Geometric overlap alone cannot make stale semantics ready.
@@ -251,6 +257,18 @@ impl AlignmentCoordinatorFrame {
                 .is_some_and(|covered| covered.contains_interval(self.camera.interval()))
             && self.covered_rows.start <= self.requested_rows.start
             && self.covered_rows.end >= self.requested_rows.end
+    }
+
+    /// Whether the source has made a terminal individual-read decision for this frame's camera.
+    /// A retained refusal from another request is not authority merely because it is attached to
+    /// a newer frame: its counted source target must contain the exact camera interval.
+    #[must_use]
+    pub fn individual_reads_refused_for_camera(&self) -> bool {
+        matches!(
+            self.individual_reads,
+            AlignmentIndividualReadCapability::Refused { target, .. }
+                if target.contains_interval(self.camera.interval())
+        )
     }
 }
 
@@ -573,7 +591,20 @@ struct AlignmentSceneSourceLane {
     telemetry: AlignmentSceneCoordinatorTelemetry,
     refusal: Option<AlignmentSceneOwnerRefusal>,
     vertical_residency_budget_limited: bool,
+    /// At most one derived camera projection is retained per lane. Its full authority key keeps
+    /// adjacent camera frames cheap without allowing an old atlas or locus to masquerade as the
+    /// current scrollbar truth.
+    row_activity_cache: RefCell<Option<AlignmentRowActivityCache>>,
 }
+
+#[derive(Clone, Debug)]
+struct AlignmentRowActivityCache {
+    atlas_revision: RowAtlasRevision,
+    interval: GenomicInterval,
+    profile: Arc<AlignmentRowActivityProfile>,
+}
+
+const ALIGNMENT_ROW_ACTIVITY_BINS: usize = 128;
 
 impl<B> AlignmentSceneSourceCoordinator<B>
 where
@@ -618,6 +649,7 @@ where
                 telemetry: AlignmentSceneCoordinatorTelemetry::default(),
                 refusal: None,
                 vertical_residency_budget_limited: false,
+                row_activity_cache: RefCell::new(None),
             },
         );
         Ok(())
@@ -1366,6 +1398,9 @@ impl AlignmentSceneSourceLane {
             .map_or(AlignmentVerticalResidency::ViewportBounded, |scene| {
                 self.vertical_residency_state(scene)
             });
+        let row_activity = snapshot
+            .as_ref()
+            .and_then(|scene| self.row_activity_for_frame(scene, desired.camera.interval()));
         Some(AlignmentCoordinatorFrame {
             camera: desired.camera,
             camera_sequence: desired.camera_sequence,
@@ -1373,6 +1408,7 @@ impl AlignmentSceneSourceLane {
             covered_interval,
             requested_rows,
             covered_rows,
+            row_activity,
             reference_requirement: self.reference_requirement(desired),
             scene_contracts_current,
             individual_reads,
@@ -1395,6 +1431,51 @@ impl AlignmentSceneSourceLane {
                 horizon: desired.source_horizon,
             }
         }
+    }
+
+    fn row_activity_for_frame(
+        &self,
+        scene: &AlignmentSceneSnapshot,
+        camera_interval: GenomicInterval,
+    ) -> Option<Arc<AlignmentRowActivityProfile>> {
+        let reads = scene.reads();
+        let evidence = reads.evidence();
+        let atlas = reads.atlas();
+        let exact_row_authority = scene.prepared_interval().contains_interval(camera_interval)
+            && evidence.coverage().covers(camera_interval)
+            && atlas.interval().contains_interval(camera_interval)
+            && atlas.derived_from_evidence() == evidence.revision()
+            && atlas.source_revision() == self.contract.source_revision
+            && atlas.record_contract() == self.contract.record_contract
+            && atlas.layout_contract() == self.contract.layout;
+        if !exact_row_authority {
+            *self.row_activity_cache.borrow_mut() = None;
+            return None;
+        }
+
+        let atlas_revision = atlas.revision();
+        if let Some(cached) = self.row_activity_cache.borrow().as_ref()
+            && cached.atlas_revision == atlas_revision
+            && cached.interval == camera_interval
+        {
+            return Some(Arc::clone(&cached.profile));
+        }
+
+        let profile = Arc::new(
+            atlas.activity_profile(
+                camera_interval,
+                NonZeroUsize::new(ALIGNMENT_ROW_ACTIVITY_BINS)
+                    .expect("the fixed row-activity bin bound is non-zero"),
+            )?,
+        );
+        debug_assert_eq!(profile.atlas_revision(), atlas_revision);
+        debug_assert_eq!(profile.interval(), camera_interval);
+        *self.row_activity_cache.borrow_mut() = Some(AlignmentRowActivityCache {
+            atlas_revision,
+            interval: camera_interval,
+            profile: Arc::clone(&profile),
+        });
+        Some(profile)
     }
 
     fn vertical_residency_state(
@@ -2556,6 +2637,120 @@ mod tests {
             .collect::<Vec<_>>();
         handles.sort_unstable();
         handles
+    }
+
+    #[test]
+    fn frame_row_activity_is_camera_exact_while_residency_remains_atlas_wide() {
+        let (mut coordinator, camera) = test_coordinator();
+        let policy = coordinator
+            .preparation_policy()
+            .with_full_vertical_residency(true);
+        assert!(
+            coordinator
+                .set_preparation_policy(policy)
+                .unwrap()
+                .is_none()
+        );
+        coordinator.update_camera(camera).unwrap();
+        pump_until_publication(&mut coordinator);
+
+        let frame = coordinator.frame().unwrap();
+        let snapshot = frame.snapshot.as_ref().unwrap();
+        let atlas = snapshot.reads().atlas();
+        let profile = frame
+            .row_activity
+            .as_ref()
+            .expect("a fully covered read-row camera has exact activity");
+        assert_eq!(profile.atlas_revision(), atlas.revision());
+        assert_eq!(profile.interval(), camera.interval());
+        assert_ne!(profile.interval(), atlas.interval());
+        assert_eq!(profile.stable_row_count(), atlas.row_count());
+        assert!(profile.bins().len() <= ALIGNMENT_ROW_ACTIVITY_BINS);
+        assert!(profile.visible_record_count() > 0);
+
+        let atlas_wide_total = match frame.vertical_residency {
+            AlignmentVerticalResidency::Preparing { total_rows, .. }
+            | AlignmentVerticalResidency::Complete { total_rows }
+            | AlignmentVerticalResidency::BudgetLimited { total_rows, .. } => total_rows,
+            AlignmentVerticalResidency::ViewportBounded => {
+                panic!("the explicitly enabled complete-residency policy must report totals")
+            }
+        };
+        assert_eq!(
+            usize::try_from(atlas_wide_total).unwrap(),
+            atlas.row_count()
+        );
+    }
+
+    #[test]
+    fn row_activity_rejects_disjoint_or_stale_snapshot_authority() {
+        let (mut coordinator, camera) = test_coordinator();
+        coordinator.update_camera(camera).unwrap();
+        pump_until_publication(&mut coordinator);
+        let initial = coordinator.frame().unwrap();
+        let initial_snapshot = Arc::clone(initial.snapshot.as_ref().unwrap());
+        let initial_profile = initial.row_activity.as_ref().unwrap();
+        assert_eq!(initial_profile.interval(), camera.interval());
+
+        let disjoint_viewport = camera
+            .viewport()
+            .pan_pixels(600.0, coordinator.contract().contig_length)
+            .unwrap();
+        let disjoint = AlignmentCamera::from_viewport(
+            disjoint_viewport,
+            0.0,
+            camera.row_height(),
+            camera.read_height(),
+            camera.clip(),
+        )
+        .unwrap();
+        coordinator.update_camera(disjoint).unwrap();
+        let disjoint_frame = coordinator.frame().unwrap();
+        assert!(Arc::ptr_eq(
+            disjoint_frame.snapshot.as_ref().unwrap(),
+            &initial_snapshot
+        ));
+        assert!(
+            !initial_snapshot
+                .prepared_interval()
+                .contains_interval(disjoint.interval())
+        );
+        assert!(disjoint_frame.row_activity.is_none());
+
+        // A cached profile is also rejected when the snapshot's row-layout contract no longer
+        // matches the lane. Restoring that exact contract produces a newly validated profile for
+        // the camera rather than reusing stale authority.
+        coordinator.update_camera(camera).unwrap();
+        let original_layout = coordinator.contract().layout;
+        coordinator
+            .source
+            .lanes
+            .get_mut(&coordinator.owner)
+            .unwrap()
+            .contract
+            .layout
+            .row_scale_class = original_layout.row_scale_class.saturating_add(1);
+        assert!(coordinator.frame().unwrap().row_activity.is_none());
+        coordinator
+            .source
+            .lanes
+            .get_mut(&coordinator.owner)
+            .unwrap()
+            .contract
+            .layout = original_layout;
+        let restored = coordinator.frame().unwrap();
+        let restored_profile = restored.row_activity.as_ref().unwrap();
+        assert_eq!(restored_profile.interval(), camera.interval());
+        assert_eq!(
+            restored_profile.atlas_revision(),
+            restored
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .reads()
+                .atlas()
+                .revision()
+        );
     }
 
     #[test]

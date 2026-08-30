@@ -40,10 +40,11 @@ use launch::*;
 use rgv_alignment_scene::{
     AlignmentCamera, AlignmentComponent, AlignmentHit, AlignmentInteractionState,
     AlignmentPanelSceneFrame, AlignmentPanelSceneStore, AlignmentPresentationScene,
-    AlignmentReadLabelMode, AlignmentSceneSnapshot, AlignmentStyleContract, AlleleSummaryDetail,
-    AllocationLedger, CapabilityRequirement, CpuAlignmentProjector, CpuClipRect, GeometryLod,
-    LayoutContract, MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract,
-    ReferenceRevision, SummaryContract,
+    AlignmentReadLabelMode, AlignmentRowActivityProfile, AlignmentSceneSnapshot,
+    AlignmentStyleContract, AlleleSummaryDetail, AllocationLedger, CapabilityRequirement,
+    CpuAlignmentProjector, CpuClipRect, GeometryLod, LayoutContract,
+    MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract, ReferenceRevision,
+    RowCoordinateSpaceRevision, SummaryContract,
 };
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,

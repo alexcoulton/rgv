@@ -1,4 +1,6 @@
-use std::{cmp::Reverse, collections::BinaryHeap, mem::size_of, ops::Range, sync::Arc};
+use std::{
+    cmp::Reverse, collections::BinaryHeap, mem::size_of, num::NonZeroUsize, ops::Range, sync::Arc,
+};
 
 use rgv_core::{
     AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, GenomicInterval,
@@ -11,7 +13,7 @@ use crate::{
     AlignmentHandle, AlignmentSourceRevision, AllocationClass, AllocationLease, AllocationLedger,
     AllocationReservation, ContractFingerprint, EvidenceRevision, EvidenceRoot,
     EvidenceSelectionError, LayoutContract, LedgerError, PinnedAllocationLease, ReservationKind,
-    RowAtlasRevision,
+    RowAtlasRevision, RowCoordinateSpaceRevision,
     fingerprint::StableHasher,
     row_oracle::{AlignmentRowGroup, OracleRowExtent, RowOracleError, build_row_oracle},
 };
@@ -134,6 +136,123 @@ impl From<OracleRowExtent> for RowExtent {
     }
 }
 
+/// Activity in one equal-row-space segment of a camera-local row profile.
+///
+/// Counts are exact for the profile interval. Rows keep their absolute canonical coordinates;
+/// bins summarize those coordinates and never compact or reindex them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentRowActivityBin {
+    row_start: usize,
+    row_end: usize,
+    occupied_rows: usize,
+    record_count: usize,
+    connector_count: usize,
+}
+
+impl AlignmentRowActivityBin {
+    #[must_use]
+    pub const fn row_start(self) -> usize {
+        self.row_start
+    }
+
+    #[must_use]
+    pub const fn row_end(self) -> usize {
+        self.row_end
+    }
+
+    #[must_use]
+    pub const fn row_range(self) -> Range<usize> {
+        self.row_start..self.row_end
+    }
+
+    #[must_use]
+    pub const fn occupied_rows(self) -> usize {
+        self.occupied_rows
+    }
+
+    #[must_use]
+    pub const fn record_count(self) -> usize {
+        self.record_count
+    }
+
+    #[must_use]
+    pub const fn connector_count(self) -> usize {
+        self.connector_count
+    }
+}
+
+/// Immutable camera-local activity projected from one canonical row atlas.
+///
+/// `stable_row_count` describes the complete atlas coordinate space while `active_row_end`
+/// describes the smallest canonical prefix containing activity in this exact interval. A sparse
+/// camera therefore gets an appropriately short scrollbar without changing any row assignment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlignmentRowActivityProfile {
+    atlas_revision: RowAtlasRevision,
+    row_coordinate_space: RowCoordinateSpaceRevision,
+    interval: GenomicInterval,
+    stable_row_count: usize,
+    active_row_end: usize,
+    occupied_rows: usize,
+    visible_record_count: usize,
+    visible_connector_count: usize,
+    bins: Arc<[AlignmentRowActivityBin]>,
+}
+
+impl AlignmentRowActivityProfile {
+    #[must_use]
+    pub const fn atlas_revision(&self) -> RowAtlasRevision {
+        self.atlas_revision
+    }
+
+    #[must_use]
+    pub const fn row_coordinate_space(&self) -> RowCoordinateSpaceRevision {
+        self.row_coordinate_space
+    }
+
+    #[must_use]
+    pub const fn interval(&self) -> GenomicInterval {
+        self.interval
+    }
+
+    #[must_use]
+    pub const fn stable_row_count(&self) -> usize {
+        self.stable_row_count
+    }
+
+    #[must_use]
+    pub const fn active_row_end(&self) -> usize {
+        self.active_row_end
+    }
+
+    #[must_use]
+    pub const fn occupied_rows(&self) -> usize {
+        self.occupied_rows
+    }
+
+    #[must_use]
+    pub const fn visible_record_count(&self) -> usize {
+        self.visible_record_count
+    }
+
+    #[must_use]
+    pub const fn visible_connector_count(&self) -> usize {
+        self.visible_connector_count
+    }
+
+    #[must_use]
+    pub fn bins(&self) -> &[AlignmentRowActivityBin] {
+        &self.bins
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RowActivity {
+    row: usize,
+    record_count: usize,
+    connector_count: usize,
+}
+
 #[derive(Debug)]
 struct RowAtlasLayer {
     /// Source-handle order makes lookup deterministic and logarithmic.
@@ -253,6 +372,7 @@ impl RowAtlasLayer {
 #[derive(Debug)]
 pub struct AlignmentRowAtlas {
     revision: RowAtlasRevision,
+    row_coordinate_space: RowCoordinateSpaceRevision,
     derived_from_evidence: EvidenceRevision,
     source_revision: AlignmentSourceRevision,
     record_contract: ContractFingerprint,
@@ -329,6 +449,7 @@ impl AlignmentRowAtlas {
         let layer = RowAtlasLayer::new(records, layer_reservation, publication_revision)?;
         Self::from_parts(
             revision,
+            RowCoordinateSpaceRevision::new(revision.fingerprint()),
             evidence.revision(),
             evidence.source_revision(),
             evidence.record_contract(),
@@ -432,6 +553,7 @@ impl AlignmentRowAtlas {
             u32::try_from(extents.len()).map_err(|_| AlignmentRowAtlasError::IndexOverflow)?;
         Self::from_parts(
             revision,
+            self.row_coordinate_space,
             evidence.revision(),
             self.source_revision,
             self.record_contract,
@@ -450,6 +572,7 @@ impl AlignmentRowAtlas {
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         revision: RowAtlasRevision,
+        row_coordinate_space: RowCoordinateSpaceRevision,
         derived_from_evidence: EvidenceRevision,
         source_revision: AlignmentSourceRevision,
         record_contract: ContractFingerprint,
@@ -475,6 +598,7 @@ impl AlignmentRowAtlas {
             metadata_reservation.register(retained_bytes, publication_revision)?;
         Ok(Arc::new(Self {
             revision,
+            row_coordinate_space,
             derived_from_evidence,
             source_revision,
             record_contract,
@@ -538,6 +662,14 @@ impl AlignmentRowAtlas {
         self.revision
     }
 
+    /// Identifies the stable canonical row-coordinate space shared by compatible layered
+    /// extensions. A rebuild or repack receives a new identity even when its assignments happen
+    /// to be equal.
+    #[must_use]
+    pub const fn row_coordinate_space(&self) -> RowCoordinateSpaceRevision {
+        self.row_coordinate_space
+    }
+
     #[must_use]
     pub const fn derived_from_evidence(&self) -> EvidenceRevision {
         self.derived_from_evidence
@@ -571,6 +703,88 @@ impl AlignmentRowAtlas {
     #[must_use]
     pub fn row_count(&self) -> usize {
         self.row_extents.len()
+    }
+
+    /// Summarizes exact read and pair-connector activity in one contained camera interval.
+    ///
+    /// This walks the atlas's retained row extents and per-layer overlap indices directly. It does
+    /// not materialize records, read GPU state, allocate ledger residency, or alter canonical row
+    /// assignments. Bins partition `0..active_row_end` into at most `max_bins` equal row-space
+    /// segments (their widths differ by at most one row).
+    #[must_use]
+    pub fn activity_profile(
+        &self,
+        interval: GenomicInterval,
+        max_bins: NonZeroUsize,
+    ) -> Option<AlignmentRowActivityProfile> {
+        if interval.contig() != self.interval.contig() || !self.interval.contains_interval(interval)
+        {
+            return None;
+        }
+
+        let mut record_activity = Vec::<RowActivity>::new();
+        for (row, extent) in self.row_extents.iter().enumerate() {
+            if extent.minimum_start >= interval.end() || extent.maximum_end <= interval.start() {
+                continue;
+            }
+            let row_coordinate =
+                u32::try_from(row).expect("row atlas extents remain u32-addressable");
+            let record_count = self
+                .layers
+                .iter()
+                .map(|layer| layer.overlapping_count(row_coordinate, interval))
+                .sum();
+            if record_count != 0 {
+                record_activity.push(RowActivity {
+                    row,
+                    record_count,
+                    connector_count: 0,
+                });
+            }
+        }
+
+        // Connectors are retained in canonical row order, so filtering preserves grouping and a
+        // connector-only row can be merged without a row-sized scratch array.
+        let mut connector_activity = Vec::<RowActivity>::new();
+        for connector in self.connectors.iter().filter(|connector| {
+            connector.start < interval.end() && connector.end > interval.start()
+        }) {
+            let row = connector.row as usize;
+            if let Some(activity) = connector_activity.last_mut()
+                && activity.row == row
+            {
+                activity.connector_count += 1;
+            } else {
+                connector_activity.push(RowActivity {
+                    row,
+                    record_count: 0,
+                    connector_count: 1,
+                });
+            }
+        }
+
+        let activity = merge_row_activity(&record_activity, &connector_activity);
+        let active_row_end = activity.last().map_or(0, |activity| {
+            activity
+                .row
+                .checked_add(1)
+                .expect("an addressable canonical row has an addressable end")
+        });
+        let visible_record_count = activity.iter().map(|entry| entry.record_count).sum();
+        let visible_connector_count = activity.iter().map(|entry| entry.connector_count).sum();
+        let bins = row_activity_bins(&activity, active_row_end, max_bins);
+
+        Some(AlignmentRowActivityProfile {
+            atlas_revision: self.revision,
+            row_coordinate_space: self.row_coordinate_space,
+            interval,
+            stable_row_count: self.row_extents.len(),
+            active_row_end,
+            occupied_rows: activity.len(),
+            visible_record_count,
+            visible_connector_count,
+            bins: bins.into(),
+        })
     }
 
     #[must_use]
@@ -768,6 +982,81 @@ impl AlignmentRowAtlasPins {
     pub fn is_empty(&self) -> bool {
         self.allocations.is_empty()
     }
+}
+
+fn merge_row_activity(records: &[RowActivity], connectors: &[RowActivity]) -> Vec<RowActivity> {
+    let mut merged = Vec::with_capacity(records.len().saturating_add(connectors.len()));
+    let mut record_cursor = 0;
+    let mut connector_cursor = 0;
+    while record_cursor < records.len() || connector_cursor < connectors.len() {
+        match (records.get(record_cursor), connectors.get(connector_cursor)) {
+            (Some(record), Some(connector)) if record.row == connector.row => {
+                merged.push(RowActivity {
+                    row: record.row,
+                    record_count: record.record_count,
+                    connector_count: connector.connector_count,
+                });
+                record_cursor += 1;
+                connector_cursor += 1;
+            }
+            (Some(record), Some(connector)) if record.row < connector.row => {
+                merged.push(*record);
+                record_cursor += 1;
+            }
+            (Some(_), Some(connector)) => {
+                merged.push(*connector);
+                connector_cursor += 1;
+            }
+            (Some(_), None) => {
+                merged.extend_from_slice(&records[record_cursor..]);
+                record_cursor = records.len();
+            }
+            (None, Some(_)) => {
+                merged.extend_from_slice(&connectors[connector_cursor..]);
+                connector_cursor = connectors.len();
+            }
+            (None, None) => break,
+        }
+    }
+    merged
+}
+
+fn row_activity_bins(
+    activity: &[RowActivity],
+    active_row_end: usize,
+    max_bins: NonZeroUsize,
+) -> Vec<AlignmentRowActivityBin> {
+    let bin_count = max_bins.get().min(active_row_end);
+    if bin_count == 0 {
+        return Vec::new();
+    }
+
+    let base_width = active_row_end / bin_count;
+    let wider_bins = active_row_end % bin_count;
+    let mut bins = Vec::with_capacity(bin_count);
+    let mut row_start = 0_usize;
+    for index in 0..bin_count {
+        let width = base_width + usize::from(index < wider_bins);
+        let row_end = row_start + width;
+        bins.push(AlignmentRowActivityBin {
+            row_start,
+            row_end,
+            ..AlignmentRowActivityBin::default()
+        });
+        row_start = row_end;
+    }
+
+    let mut bin_cursor = 0_usize;
+    for entry in activity {
+        while entry.row >= bins[bin_cursor].row_end {
+            bin_cursor += 1;
+        }
+        let bin = &mut bins[bin_cursor];
+        bin.occupied_rows += 1;
+        bin.record_count += entry.record_count;
+        bin.connector_count += entry.connector_count;
+    }
+    bins
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1416,6 +1705,138 @@ mod tests {
     }
 
     #[test]
+    fn camera_activity_uses_absolute_rows_without_inheriting_off_camera_depth() {
+        let ledger = AllocationLedger::new(8 << 20, 0);
+        let mut records = (0..101_u64)
+            .map(|index| (b"crowd".as_slice(), 0, 10, index + 1))
+            .collect::<Vec<_>>();
+        records.extend([
+            (b"near-a".as_slice(), 20, 30, 102),
+            (b"near-b".as_slice(), 20, 30, 103),
+        ]);
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 40).unwrap();
+        let evidence = evidence_root(&ledger, evidence_chunk(&ledger, &records), interval, 10);
+        let atlas = AlignmentRowAtlas::build(
+            revision(20),
+            &evidence,
+            interval,
+            contract(ReadStackingMode::Stable),
+            &ledger,
+            ReservationKind::Normal,
+            20,
+        )
+        .unwrap();
+        let before = ledger.snapshot().unwrap();
+        let assignment = atlas.assignment_fingerprint();
+
+        let sparse_camera = GenomicInterval::new(ContigId::new(0), 20, 30).unwrap();
+        let sparse = atlas
+            .activity_profile(sparse_camera, NonZeroUsize::new(128).unwrap())
+            .unwrap();
+        assert_eq!(sparse.atlas_revision(), revision(20));
+        assert_eq!(sparse.row_coordinate_space(), atlas.row_coordinate_space());
+        assert_eq!(sparse.interval(), sparse_camera);
+        assert_eq!(sparse.stable_row_count(), 101);
+        assert_eq!(sparse.active_row_end(), 2);
+        assert_eq!(sparse.occupied_rows(), 2);
+        assert_eq!(sparse.visible_record_count(), 2);
+        assert_eq!(sparse.visible_connector_count(), 0);
+        assert_eq!(sparse.bins().len(), 2);
+        assert_eq!(sparse.bins()[0].row_range(), 0..1);
+        assert_eq!(sparse.bins()[1].row_range(), 1..2);
+        assert!(sparse.bins().iter().all(|bin| bin.record_count() == 1));
+
+        let dense_camera = GenomicInterval::new(ContigId::new(0), 0, 10).unwrap();
+        let dense = atlas
+            .activity_profile(dense_camera, NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        assert_eq!(dense.stable_row_count(), 101);
+        assert_eq!(dense.active_row_end(), 101);
+        assert_eq!(dense.occupied_rows(), 101);
+        assert_eq!(dense.visible_record_count(), 101);
+        assert_eq!(dense.bins().len(), 8);
+        assert_eq!(dense.bins().first().unwrap().row_start(), 0);
+        assert_eq!(dense.bins().last().unwrap().row_end(), 101);
+        assert_eq!(
+            dense
+                .bins()
+                .iter()
+                .map(|bin| bin.record_count())
+                .sum::<usize>(),
+            101
+        );
+        assert!(
+            dense
+                .bins()
+                .windows(2)
+                .all(|pair| pair[0].row_end() == pair[1].row_start())
+        );
+        assert!(
+            dense
+                .bins()
+                .iter()
+                .map(|bin| bin.row_end() - bin.row_start())
+                .max()
+                .unwrap()
+                - dense
+                    .bins()
+                    .iter()
+                    .map(|bin| bin.row_end() - bin.row_start())
+                    .min()
+                    .unwrap()
+                <= 1
+        );
+
+        // An exact repeat is purely derived: no assignment, residency, or profile drift.
+        assert_eq!(
+            atlas
+                .activity_profile(sparse_camera, NonZeroUsize::new(128).unwrap())
+                .unwrap(),
+            sparse
+        );
+        let after = ledger.snapshot().unwrap();
+        assert_eq!(atlas.assignment_fingerprint(), assignment);
+        assert_eq!(after.charged, before.charged);
+        assert_eq!(after.records, before.records);
+    }
+
+    #[test]
+    fn empty_activity_profile_has_no_active_prefix_or_bins() {
+        let ledger = AllocationLedger::new(1 << 20, 0);
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 40).unwrap();
+        let chunk = evidence_chunk(&ledger, &[(b"left", 0, 10, 1), (b"right", 30, 40, 2)]);
+        let evidence = evidence_root(&ledger, chunk, interval, 10);
+        let atlas = AlignmentRowAtlas::build(
+            revision(20),
+            &evidence,
+            interval,
+            contract(ReadStackingMode::Stable),
+            &ledger,
+            ReservationKind::Normal,
+            20,
+        )
+        .unwrap();
+
+        let camera = GenomicInterval::new(ContigId::new(0), 15, 25).unwrap();
+        let profile = atlas
+            .activity_profile(camera, NonZeroUsize::new(128).unwrap())
+            .unwrap();
+        assert_eq!(profile.stable_row_count(), 1);
+        assert_eq!(profile.active_row_end(), 0);
+        assert_eq!(profile.occupied_rows(), 0);
+        assert_eq!(profile.visible_record_count(), 0);
+        assert_eq!(profile.visible_connector_count(), 0);
+        assert!(profile.bins().is_empty());
+
+        let outside = GenomicInterval::new(ContigId::new(0), 40, 50).unwrap();
+        assert!(
+            atlas
+                .activity_profile(outside, NonZeroUsize::new(1).unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
     fn incremental_right_extension_matches_clean_canonical_atlas() {
         let ledger = AllocationLedger::new(8 << 20, 0);
         let chunk = evidence_chunk(
@@ -1466,6 +1887,14 @@ mod tests {
 
         assert_eq!(extended.record_count(), 6);
         assert_eq!(extended.layer_count(), 2);
+        assert_eq!(
+            extended.row_coordinate_space(),
+            narrow_atlas.row_coordinate_space()
+        );
+        assert_ne!(
+            clean.row_coordinate_space(),
+            extended.row_coordinate_space()
+        );
         assert_eq!(extended.row_count(), clean.row_count());
         assert_eq!(
             extended.assignment_fingerprint(),
@@ -1787,6 +2216,18 @@ mod tests {
         assert_eq!(connectors.len(), 1);
         assert_eq!((connectors[0].start(), connectors[0].end()), (14, 30));
         assert_eq!(connectors[0].right(), Some(pair_handles[1]));
+        let connector_camera = GenomicInterval::new(ContigId::new(0), 20, 25).unwrap();
+        let connector_profile = paired
+            .activity_profile(connector_camera, NonZeroUsize::new(128).unwrap())
+            .unwrap();
+        assert_eq!(connector_profile.visible_record_count(), 0);
+        assert_eq!(connector_profile.visible_connector_count(), 1);
+        assert_eq!(connector_profile.occupied_rows(), 1);
+        assert_eq!(connector_profile.active_row_end(), 1);
+        assert_eq!(connector_profile.bins().len(), 1);
+        assert_eq!(connector_profile.bins()[0].record_count(), 0);
+        assert_eq!(connector_profile.bins()[0].connector_count(), 1);
+        assert_eq!(connector_profile.bins()[0].occupied_rows(), 1);
 
         layout.promoted_template = Some(rgv_hts::template_id(b"supp").get());
         let promoted = AlignmentRowAtlas::build(

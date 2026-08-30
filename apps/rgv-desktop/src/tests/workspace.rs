@@ -8,11 +8,11 @@ use crate::workspace::alignment_management::{
     alignment_scene_intervals_share_authority,
 };
 use crate::workspace::queries::{
-    AlignmentReferenceLanePlan, AlignmentReferenceLaneRequirement,
+    AlignmentReferenceLanePlan, AlignmentReferenceLaneRequirement, AlignmentSceneFrameSettlement,
     alignment_scene_event_token_is_current, alignment_scene_frame_is_current,
-    alignment_scene_refusal_is_current, plan_alignment_reference_lanes,
-    reference_dependency_is_settled, reference_failure_matches_requirement,
-    reference_query_completion_matches,
+    alignment_scene_frame_settlement, alignment_scene_refusal_is_current,
+    plan_alignment_reference_lanes, reference_dependency_is_settled,
+    reference_failure_matches_requirement, reference_query_completion_matches,
 };
 
 #[test]
@@ -50,7 +50,7 @@ fn read_scroll_is_reset_only_when_its_scene_row_authority_changes() {
         stable_row_anchor: Some(StableRowCameraAnchor {
             row: 40,
             offset_fraction: 0.5,
-            layout_revision: 7,
+            coordinate_space: ReadRowCoordinateSpace::Legacy(7),
             row_height: 8.0,
         }),
         scene_contig: Some(ContigId::new(6)),
@@ -78,7 +78,7 @@ fn index_only_overview_retires_read_row_authority_but_preserves_density() {
         stable_row_anchor: Some(StableRowCameraAnchor {
             row: 40,
             offset_fraction: 0.5,
-            layout_revision: 7,
+            coordinate_space: ReadRowCoordinateSpace::Legacy(7),
             row_height: 8.0,
         }),
         scene_contig: Some(ContigId::new(6)),
@@ -136,6 +136,7 @@ fn stripping_a_discontinuous_snapshot_preserves_the_new_camera_reference_require
         camera,
         camera_sequence: 2,
         snapshot: None,
+        row_activity: None,
         covered_interval: Some(actb),
         requested_rows: 0..10,
         covered_rows: 0..10,
@@ -150,6 +151,74 @@ fn stripping_a_discontinuous_snapshot_preserves_the_new_camera_reference_require
     assert!(!normalized.scene_contracts_current);
     assert_eq!(normalized.covered_interval, None);
     assert!(!normalized.visible_complete());
+}
+
+#[test]
+fn stripping_a_discontinuous_snapshot_preserves_only_a_camera_covering_refusal() {
+    let actb = GenomicInterval::new(ContigId::new(6), 5_500_000, 5_600_000).unwrap();
+    let bap1 = GenomicInterval::new(ContigId::new(2), 52_400_000, 52_410_000).unwrap();
+    let camera = AlignmentCamera::new(
+        bap1,
+        0.0,
+        7.0,
+        5.0,
+        CpuClipRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1_000.0,
+            height: 500.0,
+        },
+    )
+    .unwrap();
+    let reference_revision =
+        ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
+    let frame = AlignmentCoordinatorFrame {
+        camera,
+        camera_sequence: 3,
+        snapshot: None,
+        row_activity: None,
+        covered_interval: Some(actb),
+        requested_rows: 0..10,
+        covered_rows: 0..10,
+        reference_requirement: AlignmentReferenceRequirement::Pending {
+            revision: reference_revision,
+            horizon: bap1,
+        },
+        scene_contracts_current: true,
+        individual_reads: AlignmentIndividualReadCapability::Refused {
+            target: GenomicInterval::new(ContigId::new(2), 52_390_000, 52_420_000).unwrap(),
+            complete_read_limit: 50_000,
+            eligible_records: 86_798,
+        },
+        vertical_residency: AlignmentVerticalResidency::ViewportBounded,
+    };
+
+    let normalized =
+        alignment_scene_frame_for_ui_against_retained_interval(frame.clone(), Some(actb));
+    assert!(normalized.individual_reads_refused_for_camera());
+    assert_eq!(
+        alignment_scene_frame_settlement(&normalized),
+        AlignmentSceneFrameSettlement::Settled,
+        "a later typed frame must settle the request even if its FASTA is still pending"
+    );
+
+    let mut stale = frame;
+    stale.individual_reads = AlignmentIndividualReadCapability::Refused {
+        target: GenomicInterval::new(ContigId::new(2), 52_405_000, 52_406_000).unwrap(),
+        complete_read_limit: 50_000,
+        eligible_records: 86_798,
+    };
+    let normalized_stale =
+        alignment_scene_frame_for_ui_against_retained_interval(stale, Some(actb));
+    assert_eq!(
+        normalized_stale.individual_reads,
+        AlignmentIndividualReadCapability::Pending,
+        "a refusal which does not cover the current camera is stale, not terminal"
+    );
+    assert_eq!(
+        alignment_scene_frame_settlement(&normalized_stale),
+        AlignmentSceneFrameSettlement::WaitingForReference
+    );
 }
 
 #[test]

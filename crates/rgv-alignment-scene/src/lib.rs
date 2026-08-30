@@ -105,11 +105,13 @@ pub use resource::{
 };
 pub use revision::{
     AlignmentSourceRevision, AnnotationRevision, EvidenceRevision, ReferenceRevision,
-    RevisionFingerprint, RowAtlasRevision, SceneRevision, SourceFingerprint, SummaryRevision,
+    RevisionFingerprint, RowAtlasRevision, RowCoordinateSpaceRevision, SceneRevision,
+    SourceFingerprint, SummaryRevision,
 };
 pub use row_atlas::{
-    AlignmentRowAtlas, AlignmentRowAtlasError, AlignmentRowAtlasPins, AlignmentRowConnector,
-    RowAtlasRecord, RowAtlasRecordHit, RowExtent,
+    AlignmentRowActivityBin, AlignmentRowActivityProfile, AlignmentRowAtlas,
+    AlignmentRowAtlasError, AlignmentRowAtlasPins, AlignmentRowConnector, RowAtlasRecord,
+    RowAtlasRecordHit, RowExtent,
 };
 pub use row_oracle::{AlignmentRowGroup, AlignmentRowGroupKey, RowOracleError};
 pub use scene_snapshot::{AlignmentSceneSnapshot, AlignmentSceneSnapshotError};

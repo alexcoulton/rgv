@@ -1475,18 +1475,22 @@ pub(crate) fn alignment_scene_frame_for_ui_against_retained_interval(
     mut frame: AlignmentCoordinatorFrame,
     retained_interval: Option<GenomicInterval>,
 ) -> AlignmentCoordinatorFrame {
+    let camera_refusal_is_terminal = frame.individual_reads_refused_for_camera();
     let relevant = retained_interval.is_none_or(|interval| {
         alignment_scene_intervals_share_authority(interval, frame.camera.interval())
     });
     if !relevant {
         frame.snapshot = None;
+        frame.row_activity = None;
         frame.covered_interval = None;
         frame.covered_rows = 0..0;
         frame.requested_rows = frame.camera.visible_rows();
         // The requirement describes the new desired camera, not the discarded old snapshot. It
         // must survive so the desktop can request and install the exact FASTA horizon.
         frame.scene_contracts_current = false;
-        frame.individual_reads = AlignmentIndividualReadCapability::Pending;
+        if !camera_refusal_is_terminal {
+            frame.individual_reads = AlignmentIndividualReadCapability::Pending;
+        }
         frame.vertical_residency = AlignmentVerticalResidency::ViewportBounded;
     }
     frame

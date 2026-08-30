@@ -54,8 +54,9 @@ fn alignment_subtrack_menu(
 #[derive(Clone)]
 struct ReadPanelScrollbarDraft {
     track_id: TrackId,
-    top: f32,
-    bottom: f32,
+    /// Physical panel allocation from the live pane layout. Scene cache clips may lag this rect
+    /// and are intentionally never copied into scrollbar geometry.
+    allocation: egui::Rect,
     maximum: f32,
     offset: f32,
     density: f32,
@@ -88,6 +89,56 @@ fn pane_vertical_bounds(layout: &ui::PaneLayoutSnapshot, fallback: f32) -> (f32,
         (top, bottom)
     } else {
         (fallback, fallback)
+    }
+}
+
+fn read_panel_scrollbar_rect(
+    full_scrollbar: egui::Rect,
+    left: f32,
+    allocation: egui::Rect,
+) -> egui::Rect {
+    let left = left.clamp(full_scrollbar.left(), full_scrollbar.right());
+    let top = allocation
+        .top()
+        .clamp(full_scrollbar.top(), full_scrollbar.bottom());
+    let bottom = allocation.bottom().clamp(top, full_scrollbar.bottom());
+    egui::Rect::from_min_max(
+        egui::pos2(left, top),
+        egui::pos2(full_scrollbar.right(), bottom),
+    )
+}
+
+fn read_panel_scrollbar_draft(
+    track_id: TrackId,
+    allocation: egui::Rect,
+    state: ReadPanelScrollState,
+    density: f32,
+    density_drag_fraction: Option<f32>,
+    cached: Option<&ReadPanelDisplayCache>,
+) -> ReadPanelScrollbarDraft {
+    let maximum = cached.map_or(0.0, |read_panel| {
+        crate::display::read_panel_scrollbar_maximum(
+            state,
+            allocation.bottom(),
+            read_panel.row_coordinate_authority,
+        )
+    });
+    let preview_fraction = density_drag_fraction.or_else(|| {
+        (maximum <= f32::EPSILON)
+            .then_some(state.latent_scroll_fraction)
+            .flatten()
+    });
+    ReadPanelScrollbarDraft {
+        track_id,
+        allocation,
+        maximum,
+        offset: state.scroll_points.clamp(0.0, maximum),
+        density,
+        preview_fraction,
+        overview: cached
+            .map(|read_panel| read_panel.overview.clone())
+            .unwrap_or_default(),
+        interaction: ui::ScrollbarInteraction::default(),
     }
 }
 
@@ -625,47 +676,33 @@ impl Viewer {
                     .as_ref()
                     .map_or(pane_clip_bottom, |cache| cache.annotation_clip_bottom);
                 let read_panels = panel
-                    .scroll_display_cache
-                    .as_ref()
-                    .map(|cache| {
-                        cache
-                            .read_panels
-                            .iter()
-                            .map(|read_panel| {
-                                let state = panel.read_panel_scroll_state(read_panel.track_id);
-                                let maximum =
-                                    (state.content_bottom_points - read_panel.clip_bottom).max(0.0);
-                                let preview_fraction = self
-                                    .vertical_overview_drag
-                                    .filter(|drag| {
-                                        drag.density_dragging
-                                            && drag.panel_id == panel.id
-                                            && drag.track_id == read_panel.track_id
-                                    })
-                                    .map(|drag| drag.virtual_scroll_fraction)
-                                    .or_else(|| {
-                                        (maximum <= f32::EPSILON)
-                                            .then_some(state.latent_scroll_fraction)
-                                            .flatten()
-                                    });
-                                ReadPanelScrollbarDraft {
-                                    track_id: read_panel.track_id,
-                                    top: read_panel.clip_top,
-                                    bottom: read_panel.clip_bottom,
-                                    maximum,
-                                    offset: state.scroll_points.clamp(0.0, maximum),
-                                    density: self.alignment_density_for_panel_track(
-                                        panel.id,
-                                        read_panel.track_id,
-                                    ),
-                                    preview_fraction,
-                                    overview: read_panel.overview.clone(),
-                                    interaction: ui::ScrollbarInteraction::default(),
-                                }
+                    .live_read_panel_allocations()
+                    .map(|(track_id, allocation)| {
+                        let cached = panel.scroll_display_cache.as_ref().and_then(|cache| {
+                            cache
+                                .read_panels
+                                .iter()
+                                .find(|read_panel| read_panel.track_id == track_id)
+                        });
+                        let state = panel.read_panel_scroll_state(track_id);
+                        let density_drag_fraction = self
+                            .vertical_overview_drag
+                            .filter(|drag| {
+                                drag.density_dragging
+                                    && drag.panel_id == panel.id
+                                    && drag.track_id == track_id
                             })
-                            .collect::<Vec<_>>()
+                            .map(|drag| drag.virtual_scroll_fraction);
+                        read_panel_scrollbar_draft(
+                            track_id,
+                            allocation,
+                            state,
+                            self.alignment_density_for_panel_track(panel.id, track_id),
+                            density_drag_fraction,
+                            cached,
+                        )
                     })
-                    .unwrap_or_default();
+                    .collect::<Vec<_>>();
                 WorkspaceScrollbarsDraft {
                     index,
                     panel_id: panel.id,
@@ -1912,11 +1949,10 @@ impl Viewer {
                         full.left()
                     };
                     for scrollbar in &mut workspace.read_panels {
-                        let top = scrollbar.top.clamp(full.top(), full.bottom());
-                        let bottom = scrollbar.bottom.clamp(top, full.bottom());
-                        let rect = egui::Rect::from_min_max(
-                            egui::pos2(read_scrollbar_left, top),
-                            egui::pos2(full.right(), bottom),
+                        let rect = read_panel_scrollbar_rect(
+                            full,
+                            read_scrollbar_left,
+                            scrollbar.allocation,
                         );
                         scrollbar.interaction = ui::paint_read_panel_scrollbar(
                             ui,
@@ -4549,5 +4585,43 @@ mod tests {
             ),
             (100.0, 100.0)
         );
+    }
+
+    #[test]
+    fn read_scrollbar_rail_uses_live_allocation_instead_of_a_stale_scene_clip() {
+        let full = egui::Rect::from_min_max(egui::pos2(980.0, 100.0), egui::pos2(1_000.0, 700.0));
+        let live_allocation =
+            egui::Rect::from_min_max(egui::pos2(0.0, 260.0), egui::pos2(960.0, 650.0));
+        let rail = read_panel_scrollbar_rect(full, full.left(), live_allocation);
+
+        assert_eq!(rail.top(), 260.0);
+        assert_eq!(rail.bottom(), 650.0);
+        assert_eq!(rail.left(), full.left());
+        assert_eq!(rail.right(), full.right());
+        assert!(
+            rail.contains(egui::pos2(990.0, 600.0)),
+            "the lower live panel remains interactive even if a prior scene clip ended earlier"
+        );
+    }
+
+    #[test]
+    fn live_read_allocation_keeps_an_empty_rail_when_scene_cache_is_absent() {
+        let track_id = TrackId::new(91);
+        let allocation = egui::Rect::from_min_max(egui::pos2(0.0, 240.0), egui::pos2(900.0, 660.0));
+        let state = ReadPanelScrollState {
+            scroll_points: 480.0,
+            content_bottom_points: 2_000.0,
+            latent_scroll_fraction: Some(0.4),
+            ..ReadPanelScrollState::default()
+        };
+
+        let draft = read_panel_scrollbar_draft(track_id, allocation, state, 1.0, None, None);
+
+        assert_eq!(draft.track_id, track_id);
+        assert_eq!(draft.allocation, allocation);
+        assert_eq!(draft.maximum, 0.0);
+        assert_eq!(draft.offset, 0.0);
+        assert!(draft.overview.bins.is_empty());
+        assert_eq!(draft.preview_fraction, Some(0.4));
     }
 }

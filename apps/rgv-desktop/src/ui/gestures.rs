@@ -197,7 +197,7 @@ pub(crate) fn center_read_row_scroll(
 pub(crate) fn capture_stable_row_camera(
     effective_scroll: f32,
     row_height: f32,
-    layout_revision: u64,
+    coordinate_space: ReadRowCoordinateSpace,
 ) -> Option<StableRowCameraAnchor> {
     if !effective_scroll.is_finite() || !row_height.is_finite() || row_height <= f32::EPSILON {
         return None;
@@ -207,7 +207,7 @@ pub(crate) fn capture_stable_row_camera(
     Some(StableRowCameraAnchor {
         row,
         offset_fraction: (row_position - row as f32).clamp(0.0, 1.0),
-        layout_revision,
+        coordinate_space,
         row_height,
     })
 }
@@ -215,11 +215,19 @@ pub(crate) fn capture_stable_row_camera(
 pub(crate) fn reproject_stable_row_camera(
     anchor: StableRowCameraAnchor,
     row_height: f32,
-    layout_revision: u64,
+    coordinate_space: ReadRowCoordinateSpace,
 ) -> Option<f32> {
-    if anchor.layout_revision == layout_revision
-        && (anchor.row_height - row_height).abs() <= f32::EPSILON
-    {
+    if anchor.coordinate_space != coordinate_space {
+        // A change involving a unified coordinate space denotes a genuine repack or a switch of
+        // row authorities (stable extensions inherit their lineage). The old row number has no
+        // meaning in the new atlas, so begin at its first row instead of projecting a misleading
+        // camera position.
+        if matches!(anchor.coordinate_space, ReadRowCoordinateSpace::Unified(_))
+            || matches!(coordinate_space, ReadRowCoordinateSpace::Unified(_))
+        {
+            return Some(0.0);
+        }
+    } else if (anchor.row_height - row_height).abs() <= f32::EPSILON {
         return None;
     }
     Some((anchor.row as f32 + anchor.offset_fraction) * row_height)

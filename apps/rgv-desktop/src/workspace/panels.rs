@@ -27,20 +27,68 @@ pub(crate) struct ReadPanelDisplayCache {
     /// World-space y coordinate of stable read row zero.
     pub(crate) row_origin: Option<f32>,
     pub(crate) row_height: Option<f32>,
-    pub(crate) row_layout_revision: Option<u64>,
+    pub(crate) row_coordinate_authority: ReadRowCoordinateAuthority,
     pub(crate) materialized_row_range: Option<(usize, usize)>,
     pub(crate) total_rows: Option<usize>,
+    /// Optional semantic authority for the read navigator miniature. `Some(empty)` is
+    /// deliberately distinct from `None`: a unified scene can truthfully report that the
+    /// current genomic camera has no occupied rows even though its legacy CPU display list is
+    /// empty for an unrelated reason.
+    pub(crate) authoritative_overview: Option<ScrollbarOverview>,
     pub(crate) overview: ScrollbarOverview,
     pub(crate) actual_content_bottom: f32,
     pub(crate) clip_top: f32,
     pub(crate) clip_bottom: f32,
 }
 
+/// Identity of the row coordinate space used by a vertical read camera. Legacy CPU layouts have
+/// only their reconciliation revision; unified scenes carry the atlas lineage explicitly. The
+/// variants keep those domains disjoint so an unrelated scene revision can never accidentally
+/// preserve a row camera.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadRowCoordinateSpace {
+    Legacy(u64),
+    Unified(RowCoordinateSpaceRevision),
+}
+
+/// Whether the current display cache can describe the vertical row coordinate space exactly.
+///
+/// `Pending` is deliberately not an extent authority: it is used while a compatible retained
+/// scene overlaps the new genomic camera but does not contain it yet. The previous vertical
+/// camera remains latent during that short acquisition window, while the scrollbar itself stays
+/// empty until a camera-exact profile arrives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadRowCoordinateAuthority {
+    Absent,
+    Pending,
+    Exact(ReadRowCoordinateSpace),
+}
+
+impl ReadRowCoordinateAuthority {
+    #[must_use]
+    pub(crate) const fn is_pending(self) -> bool {
+        matches!(self, Self::Pending)
+    }
+
+    #[must_use]
+    pub(crate) const fn is_exact(self) -> bool {
+        matches!(self, Self::Exact(_))
+    }
+
+    #[must_use]
+    pub(crate) const fn exact(self) -> Option<ReadRowCoordinateSpace> {
+        match self {
+            Self::Exact(coordinate_space) => Some(coordinate_space),
+            Self::Absent | Self::Pending => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct StableRowCameraAnchor {
     pub(crate) row: usize,
     pub(crate) offset_fraction: f32,
-    pub(crate) layout_revision: u64,
+    pub(crate) coordinate_space: ReadRowCoordinateSpace,
     pub(crate) row_height: f32,
 }
 
@@ -573,6 +621,43 @@ pub(crate) fn maximum_annotation_frame_heights(
     heights
 }
 
+fn read_panel_allocation_rect(
+    layout: &WorkspacePaneLayout,
+    track_id: TrackId,
+) -> Option<egui::Rect> {
+    layout
+        .reads
+        .items
+        .iter()
+        .filter_map(read_panel_allocation)
+        .find_map(|(candidate, rect)| (candidate == track_id).then_some(rect))
+}
+
+fn read_panel_allocation_at_y(layout: &WorkspacePaneLayout, screen_y: f32) -> Option<TrackId> {
+    layout
+        .reads
+        .items
+        .iter()
+        .filter_map(read_panel_allocation)
+        .find_map(|(track_id, rect)| {
+            (screen_y >= rect.top() && screen_y < rect.bottom()).then_some(track_id)
+        })
+}
+
+fn read_panel_allocation(item: &ui::PaneItemLayout) -> Option<(TrackId, egui::Rect)> {
+    let PresentationNodeId::Track {
+        channel: ui::TrackPane::Reads,
+        track_id,
+    } = item.id
+    else {
+        return None;
+    };
+    (item.frame.kind == TrackKind::Alignment
+        && item.effective_content_visible
+        && item.row_rect.height() > 0.0)
+        .then_some((track_id, item.row_rect))
+}
+
 impl ViewPanelController {
     pub(crate) fn new(
         id: PanelId,
@@ -716,9 +801,98 @@ impl ViewPanelController {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_read_layout(track_id: TrackId, row_rect: egui::Rect) -> WorkspacePaneLayout {
+        let frame = TrackFrame {
+            key: TrackFrameKey::Alignment(track_id),
+            channel: ui::TrackPane::Reads,
+            name: "Reads".to_owned(),
+            kind: TrackKind::Alignment,
+            source_label: None,
+            top: row_rect.top(),
+            bottom: row_rect.bottom(),
+            visible: true,
+            collapsed: false,
+            frozen_bottom: Some(row_rect.top() + ui::TRACK_HEADER_HEIGHT),
+            subtracks: Vec::new(),
+        };
+        WorkspacePaneLayout {
+            annotation: ui::PaneLayoutSnapshot::empty(ui::TrackPane::Annotation),
+            reads: ui::PaneLayoutSnapshot {
+                channel: ui::TrackPane::Reads,
+                pane_rect: row_rect,
+                content_bottom: row_rect.bottom(),
+                scroll_points: 0.0,
+                stack_scroll_points: 0.0,
+                items: vec![ui::PaneItemLayout {
+                    id: PresentationNodeId::Track {
+                        channel: ui::TrackPane::Reads,
+                        track_id,
+                    },
+                    frame,
+                    row_rect,
+                    header_rect: egui::Rect::from_min_max(
+                        row_rect.min,
+                        egui::pos2(row_rect.right(), row_rect.top() + ui::TRACK_HEADER_HEIGHT),
+                    ),
+                    content_rect: Some(row_rect),
+                    clip_rect: row_rect,
+                    desired_content_visible: true,
+                    effective_content_visible: true,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn read_scrollbar_targeting_uses_the_live_panel_allocation() {
+        let track_id = TrackId::new(73);
+        let allocation = egui::Rect::from_min_max(egui::pos2(0.0, 210.0), egui::pos2(800.0, 570.0));
+        let layout = live_read_layout(track_id, allocation);
+
+        assert_eq!(
+            read_panel_allocation_rect(&layout, track_id),
+            Some(allocation)
+        );
+        assert_eq!(read_panel_allocation_at_y(&layout, 569.0), Some(track_id));
+        assert_eq!(read_panel_allocation_at_y(&layout, 570.0), None);
+
+        // A scene cache from the previous frame could still end at 420. The live allocation is
+        // intentionally the only input here, so the lower part of the current panel stays a
+        // valid scrollbar target while that cache catches up.
+        assert_eq!(read_panel_allocation_at_y(&layout, 500.0), Some(track_id));
+    }
+}
+
 impl ViewPanelController {
     pub(crate) fn effective_vertical_scroll_points(&self) -> f32 {
         (self.vertical_scroll_points - self.vertical_content_origin_points).max(0.0)
+    }
+
+    /// Returns the physical row allocated to an exposed read panel by the live pane layout.
+    ///
+    /// Scene display caches are allowed to lag this layout during navigation and window reflow,
+    /// so their clip rectangles must never define scrollbar paint or interaction geometry.
+    pub(crate) fn live_read_panel_rect(&self, track_id: TrackId) -> Option<egui::Rect> {
+        read_panel_allocation_rect(&self.pane_layout, track_id)
+    }
+
+    /// Resolves a read panel from the same live allocation used by its scrollbar rail.
+    pub(crate) fn live_read_panel_at_y(&self, screen_y: f32) -> Option<TrackId> {
+        read_panel_allocation_at_y(&self.pane_layout, screen_y)
+    }
+
+    pub(crate) fn live_read_panel_allocations(
+        &self,
+    ) -> impl Iterator<Item = (TrackId, egui::Rect)> + '_ {
+        self.pane_layout
+            .reads
+            .items
+            .iter()
+            .filter_map(read_panel_allocation)
     }
 
     pub(crate) fn read_panel_scroll_state(&self, track_id: TrackId) -> ReadPanelScrollState {

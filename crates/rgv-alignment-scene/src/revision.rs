@@ -47,6 +47,7 @@ revision_type!(AnnotationRevision);
 revision_type!(EvidenceRevision);
 revision_type!(SummaryRevision);
 revision_type!(RowAtlasRevision);
+revision_type!(RowCoordinateSpaceRevision);
 revision_type!(SceneRevision);
 
 /// Identity of one immutable version of an alignment source.

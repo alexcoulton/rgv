@@ -73,6 +73,33 @@ fn subtract_physical_regions(
     remainder
 }
 
+/// Builds the alignment-track configuration used at launch.
+///
+/// A track restored from a session remains wholly session-owned. A track synthesized from the
+/// command-line BAM/CRAM, however, must inherit the command-line complete-read limit instead of
+/// retaining `SessionAlignmentTrack::new`'s legacy 50,000-read default.
+fn alignment_track_configs_for_launch(
+    mut configured_tracks: Vec<SessionAlignmentTrack>,
+    alignment_source: Option<TrackSource>,
+    next_track_id: TrackId,
+    remote_index_url: Option<String>,
+    cli_maximum_alignments: usize,
+) -> Vec<SessionAlignmentTrack> {
+    if configured_tracks.is_empty()
+        && let Some(source) = alignment_source
+    {
+        let mut config = SessionAlignmentTrack::new(
+            next_track_id,
+            source_display_name(Some(&source), "Alignments"),
+            source,
+        );
+        config.remote_index_url = remote_index_url;
+        config.maximum_alignments = cli_maximum_alignments.max(1);
+        configured_tracks.push(config);
+    }
+    configured_tracks
+}
+
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn new(
@@ -323,29 +350,29 @@ impl Viewer {
             .map(|track| (track.id, AutomationAuxiliaryOpenState::Pending))
             .collect();
         let alignment_source = options.bam.as_ref().map(|path| track_source(path));
-        let mut alignment_track_configs = options
+        let configured_alignment_tracks = options
             .loaded_session
             .as_ref()
             .map_or_else(Vec::new, |session| session.alignment_tracks.clone());
-        if alignment_track_configs.is_empty()
-            && let Some(source) = alignment_source.clone()
-        {
-            let next_id = tracks
-                .tracks()
-                .iter()
-                .map(|track| track.id.get())
-                .max()
-                .unwrap_or_default()
-                .saturating_add(1);
-            alignment_track_configs.push(SessionAlignmentTrack::new(
-                TrackId::new(next_id),
-                source_display_name(Some(&source), "Alignments"),
-                source,
-            ));
-            alignment_track_configs[0]
-                .remote_index_url
-                .clone_from(&options.remote_index_url);
-        }
+        let next_alignment_track_id = tracks
+            .tracks()
+            .iter()
+            .map(|track| track.id.get())
+            .chain(
+                configured_alignment_tracks
+                    .iter()
+                    .map(|track| track.id.get()),
+            )
+            .max()
+            .unwrap_or_default()
+            .saturating_add(1);
+        let alignment_track_configs = alignment_track_configs_for_launch(
+            configured_alignment_tracks,
+            alignment_source.clone(),
+            TrackId::new(next_alignment_track_id),
+            options.remote_index_url.clone(),
+            options.max_alignments,
+        );
         let mut track_presentation = options.loaded_session.as_ref().map_or_else(
             || WorkspacePresentation::from_legacy(&alignment_track_configs, tracks.tracks()),
             |session| session.presentation.clone(),
@@ -1465,6 +1492,60 @@ fn decoded_capture_pixels(
         }
     }
     Ok(pixels)
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::alignment_track_configs_for_launch;
+    use rgv_core::{SessionAlignmentTrack, TrackId, TrackSource};
+
+    #[test]
+    fn command_line_alignment_track_inherits_the_requested_complete_read_limit() {
+        let source = TrackSource::Remote {
+            url: "https://example.test/sample.bam".to_owned(),
+        };
+        let tracks = alignment_track_configs_for_launch(
+            Vec::new(),
+            Some(source.clone()),
+            TrackId::new(9),
+            Some("https://example.test/sample.bam.bai".to_owned()),
+            10_000_000,
+        );
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].id, TrackId::new(9));
+        assert_eq!(tracks[0].source, source);
+        assert_eq!(tracks[0].maximum_alignments, 10_000_000);
+        assert_eq!(
+            tracks[0].remote_index_url.as_deref(),
+            Some("https://example.test/sample.bam.bai")
+        );
+    }
+
+    #[test]
+    fn restored_session_alignment_track_keeps_its_own_limit_and_index() {
+        let mut session_track = SessionAlignmentTrack::new(
+            TrackId::new(4),
+            "Session reads".to_owned(),
+            TrackSource::Local {
+                path: "/session/reads.bam".to_owned(),
+            },
+        );
+        session_track.maximum_alignments = 73_421;
+        session_track.remote_index_url = Some("https://session.test/index.bai".to_owned());
+
+        let tracks = alignment_track_configs_for_launch(
+            vec![session_track.clone()],
+            Some(TrackSource::Local {
+                path: "/cli/reads.bam".to_owned(),
+            }),
+            TrackId::new(99),
+            Some("https://cli.test/index.bai".to_owned()),
+            10_000_000,
+        );
+
+        assert_eq!(tracks, vec![session_track]);
+    }
 }
 
 #[cfg(test)]

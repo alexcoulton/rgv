@@ -13,12 +13,14 @@ use crate::display::{
     ANNOTATION_PANE_BACKGROUND, PINNED_ALIGNMENT_COVERAGE_HEIGHT,
     PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT, PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
     PINNED_ALIGNMENT_MODIFICATION_HEIGHT, PINNED_ALIGNMENT_REFERENCE_HEIGHT,
-    READ_PANE_HEADER_HEIGHT, SYNTHETIC_READ_ROW_STRIDE, alignment_annotation_lane_heights,
+    READ_PANE_HEADER_HEIGHT, SYNTHETIC_READ_ROW_STRIDE, alignment_activity_overview_from_counts,
+    alignment_annotation_lane_heights, alignment_scene_read_extent,
     annotation_frame_content_height, append_annotation_pane_background,
     ensure_annotation_presentation_frames, pane_layout_snapshot, pinned_gene_track_height,
-    primary_pinned_gene_id, read_interaction_highlight_color, reflow_annotation_presentation,
-    reflow_annotation_presentation_with_heights, synthetic_read_rows_for_bounds,
-    synthetic_section_display, track_section_geometry,
+    primary_pinned_gene_id, read_interaction_highlight_color, read_panel_scrollbar_maximum,
+    reconcile_read_panel_scroll_for_authority, reflow_annotation_presentation,
+    reflow_annotation_presentation_with_heights, resolve_read_panel_overview,
+    synthetic_read_rows_for_bounds, synthetic_section_display, track_section_geometry,
 };
 use rgv_layout::RectShape;
 
@@ -35,6 +37,106 @@ fn alignment_row_materialization_tracks_vertical_camera_with_overscan() {
     assert_eq!(
         materialized_alignment_row_range(220.0, 10.0, 320.0, 320.0, 0.0, 15, 2),
         (0, 0)
+    );
+}
+
+#[test]
+fn scene_row_activity_is_the_overview_authority_when_the_cpu_read_list_is_empty() {
+    let scene = alignment_activity_overview_from_counts([0, 3, 99, 1]);
+    let cpu_scrollable = DisplayList::default();
+    let resolved = resolve_read_panel_overview(Some(&scene), || {
+        ui::scrollbar_overview(&[], &cpu_scrollable, 0.0, 400.0, 0.0, 0.0, 800.0, 128)
+    });
+
+    assert_eq!(resolved, scene);
+    assert_eq!(resolved.bins.len(), 4);
+    assert_eq!(resolved.bins[0].kind, None);
+    assert!(resolved.bins[1].density > 0.0);
+    assert_eq!(resolved.bins[2].density, 1.0);
+    assert_eq!(resolved.bins[2].kind, Some(TrackKind::Alignment));
+}
+
+#[test]
+fn an_authoritative_empty_scene_overview_cannot_be_replaced_by_legacy_geometry() {
+    let empty = ui::ScrollbarOverview::default();
+    let resolved = resolve_read_panel_overview(Some(&empty), || {
+        alignment_activity_overview_from_counts([10, 20, 30])
+    });
+
+    assert_eq!(resolved, empty);
+}
+
+#[test]
+fn scene_active_row_end_controls_scroll_extent_and_shrink_clamps_the_camera() {
+    let (rows, bottom) = alignment_scene_read_extent(37, 200.0, 7.0, 400.0);
+    assert_eq!(rows, 37);
+    assert!((bottom - 465.0).abs() < f32::EPSILON);
+
+    let (scroll, _) = reconcile_vertical_scroll(500.0, 600.0, 100.0, Some(5.0 / 6.0), None);
+    assert!((scroll - 100.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn pending_row_authority_hides_stale_extent_without_forgetting_the_stable_camera() {
+    let lineage =
+        RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
+    let coordinate_space = ReadRowCoordinateSpace::Unified(lineage);
+    let mut state = ReadPanelScrollState {
+        scroll_points: 353.5,
+        content_origin_points: 3.5,
+        latent_scroll_fraction: Some(0.5),
+        content_bottom_points: 1_100.0,
+        density: Some(1.0),
+        stable_row_anchor: capture_stable_row_camera(350.0, 7.0, coordinate_space),
+        scene_contig: Some(ContigId::new(2)),
+    };
+    let settled = state;
+
+    assert_eq!(
+        reconcile_read_panel_scroll_for_authority(
+            &mut state,
+            ReadRowCoordinateAuthority::Pending,
+            Some(7.0),
+            400.0,
+            500.0,
+            0.0,
+            None,
+        ),
+        None
+    );
+    assert_eq!(state, settled, "pending work must remain purely latent");
+    assert_eq!(
+        read_panel_scrollbar_maximum(state, 500.0, ReadRowCoordinateAuthority::Pending),
+        0.0,
+        "the stale internal bound must never become the presented scrollbar extent"
+    );
+    assert_eq!(
+        read_panel_scrollbar_maximum(state, 500.0, ReadRowCoordinateAuthority::Absent),
+        0.0,
+        "missing semantic authority keeps the live rail but cannot expose an old thumb extent"
+    );
+
+    assert_eq!(
+        reconcile_read_panel_scroll_for_authority(
+            &mut state,
+            ReadRowCoordinateAuthority::Exact(coordinate_space),
+            Some(7.0),
+            900.0,
+            500.0,
+            0.0,
+            None,
+        ),
+        Some((7.0, coordinate_space))
+    );
+    assert!((state.scroll_points - 353.5).abs() < f32::EPSILON);
+    assert_eq!(state.stable_row_anchor, settled.stable_row_anchor);
+    assert_eq!(
+        read_panel_scrollbar_maximum(
+            state,
+            500.0,
+            ReadRowCoordinateAuthority::Exact(coordinate_space),
+        ),
+        400.0
     );
 }
 
@@ -1335,13 +1437,41 @@ fn read_highlights_are_baked_per_panel_without_object_id_collisions() {
 
 #[test]
 fn stable_row_camera_preserves_row_and_offset_across_layout_and_density_changes() {
-    let anchor = capture_stable_row_camera(10.5 * 7.0, 7.0, 4).unwrap();
+    let anchor =
+        capture_stable_row_camera(10.5 * 7.0, 7.0, ReadRowCoordinateSpace::Legacy(4)).unwrap();
     assert_eq!(anchor.row, 10);
     assert!((anchor.offset_fraction - 0.5).abs() < f32::EPSILON);
-    assert_eq!(reproject_stable_row_camera(anchor, 7.0, 4), None);
     assert_eq!(
-        reproject_stable_row_camera(anchor, 14.0, 5),
+        reproject_stable_row_camera(anchor, 7.0, ReadRowCoordinateSpace::Legacy(4)),
+        None
+    );
+    assert_eq!(
+        reproject_stable_row_camera(anchor, 14.0, ReadRowCoordinateSpace::Legacy(5)),
         Some(10.5 * 14.0)
+    );
+}
+
+#[test]
+fn unified_row_camera_survives_stable_lineage_but_resets_after_a_repack() {
+    let stable =
+        RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(1, 2));
+    let repacked =
+        RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(1, 3));
+    let anchor =
+        capture_stable_row_camera(10.5 * 7.0, 7.0, ReadRowCoordinateSpace::Unified(stable))
+            .unwrap();
+
+    assert_eq!(
+        reproject_stable_row_camera(anchor, 7.0, ReadRowCoordinateSpace::Unified(stable)),
+        None
+    );
+    assert_eq!(
+        reproject_stable_row_camera(anchor, 14.0, ReadRowCoordinateSpace::Unified(stable)),
+        Some(10.5 * 14.0)
+    );
+    assert_eq!(
+        reproject_stable_row_camera(anchor, 7.0, ReadRowCoordinateSpace::Unified(repacked)),
+        Some(0.0)
     );
 }
 

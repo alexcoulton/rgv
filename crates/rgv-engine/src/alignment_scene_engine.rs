@@ -610,22 +610,22 @@ fn scene_worker_loop<B>(
                         let Ok(telemetry) = coordinator.telemetry(refusal.owner) else {
                             continue;
                         };
+                        // This is a terminal source decision, not replaceable viewport data. A
+                        // later camera/clip frame may carry the same typed refusal, but must not
+                        // erase the only explicit terminal edge before the desktop consumes it.
                         if output
-                            .send_latest_for(
-                                refusal.owner.get(),
-                                AlignmentSceneEngineEvent::IndividualReadsRefused {
-                                    owner: refusal.owner,
-                                    request_token: current_request_token(
-                                        &request_tokens,
-                                        refusal.owner,
-                                    ),
-                                    target: refusal.target,
-                                    complete_read_limit: refusal.complete_read_limit,
-                                    eligible_records: refusal.eligible_records,
-                                    frame,
-                                    telemetry,
-                                },
-                            )
+                            .send_control(AlignmentSceneEngineEvent::IndividualReadsRefused {
+                                owner: refusal.owner,
+                                request_token: current_request_token(
+                                    &request_tokens,
+                                    refusal.owner,
+                                ),
+                                target: refusal.target,
+                                complete_read_limit: refusal.complete_read_limit,
+                                eligible_records: refusal.eligible_records,
+                                frame,
+                                telemetry,
+                            })
                             .is_err()
                         {
                             return;
@@ -1650,6 +1650,7 @@ mod tests {
                 eligible_records,
             }
         );
+        assert!(frame.individual_reads_refused_for_camera());
 
         assert!(
             engine
@@ -1657,6 +1658,46 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a terminal refusal must leave the worker idle instead of producing a restart loop"
+        );
+
+        // Camera/clip frames published after the dedicated terminal edge must remain
+        // self-describing. The desktop may legitimately consume only this later latest frame.
+        let vertically_shifted = AlignmentCamera::new(
+            camera.interval(),
+            camera.row_scroll() + 1.0,
+            camera.row_height(),
+            camera.read_height(),
+            camera.clip(),
+        )
+        .unwrap();
+        let later_request = AlignmentSceneRequestToken::new(7);
+        engine
+            .try_update_camera_for_request(owner, later_request, vertically_shifted)
+            .unwrap();
+        let later = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    request_token,
+                    frame,
+                    ..
+                } if *seen == owner
+                    && *request_token == later_request
+                    && frame.camera == vertically_shifted
+            )
+        });
+        let AlignmentSceneEngineEvent::FrameUpdated { frame, .. } = later else {
+            unreachable!("the matching event has the asserted frame shape")
+        };
+        assert!(frame.individual_reads_refused_for_camera());
+        assert_eq!(
+            frame.individual_reads,
+            crate::AlignmentIndividualReadCapability::Refused {
+                target,
+                complete_read_limit,
+                eligible_records,
+            }
         );
 
         engine

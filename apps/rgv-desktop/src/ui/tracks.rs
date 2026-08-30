@@ -803,19 +803,9 @@ fn paint_annotation_scrollbar_with_id(
     painter.rect_filled(rect, 0.0, Color32::from_gray(250));
     painter.rect_filled(geometry.track, 0.0, Color32::WHITE);
     if let Some(overview) = overview.filter(|overview| !overview.bins.is_empty()) {
-        let bin_height = geometry.track.height() / overview.bins.len() as f32;
         for (index, bin) in overview.bins.iter().enumerate() {
-            let top = geometry.track.top() + index as f32 * bin_height;
-            let bottom = if index + 1 == overview.bins.len() {
-                geometry.track.bottom()
-            } else {
-                top + bin_height + 0.5
-            };
             painter.rect_filled(
-                Rect::from_min_max(
-                    pos2(geometry.track.left(), top),
-                    pos2(geometry.track.right(), bottom),
-                ),
+                scrollbar_overview_bin_rect(geometry.track, index, overview.bins.len()),
                 0.0,
                 scrollbar_overview_color(bin.kind, bin.density),
             );
@@ -975,6 +965,19 @@ fn scrollbar_geometry_with_visible_fraction(
         egui::vec2(track.width(), thumb_height),
     );
     ScrollbarGeometry { track, thumb }
+}
+
+fn scrollbar_overview_bin_rect(track: Rect, index: usize, bin_count: usize) -> Rect {
+    debug_assert!(bin_count > 0);
+    debug_assert!(index < bin_count);
+    let bin_height = track.height() / bin_count as f32;
+    let top = track.top() + index as f32 * bin_height;
+    let bottom = if index + 1 == bin_count {
+        track.bottom()
+    } else {
+        top + bin_height + 0.5
+    };
+    Rect::from_min_max(pos2(track.left(), top), pos2(track.right(), bottom))
 }
 
 pub fn scrollbar_fraction_at_grab(
@@ -1150,19 +1153,9 @@ fn paint_vertical_scrollbar_with_id(
     painter.rect_filled(rect, 0.0, Color32::from_gray(250));
     painter.rect_filled(geometry.track, 0.0, Color32::WHITE);
     if let Some(overview) = overview.filter(|overview| !overview.bins.is_empty()) {
-        let bin_height = geometry.track.height() / overview.bins.len() as f32;
         for (index, bin) in overview.bins.iter().enumerate() {
-            let top = geometry.track.top() + index as f32 * bin_height;
-            let bottom = if index + 1 == overview.bins.len() {
-                geometry.track.bottom()
-            } else {
-                top + bin_height + 0.5
-            };
             painter.rect_filled(
-                Rect::from_min_max(
-                    pos2(geometry.track.left(), top),
-                    pos2(geometry.track.right(), bottom),
-                ),
+                scrollbar_overview_bin_rect(geometry.track, index, overview.bins.len()),
                 0.0,
                 scrollbar_overview_color(bin.kind, bin.density),
             );
@@ -5311,6 +5304,59 @@ mod tests {
             geometry.thumb.height(),
             geometry.track.height() * expected_fraction,
         );
+    }
+
+    #[test]
+    fn read_scrollbar_rail_is_invariant_while_only_the_thumb_adapts() {
+        let rect = Rect::from_min_max(pos2(0.0, 120.0), pos2(22.0, 620.0));
+        let pending = scrollbar_geometry_for_density_in_viewport(
+            rect,
+            0.0,
+            0.0,
+            MIN_VERTICAL_DENSITY,
+            rect.height(),
+        );
+        let exact = scrollbar_geometry_for_density_in_viewport(
+            rect,
+            1_500.0,
+            400.0,
+            MIN_VERTICAL_DENSITY,
+            rect.height(),
+        );
+        let dense = scrollbar_geometry_for_density_in_viewport(
+            rect,
+            1_500.0,
+            400.0,
+            MAX_VERTICAL_DENSITY,
+            rect.height(),
+        );
+
+        assert_eq!(pending.track, exact.track);
+        assert_eq!(exact.track, dense.track);
+        assert_eq!(pending.thumb, pending.track);
+        assert!(exact.thumb.height() < pending.thumb.height());
+        assert!(dense.thumb.height() <= exact.thumb.height());
+    }
+
+    #[test]
+    fn read_density_preview_spans_the_complete_fixed_rail() {
+        let rect = Rect::from_min_max(pos2(0.0, 80.0), pos2(22.0, 580.0));
+        let geometry = scrollbar_geometry_for_density_in_viewport(
+            rect,
+            2_000.0,
+            750.0,
+            MAX_VERTICAL_DENSITY,
+            rect.height(),
+        );
+        let bin_count = 128;
+        let first = scrollbar_overview_bin_rect(geometry.track, 0, bin_count);
+        let last = scrollbar_overview_bin_rect(geometry.track, bin_count - 1, bin_count);
+
+        assert_eq!(first.top(), geometry.track.top());
+        assert_eq!(last.bottom(), geometry.track.bottom());
+        assert_eq!(first.x_range(), geometry.track.x_range());
+        assert_eq!(last.x_range(), geometry.track.x_range());
+        assert!(geometry.thumb.height() < geometry.track.height());
     }
 
     #[test]
