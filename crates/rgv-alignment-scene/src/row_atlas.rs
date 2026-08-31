@@ -643,7 +643,7 @@ impl AlignmentRowActivityCursor {
 }
 
 #[derive(Debug)]
-struct RowAtlasLayer {
+pub(crate) struct RowAtlasLayer {
     /// Source-handle order makes lookup deterministic and logarithmic.
     records: Arc<[RowAtlasRecord]>,
     /// Indices into `records`, ordered by `(row, start, end, handle)`.
@@ -697,6 +697,10 @@ impl RowAtlasLayer {
             row_prefix_max_end: row_prefix_max_end.into(),
             allocation,
         }))
+    }
+
+    pub(crate) const fn allocation(&self) -> &AllocationLease {
+        &self.allocation
     }
 
     fn record(&self, handle: AlignmentHandle) -> Option<(u32, RowAtlasRecord)> {
@@ -1181,6 +1185,14 @@ impl AlignmentRowAtlas {
         self.layers.len()
     }
 
+    pub(crate) fn layers(&self) -> &[Arc<RowAtlasLayer>] {
+        &self.layers
+    }
+
+    pub(crate) const fn metadata_allocation(&self) -> &AllocationLease {
+        &self.metadata_allocation
+    }
+
     #[must_use]
     pub fn record(&self, handle: AlignmentHandle) -> Option<RowAtlasRecordHit> {
         self.layers
@@ -1321,6 +1333,10 @@ impl AlignmentRowAtlasPins {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.allocations.is_empty()
+    }
+
+    pub(crate) fn allocations(&self) -> &[PinnedAllocationLease] {
+        &self.allocations
     }
 }
 

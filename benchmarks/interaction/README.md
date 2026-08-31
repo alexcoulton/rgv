@@ -28,6 +28,12 @@ cargo run --release -p rgv-interaction-bench -- \
   --output benchmark-results/interaction-latest.json
 ```
 
+For a prepared dense locus, add `--require-contained-camera-only`. The run then fails if any
+repeated pan reacquires source evidence, rebuilds the row atlas, constructs a new presentation,
+publishes a semantic replacement, or rebuilds the row-activity cursor. Reports separate initial
+construction totals from interaction-only deltas, including the number of indexed interval
+boundaries examined during the repeated camera moves.
+
 Run on stable, named hardware before treating the result as a performance gate.
 
 The fixed post-feature scaling matrix uses the same deep short-read locus with 1, 4, and 8 tracks

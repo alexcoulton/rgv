@@ -276,6 +276,10 @@ impl ExactSummaryRoot {
         self.prepared
     }
 
+    pub(crate) const fn metadata_allocation(&self) -> &AllocationLease {
+        &self.metadata_allocation
+    }
+
     #[must_use]
     pub fn depth_tiles(&self) -> &[Arc<ExactDepthSummaryTile>] {
         &self.depth
@@ -671,6 +675,10 @@ impl ExactSummaryPins {
     #[must_use]
     pub fn len(&self) -> usize {
         self.allocations.len()
+    }
+
+    pub(crate) fn allocations(&self) -> &[PinnedAllocationLease] {
+        &self.allocations
     }
 }
 

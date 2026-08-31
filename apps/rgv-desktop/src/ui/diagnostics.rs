@@ -37,6 +37,11 @@ impl Viewer {
         let alignment_ledger_operations = self.alignment_scene_ledger.operation_counters().ok();
         let read_gpu_operations = self.alignment_gpu_renderer.operation_counters();
         let summary_gpu_operations = self.alignment_summary_gpu_renderer.operation_counters();
+        let context_gpu_operations = self.context_scene_gpu_renderer.operation_counters();
+        let generic_gpu_operations = self.rectangle_renderer.operation_counters();
+        let aggregate_cache_budget = self.aggregate_cache_budget_bytes();
+        let context_gpu_bytes = self.context_scene_gpu_renderer.resident_bytes();
+        let generic_gpu_bytes = self.rectangle_renderer.resident_bytes();
         let mut alignment_tracks = Vec::with_capacity(self.alignment_tracks.len());
         for track in &self.alignment_tracks {
             let projection = track.projection(active_panel_id);
@@ -134,8 +139,9 @@ impl Viewer {
                     .map_or_else(String::new, |failure| {
                         format!(" · INVARIANT FAILURE: {failure}")
                     });
+                let work = projection.scene_telemetry;
                 alignment_tracks.push(format!(
-                    "{} · unified scene · panel {:?} track {:?} · g{} t{} · {:?} ({}) · owner {:?} · products {:?} · camera {:?} · {} · {} · journal {}/64 [{}]{}{}",
+                    "{} · unified scene · panel {:?} track {:?} · g{} t{} · {:?} ({}) · owner {:?} · products {:?} · camera {:?} · {} · {} · work camera {}/{} source {} atlas {} presentation {} publications {} · indexed rows {} queries / {} rebuilds / {} examined / {} changed · journal {}/64 [{}]{}{}",
                     track.config.name,
                     transaction.panel_id,
                     transaction.track_id,
@@ -150,6 +156,16 @@ impl Viewer {
                     transaction.desired_camera.map(|camera| camera.interval()),
                     committed,
                     staged_source,
+                    work.camera_only_updates,
+                    work.camera_updates,
+                    work.source_acquisitions,
+                    work.row_atlas_candidates,
+                    work.presentation_candidates,
+                    work.scene_publications,
+                    work.row_activity_queries,
+                    work.row_activity_rebuilds,
+                    work.row_activity_intervals_examined,
+                    work.row_activity_intervals_changed,
                     transaction.journal_entries,
                     recent,
                     transaction
@@ -364,8 +380,17 @@ impl Viewer {
                     |progress| {
                         let retained = progress.retained;
                         let operations = alignment_ledger_operations.unwrap_or_default();
+                        let aggregate_occupied = progress
+                            .charged
+                            .saturating_add(progress.reserved)
+                            .saturating_add(context_gpu_bytes)
+                            .saturating_add(generic_gpu_bytes);
                         format!(
-                            "scene ledger {:.1}/{:.1} MiB charged · evidence {:.1} · summaries {:.1} · rows {:.1} · semantic {:.1} · GPU/frames {:.1} · reserved {:.1} · transient {:.1} (peak {:.1}) · pinned {:.1} · replacement {:?} · ledger inventories {} / {} records enumerated · prepared-manifest builds read {} ({} pages), summary {} ({} pages) · bounded prefetch keys inspected read {}, summary {} · indexed reclaim keys inspected read {}, summary {}",
+                            "aggregate cache {:.1}/{:.1} MiB occupied · context GPU {:.1} · generic GPU {:.1} (explicit non-borrowing reservations) · scene ledger {:.1}/{:.1} MiB charged · evidence {:.1} · summaries {:.1} · rows {:.1} · semantic {:.1} · GPU/frames {:.1} · reserved {:.1} · transient {:.1} (peak {:.1}) · pinned {:.1} · replacement {:?} · ledger inventories {} / {} records enumerated · prepared-manifest builds read {} ({} pages), summary {} ({} pages) · bounded prefetch keys inspected read {}, summary {} · indexed reclaim keys inspected read {}, summary {}",
+                            aggregate_occupied as f64 / (1024.0 * 1024.0),
+                            aggregate_cache_budget as f64 / (1024.0 * 1024.0),
+                            context_gpu_bytes as f64 / (1024.0 * 1024.0),
+                            generic_gpu_bytes as f64 / (1024.0 * 1024.0),
                             progress.charged as f64 / (1024.0 * 1024.0),
                             progress.budget as f64 / (1024.0 * 1024.0),
                             retained.evidence_bytes() as f64 / (1024.0 * 1024.0),
@@ -391,8 +416,50 @@ impl Viewer {
                         )
                     },
                 );
+                let reads = self.alignment_gpu_last_prepare_stats;
+                let summaries = self.alignment_summary_gpu_last_prepare_stats;
+                let pressure = self.alignment_last_gpu_budget_pressure.map_or_else(
+                    String::new,
+                    |pressure| {
+                        format!(
+                            "\nlast capacity pressure: {:?} · candidate {:.1} MiB · effective occupied {:.1} MiB · exact retirement credit {:.1} MiB · limit {:.1} MiB · required reclaim {:.1} MiB",
+                            pressure.cause,
+                            pressure.requested_bytes as f64 / (1024.0 * 1024.0),
+                            pressure
+                                .charged_bytes_at_failure
+                                .saturating_add(pressure.reserved_bytes_at_failure)
+                                as f64
+                                / (1024.0 * 1024.0),
+                            pressure.retirement_credit_bytes as f64 / (1024.0 * 1024.0),
+                            pressure.limit_bytes as f64 / (1024.0 * 1024.0),
+                            pressure.required_reclaim_bytes() as f64 / (1024.0 * 1024.0),
+                        )
+                    },
+                );
                 format!(
-                    "{scene}\nBudget scope: scene-owned CPU/GPU allocations only; wgpu driver copies, allocator retention, UI, generic tracks, and process runtime memory are outside the ledger and explain any RSS difference."
+                    "{scene}{pressure}\nlast read frame: {} pages · {} body / {} overlay instances · {} labels from {} anchors · {} new page pins · {} camera bytes · {} immutable upload bytes · hits/misses {}/{}\nlast summary frame: {} pages · depth {} / allele {} / junction {} / modification {} instances · {} range queries / {} junction entries examined · {} new page pins · {} camera bytes · {} immutable upload bytes · hits/misses {}/{}\nBudget scope: the configured aggregate includes ledger-owned alignment CPU/GPU plus explicit non-borrowing reservations for contextual and generic GPU buffers. Driver copies, allocator retention, UI, and process runtime memory are reported outside that ceiling.",
+                    reads.mandatory_pages,
+                    reads.base_instances,
+                    reads.overlay_instances,
+                    reads.text_labels,
+                    reads.label_anchors_examined,
+                    reads.page_pin_acquisitions,
+                    reads.camera_uniform_bytes,
+                    reads.geometry_uploaded_bytes,
+                    reads.page_cache_hits,
+                    reads.page_cache_misses,
+                    summaries.mandatory_pages,
+                    summaries.depth_instances,
+                    summaries.allele_instances,
+                    summaries.junction_instances,
+                    summaries.modification_instances,
+                    summaries.range_maximum_queries,
+                    summaries.junction_entries_examined,
+                    summaries.page_pin_acquisitions,
+                    summaries.camera_uniform_bytes,
+                    summaries.geometry_uploaded_bytes,
+                    summaries.page_cache_hits,
+                    summaries.page_cache_misses,
                 )
             }),
             remote: (remote_requests > 0).then(|| {
@@ -402,17 +469,25 @@ impl Viewer {
                 )
             }),
             gpu_upload: format!(
-                "GPU upload {} KiB{} · generic slabs {} entries / {} MiB / {} · contextual {} lanes / {:.2} MiB · {} KiB geometry / {} camera writes / {} rejected",
+                "GPU upload {} KiB{} · generic slabs {} entries / {} MiB / {} · cumulative {} prepares / {} instances / {} KiB · contextual {} lanes / {:.2} MiB · {} KiB geometry / {} camera writes / {} rejected · cumulative {} content prepares / {}/{} camera captures / {} replacements / {} KiB immutable",
                 upload.uploaded_bytes / 1024,
                 if upload.truncated { " · capped" } else { "" },
                 upload.slab_entries,
                 upload.slab_resident_bytes / (1024 * 1024),
                 if upload.slab_cache_hit { "hit" } else { "miss" },
+                generic_gpu_operations.preparations,
+                generic_gpu_operations.instances_examined,
+                generic_gpu_operations.uploaded_bytes / 1024,
                 context_gpu.resident_lanes,
                 context_gpu.resident_bytes as f64 / (1024.0 * 1024.0),
                 context_gpu.uploaded_bytes / 1024,
                 context_gpu.camera_writes,
                 context_gpu.rejected_lanes,
+                context_gpu_operations.content_preparations,
+                context_gpu_operations.camera_captures,
+                context_gpu_operations.camera_capture_attempts,
+                context_gpu_operations.content_replacement_requests,
+                context_gpu_operations.immutable_upload_bytes / 1024,
             ),
             navigation: format!(
                 "navigation {} inputs / {} coalesced / {} dispatched / {} release-dispatched / {} cancelled / {} committed · last {:.2} ms · {} stale results rejected · row layout {} active / {} cancelled",

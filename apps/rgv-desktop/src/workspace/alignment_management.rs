@@ -43,6 +43,8 @@ struct CapturedAlignmentLaneSource {
     camera: AlignmentSceneCamera,
     individual_reads: AlignmentIndividualReadCapability,
     semantic_target_complete: bool,
+    reference_ready: bool,
+    vertical_residency: AlignmentVerticalResidency,
     camera_sequence: u64,
     snapshot: Option<Arc<AlignmentSceneSnapshot>>,
     scene_contracts_current: bool,
@@ -52,6 +54,25 @@ struct CapturedAlignmentPanelSceneEpoch {
     panel_frames: HashMap<PanelId, AlignmentPanelSceneFrame>,
     lane_sources: Vec<CapturedAlignmentLaneSource>,
     panel_scene_stores: HashMap<PanelId, AlignmentPanelSceneStore>,
+}
+
+/// Move-only semantic half of an end-to-end alignment replacement. Both old frame captures and
+/// their resident panel stores are detached together, so rollback can restore the exact prior hit
+/// and display authority. The planner recursively proves snapshot, root, leaf, page, and pin
+/// ownership; only allocations whose complete live reference set belongs to this token enter
+/// `claim_set`, while genuinely shared ownership remains charged and protected.
+#[must_use = "restore this semantic epoch after refusal or settle it with the replacement"]
+struct AlignmentSemanticEpochRetirement {
+    claim_set: AllocationRetirementClaimSet,
+    stats: AlignmentSemanticRetirementStats,
+    panel_frames: HashMap<PanelId, AlignmentPanelSceneFrame>,
+    panel_scene_stores: HashMap<PanelId, AlignmentPanelSceneStore>,
+}
+
+impl AllocationRetirementToken for AlignmentSemanticEpochRetirement {
+    fn retirement_claim_set(&self) -> &AllocationRetirementClaimSet {
+        &self.claim_set
+    }
 }
 
 enum AlignmentGpuCameraCaptureOutcome {
@@ -285,6 +306,7 @@ impl OwnedAlignmentSummaryGpuRequest {
 /// The combined claim cannot outlive either child renderer token.
 struct AlignmentGpuCompositeRetirement {
     claim_set: AllocationRetirementClaimSet,
+    semantic: Option<AlignmentSemanticEpochRetirement>,
     reads: Option<AlignmentGpuRetirement>,
     summaries: Option<AlignmentSummaryGpuRetirement>,
 }
@@ -338,6 +360,9 @@ impl AlignmentGpuBundleFailure {
 fn alignment_gpu_bundle_blocker(
     error: &AllocationBundleError,
 ) -> Option<AlignmentGpuPublicationBlocker> {
+    if let Some(pressure) = alignment_gpu_bundle_budget_pressure(error) {
+        return Some(AlignmentGpuPublicationBlocker::AggregateGpu(pressure));
+    }
     match error {
         AllocationBundleError::ReplacementTransitionActive { bundle_id } => Some(
             AlignmentGpuPublicationBlocker::Ledger(LedgerError::ReplacementTransitionActive {
@@ -412,8 +437,63 @@ fn alignment_gpu_publication_blocker_remains(
         AlignmentGpuPublicationBlocker::Ledger(pressure) => {
             alignment_ledger_pressure_blocker_remains(pressure, snapshot)
         }
+        AlignmentGpuPublicationBlocker::AggregateGpu(pressure) => {
+            alignment_gpu_budget_pressure_remains(pressure, snapshot)
+        }
         AlignmentGpuPublicationBlocker::PolicyRevisionChanged { .. } => false,
     }
+}
+
+/// Re-evaluates one aggregate GPU refusal without losing its replacement accounting model.
+/// `retirement_credit_bytes` is subtracted only for the steady-state test; transition-overlap and
+/// ordinary retained pressure intentionally use physical occupied bytes.
+fn alignment_gpu_budget_pressure_remains(
+    pressure: GpuBudgetPressure,
+    snapshot: &impl AlignmentLedgerProgressView,
+) -> bool {
+    let snapshot = snapshot.alignment_ledger_progress();
+    let expected_limit = match pressure.cause {
+        rgv_render::GpuBudgetPressureCause::RetainedBudget => {
+            pressure.limit_bytes == snapshot.budget
+                || pressure.limit_bytes
+                    == snapshot.budget.saturating_add(snapshot.transition_reserve)
+        }
+        rgv_render::GpuBudgetPressureCause::SteadyReplacement => {
+            pressure.limit_bytes == snapshot.budget
+        }
+        rgv_render::GpuBudgetPressureCause::TransitionOverlap => {
+            pressure.limit_bytes == snapshot.budget.saturating_add(snapshot.transition_reserve)
+        }
+    };
+    if !expected_limit {
+        return false;
+    }
+    let occupied = snapshot.charged.saturating_add(snapshot.reserved);
+    let effective_occupied = match pressure.cause {
+        rgv_render::GpuBudgetPressureCause::SteadyReplacement => {
+            occupied.saturating_sub(pressure.retirement_credit_bytes)
+        }
+        rgv_render::GpuBudgetPressureCause::RetainedBudget
+        | rgv_render::GpuBudgetPressureCause::TransitionOverlap => occupied,
+    };
+    effective_occupied.saturating_add(pressure.requested_bytes) > pressure.limit_bytes
+}
+
+fn alignment_gpu_pressure_target_charged(
+    pressure: GpuBudgetPressure,
+    snapshot: &impl AlignmentLedgerProgressView,
+) -> usize {
+    let snapshot = snapshot.alignment_ledger_progress();
+    let retirement_credit = match pressure.cause {
+        rgv_render::GpuBudgetPressureCause::SteadyReplacement => pressure.retirement_credit_bytes,
+        rgv_render::GpuBudgetPressureCause::RetainedBudget
+        | rgv_render::GpuBudgetPressureCause::TransitionOverlap => 0,
+    };
+    pressure
+        .limit_bytes
+        .saturating_sub(pressure.requested_bytes)
+        .saturating_add(retirement_credit)
+        .saturating_sub(snapshot.reserved)
 }
 
 fn alignment_gpu_publication_retry_gate(
@@ -426,6 +506,18 @@ fn alignment_gpu_publication_retry_gate(
     } else {
         AlignmentGpuPublicationRetryGate::ReadyAfterObservedProgress
     }
+}
+
+/// Cache-owner progress is meaningful even when old presentation pins keep the ledger's charged
+/// byte total unchanged: relinquishing the final outside `Arc` can enlarge the exact retirement
+/// set on the next atomic attempt. This permits one correlated retry; a second reclaim cycle with
+/// neither byte nor ownership progress settles `BudgetLimited` instead of spinning.
+fn alignment_capacity_reclaim_allows_retry(
+    blocker: AlignmentGpuPublicationBlocker,
+    snapshot: &impl AlignmentLedgerProgressView,
+    relinquished_cache_entries: usize,
+) -> bool {
+    relinquished_cache_entries > 0 || !alignment_gpu_publication_blocker_remains(blocker, snapshot)
 }
 
 fn alignment_gpu_publication_retry_poll(
@@ -511,18 +603,15 @@ fn alignment_gpu_bundle_budget_pressure(
             occupied,
             retiring,
             limit,
-        } => Some(GpuBudgetPressure::from_budget_failure(
-            candidate,
-            occupied.saturating_sub(retiring),
-            0,
-            limit,
+        } => Some(GpuBudgetPressure::from_steady_replacement_failure(
+            candidate, occupied, retiring, limit,
         )),
         AllocationBundleError::TransitionOverlapBudgetExceeded {
             candidate,
             occupied,
             limit,
-        } => Some(GpuBudgetPressure::from_budget_failure(
-            candidate, occupied, 0, limit,
+        } => Some(GpuBudgetPressure::from_transition_overlap_failure(
+            candidate, occupied, limit,
         )),
         _ => None,
     }
@@ -531,12 +620,7 @@ fn alignment_gpu_bundle_budget_pressure(
 const fn alignment_gpu_budget_pressure_blocker(
     pressure: GpuBudgetPressure,
 ) -> AlignmentGpuPublicationBlocker {
-    AlignmentGpuPublicationBlocker::Ledger(LedgerError::BudgetExceeded {
-        requested: pressure.requested_bytes,
-        charged: pressure.charged_bytes_at_failure,
-        reserved: pressure.reserved_bytes_at_failure,
-        limit: pressure.limit_bytes,
-    })
+    AlignmentGpuPublicationBlocker::AggregateGpu(pressure)
 }
 
 /// Translates retained shared-ledger pressure into the exact headroom goal understood by both GPU
@@ -668,12 +752,14 @@ impl AlignmentGpuSpeculationGate {
         self.phase = AlignmentGpuSpeculationPhase::Suppressed;
     }
 
-    const fn finish_cycle(&mut self, missing_pages_remain: bool) {
+    const fn finish_cycle(&mut self, missing_pages_remain: bool, retention_limited: bool) {
         if matches!(self.phase, AlignmentGpuSpeculationPhase::Suppressed) {
             return;
         }
         self.phase = if missing_pages_remain {
             AlignmentGpuSpeculationPhase::Warming
+        } else if retention_limited {
+            AlignmentGpuSpeculationPhase::DemandPaged
         } else {
             AlignmentGpuSpeculationPhase::Resident
         };
@@ -752,7 +838,7 @@ mod alignment_gpu_policy_tests {
     fn lowering_budget_suppresses_instead_of_rewarming() {
         let mut gate = AlignmentGpuSpeculationGate::default();
         gate.observe_foreground(authority(0), 2_000);
-        gate.finish_cycle(true);
+        gate.finish_cycle(true, false);
         assert_eq!(gate.phase, AlignmentGpuSpeculationPhase::Warming);
         gate.observe_foreground(authority(0), 1_000);
         assert_eq!(gate.phase, AlignmentGpuSpeculationPhase::Suppressed);
@@ -806,11 +892,30 @@ mod alignment_gpu_policy_tests {
             };
             let pressure = alignment_gpu_bundle_budget_pressure(&error)
                 .expect("an oversized exact candidate remains typed capacity pressure");
+            assert_eq!(
+                pressure.cause,
+                rgv_render::GpuBudgetPressureCause::SteadyReplacement
+            );
             assert_eq!(pressure.requested_bytes, 1_001);
+            assert_eq!(pressure.retirement_credit_bytes, retiring);
             assert!(
                 !GpuReclaimGoal::new(pressure, occupied.saturating_sub(retiring)).is_feasible()
             );
         }
+
+        let overlap = alignment_gpu_bundle_budget_pressure(
+            &AllocationBundleError::TransitionOverlapBudgetExceeded {
+                candidate: 500,
+                occupied: 900,
+                limit: 1_200,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            overlap.cause,
+            rgv_render::GpuBudgetPressureCause::TransitionOverlap
+        );
+        assert_eq!(overlap.retirement_credit_bytes, 0);
     }
 
     #[test]
@@ -827,6 +932,24 @@ mod alignment_gpu_policy_tests {
 }
 
 impl Viewer {
+    /// Immediately releases every optional GPU pin when a foreground camera/navigation target
+    /// begins. Renderer pages remain reusable and exact; only the speculative whole-stack
+    /// residency promise is revoked, and the same authority may warm again after input settles.
+    pub(crate) fn revoke_alignment_gpu_optional_residency_for_foreground(&mut self) {
+        let (reads, summaries) = self
+            .alignment_presented_epoch
+            .as_ref()
+            .and_then(|epoch| epoch.gpu_bundle.as_ref())
+            .map_or((false, false), |bundle| {
+                (bundle.reads.is_some(), bundle.summaries.is_some())
+            });
+        self.alignment_gpu_residency_bundle = None;
+        self.alignment_gpu_prefetch.reset(reads, summaries);
+        if self.alignment_gpu_speculation_gate.authority.is_some() {
+            self.alignment_gpu_speculation_gate.phase = AlignmentGpuSpeculationPhase::Eligible;
+        }
+    }
+
     fn defer_alignment_gpu_publication(
         &mut self,
         attempt: &AlignmentScenePublicationAttempt,
@@ -891,10 +1014,10 @@ impl Viewer {
             .checked_add(1)
             .expect("alignment capacity reclaim request space was exhausted");
         let request_id = self.alignment_capacity_reclaim_clock;
-        let target_occupied = pressure
-            .limit_bytes
-            .saturating_sub(pressure.requested_bytes);
-        let target_charged = target_occupied.saturating_sub(snapshot.reserved);
+        // A steady replacement may legitimately retain the old epoch until commit. Its exact
+        // retirement credit therefore belongs in the physical occupancy ceiling; omitting it
+        // would ask source/semantic owners to evict bytes already proved to disappear atomically.
+        let target_charged = alignment_gpu_pressure_target_charged(pressure, &snapshot);
         let mut pending_tracks = HashSet::new();
         for track in &self.alignment_tracks {
             let Some(engine) = &track.scene_engine else {
@@ -916,6 +1039,7 @@ impl Viewer {
             target_charged,
             pending_tracks,
             released_bytes: 0,
+            relinquished_cache_entries: 0,
         });
         self.data_status = "Reclaiming inactive alignment cache for the current view…".to_owned();
         self.finish_alignment_capacity_reclaim_if_complete();
@@ -926,6 +1050,7 @@ impl Viewer {
         track_id: TrackId,
         request_id: u64,
         released_bytes: usize,
+        relinquished_cache_entries: usize,
     ) {
         let completed = {
             let Some(cycle) = self.alignment_capacity_reclaim.as_mut() else {
@@ -935,6 +1060,9 @@ impl Viewer {
                 return;
             }
             cycle.released_bytes = cycle.released_bytes.saturating_add(released_bytes);
+            cycle.relinquished_cache_entries = cycle
+                .relinquished_cache_entries
+                .saturating_add(relinquished_cache_entries);
             cycle.pending_tracks.is_empty()
         };
         if completed {
@@ -973,7 +1101,11 @@ impl Viewer {
                 return;
             }
         };
-        if !alignment_gpu_publication_blocker_remains(cycle.blocker, &snapshot) {
+        if alignment_capacity_reclaim_allows_retry(
+            cycle.blocker,
+            &snapshot,
+            cycle.relinquished_cache_entries,
+        ) {
             if let Some(retry) = self.alignment_gpu_publication_retry.as_mut()
                 && retry.target_revision == cycle.target_revision
                 && retry.attempt_sequence == cycle.attempt_sequence
@@ -983,8 +1115,11 @@ impl Viewer {
             tracing::debug!(
                 request_id = cycle.request_id,
                 released_bytes = cycle.released_bytes,
+                relinquished_cache_entries = cycle.relinquished_cache_entries,
                 target_charged = cycle.target_charged,
-                "aggregate alignment reclaim satisfied foreground headroom"
+                blocker_cleared =
+                    !alignment_gpu_publication_blocker_remains(cycle.blocker, &snapshot),
+                "aggregate alignment reclaim made capacity or retirement-ownership progress"
             );
             self.window.request_redraw();
             return;
@@ -1004,6 +1139,7 @@ impl Viewer {
         tracing::warn!(
             request_id = cycle.request_id,
             released_bytes = cycle.released_bytes,
+            relinquished_cache_entries = cycle.relinquished_cache_entries,
             remaining_bytes,
             charged_bytes = snapshot.charged,
             reserved_bytes = snapshot.reserved,
@@ -1115,7 +1251,9 @@ impl Viewer {
             self.alignment_gpu_speculation_gate
                 .suppress_for_foreground_pressure();
             tracing::warn!(
+                pressure_cause = ?pressure.cause,
                 requested_bytes = pressure.requested_bytes,
+                retirement_credit_bytes = pressure.retirement_credit_bytes,
                 charged_bytes_at_failure = pressure.charged_bytes_at_failure,
                 reserved_bytes_at_failure = pressure.reserved_bytes_at_failure,
                 allocation_limit_bytes = pressure.limit_bytes,
@@ -1175,9 +1313,11 @@ impl Viewer {
         );
         let headroom_satisfied = matches!(outcome, AlignmentGpuReclaimOutcome::Satisfied { .. });
         tracing::debug!(
+            pressure_cause = ?pressure.cause,
             retired_read_residency,
             retired_summary_residencies,
             requested_bytes = pressure.requested_bytes,
+            retirement_credit_bytes = pressure.retirement_credit_bytes,
             charged_bytes_at_failure = pressure.charged_bytes_at_failure,
             reserved_bytes_at_failure = pressure.reserved_bytes_at_failure,
             allocation_limit_bytes = pressure.limit_bytes,
@@ -1204,12 +1344,15 @@ impl Viewer {
                 snapshot.budget
             });
         let total_bytes = cache_budget_mib.saturating_mul(1024 * 1024).max(1);
-        self.alignment_scene_budget.budget_bytes = total_bytes;
         self.refresh_alignment_scene_budget();
-        if total_bytes < previous_budget_bytes {
+        let current_budget_bytes = self
+            .alignment_scene_ledger
+            .progress()
+            .map_or(total_bytes, |snapshot| snapshot.budget);
+        if current_budget_bytes < previous_budget_bytes {
             self.alignment_gpu_residency_bundle = None;
             self.alignment_gpu_prefetch.clear();
-            self.alignment_gpu_speculation_gate.budget_bytes = total_bytes;
+            self.alignment_gpu_speculation_gate.budget_bytes = current_budget_bytes;
             self.alignment_gpu_speculation_gate
                 .suppress_for_foreground_pressure();
             if let Ok(snapshot) = self.alignment_scene_ledger.progress() {
@@ -1217,7 +1360,7 @@ impl Viewer {
                     0,
                     snapshot.charged,
                     snapshot.reserved,
-                    total_bytes,
+                    current_budget_bytes,
                 );
                 let goal = GpuReclaimGoal::new(
                     pressure,
@@ -1236,8 +1379,8 @@ impl Viewer {
                     );
                 }
             }
-        } else if total_bytes > previous_budget_bytes {
-            self.alignment_gpu_speculation_gate.budget_bytes = total_bytes;
+        } else if current_budget_bytes > previous_budget_bytes {
+            self.alignment_gpu_speculation_gate.budget_bytes = current_budget_bytes;
             self.alignment_gpu_speculation_gate.phase = AlignmentGpuSpeculationPhase::Eligible;
             let (reads, summaries) = self
                 .alignment_presented_epoch
@@ -1251,29 +1394,52 @@ impl Viewer {
         }
     }
 
-    /// Reconciles every currently measurable alignment-scene tier against one
-    /// user-selected ceiling. Each tier may borrow all presently unused
-    /// capacity; decoded engines divide their pool from observed residency
-    /// rather than retaining a startup-time equal split.
-    /// Applies the one enforcing alignment-scene budget. Query-era decoded, row-scene, layout,
-    /// and generic rectangle caches are not alignment authorities and receive no slice of it.
-    pub(crate) fn refresh_alignment_scene_budget(&mut self) {
-        let total_budget_bytes = self
-            .settings
+    pub(crate) fn aggregate_cache_budget_bytes(&self) -> usize {
+        self.settings
             .cache_budget_mib
             .saturating_mul(1024 * 1024)
+            .max(1)
+    }
+
+    fn externally_reserved_gpu_cache_bytes(&self) -> (usize, usize) {
+        (
+            self.context_scene_gpu_renderer.resident_bytes(),
+            self.rectangle_renderer.resident_bytes(),
+        )
+    }
+
+    pub(crate) fn alignment_ledger_occupied_bytes(&self) -> usize {
+        self.alignment_scene_ledger
+            .progress()
+            .map_or(0, |progress| {
+                progress.charged.saturating_add(progress.reserved)
+            })
+    }
+
+    /// Reconciles the shared alignment ledger and the two not-yet-ledger-native GPU caches under
+    /// one configured steady-state ceiling. Context and generic slabs receive explicit
+    /// non-borrowing reservations: their measured resident bytes are subtracted from the ledger
+    /// allowance, while their next admission allowance subtracts current ledger occupancy. This
+    /// prevents the setting from being multiplied across independent pools until those renderers
+    /// participate in move-only ledger transactions directly.
+    pub(crate) fn refresh_alignment_scene_budget(&mut self) {
+        let total_budget_bytes = self.aggregate_cache_budget_bytes();
+        let (context_bytes, rectangle_bytes) = self.externally_reserved_gpu_cache_bytes();
+        let external_reservation = context_bytes.saturating_add(rectangle_bytes);
+        let alignment_budget_bytes = total_budget_bytes
+            .saturating_sub(external_reservation)
             .max(1);
-        self.alignment_scene_budget.budget_bytes = total_budget_bytes;
+        self.alignment_scene_budget.budget_bytes = alignment_budget_bytes;
         if let Err(error) = self.alignment_scene_ledger.set_limits(
-            total_budget_bytes,
+            alignment_budget_bytes,
             total_budget_bytes,
             total_budget_bytes,
         ) {
             self.data_status = format!("Could not apply alignment resource limits: {error}");
         }
 
-        let allowance =
-            NonZeroUsize::new(total_budget_bytes).expect("the selected scene budget is non-zero");
+        let allowance = NonZeroUsize::new(alignment_budget_bytes)
+            .expect("the effective alignment budget is non-zero");
         let mut first_error = None;
         for track in &mut self.alignment_tracks {
             let Some(engine) = &track.scene_engine else {
@@ -1282,7 +1448,7 @@ impl Viewer {
             if track.scene_budget_bytes == allowance {
                 continue;
             }
-            match engine.try_reduce_budget(total_budget_bytes) {
+            match engine.try_reduce_budget(alignment_budget_bytes) {
                 Ok(()) => {
                     track.scene_budget_bytes = allowance;
                     track.scene_budget_retry = None;
@@ -1293,7 +1459,10 @@ impl Viewer {
             }
         }
 
-        self.context_lane_gpu_budget_bytes = total_budget_bytes;
+        self.context_lane_gpu_budget_bytes = total_budget_bytes
+            .saturating_sub(self.alignment_ledger_occupied_bytes())
+            .saturating_sub(context_bytes)
+            .saturating_sub(self.rectangle_renderer.primary_resident_bytes());
         if let Ok(progress) = self.alignment_scene_ledger.progress() {
             self.alignment_scene_budget = AlignmentSceneBudgetSnapshot::from_progress(
                 progress,
@@ -1567,6 +1736,7 @@ impl Viewer {
             projection.finish_checking();
         }
         self.synchronize_alignment_pending_mirrors();
+        self.resume_alignment_optional_work_for_settled_panels();
     }
 
     pub(crate) fn synchronize_alignment_pending_mirrors(&mut self) {
@@ -1671,6 +1841,7 @@ impl Viewer {
             }
         }
         self.synchronize_alignment_pending_mirrors();
+        self.resume_alignment_optional_work_for_settled_panels();
     }
 
     fn settle_alignment_navigation_gpu_budget_limited(&mut self, message: &str) {
@@ -1688,6 +1859,7 @@ impl Viewer {
             }
         }
         self.synchronize_alignment_pending_mirrors();
+        self.resume_alignment_optional_work_for_settled_panels();
     }
 
     /// Ensures the scroll/display derivative catches up after the semantic/native epoch commits.
@@ -2000,6 +2172,8 @@ impl Viewer {
                 source_camera: source.camera,
                 individual_reads: source.individual_reads,
                 semantic_target_complete: source.semantic_target_complete,
+                reference_ready: source.reference_ready,
+                vertical_residency: source.vertical_residency,
             })
             .collect::<Vec<_>>();
         // Retain a small identity-only copy for exact transaction settlement even when the
@@ -2196,46 +2370,67 @@ impl Viewer {
             Ok(bundle) => Ok(bundle),
             Err(failure) if failure.blocker.is_some() => Err(failure),
             Err(failure) => match failure.pressure {
-                Some(pressure) => match self.reclaim_alignment_gpu_caches_for_foreground(
-                    pressure,
-                    &protected_read_pages,
-                    &protected_summary_pages,
-                ) {
-                    Ok(AlignmentGpuReclaimOutcome::Satisfied { .. }) => self
-                        .try_publish_alignment_gpu_bundle(
-                            target_revision,
-                            publication_attempt_sequence,
-                            &read_requests,
-                            &summary_requests,
-                            lane_authorities,
-                            read_authorities,
-                        ),
-                    Ok(AlignmentGpuReclaimOutcome::Insufficient { .. }) => {
-                        self.defer_alignment_gpu_publication_for_cross_owner_reclaim(
-                            &attempt,
-                            &navigation_candidates,
-                            pressure,
-                        );
-                        return;
+                Some(pressure) => {
+                    self.alignment_last_gpu_budget_pressure = Some(pressure);
+                    match self.reclaim_alignment_gpu_caches_for_foreground(
+                        pressure,
+                        &protected_read_pages,
+                        &protected_summary_pages,
+                    ) {
+                        Ok(AlignmentGpuReclaimOutcome::Satisfied { .. }) => self
+                            .try_publish_alignment_gpu_bundle(
+                                target_revision,
+                                publication_attempt_sequence,
+                                &read_requests,
+                                &summary_requests,
+                                lane_authorities,
+                                read_authorities,
+                            ),
+                        Ok(AlignmentGpuReclaimOutcome::Insufficient { .. }) => {
+                            self.defer_alignment_gpu_publication_for_cross_owner_reclaim(
+                                &attempt,
+                                &navigation_candidates,
+                                pressure,
+                            );
+                            return;
+                        }
+                        Ok(AlignmentGpuReclaimOutcome::Infeasible { required_bytes, .. }) => {
+                            self.wait_alignment_navigation_transactions_for_gpu(
+                                &navigation_candidates,
+                            );
+                            let message = format!(
+                                "Complete alignment presentation is cache-budget limited: the minimum exact presentation exceeds the configured capacity by {} MiB",
+                                required_bytes.saturating_add((1 << 20) - 1) >> 20,
+                            );
+                            self.settle_alignment_navigation_gpu_budget_limited(&message);
+                            self.data_status = message;
+                            self.display_dirty = true;
+                            self.window.request_redraw();
+                            return;
+                        }
+                        Err(error) => Err(AlignmentGpuBundleFailure::terminal(format!(
+                            "could not coordinate alignment GPU cache reclaim: {error}"
+                        ))),
                     }
-                    Ok(AlignmentGpuReclaimOutcome::Infeasible { required_bytes, .. }) => {
-                        self.wait_alignment_navigation_transactions_for_gpu(&navigation_candidates);
-                        let message = format!(
-                            "Complete alignment presentation is cache-budget limited: the minimum exact presentation exceeds the configured capacity by {} MiB",
-                            required_bytes.saturating_add((1 << 20) - 1) >> 20,
-                        );
-                        self.settle_alignment_navigation_gpu_budget_limited(&message);
-                        self.data_status = message;
-                        self.display_dirty = true;
-                        self.window.request_redraw();
-                        return;
-                    }
-                    Err(error) => Err(AlignmentGpuBundleFailure::terminal(format!(
-                        "could not coordinate alignment GPU cache reclaim: {error}"
-                    ))),
-                },
+                }
                 None => Err(failure),
             },
+        };
+
+        let published = match published {
+            Err(failure) if failure.pressure.is_some() => {
+                let pressure = failure
+                    .pressure
+                    .expect("guarded aggregate GPU failure retains typed pressure");
+                self.alignment_last_gpu_budget_pressure = Some(pressure);
+                self.defer_alignment_gpu_publication_for_cross_owner_reclaim(
+                    &attempt,
+                    &navigation_candidates,
+                    pressure,
+                );
+                return;
+            }
+            outcome => outcome,
         };
 
         match published {
@@ -2405,6 +2600,13 @@ impl Viewer {
                                     semantic_target_complete: exact_staging
                                         && (frame.visible_complete()
                                             || frame.individual_reads_refused_for_camera()),
+                                    reference_ready: exact_staging
+                                        && frame.reference_requirement.is_ready(),
+                                    vertical_residency: if exact_staging {
+                                        frame.vertical_residency
+                                    } else {
+                                        AlignmentVerticalResidency::ViewportBounded
+                                    },
                                     camera_sequence: frame.camera_sequence,
                                     snapshot,
                                     scene_contracts_current: snapshot_contract_current
@@ -2710,7 +2912,10 @@ impl Viewer {
                 read_requests,
                 &self.alignment_scene_ledger,
             ) {
-                Ok((frame, _)) => Some(frame),
+                Ok((frame, stats)) => {
+                    self.alignment_gpu_last_prepare_stats = stats;
+                    Some(frame)
+                }
                 Err(AlignmentGpuCameraCaptureError::ContentReplacementRequired { .. }) => {
                     return AlignmentGpuCameraCaptureOutcome::ContentReplacementRequired;
                 }
@@ -2737,7 +2942,10 @@ impl Viewer {
                 summary_requests,
                 &self.alignment_scene_ledger,
             ) {
-                Ok((frame, _)) => Some(frame),
+                Ok((frame, stats)) => {
+                    self.alignment_summary_gpu_last_prepare_stats = stats;
+                    Some(frame)
+                }
                 Err(AlignmentSummaryGpuCameraCaptureError::ContentReplacementRequired {
                     ..
                 }) => {
@@ -2759,6 +2967,80 @@ impl Viewer {
             None => None,
         };
         AlignmentGpuCameraCaptureOutcome::Captured { reads, summaries }
+    }
+
+    /// Detaches the complete old semantic desktop authority before aggregate admission. Nothing
+    /// outside this synchronous transaction can observe the temporary empty slots. The returned
+    /// token either rejoins the exact old epoch on rollback or is consumed alongside the GPU
+    /// retirement at successful bundle settlement.
+    fn detach_alignment_semantic_epoch_retirement(
+        &mut self,
+    ) -> std::result::Result<Option<AlignmentSemanticEpochRetirement>, AllocationBundleError> {
+        let Some(epoch) = self.alignment_presented_epoch.as_mut() else {
+            debug_assert!(self.alignment_panel_scene_stores.is_empty());
+            return Ok(None);
+        };
+        let panel_frames = std::mem::take(&mut epoch.panel_frames);
+        let panel_scene_stores = std::mem::take(&mut self.alignment_panel_scene_stores);
+        let planned = build_alignment_semantic_retirement_claim_set(
+            &self.alignment_scene_ledger,
+            panel_frames
+                .values()
+                .flat_map(|frame| frame.lanes.iter())
+                .filter_map(|lane| lane.snapshot.as_ref())
+                .chain(
+                    panel_scene_stores
+                        .values()
+                        .flat_map(AlignmentPanelSceneStore::snapshots),
+                ),
+        );
+        let (claim_set, stats) = match planned {
+            Ok(planned) => planned,
+            Err(error) => {
+                epoch.panel_frames = panel_frames;
+                self.alignment_panel_scene_stores = panel_scene_stores;
+                return Err(error);
+            }
+        };
+        tracing::debug!(
+            snapshot_occurrences = stats.snapshot_occurrences,
+            unique_snapshots = stats.unique_snapshots,
+            exclusively_owned_snapshots = stats.exclusively_owned_snapshots,
+            exclusively_owned_read_scenes = stats.exclusively_owned_read_scenes,
+            exclusively_owned_evidence_roots = stats.exclusively_owned_evidence_roots,
+            exclusively_owned_row_atlases = stats.exclusively_owned_row_atlases,
+            exclusively_owned_summary_roots = stats.exclusively_owned_summary_roots,
+            exclusively_owned_read_pages = stats.exclusively_owned_read_pages,
+            exclusively_owned_summary_pages = stats.exclusively_owned_summary_pages,
+            owned_references_examined = stats.owned_references_examined,
+            claimed_semantic_allocations = stats.claimed_allocations,
+            "detached semantic component of alignment epoch retirement"
+        );
+        Ok(Some(AlignmentSemanticEpochRetirement {
+            claim_set,
+            stats,
+            panel_frames,
+            panel_scene_stores,
+        }))
+    }
+
+    fn restore_alignment_semantic_epoch_retirement(
+        &mut self,
+        retirement: AlignmentSemanticEpochRetirement,
+    ) -> std::result::Result<(), String> {
+        let Some(epoch) = self.alignment_presented_epoch.as_mut() else {
+            return Err("semantic rollback has no prior presented epoch".into());
+        };
+        if !epoch.panel_frames.is_empty() || !self.alignment_panel_scene_stores.is_empty() {
+            return Err("semantic rollback would overwrite an occupied presentation slot".into());
+        }
+        tracing::debug!(
+            claimed_semantic_allocations = retirement.stats.claimed_allocations,
+            "restoring detached semantic alignment epoch"
+        );
+        epoch.panel_frames = retirement.panel_frames;
+        self.alignment_panel_scene_stores = retirement.panel_scene_stores;
+        Ok(())
     }
 
     fn try_publish_alignment_gpu_bundle(
@@ -2812,6 +3094,10 @@ impl Viewer {
             demands.extend_from_slice(plan.demands());
         }
 
+        let semantic_retirement = self
+            .detach_alignment_semantic_epoch_retirement()
+            .map_err(AlignmentGpuBundleFailure::bundle)?;
+
         let mut prior_bundle = self
             .alignment_presented_epoch
             .as_mut()
@@ -2835,6 +3121,7 @@ impl Viewer {
                         prior_bundle,
                         prior_reads,
                         prior_summaries,
+                        semantic_retirement,
                         None,
                         None,
                     )?;
@@ -2858,6 +3145,7 @@ impl Viewer {
                         prior_bundle,
                         prior_reads,
                         prior_summaries,
+                        semantic_retirement,
                         read_retirement,
                         None,
                     )?;
@@ -2868,7 +3156,10 @@ impl Viewer {
             None
         };
         let claim_set = {
-            let mut claim_sets = Vec::with_capacity(2);
+            let mut claim_sets = Vec::with_capacity(3);
+            if let Some(retirement) = &semantic_retirement {
+                claim_sets.push(retirement.retirement_claim_set());
+            }
             if let Some(retirement) = &read_retirement {
                 claim_sets.push(retirement.retirement_claim_set());
             }
@@ -2885,6 +3176,7 @@ impl Viewer {
                         prior_bundle,
                         prior_reads,
                         prior_summaries,
+                        semantic_retirement,
                         read_retirement,
                         summary_retirement,
                     )?;
@@ -2906,6 +3198,7 @@ impl Viewer {
                         prior_bundle,
                         prior_reads,
                         prior_summaries,
+                        semantic_retirement,
                         read_retirement,
                         summary_retirement,
                     )?;
@@ -2914,6 +3207,7 @@ impl Viewer {
             };
         let mut composite = Some(AlignmentGpuCompositeRetirement {
             claim_set,
+            semantic: semantic_retirement,
             reads: read_retirement,
             summaries: summary_retirement,
         });
@@ -3069,13 +3363,15 @@ impl Viewer {
             "atomic alignment publication left an unclaimed bundle lease"
         );
         let reads = publishable_reads.map(|publishable| {
-            let (frame, _, _) = self.alignment_gpu_renderer.publish_replacement(publishable);
+            let (frame, stats, _) = self.alignment_gpu_renderer.publish_replacement(publishable);
+            self.alignment_gpu_last_prepare_stats = stats;
             frame
         });
         let summaries = publishable_summaries.map(|publishable| {
-            let (frame, _, _) = self
+            let (frame, stats, _) = self
                 .alignment_summary_gpu_renderer
                 .publish_replacement(publishable);
+            self.alignment_summary_gpu_last_prepare_stats = stats;
             frame
         });
         drop(prior_bundle);
@@ -3097,13 +3393,15 @@ impl Viewer {
         prior_summaries: Vec<AlignmentSummaryGpuFrame>,
         composite: Option<AlignmentGpuCompositeRetirement>,
     ) -> std::result::Result<(), AlignmentGpuBundleFailure> {
-        let (read_retirement, summary_retirement) = composite.map_or((None, None), |composite| {
-            (composite.reads, composite.summaries)
-        });
+        let (semantic_retirement, read_retirement, summary_retirement) = composite
+            .map_or((None, None, None), |composite| {
+                (composite.semantic, composite.reads, composite.summaries)
+            });
         self.restore_alignment_gpu_replacement(
             prior_bundle,
             prior_reads,
             prior_summaries,
+            semantic_retirement,
             read_retirement,
             summary_retirement,
         )
@@ -3114,6 +3412,7 @@ impl Viewer {
         mut prior_bundle: Option<AlignmentGpuFrameBundle>,
         mut prior_reads: Option<AlignmentGpuFrame>,
         mut prior_summaries: Vec<AlignmentSummaryGpuFrame>,
+        semantic_retirement: Option<AlignmentSemanticEpochRetirement>,
         read_retirement: Option<AlignmentGpuRetirement>,
         summary_retirement: Option<AlignmentSummaryGpuRetirement>,
     ) -> std::result::Result<(), AlignmentGpuBundleFailure> {
@@ -3149,6 +3448,9 @@ impl Viewer {
                 (None, Some(_)) => {
                     return Err("rollback recovered bundle metadata without its panel epoch".into());
                 }
+            }
+            if let Some(retirement) = semantic_retirement {
+                self.restore_alignment_semantic_epoch_retirement(retirement)?;
             }
             Ok(())
         })();
@@ -3261,12 +3563,21 @@ impl Viewer {
             self.alignment_gpu_prefetch.clear();
             return;
         }
+        let optional_pin_ceiling = match self.alignment_scene_ledger.progress() {
+            Ok(progress) => progress.budget,
+            Err(error) => {
+                tracing::debug!(%error, "could not inspect optional GPU residency ceiling");
+                self.alignment_gpu_prefetch.clear();
+                return;
+            }
+        };
         if self.alignment_gpu_prefetch.reads && self.alignment_gpu_prefetch.read_cursor.is_none() {
             match self
                 .alignment_gpu_renderer
                 .begin_prepared_scene_prefetch_cursor(
                     &read_requests,
                     Arc::clone(&authority.read_pages),
+                    optional_pin_ceiling,
                 ) {
                 Ok(cursor) => self.alignment_gpu_prefetch.read_cursor = Some(cursor),
                 Err(error) => {
@@ -3286,6 +3597,7 @@ impl Viewer {
                 .begin_prepared_scene_prefetch_cursor(
                     &summary_requests,
                     Arc::clone(&authority.summary_pages),
+                    optional_pin_ceiling,
                 ) {
                 Ok(cursor) => self.alignment_gpu_prefetch.summary_cursor = Some(cursor),
                 Err(error) => {
@@ -3302,6 +3614,7 @@ impl Viewer {
             &summary_requests,
             authority,
             publication_attempt_sequence,
+            optional_pin_ceiling,
         );
     }
 
@@ -3326,10 +3639,12 @@ impl Viewer {
         summary_requests: &[AlignmentSummaryGpuSceneRequest<'_>],
         authority: AlignmentGpuPreparedAuthority,
         publication_attempt_sequence: u64,
+        optional_pin_ceiling: usize,
     ) {
         if !self.alignment_gpu_speculation_gate.allows_prefetch() {
             self.alignment_gpu_prefetch.clear();
-            self.alignment_gpu_speculation_gate.finish_cycle(false);
+            self.alignment_gpu_speculation_gate
+                .finish_cycle(false, false);
             return;
         }
 
@@ -3375,7 +3690,14 @@ impl Viewer {
                             .read_cursor
                             .take()
                             .expect("completed read prefetch retains its cursor");
-                        if read_authority_complete {
+                        if cursor.retention_limited() {
+                            self.alignment_gpu_prefetch.read_retention_limited = true;
+                            tracing::debug!(
+                                retained_bytes = cursor.retained_bytes(),
+                                optional_pin_ceiling,
+                                "read GPU warm-up completed in exact demand-paged mode"
+                            );
+                        } else if read_authority_complete {
                             match self
                                 .alignment_gpu_renderer
                                 .finish_prepared_scene_prefetch_cursor(cursor)
@@ -3388,6 +3710,11 @@ impl Viewer {
                                     tracing::debug!(%error, "could not finalize read GPU residency");
                                 }
                             }
+                        } else {
+                            // Progressive semantic preparation has not yet exposed every row, so
+                            // this exact authority is demand-paged by definition even if every
+                            // currently prepared page fitted beneath the optional pin ceiling.
+                            self.alignment_gpu_prefetch.read_retention_limited = true;
                         }
                     }
                 }
@@ -3425,16 +3752,25 @@ impl Viewer {
                             .summary_cursor
                             .take()
                             .expect("completed summary prefetch retains its cursor");
-                        match self
-                            .alignment_summary_gpu_renderer
-                            .finish_prepared_scene_prefetch_cursor(cursor)
-                        {
-                            Ok(lease) => {
-                                self.alignment_gpu_prefetch.summary_residency = Some(lease)
-                            }
-                            Err(error) => {
-                                pressure = true;
-                                tracing::debug!(%error, "could not finalize summary GPU residency");
+                        if cursor.retention_limited() {
+                            self.alignment_gpu_prefetch.summary_retention_limited = true;
+                            tracing::debug!(
+                                retained_bytes = cursor.retained_bytes(),
+                                optional_pin_ceiling,
+                                "summary GPU warm-up completed in exact demand-paged mode"
+                            );
+                        } else {
+                            match self
+                                .alignment_summary_gpu_renderer
+                                .finish_prepared_scene_prefetch_cursor(cursor)
+                            {
+                                Ok(lease) => {
+                                    self.alignment_gpu_prefetch.summary_residency = Some(lease)
+                                }
+                                Err(error) => {
+                                    pressure = true;
+                                    tracing::debug!(%error, "could not finalize summary GPU residency");
+                                }
                             }
                         }
                     }
@@ -3459,12 +3795,17 @@ impl Viewer {
                 .suppress_for_foreground_pressure();
             return;
         }
-        let reads_complete =
-            read_requests.is_empty() || self.alignment_gpu_prefetch.read_residency.is_some();
-        let summaries_complete =
-            summary_requests.is_empty() || self.alignment_gpu_prefetch.summary_residency.is_some();
-        if reads_complete
-            && summaries_complete
+        let reads_finished = read_requests.is_empty()
+            || self.alignment_gpu_prefetch.read_residency.is_some()
+            || self.alignment_gpu_prefetch.read_retention_limited;
+        let summaries_finished = summary_requests.is_empty()
+            || self.alignment_gpu_prefetch.summary_residency.is_some()
+            || self.alignment_gpu_prefetch.summary_retention_limited;
+        let retention_limited = self.alignment_gpu_prefetch.read_retention_limited
+            || self.alignment_gpu_prefetch.summary_retention_limited;
+        if reads_finished
+            && summaries_finished
+            && !retention_limited
             && self
                 .alignment_gpu_residency_bundle
                 .as_ref()
@@ -3490,9 +3831,13 @@ impl Viewer {
             // own exact authority.
             self.alignment_gpu_prefetch.read_residency = None;
             self.alignment_gpu_prefetch.summary_residency = None;
+            if retention_limited {
+                self.data_status = "Complete alignments remain available on demand; full-stack instant residency exceeds the current cache budget".to_owned();
+            }
         }
         let pending = self.alignment_gpu_prefetch.pending();
-        self.alignment_gpu_speculation_gate.finish_cycle(pending);
+        self.alignment_gpu_speculation_gate
+            .finish_cycle(pending, retention_limited);
         if pending {
             self.window.request_redraw();
         }
@@ -4051,6 +4396,7 @@ impl Viewer {
                 let projection = track.projection_mut(panel_id);
                 if lane_inserted {
                     projection.scene_owner = Some(owner);
+                    projection.scene_optional_work_paused = false;
                     projection.scene_contig = Some(contig);
                     projection.scene_contract = Some(contract.clone());
                     projection.scene_policy = Some(policy);
@@ -4058,6 +4404,7 @@ impl Viewer {
                     // A bounded control queue can accept removal and reject the subsequent insert.
                     // Make the retry state explicit; never pretend the old-contig lane remains.
                     projection.scene_owner = None;
+                    projection.scene_optional_work_paused = false;
                     projection.scene_contig = None;
                     projection.scene_contract = None;
                     projection.scene_policy = None;
@@ -4721,6 +5068,60 @@ mod gpu_publication_retry_tests {
             )
             .unwrap();
         reservation.register(bytes, 1).unwrap()
+    }
+
+    #[test]
+    fn cache_ownership_handoff_permits_one_retry_without_faking_released_bytes() {
+        let ledger = AllocationLedger::new(1_000, 500);
+        let _retained = retained_allocation(&ledger, 900);
+        let snapshot = ledger.progress().unwrap();
+        let blocker = AlignmentGpuPublicationBlocker::Ledger(LedgerError::BudgetExceeded {
+            requested: 200,
+            charged: 900,
+            reserved: 0,
+            limit: 1_000,
+        });
+        assert!(alignment_gpu_publication_blocker_remains(
+            blocker, &snapshot
+        ));
+        assert!(!alignment_capacity_reclaim_allows_retry(
+            blocker, &snapshot, 0
+        ));
+        assert!(alignment_capacity_reclaim_allows_retry(
+            blocker, &snapshot, 1
+        ));
+    }
+
+    #[test]
+    fn steady_replacement_retry_preserves_exact_retirement_credit() {
+        let ledger = AllocationLedger::new(1_000, 500);
+        let retained = retained_allocation(&ledger, 900);
+        let releasable = retained_allocation(&ledger, 100);
+        ledger.set_limits(800, 500, 800).unwrap();
+        let pressure = GpuBudgetPressure::from_steady_replacement_failure(500, 1_000, 600, 800);
+        let blocker = AlignmentGpuPublicationBlocker::AggregateGpu(pressure);
+
+        let refused = ledger.progress().unwrap();
+        assert!(alignment_gpu_publication_blocker_remains(blocker, &refused));
+        // Only 100 physical bytes must leave: 600 bytes of the old 1,000-byte epoch are already
+        // guaranteed to retire with the successor. A generic blocker would incorrectly target
+        // 300 charged bytes and attempt to purge another 600 bytes.
+        assert_eq!(
+            alignment_gpu_pressure_target_charged(pressure, &refused),
+            900
+        );
+
+        drop(releasable);
+        let fitting = ledger.progress().unwrap();
+        assert_eq!(fitting.charged, 900);
+        assert!(!alignment_gpu_publication_blocker_remains(
+            blocker, &fitting
+        ));
+        assert_eq!(
+            alignment_gpu_pressure_target_charged(pressure, &fitting),
+            900
+        );
+        drop(retained);
     }
 
     #[test]

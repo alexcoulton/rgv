@@ -2494,7 +2494,10 @@ impl Viewer {
             return false;
         }
         self.composite_display_list = composite_panel_display_lists(&self.panels);
-        self.prepare_rectangle_renderer();
+        // Generic screen-space chrome is invariant under horizontal genomic movement. Contextual
+        // shapes already live in source-coordinate GPU buffers, so only their camera uniforms
+        // (plus the bounded text projection above) change on this path.
+        self.prepare_context_scene_renderer();
         true
     }
 
@@ -2913,6 +2916,12 @@ impl Viewer {
 
     fn prepare_rectangle_renderer(&mut self) {
         self.prepare_context_scene_renderer();
+        self.prepare_generic_rectangle_renderer();
+    }
+
+    /// Rebuilds or adopts the generic screen-space rectangle slab. Horizontal genomic camera
+    /// movement must not call this method because it does not change generic chrome.
+    fn prepare_generic_rectangle_renderer(&mut self) {
         // Layout and row-scene residency may have changed while rebuilding the
         // display. Give the GPU tier precisely the currently unused headroom
         // before admitting or reusing a slab.
@@ -2963,6 +2972,11 @@ impl Viewer {
         let annotation_scroll = self.panels.annotation_scroll_points;
         let surface_width = self.surface_config.width;
         let surface_height = self.surface_config.height;
+        let rectangle_resident_bytes = self.rectangle_renderer.resident_bytes();
+        let context_budget_bytes = self
+            .aggregate_cache_budget_bytes()
+            .saturating_sub(self.alignment_ledger_occupied_bytes())
+            .saturating_sub(rectangle_resident_bytes);
         let requests = self
             .panels
             .iter()
@@ -3066,7 +3080,7 @@ impl Viewer {
                     &self.queue,
                     [logical_width, logical_height],
                     &requests,
-                    self.context_lane_gpu_budget_bytes,
+                    context_budget_bytes,
                 )
             }
             Err(ContextSceneGpuCameraCaptureError::InvalidCamera { key }) => {

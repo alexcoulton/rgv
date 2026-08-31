@@ -1,6 +1,69 @@
 # Unified alignment-scene interaction and capacity remediation plan
 
-Status: proposed; implementation has not started.
+Status: core implementation complete through Phase 6; Phase 7 local automated qualification is
+complete and native user acceptance remains pending.
+
+## Implementation progress — 31 August 2026
+
+- The pre-remediation branch was preserved in `241a503`; the Phase 7–9 working baseline was
+  preserved in `c884463`; the previously accepted recovery reference is `22828ef`.
+- Camera/content separation is now explicit for read, summary, and contextual GPU renderers.
+  Camera capture has precharged frame rings, reuses immutable page-pin leases, and records
+  operation counters which prove whether content preparation, upload, or pin reconstruction
+  occurred.
+- Exact row activity, read-label lookup, contextual text lookup, and Sashimi range metrics now use
+  immutable indexes. Exhaustive oracle tests cover the indexed results, while incremental
+  telemetry records queries, rebuilds, examined boundaries, and changed boundaries.
+- CPU semantic and read/summary GPU retirement claims now settle as one replacement transaction.
+  Recursive ownership proof includes exact snapshot, source, summary, atlas, semantic-page, and
+  pin leaves. Cross-owner source/semantic reclaim can relinquish reloadable cache ownership before
+  an intrinsically impossible candidate becomes non-destructive `BudgetLimited`; temporary
+  capacity pressure remains token-owned and retryable. Steady replacement retry preserves its
+  exact retirement credit instead of over-evicting it as continuing occupancy.
+- Source workers now expose semantic results explicitly as staged/prepared candidates. The source
+  inventory forbids rendering, inspection, or automation from consuming those candidates as
+  current; the desktop's combined semantic/GPU `PresentedAlignmentEpoch` is the sole observable
+  authority.
+- Optional semantic work and GPU residency are foreground-aware, time-budgeted, byte-bounded, and
+  revocable. Contextual and generic GPU pools participate in the aggregate policy through explicit
+  non-borrowing reservations until they become ledger-native.
+- Horizontal context movement no longer re-enters the generic rectangle compositor. It updates
+  persistent source-coordinate context cameras plus indexed visible text only. The source
+  inventory now rejects this and other forbidden camera-to-content call edges.
+- `describe_workspace` now carries constant-size alignment diagnostics for aggregate capacity,
+  source/atlas/presentation work, indexed row activity, renderer manifests, page/pin activity,
+  camera bytes, immutable uploads, contextual capture, and generic composition. Normal collection
+  does not enumerate allocations or retained scene content.
+- The full workspace test suite passes with 1,156 tests, including headless GPU camera/transaction
+  tests, exact semantic-plus-GPU retirement, typed capacity retry, feature inventory, and expanded
+  source inventory. The single ignored test requires IGV's public data server. Formatting, all-
+  target compilation, and diff checks pass.
+- The release ACTB operation-count gate in
+  `benchmark-results/unified-remediation-actb-buffered-headless-2026-08-31.json` loaded 693,350
+  exact reads in 57,861 stable rows. Across 20 subsequent contained pans it recorded zero source
+  acquisitions, row-atlas candidates, presentation candidates, semantic publications, or
+  row-activity cursor rebuilds. The camera path examined 540 crossed interval boundaries in total
+  rather than rescanning the complete stack; median/p95 coordinator publication was 0.014/0.028
+  ms and sampled RSS converged at approximately 845.5 MiB on this run.
+- The same strict gate passes for BAP1 in
+  `benchmark-results/unified-remediation-bap1-buffered-headless-2026-08-31.json` (10,623 reads,
+  402 rows, 0.013/0.025 ms median/p95), the 9.6 GiB HG002 exome BRCA1 workload in
+  `benchmark-results/unified-remediation-exome-brca1-buffered-headless-2026-08-31.json` (69,121
+  reads, 900 rows, 0.015/0.022 ms), and a two-track/two-panel ACTB+BAP1 workload in
+  `benchmark-results/unified-remediation-rna-two-track-two-panel-headless-2026-08-31.json` (four
+  projections and 1,407,946 committed read occurrences). Every contained interaction recorded
+  zero source acquisitions, atlas candidates, presentation candidates, semantic publications,
+  and row-activity rebuilds.
+- The zero-buffer control in
+  `benchmark-results/unified-remediation-actb-headless-2026-08-31.json` intentionally crosses the
+  exact no-margin envelope and therefore republishes edge presentation authority. It remains a
+  useful control; the persisted product default is a 100% side buffer and passes the strict
+  contained-camera gate.
+
+Remaining Phase 7 work is native GPU/UI assessment by the user across held pan, release, zoom,
+vertical movement, ACTB/BAP1 switching, derived lanes, hover/selection, and repeated pressure.
+The available local RNA and exome fixtures are qualified; remote WGS/CRAM qualification remains
+outside this remediation checkpoint and stays blocked until the native gate is accepted.
 
 Written on 31 August 2026 after native ACTB testing invalidated the combined Phase 7–9 visual
 checkpoint in `UNIFIED_ALIGNMENT_SCENE_IMPLEMENTATION_PLAN.md`. This plan is the temporary
@@ -801,4 +864,3 @@ This remediation is complete only when:
 - all automated correctness, operation-count, transaction, resource, and native performance gates
   pass; and
 - the user manually accepts the final native ACTB/BAP1 interaction checkpoint.
-

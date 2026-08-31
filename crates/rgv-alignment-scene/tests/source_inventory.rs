@@ -28,11 +28,25 @@ fn contains_identifier(source: &str, identifier: &str) -> bool {
     })
 }
 
+fn function_source<'a>(source: &'a str, function: &str) -> &'a str {
+    let signature = format!("fn {function}(");
+    let start = source
+        .find(&signature)
+        .unwrap_or_else(|| panic!("function {function} is absent"));
+    let remainder = &source[start + signature.len()..];
+    let end = ["\n    fn ", "\n    pub fn ", "\n    pub(crate) fn "]
+        .into_iter()
+        .filter_map(|prefix| remainder.find(prefix))
+        .min()
+        .unwrap_or(remainder.len());
+    &source[start..start + signature.len() + end]
+}
+
 #[test]
 fn unified_alignment_scene_is_the_exclusive_production_authority() {
     let raw = include_str!("../../../validation/alignment-scene-source-inventory.json");
     let document: serde_json::Value = serde_json::from_str(raw).unwrap();
-    assert_eq!(document["schema_version"], 2);
+    assert_eq!(document["schema_version"], 3);
     assert_eq!(
         document["branch_policy"],
         "unified_alignment_scene_is_the_exclusive_alignment_authority"
@@ -74,6 +88,35 @@ fn unified_alignment_scene_is_the_exclusive_production_authority() {
                 "legacy alignment identifier {identifier} remains in {}",
                 path.display()
             );
+        }
+    }
+
+    for edge in document["forbidden_call_edges"].as_array().unwrap() {
+        let relative = edge["path"].as_str().unwrap();
+        let caller = edge["caller"].as_str().unwrap();
+        let callee = edge["callee"].as_str().unwrap();
+        assert!(!edge["purpose"].as_str().unwrap().is_empty());
+        let source = fs::read_to_string(repository.join(relative))
+            .unwrap_or_else(|error| panic!("call-edge source {relative} is unreadable: {error}"));
+        let function = function_source(&source, caller);
+        assert!(
+            !contains_identifier(function, callee),
+            "forbidden production call edge {caller} -> {callee} remains in {relative}"
+        );
+    }
+
+    for forbidden_text in document["forbidden_production_text"].as_array().unwrap() {
+        let root = forbidden_text["root"].as_str().unwrap();
+        let text = forbidden_text["text"].as_str().unwrap();
+        assert!(!forbidden_text["purpose"].as_str().unwrap().is_empty());
+        for (path, source) in &source_text {
+            if path.starts_with(root) {
+                assert!(
+                    !source.contains(text),
+                    "forbidden production text {text:?} remains in {}",
+                    path.display()
+                );
+            }
         }
     }
 

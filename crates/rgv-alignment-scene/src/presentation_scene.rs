@@ -298,6 +298,25 @@ impl AlignmentPresentationScene {
         &self.metadata_allocation
     }
 
+    /// The metadata pin is exposed only inside this crate so the semantic epoch retirement
+    /// planner can prove that it owns every ledger reference before granting replacement credit.
+    /// Ordinary presentation consumers must retain the scene rather than manipulating its pins.
+    pub(crate) const fn metadata_pin(&self) -> &PinnedAllocationLease {
+        &self._pins._metadata
+    }
+
+    pub(crate) fn evidence_pins(&self) -> &[PinnedAllocationLease] {
+        self._pins._evidence.allocations()
+    }
+
+    pub(crate) fn atlas_pins(&self) -> &[PinnedAllocationLease] {
+        self._pins._atlas.allocations()
+    }
+
+    pub(crate) fn page_pins(&self) -> &[PinnedAllocationLease] {
+        &self._pins._pages
+    }
+
     #[must_use]
     pub fn covers(&self, interval: GenomicInterval, rows: Range<u32>) -> bool {
         self.prepared_interval.contains_interval(interval)

@@ -683,7 +683,7 @@ mod tests {
                 ReservationKind::Normal,
             )
             .unwrap();
-        store.publish(candidate)
+        store.stage(candidate)
     }
 
     fn clip(y: f64) -> CpuClipRect {

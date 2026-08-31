@@ -431,6 +431,9 @@ pub struct AlignmentSemanticPage {
     row_end: u32,
     primitives: Arc<[AlignmentSemanticPrimitive]>,
     row_offsets: Arc<[u32]>,
+    /// Immutable page-local anchor directory. The labels remain canonical semantic primitives;
+    /// camera capture follows these indices instead of filtering every page primitive again.
+    label_primitive_indices: Arc<[u32]>,
     labels: Arc<[AlignmentSemanticLabel]>,
     allocation: AllocationLease,
 }
@@ -651,6 +654,7 @@ impl AlignmentSemanticPage {
             maximum_primitives,
             row_offset_count,
             maximum_labels,
+            maximum_labels,
             maximum_label_bytes,
         );
         let _output_scratch = ledger.reserve_transient(
@@ -763,13 +767,24 @@ impl AlignmentSemanticPage {
             *end = u32::try_from(primitives.len())
                 .map_err(|_| SemanticPageError::PrimitiveCountOverflow)?;
         }
+        let mut label_primitive_indices = primitives
+            .iter()
+            .enumerate()
+            .filter_map(|(index, primitive)| {
+                matches!(primitive.component, AlignmentComponent::Label { .. })
+                    .then(|| u32::try_from(index))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SemanticPageError::PrimitiveCountOverflow)?;
         primitives.shrink_to_fit();
         row_offsets.shrink_to_fit();
+        label_primitive_indices.shrink_to_fit();
         let labels = finalize_labels(labels)?;
         let retained_label_bytes = labels.iter().map(|label| label.text.len()).sum::<usize>();
         let retained_bytes = semantic_page_bytes(
             primitives.len(),
             row_offsets.len(),
+            label_primitive_indices.len(),
             labels.len(),
             retained_label_bytes,
         );
@@ -781,6 +796,7 @@ impl AlignmentSemanticPage {
             row_end: rows.end,
             primitives: primitives.into(),
             row_offsets: row_offsets.into(),
+            label_primitive_indices: label_primitive_indices.into(),
             labels: labels.into(),
             allocation,
         }))
@@ -804,6 +820,19 @@ impl AlignmentSemanticPage {
     #[must_use]
     pub fn primitives(&self) -> &[AlignmentSemanticPrimitive] {
         &self.primitives
+    }
+
+    /// Camera-visible text anchors prepared once with the immutable semantic page.
+    pub fn label_anchors(&self) -> impl ExactSizeIterator<Item = &AlignmentSemanticPrimitive> {
+        self.label_primitive_indices.iter().map(|index| {
+            &self.primitives
+                [usize::try_from(*index).expect("u32 semantic primitive indices always fit usize")]
+        })
+    }
+
+    #[must_use]
+    pub fn label_anchor_count(&self) -> usize {
+        self.label_primitive_indices.len()
     }
 
     #[must_use]
@@ -2734,12 +2763,14 @@ fn hash_table_scratch_bytes(entries: usize, entry_bytes: usize) -> usize {
 const fn semantic_page_bytes(
     primitives: usize,
     row_offsets: usize,
+    label_primitive_indices: usize,
     labels: usize,
     label_bytes: usize,
 ) -> usize {
     size_of::<AlignmentSemanticPage>()
         .saturating_add(primitives.saturating_mul(size_of::<AlignmentSemanticPrimitive>()))
         .saturating_add(row_offsets.saturating_mul(size_of::<u32>()))
+        .saturating_add(label_primitive_indices.saturating_mul(size_of::<u32>()))
         .saturating_add(labels.saturating_mul(size_of::<AlignmentSemanticLabel>()))
         .saturating_add(label_bytes)
 }
@@ -3635,6 +3666,7 @@ mod tests {
             semantic_page_bytes(
                 page.primitives().len(),
                 page.row_offsets.len(),
+                page.label_primitive_indices.len(),
                 page.labels().len(),
                 page.labels().iter().map(|label| label.text().len()).sum(),
             )
@@ -4132,6 +4164,15 @@ mod tests {
         )
         .unwrap();
         let wide = crate::CpuAlignmentProjector::project(&scene, 1, wide_camera).unwrap();
+        let wide_labels = crate::CpuAlignmentProjector::project_labels(&scene, 1, wide_camera)
+            .expect("immutable label anchors project independently of read geometry");
+        let visible_anchor_count = scene
+            .visible_pages(wide_camera.interval(), wide_camera.visible_rows())
+            .into_iter()
+            .filter(|page| page.key().family() == AlignmentPageFamily::Labels)
+            .map(|page| page.label_anchor_count())
+            .sum::<usize>();
+        assert_eq!(wide_labels.anchors_examined, visible_anchor_count);
         assert_eq!(
             wide.primitives
                 .iter()
@@ -4139,6 +4180,14 @@ mod tests {
                     primitive.shape == crate::CpuPrimitiveShape::TextLabel
                         && primitive.text.as_deref() == Some("spliced")
                 })
+                .count(),
+            1
+        );
+        assert_eq!(
+            wide_labels
+                .labels
+                .iter()
+                .filter(|primitive| primitive.text.as_deref() == Some("spliced"))
                 .count(),
             1
         );

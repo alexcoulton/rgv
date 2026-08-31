@@ -276,6 +276,9 @@ pub struct CpuAlignmentLabelFrame {
     pub camera: AlignmentCamera,
     pub coverage: CpuFrameCoverage,
     pub labels: Arc<[CpuProjectedPrimitive]>,
+    /// Immutable page-local anchors examined for this camera. This is deliberately bounded by
+    /// intersecting genomic tiles and row blocks rather than the complete retained scene.
+    pub anchors_examined: usize,
     _resources: Arc<CpuFrameResources>,
 }
 
@@ -286,6 +289,7 @@ impl PartialEq for CpuAlignmentLabelFrame {
             && self.camera == other.camera
             && self.coverage == other.coverage
             && self.labels == other.labels
+            && self.anchors_examined == other.anchors_examined
     }
 }
 
@@ -330,26 +334,18 @@ impl CpuAlignmentProjector {
         let covered_interval = intersect_intervals(camera.interval(), scene.prepared_interval());
         let prepared_rows = scene.prepared_rows();
         let covered_rows = intersect_ranges(requested_rows.clone(), prepared_rows);
-        let (maximum_primitives, maximum_labels) = covered_interval.map_or((0, 0), |interval| {
-            scene
-                .pages()
+        let visible_pages = covered_interval.map_or_else(Vec::new, |interval| {
+            scene.visible_pages(interval, covered_rows.clone())
+        });
+        let (maximum_primitives, maximum_labels) =
+            visible_pages
                 .iter()
-                .filter(|page| page.interval().overlaps(interval))
-                .filter(|page| ranges_overlap(page.row_range(), covered_rows.clone()))
                 .fold((0_usize, 0_usize), |(primitives, labels), page| {
                     (
                         primitives.saturating_add(page.primitives().len()),
-                        labels.saturating_add(
-                            page.primitives()
-                                .iter()
-                                .filter(|primitive| {
-                                    matches!(primitive.component, AlignmentComponent::Label { .. })
-                                })
-                                .count(),
-                        ),
+                        labels.saturating_add(page.label_anchor_count()),
                     )
-                })
-        });
+                });
         let mut projection_resources = scene.metadata_allocation().ledger().reserve_transient(
             TransientResourceClass::CpuProjection,
             cpu_projection_scratch_bytes(maximum_primitives, maximum_labels),
@@ -360,8 +356,8 @@ impl CpuAlignmentProjector {
             HashMap::<(AlignmentHandle, AlignmentComponent), CpuProjectedPrimitive>::with_capacity(
                 maximum_labels,
             );
-        if let Some(covered_interval) = covered_interval {
-            for page in scene.visible_pages(covered_interval, covered_rows.clone()) {
+        if covered_interval.is_some() {
+            for page in visible_pages {
                 for primitive in page.primitives() {
                     let global_row = page.row_range().start.saturating_add(primitive.row_offset);
                     if global_row < covered_rows.start || global_row >= covered_rows.end {
@@ -448,24 +444,17 @@ impl CpuAlignmentProjector {
         let requested_rows = camera.visible_rows();
         let covered_interval = intersect_intervals(camera.interval(), scene.prepared_interval());
         let covered_rows = intersect_ranges(requested_rows.clone(), scene.prepared_rows());
-        let maximum_labels = covered_interval.map_or(0, |interval| {
+        let visible_label_pages = covered_interval.map_or_else(Vec::new, |interval| {
             scene
-                .pages()
-                .iter()
+                .visible_pages(interval, covered_rows.clone())
+                .into_iter()
                 .filter(|page| page.key().family() == AlignmentPageFamily::Labels)
-                .filter(|page| page.interval().overlaps(interval))
-                .filter(|page| ranges_overlap(page.row_range(), covered_rows.clone()))
-                .fold(0_usize, |labels, page| {
-                    labels.saturating_add(
-                        page.primitives()
-                            .iter()
-                            .filter(|primitive| {
-                                matches!(primitive.component, AlignmentComponent::Label { .. })
-                            })
-                            .count(),
-                    )
-                })
+                .collect::<Vec<_>>()
         });
+        let maximum_labels = visible_label_pages
+            .iter()
+            .map(|page| page.label_anchor_count())
+            .sum();
         let mut projection_resources = scene.metadata_allocation().ledger().reserve_transient(
             TransientResourceClass::CpuProjection,
             cpu_label_projection_scratch_bytes(maximum_labels),
@@ -475,15 +464,9 @@ impl CpuAlignmentProjector {
             HashMap::<(AlignmentHandle, AlignmentComponent), CpuProjectedPrimitive>::with_capacity(
                 maximum_labels,
             );
-        if let Some(covered_interval) = covered_interval {
-            for page in scene
-                .visible_pages(covered_interval, covered_rows.clone())
-                .into_iter()
-                .filter(|page| page.key().family() == AlignmentPageFamily::Labels)
-            {
-                for primitive in page.primitives().iter().copied().filter(|primitive| {
-                    matches!(primitive.component, AlignmentComponent::Label { .. })
-                }) {
+        if covered_interval.is_some() {
+            for page in visible_label_pages {
+                for primitive in page.label_anchors().copied() {
                     let global_row = page.row_range().start.saturating_add(primitive.row_offset);
                     if global_row < covered_rows.start || global_row >= covered_rows.end {
                         continue;
@@ -535,6 +518,7 @@ impl CpuAlignmentProjector {
                 covered_rows,
             },
             labels: labels.into(),
+            anchors_examined: maximum_labels,
             _resources: Arc::new(CpuFrameResources {
                 _projection: projection_resources,
             }),
@@ -618,10 +602,15 @@ fn pick_captured_scene(
     {
         return None;
     }
+    let point_interval = GenomicInterval::new(
+        camera.interval().contig(),
+        position,
+        position.saturating_add(1),
+    )
+    .ok()?;
     scene
-        .pages()
-        .iter()
-        .filter(|page| page.interval().contains(position))
+        .visible_pages(point_interval, row..row.saturating_add(1))
+        .into_iter()
         .flat_map(|page| {
             page.primitive_candidates(row, position)
                 .filter(|primitive| {
@@ -812,10 +801,6 @@ fn reconcile_labels(
             primitives.push(candidate);
         }
     }
-}
-
-const fn ranges_overlap(left: Range<u32>, right: Range<u32>) -> bool {
-    left.start < right.end && left.end > right.start
 }
 
 fn cpu_projection_scratch_bytes(primitives: usize, labels: usize) -> usize {

@@ -66,9 +66,9 @@ pub use alignment_summary::{
 pub use context_scene::{
     ContextSceneGpuCamera, ContextSceneGpuCameraCaptureError, ContextSceneGpuCoherenceKey,
     ContextSceneGpuFrame, ContextSceneGpuLaneKey, ContextSceneGpuLaneRequest,
-    ContextSceneGpuPrepareReport, ContextSceneGpuPrepareStats, ContextSceneGpuRejection,
-    ContextSceneGpuRejectionReason, ContextSceneGpuRenderer, ContextSceneGpuRetainedLaneRequest,
-    ContextSceneGpuScissor, project_context_scene_rectangle,
+    ContextSceneGpuOperationCounters, ContextSceneGpuPrepareReport, ContextSceneGpuPrepareStats,
+    ContextSceneGpuRejection, ContextSceneGpuRejectionReason, ContextSceneGpuRenderer,
+    ContextSceneGpuRetainedLaneRequest, ContextSceneGpuScissor, project_context_scene_rectangle,
 };
 
 /// Renderer-local progress from one cooperative shared-ledger reclaim pass. Retained byte
@@ -95,10 +95,26 @@ pub struct GpuReclaimReport {
 /// candidate unwind before a coordinator can run. Re-evaluating only the post-unwind ledger can
 /// otherwise repeat an aggregate reservation failure without reclaiming anything.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GpuBudgetPressureCause {
+    /// Ordinary retained allocation failed against the configured steady budget.
+    #[default]
+    RetainedBudget,
+    /// Candidate steady state exceeded the budget after exact retirement credit.
+    SteadyReplacement,
+    /// Old/new physical overlap exceeded the explicit transition allowance.
+    TransitionOverlap,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GpuBudgetPressure {
+    pub cause: GpuBudgetPressureCause,
     pub requested_bytes: usize,
+    /// Effective occupied bytes relevant to this cause. For a steady replacement this has already
+    /// subtracted the exact retirement credit, while `retirement_credit_bytes` preserves the
+    /// original accounting fact for diagnostics.
     pub charged_bytes_at_failure: usize,
     pub reserved_bytes_at_failure: usize,
+    pub retirement_credit_bytes: usize,
     pub limit_bytes: usize,
 }
 
@@ -111,9 +127,45 @@ impl GpuBudgetPressure {
         limit_bytes: usize,
     ) -> Self {
         Self {
+            cause: GpuBudgetPressureCause::RetainedBudget,
             requested_bytes,
             charged_bytes_at_failure,
             reserved_bytes_at_failure,
+            retirement_credit_bytes: 0,
+            limit_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_steady_replacement_failure(
+        requested_bytes: usize,
+        occupied_bytes_at_failure: usize,
+        retirement_credit_bytes: usize,
+        limit_bytes: usize,
+    ) -> Self {
+        Self {
+            cause: GpuBudgetPressureCause::SteadyReplacement,
+            requested_bytes,
+            charged_bytes_at_failure: occupied_bytes_at_failure
+                .saturating_sub(retirement_credit_bytes),
+            reserved_bytes_at_failure: 0,
+            retirement_credit_bytes,
+            limit_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_transition_overlap_failure(
+        requested_bytes: usize,
+        occupied_bytes_at_failure: usize,
+        limit_bytes: usize,
+    ) -> Self {
+        Self {
+            cause: GpuBudgetPressureCause::TransitionOverlap,
+            requested_bytes,
+            charged_bytes_at_failure: occupied_bytes_at_failure,
+            reserved_bytes_at_failure: 0,
+            retirement_credit_bytes: 0,
             limit_bytes,
         }
     }
@@ -277,6 +329,7 @@ pub struct RectangleRenderer {
     active_slab_key: Option<u64>,
     slab_revision: u64,
     last_prepare_stats: PrepareStats,
+    operation_counters: RectangleRendererOperationCounters,
 }
 
 struct CachedRectangleSlab {
@@ -297,6 +350,18 @@ pub struct PrepareStats {
     pub slab_cache_hit: bool,
     pub slab_entries: usize,
     pub slab_resident_bytes: usize,
+}
+
+/// Monotonic, constant-size counters for proving that camera-only genomic movement did not
+/// re-enter generic screen-space composition or upload. These counters intentionally avoid any
+/// retained-slab inventory.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RectangleRendererOperationCounters {
+    pub preparations: u64,
+    pub instances_examined: u64,
+    pub slab_cache_hits: u64,
+    pub uploaded_bytes: u64,
+    pub buffer_reallocations: u64,
 }
 
 impl RectangleRenderer {
@@ -400,6 +465,7 @@ impl RectangleRenderer {
             active_slab_key: None,
             slab_revision: 0,
             last_prepare_stats: PrepareStats::default(),
+            operation_counters: RectangleRendererOperationCounters::default(),
         }
     }
 
@@ -463,13 +529,14 @@ impl RectangleRenderer {
             self.active_slab_key = Some(key);
             self.instance_count = slab.instance_count;
             self.trim_cached_slabs(maximum_slab_bytes);
-            self.last_prepare_stats = PrepareStats {
+            let stats = PrepareStats {
                 total_instances: self.instance_count as usize,
                 slab_cache_hit: true,
                 slab_entries: self.cached_slabs.len(),
                 slab_resident_bytes: self.slab_resident_bytes(),
                 ..PrepareStats::default()
             };
+            self.record_prepare_stats(stats);
             return;
         }
 
@@ -529,7 +596,7 @@ impl RectangleRenderer {
             self.trim_cached_slabs(maximum_slab_bytes);
             stats.slab_entries = self.cached_slabs.len();
             stats.slab_resident_bytes = self.slab_resident_bytes();
-            self.last_prepare_stats = stats;
+            self.record_prepare_stats(stats);
             return;
         }
         self.active_slab_key = None;
@@ -556,7 +623,7 @@ impl RectangleRenderer {
         }
         self.instance_count = u32::try_from(instances.len()).unwrap_or(u32::MAX);
         std::mem::swap(&mut self.cached_instances, &mut self.scratch_instances);
-        self.last_prepare_stats = stats;
+        self.record_prepare_stats(stats);
     }
 
     pub fn render<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
@@ -589,6 +656,25 @@ impl RectangleRenderer {
         self.last_prepare_stats
     }
 
+    #[must_use]
+    pub const fn operation_counters(&self) -> RectangleRendererOperationCounters {
+        self.operation_counters
+    }
+
+    /// Retained capacity of the generic instance buffer, excluding optional keyed slabs.
+    #[must_use]
+    pub fn primary_resident_bytes(&self) -> usize {
+        self.instance_capacity
+            .saturating_mul(std::mem::size_of::<RectangleInstance>())
+    }
+
+    /// Application-owned generic GPU capacity included in the desktop aggregate cache scope.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.primary_resident_bytes()
+            .saturating_add(self.slab_resident_bytes())
+    }
+
     /// Applies a live GPU slab ceiling. Inactive least-recent slabs are
     /// released immediately; the active slab remains pinned until another
     /// authoritative frame replaces it.
@@ -604,6 +690,28 @@ impl RectangleRenderer {
             .map_or((&self.instance_buffer, self.instance_count), |slab| {
                 (&slab.buffer, slab.instance_count)
             })
+    }
+
+    fn record_prepare_stats(&mut self, stats: PrepareStats) {
+        self.operation_counters.preparations =
+            self.operation_counters.preparations.saturating_add(1);
+        self.operation_counters.instances_examined = self
+            .operation_counters
+            .instances_examined
+            .saturating_add(stats.total_instances as u64);
+        self.operation_counters.slab_cache_hits = self
+            .operation_counters
+            .slab_cache_hits
+            .saturating_add(u64::from(stats.slab_cache_hit));
+        self.operation_counters.uploaded_bytes = self
+            .operation_counters
+            .uploaded_bytes
+            .saturating_add(stats.uploaded_bytes as u64);
+        self.operation_counters.buffer_reallocations = self
+            .operation_counters
+            .buffer_reallocations
+            .saturating_add(u64::from(stats.buffer_reallocated));
+        self.last_prepare_stats = stats;
     }
 
     fn slab_resident_bytes(&self) -> usize {

@@ -56,6 +56,9 @@ struct Arguments {
     read_browsing_buffer_percent: u16,
     #[arg(long)]
     working_set_navigation: bool,
+    /// Fail unless repeated movement stays inside the initial immutable content authority.
+    #[arg(long)]
+    require_contained_camera_only: bool,
     #[arg(long)]
     view_as_pairs: bool,
     #[arg(long)]
@@ -89,6 +92,7 @@ struct Report {
     read_browsing_buffer_percent: u16,
     view_as_pairs: bool,
     working_set_navigation: bool,
+    contained_camera_gate_required: bool,
     open_ms: f64,
     first_useful_ms: f64,
     camera_publication_ms: Vec<f64>,
@@ -100,8 +104,29 @@ struct Report {
     scene_publications: u64,
     camera_updates: u64,
     camera_only_updates: u64,
+    source_work_started: u64,
     source_acquisitions: u64,
     source_retargets: u64,
+    evidence_candidates: u64,
+    exact_summary_candidates: u64,
+    row_atlas_candidates: u64,
+    presentation_candidates: u64,
+    row_activity_queries: u64,
+    row_activity_rebuilds: u64,
+    row_activity_intervals_examined: u64,
+    row_activity_intervals_changed: u64,
+    optional_work_pauses: u64,
+    optional_work_resumes: u64,
+    interaction_camera_updates: u64,
+    interaction_camera_only_updates: u64,
+    interaction_source_acquisitions: u64,
+    interaction_row_atlas_candidates: u64,
+    interaction_presentation_candidates: u64,
+    interaction_scene_publications: u64,
+    interaction_row_activity_queries: u64,
+    interaction_row_activity_rebuilds: u64,
+    interaction_row_activity_intervals_examined: u64,
+    interaction_row_activity_intervals_changed: u64,
     ledger_budget_bytes: usize,
     ledger_charged_bytes: usize,
     ledger_reserved_bytes: usize,
@@ -196,7 +221,9 @@ fn main() -> Result<()> {
             expected.insert(owner, request_token);
         }
     }
-    wait_for_frames(&engine, &expected)?;
+    let initial_results = wait_for_frames(&engine, &expected)?;
+    let initial_telemetry =
+        sum_scene_telemetry(initial_results.values().map(|(_, telemetry)| *telemetry));
     let first_useful_ms = milliseconds(first_started);
 
     let mut samples = Vec::with_capacity(arguments.iterations);
@@ -290,23 +317,71 @@ fn main() -> Result<()> {
                 committed_rows.saturating_add(snapshot.reads().atlas().row_count() as usize);
         }
     }
-    let telemetry = telemetry_by_owner.values().copied().fold(
-        AlignmentSceneCoordinatorTelemetry::default(),
-        |mut sum, item| {
-            sum.scene_publications = sum
-                .scene_publications
-                .saturating_add(item.scene_publications);
-            sum.camera_updates = sum.camera_updates.saturating_add(item.camera_updates);
-            sum.camera_only_updates = sum
-                .camera_only_updates
-                .saturating_add(item.camera_only_updates);
-            sum.source_acquisitions = sum
-                .source_acquisitions
-                .saturating_add(item.source_acquisitions);
-            sum.source_retargets = sum.source_retargets.saturating_add(item.source_retargets);
-            sum
-        },
-    );
+    let telemetry = sum_scene_telemetry(telemetry_by_owner.values().copied());
+    let interaction_camera_updates = telemetry
+        .camera_updates
+        .saturating_sub(initial_telemetry.camera_updates);
+    let interaction_camera_only_updates = telemetry
+        .camera_only_updates
+        .saturating_sub(initial_telemetry.camera_only_updates);
+    let interaction_source_acquisitions = telemetry
+        .source_acquisitions
+        .saturating_sub(initial_telemetry.source_acquisitions);
+    let interaction_row_atlas_candidates = telemetry
+        .row_atlas_candidates
+        .saturating_sub(initial_telemetry.row_atlas_candidates);
+    let interaction_presentation_candidates = telemetry
+        .presentation_candidates
+        .saturating_sub(initial_telemetry.presentation_candidates);
+    let interaction_scene_publications = telemetry
+        .scene_publications
+        .saturating_sub(initial_telemetry.scene_publications);
+    let interaction_row_activity_queries = telemetry
+        .row_activity_queries
+        .saturating_sub(initial_telemetry.row_activity_queries);
+    let interaction_row_activity_rebuilds = telemetry
+        .row_activity_rebuilds
+        .saturating_sub(initial_telemetry.row_activity_rebuilds);
+    let interaction_row_activity_intervals_examined = telemetry
+        .row_activity_intervals_examined
+        .saturating_sub(initial_telemetry.row_activity_intervals_examined);
+    let interaction_row_activity_intervals_changed = telemetry
+        .row_activity_intervals_changed
+        .saturating_sub(initial_telemetry.row_activity_intervals_changed);
+    if arguments.require_contained_camera_only {
+        let repeated_cameras = u64::try_from(
+            arguments
+                .iterations
+                .saturating_mul(arguments.track_count)
+                .saturating_mul(viewports.len()),
+        )
+        .unwrap_or(u64::MAX);
+        anyhow::ensure!(
+            interaction_source_acquisitions == 0,
+            "contained-camera gate observed {interaction_source_acquisitions} interaction-time source acquisitions",
+        );
+        anyhow::ensure!(
+            interaction_row_atlas_candidates == 0,
+            "contained-camera gate observed {interaction_row_atlas_candidates} interaction-time row-atlas candidates",
+        );
+        anyhow::ensure!(
+            interaction_presentation_candidates == 0,
+            "contained-camera gate observed {interaction_presentation_candidates} interaction-time presentation candidates",
+        );
+        anyhow::ensure!(
+            interaction_scene_publications == 0,
+            "contained-camera gate observed {interaction_scene_publications} interaction-time semantic scene publications",
+        );
+        anyhow::ensure!(
+            interaction_camera_only_updates >= repeated_cameras,
+            "contained-camera gate observed {} camera-only updates; expected at least the {repeated_cameras} repeated cameras",
+            interaction_camera_only_updates,
+        );
+        anyhow::ensure!(
+            interaction_row_activity_rebuilds == 0,
+            "contained-camera gate rebuilt the row-activity cursor {interaction_row_activity_rebuilds} times",
+        );
+    }
     let progress = ledger.progress()?;
     let report = Report {
         architecture: "unified_alignment_scene",
@@ -323,6 +398,7 @@ fn main() -> Result<()> {
         read_browsing_buffer_percent: arguments.read_browsing_buffer_percent,
         view_as_pairs: arguments.view_as_pairs,
         working_set_navigation: arguments.working_set_navigation,
+        contained_camera_gate_required: arguments.require_contained_camera_only,
         open_ms,
         first_useful_ms,
         camera_publication_ms: samples,
@@ -334,8 +410,29 @@ fn main() -> Result<()> {
         scene_publications: telemetry.scene_publications,
         camera_updates: telemetry.camera_updates,
         camera_only_updates: telemetry.camera_only_updates,
+        source_work_started: telemetry.source_work_started,
         source_acquisitions: telemetry.source_acquisitions,
         source_retargets: telemetry.source_retargets,
+        evidence_candidates: telemetry.evidence_candidates,
+        exact_summary_candidates: telemetry.exact_summary_candidates,
+        row_atlas_candidates: telemetry.row_atlas_candidates,
+        presentation_candidates: telemetry.presentation_candidates,
+        row_activity_queries: telemetry.row_activity_queries,
+        row_activity_rebuilds: telemetry.row_activity_rebuilds,
+        row_activity_intervals_examined: telemetry.row_activity_intervals_examined,
+        row_activity_intervals_changed: telemetry.row_activity_intervals_changed,
+        optional_work_pauses: telemetry.optional_work_pauses,
+        optional_work_resumes: telemetry.optional_work_resumes,
+        interaction_camera_updates,
+        interaction_camera_only_updates,
+        interaction_source_acquisitions,
+        interaction_row_atlas_candidates,
+        interaction_presentation_candidates,
+        interaction_scene_publications,
+        interaction_row_activity_queries,
+        interaction_row_activity_rebuilds,
+        interaction_row_activity_intervals_examined,
+        interaction_row_activity_intervals_changed,
         ledger_budget_bytes: progress.budget,
         ledger_charged_bytes: progress.charged,
         ledger_reserved_bytes: progress.reserved,
@@ -351,6 +448,61 @@ fn main() -> Result<()> {
     }
     println!("{json}");
     Ok(())
+}
+
+fn sum_scene_telemetry(
+    values: impl IntoIterator<Item = AlignmentSceneCoordinatorTelemetry>,
+) -> AlignmentSceneCoordinatorTelemetry {
+    values.into_iter().fold(
+        AlignmentSceneCoordinatorTelemetry::default(),
+        |mut sum, item| {
+            sum.scene_publications = sum
+                .scene_publications
+                .saturating_add(item.scene_publications);
+            sum.camera_updates = sum.camera_updates.saturating_add(item.camera_updates);
+            sum.camera_only_updates = sum
+                .camera_only_updates
+                .saturating_add(item.camera_only_updates);
+            sum.source_work_started = sum
+                .source_work_started
+                .saturating_add(item.source_work_started);
+            sum.source_acquisitions = sum
+                .source_acquisitions
+                .saturating_add(item.source_acquisitions);
+            sum.source_retargets = sum.source_retargets.saturating_add(item.source_retargets);
+            sum.evidence_candidates = sum
+                .evidence_candidates
+                .saturating_add(item.evidence_candidates);
+            sum.exact_summary_candidates = sum
+                .exact_summary_candidates
+                .saturating_add(item.exact_summary_candidates);
+            sum.row_atlas_candidates = sum
+                .row_atlas_candidates
+                .saturating_add(item.row_atlas_candidates);
+            sum.presentation_candidates = sum
+                .presentation_candidates
+                .saturating_add(item.presentation_candidates);
+            sum.row_activity_queries = sum
+                .row_activity_queries
+                .saturating_add(item.row_activity_queries);
+            sum.row_activity_rebuilds = sum
+                .row_activity_rebuilds
+                .saturating_add(item.row_activity_rebuilds);
+            sum.row_activity_intervals_examined = sum
+                .row_activity_intervals_examined
+                .saturating_add(item.row_activity_intervals_examined);
+            sum.row_activity_intervals_changed = sum
+                .row_activity_intervals_changed
+                .saturating_add(item.row_activity_intervals_changed);
+            sum.optional_work_pauses = sum
+                .optional_work_pauses
+                .saturating_add(item.optional_work_pauses);
+            sum.optional_work_resumes = sum
+                .optional_work_resumes
+                .saturating_add(item.optional_work_resumes);
+            sum
+        },
+    )
 }
 
 fn owner_id(track_index: usize, panel_index: usize) -> SourceOwnerId {

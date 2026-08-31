@@ -228,7 +228,7 @@ pub(crate) fn show_system_dialogs(
                             .labelled_by(label.id);
                         });
                         ui.small(
-                            "Changes apply live. Current views stay visible while speculative and least-recent cache entries are rebalanced.",
+                            "Changes apply live to one aggregate application-owned cache scope: alignment evidence/scenes/GPU pages plus contextual and generic GPU buffers. Driver/runtime memory is reported separately.",
                         );
                         ui.horizontal(|ui| {
                             let label = ui.label("Read browsing buffer");
@@ -253,11 +253,28 @@ pub(crate) fn show_system_dialogs(
                         );
                         let budget = viewer.alignment_scene_budget;
                         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+                        let context_gpu = viewer.context_scene_gpu_renderer.resident_bytes();
+                        let generic_gpu = viewer.rectangle_renderer.resident_bytes();
+                        let aggregate_occupied = budget
+                            .charged_bytes
+                            .saturating_add(budget.reserved_bytes)
+                            .saturating_add(context_gpu)
+                            .saturating_add(generic_gpu);
                         ui.group(|ui| {
                             ui.label(format!(
-                                "Alignment scene: {:.1} / {:.1} MiB retained",
+                                "Aggregate cache: {:.1} / {:.1} MiB occupied",
+                                mib(aggregate_occupied),
+                                draft.cache_budget_mib as f64,
+                            ));
+                            ui.label(format!(
+                                "Alignment ledger: {:.1} / {:.1} MiB retained",
                                 mib(budget.charged_bytes),
                                 mib(budget.budget_bytes),
+                            ));
+                            ui.small(format!(
+                                "Explicit GPU reservations: contextual {:.1} MiB · generic {:.1} MiB",
+                                mib(context_gpu),
+                                mib(generic_gpu),
                             ));
                             ui.small(format!(
                                 "Reserved {:.1} MiB (transition {:.1} / {:.1}) · temporary {:.1} / {:.1} MiB (peak {:.1})",

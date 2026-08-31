@@ -269,6 +269,12 @@ pub struct JunctionAnnotationPins {
     _allocation: PinnedAllocationLease,
 }
 
+impl JunctionAnnotationPins {
+    pub(crate) const fn allocation(&self) -> &PinnedAllocationLease {
+        &self._allocation
+    }
+}
+
 const fn annotation_bytes(
     events: usize,
     coverage: usize,

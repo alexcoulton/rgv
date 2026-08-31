@@ -934,9 +934,12 @@ mod tests {
     use crate::{
         AlignmentPageKey, AlignmentPresentationScene, AlignmentPresentationStore,
         AlignmentRowAtlas, AlignmentSceneSnapshot, AlignmentSceneSnapshotError,
-        AlignmentSemanticPage, AlignmentSourceRevision, AlleleSummaryDetail, AllocationClass,
-        CanonicalRowBlock, CapabilityRequirement, CompleteCoverage, EvidenceAcquisition,
-        EvidenceChunk, EvidenceRevision, EvidenceRoot, EvidenceRootBuilder, ExactAlleleSummaryTile,
+        AlignmentSemanticPage, AlignmentSourceRevision, AlleleSummaryDetail,
+        AllocationBundleActual, AllocationBundleDemand, AllocationBundleError,
+        AllocationBundleSlot, AllocationBundleSpec, AllocationClass, AllocationLease,
+        AllocationRetirementClaimSet, AllocationRetirementToken, CanonicalRowBlock,
+        CapabilityRequirement, CompleteCoverage, EvidenceAcquisition, EvidenceChunk,
+        EvidenceRevision, EvidenceRoot, EvidenceRootBuilder, ExactAlleleSummaryTile,
         ExactDepthSummaryTile, ExactFilterSummaryTile, ExactJunctionSummaryTile,
         ExactModificationSummaryTile, ExactPairSummaryTile, FilteredRecordProvenance, GeometryLod,
         LayoutContract, PayloadContract, PayloadSidecar, PresentationContract, RevisionFingerprint,
@@ -1180,6 +1183,213 @@ mod tests {
 
     fn exact_root(ledger: &AllocationLedger) -> Arc<ExactSummaryRoot> {
         exact_authority(ledger).1
+    }
+
+    fn exclusively_owned_scene_snapshot(ledger: &AllocationLedger) -> Arc<AlignmentSceneSnapshot> {
+        let (evidence, summaries) = exact_authority(ledger);
+        let interval = summaries.prepared_interval();
+        let layout = LayoutContract {
+            row_scale_class: 0,
+            stacking: ReadStackingMode::Compact,
+            grouping: AlignmentGroupMode::None,
+            group_order: AlignmentOrderDirection::Natural,
+            sorting: AlignmentSortMode::Start,
+            sort_order: AlignmentOrderDirection::Natural,
+            sort_anchor: None,
+            view_as_pairs: false,
+            pair_length_bounds: TemplateLengthBounds::default(),
+            promoted_template: None,
+        };
+        let atlas = AlignmentRowAtlas::build(
+            RowAtlasRevision::new(RevisionFingerprint::new(90, 91)),
+            &evidence,
+            interval,
+            layout,
+            ledger,
+            ReservationKind::Normal,
+            90,
+        )
+        .unwrap();
+        let presentation = PresentationContract {
+            geometry_lod: GeometryLod::Span,
+            style: crate::AlignmentStyleContract {
+                show_modified_bases: false,
+                ..crate::AlignmentStyleContract::default()
+            },
+            reference: None,
+            annotation: None,
+        };
+        let tile = summaries.depth_tiles()[0].tile();
+        let row_block = CanonicalRowBlock::new(0, NonZeroU32::new(16).unwrap());
+        let read_page = AlignmentSemanticPage::build(
+            AlignmentPageKey::new(
+                evidence.source_revision(),
+                evidence.revision(),
+                atlas.revision(),
+                layout.fingerprint(),
+                presentation.page_fingerprint(crate::AlignmentPageFamily::ReadGeometry),
+                tile,
+                row_block,
+                crate::AlignmentPageFamily::ReadGeometry,
+                GeometryLod::Span,
+            ),
+            &evidence,
+            &atlas,
+            presentation,
+            100,
+            None,
+            ledger,
+            ReservationKind::Normal,
+            91,
+        )
+        .unwrap();
+        let revision = SceneRevision::new(RevisionFingerprint::new(92, 93));
+        let reads = AlignmentPresentationScene::new(
+            revision,
+            Arc::clone(&evidence),
+            Arc::clone(&atlas),
+            presentation,
+            interval,
+            0..1,
+            vec![read_page],
+            ledger,
+            ReservationKind::Normal,
+            92,
+        )
+        .unwrap();
+        let pages = [
+            SummaryPageFamily::Depth,
+            SummaryPageFamily::Alleles,
+            SummaryPageFamily::Junctions,
+            SummaryPageFamily::Modifications,
+            SummaryPageFamily::Pairs,
+            SummaryPageFamily::FilterProvenance,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, family)| {
+            SummarySemanticPage::build(
+                SummaryPageKey::new(&summaries, tile, family),
+                &summaries,
+                None,
+                ledger,
+                ReservationKind::Normal,
+                100 + index as u64,
+            )
+            .unwrap()
+        })
+        .collect();
+        AlignmentSceneSnapshot::new(
+            revision,
+            reads,
+            summaries,
+            pages,
+            ledger,
+            ReservationKind::Normal,
+            110,
+        )
+        .unwrap()
+    }
+
+    struct OwnedSnapshotAndGpuRetirement {
+        claims: AllocationRetirementClaimSet,
+        _snapshot: Arc<AlignmentSceneSnapshot>,
+        _gpu: AllocationLease,
+    }
+
+    impl AllocationRetirementToken for OwnedSnapshotAndGpuRetirement {
+        fn retirement_claim_set(&self) -> &AllocationRetirementClaimSet {
+            &self.claims
+        }
+    }
+
+    #[test]
+    fn semantic_and_gpu_epochs_must_supply_one_exact_atomic_retirement_credit() {
+        let ledger = AllocationLedger::new(64 << 20, 64 << 20);
+        let snapshot = exclusively_owned_scene_snapshot(&ledger);
+        let old_gpu_bytes = 4 << 10;
+        let old_gpu = ledger
+            .reserve(
+                AllocationClass::GpuPage,
+                old_gpu_bytes,
+                ReservationKind::Normal,
+            )
+            .unwrap()
+            .register(old_gpu_bytes, 120)
+            .unwrap();
+        let before = ledger.snapshot().unwrap();
+        let (semantic_claims, stats) = crate::build_alignment_semantic_retirement_claim_set(
+            &ledger,
+            std::iter::once(&snapshot),
+        )
+        .unwrap();
+        assert_eq!(
+            semantic_claims.len().saturating_add(1),
+            before.records.len()
+        );
+        assert_eq!(stats.exclusively_owned_evidence_roots, 1);
+        assert_eq!(stats.exclusively_owned_row_atlases, 1);
+        assert_eq!(stats.exclusively_owned_summary_roots, 1);
+        let gpu_claims = {
+            let mut builder = ledger.retirement_claim_builder();
+            builder.include_lease(&old_gpu).unwrap();
+            builder.finish().unwrap()
+        };
+        let combined_claims = ledger
+            .combine_retirement_claim_sets([&semantic_claims, &gpu_claims])
+            .unwrap();
+
+        let candidate_bytes = 4 << 10;
+        ledger.set_budget(candidate_bytes).unwrap();
+        let progress = ledger.progress().unwrap();
+        let slot = AllocationBundleSlot::new(0);
+        let demands = vec![AllocationBundleDemand::new(
+            slot,
+            AllocationClass::GpuPage,
+            candidate_bytes,
+        )];
+        assert!(matches!(
+            ledger.reserve_replacement_bundle(AllocationBundleSpec::new(
+                progress.policy_revision,
+                demands.clone(),
+                semantic_claims,
+            )),
+            Err(AllocationBundleError::SteadyBudgetExceeded { .. })
+        ));
+        assert!(matches!(
+            ledger.reserve_replacement_bundle(AllocationBundleSpec::new(
+                progress.policy_revision,
+                demands.clone(),
+                gpu_claims,
+            )),
+            Err(AllocationBundleError::SteadyBudgetExceeded { .. })
+        ));
+
+        let reservation = ledger
+            .reserve_replacement_bundle(AllocationBundleSpec::new(
+                progress.policy_revision,
+                demands,
+                combined_claims.clone(),
+            ))
+            .unwrap();
+        let commit = reservation
+            .commit(vec![AllocationBundleActual::new(
+                slot,
+                candidate_bytes,
+                121,
+            )])
+            .unwrap();
+        let mut retirement = Some(OwnedSnapshotAndGpuRetirement {
+            claims: combined_claims,
+            _snapshot: snapshot,
+            _gpu: old_gpu,
+        });
+        let candidate = commit.retire_and_settle(&mut retirement).unwrap();
+        assert_eq!(candidate.len(), 1);
+        assert!(retirement.is_none());
+        assert_eq!(ledger.snapshot().unwrap().charged, candidate_bytes);
+        drop(candidate);
+        assert_eq!(ledger.snapshot().unwrap().charged, 0);
     }
 
     const CROSS_TILE_CONTIG_LENGTH: u64 = 300;
@@ -2274,6 +2484,35 @@ mod tests {
             snapshot.reads().evidence().revision(),
             snapshot.summaries().evidence_revision()
         );
+        let (semantic_retirement, semantic_stats) =
+            crate::build_alignment_semantic_retirement_claim_set(
+                &ledger,
+                std::iter::once(&snapshot),
+            )
+            .unwrap();
+        // Root variables remain externally owned in this test, while the moved read/summary
+        // semantic pages are exclusive to the snapshot. The maximal exact proof credits the two
+        // scene metadata allocations plus all seven page allocations, but not shared roots.
+        assert_eq!(semantic_retirement.len(), 9);
+        assert_eq!(semantic_stats.exclusively_owned_snapshots, 1);
+        assert_eq!(semantic_stats.exclusively_owned_read_scenes, 1);
+        assert_eq!(semantic_stats.exclusively_owned_evidence_roots, 0);
+        assert_eq!(semantic_stats.exclusively_owned_row_atlases, 0);
+        assert_eq!(semantic_stats.exclusively_owned_summary_roots, 0);
+        assert_eq!(semantic_stats.exclusively_owned_read_pages, 1);
+        assert_eq!(semantic_stats.exclusively_owned_summary_pages, 6);
+        assert_eq!(semantic_stats.claimed_allocations, 9);
+
+        let external_snapshot_owner = Arc::clone(&snapshot);
+        let (shared_retirement, shared_stats) =
+            crate::build_alignment_semantic_retirement_claim_set(
+                &ledger,
+                std::iter::once(&snapshot),
+            )
+            .unwrap();
+        assert!(shared_retirement.is_empty());
+        assert_eq!(shared_stats.exclusively_owned_snapshots, 0);
+        drop(external_snapshot_owner);
         assert!(snapshot.metadata_allocation().snapshot().unwrap().pins > 0);
         let allele_site = snapshot.allele_site_at(10).unwrap();
         assert_eq!(allele_site.evidence.owner_interval, interval);
@@ -2400,11 +2639,11 @@ mod tests {
                 ReservationKind::Normal,
             )
             .unwrap();
-        assert!(store.current().is_none());
+        assert!(store.prepared().is_none());
         assert_eq!(store.read_page_count(), 1);
         assert_eq!(store.summary_page_count(), 6);
-        let current = store.publish(candidate);
-        assert!(store.current_covers(interval, 0..1));
+        let current = store.stage(candidate);
+        assert!(store.prepared_covers(interval, 0..1));
 
         let resident = store
             .prepare(
@@ -2423,8 +2662,8 @@ mod tests {
             .unwrap();
         assert_eq!(store.read_page_count(), 1);
         assert_eq!(store.summary_page_count(), 6);
-        assert!(Arc::ptr_eq(store.current().unwrap(), &current));
-        let replacement = store.publish(resident);
+        assert!(Arc::ptr_eq(store.prepared().unwrap(), &current));
+        let replacement = store.stage(resident);
         assert!(!Arc::ptr_eq(&replacement, &current));
         assert_eq!(
             replacement.reads().pages()[0].key(),
@@ -2647,7 +2886,7 @@ mod tests {
                 ReservationKind::Normal,
             )
             .unwrap();
-        let current = store.publish(candidate);
+        let current = store.stage(candidate);
         let current_pointer = Arc::as_ptr(&current);
         let baseline_read_pages = store.read_page_count();
 
@@ -2672,15 +2911,20 @@ mod tests {
             )
             .unwrap();
         assert!(store.read_page_count() > baseline_read_pages);
+        let ownership_pressure = store.evict_inactive_until(0).unwrap();
+        assert!(ownership_pressure.evicted_read_pages > 0);
+        assert!(ownership_pressure.remaining_overage > 0);
+        assert_eq!(store.read_page_count(), baseline_read_pages);
+        assert!(inactive.snapshot().covers(interval, 0..1));
         drop(inactive);
 
         let pinned = ledger.snapshot().unwrap().pinned;
         let pressure = store.reduce_budget(pinned).unwrap();
-        assert!(pressure.evicted_read_pages > 0);
+        assert_eq!(pressure.evicted_read_pages, 0);
         assert_eq!(pressure.remaining_overage, 0);
         assert_eq!(store.read_page_count(), baseline_read_pages);
-        assert_eq!(Arc::as_ptr(store.current().unwrap()), current_pointer);
-        assert!(store.current_covers(interval, 0..1));
+        assert_eq!(Arc::as_ptr(store.prepared().unwrap()), current_pointer);
+        assert!(store.prepared_covers(interval, 0..1));
 
         let pinned_pressure = store.reduce_budget(0).unwrap();
         assert_eq!(pinned_pressure.charged, pinned_pressure.pinned);
@@ -2786,7 +3030,7 @@ mod tests {
                 ReservationKind::Normal,
             )
             .unwrap();
-        let snapshot = store.publish(candidate);
+        let snapshot = store.stage(candidate);
         assert!(Arc::ptr_eq(snapshot.annotation().unwrap(), &annotation));
         assert_eq!(
             snapshot

@@ -285,6 +285,30 @@ impl<'a> AllocationRetirementClaimBuilder<'a> {
     }
 
     pub fn finish(self) -> Result<AllocationRetirementClaimSet, AllocationBundleError> {
+        self.finish_with_policy(RetirementClaimSelectionPolicy::RequireEveryReference)
+    }
+
+    /// Produces the maximal exact claim set from a recursively owned epoch graph.
+    ///
+    /// A detached semantic epoch can own pins for an allocation whose immutable object is still
+    /// shared by a current source root or cache. Such a pin will disappear on commit, but the
+    /// allocation itself will not, so it must not receive retirement credit. Callers add every
+    /// physical reference which their move-only token truly owns; this method atomically keeps
+    /// only allocation identities for which those references are the complete live set.
+    ///
+    /// This is deliberately different from [`Self::finish`], whose strict mismatch is useful for
+    /// renderer tokens that are expected to own a closed allocation set. Unknown, foreign,
+    /// duplicate, or already-claimed references remain errors in both modes.
+    pub(crate) fn finish_maximal_exact(
+        self,
+    ) -> Result<AllocationRetirementClaimSet, AllocationBundleError> {
+        self.finish_with_policy(RetirementClaimSelectionPolicy::KeepCompleteAllocations)
+    }
+
+    fn finish_with_policy(
+        self,
+        policy: RetirementClaimSelectionPolicy,
+    ) -> Result<AllocationRetirementClaimSet, AllocationBundleError> {
         let mut ids = self
             .references
             .iter()
@@ -313,11 +337,19 @@ impl<'a> AllocationRetirementClaimBuilder<'a> {
                 return Err(AllocationBundleError::RetirementAlreadyClaimed(id));
             }
             if record.references != owned_references {
-                return Err(AllocationBundleError::RetirementReferenceMismatch {
-                    id,
-                    expected: owned_references,
-                    actual: record.references,
-                });
+                match policy {
+                    RetirementClaimSelectionPolicy::RequireEveryReference => {
+                        return Err(AllocationBundleError::RetirementReferenceMismatch {
+                            id,
+                            expected: owned_references,
+                            actual: record.references,
+                        });
+                    }
+                    RetirementClaimSelectionPolicy::KeepCompleteAllocations => {
+                        start = end;
+                        continue;
+                    }
+                }
             }
             claims.push(AllocationRetirementClaim {
                 id,
@@ -331,6 +363,12 @@ impl<'a> AllocationRetirementClaimBuilder<'a> {
             claims,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetirementClaimSelectionPolicy {
+    RequireEveryReference,
+    KeepCompleteAllocations,
 }
 
 /// Implemented by renderer-owned, non-cloneable objects which retain the exact old presentation
@@ -1921,6 +1959,48 @@ impl AllocationLease {
         drop(inner);
         Ok(PinnedAllocationLease { lease })
     }
+
+    /// Atomically acquires an optional pin only when doing so keeps the ledger's unique pinned
+    /// capacity at or below `maximum_total_pinned_bytes`. An already-pinned allocation adds no
+    /// unique bytes and may therefore be shared even at the ceiling. Mandatory presentation pins
+    /// continue to use [`Self::pin`].
+    pub fn pin_if_total_at_most(
+        &self,
+        maximum_total_pinned_bytes: usize,
+    ) -> Result<Option<PinnedAllocationLease>, LedgerError> {
+        let mut inner = self.inner.lock().map_err(|_| LedgerError::Poisoned)?;
+        let (newly_pinned_bytes, allowed) = {
+            let record = inner
+                .records
+                .get(&self.id)
+                .ok_or(LedgerError::UnknownAllocation(self.id))?;
+            let newly_pinned_bytes = (record.pins == 0).then_some(record.charged_capacity);
+            let allowed = newly_pinned_bytes.is_none_or(|bytes| {
+                inner.pinned.saturating_add(bytes) <= maximum_total_pinned_bytes
+            });
+            (newly_pinned_bytes, allowed)
+        };
+        if !allowed {
+            return Ok(None);
+        }
+        let record = inner
+            .records
+            .get_mut(&self.id)
+            .expect("optional pin allocation was validated under the same ledger lock");
+        record.references = record.references.saturating_add(1);
+        record.pins = record.pins.saturating_add(1);
+        if let Some(bytes) = newly_pinned_bytes {
+            inner.pinned = inner.pinned.saturating_add(bytes);
+        }
+        inner.note_progress();
+        drop(inner);
+        Ok(Some(PinnedAllocationLease {
+            lease: AllocationLease {
+                inner: Arc::clone(&self.inner),
+                id: self.id,
+            },
+        }))
+    }
 }
 
 impl Clone for AllocationLease {
@@ -2620,6 +2700,32 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn maximal_exact_retirement_skips_shared_allocations_without_weakening_strict_proofs() {
+        let ledger = AllocationLedger::new(1_000, 500);
+        let mut reservation = ledger
+            .reserve(AllocationClass::GpuPage, 600, ReservationKind::Normal)
+            .unwrap();
+        let old = reservation.register(600, 1).unwrap();
+        let external = old.clone();
+
+        let maximal = {
+            let mut builder = ledger.retirement_claim_builder();
+            builder.include_lease(&old).unwrap();
+            builder.finish_maximal_exact().unwrap()
+        };
+        assert!(maximal.is_empty());
+
+        drop(external);
+        let complete = {
+            let mut builder = ledger.retirement_claim_builder();
+            builder.include_lease(&old).unwrap();
+            builder.finish_maximal_exact().unwrap()
+        };
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete.claims[0].id(), old.id());
     }
 
     #[test]
@@ -3340,6 +3446,30 @@ mod tests {
         drop(second_pin);
         assert_eq!(ledger.progress().unwrap().pinned, 0);
         assert_eq!(ledger.snapshot().unwrap().pinned, 0);
+    }
+
+    #[test]
+    fn optional_pin_ceiling_is_atomic_and_counts_unique_capacity() {
+        let ledger = AllocationLedger::new(1_000, 0);
+        let mut first = ledger
+            .reserve(AllocationClass::GpuPage, 600, ReservationKind::Normal)
+            .unwrap();
+        let first = first.register(600, 1).unwrap();
+        let mut second = ledger
+            .reserve(AllocationClass::GpuPage, 300, ReservationKind::Normal)
+            .unwrap();
+        let second = second.register(300, 2).unwrap();
+
+        let first_pin = first.pin_if_total_at_most(700).unwrap().unwrap();
+        assert_eq!(ledger.progress().unwrap().pinned, 600);
+        assert!(second.pin_if_total_at_most(700).unwrap().is_none());
+        let shared_first = first.pin_if_total_at_most(600).unwrap().unwrap();
+        assert_eq!(ledger.progress().unwrap().pinned, 600);
+        drop(first_pin);
+        assert_eq!(ledger.progress().unwrap().pinned, 600);
+        drop(shared_first);
+        assert_eq!(ledger.progress().unwrap().pinned, 0);
+        assert!(second.pin_if_total_at_most(300).unwrap().is_some());
     }
 
     #[test]

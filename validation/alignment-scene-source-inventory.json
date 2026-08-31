@@ -1,8 +1,9 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "branch_policy": "unified_alignment_scene_is_the_exclusive_alignment_authority",
   "production_roots": [
     "apps/rgv-desktop/src",
+    "crates/rgv-alignment-scene/src",
     "crates/rgv-engine/src",
     "crates/rgv-layout/src",
     "crates/rgv-render/src"
@@ -60,6 +61,95 @@
     "navigation_preview_texture_bytes",
     "navigation_preview"
   ],
+  "forbidden_call_edges": [
+    {
+      "path": "apps/rgv-desktop/src/display/mod.rs",
+      "caller": "reproject_active_context_lanes",
+      "callee": "prepare_rectangle_renderer",
+      "purpose": "horizontal genomic camera movement cannot rebuild or rehash generic screen-space slabs"
+    },
+    {
+      "path": "apps/rgv-desktop/src/workspace/alignment_management.rs",
+      "caller": "capture_alignment_gpu_bundle_from_resident_content",
+      "callee": "stage_replacement",
+      "purpose": "alignment camera capture cannot enter immutable replacement staging"
+    },
+    {
+      "path": "crates/rgv-render/src/alignment_scene.rs",
+      "caller": "capture_camera_frame",
+      "callee": "stage_replacement",
+      "purpose": "read camera capture cannot open an immutable replacement transaction"
+    },
+    {
+      "path": "crates/rgv-render/src/alignment_scene.rs",
+      "caller": "capture_camera_frame",
+      "callee": "prepare_with_admission",
+      "purpose": "read camera capture cannot enter the general content admission path"
+    },
+    {
+      "path": "crates/rgv-render/src/alignment_scene.rs",
+      "caller": "capture_camera_frame",
+      "callee": "admit_pages",
+      "purpose": "read camera capture cannot admit immutable geometry pages"
+    },
+    {
+      "path": "crates/rgv-render/src/alignment_summary.rs",
+      "caller": "capture_camera_frame",
+      "callee": "stage_replacement",
+      "purpose": "summary camera capture cannot open an immutable replacement transaction"
+    },
+    {
+      "path": "crates/rgv-render/src/alignment_summary.rs",
+      "caller": "capture_camera_frame",
+      "callee": "prepare_with_admission",
+      "purpose": "summary camera capture cannot enter the general content admission path"
+    },
+    {
+      "path": "crates/rgv-render/src/alignment_summary.rs",
+      "caller": "capture_camera_frame",
+      "callee": "admit_pages",
+      "purpose": "summary camera capture cannot admit immutable geometry pages"
+    },
+    {
+      "path": "crates/rgv-render/src/context_scene.rs",
+      "caller": "capture_camera_frame",
+      "callee": "prepare_context_unit",
+      "purpose": "context camera capture cannot invoke content admission"
+    },
+    {
+      "path": "crates/rgv-render/src/context_scene.rs",
+      "caller": "capture_camera_frame",
+      "callee": "create_resident_lane",
+      "purpose": "context camera capture cannot allocate immutable lane buffers"
+    }
+  ],
+  "forbidden_production_text": [
+    {
+      "root": "apps/rgv-desktop/src",
+      "text": "alignment memory budget could not admit",
+      "purpose": "an internal admission condition cannot be flattened into a terminal read-data overlay"
+    },
+    {
+      "root": "apps/rgv-desktop/src",
+      "text": "replacement GPU transition bundle",
+      "purpose": "a renderer transition invariant cannot leak into the product UI"
+    },
+    {
+      "root": "apps/rgv-desktop/src/display",
+      "text": ".scene_frame",
+      "purpose": "rendering cannot consume a source-worker staged frame instead of the committed desktop epoch"
+    },
+    {
+      "root": "apps/rgv-desktop/src/inspection",
+      "text": ".scene_frame",
+      "purpose": "picking and inspection cannot consume a source-worker staged frame instead of the committed desktop epoch"
+    },
+    {
+      "root": "apps/rgv-desktop/src/automation",
+      "text": ".scene_frame",
+      "purpose": "automation cannot report a source-worker staged frame as the committed presentation"
+    }
+  ],
   "retained_boundaries": [
     {
       "identifier": "AlignmentSceneEngine",
@@ -70,6 +160,16 @@
       "identifier": "AlignmentPresentationScene",
       "path": "crates/rgv-alignment-scene/src/presentation_scene.rs",
       "purpose": "immutable alignment semantic authority"
+    },
+    {
+      "identifier": "stage_for",
+      "path": "crates/rgv-alignment-scene/src/presentation_store.rs",
+      "purpose": "source workers retain explicitly private prepared semantic candidates rather than a product-current presentation"
+    },
+    {
+      "identifier": "PresentedAlignmentEpoch",
+      "path": "apps/rgv-desktop/src/lib.rs",
+      "purpose": "exclusive observable desktop authority committed with semantic and GPU state together"
     },
     {
       "identifier": "DisplayList",

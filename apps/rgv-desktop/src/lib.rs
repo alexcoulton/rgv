@@ -50,10 +50,10 @@ use rgv_alignment_scene::{
     AlignmentPanelSceneAdmission, AlignmentPanelSceneError, AlignmentPanelSceneFrame,
     AlignmentPanelSceneStore, AlignmentPresentationScene, AlignmentReadLabelMode,
     AlignmentRowActivityProfile, AlignmentSashimiLaneOptions, AlignmentSashimiScalePolicy,
-    AlignmentSceneCamera, AlignmentSceneSnapshot, AlignmentStyleContract,
-    AlignmentTraversalDirection, AlleleSummaryDetail, AllocationBundleActual,
-    AllocationBundleCommit, AllocationBundleError, AllocationBundleLease, AllocationBundleSlot,
-    AllocationBundleSpec, AllocationLedger, AllocationRetirementClaimSet,
+    AlignmentSceneCamera, AlignmentSceneSnapshot, AlignmentSemanticRetirementStats,
+    AlignmentStyleContract, AlignmentTraversalDirection, AlleleSummaryDetail,
+    AllocationBundleActual, AllocationBundleCommit, AllocationBundleError, AllocationBundleLease,
+    AllocationBundleSlot, AllocationBundleSpec, AllocationLedger, AllocationRetirementClaimSet,
     AllocationRetirementToken, CapabilityRequirement, CoverageAlleleInterpretation,
     CpuAlignmentProjector, CpuAlleleProjectionOptions, CpuClipRect, CpuDepthProjectionOptions,
     CpuJunctionProjectionOptions, CpuModificationProjectionOptions, CpuProjectionError,
@@ -61,35 +61,35 @@ use rgv_alignment_scene::{
     LedgerProgressEpoch, LedgerProgressSubscription, LedgerSnapshot,
     MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract, ReferenceRevision,
     RowAtlasRevision, RowCoordinateSpaceRevision, SummaryContract, SummaryPageFamily,
-    SummarySemanticComponent,
+    SummarySemanticComponent, build_alignment_semantic_retirement_claim_set,
 };
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,
-    AutomationAlignmentSelector, AutomationAlignmentState, AutomationAlignmentTrackSnapshot,
-    AutomationBatch, AutomationCommand, AutomationCommandResult, AutomationCommandStatus,
-    AutomationContextLaneSnapshot, AutomationCytobandAvailability, AutomationEnvironmentTelemetry,
-    AutomationErrorCode, AutomationEvidenceField, AutomationExportKind, AutomationFrameTelemetry,
-    AutomationGenomeSnapshot, AutomationGpuTelemetry, AutomationHistoryNavigation,
-    AutomationLandmarkIntegrityState, AutomationLandmarkSnapshot, AutomationLandmarkTrackState,
-    AutomationNavigationDestination, AutomationNavigationTelemetry, AutomationOptionScope,
-    AutomationPaneItemLayoutSnapshot, AutomationPaneLayoutSnapshot, AutomationPanelSnapshot,
-    AutomationPresentationCompositeSnapshot, AutomationPresentationGroupSnapshot,
-    AutomationPresentationNodeSnapshot, AutomationReadPanelStateSnapshot,
-    AutomationReadPresentationState, AutomationRectSnapshot, AutomationRenderLaneSnapshot,
-    AutomationRenderOmissionReason, AutomationReviewNavigation, AutomationRunReport,
-    AutomationRunTelemetry, AutomationSelection, AutomationSelectionGranularity,
-    AutomationSelectionKind, AutomationSelectionSnapshot, AutomationSetting,
-    AutomationSnapshotFormat, AutomationSnapshotScope, AutomationTrackGestureKind,
-    AutomationTrackGestureSnapshot, AutomationTrackLifecycle, AutomationTrackSnapshot,
-    AutomationUnsavedChangesPolicy, AutomationViewportOperation, AutomationWorkspaceLayoutSnapshot,
-    AutomationWorkspacePanelLayoutSnapshot, AutomationWorkspaceSnapshot, BisulfiteContext,
-    ContigAliases, ContigId, CopyNumberSortLocus, CopyNumberSortMode, CopyNumberTrackSettings,
-    CopyNumberValueMode, CoverageScaleTransform, DesktopSettings, DetailLevel, FeatureDisplayMode,
-    GenerationClock, GeneticCode, GenomeAssembly, GenomeAssemblyIdentity, GenomeConfiguration,
-    GenomeLandmarkCatalogue, GenomicInterval, GenomicSourceFormat, GwasColorMode,
-    GwasTrackSettings, IgvImportReport, InspectorActivation, InteractionDisplayMode,
-    InteractionTrackSettings, JunctionDisplayMode, LandmarkAssetRole, LandmarkSearchIndex,
-    MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_AUTOMATION_EVIDENCE_FIELDS,
+    AutomationAlignmentSceneDiagnostics, AutomationAlignmentSelector, AutomationAlignmentState,
+    AutomationAlignmentTrackSnapshot, AutomationBatch, AutomationCommand, AutomationCommandResult,
+    AutomationCommandStatus, AutomationContextLaneSnapshot, AutomationCytobandAvailability,
+    AutomationEnvironmentTelemetry, AutomationErrorCode, AutomationEvidenceField,
+    AutomationExportKind, AutomationFrameTelemetry, AutomationGenomeSnapshot,
+    AutomationGpuTelemetry, AutomationHistoryNavigation, AutomationLandmarkIntegrityState,
+    AutomationLandmarkSnapshot, AutomationLandmarkTrackState, AutomationNavigationDestination,
+    AutomationNavigationTelemetry, AutomationOptionScope, AutomationPaneItemLayoutSnapshot,
+    AutomationPaneLayoutSnapshot, AutomationPanelSnapshot, AutomationPresentationCompositeSnapshot,
+    AutomationPresentationGroupSnapshot, AutomationPresentationNodeSnapshot,
+    AutomationReadPanelStateSnapshot, AutomationReadPresentationState, AutomationRectSnapshot,
+    AutomationRenderLaneSnapshot, AutomationRenderOmissionReason, AutomationReviewNavigation,
+    AutomationRunReport, AutomationRunTelemetry, AutomationSelection,
+    AutomationSelectionGranularity, AutomationSelectionKind, AutomationSelectionSnapshot,
+    AutomationSetting, AutomationSnapshotFormat, AutomationSnapshotScope,
+    AutomationTrackGestureKind, AutomationTrackGestureSnapshot, AutomationTrackLifecycle,
+    AutomationTrackSnapshot, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
+    AutomationWorkspaceLayoutSnapshot, AutomationWorkspacePanelLayoutSnapshot,
+    AutomationWorkspaceSnapshot, BisulfiteContext, ContigAliases, ContigId, CopyNumberSortLocus,
+    CopyNumberSortMode, CopyNumberTrackSettings, CopyNumberValueMode, CoverageScaleTransform,
+    DesktopSettings, DetailLevel, FeatureDisplayMode, GenerationClock, GeneticCode, GenomeAssembly,
+    GenomeAssemblyIdentity, GenomeConfiguration, GenomeLandmarkCatalogue, GenomicInterval,
+    GenomicSourceFormat, GwasColorMode, GwasTrackSettings, IgvImportReport, InspectorActivation,
+    InteractionDisplayMode, InteractionTrackSettings, JunctionDisplayMode, LandmarkAssetRole,
+    LandmarkSearchIndex, MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_AUTOMATION_EVIDENCE_FIELDS,
     MAXIMUM_AUTOMATION_HISTORY_ENTRIES, MAXIMUM_AUTOMATION_LOCI,
     MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS, MAXIMUM_AUTOSAVE_INTERVAL_SECONDS,
     MAXIMUM_AUTOSAVE_RETENTION, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, MAXIMUM_CACHE_BUDGET_MIB,
@@ -152,21 +152,21 @@ use rgv_layout::{
 };
 use rgv_render::{
     AlignmentGpuCameraCaptureError, AlignmentGpuFrame, AlignmentGpuPageAdmissionError,
-    AlignmentGpuPrefetchCursor, AlignmentGpuPrepareError, AlignmentGpuRenderer,
-    AlignmentGpuReplacementError, AlignmentGpuResidencyLease, AlignmentGpuRetirement,
-    AlignmentGpuSceneRequest, AlignmentGpuScissor, AlignmentSummaryFrameOverlays,
-    AlignmentSummaryGpuCameraCaptureError, AlignmentSummaryGpuFrame,
+    AlignmentGpuPrefetchCursor, AlignmentGpuPrepareError, AlignmentGpuPrepareStats,
+    AlignmentGpuRenderer, AlignmentGpuReplacementError, AlignmentGpuResidencyLease,
+    AlignmentGpuRetirement, AlignmentGpuSceneRequest, AlignmentGpuScissor,
+    AlignmentSummaryFrameOverlays, AlignmentSummaryGpuCameraCaptureError, AlignmentSummaryGpuFrame,
     AlignmentSummaryGpuLaneOptions, AlignmentSummaryGpuPageAdmissionError,
     AlignmentSummaryGpuPageKey, AlignmentSummaryGpuPrefetchCursor, AlignmentSummaryGpuPrepareError,
-    AlignmentSummaryGpuRenderer, AlignmentSummaryGpuReplacementError,
-    AlignmentSummaryGpuResidencyLease, AlignmentSummaryGpuRetirement,
-    AlignmentSummaryGpuSceneRequest, AlignmentSummaryJunctionComponentToken,
-    AlignmentSummaryJunctionInteraction, ContextSceneGpuCamera, ContextSceneGpuCameraCaptureError,
-    ContextSceneGpuCoherenceKey, ContextSceneGpuFrame, ContextSceneGpuLaneKey,
-    ContextSceneGpuLaneRequest, ContextSceneGpuRejection, ContextSceneGpuRejectionReason,
-    ContextSceneGpuRenderer, ContextSceneGpuRetainedLaneRequest, ContextSceneGpuScissor,
-    GpuBudgetPressure, GpuReclaimGoal, GpuReclaimReport, PrepareStats, RectangleRenderer,
-    export_png,
+    AlignmentSummaryGpuPrepareStats, AlignmentSummaryGpuRenderer,
+    AlignmentSummaryGpuReplacementError, AlignmentSummaryGpuResidencyLease,
+    AlignmentSummaryGpuRetirement, AlignmentSummaryGpuSceneRequest,
+    AlignmentSummaryJunctionComponentToken, AlignmentSummaryJunctionInteraction,
+    ContextSceneGpuCamera, ContextSceneGpuCameraCaptureError, ContextSceneGpuCoherenceKey,
+    ContextSceneGpuFrame, ContextSceneGpuLaneKey, ContextSceneGpuLaneRequest,
+    ContextSceneGpuRejection, ContextSceneGpuRejectionReason, ContextSceneGpuRenderer,
+    ContextSceneGpuRetainedLaneRequest, ContextSceneGpuScissor, GpuBudgetPressure, GpuReclaimGoal,
+    GpuReclaimReport, PrepareStats, RectangleRenderer, export_png,
 };
 use runtime::*;
 use sha2::{Digest as _, Sha256};
@@ -1103,6 +1103,8 @@ struct AlignmentCommittedLaneAuthority {
     source_camera: AlignmentSceneCamera,
     individual_reads: AlignmentIndividualReadCapability,
     semantic_target_complete: bool,
+    reference_ready: bool,
+    vertical_residency: AlignmentVerticalResidency,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1208,6 +1210,8 @@ struct AlignmentGpuPrefetchState {
     summary_cursor: Option<AlignmentSummaryGpuPrefetchCursor>,
     read_residency: Option<AlignmentGpuResidencyLease>,
     summary_residency: Option<AlignmentSummaryGpuResidencyLease>,
+    read_retention_limited: bool,
+    summary_retention_limited: bool,
     page_quantum: usize,
     summaries_next: bool,
 }
@@ -1221,18 +1225,24 @@ impl Default for AlignmentGpuPrefetchState {
             summary_cursor: None,
             read_residency: None,
             summary_residency: None,
+            read_retention_limited: false,
+            summary_retention_limited: false,
             page_quantum: 1,
             summaries_next: false,
         }
     }
 }
 
-/// A recoverable foreground GPU publication refusal. Keeping the original ledger error typed
-/// lets the scheduler determine whether the exact obstruction still exists without parsing a
-/// user-facing diagnostic.
+/// A recoverable foreground GPU publication refusal. Keeping the original ledger or aggregate
+/// replacement pressure typed lets the scheduler determine whether the exact obstruction still
+/// exists without parsing a user-facing diagnostic or discarding semantic/GPU retirement credit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AlignmentGpuPublicationBlocker {
     Ledger(LedgerError),
+    /// Aggregate replacement pressure carries a cause-specific physical-overlap model and the
+    /// exact old-epoch retirement credit. Flattening this into `LedgerError::BudgetExceeded`
+    /// would make the retry gate treat guaranteed retirement as continuing occupancy.
+    AggregateGpu(GpuBudgetPressure),
     /// A shared-ledger policy edit raced a replacement plan. The mismatch itself proves that the
     /// refused plan is obsolete, so the next attempt must re-snapshot and re-plan exactly once.
     PolicyRevisionChanged {
@@ -1260,8 +1270,9 @@ struct AlignmentGpuPublicationRetry {
 
 /// One deterministic cross-owner reclaim cycle for an exact foreground publication. Every source
 /// engine gets at most one correlated eviction request. The cycle either creates enough exact
-/// headroom for one retry or settles as an interactive `BudgetLimited` result; it never polls or
-/// converts capacity pressure into source failure.
+/// headroom or relinquishes cache ownership for one exact retry, otherwise it settles as an
+/// interactive `BudgetLimited` result; it never polls or converts capacity pressure into source
+/// failure.
 #[derive(Clone, Debug)]
 struct AlignmentCapacityReclaimCycle {
     request_id: u64,
@@ -1272,6 +1283,7 @@ struct AlignmentCapacityReclaimCycle {
     target_charged: usize,
     pending_tracks: HashSet<TrackId>,
     released_bytes: usize,
+    relinquished_cache_entries: usize,
 }
 
 impl AlignmentGpuPrefetchState {
@@ -1298,6 +1310,7 @@ enum AlignmentGpuSpeculationPhase {
     Eligible,
     Warming,
     Resident,
+    DemandPaged,
     Suppressed,
 }
 
@@ -1327,10 +1340,15 @@ struct Viewer {
     alignment_ledger_progress: LedgerProgressSubscription,
     alignment_gpu_renderer: AlignmentGpuRenderer,
     alignment_summary_gpu_renderer: AlignmentSummaryGpuRenderer,
+    alignment_gpu_last_prepare_stats: AlignmentGpuPrepareStats,
+    alignment_summary_gpu_last_prepare_stats: AlignmentSummaryGpuPrepareStats,
     alignment_presented_epoch: Option<PresentedAlignmentEpoch>,
     alignment_gpu_residency_bundle: Option<AlignmentGpuResidencyBundle>,
     alignment_gpu_prefetch: AlignmentGpuPrefetchState,
     alignment_gpu_publication_retry: Option<AlignmentGpuPublicationRetry>,
+    /// Most recent typed aggregate GPU admission pressure. Retained after recovery or
+    /// `BudgetLimited` settlement so diagnostics do not depend on parsing status text.
+    alignment_last_gpu_budget_pressure: Option<GpuBudgetPressure>,
     alignment_capacity_reclaim: Option<AlignmentCapacityReclaimCycle>,
     alignment_capacity_reclaim_clock: u64,
     alignment_gpu_speculation_gate: AlignmentGpuSpeculationGate,

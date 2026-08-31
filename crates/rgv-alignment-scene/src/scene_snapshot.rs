@@ -12,12 +12,263 @@ use thiserror::Error;
 use crate::summary_page::required_summary_page_keys;
 use crate::{
     AlignmentExportError, AlignmentExportRecord, AlignmentHandle, AlignmentPresentationScene,
-    AllocationClass, AllocationLease, AllocationLedger, CanonicalGenomicTile,
-    ExactAlleleSiteEvidence, ExactPileupSiteEvidence, ExactSummaryPins, ExactSummaryRoot,
-    JunctionAnnotationIndex, JunctionAnnotationPins, LedgerError, PinnedAllocationLease,
-    ReservationKind, SceneRevision, SummaryPageFamily, SummaryPageKey, SummaryRevision,
-    SummarySemanticComponent, SummarySemanticPage,
+    AllocationBundleError, AllocationClass, AllocationLease, AllocationLedger,
+    AllocationRetirementClaimSet, CanonicalGenomicTile, ExactAlleleSiteEvidence,
+    ExactPileupSiteEvidence, ExactSummaryPins, ExactSummaryRoot, JunctionAnnotationIndex,
+    JunctionAnnotationPins, LedgerError, PinnedAllocationLease, ReservationKind, SceneRevision,
+    SummaryPageFamily, SummaryPageKey, SummaryRevision, SummarySemanticComponent,
+    SummarySemanticPage,
 };
+
+/// Exact semantic allocations proved to disappear with one detached desktop epoch. Shared roots,
+/// pages, and scenes are deliberately omitted unless every strong reference is among the supplied
+/// occurrences; omitted resources remain protected and receive no admission credit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentSemanticRetirementStats {
+    pub snapshot_occurrences: usize,
+    pub unique_snapshots: usize,
+    pub exclusively_owned_snapshots: usize,
+    pub exclusively_owned_read_scenes: usize,
+    pub exclusively_owned_evidence_roots: usize,
+    pub exclusively_owned_row_atlases: usize,
+    pub exclusively_owned_summary_roots: usize,
+    pub exclusively_owned_read_pages: usize,
+    pub exclusively_owned_summary_pages: usize,
+    pub owned_references_examined: usize,
+    pub claimed_allocations: usize,
+}
+
+/// Builds the semantic component of an end-to-end epoch retirement from the actual snapshot
+/// references physically owned by the detached presentation token.
+///
+/// The caller must keep every supplied occurrence alive in that move-only token until settlement
+/// or rollback. Each immutable object is credited only when every strong occurrence belongs to
+/// the token and no weak authority could mint a new owner. The proof walks snapshots, read scenes,
+/// source/summary/layout roots, their shared leaves, and semantic pages recursively. Pins owned by
+/// exclusive parents are always presented to the ledger; an allocation is retained in the final
+/// claim only when those references plus its exclusively owned lease comprise its complete live
+/// reference set. Shared current roots and cache entries therefore remain charged without making
+/// the otherwise-exact retirement fail.
+pub fn build_alignment_semantic_retirement_claim_set<'a>(
+    ledger: &AllocationLedger,
+    snapshots: impl IntoIterator<Item = &'a Arc<AlignmentSceneSnapshot>>,
+) -> Result<
+    (
+        AllocationRetirementClaimSet,
+        AlignmentSemanticRetirementStats,
+    ),
+    AllocationBundleError,
+> {
+    let snapshots = snapshots.into_iter().collect::<Vec<_>>();
+    let unique_snapshots = unique_arc_count(snapshots.iter().copied());
+    let exclusive_snapshots = exclusively_owned_arcs(snapshots.iter().copied());
+    let exclusive_reads =
+        exclusively_owned_arcs(exclusive_snapshots.iter().map(|snapshot| snapshot.reads()));
+    let exclusive_evidence =
+        exclusively_owned_arcs(exclusive_reads.iter().map(|reads| reads.evidence()));
+    let exclusive_atlases =
+        exclusively_owned_arcs(exclusive_reads.iter().map(|reads| reads.atlas()));
+    let exclusive_summaries = exclusively_owned_arcs(
+        exclusive_snapshots
+            .iter()
+            .map(|snapshot| snapshot.summaries()),
+    );
+    let exclusive_annotations = exclusively_owned_arcs(
+        exclusive_snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot.annotation()),
+    );
+    let exclusive_read_pages = exclusively_owned_arcs(
+        exclusive_reads
+            .iter()
+            .flat_map(|reads| reads.pages().iter()),
+    );
+    let exclusive_summary_pages = exclusively_owned_arcs(
+        exclusive_snapshots
+            .iter()
+            .flat_map(|snapshot| snapshot.summary_pages().iter()),
+    );
+    let exclusive_chunks = exclusively_owned_arcs(
+        exclusive_evidence
+            .iter()
+            .flat_map(|evidence| evidence.chunks().iter()),
+    );
+    let exclusive_payloads =
+        exclusively_owned_arcs(exclusive_chunks.iter().filter_map(|chunk| chunk.payload()));
+    let exclusive_atlas_layers = exclusively_owned_arcs(
+        exclusive_atlases
+            .iter()
+            .flat_map(|atlas| atlas.layers().iter()),
+    );
+    let exclusive_depth_tiles = exclusively_owned_arcs(
+        exclusive_summaries
+            .iter()
+            .flat_map(|root| root.depth_tiles().iter()),
+    );
+    let exclusive_allele_tiles = exclusively_owned_arcs(
+        exclusive_summaries
+            .iter()
+            .flat_map(|root| root.allele_tiles().iter()),
+    );
+    let exclusive_junction_tiles = exclusively_owned_arcs(
+        exclusive_summaries
+            .iter()
+            .flat_map(|root| root.junction_tiles().iter()),
+    );
+    let exclusive_pair_tiles = exclusively_owned_arcs(
+        exclusive_summaries
+            .iter()
+            .flat_map(|root| root.pair_tiles().iter()),
+    );
+    let exclusive_filter_tiles = exclusively_owned_arcs(
+        exclusive_summaries
+            .iter()
+            .flat_map(|root| root.filter_tiles().iter()),
+    );
+    let exclusive_modification_tiles = exclusively_owned_arcs(
+        exclusive_summaries
+            .iter()
+            .flat_map(|root| root.modification_tiles().iter()),
+    );
+
+    let mut builder = ledger.retirement_claim_builder();
+    let mut owned_references_examined = 0_usize;
+    for snapshot in &exclusive_snapshots {
+        builder.include_lease(snapshot.metadata_allocation())?;
+        builder.include_pin(&snapshot._pins._metadata)?;
+        owned_references_examined = owned_references_examined.saturating_add(2);
+        for pin in snapshot._pins._summaries.allocations() {
+            builder.include_pin(pin)?;
+            owned_references_examined = owned_references_examined.saturating_add(1);
+        }
+        if let Some(annotation) = &snapshot._pins._annotation {
+            builder.include_pin(annotation.allocation())?;
+            owned_references_examined = owned_references_examined.saturating_add(1);
+        }
+        for pin in &snapshot._pins._summary_pages {
+            builder.include_pin(pin)?;
+            owned_references_examined = owned_references_examined.saturating_add(1);
+        }
+    }
+    for reads in &exclusive_reads {
+        builder.include_lease(reads.metadata_allocation())?;
+        builder.include_pin(reads.metadata_pin())?;
+        owned_references_examined = owned_references_examined.saturating_add(2);
+        for pin in reads.evidence_pins() {
+            builder.include_pin(pin)?;
+            owned_references_examined = owned_references_examined.saturating_add(1);
+        }
+        for pin in reads.atlas_pins() {
+            builder.include_pin(pin)?;
+            owned_references_examined = owned_references_examined.saturating_add(1);
+        }
+        for pin in reads.page_pins() {
+            builder.include_pin(pin)?;
+            owned_references_examined = owned_references_examined.saturating_add(1);
+        }
+    }
+    for evidence in &exclusive_evidence {
+        builder.include_lease(evidence.metadata_allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for chunk in &exclusive_chunks {
+        builder.include_lease(chunk.core_allocation())?;
+        builder.include_lease(chunk.overlap_allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(2);
+    }
+    for payload in &exclusive_payloads {
+        builder.include_lease(payload.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for atlas in &exclusive_atlases {
+        builder.include_lease(atlas.metadata_allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for layer in &exclusive_atlas_layers {
+        builder.include_lease(layer.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for root in &exclusive_summaries {
+        builder.include_lease(root.metadata_allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for tile in &exclusive_depth_tiles {
+        builder.include_lease(tile.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for tile in &exclusive_allele_tiles {
+        builder.include_lease(tile.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for tile in &exclusive_junction_tiles {
+        builder.include_lease(tile.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for tile in &exclusive_pair_tiles {
+        builder.include_lease(tile.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for tile in &exclusive_filter_tiles {
+        builder.include_lease(tile.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for tile in &exclusive_modification_tiles {
+        builder.include_lease(tile.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for annotation in &exclusive_annotations {
+        builder.include_lease(annotation.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for page in &exclusive_read_pages {
+        builder.include_lease(page.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    for page in &exclusive_summary_pages {
+        builder.include_lease(page.allocation())?;
+        owned_references_examined = owned_references_examined.saturating_add(1);
+    }
+    let claim_set = builder.finish_maximal_exact()?;
+    let stats = AlignmentSemanticRetirementStats {
+        snapshot_occurrences: snapshots.len(),
+        unique_snapshots,
+        exclusively_owned_snapshots: exclusive_snapshots.len(),
+        exclusively_owned_read_scenes: exclusive_reads.len(),
+        exclusively_owned_evidence_roots: exclusive_evidence.len(),
+        exclusively_owned_row_atlases: exclusive_atlases.len(),
+        exclusively_owned_summary_roots: exclusive_summaries.len(),
+        exclusively_owned_read_pages: exclusive_read_pages.len(),
+        exclusively_owned_summary_pages: exclusive_summary_pages.len(),
+        owned_references_examined,
+        claimed_allocations: claim_set.len(),
+    };
+    Ok((claim_set, stats))
+}
+
+fn unique_arc_count<'a, T: 'a>(occurrences: impl IntoIterator<Item = &'a Arc<T>>) -> usize {
+    occurrences
+        .into_iter()
+        .map(Arc::as_ptr)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn exclusively_owned_arcs<'a, T>(
+    occurrences: impl IntoIterator<Item = &'a Arc<T>>,
+) -> Vec<&'a Arc<T>> {
+    let mut owned = HashMap::<*const T, (usize, &'a Arc<T>)>::new();
+    for value in occurrences {
+        let entry = owned.entry(Arc::as_ptr(value)).or_insert((0, value));
+        entry.0 = entry.0.saturating_add(1);
+    }
+    owned
+        .into_values()
+        .filter_map(|(occurrences, value)| {
+            (Arc::strong_count(value) == occurrences && Arc::weak_count(value) == 0)
+                .then_some(value)
+        })
+        .collect()
+}
 
 /// Scene-backed allele observation used by inspection and automation consumers. The base counts
 /// and tile provenance come from the exact summary root; the optional reference base comes from

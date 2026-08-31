@@ -240,6 +240,49 @@ pub(crate) fn plan_alignment_reference_lanes(
 }
 
 impl Viewer {
+    fn set_panel_alignment_optional_work_paused(&mut self, panel_id: PanelId, paused: bool) {
+        for track_index in 0..self.alignment_tracks.len() {
+            let Some(owner) = self.alignment_tracks[track_index]
+                .projection(panel_id)
+                .and_then(|projection| {
+                    (projection.scene_optional_work_paused != paused)
+                        .then_some(projection.scene_owner)
+                        .flatten()
+                })
+            else {
+                continue;
+            };
+            let result = self.alignment_tracks[track_index]
+                .scene_engine
+                .as_ref()
+                .map(|engine| engine.try_set_optional_work_paused(owner, paused));
+            match result {
+                Some(Ok(())) => {
+                    self.alignment_tracks[track_index]
+                        .projection_mut(panel_id)
+                        .scene_optional_work_paused = paused;
+                }
+                Some(Err(EngineQueueError::Disconnected)) => {
+                    self.alignment_tracks[track_index].lifecycle =
+                        AlignmentTrackLifecycle::Failed(EngineQueueError::Disconnected.to_string());
+                }
+                Some(Err(EngineQueueError::Full)) | None => {}
+            }
+        }
+    }
+
+    pub(crate) fn resume_alignment_optional_work_for_settled_panels(&mut self) {
+        let settled = self
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .filter(|panel_id| self.panel_alignment_queries_are_settled(*panel_id))
+            .collect::<Vec<_>>();
+        for panel_id in settled {
+            self.set_panel_alignment_optional_work_paused(panel_id, false);
+        }
+    }
+
     fn mark_active_panel_navigation_queries_pending(&mut self) {
         let panel_id = self.panels.active().id;
         for track_index in 0..self.alignment_tracks.len() {
@@ -276,6 +319,7 @@ impl Viewer {
         gesture_active: bool,
         hold_commit_until_end: bool,
     ) {
+        let panel_id = self.panels.active().id;
         if self
             .panels
             .active()
@@ -284,6 +328,8 @@ impl Viewer {
         {
             return;
         }
+        self.set_panel_alignment_optional_work_paused(panel_id, true);
+        self.revoke_alignment_gpu_optional_residency_for_foreground();
         if self.synthetic
             || !(self.has_alignment_engine()
                 || self.reference_engine.is_some()
@@ -296,7 +342,6 @@ impl Viewer {
 
         let now = Instant::now();
         self.retain_active_read_selection_for_query_refresh();
-        let panel_id = self.panels.active().id;
         let previous_target_generation = self
             .panels
             .active()
@@ -363,6 +408,7 @@ impl Viewer {
         if let Some(target) = target {
             self.dispatch_navigation_query_target(panel_id, target);
         }
+        self.resume_alignment_optional_work_for_settled_panels();
         self.window.request_redraw();
     }
 
@@ -2160,6 +2206,7 @@ impl Viewer {
                         track_id,
                         request_id,
                         eviction.released,
+                        eviction.relinquished_cache_entries,
                     );
                 }
                 AlignmentSceneEngineEvent::Error {

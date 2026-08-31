@@ -892,6 +892,8 @@ pub(crate) struct AlignmentPanelProjection {
     /// Last exact pressure resume admitted for this request at a specific shared-ledger epoch.
     /// It is scheduling state only and never authorizes scene publication.
     pub(crate) scene_pressure_retry: Option<AlignmentScenePressureRetry>,
+    /// Last optional-preparation foreground state accepted by the source worker mailbox.
+    pub(crate) scene_optional_work_paused: bool,
     pub(crate) scene_frame: Option<AlignmentCoordinatorFrame>,
     pub(crate) scene_frame_request_token: Option<AlignmentSceneRequestToken>,
     pub(crate) scene_telemetry: AlignmentSceneCoordinatorTelemetry,

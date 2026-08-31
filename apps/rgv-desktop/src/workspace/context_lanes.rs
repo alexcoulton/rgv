@@ -70,6 +70,9 @@ pub(crate) struct ContextLaneLease {
     pub(crate) source_viewport: Viewport,
     pub(crate) frame_key: TrackFrameKey,
     pub(crate) display: Arc<DisplayList>,
+    /// Finite text anchors sorted by immutable source x. Camera projection binary-searches this
+    /// directory instead of cloning/filtering every off-screen label in the buffered lane.
+    text_order: Arc<[usize]>,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +116,8 @@ pub(crate) struct PanelContextScene {
     pub(crate) lanes: BTreeMap<ContextLaneKey, ContextLaneState>,
     pub(crate) coherence_groups: BTreeMap<String, BTreeSet<ContextLaneKey>>,
     pub(crate) projected: DisplayList,
+    pub(crate) camera_text_anchors_examined: usize,
+    pub(crate) camera_text_anchors_available: usize,
     candidates: BTreeMap<ContextLaneKey, Arc<ContextLaneLease>>,
     eligible_candidates: BTreeSet<ContextLaneKey>,
     coherence_components: BTreeMap<ContextLaneKey, u64>,
@@ -163,9 +168,11 @@ impl PanelContextScene {
                 source_viewport: draft.source_viewport,
                 frame_key: draft.frame_key,
                 display: Arc::clone(&previous.display),
+                text_order: Arc::clone(&previous.text_order),
             });
         }
         self.next_revision = self.next_revision.saturating_add(1).max(1);
+        let text_order = context_text_order(&draft.display);
         Arc::new(ContextLaneLease {
             key: draft.key,
             revision: self.next_revision,
@@ -173,6 +180,7 @@ impl PanelContextScene {
             source_viewport: draft.source_viewport,
             frame_key: draft.frame_key,
             display: Arc::new(draft.display),
+            text_order,
         })
     }
 
@@ -357,6 +365,7 @@ impl PanelContextScene {
             }
             project_context_lane_display(
                 lease.display.as_ref(),
+                &lease.text_order,
                 lease.source_viewport,
                 target,
                 frame.top,
@@ -372,6 +381,8 @@ impl PanelContextScene {
     /// rectangle compositor unnecessarily.
     pub(crate) fn project_camera_text(&mut self, target: Viewport, frames: &[TrackFrame]) {
         let mut projected = DisplayList::default();
+        let mut examined = 0_usize;
+        let mut available = 0_usize;
         for state in self.lanes.values() {
             if matches!(
                 state.readiness,
@@ -393,15 +404,19 @@ impl PanelContextScene {
             if !lease.source_viewport.interval().overlaps(target.interval()) {
                 continue;
             }
-            project_context_lane_text(
+            available = available.saturating_add(lease.text_order.len());
+            examined = examined.saturating_add(project_context_lane_text(
                 lease.display.as_ref(),
+                &lease.text_order,
                 lease.source_viewport,
                 target,
                 frame.top,
                 &mut projected,
-            );
+            ));
         }
         self.projected = projected;
+        self.camera_text_anchors_examined = examined;
+        self.camera_text_anchors_available = available;
     }
 
     pub(crate) fn gpu_publications(&self) -> impl Iterator<Item = ContextLaneGpuPublication<'_>> {
@@ -599,8 +614,26 @@ fn localize_display_vertical(display: &mut DisplayList, frame_top: f32) {
     }
 }
 
+fn context_text_order(display: &DisplayList) -> Arc<[usize]> {
+    let mut order = display
+        .texts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, text)| text.x.is_finite().then_some(index))
+        .collect::<Vec<_>>();
+    order.sort_unstable_by(|left, right| {
+        display.texts[*left]
+            .x
+            .total_cmp(&display.texts[*right].x)
+            .then_with(|| display.texts[*left].y.total_cmp(&display.texts[*right].y))
+            .then_with(|| left.cmp(right))
+    });
+    order.into()
+}
+
 pub(crate) fn project_context_lane_display(
     source: &DisplayList,
+    text_order: &[usize],
     source_viewport: Viewport,
     target: Viewport,
     frame_top: f32,
@@ -655,21 +688,24 @@ pub(crate) fn project_context_lane_display(
             }
             (rectangle.width > 0.0).then_some(rectangle)
         }));
-    output.texts.extend(source.texts.iter().filter_map(|text| {
-        let mut text = text.clone();
-        text.x = project_x(text.x);
-        text.y += frame_top;
-        (text.x >= -128.0 && text.x <= target_width + 128.0).then_some(text)
-    }));
+    project_context_lane_text(
+        source,
+        text_order,
+        source_viewport,
+        target,
+        frame_top,
+        output,
+    );
 }
 
 fn project_context_lane_text(
     source: &DisplayList,
+    text_order: &[usize],
     source_viewport: Viewport,
     target: Viewport,
     frame_top: f32,
     output: &mut DisplayList,
-) {
+) -> usize {
     let source_bases_per_pixel = source_viewport.bases_per_pixel();
     let target_bases_per_pixel = target.bases_per_pixel();
     let target_width = target.pixel_width() as f32;
@@ -678,15 +714,26 @@ fn project_context_lane_text(
         || source_bases_per_pixel <= 0.0
         || target_bases_per_pixel <= 0.0
     {
-        return;
+        return 0;
     }
-    output.texts.extend(source.texts.iter().filter_map(|text| {
+    let source_x_for_target = |target_x: f64| {
+        (target.exact_start() + target_x * target_bases_per_pixel - source_viewport.exact_start())
+            / source_bases_per_pixel
+    };
+    let minimum_source_x = source_x_for_target(-128.0) as f32;
+    let maximum_source_x = source_x_for_target(f64::from(target_width) + 128.0) as f32;
+    let first = text_order.partition_point(|index| source.texts[*index].x < minimum_source_x);
+    let last = text_order.partition_point(|index| source.texts[*index].x <= maximum_source_x);
+    let candidates = &text_order[first.min(last)..last];
+    output.texts.extend(candidates.iter().filter_map(|index| {
+        let text = &source.texts[*index];
         let genomic = source_viewport.exact_start() + f64::from(text.x) * source_bases_per_pixel;
         let mut text = text.clone();
         text.x = ((genomic - target.exact_start()) / target_bases_per_pixel) as f32;
         text.y += frame_top;
         (text.x >= -128.0 && text.x <= target_width + 128.0).then_some(text)
     }));
+    candidates.len()
 }
 
 /// Uses the same user-facing side-buffer convention as alignment scenes: 100% means one visible
@@ -867,7 +914,15 @@ mod tests {
             }],
         };
         let mut projected = DisplayList::default();
-        project_context_lane_display(&source, source_viewport, target, 40.0, &mut projected);
+        let text_order = context_text_order(&source);
+        project_context_lane_display(
+            &source,
+            &text_order,
+            source_viewport,
+            target,
+            40.0,
+            &mut projected,
+        );
         assert_eq!(projected.rectangles[0].x, 100.0);
         assert_eq!(projected.rectangles[0].width, 200.0);
         assert_eq!(projected.rectangles[0].y, 45.0);
@@ -898,11 +953,56 @@ mod tests {
             }],
         };
         let mut projected = DisplayList::default();
-        project_context_lane_text(&source, source_viewport, target, 50.0, &mut projected);
+        let text_order = context_text_order(&source);
+        let examined = project_context_lane_text(
+            &source,
+            &text_order,
+            source_viewport,
+            target,
+            50.0,
+            &mut projected,
+        );
+        assert_eq!(examined, 1);
         assert!(projected.rectangles.is_empty());
         assert_eq!(projected.texts.len(), 1);
         assert_eq!(projected.texts[0].x, 200.0);
         assert_eq!(projected.texts[0].y, 59.0);
+    }
+
+    #[test]
+    fn camera_text_projection_binary_searches_visible_anchors() {
+        let source_viewport = viewport(0, 100_000, 100_000.0);
+        let target = viewport(50_000, 50_100, 100.0);
+        let source = DisplayList {
+            rectangles: Vec::new(),
+            texts: (0..10_000)
+                .map(|index| rgv_layout::TextPrimitive {
+                    x: (index * 10) as f32,
+                    y: 5.0,
+                    text: format!("G{index}"),
+                    font_size: 10.0,
+                    color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+                })
+                .collect(),
+        };
+        let text_order = context_text_order(&source);
+        let mut projected = DisplayList::default();
+        let examined = project_context_lane_text(
+            &source,
+            &text_order,
+            source_viewport,
+            target,
+            0.0,
+            &mut projected,
+        );
+        assert!(!projected.texts.is_empty());
+        assert!(examined < source.texts.len() / 20);
+        assert!(
+            projected
+                .texts
+                .iter()
+                .all(|text| text.x >= -128.0 && text.x <= 228.0)
+        );
     }
 
     fn draft(key: ContextLaneKey, generation: u64, object_id: u32) -> ContextLaneDraft {

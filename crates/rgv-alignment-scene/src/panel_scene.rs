@@ -439,6 +439,15 @@ impl AlignmentPanelSceneStore {
         self.advance_authority();
     }
 
+    /// Enumerates the exact strong snapshot references owned by this resident panel store.
+    /// Replacement retirement uses occurrences rather than unique identities so it can compare
+    /// them with `Arc::strong_count` without manufacturing another semantic owner.
+    pub fn snapshots(&self) -> impl Iterator<Item = &Arc<AlignmentSceneSnapshot>> {
+        self.lanes
+            .values()
+            .filter_map(|lane| lane.snapshot.as_ref())
+    }
+
     pub fn set_coherence_groups(
         &mut self,
         groups: impl IntoIterator<Item = AlignmentCoherenceGroupSpec>,

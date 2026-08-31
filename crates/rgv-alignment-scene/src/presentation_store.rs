@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     num::{NonZeroU32, NonZeroU64},
     ops::Range,
     sync::Arc,
@@ -57,7 +57,9 @@ pub struct AlignmentPresentationStore {
     ledger: AllocationLedger,
     read_pages: HashMap<AlignmentPageKey, CachedReadPage>,
     summary_pages: HashMap<SummaryPageKey, CachedSummaryPage>,
-    currents: HashMap<AlignmentPresentationOwner, Arc<AlignmentSceneSnapshot>>,
+    /// Source-worker preparation authority. These snapshots are reusable private candidates;
+    /// they are never the desktop's observable presented epoch.
+    prepared_by_owner: HashMap<AlignmentPresentationOwner, Arc<AlignmentSceneSnapshot>>,
     next_revision: u64,
 }
 
@@ -68,7 +70,7 @@ impl AlignmentPresentationStore {
             ledger,
             read_pages: HashMap::new(),
             summary_pages: HashMap::new(),
-            currents: HashMap::new(),
+            prepared_by_owner: HashMap::new(),
             next_revision: 1,
         }
     }
@@ -229,47 +231,48 @@ impl AlignmentPresentationStore {
         })
     }
 
-    pub fn publish(&mut self, candidate: AlignmentSceneCandidate) -> Arc<AlignmentSceneSnapshot> {
-        self.publish_for(AlignmentPresentationOwner::default(), candidate)
+    pub fn stage(&mut self, candidate: AlignmentSceneCandidate) -> Arc<AlignmentSceneSnapshot> {
+        self.stage_for(AlignmentPresentationOwner::default(), candidate)
     }
 
-    /// Atomically replaces one owner's publication without disturbing another panel.
-    pub fn publish_for(
+    /// Replaces one source worker's private prepared candidate without disturbing another panel.
+    /// Product presentation remains a separate CPU/GPU transaction owned by the desktop.
+    pub fn stage_for(
         &mut self,
         owner: AlignmentPresentationOwner,
         candidate: AlignmentSceneCandidate,
     ) -> Arc<AlignmentSceneSnapshot> {
         let snapshot = Arc::clone(&candidate.snapshot);
-        self.currents.insert(owner, candidate.snapshot);
+        self.prepared_by_owner.insert(owner, candidate.snapshot);
         snapshot
     }
 
     #[must_use]
-    pub fn current(&self) -> Option<&Arc<AlignmentSceneSnapshot>> {
-        self.current_for(AlignmentPresentationOwner::default())
+    pub fn prepared(&self) -> Option<&Arc<AlignmentSceneSnapshot>> {
+        self.prepared_for(AlignmentPresentationOwner::default())
     }
 
     #[must_use]
-    pub fn current_for(
+    pub fn prepared_for(
         &self,
         owner: AlignmentPresentationOwner,
     ) -> Option<&Arc<AlignmentSceneSnapshot>> {
-        self.currents.get(&owner)
+        self.prepared_by_owner.get(&owner)
     }
 
     #[must_use]
-    pub fn current_covers(&self, interval: GenomicInterval, rows: Range<u32>) -> bool {
-        self.current_covers_for(AlignmentPresentationOwner::default(), interval, rows)
+    pub fn prepared_covers(&self, interval: GenomicInterval, rows: Range<u32>) -> bool {
+        self.prepared_covers_for(AlignmentPresentationOwner::default(), interval, rows)
     }
 
     #[must_use]
-    pub fn current_covers_for(
+    pub fn prepared_covers_for(
         &self,
         owner: AlignmentPresentationOwner,
         interval: GenomicInterval,
         rows: Range<u32>,
     ) -> bool {
-        self.currents
+        self.prepared_by_owner
             .get(&owner)
             .is_some_and(|current| current.covers(interval, rows))
     }
@@ -279,12 +282,12 @@ impl AlignmentPresentationStore {
         &mut self,
         owner: AlignmentPresentationOwner,
     ) -> Option<Arc<AlignmentSceneSnapshot>> {
-        self.currents.remove(&owner)
+        self.prepared_by_owner.remove(&owner)
     }
 
     #[must_use]
     pub fn owner_count(&self) -> usize {
-        self.currents.len()
+        self.prepared_by_owner.len()
     }
 
     #[must_use]
@@ -324,10 +327,11 @@ impl AlignmentPresentationStore {
         }
     }
 
-    /// Applies a lower shared allocation budget and evicts inactive semantic-page cache entries
-    /// in true least-recently-used order. Current/candidate scene pins are never eviction
-    /// candidates. If pinned or externally leased allocations alone exceed the new ceiling, the
-    /// returned pressure snapshot reports the exact remaining overage.
+    /// Applies a lower shared allocation budget and relinquishes semantic-page cache ownership in
+    /// true least-recently-used order. Staged worker scenes and committed desktop epochs retain
+    /// their own `Arc`s and pins, so removing a lookup entry never destroys either authority. A page
+    /// which remains pinned may release no bytes immediately, but relinquishing the cache's last
+    /// outside `Arc` lets an atomic epoch replacement prove that it will retire on commit.
     pub fn reduce_budget(
         &mut self,
         budget: usize,
@@ -336,28 +340,36 @@ impl AlignmentPresentationStore {
         self.evict_inactive_until(budget)
     }
 
-    /// Releases inactive semantic pages toward a shared-ledger headroom target without changing
-    /// the user policy. This is the owner-local half of aggregate foreground reclaim: another
-    /// owner may have encountered pressure even though this store still owns the oldest legal
-    /// eviction candidate.
+    /// Releases inactive semantic cache ownership toward a shared-ledger headroom target without
+    /// changing the user policy. This is the owner-local half of aggregate foreground reclaim:
+    /// another owner may have encountered pressure even though this store still owns the oldest
+    /// legal cache reference. Cache entries are removable even while an external scene pins their
+    /// allocation; the scene remains exact and the ownership change can unlock retirement credit
+    /// on the subsequent aggregate admission retry.
     pub fn evict_inactive_until(
         &mut self,
         target_charged: usize,
     ) -> Result<PresentationStorePressure, AlignmentPresentationStoreError> {
         let mut evicted_read_pages = 0_usize;
         let mut evicted_summary_pages = 0_usize;
+        let protected_read_pages = self
+            .prepared_by_owner
+            .values()
+            .flat_map(|snapshot| snapshot.reads().pages().iter().map(|page| page.key()))
+            .collect::<HashSet<_>>();
+        let protected_summary_pages = self
+            .prepared_by_owner
+            .values()
+            .flat_map(|snapshot| snapshot.summary_pages().iter().map(|page| page.key()))
+            .collect::<HashSet<_>>();
 
         loop {
-            let snapshot = self.ledger.snapshot()?;
-            if snapshot.charged <= target_charged {
+            if self.ledger.progress()?.charged <= target_charged {
                 break;
             }
-            let pins = snapshot
-                .records
-                .iter()
-                .map(|record| (record.id, record.pins))
-                .collect::<HashMap<_, _>>();
-            let Some(candidate) = self.oldest_unpinned_page(&pins) else {
+            let Some(candidate) =
+                self.oldest_cached_page(&protected_read_pages, &protected_summary_pages)
+            else {
                 break;
             };
             match candidate {
@@ -463,17 +475,15 @@ impl AlignmentPresentationStore {
         Ok(revision)
     }
 
-    fn oldest_unpinned_page(
+    fn oldest_cached_page(
         &self,
-        pins: &HashMap<crate::AllocationId, usize>,
+        protected_read_pages: &HashSet<AlignmentPageKey>,
+        protected_summary_pages: &HashSet<SummaryPageKey>,
     ) -> Option<CachedPageLocation> {
         let read = self
             .read_pages
             .iter()
-            .filter(|(_, cached)| {
-                pins.get(&cached.page.allocation().id())
-                    .is_some_and(|pins| *pins == 0)
-            })
+            .filter(|(key, _)| !protected_read_pages.contains(key))
             .min_by_key(|(_, cached)| (cached.last_used_revision, cached.page.allocation().id()))
             .map(|(key, cached)| {
                 (
@@ -485,10 +495,7 @@ impl AlignmentPresentationStore {
         let summary = self
             .summary_pages
             .iter()
-            .filter(|(_, cached)| {
-                pins.get(&cached.page.allocation().id())
-                    .is_some_and(|pins| *pins == 0)
-            })
+            .filter(|(key, _)| !protected_summary_pages.contains(key))
             .min_by_key(|(_, cached)| (cached.last_used_revision, cached.page.allocation().id()))
             .map(|(key, cached)| {
                 (

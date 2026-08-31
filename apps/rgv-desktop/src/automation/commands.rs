@@ -1620,6 +1620,170 @@ impl Viewer {
         }
     }
 
+    fn automation_alignment_scene_diagnostics(&self) -> AutomationAlignmentSceneDiagnostics {
+        let telemetry = self
+            .alignment_tracks
+            .iter()
+            .flat_map(|track| track.projections.values())
+            .map(|projection| projection.scene_telemetry)
+            .fold(
+                AlignmentSceneCoordinatorTelemetry::default(),
+                |mut total, item| {
+                    total.camera_updates = total.camera_updates.saturating_add(item.camera_updates);
+                    total.camera_only_updates = total
+                        .camera_only_updates
+                        .saturating_add(item.camera_only_updates);
+                    total.source_acquisitions = total
+                        .source_acquisitions
+                        .saturating_add(item.source_acquisitions);
+                    total.row_atlas_candidates = total
+                        .row_atlas_candidates
+                        .saturating_add(item.row_atlas_candidates);
+                    total.presentation_candidates = total
+                        .presentation_candidates
+                        .saturating_add(item.presentation_candidates);
+                    total.scene_publications = total
+                        .scene_publications
+                        .saturating_add(item.scene_publications);
+                    total.optional_work_pauses = total
+                        .optional_work_pauses
+                        .saturating_add(item.optional_work_pauses);
+                    total.optional_work_resumes = total
+                        .optional_work_resumes
+                        .saturating_add(item.optional_work_resumes);
+                    total.row_activity_queries = total
+                        .row_activity_queries
+                        .saturating_add(item.row_activity_queries);
+                    total.row_activity_rebuilds = total
+                        .row_activity_rebuilds
+                        .saturating_add(item.row_activity_rebuilds);
+                    total.row_activity_intervals_examined = total
+                        .row_activity_intervals_examined
+                        .saturating_add(item.row_activity_intervals_examined);
+                    total.row_activity_intervals_changed = total
+                        .row_activity_intervals_changed
+                        .saturating_add(item.row_activity_intervals_changed);
+                    total
+                },
+            );
+        let ledger = self.alignment_scene_ledger.progress().ok();
+        let context = self.context_scene_gpu_renderer.last_prepare_stats();
+        let generic = self.rectangle_renderer.last_prepare_stats();
+        let context_operations = self.context_scene_gpu_renderer.operation_counters();
+        let generic_operations = self.rectangle_renderer.operation_counters();
+        let context_bytes = self.context_scene_gpu_renderer.resident_bytes();
+        let generic_bytes = self.rectangle_renderer.resident_bytes();
+        let read = self.alignment_gpu_last_prepare_stats;
+        let summary = self.alignment_summary_gpu_last_prepare_stats;
+        let read_operations = self.alignment_gpu_renderer.operation_counters();
+        let summary_operations = self.alignment_summary_gpu_renderer.operation_counters();
+        let (contextual_text_anchors_examined, contextual_text_anchors_available) = self
+            .panels
+            .iter()
+            .fold((0_usize, 0_usize), |(examined, available), panel| {
+                (
+                    examined.saturating_add(panel.context_scene.camera_text_anchors_examined),
+                    available.saturating_add(panel.context_scene.camera_text_anchors_available),
+                )
+            });
+        let alignment_occupied = ledger.map_or(0, |progress| {
+            progress.charged.saturating_add(progress.reserved)
+        });
+        let pressure = self.alignment_last_gpu_budget_pressure;
+        AutomationAlignmentSceneDiagnostics {
+            aggregate_cache_budget_bytes: self.aggregate_cache_budget_bytes(),
+            aggregate_cache_occupied_bytes: alignment_occupied
+                .saturating_add(context_bytes)
+                .saturating_add(generic_bytes),
+            contextual_gpu_reserved_bytes: context_bytes,
+            generic_gpu_reserved_bytes: generic_bytes,
+            publication_waiting_for_capacity: self.alignment_gpu_publication_retry.is_some(),
+            cross_owner_reclaim_active: self.alignment_capacity_reclaim.is_some(),
+            last_capacity_pressure_cause: pressure
+                .map_or_else(String::new, |pressure| format!("{:?}", pressure.cause)),
+            last_capacity_pressure_requested_bytes: pressure
+                .map_or(0, |pressure| pressure.requested_bytes),
+            last_capacity_pressure_effective_occupied_bytes: pressure.map_or(0, |pressure| {
+                pressure
+                    .charged_bytes_at_failure
+                    .saturating_add(pressure.reserved_bytes_at_failure)
+            }),
+            last_capacity_pressure_retirement_credit_bytes: pressure
+                .map_or(0, |pressure| pressure.retirement_credit_bytes),
+            last_capacity_pressure_limit_bytes: pressure.map_or(0, |pressure| pressure.limit_bytes),
+            last_capacity_pressure_required_reclaim_bytes: pressure
+                .map_or(0, GpuBudgetPressure::required_reclaim_bytes),
+            optional_residency_phase: format!("{:?}", self.alignment_gpu_speculation_gate.phase),
+            optional_residency_retention_limited: self
+                .alignment_gpu_prefetch
+                .read_retention_limited
+                || self.alignment_gpu_prefetch.summary_retention_limited,
+            camera_updates: telemetry.camera_updates,
+            camera_only_updates: telemetry.camera_only_updates,
+            source_acquisitions: telemetry.source_acquisitions,
+            row_atlas_candidates: telemetry.row_atlas_candidates,
+            presentation_candidates: telemetry.presentation_candidates,
+            scene_publications: telemetry.scene_publications,
+            optional_work_pauses: telemetry.optional_work_pauses,
+            optional_work_resumes: telemetry.optional_work_resumes,
+            row_activity_queries: telemetry.row_activity_queries,
+            row_activity_rebuilds: telemetry.row_activity_rebuilds,
+            row_activity_intervals_examined: telemetry.row_activity_intervals_examined,
+            row_activity_intervals_changed: telemetry.row_activity_intervals_changed,
+            read_content_manifest_builds: read_operations.content_manifest_builds,
+            read_content_manifest_pages_enumerated: read_operations
+                .content_manifest_pages_enumerated,
+            read_prefetch_keys_inspected: read_operations.prefetch_authority_keys_inspected,
+            read_reclaim_keys_inspected: read_operations.reclaim_authority_keys_inspected,
+            summary_content_manifest_builds: summary_operations.content_manifest_builds,
+            summary_content_manifest_pages_enumerated: summary_operations
+                .content_manifest_pages_enumerated,
+            summary_prefetch_keys_inspected: summary_operations.prefetch_authority_keys_inspected,
+            summary_reclaim_keys_inspected: summary_operations.reclaim_authority_keys_inspected,
+            read_frame_mandatory_pages: read.mandatory_pages,
+            read_frame_body_instances: read.base_instances,
+            read_frame_overlay_instances: read.overlay_instances,
+            read_frame_labels: read.text_labels,
+            read_frame_label_anchors_examined: read.label_anchors_examined,
+            read_frame_page_pin_acquisitions: read.page_pin_acquisitions,
+            read_frame_camera_bytes: read.camera_uniform_bytes,
+            read_frame_immutable_upload_bytes: read.geometry_uploaded_bytes,
+            read_frame_cache_hits: read.page_cache_hits,
+            read_frame_cache_misses: read.page_cache_misses,
+            summary_frame_mandatory_pages: summary.mandatory_pages,
+            summary_frame_depth_instances: summary.depth_instances,
+            summary_frame_allele_instances: summary.allele_instances,
+            summary_frame_junction_instances: summary.junction_instances,
+            summary_frame_modification_instances: summary.modification_instances,
+            summary_frame_range_queries: summary.range_maximum_queries,
+            summary_frame_junction_entries_examined: summary.junction_entries_examined,
+            summary_frame_page_pin_acquisitions: summary.page_pin_acquisitions,
+            summary_frame_camera_bytes: summary.camera_uniform_bytes,
+            summary_frame_immutable_upload_bytes: summary.geometry_uploaded_bytes,
+            summary_frame_cache_hits: summary.page_cache_hits,
+            summary_frame_cache_misses: summary.page_cache_misses,
+            contextual_frame_camera_writes: context.camera_writes,
+            contextual_frame_immutable_upload_bytes: context.uploaded_bytes,
+            contextual_text_anchors_examined,
+            contextual_text_anchors_available,
+            contextual_content_preparations: context_operations.content_preparations,
+            contextual_camera_capture_attempts: context_operations.camera_capture_attempts,
+            contextual_camera_captures: context_operations.camera_captures,
+            contextual_content_replacement_requests: context_operations
+                .content_replacement_requests,
+            contextual_invalid_camera_captures: context_operations.invalid_camera_captures,
+            contextual_total_immutable_upload_bytes: context_operations.immutable_upload_bytes,
+            contextual_total_camera_writes: context_operations.camera_writes,
+            generic_frame_uploaded_bytes: generic.uploaded_bytes,
+            generic_frame_slab_cache_hit: generic.slab_cache_hit,
+            generic_preparations: generic_operations.preparations,
+            generic_instances_examined: generic_operations.instances_examined,
+            generic_slab_cache_hits: generic_operations.slab_cache_hits,
+            generic_total_uploaded_bytes: generic_operations.uploaded_bytes,
+            generic_buffer_reallocations: generic_operations.buffer_reallocations,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn automation_workspace_snapshot(&self) -> AutomationWorkspaceSnapshot {
         let shared_annotation_scroll = self.panels.annotation_scroll_points;
@@ -2000,18 +2164,15 @@ impl Viewer {
                             .is_some_and(|presented| presented.source.semantic_target_complete),
                         scene_reads_complete: presented_scene
                             .is_some_and(|presented| presented.lane.reads_complete()),
-                        scene_reference_ready: presented_scene.is_some()
-                            && projection
-                                .and_then(|projection| projection.scene_frame.as_ref())
-                                .is_some_and(|frame| frame.reference_requirement.is_ready()),
-                        scene_vertical_residency: projection
-                            .and_then(|projection| projection.scene_frame.as_ref())
-                            .map_or_else(
-                                || "unavailable".to_owned(),
-                                |frame| {
-                                    format!("{:?}", frame.vertical_residency).to_ascii_lowercase()
-                                },
-                            ),
+                        scene_reference_ready: presented_scene
+                            .is_some_and(|presented| presented.source.reference_ready),
+                        scene_vertical_residency: presented_scene.map_or_else(
+                            || "unavailable".to_owned(),
+                            |presented| {
+                                format!("{:?}", presented.source.vertical_residency)
+                                    .to_ascii_lowercase()
+                            },
+                        ),
                         scene_camera_updates: projection
                             .map_or(0, |projection| projection.scene_telemetry.camera_updates),
                         scene_camera_only_updates: projection.map_or(0, |projection| {
@@ -2353,6 +2514,7 @@ impl Viewer {
         panels.truncate(MAXIMUM_AUTOMATION_LOCI);
         tracks.truncate(MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS);
         let scene_budget = self.alignment_scene_budget;
+        let alignment_scene_diagnostics = self.automation_alignment_scene_diagnostics();
         AutomationWorkspaceSnapshot {
             application_version: env!("CARGO_PKG_VERSION").to_owned(),
             schema_version: AUTOMATION_SCHEMA_VERSION,
@@ -2401,6 +2563,7 @@ impl Viewer {
             alignment_scene_pinned_overage_bytes: scene_budget.pinned_overage_bytes,
             alignment_scene_active_replacement_bundle: scene_budget.active_replacement_bundle,
             alignment_scene_budget_refreshes: scene_budget.refreshes,
+            alignment_scene_diagnostics,
             read_pane_height: self.track_presentation.read_pane_height,
             annotation_section_expanded: self.track_presentation.annotation_section_expanded,
             read_section_expanded: self.track_presentation.read_section_expanded,

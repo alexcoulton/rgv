@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::BTreeMap,
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     ops::Range,
@@ -361,6 +361,16 @@ pub struct AlignmentSceneCoordinatorTelemetry {
     pub vertical_residency_publications: u64,
     pub vertical_residency_completions: u64,
     pub vertical_residency_budget_limits: u64,
+    pub optional_work_pauses: u64,
+    pub optional_work_resumes: u64,
+    /// Exact camera-row activity queries served from the immutable atlas index.
+    pub row_activity_queries: u64,
+    /// Queries which had to initialize a cursor rather than advance the current one.
+    pub row_activity_rebuilds: u64,
+    /// Interval-index entries whose start/end predicate changed across camera updates.
+    pub row_activity_intervals_examined: u64,
+    /// Entries whose active membership actually changed across camera updates.
+    pub row_activity_intervals_changed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -414,6 +424,10 @@ pub struct AlignmentCoordinatorEviction {
     pub charged: usize,
     pub pinned: usize,
     pub released: usize,
+    /// Reloadable cache `Arc`s relinquished even when the currently presented epoch's pins kept
+    /// their allocations charged. A non-zero value is ownership progress: the next aggregate
+    /// replacement may be able to prove those allocations retire atomically with the old epoch.
+    pub relinquished_cache_entries: usize,
     pub remaining: usize,
 }
 
@@ -504,6 +518,13 @@ where
         &mut self,
     ) -> Result<Option<AlignmentPresentationPump>, AlignmentSceneCoordinatorError<B::Error>> {
         self.source.pump_presentation_once()
+    }
+
+    pub fn set_optional_work_paused(
+        &mut self,
+        paused: bool,
+    ) -> Result<(), AlignmentSceneCoordinatorConfigError> {
+        self.source.set_optional_work_paused(self.owner, paused)
     }
 
     pub fn replace_contract(
@@ -674,10 +695,15 @@ struct AlignmentSceneSourceLane {
     telemetry: AlignmentSceneCoordinatorTelemetry,
     refusal: Option<AlignmentSceneOwnerRefusal>,
     vertical_residency_budget_limited: bool,
+    /// Foreground pointer/navigation ownership suppresses optional vertical semantic-page work.
+    /// The latest state is mailbox-coalesced and takes effect at the next canonical block
+    /// checkpoint without cancelling complete evidence or the visible committed scene.
+    optional_work_paused: bool,
     /// At most one derived camera projection is retained per lane. Its full authority key keeps
     /// adjacent camera frames cheap without allowing an old atlas or locus to masquerade as the
     /// current scrollbar truth.
     row_activity_cache: RefCell<Option<AlignmentRowActivityCache>>,
+    row_activity_telemetry: Cell<AlignmentRowActivityTelemetry>,
 }
 
 #[derive(Clone, Debug)]
@@ -685,6 +711,27 @@ struct AlignmentRowActivityCache {
     atlas_revision: RowAtlasRevision,
     cursor: AlignmentRowActivityCursor,
     profile: Arc<AlignmentRowActivityProfile>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AlignmentRowActivityTelemetry {
+    queries: u64,
+    rebuilds: u64,
+    intervals_examined: u64,
+    intervals_changed: u64,
+}
+
+impl AlignmentRowActivityTelemetry {
+    fn record(&mut self, stats: rgv_alignment_scene::AlignmentRowActivityUpdateStats) {
+        self.queries = self.queries.saturating_add(1);
+        self.rebuilds = self.rebuilds.saturating_add(u64::from(stats.rebuilt()));
+        self.intervals_examined = self
+            .intervals_examined
+            .saturating_add(stats.examined_intervals() as u64);
+        self.intervals_changed = self
+            .intervals_changed
+            .saturating_add(stats.changed_intervals() as u64);
+    }
 }
 
 const ALIGNMENT_ROW_ACTIVITY_BINS: usize = 128;
@@ -732,7 +779,9 @@ where
                 telemetry: AlignmentSceneCoordinatorTelemetry::default(),
                 refusal: None,
                 vertical_residency_budget_limited: false,
+                optional_work_paused: false,
                 row_activity_cache: RefCell::new(None),
+                row_activity_telemetry: Cell::new(AlignmentRowActivityTelemetry::default()),
             },
         );
         Ok(())
@@ -743,6 +792,29 @@ where
         self.actor.cancel_speculation_for(owner);
         self.presentation.remove_owner(presentation_owner(owner));
         self.lanes.remove(&owner).is_some()
+    }
+
+    pub fn set_optional_work_paused(
+        &mut self,
+        owner: SourceOwnerId,
+        paused: bool,
+    ) -> Result<(), AlignmentSceneCoordinatorConfigError> {
+        let lane = self
+            .lanes
+            .get_mut(&owner)
+            .ok_or(AlignmentSceneCoordinatorConfigError::UnknownOwner(owner))?;
+        if lane.optional_work_paused == paused {
+            return Ok(());
+        }
+        lane.optional_work_paused = paused;
+        if paused {
+            lane.telemetry.optional_work_pauses =
+                lane.telemetry.optional_work_pauses.saturating_add(1);
+        } else {
+            lane.telemetry.optional_work_resumes =
+                lane.telemetry.optional_work_resumes.saturating_add(1);
+        }
+        Ok(())
     }
 
     pub fn update_camera(
@@ -920,7 +992,7 @@ where
                         }
                     }
                 }
-                if lane.current_covers_desired(owner, &self.presentation) {
+                if lane.prepared_covers_desired(owner, &self.presentation) {
                     self.actor.cancel_foreground_for(owner);
                     self.actor.cancel_speculation_for(owner);
                 }
@@ -928,7 +1000,7 @@ where
             if let Some(owner) = event_owner
                 && let Some(lane) = self.lanes.get_mut(&owner)
                 && !pressures.iter().any(|pressure| pressure.owner == owner)
-                && !lane.current_covers_desired(owner, &self.presentation)
+                && !lane.prepared_covers_desired(owner, &self.presentation)
             {
                 if lane
                     .frame(owner, &self.presentation)
@@ -969,7 +1041,15 @@ where
     ) -> Result<AlignmentSceneCoordinatorTelemetry, AlignmentSceneCoordinatorConfigError> {
         self.lanes
             .get(&owner)
-            .map(|lane| lane.telemetry)
+            .map(|lane| {
+                let mut telemetry = lane.telemetry;
+                let row_activity = lane.row_activity_telemetry.get();
+                telemetry.row_activity_queries = row_activity.queries;
+                telemetry.row_activity_rebuilds = row_activity.rebuilds;
+                telemetry.row_activity_intervals_examined = row_activity.intervals_examined;
+                telemetry.row_activity_intervals_changed = row_activity.intervals_changed;
+                telemetry
+            })
             .ok_or(AlignmentSceneCoordinatorConfigError::UnknownOwner(owner))
     }
 
@@ -1165,7 +1245,7 @@ where
         let camera_sequence = desired.camera_sequence;
         let before = self
             .presentation
-            .current_for(presentation_owner(owner))
+            .prepared_for(presentation_owner(owner))
             .map(|scene| scene.revision());
         let published =
             lane.reconcile_from_resident_or_cache(owner, &mut self.actor, &mut self.presentation)?;
@@ -1181,7 +1261,7 @@ where
             ..AlignmentCoordinatorUpdate::default()
         };
 
-        if lane.current_covers_desired(owner, &self.presentation) {
+        if lane.prepared_covers_desired(owner, &self.presentation) {
             self.actor.cancel_foreground_for(owner);
             self.actor.cancel_speculation_for(owner);
         } else if update.visible_complete {
@@ -1289,6 +1369,13 @@ where
             charged: progress.charged,
             pinned: progress.pinned,
             released: before.charged.saturating_sub(progress.charged),
+            relinquished_cache_entries: presentation.evicted_pages().saturating_add(
+                evidence
+                    .evicted_acquisitions
+                    .saturating_add(evidence.evicted_chunks)
+                    .saturating_add(evidence.evicted_exact_summaries)
+                    .saturating_add(evidence.evicted_row_atlases),
+            ),
             remaining: progress.charged.saturating_sub(target_charged),
         })
     }
@@ -1369,7 +1456,7 @@ impl AlignmentSceneSourceLane {
         self.telemetry.camera_updates = self.telemetry.camera_updates.saturating_add(1);
 
         let before = presentation
-            .current_for(presentation_owner(owner))
+            .prepared_for(presentation_owner(owner))
             .map(|scene| scene.revision());
         let published = self.reconcile_from_resident_or_cache(owner, actor, presentation)?;
         let frame = self
@@ -1388,7 +1475,7 @@ impl AlignmentSceneSourceLane {
                 self.telemetry.camera_only_updates.saturating_add(1);
         }
 
-        if self.current_covers_desired(owner, presentation) {
+        if self.prepared_covers_desired(owner, presentation) {
             actor.cancel_foreground_for(owner);
             actor.cancel_speculation_for(owner);
         } else if update.visible_complete {
@@ -1459,7 +1546,7 @@ impl AlignmentSceneSourceLane {
 
         self.contract.reference = Some(authority);
         let published_scene = self.reconcile_from_resident_or_cache(owner, actor, presentation)?;
-        if self.current_covers_desired(owner, presentation) {
+        if self.prepared_covers_desired(owner, presentation) {
             actor.cancel_foreground_for(owner);
             actor.cancel_speculation_for(owner);
         }
@@ -1504,7 +1591,7 @@ impl AlignmentSceneSourceLane {
             }
         };
         let Some(current) = presentation_store
-            .current_for(presentation_owner(owner))
+            .prepared_for(presentation_owner(owner))
             .cloned()
         else {
             return Ok(false);
@@ -1559,7 +1646,9 @@ impl AlignmentSceneSourceLane {
         presentation: &AlignmentPresentationStore,
     ) -> Option<AlignmentCoordinatorFrame> {
         let desired = self.desired.as_ref()?;
-        let snapshot = presentation.current_for(presentation_owner(owner)).cloned();
+        let snapshot = presentation
+            .prepared_for(presentation_owner(owner))
+            .cloned();
         let requested_rows = snapshot.as_ref().map_or_else(
             || desired.camera.visible_rows(),
             |scene| {
@@ -1694,9 +1783,16 @@ impl AlignmentSceneSourceLane {
             && cached.atlas_revision == atlas_revision
         {
             if cached.cursor.interval() == camera_interval {
+                let mut telemetry = self.row_activity_telemetry.get();
+                telemetry.record(Default::default());
+                self.row_activity_telemetry.set(telemetry);
                 return Some(Arc::clone(&cached.profile));
             }
             if cached.cursor.update(camera_interval) {
+                let stats = cached.cursor.last_update_stats();
+                let mut telemetry = self.row_activity_telemetry.get();
+                telemetry.record(stats);
+                self.row_activity_telemetry.set(telemetry);
                 let profile = Arc::new(cached.cursor.profile(max_bins));
                 debug_assert!(alignment_row_activity_satisfies_contract(
                     &profile,
@@ -1710,6 +1806,10 @@ impl AlignmentSceneSourceLane {
         }
 
         let cursor = atlas.activity_cursor(camera_interval)?;
+        let stats = cursor.last_update_stats();
+        let mut telemetry = self.row_activity_telemetry.get();
+        telemetry.record(stats);
+        self.row_activity_telemetry.set(telemetry);
         let profile = Arc::new(cursor.profile(max_bins));
         debug_assert!(alignment_row_activity_satisfies_contract(
             &profile,
@@ -1763,7 +1863,7 @@ impl AlignmentSceneSourceLane {
         let Some(desired) = self.desired.clone() else {
             return Ok(None);
         };
-        if self.current_covers_desired(owner, presentation) {
+        if self.prepared_covers_desired(owner, presentation) {
             return Ok(None);
         }
         if let Some(scene) = self.prepare_from_current_roots(owner, presentation, &desired)? {
@@ -1795,7 +1895,10 @@ impl AlignmentSceneSourceLane {
         presentation: &mut AlignmentPresentationStore,
         desired: &DesiredScene,
     ) -> Result<Option<Arc<AlignmentSceneSnapshot>>, AlignmentSceneCoordinatorError<B>> {
-        let Some(current) = presentation.current_for(presentation_owner(owner)).cloned() else {
+        let Some(current) = presentation
+            .prepared_for(presentation_owner(owner))
+            .cloned()
+        else {
             return Ok(None);
         };
         let reads = current.reads();
@@ -1832,7 +1935,7 @@ impl AlignmentSceneSourceLane {
         )?;
         self.telemetry.presentation_candidates =
             self.telemetry.presentation_candidates.saturating_add(1);
-        let scene = presentation.publish_for(presentation_owner(owner), candidate);
+        let scene = presentation.stage_for(presentation_owner(owner), candidate);
         self.refusal = None;
         self.telemetry.scene_publications = self.telemetry.scene_publications.saturating_add(1);
         Ok(Some(scene))
@@ -1888,7 +1991,7 @@ impl AlignmentSceneSourceLane {
         )?;
         self.telemetry.presentation_candidates =
             self.telemetry.presentation_candidates.saturating_add(1);
-        let scene = presentation.publish_for(presentation_owner(owner), candidate);
+        let scene = presentation.stage_for(presentation_owner(owner), candidate);
         self.refusal = None;
         self.telemetry.scene_publications = self.telemetry.scene_publications.saturating_add(1);
         Ok(Some(scene))
@@ -1966,7 +2069,7 @@ impl AlignmentSceneSourceLane {
         Ok(())
     }
 
-    fn current_covers_desired(
+    fn prepared_covers_desired(
         &self,
         owner: SourceOwnerId,
         presentation: &AlignmentPresentationStore,
@@ -1974,7 +2077,7 @@ impl AlignmentSceneSourceLane {
         let Some(desired) = &self.desired else {
             return false;
         };
-        let Some(scene) = presentation.current_for(presentation_owner(owner)) else {
+        let Some(scene) = presentation.prepared_for(presentation_owner(owner)) else {
             return false;
         };
         let (available_presentation, _) =
@@ -2008,7 +2111,7 @@ impl AlignmentSceneSourceLane {
         camera: AlignmentSceneCamera,
         direction: CameraDirection,
     ) -> Option<(GenomicInterval, Option<Range<u32>>)> {
-        let scene = presentation.current_for(presentation_owner(owner))?;
+        let scene = presentation.prepared_for(presentation_owner(owner))?;
         if !presentation_core_matches(scene.reads().presentation(), self.contract.presentation)
             || scene.summaries().contract() != self.contract.summaries
             || scene.reads().atlas().layout_contract() != self.contract.layout
@@ -2057,6 +2160,7 @@ impl AlignmentSceneSourceLane {
         presentation: &AlignmentPresentationStore,
     ) -> bool {
         if !self.policy.full_vertical_residency
+            || self.optional_work_paused
             || self.vertical_residency_budget_limited
             || !supports_full_vertical_residency(self.contract.presentation.geometry_lod)
         {
@@ -2068,7 +2172,7 @@ impl AlignmentSceneSourceLane {
         if !desired.camera.has_visible_rows() {
             return false;
         }
-        let Some(scene) = presentation.current_for(presentation_owner(owner)) else {
+        let Some(scene) = presentation.prepared_for(presentation_owner(owner)) else {
             return false;
         };
         let (available_presentation, _) =
@@ -2105,7 +2209,7 @@ impl AlignmentSceneSourceLane {
             .clone()
             .ok_or(AlignmentSceneCoordinatorError::MissingCamera)?;
         let current = presentation
-            .current_for(presentation_owner(owner))
+            .prepared_for(presentation_owner(owner))
             .cloned()
             .ok_or(AlignmentSceneCoordinatorError::MissingCamera)?;
         let total_rows = u32::try_from(current.reads().atlas().row_count())
@@ -2156,7 +2260,7 @@ impl AlignmentSceneSourceLane {
         };
         self.telemetry.presentation_candidates =
             self.telemetry.presentation_candidates.saturating_add(1);
-        let scene = presentation.publish_for(presentation_owner(owner), candidate);
+        let scene = presentation.stage_for(presentation_owner(owner), candidate);
         self.telemetry.scene_publications = self.telemetry.scene_publications.saturating_add(1);
         self.telemetry.vertical_residency_publications = self
             .telemetry
@@ -2980,6 +3084,10 @@ mod tests {
         assert_eq!(profile.stable_row_count(), atlas.row_count());
         assert!(profile.bins().len() <= ALIGNMENT_ROW_ACTIVITY_BINS);
         assert!(profile.visible_record_count() > 0);
+        let telemetry = coordinator.telemetry();
+        assert!(telemetry.row_activity_queries > 0);
+        assert!(telemetry.row_activity_rebuilds > 0);
+        assert!(telemetry.row_activity_intervals_examined > 0);
 
         let atlas_wide_total = match frame.vertical_residency {
             AlignmentVerticalResidency::Preparing { total_rows, .. }
@@ -4142,6 +4250,18 @@ mod tests {
         ));
         let source_work = coordinator.telemetry().source_work_started;
         let atlas_revision = initial_scene.reads().atlas().revision();
+
+        coordinator.set_optional_work_paused(true).unwrap();
+        assert!(!coordinator.has_pending_presentation_work());
+        assert!(coordinator.pump_presentation_once().unwrap().is_none());
+        assert_eq!(coordinator.telemetry().optional_work_pauses, 1);
+        assert_eq!(
+            coordinator.frame().unwrap().snapshot.unwrap().revision(),
+            initial_scene.revision()
+        );
+        coordinator.set_optional_work_paused(false).unwrap();
+        assert!(coordinator.has_pending_presentation_work());
+        assert_eq!(coordinator.telemetry().optional_work_resumes, 1);
 
         let mut checkpoints = 0_usize;
         while coordinator.has_pending_presentation_work() {

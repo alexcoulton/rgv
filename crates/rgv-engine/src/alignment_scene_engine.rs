@@ -231,6 +231,10 @@ enum AlignmentSceneEngineRequest<C> {
         request_token: AlignmentSceneRequestToken,
         camera: AlignmentSceneCamera,
     },
+    SetOptionalWorkPaused {
+        owner: SourceOwnerId,
+        paused: bool,
+    },
     ReplaceContract {
         owner: SourceOwnerId,
         request_token: AlignmentSceneRequestToken,
@@ -366,6 +370,26 @@ where
                     request_token,
                     camera,
                 },
+            )
+            .map_err(|_| EngineQueueError::Disconnected)
+    }
+
+    /// Pauses/resumes optional vertical semantic-page preparation for one visible owner. This is
+    /// a replaceable foreground-state edge, not an ordered command: a burst can retain only its
+    /// newest state and the worker observes it at the next canonical block checkpoint.
+    pub fn try_set_optional_work_paused(
+        &self,
+        owner: SourceOwnerId,
+        paused: bool,
+    ) -> Result<(), EngineQueueError> {
+        let Some(input) = &self.input else {
+            return Err(EngineQueueError::Disconnected);
+        };
+        input
+            .send_latest_system_for(
+                3,
+                owner.get(),
+                AlignmentSceneEngineRequest::SetOptionalWorkPaused { owner, paused },
             )
             .map_err(|_| EngineQueueError::Disconnected)
     }
@@ -1183,6 +1207,20 @@ where
                 ),
             }
         }
+        AlignmentSceneEngineRequest::SetOptionalWorkPaused { owner, paused } => coordinator
+            .set_optional_work_paused(owner, paused)
+            .map_or_else(
+                |error| {
+                    send_error(
+                        output,
+                        Some(owner),
+                        Some(current_request_token(request_tokens, owner)),
+                        AlignmentSceneEngineOperation::PumpPresentation,
+                        error,
+                    )
+                },
+                |()| true,
+            ),
         AlignmentSceneEngineRequest::ReplaceContract {
             owner,
             request_token,

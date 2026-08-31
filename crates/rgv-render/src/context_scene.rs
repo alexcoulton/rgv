@@ -157,6 +157,19 @@ pub struct ContextSceneGpuPrepareStats {
     pub resident_bytes: usize,
 }
 
+/// Monotonic operation counters used to distinguish bounded camera capture from immutable
+/// contextual content admission without enumerating resident lanes or primitives.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContextSceneGpuOperationCounters {
+    pub content_preparations: u64,
+    pub camera_capture_attempts: u64,
+    pub camera_captures: u64,
+    pub content_replacement_requests: u64,
+    pub invalid_camera_captures: u64,
+    pub immutable_upload_bytes: u64,
+    pub camera_writes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContextSceneGpuRejectionReason {
     Budget,
@@ -264,6 +277,7 @@ pub struct ContextSceneGpuRenderer {
     resident: HashMap<ContextSceneGpuLaneKey, ResidentContextLane>,
     camera_sequence: u64,
     last_prepare_stats: ContextSceneGpuPrepareStats,
+    operation_counters: ContextSceneGpuOperationCounters,
 }
 
 impl ContextSceneGpuRenderer {
@@ -322,6 +336,7 @@ impl ContextSceneGpuRenderer {
             resident: HashMap::new(),
             camera_sequence: 0,
             last_prepare_stats: ContextSceneGpuPrepareStats::default(),
+            operation_counters: ContextSceneGpuOperationCounters::default(),
         }
     }
 
@@ -551,7 +566,7 @@ impl ContextSceneGpuRenderer {
         report.stats.rejected_lanes = report.rejections.len();
         report.stats.resident_lanes = self.resident.len();
         report.stats.resident_bytes = self.resident_bytes();
-        self.last_prepare_stats = report.stats;
+        self.record_content_prepare(report.stats);
         report
     }
 
@@ -564,6 +579,10 @@ impl ContextSceneGpuRenderer {
         screen_size: [f32; 2],
         requests: &[ContextSceneGpuLaneRequest<'_>],
     ) -> Result<ContextSceneGpuPrepareReport, ContextSceneGpuCameraCaptureError> {
+        self.operation_counters.camera_capture_attempts = self
+            .operation_counters
+            .camera_capture_attempts
+            .saturating_add(1);
         let exact_content = requests.len() == self.resident.len()
             && requests.iter().all(|request| {
                 self.resident
@@ -577,6 +596,10 @@ impl ContextSceneGpuRenderer {
                 .len()
                 == requests.len();
         if !exact_content {
+            self.operation_counters.content_replacement_requests = self
+                .operation_counters
+                .content_replacement_requests
+                .saturating_add(1);
             return Err(
                 ContextSceneGpuCameraCaptureError::ContentReplacementRequired {
                     requested_lanes: requests.len(),
@@ -606,6 +629,10 @@ impl ContextSceneGpuRenderer {
                 continue;
             }
             let Some(uniform) = context_camera_uniform(screen_size, request.camera) else {
+                self.operation_counters.invalid_camera_captures = self
+                    .operation_counters
+                    .invalid_camera_captures
+                    .saturating_add(1);
                 return Err(ContextSceneGpuCameraCaptureError::InvalidCamera { key: request.key });
             };
             let lane = self
@@ -625,7 +652,7 @@ impl ContextSceneGpuRenderer {
                 scissor: request.camera.scissor,
             });
         }
-        self.last_prepare_stats = report.stats;
+        self.record_camera_capture(report.stats);
         Ok(report)
     }
 
@@ -660,6 +687,11 @@ impl ContextSceneGpuRenderer {
     }
 
     #[must_use]
+    pub const fn operation_counters(&self) -> ContextSceneGpuOperationCounters {
+        self.operation_counters
+    }
+
+    #[must_use]
     pub fn resident_bytes(&self) -> usize {
         self.resident.values().fold(0_usize, |total, lane| {
             total.saturating_add(lane.allocated_bytes)
@@ -669,6 +701,32 @@ impl ContextSceneGpuRenderer {
     pub fn discard_all(&mut self) {
         self.resident.clear();
         self.last_prepare_stats = ContextSceneGpuPrepareStats::default();
+    }
+
+    fn record_content_prepare(&mut self, stats: ContextSceneGpuPrepareStats) {
+        self.operation_counters.content_preparations = self
+            .operation_counters
+            .content_preparations
+            .saturating_add(1);
+        self.operation_counters.immutable_upload_bytes = self
+            .operation_counters
+            .immutable_upload_bytes
+            .saturating_add(stats.uploaded_bytes as u64);
+        self.operation_counters.camera_writes = self
+            .operation_counters
+            .camera_writes
+            .saturating_add(stats.camera_writes as u64);
+        self.last_prepare_stats = stats;
+    }
+
+    fn record_camera_capture(&mut self, stats: ContextSceneGpuPrepareStats) {
+        self.operation_counters.camera_captures =
+            self.operation_counters.camera_captures.saturating_add(1);
+        self.operation_counters.camera_writes = self
+            .operation_counters
+            .camera_writes
+            .saturating_add(stats.camera_writes as u64);
+        self.last_prepare_stats = stats;
     }
 }
 
@@ -1093,6 +1151,17 @@ mod tests {
             ),
             Err(ContextSceneGpuCameraCaptureError::ContentReplacementRequired { .. })
         ));
+        let operations = renderer.operation_counters();
+        assert_eq!(operations.content_preparations, 2);
+        assert_eq!(operations.camera_capture_attempts, 2);
+        assert_eq!(operations.camera_captures, 1);
+        assert_eq!(operations.content_replacement_requests, 1);
+        assert_eq!(operations.invalid_camera_captures, 0);
+        assert_eq!(
+            operations.immutable_upload_bytes,
+            initial.stats.uploaded_bytes as u64
+        );
+        assert_eq!(operations.camera_writes, 2);
 
         let second_rectangles = [rectangle(), rectangle()];
         let second_key = ContextSceneGpuLaneKey::new(1, 2);

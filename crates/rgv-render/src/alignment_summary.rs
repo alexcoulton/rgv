@@ -4,7 +4,7 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     ops::Range,
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -887,12 +887,24 @@ pub struct AlignmentSummaryModificationPageMetadata {
 
 #[derive(Clone, Copy, Debug)]
 pub struct AlignmentSummaryJunctionEntry {
+    start_offset: u64,
+    end_offset: u64,
     evidence: JunctionEvidence,
     expanded_row: u32,
     annotation: Option<JunctionAnnotationStatus>,
 }
 
 impl AlignmentSummaryJunctionEntry {
+    #[must_use]
+    pub const fn start_offset(self) -> u64 {
+        self.start_offset
+    }
+
+    #[must_use]
+    pub const fn end_offset(self) -> u64 {
+        self.end_offset
+    }
+
     #[must_use]
     pub const fn evidence(self) -> JunctionEvidence {
         self.evidence
@@ -909,9 +921,196 @@ impl AlignmentSummaryJunctionEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct JunctionRangeAggregate {
+    minimum_start: u64,
+    maximum_end: u64,
+    maximum_depth: u32,
+    maximum_left_flank: u32,
+    maximum_right_flank: u32,
+    maximum_expanded_row: u32,
+    populated: bool,
+}
+
+impl JunctionRangeAggregate {
+    const fn for_entry(entry: AlignmentSummaryJunctionEntry) -> Self {
+        Self {
+            minimum_start: entry.start_offset,
+            maximum_end: entry.end_offset,
+            maximum_depth: entry.evidence.depth,
+            maximum_left_flank: entry.evidence.minimum_left_flank,
+            maximum_right_flank: entry.evidence.minimum_right_flank,
+            maximum_expanded_row: entry.expanded_row,
+            populated: true,
+        }
+    }
+
+    const fn combine(left: Self, right: Self) -> Self {
+        if !left.populated {
+            return right;
+        }
+        if !right.populated {
+            return left;
+        }
+        Self {
+            minimum_start: if left.minimum_start < right.minimum_start {
+                left.minimum_start
+            } else {
+                right.minimum_start
+            },
+            maximum_end: if left.maximum_end > right.maximum_end {
+                left.maximum_end
+            } else {
+                right.maximum_end
+            },
+            maximum_depth: if left.maximum_depth > right.maximum_depth {
+                left.maximum_depth
+            } else {
+                right.maximum_depth
+            },
+            maximum_left_flank: if left.maximum_left_flank > right.maximum_left_flank {
+                left.maximum_left_flank
+            } else {
+                right.maximum_left_flank
+            },
+            maximum_right_flank: if left.maximum_right_flank > right.maximum_right_flank {
+                left.maximum_right_flank
+            } else {
+                right.maximum_right_flank
+            },
+            maximum_expanded_row: if left.maximum_expanded_row > right.maximum_expanded_row {
+                left.maximum_expanded_row
+            } else {
+                right.maximum_expanded_row
+            },
+            populated: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct JunctionRangeQuery {
+    maximum_depth: u32,
+    maximum_expanded_row: u32,
+    matched: usize,
+    examined_entries: usize,
+}
+
+/// Exact interval/filter aggregate built once beside packed junction geometry. Camera capture
+/// traverses only tree nodes which can overlap and satisfy the requested depth/flank thresholds;
+/// it never revisits the semantic primitive list.
+#[derive(Clone, Debug, Default)]
+struct AlignmentSummaryJunctionRangeIndex {
+    leaf_base: usize,
+    tree: Vec<JunctionRangeAggregate>,
+}
+
+impl AlignmentSummaryJunctionRangeIndex {
+    fn build(entries: &[AlignmentSummaryJunctionEntry]) -> Self {
+        if entries.is_empty() {
+            return Self::default();
+        }
+        let leaf_base = entries.len().next_power_of_two();
+        let mut tree = vec![JunctionRangeAggregate::default(); leaf_base.saturating_mul(2)];
+        for (index, entry) in entries.iter().copied().enumerate() {
+            tree[leaf_base + index] = JunctionRangeAggregate::for_entry(entry);
+        }
+        for node in (1..leaf_base).rev() {
+            tree[node] = JunctionRangeAggregate::combine(tree[node * 2], tree[node * 2 + 1]);
+        }
+        Self { leaf_base, tree }
+    }
+
+    fn query(
+        &self,
+        entries: &[AlignmentSummaryJunctionEntry],
+        start: u64,
+        end: u64,
+        minimum_depth: u32,
+        minimum_flank: u32,
+    ) -> JunctionRangeQuery {
+        if self.leaf_base == 0 || start >= end {
+            return JunctionRangeQuery::default();
+        }
+        let mut result = JunctionRangeQuery::default();
+        self.query_node(
+            1,
+            entries,
+            start,
+            end,
+            minimum_depth,
+            minimum_flank,
+            &mut result,
+        );
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_node(
+        &self,
+        node: usize,
+        entries: &[AlignmentSummaryJunctionEntry],
+        start: u64,
+        end: u64,
+        minimum_depth: u32,
+        minimum_flank: u32,
+        result: &mut JunctionRangeQuery,
+    ) {
+        let Some(aggregate) = self.tree.get(node).copied() else {
+            return;
+        };
+        if !aggregate.populated
+            || aggregate.minimum_start >= end
+            || aggregate.maximum_end <= start
+            || aggregate.maximum_depth < minimum_depth
+            || aggregate.maximum_left_flank < minimum_flank
+            || aggregate.maximum_right_flank < minimum_flank
+        {
+            return;
+        }
+        if node >= self.leaf_base {
+            let entry_index = node - self.leaf_base;
+            let Some(entry) = entries.get(entry_index).copied() else {
+                return;
+            };
+            result.examined_entries = result.examined_entries.saturating_add(1);
+            if entry.start_offset < end
+                && entry.end_offset > start
+                && entry.evidence.depth >= minimum_depth
+                && entry.evidence.minimum_left_flank >= minimum_flank
+                && entry.evidence.minimum_right_flank >= minimum_flank
+            {
+                result.matched = result.matched.saturating_add(1);
+                result.maximum_depth = result.maximum_depth.max(entry.evidence.depth);
+                result.maximum_expanded_row = result.maximum_expanded_row.max(entry.expanded_row);
+            }
+            return;
+        }
+        self.query_node(
+            node * 2,
+            entries,
+            start,
+            end,
+            minimum_depth,
+            minimum_flank,
+            result,
+        );
+        self.query_node(
+            node * 2 + 1,
+            entries,
+            start,
+            end,
+            minimum_depth,
+            minimum_flank,
+            result,
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AlignmentSummaryJunctionPageMetadata {
     entries: Vec<AlignmentSummaryJunctionEntry>,
+    range_index: AlignmentSummaryJunctionRangeIndex,
     normalization_mapped_records: Option<u64>,
     maximum_expanded_row: u32,
 }
@@ -936,6 +1135,12 @@ impl AlignmentSummaryJunctionPageMetadata {
         self.entries
             .capacity()
             .saturating_mul(size_of::<AlignmentSummaryJunctionEntry>())
+            .saturating_add(
+                self.range_index
+                    .tree
+                    .capacity()
+                    .saturating_mul(size_of::<JunctionRangeAggregate>()),
+            )
     }
 
     fn normalization_factor(&self, count_mode: SashimiCountMode) -> Option<f64> {
@@ -1268,6 +1473,8 @@ fn pack_junction_page(
         };
         maximum_expanded_row = maximum_expanded_row.max(junction.expanded_row);
         entries.push(AlignmentSummaryJunctionEntry {
+            start_offset: primitive.start_offset,
+            end_offset: primitive.end_offset,
             evidence: junction.evidence,
             expanded_row: junction.expanded_row,
             annotation: junction.annotation,
@@ -1327,10 +1534,12 @@ fn pack_junction_page(
     }
     instances.shrink_to_fit();
     entries.shrink_to_fit();
+    let range_index = AlignmentSummaryJunctionRangeIndex::build(&entries);
     Ok(PackedAlignmentSummaryPage::Junctions {
         instances,
         metadata: AlignmentSummaryJunctionPageMetadata {
             entries,
+            range_index,
             normalization_mapped_records: page.key().junction_normalization_mapped_records(),
             maximum_expanded_row,
         },
@@ -1640,6 +1849,8 @@ pub struct AlignmentSummaryGpuPrepareStats {
     pub camera_uniform_bytes: usize,
     pub geometry_uploaded_bytes: usize,
     pub range_maximum_queries: usize,
+    pub junction_entries_examined: usize,
+    pub page_pin_acquisitions: usize,
     pub page_cache_hits: usize,
     pub page_cache_misses: usize,
     pub resident_pages: usize,
@@ -1671,6 +1882,8 @@ pub struct AlignmentSummaryGpuPrefetchProgress {
     pub admission: AlignmentSummaryGpuBatchAdmission,
     pub remaining_missing_pages: usize,
     pub missing_pages_remain: bool,
+    pub retained_bytes: usize,
+    pub retention_limited: bool,
 }
 
 /// Resumable exact-summary warm-up bound to one immutable prepared-page authority. Semantic pages
@@ -1686,6 +1899,9 @@ pub struct AlignmentSummaryGpuPrefetchCursor {
     )>,
     next_page: usize,
     pins: Vec<PinnedAllocationLease>,
+    retained_bytes: usize,
+    maximum_total_pinned_bytes: usize,
+    retention_limited: bool,
 }
 
 impl AlignmentSummaryGpuPrefetchCursor {
@@ -1697,6 +1913,16 @@ impl AlignmentSummaryGpuPrefetchCursor {
     #[must_use]
     pub fn remaining_pages(&self) -> usize {
         self.page_keys.len().saturating_sub(self.next_page)
+    }
+
+    #[must_use]
+    pub const fn retention_limited(&self) -> bool {
+        self.retention_limited
+    }
+
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 }
 
@@ -1825,6 +2051,40 @@ struct PendingSummaryDraw {
     foreground_range: Range<u32>,
 }
 
+#[derive(Debug)]
+struct AlignmentSummaryGpuResidentPageLease {
+    key: AlignmentSummaryGpuPageKey,
+    allocation: AllocationId,
+    pin: PinnedAllocationLease,
+}
+
+#[derive(Debug, Default)]
+struct AlignmentSummaryGpuContentLeaseCache {
+    pages: Mutex<BTreeMap<AlignmentSummaryGpuPageKey, Weak<AlignmentSummaryGpuResidentPageLease>>>,
+}
+
+impl AlignmentSummaryGpuContentLeaseCache {
+    fn acquire(
+        &self,
+        key: AlignmentSummaryGpuPageKey,
+        allocation: &AllocationLease,
+    ) -> Result<(Arc<AlignmentSummaryGpuResidentPageLease>, bool), LedgerError> {
+        let mut pages = self.pages.lock().map_err(|_| LedgerError::Poisoned)?;
+        if let Some(existing) = pages.get(&key).and_then(Weak::upgrade)
+            && existing.allocation == allocation.id()
+        {
+            return Ok((existing, false));
+        }
+        let lease = Arc::new(AlignmentSummaryGpuResidentPageLease {
+            key,
+            allocation: allocation.id(),
+            pin: allocation.pin()?,
+        });
+        pages.insert(key, Arc::downgrade(&lease));
+        Ok((lease, true))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SummaryDrawStyle {
     minimum_alternate_fraction: f32,
@@ -1864,16 +2124,34 @@ enum AlignmentSummaryGpuContentSelector {
 ///
 /// Camera capture validates only the constant-size-per-lane identities/selectors. The manifest
 /// remains exact replacement/retirement authority but is not rebuilt during navigation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AlignmentSummaryGpuContentAuthority {
     device_generation: u64,
     scene_revisions: Arc<[SceneRevision]>,
     scene_allocations: Arc<[AllocationId]>,
     content_selectors: Arc<[AlignmentSummaryGpuContentSelector]>,
     page_manifest: Arc<[AlignmentSummaryGpuPageKey]>,
+    leases: Arc<AlignmentSummaryGpuContentLeaseCache>,
 }
 
 impl AlignmentSummaryGpuContentAuthority {
+    fn new(
+        device_generation: u64,
+        scene_revisions: Arc<[SceneRevision]>,
+        scene_allocations: Arc<[AllocationId]>,
+        content_selectors: Arc<[AlignmentSummaryGpuContentSelector]>,
+        page_manifest: Arc<[AlignmentSummaryGpuPageKey]>,
+    ) -> Self {
+        Self {
+            device_generation,
+            scene_revisions,
+            scene_allocations,
+            content_selectors,
+            page_manifest,
+            leases: Arc::new(AlignmentSummaryGpuContentLeaseCache::default()),
+        }
+    }
+
     #[must_use]
     pub const fn device_generation(&self) -> u64 {
         self.device_generation
@@ -1890,6 +2168,18 @@ impl AlignmentSummaryGpuContentAuthority {
     }
 }
 
+impl PartialEq for AlignmentSummaryGpuContentAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.device_generation == other.device_generation
+            && self.scene_revisions == other.scene_revisions
+            && self.scene_allocations == other.scene_allocations
+            && self.content_selectors == other.content_selectors
+            && self.page_manifest == other.page_manifest
+    }
+}
+
+impl Eq for AlignmentSummaryGpuContentAuthority {}
+
 #[derive(Debug)]
 pub struct AlignmentSummaryGpuFrame {
     revision: u64,
@@ -1901,6 +2191,7 @@ pub struct AlignmentSummaryGpuFrame {
     draws: Arc<[PreparedSummaryDraw]>,
     overlay_draws: Arc<[PreparedSummaryOverlayDraw]>,
     buffers: Arc<GpuSummaryFrameBuffers>,
+    _page_leases: Vec<Arc<AlignmentSummaryGpuResidentPageLease>>,
     _pins: Vec<PinnedAllocationLease>,
 }
 
@@ -2108,6 +2399,7 @@ pub struct AlignmentSummaryGpuStagedReplacement {
     camera_uniform_bytes: usize,
     geometry_uploaded_bytes: usize,
     range_maximum_queries: usize,
+    junction_entries_examined: usize,
 }
 
 impl AlignmentSummaryGpuStagedReplacement {
@@ -2582,9 +2874,15 @@ impl AlignmentSummaryGpuRenderer {
             return Err(AlignmentSummaryGpuReplacementError::PriorFrameDeviceGeneration);
         }
         let mut prior_pin_counts = BTreeMap::<AllocationId, usize>::new();
+        let mut counted_page_leases = BTreeSet::<usize>::new();
         for frame in prior_frames.iter() {
             for pin in &frame._pins {
                 *prior_pin_counts.entry(pin.id()).or_default() += 1;
+            }
+            for lease in &frame._page_leases {
+                if counted_page_leases.insert(Arc::as_ptr(lease) as usize) {
+                    *prior_pin_counts.entry(lease.pin.id()).or_default() += 1;
+                }
             }
         }
         let prepared = plan
@@ -2682,10 +2980,18 @@ impl AlignmentSummaryGpuRenderer {
         // been detached yet, so an error leaves the published frames and cache byte-for-byte
         // untouched.
         let mut builder = ledger.retirement_claim_builder();
+        let mut included_page_leases = BTreeSet::<usize>::new();
         for frame in prior_frames.iter() {
             for pin in &frame._pins {
                 if claimable.contains(&pin.id()) {
                     builder.include_pin(pin)?;
+                }
+            }
+            for lease in &frame._page_leases {
+                if included_page_leases.insert(Arc::as_ptr(lease) as usize)
+                    && claimable.contains(&lease.pin.id())
+                {
+                    builder.include_pin(&lease.pin)?;
                 }
             }
         }
@@ -3039,6 +3345,12 @@ impl AlignmentSummaryGpuRenderer {
             resolved_depth_scales.push(maximum);
         }
         let junction_metrics = resolve_junction_request_metrics(requests, &visible_pages)?;
+        let junction_entries_examined = visible_pages
+            .iter()
+            .flatten()
+            .filter(|page| page.key.family() == SummaryPageFamily::Junctions)
+            .map(|page| page.page.primitives().len())
+            .sum();
 
         let mut pending_draws = Vec::with_capacity(plan.mandatory_draws);
         let mut overlays = Vec::with_capacity(plan.overlay_instances);
@@ -3378,6 +3690,7 @@ impl AlignmentSummaryGpuRenderer {
             camera_uniform_bytes: uniforms.len(),
             geometry_uploaded_bytes,
             range_maximum_queries,
+            junction_entries_examined,
             plan,
         })
     }
@@ -3604,13 +3917,13 @@ impl AlignmentSummaryGpuRenderer {
         self.pending_geometry_uploaded_bytes = self
             .pending_geometry_uploaded_bytes
             .saturating_add(staged.geometry_uploaded_bytes);
-        let content_authority = AlignmentSummaryGpuContentAuthority {
-            device_generation: self.device_generation,
-            scene_revisions: staged.scene_revisions.clone().into(),
-            scene_allocations: staged.scene_allocations.into(),
-            content_selectors: staged.plan.content_selectors.clone().into(),
-            page_manifest: Arc::clone(&staged.plan.prepared_page_keys),
-        };
+        let content_authority = AlignmentSummaryGpuContentAuthority::new(
+            self.device_generation,
+            staged.scene_revisions.clone().into(),
+            staged.scene_allocations.into(),
+            staged.plan.content_selectors.clone().into(),
+            Arc::clone(&staged.plan.prepared_page_keys),
+        );
         let frame = AlignmentSummaryGpuFrame {
             revision: next_revision,
             device_generation: self.device_generation,
@@ -3621,6 +3934,7 @@ impl AlignmentSummaryGpuRenderer {
             draws: staged.draws.into(),
             overlay_draws: staged.overlay_draws.into(),
             buffers: initial_frame_buffers,
+            _page_leases: Vec::new(),
             _pins: pins,
         };
         let resident_gpu_bytes = self
@@ -3637,6 +3951,8 @@ impl AlignmentSummaryGpuRenderer {
             camera_uniform_bytes: staged.camera_uniform_bytes,
             geometry_uploaded_bytes: std::mem::take(&mut self.pending_geometry_uploaded_bytes),
             range_maximum_queries: staged.range_maximum_queries,
+            junction_entries_examined: staged.junction_entries_examined,
+            page_pin_acquisitions: staged.plan.mandatory_draws,
             page_cache_hits: staged.plan.page_cache_hits,
             page_cache_misses: staged.plan.page_cache_misses,
             resident_pages: self.pages.len(),
@@ -3913,21 +4229,21 @@ impl AlignmentSummaryGpuRenderer {
         }
         let page_manifest = Self::prepared_page_keys(requests)?;
         self.record_content_manifest_build(page_manifest.len());
-        let authority = AlignmentSummaryGpuContentAuthority {
-            device_generation: self.device_generation,
-            scene_revisions: requests
+        let authority = AlignmentSummaryGpuContentAuthority::new(
+            self.device_generation,
+            requests
                 .iter()
                 .map(|request| request.scene.revision())
                 .collect::<Vec<_>>()
                 .into(),
-            scene_allocations: requests
+            requests
                 .iter()
                 .map(|request| request.scene.metadata_allocation().id())
                 .collect::<Vec<_>>()
                 .into(),
-            content_selectors: summary_content_selectors(requests).into(),
-            page_manifest: page_manifest.into(),
-        };
+            summary_content_selectors(requests).into(),
+            page_manifest.into(),
+        );
         self.capture_resident_camera_frame(device, queue, requests, ledger, &authority, true)
     }
 
@@ -4033,7 +4349,9 @@ impl AlignmentSummaryGpuRenderer {
             };
             resolved_depth_scales.push(maximum);
         }
-        let junction_metrics = resolve_junction_request_metrics(requests, &visible)?;
+        let (junction_metrics, junction_range_queries, junction_entries_examined) =
+            resolve_resident_junction_request_metrics(self, requests, &visible)?;
+        range_maximum_queries = range_maximum_queries.saturating_add(junction_range_queries);
 
         let overlay_count = requests.iter().map(summary_overlay_count).sum::<usize>();
         u32::try_from(overlay_count)
@@ -4177,7 +4495,11 @@ impl AlignmentSummaryGpuRenderer {
         let mut draws = Vec::with_capacity(mandatory_pages);
         let mut prepared_overlays = Vec::with_capacity(overlay_draws);
         let next_revision = self.revision.saturating_add(1);
-        let mut pins = Vec::with_capacity(mandatory_pages.saturating_add(4));
+        let mut page_leases =
+            BTreeMap::<AlignmentSummaryGpuPageKey, Arc<AlignmentSummaryGpuResidentPageLease>>::new(
+            );
+        let mut page_pin_acquisitions = 0_usize;
+        let mut pins = Vec::with_capacity(4);
         let mut uniform_index = 0_usize;
         for request in &pending_draws {
             let uniform = summary_uniform(
@@ -4211,8 +4533,14 @@ impl AlignmentSummaryGpuRenderer {
                 .expect("mandatory summary residency was proven before frame mutation");
             self.touch_page_at(page_index, next_revision);
             let page = &self.pages[page_index];
-            if let Some(allocation) = &page.allocation {
-                pins.push(allocation.pin()?);
+            if let Some(allocation) = &page.allocation
+                && !page_leases.contains_key(&request.page)
+            {
+                let (lease, acquired) =
+                    content_authority.leases.acquire(request.page, allocation)?;
+                debug_assert_eq!(lease.key, request.page);
+                page_pin_acquisitions = page_pin_acquisitions.saturating_add(usize::from(acquired));
+                page_leases.insert(request.page, lease);
             }
             draws.push(PreparedSummaryDraw {
                 page: request.page,
@@ -4310,7 +4638,9 @@ impl AlignmentSummaryGpuRenderer {
             resolved_depth_scales.len(),
             draws.len(),
             prepared_overlays.len(),
-            pins.len().saturating_add(1),
+            pins.len()
+                .saturating_add(page_leases.len())
+                .saturating_add(1),
         );
         if retained_frame_bytes > frame_buffers.frame_capacity {
             return Err(AlignmentSummaryGpuPrepareError::FrameSlotCapacity {
@@ -4329,6 +4659,7 @@ impl AlignmentSummaryGpuRenderer {
             draws: draws.into(),
             overlay_draws: prepared_overlays.into(),
             buffers: frame_buffers,
+            _page_leases: page_leases.into_values().collect(),
             _pins: pins,
         };
         let resident_gpu_bytes = self.resident_gpu_bytes()?;
@@ -4343,6 +4674,8 @@ impl AlignmentSummaryGpuRenderer {
             camera_uniform_bytes: uniforms.len(),
             geometry_uploaded_bytes: std::mem::take(&mut self.pending_geometry_uploaded_bytes),
             range_maximum_queries,
+            junction_entries_examined,
+            page_pin_acquisitions,
             page_cache_hits,
             page_cache_misses: 0,
             resident_pages: self.pages.len(),
@@ -4578,6 +4911,8 @@ impl AlignmentSummaryGpuRenderer {
             admission,
             remaining_missing_pages,
             missing_pages_remain: remaining_missing_pages > 0,
+            retained_bytes: 0,
+            retention_limited: false,
         })
     }
 
@@ -4587,6 +4922,7 @@ impl AlignmentSummaryGpuRenderer {
         &self,
         requests: &[AlignmentSummaryGpuSceneRequest<'_>],
         page_keys: Arc<[AlignmentSummaryGpuPageKey]>,
+        maximum_total_pinned_bytes: usize,
     ) -> Result<AlignmentSummaryGpuPrefetchCursor, AlignmentSummaryGpuPrefetchCursorError> {
         let selectors = summary_content_selectors(requests);
         let scenes = requests
@@ -4600,6 +4936,9 @@ impl AlignmentSummaryGpuRenderer {
             scenes,
             next_page: 0,
             pins: Vec::new(),
+            retained_bytes: 0,
+            maximum_total_pinned_bytes,
+            retention_limited: false,
         })
     }
 
@@ -4628,11 +4967,20 @@ impl AlignmentSummaryGpuRenderer {
             .fetch_add(inspected as u64, Ordering::Relaxed);
         let mut batch = Vec::with_capacity(inspected);
         let mut resident_pins = Vec::new();
+        let mut resident_retained_bytes = 0_usize;
         for key in cursor.page_keys[cursor.next_page..end].iter().copied() {
             let page = summary_cursor_page(&cursor.scenes, key)?;
             if let Some(resident) = self.page(key) {
                 if let Some(allocation) = &resident.allocation {
-                    resident_pins.push(allocation.pin()?);
+                    let capacity = allocation.snapshot()?.charged_capacity;
+                    if let Some(pin) =
+                        allocation.pin_if_total_at_most(cursor.maximum_total_pinned_bytes)?
+                    {
+                        resident_pins.push(pin);
+                        resident_retained_bytes = resident_retained_bytes.saturating_add(capacity);
+                    } else {
+                        cursor.retention_limited = true;
+                    }
                 }
             } else {
                 batch.push(page);
@@ -4648,10 +4996,21 @@ impl AlignmentSummaryGpuRenderer {
                 .page(page.key)
                 .expect("successful summary cursor admission makes every batch page resident");
             if let Some(allocation) = &resident.allocation {
-                cursor.pins.push(allocation.pin()?);
+                let capacity = allocation.snapshot()?.charged_capacity;
+                if let Some(pin) =
+                    allocation.pin_if_total_at_most(cursor.maximum_total_pinned_bytes)?
+                {
+                    cursor.pins.push(pin);
+                    cursor.retained_bytes = cursor.retained_bytes.saturating_add(capacity);
+                } else {
+                    cursor.retention_limited = true;
+                }
             }
         }
         cursor.pins.extend(resident_pins);
+        cursor.retained_bytes = cursor
+            .retained_bytes
+            .saturating_add(resident_retained_bytes);
         cursor.next_page = end;
         let remaining_authority_pages = cursor.remaining_pages();
         Ok(AlignmentSummaryGpuPrefetchProgress {
@@ -4660,6 +5019,8 @@ impl AlignmentSummaryGpuRenderer {
             admission,
             remaining_missing_pages: remaining_authority_pages,
             missing_pages_remain: remaining_authority_pages > 0,
+            retained_bytes: cursor.retained_bytes,
+            retention_limited: cursor.retention_limited,
         })
     }
 
@@ -4677,6 +5038,14 @@ impl AlignmentSummaryGpuRenderer {
             return Err(AlignmentSummaryGpuPrefetchCursorError::Incomplete {
                 remaining: cursor.remaining_pages(),
             });
+        }
+        if cursor.retention_limited {
+            return Err(
+                AlignmentSummaryGpuPrefetchCursorError::ResidencyBudgetLimited {
+                    retained_bytes: cursor.retained_bytes,
+                    maximum_total_pinned_bytes: cursor.maximum_total_pinned_bytes,
+                },
+            );
         }
         Ok(AlignmentSummaryGpuResidencyLease {
             device_generation: cursor.device_generation,
@@ -5963,8 +6332,20 @@ fn summary_page_maximum_retained_bytes(
             let metadata = primitive_count
                 .checked_mul(size_of::<AlignmentSummaryJunctionEntry>())
                 .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?;
+            let range_entries = if primitive_count == 0 {
+                0
+            } else {
+                primitive_count
+                    .checked_next_power_of_two()
+                    .and_then(|count| count.checked_mul(2))
+                    .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?
+            };
+            let range_index = range_entries
+                .checked_mul(size_of::<JunctionRangeAggregate>())
+                .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?;
             buffer
                 .checked_add(metadata)
+                .and_then(|bytes| bytes.checked_add(range_index))
                 .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)
         }
         family => Err(AlignmentSummaryGpuPageError::UnsupportedFamily(family).into()),
@@ -6343,7 +6724,19 @@ fn resolve_junction_request_metrics(
         }
         measured.push(Some((maximum, row_count)));
     }
-    Ok(requests
+    Ok(finalize_junction_request_metrics(
+        requests,
+        measured,
+        &shared_maxima,
+    ))
+}
+
+fn finalize_junction_request_metrics(
+    requests: &[AlignmentSummaryGpuSceneRequest<'_>],
+    measured: Vec<Option<(f64, u32)>>,
+    shared_maxima: &BTreeMap<(u64, u64, u8), f64>,
+) -> Vec<Option<JunctionRequestMetrics>> {
+    requests
         .iter()
         .zip(measured)
         .map(|(request, measured)| {
@@ -6369,7 +6762,84 @@ fn resolve_junction_request_metrics(
                 row_count,
             })
         })
-        .collect())
+        .collect()
+}
+
+fn resolve_resident_junction_request_metrics(
+    renderer: &AlignmentSummaryGpuRenderer,
+    requests: &[AlignmentSummaryGpuSceneRequest<'_>],
+    visible_pages: &[Vec<OwnedSummaryPageRequest>],
+) -> Result<(Vec<Option<JunctionRequestMetrics>>, usize, usize), AlignmentSummaryGpuPrepareError> {
+    let mut measured = Vec::with_capacity(requests.len());
+    let mut shared_maxima = BTreeMap::<(u64, u64, u8), f64>::new();
+    let mut range_queries = 0_usize;
+    let mut examined_entries = 0_usize;
+    for (request, pages) in requests.iter().zip(visible_pages) {
+        let AlignmentSummaryGpuLaneOptions::Sashimi(options) = &request.options else {
+            measured.push(None);
+            continue;
+        };
+        let covered = summary_covered_interval(request);
+        let mut maximum = 0.0_f64;
+        let mut maximum_row = 0_u32;
+        let mut any = false;
+        for page_request in pages {
+            let page = renderer.page(page_request.key).ok_or(
+                AlignmentSummaryGpuPrepareError::ResidentMetadataMismatch(page_request.key),
+            )?;
+            let GpuSummaryPageMetadata::Junctions(metadata) = &page.metadata else {
+                return Err(AlignmentSummaryGpuPrepareError::ResidentMetadataMismatch(
+                    page_request.key,
+                ));
+            };
+            let Some(covered) = covered else {
+                continue;
+            };
+            let normalization = metadata
+                .normalization_factor(options.projection.count_mode)
+                .ok_or(AlignmentSummaryGpuPrepareError::MissingJunctionNormalization)?;
+            let query = metadata.range_index.query(
+                &metadata.entries,
+                covered.start().saturating_sub(page.interval_start),
+                covered.end().saturating_sub(page.interval_start),
+                options.projection.minimum_depth,
+                options.projection.minimum_flank,
+            );
+            range_queries = range_queries.saturating_add(1);
+            examined_entries = examined_entries.saturating_add(query.examined_entries);
+            if query.matched > 0 {
+                any = true;
+                maximum = maximum.max(f64::from(query.maximum_depth) * normalization);
+                maximum_row = maximum_row.max(query.maximum_expanded_row);
+            }
+        }
+        let row_count = if options.projection.display_mode == JunctionDisplayMode::Expanded {
+            request
+                .scene
+                .summaries()
+                .expanded_junction_row_count()
+                .max(maximum_row.saturating_add(u32::from(any)))
+                .max(1)
+        } else {
+            1
+        };
+        if let AlignmentSashimiScalePolicy::Shared(group) = options.scale {
+            let mode = match options.projection.count_mode {
+                SashimiCountMode::Raw => 0,
+                SashimiCountMode::CountsPerMillion => 1,
+            };
+            shared_maxima
+                .entry((request.coherence_scope, group.get(), mode))
+                .and_modify(|shared| *shared = shared.max(maximum))
+                .or_insert(maximum);
+        }
+        measured.push(Some((maximum, row_count)));
+    }
+    Ok((
+        finalize_junction_request_metrics(requests, measured, &shared_maxima),
+        range_queries,
+        examined_entries,
+    ))
 }
 
 fn summary_draw_style(
@@ -6783,6 +7253,13 @@ pub enum AlignmentSummaryGpuPrefetchCursorError {
     DeviceGeneration { cursor: u64, renderer: u64 },
     #[error("summary GPU prefetch cursor still has {remaining} pages to admit")]
     Incomplete { remaining: usize },
+    #[error(
+        "complete summary GPU residency exceeds the optional pin ceiling after retaining {retained_bytes} bytes (aggregate pinned ceiling {maximum_total_pinned_bytes})"
+    )]
+    ResidencyBudgetLimited {
+        retained_bytes: usize,
+        maximum_total_pinned_bytes: usize,
+    },
     #[error(transparent)]
     Page(#[from] AlignmentSummaryGpuPageError),
     #[error(transparent)]
@@ -8050,6 +8527,73 @@ mod tests {
     }
 
     #[test]
+    fn junction_range_index_matches_exhaustive_scan_and_prunes_narrow_queries() {
+        let entries = (0_u64..4_096)
+            .map(|index| {
+                let start_offset = index.saturating_mul(10);
+                AlignmentSummaryJunctionEntry {
+                    start_offset,
+                    end_offset: start_offset.saturating_add(5 + index % 7),
+                    evidence: rgv_hts::JunctionEvidence {
+                        start: start_offset,
+                        end: start_offset.saturating_add(5 + index % 7),
+                        depth: (index % 19 + 1) as u32,
+                        minimum_left_flank: (index % 11 + 1) as u32,
+                        minimum_right_flank: (index % 13 + 1) as u32,
+                        ..rgv_hts::JunctionEvidence::default()
+                    },
+                    expanded_row: (index % 23) as u32,
+                    annotation: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let index = AlignmentSummaryJunctionRangeIndex::build(&entries);
+
+        let exhaustive = |start: u64, end: u64, minimum_depth: u32, minimum_flank: u32| {
+            let mut result = JunctionRangeQuery::default();
+            for entry in &entries {
+                if entry.start_offset < end
+                    && entry.end_offset > start
+                    && entry.evidence.depth >= minimum_depth
+                    && entry.evidence.minimum_left_flank >= minimum_flank
+                    && entry.evidence.minimum_right_flank >= minimum_flank
+                {
+                    result.matched = result.matched.saturating_add(1);
+                    result.maximum_depth = result.maximum_depth.max(entry.evidence.depth);
+                    result.maximum_expanded_row =
+                        result.maximum_expanded_row.max(entry.expanded_row);
+                }
+            }
+            result
+        };
+
+        for (start, end, minimum_depth, minimum_flank) in [
+            (0, 40_960, 0, 0),
+            (0, 1, 1, 1),
+            (9_997, 10_111, 7, 4),
+            (20_000, 20_006, 1, 1),
+            (30_000, 32_000, 18, 10),
+            (40_950, 41_000, 3, 2),
+            (1_000, 1_000, 1, 1),
+        ] {
+            let indexed = index.query(&entries, start, end, minimum_depth, minimum_flank);
+            let expected = exhaustive(start, end, minimum_depth, minimum_flank);
+            assert_eq!(indexed.matched, expected.matched);
+            assert_eq!(indexed.maximum_depth, expected.maximum_depth);
+            assert_eq!(indexed.maximum_expanded_row, expected.maximum_expanded_row);
+        }
+
+        let narrow = index.query(&entries, 20_000, 20_006, 1, 1);
+        assert!(narrow.matched > 0);
+        assert!(
+            narrow.examined_entries < entries.len() / 16,
+            "narrow query examined {} of {} entries",
+            narrow.examined_entries,
+            entries.len()
+        );
+    }
+
+    #[test]
     fn shared_sashimi_scales_are_coherent_within_but_never_across_panels() {
         let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
         let scene = test_snapshot(&ledger);
@@ -8544,8 +9088,12 @@ mod tests {
                 selected,
             ),
         ];
+        let repeated_camera = camera_options[2].0;
+        let repeated_options = camera_options[2].1;
         let operations_before = ledger.operation_counters().unwrap();
         let renderer_operations_before = renderer.operation_counters();
+        let mut presented = None;
+        let mut page_pin_acquisitions = Vec::new();
         for (index, (camera, options)) in camera_options.into_iter().enumerate() {
             assert_eq!(ledger.progress().unwrap().active_replacement_bundle, None);
             let requests = [request(&scene, 2 + index as u64, camera, options)];
@@ -8554,6 +9102,7 @@ mod tests {
                 .unwrap();
             assert_eq!(stats.geometry_uploaded_bytes, 0);
             assert_eq!(stats.page_cache_misses, 0);
+            page_pin_acquisitions.push(stats.page_pin_acquisitions);
             assert_eq!(frame.content_authority(), &authority);
             assert_eq!(ledger.progress().unwrap().active_replacement_bundle, None);
             assert_eq!(
@@ -8571,8 +9120,20 @@ mod tests {
                     .map(AllocationLease::id),
                 page_table_allocation
             );
-            drop(frame);
+            let previous = presented.replace(frame);
+            drop(previous);
         }
+        assert!(page_pin_acquisitions[0] > 0);
+        let repeated_requests = [request(&scene, 99, repeated_camera, repeated_options)];
+        let (repeated, repeated_stats) = renderer
+            .capture_camera_frame(&device, &queue, &authority, &repeated_requests, &ledger)
+            .unwrap();
+        assert_eq!(
+            repeated_stats.page_pin_acquisitions, 0,
+            "a contained summary frame must reuse the prior presentation's page leases"
+        );
+        let previous = presented.replace(repeated);
+        drop(previous);
         let operations_after = ledger.operation_counters().unwrap();
         let renderer_operations_after = renderer.operation_counters();
         assert_eq!(
@@ -8991,7 +9552,11 @@ mod tests {
                 .into();
         let before = renderer.operation_counters();
         let mut cursor = renderer
-            .begin_prepared_scene_prefetch_cursor(&requests, Arc::clone(&keys))
+            .begin_prepared_scene_prefetch_cursor(
+                &requests,
+                Arc::clone(&keys),
+                ledger.progress().unwrap().budget,
+            )
             .unwrap();
         let after_begin = renderer.operation_counters();
         assert_eq!(after_begin, before);
@@ -9032,6 +9597,33 @@ mod tests {
             .unwrap();
         assert_eq!(residency.page_keys.as_ref(), keys.as_ref());
         assert_eq!(renderer.resident_page_count(), keys.len());
+        drop(residency);
+
+        let mut limited = renderer
+            .begin_prepared_scene_prefetch_cursor(&requests, Arc::clone(&keys), 0)
+            .unwrap();
+        while !limited.is_complete() {
+            let progress = renderer
+                .advance_prepared_scene_prefetch_cursor(
+                    &device,
+                    &queue,
+                    &mut limited,
+                    &ledger,
+                    revision,
+                    NonZeroUsize::new(2).unwrap(),
+                )
+                .unwrap();
+            assert!(progress.retention_limited);
+        }
+        assert!(matches!(
+            renderer.finish_prepared_scene_prefetch_cursor(limited),
+            Err(
+                AlignmentSummaryGpuPrefetchCursorError::ResidencyBudgetLimited {
+                    maximum_total_pinned_bytes: 0,
+                    ..
+                }
+            )
+        ));
     }
 
     #[test]

@@ -135,7 +135,8 @@ pub use row_oracle::{AlignmentRowGroup, AlignmentRowGroupKey, RowOracleError};
 pub use scene_camera::{AlignmentSceneCamera, AlignmentSceneCameraError, AlignmentSceneRowDemand};
 pub use scene_snapshot::{
     AlignmentSceneAlleleSite, AlignmentScenePileupSite, AlignmentSceneSnapshot,
-    AlignmentSceneSnapshotError,
+    AlignmentSceneSnapshotError, AlignmentSemanticRetirementStats,
+    build_alignment_semantic_retirement_claim_set,
 };
 pub use semantic_page::{
     AlignmentBodyColorToken, AlignmentComponent, AlignmentGeometryToken, AlignmentLabelKind,

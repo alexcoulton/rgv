@@ -296,6 +296,12 @@ impl EvidenceRoot {
         &self.coverage
     }
 
+    /// Allocation owned directly by this root. Exposed only to the crate's move-only semantic
+    /// retirement planner; callers must still prove exclusive `Arc` ownership before claiming it.
+    pub(crate) const fn metadata_allocation(&self) -> &AllocationLease {
+        &self.metadata_allocation
+    }
+
     #[must_use]
     pub fn exact_filter_provenance(
         &self,
@@ -507,6 +513,10 @@ impl EvidencePins {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.allocations.is_empty()
+    }
+
+    pub(crate) fn allocations(&self) -> &[PinnedAllocationLease] {
+        &self.allocations
     }
 }
 
