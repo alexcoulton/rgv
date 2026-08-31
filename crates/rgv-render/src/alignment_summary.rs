@@ -7779,7 +7779,6 @@ mod tests {
         };
         assert_eq!(reference.bases.len(), interval.len() as usize);
         let layout = LayoutContract {
-            row_scale_class: 0,
             stacking: ReadStackingMode::Compact,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,

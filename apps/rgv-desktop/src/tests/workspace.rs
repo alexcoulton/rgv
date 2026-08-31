@@ -3,17 +3,117 @@ use crate::workspace::alignment_management::{
     alignment_gpu_bundle_error_is_deferred, alignment_read_camera_capture_error_is_deferred,
     alignment_scene_covered_clip, alignment_scene_frame_for_ui_against_retained_interval,
     alignment_scene_intervals_share_authority, alignment_scene_staging_frame_is_current,
-    alignment_summary_camera_capture_error_is_deferred,
+    alignment_scene_viewport_for_layout_width, alignment_summary_camera_capture_error_is_deferred,
+    retained_alignment_scene_can_present, uncovered_vertical_candidate_retains_committed_pixels,
 };
 use crate::workspace::queries::{
     AlignmentReferenceLanePlan, AlignmentReferenceLaneRequirement, AlignmentSceneFrameSettlement,
     alignment_scene_budget_event_is_current, alignment_scene_event_token_is_current,
     alignment_scene_frame_is_current, alignment_scene_frame_settlement,
-    alignment_scene_pressure_is_current, alignment_scene_pressure_preserves_visible_epoch,
-    alignment_scene_pressure_requires_resume, alignment_scene_refusal_is_current,
-    plan_alignment_reference_lanes, reference_dependency_is_settled,
-    reference_failure_matches_requirement, reference_query_completion_matches,
+    alignment_scene_pressure_is_current, alignment_scene_pressure_owns_navigation,
+    alignment_scene_pressure_preserves_visible_epoch, alignment_scene_pressure_requires_resume,
+    alignment_scene_refusal_is_current, plan_alignment_reference_lanes,
+    reference_dependency_is_settled, reference_failure_matches_requirement,
+    reference_query_completion_matches,
 };
+
+#[test]
+fn retained_scene_overlap_is_presentable_only_when_semantically_current() {
+    let requested = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+    let overlap = GenomicInterval::new(ContigId::new(0), 50, 150).unwrap();
+    let disjoint = GenomicInterval::new(ContigId::new(0), 250, 300).unwrap();
+
+    assert!(retained_alignment_scene_can_present(
+        true,
+        true,
+        Some(overlap),
+        requested,
+    ));
+    assert!(!retained_alignment_scene_can_present(
+        false,
+        true,
+        Some(overlap),
+        requested,
+    ));
+    assert!(!retained_alignment_scene_can_present(
+        true,
+        false,
+        Some(overlap),
+        requested,
+    ));
+    assert!(!retained_alignment_scene_can_present(
+        true,
+        true,
+        Some(disjoint),
+        requested,
+    ));
+}
+
+#[test]
+fn uncovered_vertical_candidate_cannot_replace_coherent_read_pixels() {
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+        100.0,
+    )
+    .unwrap();
+    let panned = viewport.pan_pixels(1.0, 10_000).unwrap();
+
+    assert!(uncovered_vertical_candidate_retains_committed_pixels(
+        viewport,
+        true,
+        true,
+        viewport,
+        &(100..150),
+        &(150..150),
+    ));
+    assert!(!uncovered_vertical_candidate_retains_committed_pixels(
+        viewport,
+        true,
+        true,
+        viewport,
+        &(100..150),
+        &(125..150),
+    ));
+    assert!(!uncovered_vertical_candidate_retains_committed_pixels(
+        viewport,
+        true,
+        true,
+        panned,
+        &(100..150),
+        &(150..150),
+    ));
+    assert!(!uncovered_vertical_candidate_retains_committed_pixels(
+        viewport,
+        true,
+        false,
+        viewport,
+        &(100..150),
+        &(150..150),
+    ));
+    assert!(!uncovered_vertical_candidate_retains_committed_pixels(
+        viewport,
+        true,
+        true,
+        viewport,
+        &(150..150),
+        &(150..150),
+    ));
+}
+
+#[test]
+fn alignment_presentation_uses_the_exact_live_layout_width() {
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 1_100).unwrap(),
+        987.84375,
+    )
+    .unwrap();
+    let projected = alignment_scene_viewport_for_layout_width(viewport, 988.21875).unwrap();
+
+    assert_eq!(projected.interval(), viewport.interval());
+    assert_eq!(projected.exact_start(), viewport.exact_start());
+    assert_eq!(projected.span(), viewport.span());
+    assert_eq!(projected.pixel_width(), 988.21875);
+}
 
 fn alignment_publication_target(
     viewport: Viewport,
@@ -1855,6 +1955,28 @@ fn vertical_presentation_pressure_is_resumed_even_though_its_work_is_speculative
     assert!(alignment_scene_pressure_requires_resume(
         AlignmentSceneEngineOperation::PumpSource,
         SourceIntentKind::Foreground,
+    ));
+}
+
+#[test]
+fn background_pressure_cannot_reopen_a_settled_navigation_transaction() {
+    assert!(alignment_scene_pressure_owns_navigation(
+        AlignmentNavigationPhase::Running,
+    ));
+    assert!(alignment_scene_pressure_owns_navigation(
+        AlignmentNavigationPhase::WaitingForSourcePressure,
+    ));
+    assert!(!alignment_scene_pressure_owns_navigation(
+        AlignmentNavigationPhase::CandidateReady,
+    ));
+    assert!(!alignment_scene_pressure_owns_navigation(
+        AlignmentNavigationPhase::WaitingForGpuPressure,
+    ));
+    assert!(!alignment_scene_pressure_owns_navigation(
+        AlignmentNavigationPhase::Committed,
+    ));
+    assert!(!alignment_scene_pressure_owns_navigation(
+        AlignmentNavigationPhase::BudgetLimited,
     ));
 }
 

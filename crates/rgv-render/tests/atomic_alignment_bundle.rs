@@ -653,7 +653,6 @@ fn test_snapshot(ledger: &AllocationLedger) -> Arc<AlignmentSceneSnapshot> {
         bases: vec![b'A'; interval.len() as usize],
     };
     let layout = LayoutContract {
-        row_scale_class: 0,
         stacking: ReadStackingMode::Compact,
         grouping: AlignmentGroupMode::None,
         group_order: AlignmentOrderDirection::Natural,

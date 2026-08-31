@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     ops::Range,
     sync::Arc,
@@ -12,13 +12,13 @@ use rgv_alignment_scene::{
     AlignmentPresentationStoreError, AlignmentRowActivityCursor, AlignmentRowActivityProfile,
     AlignmentRowAtlasError, AlignmentSceneCamera, AlignmentSceneSnapshot,
     AlignmentSceneSnapshotError, AlignmentSourceRevision, AlleleSummaryDetail,
-    CanonicalGenomicTile, ContractFingerprint, EvidenceBuildError, EvidenceSelectionError,
-    EvidenceStoreError, ExactAlleleSummaryError, ExactDepthSummaryError, ExactFilterSummaryError,
-    ExactJunctionSummaryError, ExactModificationSummaryError, ExactPairSummaryError,
-    ExactSummaryRootError, GeometryLod, JunctionAnnotationIndex, LayoutContract, LedgerError,
-    PayloadContract, PresentationContract, PresentationStorePressure, ReferenceRevision,
-    ReservationKind, RowAtlasRevision, SceneRevision, SemanticPageError, StorePressure,
-    SummaryContract, SummarySemanticPageError,
+    CanonicalGenomicTile, CanonicalRowBlock, ContractFingerprint, EvidenceBuildError,
+    EvidenceRevision, EvidenceSelectionError, EvidenceStoreError, ExactAlleleSummaryError,
+    ExactDepthSummaryError, ExactFilterSummaryError, ExactJunctionSummaryError,
+    ExactModificationSummaryError, ExactPairSummaryError, ExactSummaryRootError, GeometryLod,
+    JunctionAnnotationIndex, LayoutContract, LedgerError, PayloadContract, PresentationContract,
+    PresentationStorePressure, ReferenceRevision, ReservationKind, RowAtlasRevision, SceneRevision,
+    SemanticPageError, StorePressure, SummaryContract, SummarySemanticPageError,
 };
 use rgv_core::{ContigId, GenomicInterval};
 use rgv_hts::ReferenceSlice;
@@ -166,7 +166,11 @@ fn alignment_row_atlas_satisfies_contract(
     scene.prepared_interval().contains_interval(interval)
         && evidence.coverage().covers(interval)
         && atlas.interval().contains_interval(interval)
-        && atlas.derived_from_evidence() == evidence.revision()
+        // A containing canonical atlas is intentionally reusable across compatible evidence
+        // publications because its handles are source-stable. Treating provenance revision as
+        // equality authority here made the committed scene renderable while permanently revoking
+        // its scrollbar profile.
+        && atlas.shares_stable_record_authority(evidence)
         && atlas.source_revision() == contract.source_revision
         && atlas.record_contract() == contract.record_contract
         && atlas.layout_contract() == contract.layout
@@ -243,6 +247,12 @@ pub enum AlignmentVerticalResidency {
         total_rows: u32,
     },
     BudgetLimited {
+        prepared_rows: u32,
+        total_rows: u32,
+    },
+    /// The visible scene remains complete, but an unexpected optional page-warm failure stopped
+    /// the background pass for this scene authority. A later source horizon or contract may retry.
+    Unavailable {
         prepared_rows: u32,
         total_rows: u32,
     },
@@ -361,9 +371,9 @@ impl From<Range<u32>> for AlignmentSceneTelemetryRowRange {
 /// Terminal state of the most recent optional vertical-presentation checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AlignmentVerticalResidencyPumpOutcome {
-    /// One larger, still-partial immutable scene was published.
-    Published,
-    /// The publication reached every row in the stable atlas.
+    /// One independently keyed semantic row block was warmed without replacing the visible scene.
+    Warmed,
+    /// The warmed block directory now covers every row in the stable atlas.
     Completed,
     /// The optional candidate was refused by the shared allocation policy; the visible scene was
     /// preserved and the lane stopped warming.
@@ -372,9 +382,9 @@ pub enum AlignmentVerticalResidencyPumpOutcome {
     Failed,
 }
 
-/// Constant-size trace record for one semantic vertical-residency checkpoint. Page counts are
-/// occurrences in the cumulative immutable scene manifest, not newly materialized cache misses.
-/// `target_*_pages` is absent when preparation failed before a complete candidate existed.
+/// Constant-size trace record for one semantic vertical-residency checkpoint. Target page counts
+/// describe only the independently warmed row block; no cumulative snapshot is constructed.
+/// `target_*_pages` is absent when preparation failed before that block was admitted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AlignmentVerticalResidencyPumpTelemetry {
     pub checkpoint: u64,
@@ -387,6 +397,7 @@ pub struct AlignmentVerticalResidencyPumpTelemetry {
     pub current_summary_pages: u64,
     pub target_read_pages: Option<u64>,
     pub target_summary_pages: Option<u64>,
+    pub target_read_page_cache_misses: Option<u64>,
     pub prepare_elapsed_nanoseconds: u64,
     pub pump_elapsed_nanoseconds: u64,
     pub outcome: AlignmentVerticalResidencyPumpOutcome,
@@ -412,12 +423,15 @@ pub struct AlignmentSceneCoordinatorTelemetry {
     pub resource_pressure_speculation_aborts: u64,
     pub vertical_residency_checkpoints: u64,
     pub vertical_residency_publications: u64,
+    /// Independently keyed row blocks warmed without replacing the visible scene snapshot.
+    pub vertical_residency_blocks_warmed: u64,
     pub vertical_residency_completions: u64,
     pub vertical_residency_budget_limits: u64,
     pub vertical_residency_failures: u64,
-    /// Sum of complete read-page manifest occurrences produced by successful vertical candidates.
-    /// Comparing this with the latest target page count exposes cumulative reconstruction.
+    /// Sum of independently warmed read-page key occurrences. Growth is linear in warmed blocks,
+    /// never the triangular sum of successively larger cumulative manifests.
     pub vertical_residency_read_page_occurrences: u64,
+    pub vertical_residency_read_page_cache_misses: u64,
     /// Summary-page counterpart to `vertical_residency_read_page_occurrences`.
     pub vertical_residency_summary_page_occurrences: u64,
     /// Cumulative wall time spent inside semantic presentation-store preparation.
@@ -699,8 +713,12 @@ pub struct AlignmentSceneSourcePump {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AlignmentPresentationPump {
     pub owner: SourceOwnerId,
+    /// Compatibility publication field. Independent warm-up never changes the current scene.
     pub published_scene: Option<SceneRevision>,
     pub budget_limited: bool,
+    /// An unexpected optional warm-up failure was latched without invalidating the visible scene.
+    pub failed: bool,
+    pub completed: bool,
     /// Allocation pressure which paused this optional vertical-residency checkpoint. The current
     /// immutable scene remains authoritative; callers may resume the lane after shared-ledger
     /// progress instead of treating the source as unavailable.
@@ -764,6 +782,11 @@ struct AlignmentSceneSourceLane {
     telemetry: AlignmentSceneCoordinatorTelemetry,
     refusal: Option<AlignmentSceneOwnerRefusal>,
     vertical_residency_budget_limited: bool,
+    /// Terminal only for optional full-height warming under the current scene authority. This
+    /// prevents a deterministic semantic-page failure from spinning in the worker and from
+    /// turning already complete visible reads into a failed foreground navigation.
+    vertical_residency_failed: bool,
+    vertical_read_residency: Option<VerticalReadResidency>,
     /// Foreground pointer/navigation ownership suppresses optional vertical semantic-page work.
     /// The latest state is mailbox-coalesced and takes effect at the next canonical block
     /// checkpoint without cancelling complete evidence or the visible committed scene.
@@ -773,6 +796,22 @@ struct AlignmentSceneSourceLane {
     /// current scrollbar truth.
     row_activity_cache: RefCell<Option<AlignmentRowActivityCache>>,
     row_activity_telemetry: Cell<AlignmentRowActivityTelemetry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerticalReadResidencyAuthority {
+    evidence_revision: EvidenceRevision,
+    atlas_revision: RowAtlasRevision,
+    presentation: PresentationContract,
+    prepared_interval: GenomicInterval,
+    geometry_tile_bases: NonZeroU64,
+    row_block_rows: NonZeroU32,
+}
+
+#[derive(Clone, Debug)]
+struct VerticalReadResidency {
+    authority: VerticalReadResidencyAuthority,
+    warmed_blocks: BTreeSet<CanonicalRowBlock>,
 }
 
 #[derive(Clone, Debug)]
@@ -873,6 +912,8 @@ where
                 telemetry: AlignmentSceneCoordinatorTelemetry::default(),
                 refusal: None,
                 vertical_residency_budget_limited: false,
+                vertical_residency_failed: false,
+                vertical_read_residency: None,
                 optional_work_paused: false,
                 row_activity_cache: RefCell::new(None),
                 row_activity_telemetry: Cell::new(AlignmentRowActivityTelemetry::default()),
@@ -936,6 +977,7 @@ where
         policy.validate()?;
         lane.policy = policy;
         lane.vertical_residency_budget_limited = false;
+        lane.vertical_residency_failed = false;
         let Some(camera) = lane.desired.as_ref().map(|desired| desired.camera) else {
             return Ok(None);
         };
@@ -1378,6 +1420,7 @@ where
             // A budget change is an explicit new admission decision. A prior background refusal
             // must not permanently suppress work after the user grants more room.
             lane.vertical_residency_budget_limited = false;
+            lane.vertical_residency_failed = false;
         }
         let speculation_was_pending = self.actor.schedule().desired_speculation().is_some()
             || self
@@ -1395,6 +1438,11 @@ where
                 .saturating_add(1);
         }
         let presentation = self.presentation.reduce_budget(budget)?;
+        if presentation.evicted_read_pages > 0 {
+            for lane in self.lanes.values_mut() {
+                lane.vertical_read_residency = None;
+            }
+        }
         let evidence = self.actor.store_mut().reduce_budget(budget)?;
         let progress = self
             .actor
@@ -1445,6 +1493,11 @@ where
                 .saturating_add(1);
         }
         let presentation = self.presentation.evict_inactive_until(target_charged)?;
+        if presentation.evicted_read_pages > 0 {
+            for lane in self.lanes.values_mut() {
+                lane.vertical_read_residency = None;
+            }
+        }
         let evidence = self
             .actor
             .store_mut()
@@ -1534,6 +1587,7 @@ impl AlignmentSceneSourceLane {
         let source_horizon = source_horizon(prepared_interval, &self.contract)?;
         if previous_source_horizon != Some(source_horizon) {
             self.vertical_residency_budget_limited = false;
+            self.vertical_residency_failed = false;
         }
         if self
             .refusal
@@ -1613,6 +1667,7 @@ impl AlignmentSceneSourceLane {
             .ok_or(AlignmentSceneCoordinatorError::MissingCamera)?;
         self.contract = contract;
         self.vertical_residency_budget_limited = false;
+        self.vertical_residency_failed = false;
         self.update_camera(owner, actor, presentation, camera, true)
     }
 
@@ -1931,20 +1986,82 @@ impl AlignmentSceneSourceLane {
             return AlignmentVerticalResidency::ViewportBounded;
         }
         let total_rows = u32::try_from(scene.reads().atlas().row_count()).unwrap_or(u32::MAX);
-        let prepared = scene.reads().prepared_rows();
-        if prepared.start == 0 && prepared.end == total_rows {
+        let prepared_rows = self.warmed_vertical_row_count(scene);
+        if prepared_rows == total_rows {
             AlignmentVerticalResidency::Complete { total_rows }
         } else if self.vertical_residency_budget_limited {
             AlignmentVerticalResidency::BudgetLimited {
-                prepared_rows: prepared.end.saturating_sub(prepared.start),
+                prepared_rows,
+                total_rows,
+            }
+        } else if self.vertical_residency_failed {
+            AlignmentVerticalResidency::Unavailable {
+                prepared_rows,
                 total_rows,
             }
         } else {
             AlignmentVerticalResidency::Preparing {
-                prepared_rows: prepared.end.saturating_sub(prepared.start),
+                prepared_rows,
                 total_rows,
             }
         }
+    }
+
+    fn vertical_residency_authority(
+        &self,
+        scene: &AlignmentSceneSnapshot,
+    ) -> VerticalReadResidencyAuthority {
+        VerticalReadResidencyAuthority {
+            evidence_revision: scene.reads().evidence().revision(),
+            atlas_revision: scene.reads().atlas().revision(),
+            presentation: scene.reads().presentation(),
+            prepared_interval: scene.prepared_interval(),
+            geometry_tile_bases: self.contract.geometry_tile_bases,
+            row_block_rows: self.contract.row_block_rows,
+        }
+    }
+
+    fn observe_scene_for_vertical_residency(&mut self, scene: &AlignmentSceneSnapshot) {
+        let authority = self.vertical_residency_authority(scene);
+        let residency = self
+            .vertical_read_residency
+            .get_or_insert_with(|| VerticalReadResidency {
+                authority: authority.clone(),
+                warmed_blocks: BTreeSet::new(),
+            });
+        if residency.authority != authority {
+            *residency = VerticalReadResidency {
+                authority,
+                warmed_blocks: BTreeSet::new(),
+            };
+            self.vertical_residency_failed = false;
+        }
+        residency
+            .warmed_blocks
+            .extend(scene.reads().page_keys().iter().map(|key| key.row_block()));
+    }
+
+    fn warmed_vertical_row_count(&self, scene: &AlignmentSceneSnapshot) -> u32 {
+        let authority = self.vertical_residency_authority(scene);
+        let total_rows = scene.reads().atlas().row_count();
+        let Some(residency) = self
+            .vertical_read_residency
+            .as_ref()
+            .filter(|residency| residency.authority == authority)
+        else {
+            return scene
+                .reads()
+                .prepared_rows()
+                .end
+                .saturating_sub(scene.reads().prepared_rows().start);
+        };
+        residency
+            .warmed_blocks
+            .iter()
+            .filter_map(|block| block.range(total_rows).ok())
+            .fold(0_u32, |rows, range| {
+                rows.saturating_add(range.end.saturating_sub(range.start))
+            })
     }
 
     fn reconcile_from_resident_or_cache<B>(
@@ -2032,6 +2149,7 @@ impl AlignmentSceneSourceLane {
         self.telemetry.presentation_candidates =
             self.telemetry.presentation_candidates.saturating_add(1);
         let scene = presentation.stage_for(presentation_owner(owner), candidate);
+        self.observe_scene_for_vertical_residency(&scene);
         self.refusal = None;
         self.telemetry.scene_publications = self.telemetry.scene_publications.saturating_add(1);
         Ok(Some(scene))
@@ -2088,6 +2206,7 @@ impl AlignmentSceneSourceLane {
         self.telemetry.presentation_candidates =
             self.telemetry.presentation_candidates.saturating_add(1);
         let scene = presentation.stage_for(presentation_owner(owner), candidate);
+        self.observe_scene_for_vertical_residency(&scene);
         self.refusal = None;
         self.telemetry.scene_publications = self.telemetry.scene_publications.saturating_add(1);
         Ok(Some(scene))
@@ -2258,6 +2377,7 @@ impl AlignmentSceneSourceLane {
         if !self.policy.full_vertical_residency
             || self.optional_work_paused
             || self.vertical_residency_budget_limited
+            || self.vertical_residency_failed
             || !supports_full_vertical_residency(self.contract.presentation.geometry_lod)
         {
             return false;
@@ -2291,8 +2411,7 @@ impl AlignmentSceneSourceLane {
             return false;
         }
         let total_rows = u32::try_from(scene.reads().atlas().row_count()).unwrap_or(u32::MAX);
-        let rows = scene.reads().prepared_rows();
-        rows.start > 0 || rows.end < total_rows
+        self.warmed_vertical_row_count(scene) < total_rows
     }
 
     fn expand_vertical_residency_once<E>(
@@ -2311,12 +2430,22 @@ impl AlignmentSceneSourceLane {
             .ok_or(AlignmentSceneCoordinatorError::MissingCamera)?;
         let total_rows = u32::try_from(current.reads().atlas().row_count())
             .map_err(|_| AlignmentSceneCoordinatorConfigError::RowCoordinateOverflow)?;
-        let target_rows = expanded_vertical_rows(
-            current.reads().prepared_rows(),
+        self.observe_scene_for_vertical_residency(&current);
+        let authority = self.vertical_residency_authority(&current);
+        let target_block = next_unwarmed_vertical_block(
+            self.vertical_read_residency
+                .as_ref()
+                .filter(|residency| residency.authority == authority)
+                .map(|residency| &residency.warmed_blocks)
+                .expect("observing the current scene establishes vertical residency authority"),
             total_rows,
             self.contract.row_block_rows,
             desired.camera.visible_rows(),
-        );
+        )
+        .ok_or(AlignmentSceneCoordinatorError::MissingCamera)?;
+        let target_rows = target_block
+            .range(current.reads().atlas().row_count())
+            .map_err(AlignmentPresentationStoreError::from)?;
         self.telemetry.vertical_residency_checkpoints = self
             .telemetry
             .vertical_residency_checkpoints
@@ -2324,18 +2453,15 @@ impl AlignmentSceneSourceLane {
         let (presentation_contract, reference) =
             self.available_presentation_contract(desired.source_horizon);
         let prepare_started = Instant::now();
-        let prepared = presentation.prepare_with_annotation(
+        let prepared = presentation.warm_read_row_block(
             current.reads().evidence(),
-            current.summaries(),
             current.reads().atlas(),
             presentation_contract,
             current.prepared_interval(),
-            target_rows.clone(),
+            target_block,
             self.contract.contig_length,
             self.contract.geometry_tile_bases,
-            self.contract.row_block_rows,
             reference,
-            self.contract.annotation.as_ref(),
             ReservationKind::Normal,
         );
         let prepare_elapsed_nanoseconds = elapsed_nanoseconds(prepare_started);
@@ -2356,16 +2482,24 @@ impl AlignmentSceneSourceLane {
                     target_rows,
                     total_rows,
                     None,
+                    None,
+                    None,
                     AlignmentVerticalResidencyPumpOutcome::BudgetLimited,
                 );
                 return Ok(AlignmentPresentationPump {
                     owner,
                     published_scene: None,
                     budget_limited: true,
+                    failed: false,
+                    completed: false,
                     pressure: Some(pressure),
                 });
             }
-            Err(error) => {
+            Err(_error) => {
+                // Full-height warming is optional once the visible scene is complete. Latch one
+                // failure for this authority so a deterministic invariant error cannot consume a
+                // core in an unbounded retry loop or fail the foreground navigation transaction.
+                self.vertical_residency_failed = true;
                 self.telemetry.vertical_residency_failures =
                     self.telemetry.vertical_residency_failures.saturating_add(1);
                 self.record_vertical_residency_pump(
@@ -2375,20 +2509,30 @@ impl AlignmentSceneSourceLane {
                     target_rows,
                     total_rows,
                     None,
+                    None,
+                    None,
                     AlignmentVerticalResidencyPumpOutcome::Failed,
                 );
-                return Err(error.into());
+                return Ok(AlignmentPresentationPump {
+                    owner,
+                    published_scene: None,
+                    budget_limited: false,
+                    failed: true,
+                    completed: false,
+                    pressure: None,
+                });
             }
         };
-        self.telemetry.presentation_candidates =
-            self.telemetry.presentation_candidates.saturating_add(1);
-        let scene = presentation.stage_for(presentation_owner(owner), candidate);
-        self.telemetry.scene_publications = self.telemetry.scene_publications.saturating_add(1);
-        self.telemetry.vertical_residency_publications = self
+        self.vertical_read_residency
+            .as_mut()
+            .expect("a successful warm retains its observed authority")
+            .warmed_blocks
+            .insert(candidate.row_block);
+        self.telemetry.vertical_residency_blocks_warmed = self
             .telemetry
-            .vertical_residency_publications
+            .vertical_residency_blocks_warmed
             .saturating_add(1);
-        let completed = target_rows.start == 0 && target_rows.end == total_rows;
+        let completed = self.warmed_vertical_row_count(&current) == total_rows;
         if completed {
             self.telemetry.vertical_residency_completions = self
                 .telemetry
@@ -2401,17 +2545,21 @@ impl AlignmentSceneSourceLane {
             &current,
             target_rows,
             total_rows,
-            Some(&scene),
+            Some(usize_as_u64(candidate.page_occurrences)),
+            Some(usize_as_u64(candidate.cache_misses)),
+            None,
             if completed {
                 AlignmentVerticalResidencyPumpOutcome::Completed
             } else {
-                AlignmentVerticalResidencyPumpOutcome::Published
+                AlignmentVerticalResidencyPumpOutcome::Warmed
             },
         );
         Ok(AlignmentPresentationPump {
             owner,
-            published_scene: Some(scene.revision()),
+            published_scene: None,
             budget_limited: false,
+            failed: false,
+            completed,
             pressure: None,
         })
     }
@@ -2424,18 +2572,24 @@ impl AlignmentSceneSourceLane {
         current: &AlignmentSceneSnapshot,
         target_prepared_rows: Range<u32>,
         total_rows: u32,
-        target: Option<&AlignmentSceneSnapshot>,
+        target_read_pages: Option<u64>,
+        target_read_page_cache_misses: Option<u64>,
+        target_summary_pages: Option<u64>,
         outcome: AlignmentVerticalResidencyPumpOutcome,
     ) {
         let current_read_pages = usize_as_u64(current.reads().pages().len());
         let current_summary_pages = usize_as_u64(current.summary_pages().len());
-        let target_read_pages = target.map(|scene| usize_as_u64(scene.reads().pages().len()));
-        let target_summary_pages = target.map(|scene| usize_as_u64(scene.summary_pages().len()));
         if let Some(pages) = target_read_pages {
             self.telemetry.vertical_residency_read_page_occurrences = self
                 .telemetry
                 .vertical_residency_read_page_occurrences
                 .saturating_add(pages);
+        }
+        if let Some(misses) = target_read_page_cache_misses {
+            self.telemetry.vertical_residency_read_page_cache_misses = self
+                .telemetry
+                .vertical_residency_read_page_cache_misses
+                .saturating_add(misses);
         }
         if let Some(pages) = target_summary_pages {
             self.telemetry.vertical_residency_summary_page_occurrences = self
@@ -2456,7 +2610,7 @@ impl AlignmentSceneSourceLane {
             Some(AlignmentVerticalResidencyPumpTelemetry {
                 checkpoint: self.telemetry.vertical_residency_checkpoints,
                 current_scene: current.revision(),
-                published_scene: target.map(AlignmentSceneSnapshot::revision),
+                published_scene: None,
                 current_prepared_rows: current.reads().prepared_rows().into(),
                 target_prepared_rows: target_prepared_rows.into(),
                 total_rows,
@@ -2464,6 +2618,7 @@ impl AlignmentSceneSourceLane {
                 current_summary_pages,
                 target_read_pages,
                 target_summary_pages,
+                target_read_page_cache_misses,
                 prepare_elapsed_nanoseconds,
                 pump_elapsed_nanoseconds,
                 outcome,
@@ -2733,42 +2888,36 @@ const fn supports_full_vertical_residency(lod: GeometryLod) -> bool {
     matches!(lod, GeometryLod::Span | GeometryLod::Read)
 }
 
-/// Expands a contiguous prepared row range by at most one previously absent canonical block.
-/// When both sides are available, the edge closest to the live camera wins; ties favour the
-/// usual top-to-bottom browsing direction. Existing partial edge blocks are normalised for free
-/// because their semantic page is already cached.
-fn expanded_vertical_rows(
-    current: Range<u32>,
+/// Chooses one independently keyed row block nearest the live camera. Previously warmed blocks
+/// need not form a contiguous prefix or interval, so changing vertical direction never rebuilds
+/// or republishes the blocks already in the cache. Distance ties favour the usual top-to-bottom
+/// browsing direction.
+fn next_unwarmed_vertical_block(
+    warmed: &BTreeSet<CanonicalRowBlock>,
     total_rows: u32,
     block_rows: NonZeroU32,
     visible: Range<u32>,
-) -> Range<u32> {
+) -> Option<CanonicalRowBlock> {
     if total_rows == 0 {
-        return 0..0;
+        return None;
     }
     let rows = block_rows.get();
-    let current = current.start.min(total_rows)..current.end.min(total_rows);
-    let can_expand_before = current.start > 0;
-    let can_expand_after = current.end < total_rows;
-    if !can_expand_before && !can_expand_after {
-        return 0..total_rows;
-    }
-    let before_distance = visible.start.saturating_sub(current.start);
-    let after_distance = current.end.saturating_sub(visible.end);
-    let expand_after =
-        can_expand_after && (!can_expand_before || after_distance <= before_distance);
-    if expand_after {
-        let covered_blocks = current.end.saturating_add(rows.saturating_sub(1)) / rows;
-        let end = covered_blocks
-            .saturating_add(1)
-            .saturating_mul(rows)
-            .min(total_rows);
-        current.start..end
-    } else {
-        let first_block = current.start / rows;
-        let start = first_block.saturating_sub(1).saturating_mul(rows);
-        start..current.end
-    }
+    let block_count = total_rows.div_ceil(rows);
+    let visible_middle = visible
+        .start
+        .saturating_add(visible.end.saturating_sub(visible.start) / 2)
+        .min(total_rows.saturating_sub(1));
+    let visible_block = visible_middle / rows;
+    (0..block_count)
+        .filter(|coordinate| !warmed.contains(&CanonicalRowBlock::new(*coordinate, block_rows)))
+        .min_by_key(|coordinate| {
+            (
+                coordinate.abs_diff(visible_block),
+                u8::from(*coordinate < visible_block),
+                *coordinate,
+            )
+        })
+        .map(|coordinate| CanonicalRowBlock::new(coordinate, block_rows))
 }
 
 fn elapsed_nanoseconds(started: Instant) -> u64 {
@@ -3046,7 +3195,6 @@ mod tests {
                 collect_modifications: false,
             },
             layout: LayoutContract {
-                row_scale_class: 0,
                 stacking: ReadStackingMode::Compact,
                 grouping: AlignmentGroupMode::None,
                 group_order: AlignmentOrderDirection::Natural,
@@ -3331,7 +3479,8 @@ mod tests {
         let atlas_wide_total = match frame.vertical_residency {
             AlignmentVerticalResidency::Preparing { total_rows, .. }
             | AlignmentVerticalResidency::Complete { total_rows }
-            | AlignmentVerticalResidency::BudgetLimited { total_rows, .. } => total_rows,
+            | AlignmentVerticalResidency::BudgetLimited { total_rows, .. }
+            | AlignmentVerticalResidency::Unavailable { total_rows, .. } => total_rows,
             AlignmentVerticalResidency::ViewportBounded => {
                 panic!("the explicitly enabled complete-residency policy must report totals")
             }
@@ -3381,13 +3530,76 @@ mod tests {
         ));
 
         let mut changed_layout = coordinator.contract().clone();
-        changed_layout.layout.row_scale_class =
-            changed_layout.layout.row_scale_class.saturating_add(1);
+        changed_layout.layout.stacking = match changed_layout.layout.stacking {
+            ReadStackingMode::Stable => ReadStackingMode::Compact,
+            ReadStackingMode::Compact => ReadStackingMode::Stable,
+        };
         assert!(!alignment_row_activity_satisfies_contract(
             profile,
             snapshot,
             camera.interval(),
             &changed_layout,
+        ));
+    }
+
+    #[test]
+    fn compatible_atlas_republication_preserves_exact_row_activity_authority() {
+        let (mut coordinator, camera) = test_coordinator();
+        coordinator.update_camera(camera).unwrap();
+        pump_until_publication(&mut coordinator);
+
+        let initial = coordinator.frame().unwrap();
+        let initial_scene = initial.snapshot.unwrap();
+        let initial_evidence_revision = initial_scene.reads().evidence().revision();
+        let initial_atlas_revision = initial_scene.reads().atlas().revision();
+        let owner = coordinator.owner;
+        let desired = coordinator
+            .source
+            .lanes
+            .get(&owner)
+            .unwrap()
+            .desired
+            .clone()
+            .unwrap();
+
+        {
+            let source = &mut coordinator.source;
+            let lane = source.lanes.get_mut(&owner).unwrap();
+            lane.publish_source_roots_from_cache(&mut source.actor, &desired)
+                .unwrap();
+            lane.prepare_from_source_roots(
+                owner,
+                &source.actor,
+                &mut source.presentation,
+                &desired,
+            )
+            .unwrap()
+            .expect("compatible republished roots prepare a replacement scene");
+        }
+
+        let republished = coordinator.frame().unwrap();
+        let republished_scene = republished.snapshot.as_ref().unwrap();
+        assert_ne!(
+            republished_scene.reads().evidence().revision(),
+            initial_evidence_revision
+        );
+        assert_eq!(
+            republished_scene.reads().atlas().revision(),
+            initial_atlas_revision
+        );
+        assert_ne!(
+            republished_scene.reads().atlas().derived_from_evidence(),
+            republished_scene.reads().evidence().revision()
+        );
+        let profile = republished
+            .row_activity
+            .as_ref()
+            .expect("compatible atlas reuse must retain exact scrollbar row authority");
+        assert!(alignment_row_activity_satisfies_contract(
+            profile,
+            republished_scene,
+            camera.interval(),
+            coordinator.contract(),
         ));
     }
 
@@ -3426,9 +3638,9 @@ mod tests {
         );
         assert!(disjoint_frame.row_activity.is_none());
 
-        // A cached profile is also rejected when the snapshot's row-layout contract no longer
-        // matches the lane. Restoring that exact contract produces a newly validated profile for
-        // the camera rather than reusing stale authority.
+        // A cached profile is also rejected when the snapshot's real row-layout contract no
+        // longer matches the lane. Restoring that exact contract produces a newly validated
+        // profile for the camera rather than reusing stale authority.
         coordinator.update_camera(camera).unwrap();
         let original_layout = coordinator.contract().layout;
         coordinator
@@ -3438,7 +3650,10 @@ mod tests {
             .unwrap()
             .contract
             .layout
-            .row_scale_class = original_layout.row_scale_class.saturating_add(1);
+            .stacking = match original_layout.stacking {
+            ReadStackingMode::Stable => ReadStackingMode::Compact,
+            ReadStackingMode::Compact => ReadStackingMode::Stable,
+        };
         assert!(coordinator.frame().unwrap().row_activity.is_none());
         coordinator
             .source
@@ -4503,16 +4718,18 @@ mod tests {
         assert_eq!(coordinator.telemetry().optional_work_resumes, 1);
 
         let mut checkpoints = 0_usize;
-        let mut previous_scene = initial_scene;
         let mut cumulative_read_page_occurrences = 0_u64;
-        let mut cumulative_summary_page_occurrences = 0_u64;
+        let mut previous_warmed_rows = match initial.vertical_residency {
+            AlignmentVerticalResidency::Preparing { prepared_rows, .. } => prepared_rows,
+            state => panic!("initial bounded scene should still be warming, got {state:?}"),
+        };
         while coordinator.has_pending_presentation_work() {
             let pump = coordinator
                 .pump_presentation_once()
                 .unwrap()
                 .expect("pending vertical work produces one checkpoint");
             assert!(!pump.budget_limited);
-            assert!(pump.published_scene.is_some());
+            assert!(pump.published_scene.is_none());
             checkpoints = checkpoints.saturating_add(1);
             assert!(checkpoints < 256, "vertical warmup did not converge");
 
@@ -4520,47 +4737,34 @@ mod tests {
             let trace = telemetry
                 .last_vertical_residency_pump
                 .expect("a vertical checkpoint records its exact trace state");
-            let published = coordinator.frame().unwrap().snapshot.unwrap();
+            let retained_frame = coordinator.frame().unwrap();
+            let retained = retained_frame.snapshot.unwrap();
             assert_eq!(trace.checkpoint, telemetry.vertical_residency_checkpoints);
-            assert_eq!(trace.current_scene, previous_scene.revision());
-            assert_eq!(trace.published_scene, Some(published.revision()));
+            assert_eq!(trace.current_scene, initial_scene.revision());
+            assert_eq!(trace.published_scene, None);
             assert_eq!(
                 trace.current_prepared_rows,
-                previous_scene.reads().prepared_rows().into()
-            );
-            assert_eq!(
-                trace.target_prepared_rows,
-                published.reads().prepared_rows().into()
+                initial_scene.reads().prepared_rows().into()
             );
             assert_eq!(
                 trace.current_read_pages,
-                usize_as_u64(previous_scene.reads().pages().len())
+                usize_as_u64(initial_scene.reads().pages().len())
             );
             assert_eq!(
                 trace.current_summary_pages,
-                usize_as_u64(previous_scene.summary_pages().len())
+                usize_as_u64(initial_scene.summary_pages().len())
             );
-            assert_eq!(
-                trace.target_read_pages,
-                Some(usize_as_u64(published.reads().pages().len()))
-            );
-            assert_eq!(
-                trace.target_summary_pages,
-                Some(usize_as_u64(published.summary_pages().len()))
-            );
+            assert!(trace.target_read_pages.is_some_and(|pages| pages > 0));
+            assert!(trace.target_read_page_cache_misses.is_some());
+            assert_eq!(trace.target_summary_pages, None);
             assert!(trace.pump_elapsed_nanoseconds >= trace.prepare_elapsed_nanoseconds);
             cumulative_read_page_occurrences =
                 cumulative_read_page_occurrences.saturating_add(trace.target_read_pages.unwrap());
-            cumulative_summary_page_occurrences = cumulative_summary_page_occurrences
-                .saturating_add(trace.target_summary_pages.unwrap());
             assert_eq!(
                 telemetry.vertical_residency_read_page_occurrences,
                 cumulative_read_page_occurrences
             );
-            assert_eq!(
-                telemetry.vertical_residency_summary_page_occurrences,
-                cumulative_summary_page_occurrences
-            );
+            assert_eq!(telemetry.vertical_residency_summary_page_occurrences, 0);
             assert!(
                 telemetry.vertical_residency_prepare_nanoseconds
                     >= trace.prepare_elapsed_nanoseconds
@@ -4568,7 +4772,20 @@ mod tests {
             assert!(
                 telemetry.vertical_residency_pump_nanoseconds >= trace.pump_elapsed_nanoseconds
             );
-            previous_scene = published;
+            assert_eq!(retained.revision(), initial_scene.revision());
+            assert_eq!(retained.reads().prepared_rows(), initial_rows);
+            let warmed_rows = match retained_frame.vertical_residency {
+                AlignmentVerticalResidency::Preparing { prepared_rows, .. }
+                | AlignmentVerticalResidency::BudgetLimited { prepared_rows, .. }
+                | AlignmentVerticalResidency::Unavailable { prepared_rows, .. } => prepared_rows,
+                AlignmentVerticalResidency::Complete { total_rows } => total_rows,
+                AlignmentVerticalResidency::ViewportBounded => {
+                    panic!("full vertical residency policy unexpectedly became viewport-bounded")
+                }
+            };
+            assert!(warmed_rows > previous_warmed_rows);
+            previous_warmed_rows = warmed_rows;
+            assert_eq!(pump.completed, warmed_rows == total_rows);
         }
 
         let complete = coordinator.frame().unwrap();
@@ -4579,12 +4796,17 @@ mod tests {
             } if completed == total_rows
         ));
         let complete_scene = complete.snapshot.unwrap();
-        assert_eq!(complete_scene.reads().prepared_rows(), 0..total_rows);
+        assert_eq!(complete_scene.revision(), initial_scene.revision());
+        assert_eq!(complete_scene.reads().prepared_rows(), initial_rows);
         assert_eq!(complete_scene.reads().atlas().revision(), atlas_revision);
         let warmed = coordinator.telemetry();
         assert_eq!(warmed.source_work_started, source_work);
         assert_eq!(warmed.vertical_residency_checkpoints as usize, checkpoints);
-        assert_eq!(warmed.vertical_residency_publications as usize, checkpoints);
+        assert_eq!(warmed.vertical_residency_publications, 0);
+        assert_eq!(
+            warmed.vertical_residency_blocks_warmed as usize,
+            checkpoints
+        );
         assert_eq!(warmed.vertical_residency_completions, 1);
         assert_eq!(warmed.vertical_residency_budget_limits, 0);
         assert_eq!(warmed.vertical_residency_failures, 0);
@@ -4605,23 +4827,113 @@ mod tests {
             camera.clip(),
         )
         .unwrap();
+        let bottom_prepared = prepared_interval(
+            bottom.into(),
+            CameraDirection::Stationary,
+            coordinator.preparation_policy(),
+            coordinator.contract(),
+        )
+        .unwrap();
+        assert_eq!(bottom_prepared, initial_scene.prepared_interval());
+        let warmed_page_count = coordinator.presentation().read_page_count();
         let update = coordinator.update_camera(bottom).unwrap();
         assert!(update.visible_complete);
-        assert!(update.reused_current_scene);
-        assert!(update.published_scene.is_none());
+        assert!(!update.reused_current_scene);
+        assert!(update.published_scene.is_some());
         assert_eq!(
             coordinator.telemetry().presentation_candidates,
-            warmed.presentation_candidates
+            warmed.presentation_candidates + 1
+        );
+        assert_eq!(
+            coordinator.presentation().read_page_count(),
+            warmed_page_count
         );
     }
 
     #[test]
-    fn vertical_residency_expansion_is_block_aligned_and_nearest_first() {
+    fn unexpected_vertical_warm_failure_is_latched_without_failing_the_visible_scene() {
+        let (mut coordinator, camera) = test_coordinator();
+        let policy = AlignmentScenePreparationPolicy::new(0.0, 0.0, 0.0, 0, 1)
+            .unwrap()
+            .with_full_vertical_residency(true);
+        assert!(
+            coordinator
+                .set_preparation_policy(policy)
+                .unwrap()
+                .is_none()
+        );
+        coordinator.update_camera(camera).unwrap();
+        let visible_revision = pump_until_publication(&mut coordinator);
+        let prepared_end = coordinator
+            .frame()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .prepared_interval()
+            .end();
+        assert!(coordinator.has_pending_presentation_work());
+
+        // Deliberately invalidate only the optional tile horizon after the visible scene has
+        // committed. This exercises the defensive failure path without manufacturing malformed
+        // evidence or atlas roots, which their public constructors correctly forbid.
+        let owner = coordinator.owner;
+        coordinator
+            .source
+            .lanes
+            .get_mut(&owner)
+            .unwrap()
+            .contract
+            .contig_length = prepared_end.saturating_sub(1);
+
+        let failed = coordinator
+            .pump_presentation_once()
+            .unwrap()
+            .expect("one optional checkpoint observes the injected failure");
+        assert!(failed.failed);
+        assert!(!failed.budget_limited);
+        assert!(!failed.completed);
+        assert!(!coordinator.has_pending_presentation_work());
+        assert!(coordinator.pump_presentation_once().unwrap().is_none());
+        assert_eq!(coordinator.telemetry().vertical_residency_failures, 1);
+
+        let retained = coordinator.frame().unwrap();
+        assert!(retained.visible_complete());
+        assert_eq!(retained.snapshot.unwrap().revision(), visible_revision);
+        assert!(matches!(
+            retained.vertical_residency,
+            AlignmentVerticalResidency::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn vertical_residency_warm_blocks_are_nearest_first_and_never_repeat() {
         let block = NonZeroU32::new(8).unwrap();
-        assert_eq!(expanded_vertical_rows(0..3, 30, block, 0..3), 0..16);
-        assert_eq!(expanded_vertical_rows(9..15, 30, block, 10..14), 9..24);
-        assert_eq!(expanded_vertical_rows(9..24, 30, block, 10..14), 0..24);
-        assert_eq!(expanded_vertical_rows(0..24, 30, block, 10..14), 0..30);
+        let mut warmed = BTreeSet::new();
+        assert_eq!(
+            next_unwarmed_vertical_block(&warmed, 30, block, 10..14),
+            Some(CanonicalRowBlock::new(1, block))
+        );
+        warmed.insert(CanonicalRowBlock::new(1, block));
+        assert_eq!(
+            next_unwarmed_vertical_block(&warmed, 30, block, 10..14),
+            Some(CanonicalRowBlock::new(2, block))
+        );
+        warmed.insert(CanonicalRowBlock::new(2, block));
+        assert_eq!(
+            next_unwarmed_vertical_block(&warmed, 30, block, 10..14),
+            Some(CanonicalRowBlock::new(0, block))
+        );
+        warmed.insert(CanonicalRowBlock::new(0, block));
+        assert_eq!(
+            next_unwarmed_vertical_block(&warmed, 30, block, 10..14),
+            Some(CanonicalRowBlock::new(3, block))
+        );
+        warmed.insert(CanonicalRowBlock::new(3, block));
+        assert_eq!(
+            next_unwarmed_vertical_block(&warmed, 30, block, 10..14),
+            None
+        );
     }
 
     #[test]
@@ -4708,7 +5020,7 @@ mod tests {
         coordinator.update_camera(camera).unwrap();
         pump_until_publication(&mut coordinator);
         let first = coordinator.pump_presentation_once().unwrap().unwrap();
-        assert!(first.published_scene.is_some());
+        assert!(first.published_scene.is_none());
         let checkpoints = coordinator.telemetry().vertical_residency_checkpoints;
 
         let disjoint_viewport = camera

@@ -222,6 +222,16 @@ impl EvidenceRootBuilder {
         publication_revision: u64,
     ) -> Result<Arc<EvidenceRoot>, EvidenceBuildError> {
         self.chunks.sort_by_key(|chunk| chunk.chunk.id());
+        // A root may retain the same canonical record through more than one acquired chunk, so
+        // summing chunk lengths is not exact. Compute the unique count once while this root is
+        // still builder-owned; every published root is immutable and can thereafter expose the
+        // value without rebuilding a million-entry set on UI or diagnostic paths.
+        let record_count = self
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.chunk.handles().iter().copied())
+            .collect::<HashSet<_>>()
+            .len();
         let retained_metadata_bytes = self
             .chunks
             .len()
@@ -247,6 +257,7 @@ impl EvidenceRootBuilder {
             record_contract: self.record_contract,
             payload: self.payload,
             chunks: self.chunks.into(),
+            record_count,
             coverage: self.coverage,
             metadata_allocation,
         }))
@@ -261,6 +272,7 @@ pub struct EvidenceRoot {
     record_contract: ContractFingerprint,
     payload: PayloadContract,
     chunks: Arc<[Arc<EvidenceChunk>]>,
+    record_count: usize,
     coverage: CertifiedCoverageSet,
     metadata_allocation: AllocationLease,
 }
@@ -311,12 +323,8 @@ impl EvidenceRoot {
     }
 
     #[must_use]
-    pub fn record_count(&self) -> usize {
-        self.chunks
-            .iter()
-            .flat_map(|chunk| chunk.chunk.handles().iter().copied())
-            .collect::<HashSet<_>>()
-            .len()
+    pub const fn record_count(&self) -> usize {
+        self.record_count
     }
 
     /// Conservative number of physical records retained by the root without allocating a
@@ -845,6 +853,21 @@ mod tests {
                 .iter()
                 .all(|record| record.handle.source_revision() == source_revision())
         );
+    }
+
+    #[test]
+    fn immutable_root_caches_its_exact_unique_record_count() {
+        let ledger = AllocationLedger::new(1 << 20, 0);
+        let root = root(&ledger);
+        let expected = root
+            .chunks()
+            .iter()
+            .flat_map(|chunk| chunk.chunk().handles().iter().copied())
+            .collect::<HashSet<_>>()
+            .len();
+
+        assert_eq!(root.record_count(), expected);
+        assert_eq!(root.record_count(), 3);
     }
 
     #[test]

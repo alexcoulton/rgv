@@ -56,6 +56,52 @@ struct CapturedAlignmentPanelSceneEpoch {
     panel_scene_stores: HashMap<PanelId, AlignmentPanelSceneStore>,
 }
 
+struct AlignmentPanelSceneEpochCaptureFailure {
+    message: String,
+    fields: ManualDiagnosticTraceFields,
+}
+
+/// The immutable genomic interval belongs to navigation, while the horizontal pixel transform
+/// belongs to the committed workspace layout. During a native panel resize those two authorities
+/// can advance in adjacent frame phases, so every presentation capture explicitly projects the
+/// interval through the live layout width instead of borrowing a stale stored pixel width.
+pub(crate) fn alignment_scene_viewport_for_layout_width(
+    viewport: Viewport,
+    layout_width: f64,
+) -> Option<Viewport> {
+    viewport.resized(layout_width).ok()
+}
+
+pub(crate) fn retained_alignment_scene_can_present(
+    scene_contracts_current: bool,
+    has_snapshot: bool,
+    covered_interval: Option<GenomicInterval>,
+    requested_interval: GenomicInterval,
+) -> bool {
+    scene_contracts_current
+        && has_snapshot
+        && covered_interval.is_some_and(|covered| covered.overlaps(requested_interval))
+}
+
+/// A vertical-only target which has not prepared any of its requested rows is not a publishable
+/// successor to a coherent native read frame. Keeping the committed camera authoritative until
+/// at least one requested row is covered avoids replacing truthful pixels with an empty frame;
+/// genomic movement is deliberately excluded because old pixels must never claim a new locus.
+pub(crate) fn uncovered_vertical_candidate_retains_committed_pixels(
+    committed_viewport: Viewport,
+    committed_reads_complete: bool,
+    committed_native_reads: bool,
+    candidate_viewport: Viewport,
+    candidate_requested_rows: &std::ops::Range<u32>,
+    candidate_covered_rows: &std::ops::Range<u32>,
+) -> bool {
+    committed_reads_complete
+        && committed_native_reads
+        && committed_viewport == candidate_viewport
+        && !candidate_requested_rows.is_empty()
+        && candidate_covered_rows.is_empty()
+}
+
 /// Move-only semantic half of an end-to-end alignment replacement. Both old frame captures and
 /// their resident panel stores are detached together, so rollback can restore the exact prior hit
 /// and display authority. The planner recursively proves snapshot, root, leaf, page, and pin
@@ -1575,6 +1621,11 @@ impl Viewer {
             .viewport
             .remapped_contig(contig, contig_length)
             .context("could not remap the alignment scene camera")?;
+        let viewport =
+            alignment_scene_viewport_for_layout_width(viewport, f64::from(panel_rect.width()))
+                .context(
+                    "could not reconcile the alignment scene camera with the live panel width",
+                )?;
         let read_camera = alignment_scene_read_clip(
             &panel.pane_layout.reads,
             track_id,
@@ -1704,6 +1755,55 @@ impl Viewer {
     /// vertical scroll can call this on every input event using already-published pages.
     pub(crate) fn prepare_alignment_scene_frame(&mut self) {
         self.prepare_alignment_scene_frame_atomic();
+    }
+
+    fn uncovered_vertical_candidate_lane_count(
+        &self,
+        candidate: &CapturedAlignmentPanelSceneEpoch,
+    ) -> usize {
+        let Some(committed_epoch) = self.alignment_presented_epoch.as_ref() else {
+            return 0;
+        };
+        let Some(committed_bundle) = committed_epoch.gpu_bundle.as_ref() else {
+            return 0;
+        };
+        if !alignment_gpu_bundle_is_current(
+            committed_bundle,
+            &self.alignment_scene_publication_authority,
+        ) {
+            return 0;
+        }
+
+        candidate
+            .panel_frames
+            .iter()
+            .flat_map(|(panel_id, candidate_frame)| {
+                candidate_frame.lanes.iter().filter(move |candidate_lane| {
+                    let Some(committed_lane) = committed_epoch
+                        .panel_frames
+                        .get(panel_id)
+                        .and_then(|frame| frame.lane(candidate_lane.track_id))
+                    else {
+                        return false;
+                    };
+                    let committed_native_reads = committed_bundle.reads.is_some()
+                        && committed_bundle.read_authorities.iter().any(|authority| {
+                            authority.panel_id == *panel_id
+                                && authority.track_id == candidate_lane.track_id
+                        });
+                    candidate_lane.read_camera.is_some()
+                        && committed_lane.read_camera.is_some()
+                        && uncovered_vertical_candidate_retains_committed_pixels(
+                            committed_lane.preparation_camera.viewport(),
+                            committed_lane.reads_complete(),
+                            committed_native_reads,
+                            candidate_lane.preparation_camera.viewport(),
+                            &candidate_lane.requested_rows,
+                            &candidate_lane.covered_rows,
+                        )
+                })
+            })
+            .count()
     }
 
     fn commit_alignment_navigation_transactions(&mut self, bundle: &AlignmentGpuFrameBundle) {
@@ -2098,8 +2198,45 @@ impl Viewer {
         // stale-gate it immediately when the actual camera or layout target changed.
         let scale_factor = self.window.scale_factor();
         let capture_started = Instant::now();
-        let mut candidate_epoch = self.capture_alignment_panel_scene_epoch(0);
+        let candidate_epoch = self.capture_alignment_panel_scene_epoch(0);
         let capture_elapsed = capture_started.elapsed();
+        let mut candidate_epoch = match candidate_epoch {
+            Ok(candidate) => candidate,
+            Err(mut failure) => {
+                failure.fields.insert(
+                    "capture_elapsed_us".to_owned(),
+                    serde_json::json!(capture_elapsed.as_micros()),
+                );
+                failure.fields.insert(
+                    "publication_disposition".to_owned(),
+                    serde_json::json!(
+                        "rejected before target authority advanced; committed epoch retained"
+                    ),
+                );
+                self.data_status.clone_from(&failure.message);
+                self.queue_manual_diagnostic_trace_failure(
+                    "alignment_publication",
+                    "panel_scene_capture_failed",
+                    &failure.message,
+                    failure.fields,
+                );
+                return;
+            }
+        };
+        let uncovered_vertical_lanes =
+            self.uncovered_vertical_candidate_lane_count(&candidate_epoch);
+        if uncovered_vertical_lanes > 0 {
+            self.record_manual_diagnostic_event(
+                "alignment_publication",
+                "uncovered_vertical_candidate_retained",
+                serde_json::json!({
+                    "lane_count": uncovered_vertical_lanes,
+                    "capture_elapsed_us": capture_elapsed.as_micros(),
+                    "reason": "requested vertical rows have no prepared intersection; retaining the coherent committed epoch",
+                }),
+            );
+            return;
+        }
         let target = AlignmentSceneTargetIdentity::from_panel_frames(
             self.workspace_layout.revision,
             [self.surface_config.width, self.surface_config.height],
@@ -2279,6 +2416,29 @@ impl Viewer {
             .collect::<Vec<_>>();
 
         if read_requests.is_empty() && summary_requests.is_empty() {
+            let unchanged_authoritative_empty = !attempt.target_changed
+                && lane_authorities.is_empty()
+                && self
+                    .alignment_presented_epoch
+                    .as_ref()
+                    .and_then(|epoch| epoch.gpu_bundle.as_ref())
+                    .is_some_and(|bundle| {
+                        bundle.reads.is_none()
+                            && bundle.summaries.is_none()
+                            && bundle.lane_authorities.is_empty()
+                    });
+            if unchanged_authoritative_empty {
+                self.record_manual_diagnostic_event(
+                    "alignment_publication",
+                    "unchanged_empty_epoch_retained",
+                    serde_json::json!({
+                        "target_revision": target_revision,
+                        "publication_attempt_sequence": publication_attempt_sequence,
+                        "reason": "the already committed target has no alignment pixel demand",
+                    }),
+                );
+                return;
+            }
             let bundle = AlignmentGpuFrameBundle {
                 target_revision,
                 publication_attempt_sequence,
@@ -2652,7 +2812,8 @@ impl Viewer {
     fn capture_alignment_panel_scene_epoch(
         &mut self,
         camera_revision: u64,
-    ) -> CapturedAlignmentPanelSceneEpoch {
+    ) -> std::result::Result<CapturedAlignmentPanelSceneEpoch, AlignmentPanelSceneEpochCaptureFailure>
+    {
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         let mut captured = HashMap::new();
         let mut lane_sources = Vec::new();
@@ -2662,11 +2823,41 @@ impl Viewer {
         // store byte-for-byte unchanged.
         let mut panel_scene_stores = self.alignment_panel_scene_stores.clone();
         for panel_id in panel_ids {
-            let Some((panel_viewport, contig_name)) = self
+            let Some((stored_panel_viewport, contig_name)) = self
                 .panels
                 .get(panel_id)
                 .map(|panel| (panel.viewport, panel.contig_name.clone()))
             else {
+                continue;
+            };
+            let Some(layout_width) = self
+                .panel_column_rect(panel_id)
+                .map(|rect| f64::from(rect.width()))
+                .filter(|width| width.is_finite() && *width > 0.0)
+            else {
+                continue;
+            };
+            let Some(panel_viewport) =
+                alignment_scene_viewport_for_layout_width(stored_panel_viewport, layout_width)
+            else {
+                let message = format!(
+                    "Could not capture alignment scene: panel {} has an invalid live layout width",
+                    panel_id.get()
+                );
+                critical_capture_failure.get_or_insert_with(|| {
+                    (
+                        message,
+                        object_fields(serde_json::json!({
+                            "panel_id": panel_id.get(),
+                            "panel_contig": contig_name,
+                            "stored_pixel_width": stored_panel_viewport.pixel_width(),
+                            "layout_pixel_width": layout_width,
+                            "camera_revision": camera_revision,
+                            "workspace_layout_revision": self.workspace_layout.revision,
+                            "surface": [self.surface_config.width, self.surface_config.height],
+                        })),
+                    )
+                });
                 continue;
             };
             let mut lane_captures = Vec::new();
@@ -2921,6 +3112,70 @@ impl Viewer {
             });
             match store.capture(panel_id, camera_revision, panel_viewport, lane_captures) {
                 Ok(frame) => {
+                    // A worker candidate can be temporarily absent while the immutable scene
+                    // already committed for this lane still overlaps the live camera. Preserve
+                    // that truthful overlap and recapture it with the live camera; background
+                    // completion remains pending and may replace it later. Without this bridge,
+                    // an ordinary source checkpoint becomes an empty GPU epoch and blanks the
+                    // complete lane despite reusable scene authority still being resident.
+                    for lane in frame.lanes.iter() {
+                        if admitted_panel_sources
+                            .iter()
+                            .any(|source| source.track_id == lane.track_id)
+                            || !retained_alignment_scene_can_present(
+                                lane.scene_contracts_current,
+                                lane.snapshot.is_some(),
+                                lane.covered_interval,
+                                lane.preparation_camera.interval(),
+                            )
+                        {
+                            continue;
+                        }
+                        let desired_request_token = self
+                            .alignment_tracks
+                            .iter()
+                            .find(|track| track.config.id == lane.track_id)
+                            .and_then(|track| track.projection(panel_id))
+                            .and_then(|projection| projection.navigation.request_token());
+                        let Some(desired_request_token) = desired_request_token else {
+                            continue;
+                        };
+                        let prior_source = self
+                            .alignment_presented_epoch
+                            .as_ref()
+                            .and_then(|epoch| {
+                                let prior_lane =
+                                    epoch.panel_frames.get(&panel_id)?.lane(lane.track_id)?;
+                                let candidate_revision = lane.snapshot.as_ref()?.revision();
+                                (prior_lane.snapshot.as_ref()?.revision() == candidate_revision)
+                                    .then_some(epoch)
+                            })
+                            .and_then(|epoch| epoch.gpu_bundle.as_ref())
+                            .and_then(|bundle| {
+                                bundle.lane_authorities.iter().find(|authority| {
+                                    authority.panel_id == panel_id
+                                        && authority.track_id == lane.track_id
+                                })
+                            })
+                            .copied();
+                        let Some(prior_source) = prior_source else {
+                            continue;
+                        };
+                        admitted_panel_sources.push(CapturedAlignmentLaneSource {
+                            panel_id,
+                            track_id: lane.track_id,
+                            semantic_request_token: prior_source.source_request_token,
+                            desired_request_token,
+                            camera: lane.preparation_camera,
+                            individual_reads: AlignmentIndividualReadCapability::Pending,
+                            semantic_target_complete: false,
+                            reference_ready: false,
+                            vertical_residency: prior_source.vertical_residency,
+                            camera_sequence: lane.source_camera_sequence,
+                            snapshot: lane.snapshot.clone(),
+                            scene_contracts_current: true,
+                        });
+                    }
                     captured.insert(panel_id, frame);
                     lane_sources.extend(admitted_panel_sources);
                 }
@@ -2951,18 +3206,13 @@ impl Viewer {
             }
         }
         if let Some((message, fields)) = critical_capture_failure {
-            self.queue_manual_diagnostic_trace_failure(
-                "alignment_publication",
-                "panel_scene_capture_failed",
-                &message,
-                fields,
-            );
+            return Err(AlignmentPanelSceneEpochCaptureFailure { message, fields });
         }
-        CapturedAlignmentPanelSceneEpoch {
+        Ok(CapturedAlignmentPanelSceneEpoch {
             panel_frames: captured,
             lane_sources,
             panel_scene_stores,
-        }
+        })
     }
 
     fn collect_alignment_gpu_requests(

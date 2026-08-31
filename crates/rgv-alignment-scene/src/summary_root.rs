@@ -14,6 +14,8 @@ use crate::{
     ReservationKind, SummaryContract, SummaryRevision, pair_summary::summarize_pair_candidate_iter,
 };
 
+const EXACT_SUMMARY_OVERVIEW_BINS: usize = 256;
+
 /// One immutable exact-summary authority graph for a prepared canonical genomic horizon.
 #[derive(Debug)]
 pub struct ExactSummaryRoot {
@@ -30,6 +32,13 @@ pub struct ExactSummaryRoot {
     pairs: Arc<[Arc<ExactPairSummaryTile>]>,
     filters: Arc<[Arc<ExactFilterSummaryTile>]>,
     modifications: Arc<[Arc<ExactModificationSummaryTile>]>,
+    /// Exact paired-template statistics for the immutable prepared horizon. Settings and other
+    /// frame-shell consumers read this O(1) derivative instead of rescanning every pair candidate
+    /// on every redraw.
+    prepared_pair_summary: PairSummary,
+    /// Fixed-size, exact depth projection built with the immutable root on the worker. UI frames
+    /// consume this bounded derivative instead of rescanning every retained depth run.
+    overview_depths: Arc<[u32]>,
     metadata_allocation: AllocationLease,
 }
 
@@ -213,6 +222,18 @@ impl ExactSummaryRoot {
             }
         }
 
+        let prepared_pair_summary = summarize_pair_candidate_iter(
+            pairs
+                .iter()
+                .flat_map(|tile| tile.candidates().iter().copied())
+                .filter(|candidate| {
+                    candidate.record_start < prepared.end()
+                        && candidate.record_end > prepared.start()
+                }),
+            true,
+        );
+        let overview_depths = project_overview_depths(&depth, prepared);
+
         let metadata_bytes = root_metadata_bytes(
             depth.len(),
             alleles.len(),
@@ -221,6 +242,7 @@ impl ExactSummaryRoot {
             filters.len(),
             modifications.len(),
             expanded_junction_rows.len(),
+            overview_depths.len(),
         );
         let mut reservation = ledger.reserve(
             AllocationClass::SummaryRootMetadata,
@@ -242,6 +264,8 @@ impl ExactSummaryRoot {
             pairs: pairs.into(),
             filters: filters.into(),
             modifications: modifications.into(),
+            prepared_pair_summary,
+            overview_depths: overview_depths.into(),
             metadata_allocation,
         }))
     }
@@ -283,6 +307,13 @@ impl ExactSummaryRoot {
     #[must_use]
     pub fn depth_tiles(&self) -> &[Arc<ExactDepthSummaryTile>] {
         &self.depth
+    }
+
+    /// Fixed-size exact depth overview for the whole prepared root. Its bin order spans
+    /// [`Self::prepared_interval`] and its construction is never charged to a UI frame.
+    #[must_use]
+    pub fn overview_depths(&self) -> &[u32] {
+        &self.overview_depths
     }
 
     #[must_use]
@@ -351,6 +382,13 @@ impl ExactSummaryRoot {
     #[must_use]
     pub fn pair_tiles(&self) -> &[Arc<ExactPairSummaryTile>] {
         &self.pairs
+    }
+
+    /// Exact pair statistics for this root's complete immutable prepared horizon. This derivative
+    /// is built once beside the root and is therefore safe to consume from a native UI frame.
+    #[must_use]
+    pub const fn prepared_pair_summary(&self) -> PairSummary {
+        self.prepared_pair_summary
     }
 
     #[must_use]
@@ -655,6 +693,7 @@ impl ExactSummaryRoot {
             self.filters.len(),
             self.modifications.len(),
             self.expanded_junction_rows.len(),
+            self.overview_depths.len(),
         )
     }
 
@@ -781,6 +820,7 @@ fn root_metadata_bytes(
     filters: usize,
     modifications: usize,
     expanded_junction_rows: usize,
+    overview_depths: usize,
 ) -> usize {
     size_of::<ExactSummaryRoot>()
         .saturating_add(
@@ -795,6 +835,25 @@ fn root_metadata_bytes(
         .saturating_add(
             expanded_junction_rows.saturating_mul(size_of::<ExpandedJunctionRowAssignment>()),
         )
+        .saturating_add(overview_depths.saturating_mul(size_of::<u32>()))
+}
+
+fn project_overview_depths(
+    depth: &[Arc<ExactDepthSummaryTile>],
+    prepared: GenomicInterval,
+) -> Vec<u32> {
+    let bins = usize::try_from(prepared.len().min(EXACT_SUMMARY_OVERVIEW_BINS as u64))
+        .unwrap_or(EXACT_SUMMARY_OVERVIEW_BINS);
+    let mut output = vec![0_u32; bins];
+    for tile in depth {
+        for (output, candidate) in output
+            .iter_mut()
+            .zip(tile.depth().project_bins(prepared, bins))
+        {
+            *output = (*output).max(candidate.depth);
+        }
+    }
+    output
 }
 
 fn expanded_junction_row_assignments(

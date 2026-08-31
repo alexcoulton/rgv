@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 pub(crate) const MANUAL_DIAGNOSTIC_TRACE_SCHEMA_NAME: &str = "rgv.manual_diagnostic_trace";
 pub(crate) const MANUAL_DIAGNOSTIC_TRACE_SCHEMA_VERSION: u64 = 1;
-pub(crate) const MANUAL_DIAGNOSTIC_TRACE_MAX_EVENTS: usize = 50_000;
-pub(crate) const MANUAL_DIAGNOSTIC_TRACE_RETENTION: Duration = Duration::from_secs(120);
+pub(crate) const MANUAL_DIAGNOSTIC_TRACE_MAX_EVENTS: usize = 100_000;
+pub(crate) const MANUAL_DIAGNOSTIC_TRACE_RETENTION: Duration = Duration::from_secs(300);
 
 const JSON_MEDIA_TYPE: &str = "application/json";
 

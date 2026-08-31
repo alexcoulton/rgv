@@ -2,39 +2,6 @@ use super::*;
 
 pub(crate) const INDEX_ONLY_READ_NOTICE: &str = "zoom in to see read data";
 
-/// Quantizes horizontal scale into four-fold presentation bands whose boundaries are centred at
-/// 2×4ⁿ bases per pixel. A normal two-fold zoom therefore usually remains in one class, while a
-/// genuinely different read-packing scale receives independent stable row history.
-pub(crate) fn alignment_row_scale_class(bases_per_pixel: f64) -> u8 {
-    if !bases_per_pixel.is_finite() || bases_per_pixel <= 0.0 {
-        return 0;
-    }
-    let exponent = bases_per_pixel.log2().floor().clamp(-126.0, 126.0) as i32;
-    let class = (exponent - 1).div_euclid(2) + 64;
-    u8::try_from(class.clamp(0, i32::from(u8::MAX))).unwrap_or_default()
-}
-
-#[cfg(test)]
-mod scale_class_tests {
-    use super::alignment_row_scale_class;
-
-    #[test]
-    fn row_scale_classes_keep_motivating_two_fold_zoom_together() {
-        assert_eq!(
-            alignment_row_scale_class(161.0),
-            alignment_row_scale_class(322.0)
-        );
-        assert_ne!(
-            alignment_row_scale_class(6.5),
-            alignment_row_scale_class(161.0)
-        );
-        assert_ne!(
-            alignment_row_scale_class(127.0),
-            alignment_row_scale_class(128.0)
-        );
-    }
-}
-
 pub(crate) fn index_only_read_notice(mapped_record_count: Option<u64>) -> String {
     mapped_record_count.map_or_else(
         || INDEX_ONLY_READ_NOTICE.to_owned(),

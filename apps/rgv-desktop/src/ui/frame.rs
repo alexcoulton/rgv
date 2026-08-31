@@ -194,11 +194,93 @@ fn remap_genomic_texts_for_layout(
 }
 
 impl Viewer {
+    fn genome_overview_for_panel(
+        &mut self,
+        panel_id: PanelId,
+        contig_name: &str,
+        contig_length: u64,
+    ) -> ui::GenomeOverviewData {
+        let key = GenomeOverviewCacheKey {
+            contig_name: contig_name.to_owned(),
+            contig_length,
+            tracks: self
+                .alignment_tracks
+                .iter()
+                .map(|track| GenomeOverviewTrackCacheKey {
+                    track_id: track.config.id,
+                    index_overview_identity: track
+                        .index_overview
+                        .as_ref()
+                        .map(|overview| Arc::as_ptr(overview) as usize),
+                    summary_revision: self
+                        .presented_alignment_lane(panel_id, track.config.id)
+                        .and_then(|presented| presented.lane.snapshot.as_ref())
+                        .map(|snapshot| snapshot.summary_revision()),
+                })
+                .collect(),
+        };
+        if let Some(cached) = self.genome_overview_cache.get(&panel_id)
+            && cached.key == key
+        {
+            return cached.data.clone();
+        }
+
+        let mut genome_overview = ui::GenomeOverviewData::default();
+        let mut scene_overview = ui::GenomeOverviewData::default();
+        for track in &self.alignment_tracks {
+            let index_bins = track
+                .dictionary
+                .as_ref()
+                .and_then(|dictionary| dictionary.id_by_name(contig_name))
+                .and_then(|contig| {
+                    track
+                        .index_overview
+                        .as_ref()
+                        .and_then(|overview| overview.contig_bins(contig))
+                });
+            if let Some(index_bins) = index_bins {
+                genome_overview.add_index_density(index_bins);
+            }
+            if let Some(snapshot) = self
+                .presented_alignment_lane(panel_id, track.config.id)
+                .and_then(|presented| presented.lane.snapshot.as_ref())
+            {
+                let interval = snapshot.prepared_interval();
+                scene_overview.add_depths(
+                    contig_length,
+                    interval,
+                    snapshot.summaries().overview_depths().iter().copied(),
+                );
+            }
+        }
+        scene_overview.normalize_logarithmically();
+        genome_overview.merge_max(&scene_overview);
+        self.genome_overview_recomputations = self.genome_overview_recomputations.saturating_add(1);
+        self.genome_overview_cache.insert(
+            panel_id,
+            CachedGenomeOverview {
+                key,
+                data: genome_overview.clone(),
+            },
+        );
+        self.record_manual_diagnostic_event(
+            "ui",
+            "genome_overview_recomputed",
+            serde_json::json!({
+                "panel_id": panel_id.get(),
+                "contig": contig_name,
+                "recomputation_count": self.genome_overview_recomputations,
+            }),
+        );
+        genome_overview
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn render_shell_frame(
         &mut self,
         raw_input: egui::RawInput,
     ) -> (egui::FullOutput, Duration) {
+        let mut shell_preparation_started = Instant::now();
         let interval = self.panels.active().viewport.interval();
         let bases_per_pixel = self.panels.active().viewport.bases_per_pixel();
         let detail = self.panels.active().viewport.detail_level();
@@ -231,8 +313,14 @@ impl Viewer {
         };
         let announce_status = self.announced_status != data_status;
         let active_panel_id = self.panels.active().id;
+        let diagnostics_started = Instant::now();
         let diagnostics = self.diagnostics_snapshot();
         let manual_trace = self.manual_diagnostic_trace_snapshot();
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ShellDiagnostics,
+            diagnostics_started.elapsed(),
+        );
+        let inspectors_started = Instant::now();
         let inspector = self.inspector_snapshot();
         let pileup_inspector = self.pileup_inspector_snapshot();
         let modification_inspector = self.modification_inspector_snapshot();
@@ -244,6 +332,10 @@ impl Viewer {
             .map_or_else(Vec::new, |inspector| {
                 self.variant_alignment_evidence(inspector)
             });
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ShellInspectors,
+            inspectors_started.elapsed(),
+        );
         let mut clear_selection = false;
         let mut selected_to_top_requested = false;
         let mut chain_navigation_requested = None;
@@ -302,27 +394,40 @@ impl Viewer {
                 })
             });
         let settings_alignment_id = editing_alignment_id.unwrap_or(primary_alignment_id);
+        let pair_summary_started = Instant::now();
         let settings_pair_summary = self.alignment_pair_summary_for_track(settings_alignment_id);
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ShellPairSummary,
+            pair_summary_started.elapsed(),
+        );
         let available_modification_codes = editing_alignment_id.map_or_else(Vec::new, |track_id| {
             self.available_modification_codes(track_id)
         });
         let settings_controller = self
             .alignment_tracks
             .iter()
-            .find(|track| track.config.id == settings_alignment_id);
+            .find(|track| track.config.id == settings_alignment_id)
+            .map(|track| {
+                (
+                    track.config.filters.clone(),
+                    track.filter_editor.clone(),
+                    track.config.maximum_alignments,
+                    track.config.name.clone(),
+                )
+            });
         let settings_filters = if settings_alignment_id == primary_alignment_id {
             self.live_session_filters()
         } else {
-            settings_controller.map_or_else(SessionFilters::default, |track| {
-                track.config.filters.clone()
-            })
+            settings_controller
+                .as_ref()
+                .map_or_else(SessionFilters::default, |track| track.0.clone())
         };
         let settings_filter_editor = if settings_alignment_id == primary_alignment_id {
             self.primary_filter_editor().clone()
         } else {
-            settings_controller.map_or_else(
+            settings_controller.as_ref().map_or_else(
                 || self.primary_filter_editor().clone(),
-                |track| track.filter_editor.clone(),
+                |track| track.1.clone(),
             )
         };
         let mut minimum_mapq = settings_filter_editor.minimum_mapq;
@@ -399,9 +504,9 @@ impl Viewer {
         let mut bulk_alignment_visibility = None;
         let mut bulk_alignment_collapsed = None;
         let mut complete_read_limit = u32::try_from(
-            settings_controller.map_or(self.primary_alignment_limit(), |track| {
-                track.config.maximum_alignments
-            }),
+            settings_controller
+                .as_ref()
+                .map_or(self.primary_alignment_limit(), |track| track.2),
         )
         .unwrap_or(u32::MAX)
         .clamp(1, rgv_core::MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT as u32);
@@ -681,6 +786,7 @@ impl Viewer {
                     .iter()
                     .all(|id| group.members.contains(id))
         });
+        let scrollbars_started = Instant::now();
         let current_alignment_target_revision = self
             .alignment_scene_publication_authority
             .desired_target_revision();
@@ -755,16 +861,25 @@ impl Viewer {
                 }
             })
             .collect::<Vec<_>>();
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ShellScrollbars,
+            scrollbars_started.elapsed(),
+        );
         let (pane_annotation_top, pane_annotation_bottom) = pane_vertical_bounds(
             &pane_layout.annotation,
             committed_canvas_geometry.viewport.top(),
         );
+        let text_copy_started = Instant::now();
         let genomic_texts = self
             .composite_display_list
             .texts
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ShellTextCopy,
+            text_copy_started.elapsed(),
+        );
         let selected_track = self.panels.active().selected_track;
         let assembly = self.assembly.clone();
         let assembly_label = assembly.context_label();
@@ -803,53 +918,42 @@ impl Viewer {
                 )
             })
             .collect::<Vec<_>>();
-        let panel_contexts = self
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ShellPreparation,
+            shell_preparation_started.elapsed(),
+        );
+        let overview_projection_started = Instant::now();
+        let panel_overview_inputs = self
             .panels
             .iter()
             .map(|panel| {
-                let mut genome_overview = ui::GenomeOverviewData::default();
-                let mut scene_overview = ui::GenomeOverviewData::default();
-                for track in &self.alignment_tracks {
-                    let index_bins = track
-                        .dictionary
-                        .as_ref()
-                        .and_then(|dictionary| dictionary.id_by_name(&panel.contig_name))
-                        .and_then(|contig| {
-                            track
-                                .index_overview
-                                .as_ref()
-                                .and_then(|overview| overview.contig_bins(contig))
-                        });
-                    if let Some(index_bins) = index_bins {
-                        genome_overview.add_index_density(index_bins);
-                    }
-                    if let Some(snapshot) = self
-                        .presented_alignment_lane(panel.id, track.config.id)
-                        .and_then(|presented| presented.lane.snapshot.as_ref())
-                    {
-                        let interval = snapshot.prepared_interval();
-                        let bins = usize::try_from(interval.len().min(2_048)).unwrap_or(2_048);
-                        if let Ok(depths) = snapshot.summaries().project_depth_bins(interval, bins)
-                        {
-                            scene_overview.add_depths(
-                                panel.contig_length,
-                                interval,
-                                depths.into_iter().map(|bin| bin.depth),
-                            );
-                        }
-                    }
-                }
-                scene_overview.normalize_logarithmically();
-                genome_overview.merge_max(&scene_overview);
                 (
                     panel.id,
                     panel.contig_name.clone(),
                     panel.contig_length,
                     panel.viewport,
+                )
+            })
+            .collect::<Vec<_>>();
+        let panel_contexts = panel_overview_inputs
+            .into_iter()
+            .map(|(panel_id, contig_name, contig_length, viewport)| {
+                let genome_overview =
+                    self.genome_overview_for_panel(panel_id, &contig_name, contig_length);
+                (
+                    panel_id,
+                    contig_name,
+                    contig_length,
+                    viewport,
                     genome_overview,
                 )
             })
             .collect::<Vec<_>>();
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ShellOverviewProjection,
+            overview_projection_started.elapsed(),
+        );
+        shell_preparation_started = Instant::now();
         let mut panel_to_activate = None;
         let mut panel_to_close = None;
         let mut panel_to_move = None;
@@ -924,9 +1028,9 @@ impl Viewer {
         let mut alignment_visible =
             annotation_presentation_state.is_none_or(|state| state.content_visible);
         let mut alignment_collapsed = !alignment_visible;
-        let mut alignment_name = settings_controller.map_or_else(
+        let mut alignment_name = settings_controller.as_ref().map_or_else(
             || self.primary_alignment_name().to_owned(),
-            |track| track.config.name.clone(),
+            |track| track.3.clone(),
         );
         let mut alignment_height = annotation_presentation_state
             .and_then(|state| state.preferred_height)
@@ -970,6 +1074,11 @@ impl Viewer {
         } else {
             "Ctrl"
         };
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ShellPreparation,
+            shell_preparation_started.elapsed(),
+        );
+        let shell_ui_started = Instant::now();
         let full_output = self.egui_context.run_ui(raw_input, |ui| {
             egui::Panel::top("application-menu")
                 .exact_size(MENU_HEIGHT)
@@ -2982,6 +3091,11 @@ impl Viewer {
             recovery_requested = system_dialogs.recovery_requested;
             dismiss_recovery = system_dialogs.dismiss_recovery;
         });
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ShellUiRun,
+            shell_ui_started.elapsed(),
+        );
+        let shell_post_process_started = Instant::now();
         self.egui_context.data_mut(|data| {
             data.insert_temp(properties_expanded_id, properties_expanded);
         });
@@ -3021,6 +3135,19 @@ impl Viewer {
                 self.workspace_layout_recomputations.saturating_add(1);
         }
         self.workspace_layout = new_workspace_layout;
+        // The panel's genomic interval and the workspace's pixel geometry are separate
+        // authorities. Keep their horizontal transforms synchronized even for sub-point native
+        // layout changes; presentation cameras use the exact live canvas width and must never see
+        // the previous frame's width here.
+        let panel_widths_changed = self.workspace_layout.panels.iter().any(|layout| {
+            self.panels.get(layout.panel_id).is_some_and(|panel| {
+                (panel.viewport.pixel_width() - f64::from(layout.canvas.width())).abs()
+                    > f64::EPSILON
+            })
+        });
+        if panel_widths_changed {
+            self.synchronize_panel_widths();
+        }
         if workspace_layout_changed {
             for panel in self.panels.iter_mut() {
                 panel
@@ -3034,7 +3161,6 @@ impl Viewer {
             .abs()
                 >= 0.5;
             if width_changed {
-                self.synchronize_panel_widths();
                 if !properties_resize_active {
                     self.schedule_resolution_query_refresh();
                 }
@@ -4535,6 +4661,10 @@ impl Viewer {
         {
             self.data_status = error.to_string();
         }
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ShellPostProcess,
+            shell_post_process_started.elapsed(),
+        );
         (full_output, repaint_delay)
     }
 }

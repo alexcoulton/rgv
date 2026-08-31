@@ -231,6 +231,65 @@ impl AlignmentPresentationStore {
         })
     }
 
+    /// Materializes one canonical row block into the semantic-page cache without constructing or
+    /// publishing a cumulative scene snapshot. This is the unit of optional vertical warm-up:
+    /// foreground cameras later assemble their bounded snapshot from these independently keyed
+    /// pages, while the currently presented scene remains byte-for-byte unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn warm_read_row_block(
+        &mut self,
+        evidence: &Arc<crate::EvidenceRoot>,
+        atlas: &Arc<AlignmentRowAtlas>,
+        presentation: PresentationContract,
+        prepared_interval: GenomicInterval,
+        row_block: CanonicalRowBlock,
+        contig_length: u64,
+        geometry_tile_bases: NonZeroU64,
+        reference: Option<&ReferenceSlice>,
+        reservation_kind: ReservationKind,
+    ) -> Result<AlignmentReadPageWarm, AlignmentPresentationStoreError> {
+        validate_read_roots(evidence, atlas, prepared_interval)?;
+        row_block.range(atlas.row_count())?;
+        let revision_number = self.take_revision()?;
+        let genomic_tiles =
+            CanonicalGenomicTile::covering(prepared_interval, geometry_tile_bases, contig_length)?;
+        let read_families = presentation.required_page_families();
+        let page_occurrences = genomic_tiles.len().saturating_mul(read_families.len());
+        let mut cache_misses = 0_usize;
+        for genomic_tile in genomic_tiles {
+            for family in read_families.iter().copied() {
+                let key = AlignmentPageKey::new(
+                    evidence.source_revision(),
+                    evidence.revision(),
+                    atlas.revision(),
+                    atlas.layout_contract().fingerprint(),
+                    presentation.page_fingerprint(family),
+                    genomic_tile,
+                    row_block,
+                    family,
+                    presentation.geometry_lod,
+                );
+                cache_misses =
+                    cache_misses.saturating_add(usize::from(!self.read_pages.contains_key(&key)));
+                self.read_page(
+                    key,
+                    evidence,
+                    atlas,
+                    presentation,
+                    contig_length,
+                    reference,
+                    reservation_kind,
+                    revision_number,
+                )?;
+            }
+        }
+        Ok(AlignmentReadPageWarm {
+            row_block,
+            page_occurrences,
+            cache_misses,
+        })
+    }
+
     pub fn stage(&mut self, candidate: AlignmentSceneCandidate) -> Arc<AlignmentSceneSnapshot> {
         self.stage_for(AlignmentPresentationOwner::default(), candidate)
     }
@@ -564,6 +623,15 @@ pub struct AlignmentSceneCandidate {
     snapshot: Arc<AlignmentSceneSnapshot>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AlignmentReadPageWarm {
+    pub row_block: CanonicalRowBlock,
+    /// Number of stable semantic page keys covered by this row block and horizontal horizon.
+    pub page_occurrences: usize,
+    /// Keys which required new semantic-page construction rather than a cache touch.
+    pub cache_misses: usize,
+}
+
 impl AlignmentSceneCandidate {
     #[must_use]
     pub const fn prepared_interval(&self) -> GenomicInterval {
@@ -591,8 +659,7 @@ fn validate_roots(
     if summaries.evidence_revision() != evidence.revision()
         || summaries.source_revision() != evidence.source_revision()
         || summaries.record_contract() != evidence.record_contract()
-        || atlas.source_revision() != evidence.source_revision()
-        || atlas.record_contract() != evidence.record_contract()
+        || !atlas.shares_stable_record_authority(evidence)
     {
         return Err(AlignmentPresentationStoreError::AuthorityMismatch);
     }
@@ -616,9 +683,38 @@ fn validate_roots(
     Ok(())
 }
 
+fn validate_read_roots(
+    evidence: &crate::EvidenceRoot,
+    atlas: &AlignmentRowAtlas,
+    interval: GenomicInterval,
+) -> Result<(), AlignmentPresentationStoreError> {
+    // Row assignments are keyed by source-stable alignment handles, so a containing atlas may be
+    // reused across compatible evidence publications. Requiring the atlas's historical evidence
+    // revision to equal the current root contradicted `EvidenceStore::prepare_row_atlas` and made
+    // every optional vertical warm-up fail after an otherwise valid contained-target reuse.
+    if !atlas.shares_stable_record_authority(evidence) {
+        return Err(AlignmentPresentationStoreError::AuthorityMismatch);
+    }
+    if !evidence.coverage().covers(interval) || !atlas.interval().contains_interval(interval) {
+        return Err(AlignmentPresentationStoreError::UnpreparedInterval(
+            interval,
+        ));
+    }
+    Ok(())
+}
+
 fn covering_row_blocks(rows: Range<u32>, block_rows: NonZeroU32) -> Vec<CanonicalRowBlock> {
     if rows.is_empty() {
-        return vec![CanonicalRowBlock::new(0, block_rows)];
+        // Empty camera ranges can occur exactly at the bottom boundary while scroll state is
+        // being clamped to a newly published row extent. The presentation validator still asks
+        // for one canonical block, so retain the block immediately before that boundary (or zero
+        // at the top). Choosing block zero unconditionally made a legitimate deep-row camera fail
+        // with `MissingMandatoryBlock`, while choosing `start / rows` can point beyond a perfectly
+        // block-aligned atlas.
+        return vec![CanonicalRowBlock::new(
+            rows.start.saturating_sub(1) / block_rows.get(),
+            block_rows,
+        )];
     }
     let first = rows.start / block_rows.get();
     let last = rows.end.saturating_sub(1) / block_rows.get();

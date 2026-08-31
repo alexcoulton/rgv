@@ -2864,7 +2864,6 @@ mod tests {
 
     fn layout_contract() -> crate::LayoutContract {
         crate::LayoutContract {
-            row_scale_class: 0,
             stacking: ReadStackingMode::Compact,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,

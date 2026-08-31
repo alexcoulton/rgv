@@ -476,8 +476,9 @@ impl EvidenceStore {
         {
             return Err(EvidenceStoreError::SummaryEvidenceMismatch);
         }
-        if row_atlas.root.source_revision() != evidence.root.source_revision()
-            || row_atlas.root.record_contract() != evidence.root.record_contract()
+        if !row_atlas
+            .root
+            .shares_stable_record_authority(&evidence.root)
             || !row_atlas.root.interval().contains_interval(evidence.target)
             || !row_atlas
                 .root
@@ -1247,9 +1248,7 @@ fn atlas_compatible(
     evidence: &EvidenceRoot,
     layout_contract: LayoutContract,
 ) -> bool {
-    atlas.source_revision() == evidence.source_revision()
-        && atlas.record_contract() == evidence.record_contract()
-        && atlas.layout_contract() == layout_contract
+    atlas.shares_stable_record_authority(evidence) && atlas.layout_contract() == layout_contract
 }
 
 fn chunk_satisfies_payload(chunk: &EvidenceChunk, required: &PayloadContract) -> bool {
@@ -1423,7 +1422,7 @@ pub enum EvidenceStoreError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU64, NonZeroUsize};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
     use rgv_core::{
         AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigId, GenomicInterval,
@@ -1436,8 +1435,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        AllocationClass, CanonicalRecordChunk, CapabilityRequirement, CompleteCoverage,
-        ContractFingerprint, EvidenceChunk, FilteredRecordProvenance, SourceChunkId,
+        AlignmentPresentationStore, AlignmentStyleContract, AllocationClass, CanonicalRecordChunk,
+        CanonicalRowBlock, CapabilityRequirement, CompleteCoverage, ContractFingerprint,
+        EvidenceChunk, FilteredRecordProvenance, GeometryLod, PresentationContract, SourceChunkId,
         SourceFingerprint,
     };
 
@@ -1478,7 +1478,6 @@ mod tests {
 
     fn layout_contract() -> LayoutContract {
         LayoutContract {
-            row_scale_class: 0,
             stacking: ReadStackingMode::Stable,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,
@@ -1759,6 +1758,67 @@ mod tests {
     }
 
     #[test]
+    fn compatible_older_row_atlas_can_warm_pages_for_newer_evidence() {
+        let ledger = AllocationLedger::new(4 << 20, 1 << 20);
+        let mut evidence_store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        evidence_store
+            .admit(one_record_acquisition(&ledger, 0, 100, 7))
+            .unwrap();
+        let horizon = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let first_evidence = evidence_store
+            .prepare(horizon, no_payload(), ReservationKind::Normal)
+            .unwrap();
+        let retained_atlas = evidence_store
+            .prepare_row_atlas(
+                first_evidence.root(),
+                horizon,
+                layout_contract(),
+                ReservationKind::Normal,
+            )
+            .unwrap();
+
+        let contained = GenomicInterval::new(ContigId::new(0), 0, 50).unwrap();
+        let newer_evidence = evidence_store
+            .prepare(contained, no_payload(), ReservationKind::Normal)
+            .unwrap();
+        assert_ne!(
+            retained_atlas.root().derived_from_evidence(),
+            newer_evidence.root().revision()
+        );
+        assert!(
+            retained_atlas
+                .root()
+                .shares_stable_record_authority(newer_evidence.root())
+        );
+
+        let mut presentation_store = AlignmentPresentationStore::new(ledger);
+        let warmed = presentation_store
+            .warm_read_row_block(
+                newer_evidence.root(),
+                retained_atlas.root(),
+                PresentationContract {
+                    geometry_lod: GeometryLod::Span,
+                    style: AlignmentStyleContract::default(),
+                    reference: None,
+                    annotation: None,
+                },
+                contained,
+                CanonicalRowBlock::new(0, NonZeroU32::new(8).unwrap()),
+                100,
+                NonZeroU64::new(100).unwrap(),
+                None,
+                ReservationKind::Normal,
+            )
+            .unwrap();
+
+        assert!(warmed.page_occurrences > 0);
+    }
+
+    #[test]
     fn evidence_summaries_and_rows_publish_as_one_authority() {
         let ledger = AllocationLedger::new(4 << 20, 1 << 20);
         let mut store = EvidenceStore::new(source_revision(), ContractFingerprint::new(9), ledger);
@@ -1883,6 +1943,13 @@ mod tests {
                 .unwrap()
                 .sampled_templates,
             0
+        );
+        assert_eq!(
+            summaries.root().prepared_pair_summary(),
+            summaries
+                .root()
+                .pair_summary(summaries.root().prepared_interval())
+                .unwrap()
         );
         assert_eq!(summaries.root().pin().unwrap().len(), 9);
         assert_eq!(summaries.root().filter_tiles().len(), 2);

@@ -680,9 +680,7 @@ fn validate_scene_dependencies(
     prepared_rows: &Range<u32>,
     pages: &[Arc<AlignmentSemanticPage>],
 ) -> Result<(), AlignmentPresentationSceneError> {
-    if atlas.source_revision() != evidence.source_revision()
-        || atlas.record_contract() != evidence.record_contract()
-    {
+    if !atlas.shares_stable_record_authority(evidence) {
         return Err(AlignmentPresentationSceneError::AuthorityMismatch);
     }
     if !evidence.coverage().covers(prepared_interval)
@@ -740,12 +738,12 @@ fn validate_mandatory_coverage(
     family: AlignmentPageFamily,
 ) -> Result<(), AlignmentPresentationSceneError> {
     let block_rows = first.row_block().rows().get();
-    let first_block = prepared_rows.start / block_rows;
-    let last_block = if prepared_rows.is_empty() {
-        first_block
+    let first_block = if prepared_rows.is_empty() {
+        prepared_rows.start.saturating_sub(1) / block_rows
     } else {
-        prepared_rows.end.saturating_sub(1) / block_rows
+        prepared_rows.start / block_rows
     };
+    let last_block = prepared_rows.end.saturating_sub(1) / block_rows;
     for block in first_block..=last_block {
         let mut intervals = pages
             .iter()

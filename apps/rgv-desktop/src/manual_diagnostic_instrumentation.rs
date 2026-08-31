@@ -9,6 +9,15 @@ pub(crate) enum ManualDiagnosticFramePhase {
     ApplyCapturedMotion,
     FirstDisplayRebuild,
     Shell,
+    ShellPreparation,
+    ShellDiagnostics,
+    ShellInspectors,
+    ShellPairSummary,
+    ShellScrollbars,
+    ShellTextCopy,
+    ShellOverviewProjection,
+    ShellUiRun,
+    ShellPostProcess,
     SecondDisplayRebuild,
     Tessellation,
     SurfaceAcquisition,
@@ -25,6 +34,15 @@ struct ManualDiagnosticFrameTimings {
     apply_captured_motion_us: u64,
     first_display_rebuild_us: u64,
     shell_us: u64,
+    shell_preparation_us: u64,
+    shell_diagnostics_us: u64,
+    shell_inspectors_us: u64,
+    shell_pair_summary_us: u64,
+    shell_scrollbars_us: u64,
+    shell_text_copy_us: u64,
+    shell_overview_projection_us: u64,
+    shell_ui_run_us: u64,
+    shell_post_process_us: u64,
     second_display_rebuild_us: u64,
     tessellation_us: u64,
     surface_acquisition_us: u64,
@@ -41,28 +59,73 @@ struct PendingManualDiagnosticFailure {
 }
 
 impl ManualDiagnosticFrameTimings {
-    fn set(&mut self, phase: ManualDiagnosticFramePhase, duration: Duration) {
+    fn add(&mut self, phase: ManualDiagnosticFramePhase, duration: Duration) {
         let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
         match phase {
-            ManualDiagnosticFramePhase::PollBackground => self.poll_background_us = micros,
+            ManualDiagnosticFramePhase::PollBackground => {
+                self.poll_background_us = self.poll_background_us.saturating_add(micros);
+            }
             ManualDiagnosticFramePhase::ApplyCapturedMotion => {
-                self.apply_captured_motion_us = micros;
+                self.apply_captured_motion_us =
+                    self.apply_captured_motion_us.saturating_add(micros);
             }
             ManualDiagnosticFramePhase::FirstDisplayRebuild => {
-                self.first_display_rebuild_us = micros;
+                self.first_display_rebuild_us =
+                    self.first_display_rebuild_us.saturating_add(micros);
             }
-            ManualDiagnosticFramePhase::Shell => self.shell_us = micros,
+            ManualDiagnosticFramePhase::Shell => {
+                self.shell_us = self.shell_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::ShellPreparation => {
+                self.shell_preparation_us = self.shell_preparation_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::ShellDiagnostics => {
+                self.shell_diagnostics_us = self.shell_diagnostics_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::ShellInspectors => {
+                self.shell_inspectors_us = self.shell_inspectors_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::ShellPairSummary => {
+                self.shell_pair_summary_us = self.shell_pair_summary_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::ShellScrollbars => {
+                self.shell_scrollbars_us = self.shell_scrollbars_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::ShellTextCopy => {
+                self.shell_text_copy_us = self.shell_text_copy_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::ShellOverviewProjection => {
+                self.shell_overview_projection_us =
+                    self.shell_overview_projection_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::ShellUiRun => {
+                self.shell_ui_run_us = self.shell_ui_run_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::ShellPostProcess => {
+                self.shell_post_process_us = self.shell_post_process_us.saturating_add(micros);
+            }
             ManualDiagnosticFramePhase::SecondDisplayRebuild => {
-                self.second_display_rebuild_us = micros;
+                self.second_display_rebuild_us =
+                    self.second_display_rebuild_us.saturating_add(micros);
             }
-            ManualDiagnosticFramePhase::Tessellation => self.tessellation_us = micros,
+            ManualDiagnosticFramePhase::Tessellation => {
+                self.tessellation_us = self.tessellation_us.saturating_add(micros);
+            }
             ManualDiagnosticFramePhase::SurfaceAcquisition => {
-                self.surface_acquisition_us = micros;
+                self.surface_acquisition_us = self.surface_acquisition_us.saturating_add(micros);
             }
-            ManualDiagnosticFramePhase::EguiBuffers => self.egui_buffers_us = micros,
-            ManualDiagnosticFramePhase::QueueSubmission => self.queue_submission_us = micros,
-            ManualDiagnosticFramePhase::Present => self.present_us = micros,
-            ManualDiagnosticFramePhase::Prefetch => self.prefetch_us = micros,
+            ManualDiagnosticFramePhase::EguiBuffers => {
+                self.egui_buffers_us = self.egui_buffers_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::QueueSubmission => {
+                self.queue_submission_us = self.queue_submission_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::Present => {
+                self.present_us = self.present_us.saturating_add(micros);
+            }
+            ManualDiagnosticFramePhase::Prefetch => {
+                self.prefetch_us = self.prefetch_us.saturating_add(micros);
+            }
         }
     }
 }
@@ -119,6 +182,25 @@ impl ManualDiagnosticTraceRuntime {
 }
 
 impl Viewer {
+    pub(crate) fn maybe_start_pending_manual_diagnostic_trace(&mut self) {
+        if !self.manual_diagnostic_trace_autostart_pending {
+            return;
+        }
+        let source_is_ready = self.synthetic
+            || self.alignment_tracks.is_empty()
+            || self
+                .alignment_tracks
+                .iter()
+                .any(|track| track.dictionary.is_some());
+        let bootstrap_locus_is_resolved = self.synthetic
+            || self.alignment_tracks.is_empty()
+            || self.panels.active().contig_name != "chrSynthetic";
+        if source_is_ready && bootstrap_locus_is_resolved {
+            self.manual_diagnostic_trace_autostart_pending = false;
+            self.start_manual_diagnostic_trace("launch option");
+        }
+    }
+
     pub(crate) fn start_manual_diagnostic_trace(&mut self, trigger: &str) {
         self.manual_diagnostic_trace_runtime
             .reset_for_recording(&self.data_status);
@@ -464,7 +546,7 @@ impl Viewer {
         duration: Duration,
     ) {
         if let Some(frame) = self.manual_diagnostic_trace_runtime.current_frame.as_mut() {
-            frame.set(phase, duration);
+            frame.add(phase, duration);
         }
     }
 
@@ -489,6 +571,15 @@ impl Viewer {
                 "apply_captured_motion_us": frame.apply_captured_motion_us,
                 "first_display_rebuild_us": frame.first_display_rebuild_us,
                 "shell_us": frame.shell_us,
+                "shell_preparation_us": frame.shell_preparation_us,
+                "shell_diagnostics_us": frame.shell_diagnostics_us,
+                "shell_inspectors_us": frame.shell_inspectors_us,
+                "shell_pair_summary_us": frame.shell_pair_summary_us,
+                "shell_scrollbars_us": frame.shell_scrollbars_us,
+                "shell_text_copy_us": frame.shell_text_copy_us,
+                "shell_overview_projection_us": frame.shell_overview_projection_us,
+                "shell_ui_run_us": frame.shell_ui_run_us,
+                "shell_post_process_us": frame.shell_post_process_us,
                 "second_display_rebuild_us": frame.second_display_rebuild_us,
                 "tessellation_us": frame.tessellation_us,
                 "surface_acquisition_us": frame.surface_acquisition_us,
@@ -752,6 +843,7 @@ impl Viewer {
                                 "current_summary_pages": pump.current_summary_pages,
                                 "target_read_pages": pump.target_read_pages,
                                 "target_summary_pages": pump.target_summary_pages,
+                                "target_read_page_cache_misses": pump.target_read_page_cache_misses,
                                 "prepare_elapsed_nanoseconds": pump.prepare_elapsed_nanoseconds,
                                 "pump_elapsed_nanoseconds": pump.pump_elapsed_nanoseconds,
                                 "outcome": format!("{:?}", pump.outcome),
@@ -773,10 +865,12 @@ impl Viewer {
                             "speculation_submissions": work.speculation_submissions,
                             "vertical_checkpoints": work.vertical_residency_checkpoints,
                             "vertical_publications": work.vertical_residency_publications,
+                            "vertical_blocks_warmed": work.vertical_residency_blocks_warmed,
                             "vertical_completions": work.vertical_residency_completions,
                             "vertical_budget_limits": work.vertical_residency_budget_limits,
                             "vertical_failures": work.vertical_residency_failures,
                             "vertical_read_page_occurrences": work.vertical_residency_read_page_occurrences,
+                            "vertical_read_page_cache_misses": work.vertical_residency_read_page_cache_misses,
                             "vertical_summary_page_occurrences": work.vertical_residency_summary_page_occurrences,
                             "vertical_prepare_nanoseconds": work.vertical_residency_prepare_nanoseconds,
                             "vertical_pump_nanoseconds": work.vertical_residency_pump_nanoseconds,
@@ -885,6 +979,7 @@ impl Viewer {
             "workspace": {
                 "layout_revision": self.workspace_layout.revision,
                 "layout_recomputations": self.workspace_layout_recomputations,
+                "genome_overview_recomputations": self.genome_overview_recomputations,
                 "navigation_contract_revision": self.navigation_contract_revision,
                 "stale_result_rejections": self.navigation_stale_result_rejections,
                 "surface_width": self.surface_config.width,
@@ -1124,17 +1219,21 @@ mod tests {
     }
 
     #[test]
-    fn frame_phase_timings_replace_their_exact_slot() {
+    fn frame_phase_timings_accumulate_in_their_exact_slot() {
         let mut timings = ManualDiagnosticFrameTimings::default();
-        timings.set(
+        timings.add(
             ManualDiagnosticFramePhase::FirstDisplayRebuild,
             Duration::from_micros(41),
         );
-        timings.set(
+        timings.add(
+            ManualDiagnosticFramePhase::FirstDisplayRebuild,
+            Duration::from_micros(1),
+        );
+        timings.add(
             ManualDiagnosticFramePhase::QueueSubmission,
             Duration::from_micros(7),
         );
-        assert_eq!(timings.first_display_rebuild_us, 41);
+        assert_eq!(timings.first_display_rebuild_us, 42);
         assert_eq!(timings.queue_submission_us, 7);
         assert_eq!(timings.shell_us, 0);
     }

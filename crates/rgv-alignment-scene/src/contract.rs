@@ -392,7 +392,6 @@ impl DepthSummaryContract {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayoutContract {
-    pub row_scale_class: u8,
     pub stacking: ReadStackingMode,
     pub grouping: AlignmentGroupMode,
     pub group_order: AlignmentOrderDirection,
@@ -410,7 +409,6 @@ impl LayoutContract {
     #[must_use]
     pub fn fingerprint(self) -> ContractFingerprint {
         let mut hash = StableHasher::default();
-        hash.write(&[self.row_scale_class]);
         hash.write(&[match self.stacking {
             ReadStackingMode::Stable => 0,
             ReadStackingMode::Compact => 1,

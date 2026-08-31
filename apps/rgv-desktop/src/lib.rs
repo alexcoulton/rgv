@@ -70,7 +70,7 @@ use rgv_alignment_scene::{
     LedgerProgressEpoch, LedgerProgressSubscription, LedgerSnapshot,
     MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract, ReferenceRevision,
     RowAtlasRevision, RowCoordinateSpaceRevision, SummaryContract, SummaryPageFamily,
-    SummarySemanticComponent, build_alignment_semantic_retirement_claim_set,
+    SummaryRevision, SummarySemanticComponent, build_alignment_semantic_retirement_claim_set,
 };
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,
@@ -1330,6 +1330,26 @@ struct AlignmentGpuSpeculationGate {
     phase: AlignmentGpuSpeculationPhase,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GenomeOverviewTrackCacheKey {
+    track_id: TrackId,
+    index_overview_identity: Option<usize>,
+    summary_revision: Option<SummaryRevision>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GenomeOverviewCacheKey {
+    contig_name: String,
+    contig_length: u64,
+    tracks: Vec<GenomeOverviewTrackCacheKey>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedGenomeOverview {
+    key: GenomeOverviewCacheKey,
+    data: ui::GenomeOverviewData,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct Viewer {
     application_instance_id: String,
@@ -1461,6 +1481,9 @@ struct Viewer {
     interaction_trace: InteractionTraceRecorder,
     manual_diagnostic_trace: ManualDiagnosticTraceRecorder,
     manual_diagnostic_trace_runtime: ManualDiagnosticTraceRuntime,
+    manual_diagnostic_trace_autostart_pending: bool,
+    genome_overview_cache: BTreeMap<PanelId, CachedGenomeOverview>,
+    genome_overview_recomputations: u64,
     sashimi_interaction_diagnostics: SashimiInteractionDiagnostics,
     command_search: String,
     annotation_search_generation: u64,

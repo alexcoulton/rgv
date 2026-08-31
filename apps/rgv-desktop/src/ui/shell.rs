@@ -31,7 +31,10 @@ impl Viewer {
         );
 
         let phase_started = Instant::now();
-        self.rebuild_display_list();
+        let first_egui_frame = self.egui_context.cumulative_frame_nr() == 0;
+        if !first_egui_frame {
+            self.rebuild_display_list();
+        }
         self.record_manual_diagnostic_frame_phase(
             ManualDiagnosticFramePhase::FirstDisplayRebuild,
             phase_started.elapsed(),
@@ -53,6 +56,14 @@ impl Viewer {
             ManualDiagnosticFramePhase::SecondDisplayRebuild,
             phase_started.elapsed(),
         );
+        if first_egui_frame {
+            // Feature-label layout measures real egui fonts. Those fonts are initialized by the
+            // first `run_ui` above, so the pre-shell rebuild must be skipped exactly once. The
+            // post-shell rebuild now has valid font authority; request one immediate follow-up so
+            // its genomic text joins the already coherent native geometry without waiting for an
+            // unrelated input event.
+            self.window.request_redraw();
+        }
         let prepared_stats = std::mem::take(&mut self.display_upload_pending_metrics)
             .then(|| self.rectangle_renderer.last_prepare_stats());
         self.submit_ui_frame(full_output, prepared_stats, frame_started, repaint_delay);

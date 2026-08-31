@@ -125,6 +125,19 @@ pub(crate) fn alignment_scene_pressure_requires_resume(
         || matches!(operation, AlignmentSceneEngineOperation::PumpPresentation)
 }
 
+/// Resource-pressure retries can outlive the foreground navigation transaction which started
+/// them. In particular, speculative vertical row preparation continues after the exact visible
+/// scene has committed. Such work must still be retried, but it must not reopen or otherwise
+/// mutate an already settled navigation transaction.
+pub(crate) const fn alignment_scene_pressure_owns_navigation(
+    phase: AlignmentNavigationPhase,
+) -> bool {
+    matches!(
+        phase,
+        AlignmentNavigationPhase::Running | AlignmentNavigationPhase::WaitingForSourcePressure
+    )
+}
+
 /// An intrinsically oversized optional row-residency page limits instant deep scrolling; it does
 /// not invalidate the already complete visible scene. Keep this operation check deliberately
 /// narrow: speculative source acquisition has different lifecycle semantics and continues to use
@@ -1083,22 +1096,23 @@ impl Viewer {
                 .scene_engine
                 .as_ref()
                 .map(|engine| engine.try_retry_resource_pressure(owner, request_token, target));
-            if let Some(retry) = self.alignment_tracks[track_index]
-                .projection_mut(panel_id)
-                .scene_pressure_retry
-                .as_mut()
             {
-                retry.ledger_epoch = epoch;
-                retry.in_flight = matches!(result, Some(Ok(())));
-            }
-            if matches!(result, Some(Ok(()))) {
-                self.alignment_tracks[track_index]
-                    .projection_mut(panel_id)
-                    .navigation
-                    .transition(
+                let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+                if let Some(retry) = projection.scene_pressure_retry.as_mut()
+                    && retry.same_request(request_token, target)
+                {
+                    retry.ledger_epoch = epoch;
+                    retry.in_flight = matches!(result, Some(Ok(())));
+                }
+                if matches!(result, Some(Ok(())))
+                    && projection.navigation.phase()
+                        == AlignmentNavigationPhase::WaitingForSourcePressure
+                {
+                    projection.navigation.transition(
                         AlignmentNavigationPhase::Running,
                         "ledger progress resumed the exact source target",
                     );
+                }
             }
             if matches!(result, Some(Err(EngineQueueError::Disconnected)) | None) {
                 self.alignment_tracks[track_index]
@@ -1232,6 +1246,7 @@ impl Viewer {
         if self.display_dirty {
             self.window.request_redraw();
         }
+        self.maybe_start_pending_manual_diagnostic_trace();
     }
 
     fn synchronize_alignment_contextual_product_states(&mut self) {
@@ -1848,6 +1863,12 @@ impl Viewer {
                                     } => format!(
                                         "{records} complete alignments · {prepared_rows}/{total_rows} rows resident (cache budget reached)"
                                     ),
+                                    AlignmentVerticalResidency::Unavailable {
+                                        prepared_rows,
+                                        total_rows,
+                                    } => format!(
+                                        "{records} complete alignments · {prepared_rows}/{total_rows} rows prepared (instant deep scrolling unavailable)"
+                                    ),
                                     AlignmentVerticalResidency::ViewportBounded => {
                                         format!("{records} complete alignments")
                                     }
@@ -1872,7 +1893,12 @@ impl Viewer {
                         || row_activity_changed
                         || (published_scene.is_some()
                             && cause != AlignmentSceneFrameCause::VerticalResidency);
-                    prepare_frame = true;
+                    // Optional vertical warm-up now populates independently keyed semantic pages
+                    // without publishing a scene. Its progress/status event must not recapture or
+                    // replace the foreground GPU presentation on every background row block.
+                    prepare_frame |= cause != AlignmentSceneFrameCause::VerticalResidency
+                        || published_scene.is_some()
+                        || row_activity_changed;
                 }
                 AlignmentSceneEngineEvent::IndividualReadsRefused {
                     owner,
@@ -2019,6 +2045,12 @@ impl Viewer {
                                     } => format!(
                                         "{records} complete alignments · {prepared_rows}/{total_rows} rows resident (cache budget reached)"
                                     ),
+                                    AlignmentVerticalResidency::Unavailable {
+                                        prepared_rows,
+                                        total_rows,
+                                    } => format!(
+                                        "{records} complete alignments · {prepared_rows}/{total_rows} rows prepared (instant deep scrolling unavailable)"
+                                    ),
                                     AlignmentVerticalResidency::Complete { total_rows } => format!(
                                         "{records} complete alignments · all {total_rows} rows prepared"
                                     ),
@@ -2081,6 +2113,13 @@ impl Viewer {
                         }
                     };
                     let retry_epoch = post_relief.progress_epoch();
+                    let pressure_owns_navigation = alignment_scene_pressure_owns_navigation(
+                        self.alignment_tracks[track_index]
+                            .projection(panel_id)
+                            .map_or(AlignmentNavigationPhase::Dormant, |projection| {
+                                projection.navigation.phase()
+                            }),
+                    );
                     if let AlignmentScenePressureRetryPoll::Waiting(waiting) =
                         alignment_scene_pressure_after_relief(
                             request_token,
@@ -2095,16 +2134,18 @@ impl Viewer {
                         self.alignment_tracks[track_index]
                             .projection_mut(panel_id)
                             .scene_pressure_retry = Some(waiting);
-                        self.alignment_tracks[track_index]
-                            .projection_mut(panel_id)
-                            .navigation
-                            .transition(
-                                AlignmentNavigationPhase::WaitingForSourcePressure,
-                                "source allocation is paused on an exact ledger blocker",
-                            );
-                        if Some(track_id) == primary_id && panel_id == active_panel_id {
-                            "Waiting for shared alignment cache capacity…"
-                                .clone_into(&mut self.data_status);
+                        if pressure_owns_navigation {
+                            self.alignment_tracks[track_index]
+                                .projection_mut(panel_id)
+                                .navigation
+                                .transition(
+                                    AlignmentNavigationPhase::WaitingForSourcePressure,
+                                    "source allocation is paused on an exact ledger blocker",
+                                );
+                            if Some(track_id) == primary_id && panel_id == active_panel_id {
+                                "Waiting for shared alignment cache capacity…"
+                                    .clone_into(&mut self.data_status);
+                            }
                         }
                         continue;
                     }
@@ -2126,15 +2167,17 @@ impl Viewer {
                     });
                     match retry_result {
                         Some(Ok(())) => {
-                            self.alignment_tracks[track_index]
-                                .projection_mut(panel_id)
-                                .navigation
-                                .transition(
-                                    AlignmentNavigationPhase::Running,
-                                    "source pressure retry was accepted",
-                                );
-                            if Some(track_id) == primary_id && panel_id == active_panel_id {
-                                "Updating alignment scene…".clone_into(&mut self.data_status);
+                            if pressure_owns_navigation {
+                                self.alignment_tracks[track_index]
+                                    .projection_mut(panel_id)
+                                    .navigation
+                                    .transition(
+                                        AlignmentNavigationPhase::Running,
+                                        "source pressure retry was accepted",
+                                    );
+                                if Some(track_id) == primary_id && panel_id == active_panel_id {
+                                    "Updating alignment scene…".clone_into(&mut self.data_status);
+                                }
                             }
                         }
                         Some(Err(EngineQueueError::Disconnected)) | None => {

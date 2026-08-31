@@ -107,7 +107,8 @@ pub use presentation_scene::{
 };
 pub use presentation_store::{
     AlignmentPresentationOwner, AlignmentPresentationStore, AlignmentPresentationStoreError,
-    AlignmentSceneCandidate, PresentationCacheDiscard, PresentationStorePressure,
+    AlignmentReadPageWarm, AlignmentSceneCandidate, PresentationCacheDiscard,
+    PresentationStorePressure,
 };
 pub use resource::{
     AllocationBundleAccountingOperation, AllocationBundleActual, AllocationBundleCommit,

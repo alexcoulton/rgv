@@ -673,6 +673,9 @@ impl Viewer {
                 adapter_info.name.clone(),
                 format!("{:?}", adapter_info.backend),
             ),
+            manual_diagnostic_trace_autostart_pending: start_diagnostic_trace,
+            genome_overview_cache: BTreeMap::new(),
+            genome_overview_recomputations: 0,
             sashimi_interaction_diagnostics: SashimiInteractionDiagnostics::default(),
             command_search: String::new(),
             annotation_search_generation: 0,
@@ -713,7 +716,8 @@ impl Viewer {
             captured_motion_distance: 0.0,
             suppress_horizontal_overview_click: false,
         };
-        if start_diagnostic_trace {
+        if start_diagnostic_trace && (viewer.synthetic || viewer.alignment_tracks.is_empty()) {
+            viewer.manual_diagnostic_trace_autostart_pending = false;
             viewer.start_manual_diagnostic_trace("launch option");
         }
         Ok(viewer)

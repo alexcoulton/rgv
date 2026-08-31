@@ -118,13 +118,14 @@ impl Viewer {
         if !presented.lane.summary_current() || !presented.source.semantic_target_complete {
             return None;
         }
-        presented
-            .lane
-            .snapshot
-            .as_ref()?
-            .summaries()
-            .pair_summary(self.panels.active().viewport.interval())
-            .ok()
+        Some(
+            presented
+                .lane
+                .snapshot
+                .as_ref()?
+                .summaries()
+                .prepared_pair_summary(),
+        )
     }
 }
 

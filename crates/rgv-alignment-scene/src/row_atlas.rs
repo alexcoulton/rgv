@@ -1088,6 +1088,18 @@ impl AlignmentRowAtlas {
         self.record_contract
     }
 
+    /// Whether this immutable row coordinate space can be used with an evidence publication.
+    ///
+    /// Alignment handles are physical, source-stable identities. A containing atlas can therefore
+    /// remain authoritative across newer compatible evidence roots; `derived_from_evidence` is
+    /// provenance, not an equality requirement. Every consumer must use this predicate instead of
+    /// independently tightening the compatibility rule to one historical evidence revision.
+    #[must_use]
+    pub fn shares_stable_record_authority(&self, evidence: &EvidenceRoot) -> bool {
+        self.source_revision == evidence.source_revision()
+            && self.record_contract == evidence.record_contract()
+    }
+
     #[must_use]
     pub const fn layout_contract(&self) -> LayoutContract {
         self.layout_contract
@@ -1678,7 +1690,6 @@ mod tests {
 
     fn contract(stacking: ReadStackingMode) -> LayoutContract {
         LayoutContract {
-            row_scale_class: 0,
             stacking,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,

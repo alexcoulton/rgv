@@ -4529,7 +4529,6 @@ mod tests {
         evidence_builder.insert_acquisition(&acquisition).unwrap();
         let evidence = evidence_builder.build(2).unwrap();
         let layout = LayoutContract {
-            row_scale_class: 0,
             stacking: ReadStackingMode::Compact,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,

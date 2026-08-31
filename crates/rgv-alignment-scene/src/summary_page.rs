@@ -1189,7 +1189,6 @@ mod tests {
         let (evidence, summaries) = exact_authority(ledger);
         let interval = summaries.prepared_interval();
         let layout = LayoutContract {
-            row_scale_class: 0,
             stacking: ReadStackingMode::Compact,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,
@@ -1678,7 +1677,6 @@ mod tests {
         ledger: &AllocationLedger,
     ) -> Arc<AlignmentRowAtlas> {
         let layout = LayoutContract {
-            row_scale_class: 0,
             stacking: ReadStackingMode::Compact,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,
@@ -2361,7 +2359,6 @@ mod tests {
         let (evidence, summaries) = exact_authority(&ledger);
         let interval = summaries.prepared_interval();
         let layout = LayoutContract {
-            row_scale_class: 0,
             stacking: ReadStackingMode::Compact,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,
@@ -2840,7 +2837,6 @@ mod tests {
         let (evidence, summaries) = exact_authority(&ledger);
         let interval = summaries.prepared_interval();
         let layout = LayoutContract {
-            row_scale_class: 0,
             stacking: ReadStackingMode::Compact,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,
@@ -2947,7 +2943,6 @@ mod tests {
         let (evidence, summaries) = exact_authority(&ledger);
         let interval = summaries.prepared_interval();
         let layout = LayoutContract {
-            row_scale_class: 0,
             stacking: ReadStackingMode::Compact,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,

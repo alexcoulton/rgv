@@ -885,16 +885,22 @@ fn scene_worker_loop<B>(
                         ) {
                             return;
                         }
-                    } else if !send_frame(
-                        &coordinator,
-                        output,
-                        pump.owner,
-                        current_request_token(&request_tokens, pump.owner),
-                        AlignmentSceneFrameCause::VerticalResidency,
-                        None,
-                        pump.published_scene,
-                    ) {
-                        return;
+                    } else if pump.completed || pump.failed {
+                        // Intermediate independent row-block warms neither replace the semantic
+                        // scene nor require a desktop redraw. Publish one coalesced status/frame
+                        // update only when the whole directory becomes warm or optional warming
+                        // becomes unavailable. The latter preserves the complete visible scene.
+                        if !send_frame(
+                            &coordinator,
+                            output,
+                            pump.owner,
+                            current_request_token(&request_tokens, pump.owner),
+                            AlignmentSceneFrameCause::VerticalResidency,
+                            None,
+                            None,
+                        ) {
+                            return;
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -1961,7 +1967,6 @@ mod tests {
                 collect_modifications: false,
             },
             layout: LayoutContract {
-                row_scale_class: 0,
                 stacking: ReadStackingMode::Compact,
                 grouping: AlignmentGroupMode::None,
                 group_order: AlignmentOrderDirection::Natural,
@@ -2788,8 +2793,13 @@ mod tests {
         };
         assert!(frame.visible_complete());
         let scene = frame.snapshot.unwrap();
-        assert_eq!(scene.reads().prepared_rows(), 0..13);
+        assert_ne!(scene.reads().prepared_rows(), 0..13);
         assert!(telemetry.vertical_residency_checkpoints > 0);
+        assert_eq!(
+            telemetry.vertical_residency_blocks_warmed,
+            telemetry.vertical_residency_checkpoints
+        );
+        assert_eq!(telemetry.vertical_residency_publications, 0);
         assert_eq!(telemetry.vertical_residency_completions, 1);
         let trace = telemetry
             .last_vertical_residency_pump
@@ -2798,13 +2808,11 @@ mod tests {
             trace.outcome,
             AlignmentVerticalResidencyPumpOutcome::Completed
         );
-        assert_eq!(trace.published_scene, Some(scene.revision()));
-        assert_eq!(trace.target_prepared_rows.start, 0);
-        assert_eq!(trace.target_prepared_rows.end, 13);
-        assert_eq!(
-            trace.target_read_pages,
-            Some(u64::try_from(scene.reads().pages().len()).unwrap())
-        );
+        assert_eq!(trace.current_scene, scene.revision());
+        assert_eq!(trace.published_scene, None);
+        assert!(trace.target_prepared_rows.end <= 13);
+        assert!(trace.target_read_pages.is_some_and(|pages| pages > 0));
+        assert_eq!(trace.target_summary_pages, None);
         assert!(trace.pump_elapsed_nanoseconds >= trace.prepare_elapsed_nanoseconds);
     }
 

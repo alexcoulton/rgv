@@ -1,5 +1,4 @@
 use super::super::*;
-use crate::display::alignment;
 
 /// Canonical presentation partition used by the first desktop qualification slice. This is a
 /// cache/page granularity, never an evidence or display cap. Measurements may replace it without
@@ -1440,7 +1439,6 @@ pub(crate) fn alignment_scene_build_contract(
             collect_modifications: filters.show_modification_frequency,
         },
         layout: LayoutContract {
-            row_scale_class: alignment::alignment_row_scale_class(viewport.bases_per_pixel()),
             stacking: filters.read_stacking_mode,
             grouping: filters.alignment_group_mode,
             group_order: filters.alignment_group_order,
