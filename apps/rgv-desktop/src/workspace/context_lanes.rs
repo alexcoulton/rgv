@@ -366,6 +366,44 @@ impl PanelContextScene {
         self.projected = projected;
     }
 
+    /// Reprojects only camera-dependent contextual text. Immutable rectangles are already
+    /// transformed by `ContextSceneGpuRenderer::capture_camera_frame`; rebuilding their CPU
+    /// display list during a held pan would duplicate the native camera path and feed the generic
+    /// rectangle compositor unnecessarily.
+    pub(crate) fn project_camera_text(&mut self, target: Viewport, frames: &[TrackFrame]) {
+        let mut projected = DisplayList::default();
+        for state in self.lanes.values() {
+            if matches!(
+                state.readiness,
+                ContextLaneReadiness::Hidden | ContextLaneReadiness::Unavailable
+            ) {
+                continue;
+            }
+            let Some(lease) = state.lease.as_ref() else {
+                continue;
+            };
+            if state.gpu_readiness != ContextLaneGpuReadiness::Ready
+                || state.gpu_revision != Some(lease.revision)
+            {
+                continue;
+            }
+            let Some(frame) = frames.iter().find(|frame| frame.key == lease.frame_key) else {
+                continue;
+            };
+            if !lease.source_viewport.interval().overlaps(target.interval()) {
+                continue;
+            }
+            project_context_lane_text(
+                lease.display.as_ref(),
+                lease.source_viewport,
+                target,
+                frame.top,
+                &mut projected,
+            );
+        }
+        self.projected = projected;
+    }
+
     pub(crate) fn gpu_publications(&self) -> impl Iterator<Item = ContextLaneGpuPublication<'_>> {
         self.lanes.iter().filter_map(|(key, state)| {
             if state.readiness == ContextLaneReadiness::Hidden {
@@ -625,6 +663,32 @@ pub(crate) fn project_context_lane_display(
     }));
 }
 
+fn project_context_lane_text(
+    source: &DisplayList,
+    source_viewport: Viewport,
+    target: Viewport,
+    frame_top: f32,
+    output: &mut DisplayList,
+) {
+    let source_bases_per_pixel = source_viewport.bases_per_pixel();
+    let target_bases_per_pixel = target.bases_per_pixel();
+    let target_width = target.pixel_width() as f32;
+    if !source_bases_per_pixel.is_finite()
+        || !target_bases_per_pixel.is_finite()
+        || source_bases_per_pixel <= 0.0
+        || target_bases_per_pixel <= 0.0
+    {
+        return;
+    }
+    output.texts.extend(source.texts.iter().filter_map(|text| {
+        let genomic = source_viewport.exact_start() + f64::from(text.x) * source_bases_per_pixel;
+        let mut text = text.clone();
+        text.x = ((genomic - target.exact_start()) / target_bases_per_pixel) as f32;
+        text.y += frame_top;
+        (text.x >= -128.0 && text.x <= target_width + 128.0).then_some(text)
+    }));
+}
+
 /// Uses the same user-facing side-buffer convention as alignment scenes: 100% means one visible
 /// viewport on each side. The optional cap is used by bounded sources such as FASTA.
 pub(crate) fn buffered_context_interval(
@@ -809,6 +873,36 @@ mod tests {
         assert_eq!(projected.rectangles[0].y, 45.0);
         assert_eq!(projected.texts[0].x, 200.0);
         assert_eq!(projected.texts[0].y, 49.0);
+    }
+
+    #[test]
+    fn camera_text_projection_does_not_rebuild_native_rectangles() {
+        let source_viewport = viewport(0, 3_000, 3_000.0);
+        let target = viewport(1_000, 2_000, 1_000.0);
+        let source = DisplayList {
+            rectangles: vec![RectPrimitive {
+                x: 1_100.0,
+                y: 5.0,
+                width: 200.0,
+                height: 8.0,
+                color: Rgba::new(1.0, 0.0, 0.0, 1.0),
+                object_id: 7,
+                shape: rgv_layout::RectShape::Rectangle,
+            }],
+            texts: vec![rgv_layout::TextPrimitive {
+                x: 1_200.0,
+                y: 9.0,
+                text: "GENE".to_owned(),
+                font_size: 10.0,
+                color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+            }],
+        };
+        let mut projected = DisplayList::default();
+        project_context_lane_text(&source, source_viewport, target, 50.0, &mut projected);
+        assert!(projected.rectangles.is_empty());
+        assert_eq!(projected.texts.len(), 1);
+        assert_eq!(projected.texts[0].x, 200.0);
+        assert_eq!(projected.texts[0].y, 59.0);
     }
 
     fn draft(key: ContextLaneKey, generation: u64, object_id: u32) -> ContextLaneDraft {

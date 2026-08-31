@@ -8,15 +8,16 @@ use std::{
 
 use rgv_alignment_scene::{
     AlignmentPresentationOwner, AlignmentPresentationSceneError, AlignmentPresentationStore,
-    AlignmentPresentationStoreError, AlignmentRowActivityProfile, AlignmentRowAtlasError,
-    AlignmentSceneCamera, AlignmentSceneSnapshot, AlignmentSceneSnapshotError,
-    AlignmentSourceRevision, AlleleSummaryDetail, CanonicalGenomicTile, ContractFingerprint,
-    EvidenceBuildError, EvidenceSelectionError, EvidenceStoreError, ExactAlleleSummaryError,
-    ExactDepthSummaryError, ExactFilterSummaryError, ExactJunctionSummaryError,
-    ExactModificationSummaryError, ExactPairSummaryError, ExactSummaryRootError, GeometryLod,
-    JunctionAnnotationIndex, LayoutContract, LedgerError, PayloadContract, PresentationContract,
-    PresentationStorePressure, ReferenceRevision, ReservationKind, RowAtlasRevision, SceneRevision,
-    SemanticPageError, StorePressure, SummaryContract, SummarySemanticPageError,
+    AlignmentPresentationStoreError, AlignmentRowActivityCursor, AlignmentRowActivityProfile,
+    AlignmentRowAtlasError, AlignmentSceneCamera, AlignmentSceneSnapshot,
+    AlignmentSceneSnapshotError, AlignmentSourceRevision, AlleleSummaryDetail,
+    CanonicalGenomicTile, ContractFingerprint, EvidenceBuildError, EvidenceSelectionError,
+    EvidenceStoreError, ExactAlleleSummaryError, ExactDepthSummaryError, ExactFilterSummaryError,
+    ExactJunctionSummaryError, ExactModificationSummaryError, ExactPairSummaryError,
+    ExactSummaryRootError, GeometryLod, JunctionAnnotationIndex, LayoutContract, LedgerError,
+    PayloadContract, PresentationContract, PresentationStorePressure, ReferenceRevision,
+    ReservationKind, RowAtlasRevision, SceneRevision, SemanticPageError, StorePressure,
+    SummaryContract, SummarySemanticPageError,
 };
 use rgv_core::{ContigId, GenomicInterval};
 use rgv_hts::ReferenceSlice;
@@ -398,6 +399,24 @@ pub struct AlignmentCoordinatorPressure {
     pub remaining_overage: usize,
 }
 
+/// One eviction-only pass across the source and semantic-page owners which share the alignment
+/// ledger. Unlike [`AlignmentCoordinatorPressure`], this never edits the configured budget: it
+/// merely asks this coordinator to release every legal inactive allocation until the aggregate
+/// ledger reaches `target_charged` or only protected ownership remains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AlignmentCoordinatorEviction {
+    pub target_charged: usize,
+    pub speculation_was_pending: bool,
+    pub active_speculation_aborted: bool,
+    pub presentation: PresentationStorePressure,
+    pub evidence: StorePressure,
+    pub charged_before: usize,
+    pub charged: usize,
+    pub pinned: usize,
+    pub released: usize,
+    pub remaining: usize,
+}
+
 /// Convenience façade for callers that display one lane from a source. It owns no scheduling,
 /// cache, or publication algorithm of its own: every operation delegates to the same source-level
 /// coordinator used by multi-panel desktop sessions.
@@ -564,6 +583,13 @@ where
     ) -> Result<AlignmentCoordinatorPressure, AlignmentSceneCoordinatorError<B::Error>> {
         self.source.reduce_budget(budget)
     }
+
+    pub fn evict_inactive_until(
+        &mut self,
+        target_charged: usize,
+    ) -> Result<AlignmentCoordinatorEviction, AlignmentSceneCoordinatorError<B::Error>> {
+        self.source.evict_inactive_until(target_charged)
+    }
 }
 
 /// Source-level coordinator event. A source actor is shared by all panel owners; publication is
@@ -657,7 +683,7 @@ struct AlignmentSceneSourceLane {
 #[derive(Clone, Debug)]
 struct AlignmentRowActivityCache {
     atlas_revision: RowAtlasRevision,
-    interval: GenomicInterval,
+    cursor: AlignmentRowActivityCursor,
     profile: Arc<AlignmentRowActivityProfile>,
 }
 
@@ -1212,6 +1238,60 @@ where
             remaining_overage: progress.charged.saturating_sub(budget),
         })
     }
+
+    /// Releases inactive source and semantic-page ownership toward an aggregate headroom goal
+    /// without changing policy. This is deliberately deterministic (presentation pages first,
+    /// then source/summary/layout caches), aborts optional read-ahead, and preserves every
+    /// published pin.
+    pub fn evict_inactive_until(
+        &mut self,
+        target_charged: usize,
+    ) -> Result<AlignmentCoordinatorEviction, AlignmentSceneCoordinatorError<B::Error>> {
+        let before = self
+            .actor
+            .store()
+            .ledger()
+            .progress()
+            .map_err(EvidenceStoreError::from)?;
+        let speculation_was_pending = self.actor.schedule().desired_speculation().is_some()
+            || self
+                .actor
+                .schedule()
+                .active()
+                .is_some_and(|work| work.kind() == crate::SourceIntentKind::Speculative);
+        let aborted = self.actor.abort_speculation();
+        if let Some(work) = &aborted
+            && let Some(lane) = self.lanes.get_mut(&work.intent().owner())
+        {
+            lane.telemetry.resource_pressure_speculation_aborts = lane
+                .telemetry
+                .resource_pressure_speculation_aborts
+                .saturating_add(1);
+        }
+        let presentation = self.presentation.evict_inactive_until(target_charged)?;
+        let evidence = self
+            .actor
+            .store_mut()
+            .evict_inactive_until(target_charged)?;
+        let progress = self
+            .actor
+            .store()
+            .ledger()
+            .progress()
+            .map_err(EvidenceStoreError::from)?;
+        Ok(AlignmentCoordinatorEviction {
+            target_charged,
+            speculation_was_pending,
+            active_speculation_aborted: aborted.is_some(),
+            presentation,
+            evidence,
+            charged_before: before.charged,
+            charged: progress.charged,
+            pinned: progress.pinned,
+            released: before.charged.saturating_sub(progress.charged),
+            remaining: progress.charged.saturating_sub(target_charged),
+        })
+    }
 }
 
 const fn presentation_owner(owner: SourceOwnerId) -> AlignmentPresentationOwner {
@@ -1607,29 +1687,39 @@ impl AlignmentSceneSourceLane {
 
         let atlas = scene.reads().atlas();
         let atlas_revision = atlas.revision();
-        if let Some(cached) = self.row_activity_cache.borrow().as_ref()
+        let max_bins = NonZeroUsize::new(ALIGNMENT_ROW_ACTIVITY_BINS)
+            .expect("the fixed row-activity bin bound is non-zero");
+        let mut cache = self.row_activity_cache.borrow_mut();
+        if let Some(cached) = cache.as_mut()
             && cached.atlas_revision == atlas_revision
-            && cached.interval == camera_interval
         {
-            return Some(Arc::clone(&cached.profile));
+            if cached.cursor.interval() == camera_interval {
+                return Some(Arc::clone(&cached.profile));
+            }
+            if cached.cursor.update(camera_interval) {
+                let profile = Arc::new(cached.cursor.profile(max_bins));
+                debug_assert!(alignment_row_activity_satisfies_contract(
+                    &profile,
+                    scene,
+                    camera_interval,
+                    &self.contract,
+                ));
+                cached.profile = Arc::clone(&profile);
+                return Some(profile);
+            }
         }
 
-        let profile = Arc::new(
-            atlas.activity_profile(
-                camera_interval,
-                NonZeroUsize::new(ALIGNMENT_ROW_ACTIVITY_BINS)
-                    .expect("the fixed row-activity bin bound is non-zero"),
-            )?,
-        );
+        let cursor = atlas.activity_cursor(camera_interval)?;
+        let profile = Arc::new(cursor.profile(max_bins));
         debug_assert!(alignment_row_activity_satisfies_contract(
             &profile,
             scene,
             camera_interval,
             &self.contract,
         ));
-        *self.row_activity_cache.borrow_mut() = Some(AlignmentRowActivityCache {
+        *cache = Some(AlignmentRowActivityCache {
             atlas_revision,
-            interval: camera_interval,
+            cursor,
             profile: Arc::clone(&profile),
         });
         Some(profile)

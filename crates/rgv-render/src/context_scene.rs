@@ -216,6 +216,19 @@ pub struct ContextSceneGpuPrepareReport {
     pub stats: ContextSceneGpuPrepareStats,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextSceneGpuCameraCaptureError {
+    /// The requested lane set or one content revision differs from resident immutable geometry.
+    /// The caller must run an explicit content-admission transaction before camera capture.
+    ContentReplacementRequired {
+        requested_lanes: usize,
+        resident_lanes: usize,
+    },
+    InvalidCamera {
+        key: ContextSceneGpuLaneKey,
+    },
+}
+
 struct ResidentContextLane {
     content_revision: u64,
     instance_buffer: wgpu::Buffer,
@@ -540,6 +553,80 @@ impl ContextSceneGpuRenderer {
         report.stats.resident_bytes = self.resident_bytes();
         self.last_prepare_stats = report.stats;
         report
+    }
+
+    /// Captures only camera/scissor/interaction state for an exactly resident contextual content
+    /// set. It does not inspect rectangle arrays, calculate admission bytes, form coherence
+    /// groups, create buffers, evict lanes, or upload immutable instances.
+    pub fn capture_camera_frame(
+        &mut self,
+        queue: &wgpu::Queue,
+        screen_size: [f32; 2],
+        requests: &[ContextSceneGpuLaneRequest<'_>],
+    ) -> Result<ContextSceneGpuPrepareReport, ContextSceneGpuCameraCaptureError> {
+        let exact_content = requests.len() == self.resident.len()
+            && requests.iter().all(|request| {
+                self.resident
+                    .get(&request.key)
+                    .is_some_and(|lane| lane.content_revision == request.content_revision)
+            })
+            && requests
+                .iter()
+                .map(|request| request.key)
+                .collect::<HashSet<_>>()
+                .len()
+                == requests.len();
+        if !exact_content {
+            return Err(
+                ContextSceneGpuCameraCaptureError::ContentReplacementRequired {
+                    requested_lanes: requests.len(),
+                    resident_lanes: self.resident.len(),
+                },
+            );
+        }
+
+        self.camera_sequence = self.camera_sequence.saturating_add(1);
+        let camera_slot = (self.camera_sequence as usize) % CAMERA_RING_SIZE;
+        let mut report = ContextSceneGpuPrepareReport {
+            stats: ContextSceneGpuPrepareStats {
+                requested_lanes: requests.len(),
+                reused_lanes: requests.len(),
+                resident_lanes: self.resident.len(),
+                resident_bytes: self.resident_bytes(),
+                ..ContextSceneGpuPrepareStats::default()
+            },
+            ..ContextSceneGpuPrepareReport::default()
+        };
+        for request in requests {
+            report
+                .frame
+                .publications
+                .push((request.key, request.content_revision));
+            if request.camera.scissor.is_empty() {
+                continue;
+            }
+            let Some(uniform) = context_camera_uniform(screen_size, request.camera) else {
+                return Err(ContextSceneGpuCameraCaptureError::InvalidCamera { key: request.key });
+            };
+            let lane = self
+                .resident
+                .get(&request.key)
+                .expect("exact contextual content residency was proven");
+            queue.write_buffer(
+                &lane.camera_buffers[camera_slot],
+                0,
+                bytemuck::bytes_of(&uniform),
+            );
+            report.stats.camera_writes = report.stats.camera_writes.saturating_add(1);
+            report.frame.draws.push(ContextSceneGpuDraw {
+                key: request.key,
+                content_revision: request.content_revision,
+                camera_slot,
+                scissor: request.camera.scissor,
+            });
+        }
+        self.last_prepare_stats = report.stats;
+        Ok(report)
     }
 
     pub fn render<'pass>(
@@ -971,24 +1058,41 @@ mod tests {
 
         let mut panned_camera = camera();
         panned_camera.target_exact_start += 25.5;
-        let camera_only = renderer.prepare(
-            &device,
-            &queue,
-            [1_000.0, 500.0],
-            &[ContextSceneGpuLaneRequest {
-                key: first_key,
-                content_revision: 1,
-                camera: panned_camera,
-                rectangles: &first_rectangles,
-                retained: None,
-                coherence_group: None,
-            }],
-            initial.stats.resident_bytes,
-        );
+        let camera_only = renderer
+            .capture_camera_frame(
+                &queue,
+                [1_000.0, 500.0],
+                &[ContextSceneGpuLaneRequest {
+                    key: first_key,
+                    content_revision: 1,
+                    camera: panned_camera,
+                    // Camera capture deliberately never reads semantic geometry.
+                    rectangles: &[],
+                    retained: None,
+                    coherence_group: None,
+                }],
+            )
+            .unwrap();
         assert_eq!(camera_only.stats.reused_lanes, 1);
         assert_eq!(camera_only.stats.uploaded_instances, 0);
         assert_eq!(camera_only.stats.uploaded_bytes, 0);
         assert_eq!(camera_only.stats.camera_writes, 1);
+
+        assert!(matches!(
+            renderer.capture_camera_frame(
+                &queue,
+                [1_000.0, 500.0],
+                &[ContextSceneGpuLaneRequest {
+                    key: first_key,
+                    content_revision: 2,
+                    camera: panned_camera,
+                    rectangles: &[],
+                    retained: None,
+                    coherence_group: None,
+                }],
+            ),
+            Err(ContextSceneGpuCameraCaptureError::ContentReplacementRequired { .. })
+        ));
 
         let second_rectangles = [rectangle(), rectangle()];
         let second_key = ContextSceneGpuLaneKey::new(1, 2);

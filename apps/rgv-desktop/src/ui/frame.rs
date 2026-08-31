@@ -3903,6 +3903,7 @@ impl Viewer {
             self.alignment_gpu_residency_bundle = None;
             self.alignment_gpu_prefetch.clear();
             self.alignment_gpu_publication_retry = None;
+            self.alignment_capacity_reclaim = None;
             self.alignment_gpu_renderer.discard_device_resources();
             self.alignment_summary_gpu_renderer
                 .discard_device_resources();

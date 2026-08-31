@@ -2488,7 +2488,7 @@ impl Viewer {
         {
             let panel = self.panels.active_mut();
             panel.context_scene.update_target_readiness(target);
-            panel.context_scene.project_content(target, &frames);
+            panel.context_scene.project_camera_text(target, &frames);
         }
         if !self.rebuild_active_panel_from_scroll_cache() {
             return false;
@@ -3054,13 +3054,29 @@ impl Viewer {
                     .into_iter()
             })
             .collect::<Vec<_>>();
-        let report = self.context_scene_gpu_renderer.prepare(
-            &self.device,
+        let report = match self.context_scene_gpu_renderer.capture_camera_frame(
             &self.queue,
             [logical_width, logical_height],
             &requests,
-            self.context_lane_gpu_budget_bytes,
-        );
+        ) {
+            Ok(report) => report,
+            Err(ContextSceneGpuCameraCaptureError::ContentReplacementRequired { .. }) => {
+                self.context_scene_gpu_renderer.prepare(
+                    &self.device,
+                    &self.queue,
+                    [logical_width, logical_height],
+                    &requests,
+                    self.context_lane_gpu_budget_bytes,
+                )
+            }
+            Err(ContextSceneGpuCameraCaptureError::InvalidCamera { key }) => {
+                self.data_status = format!(
+                    "Could not capture contextual lane {} camera state",
+                    key.lane
+                );
+                return;
+            }
+        };
         drop(requests);
 
         let mut semantic_projection_changed = false;

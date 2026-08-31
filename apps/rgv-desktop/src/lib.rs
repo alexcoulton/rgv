@@ -161,11 +161,12 @@ use rgv_render::{
     AlignmentSummaryGpuRenderer, AlignmentSummaryGpuReplacementError,
     AlignmentSummaryGpuResidencyLease, AlignmentSummaryGpuRetirement,
     AlignmentSummaryGpuSceneRequest, AlignmentSummaryJunctionComponentToken,
-    AlignmentSummaryJunctionInteraction, ContextSceneGpuCamera, ContextSceneGpuCoherenceKey,
-    ContextSceneGpuFrame, ContextSceneGpuLaneKey, ContextSceneGpuLaneRequest,
-    ContextSceneGpuRejection, ContextSceneGpuRejectionReason, ContextSceneGpuRenderer,
-    ContextSceneGpuRetainedLaneRequest, ContextSceneGpuScissor, GpuBudgetPressure, GpuReclaimGoal,
-    GpuReclaimReport, PrepareStats, RectangleRenderer, export_png,
+    AlignmentSummaryJunctionInteraction, ContextSceneGpuCamera, ContextSceneGpuCameraCaptureError,
+    ContextSceneGpuCoherenceKey, ContextSceneGpuFrame, ContextSceneGpuLaneKey,
+    ContextSceneGpuLaneRequest, ContextSceneGpuRejection, ContextSceneGpuRejectionReason,
+    ContextSceneGpuRenderer, ContextSceneGpuRetainedLaneRequest, ContextSceneGpuScissor,
+    GpuBudgetPressure, GpuReclaimGoal, GpuReclaimReport, PrepareStats, RectangleRenderer,
+    export_png,
 };
 use runtime::*;
 use sha2::{Digest as _, Sha256};
@@ -1200,7 +1201,6 @@ struct AlignmentGpuResidencyBundle {
     _summaries: Option<AlignmentSummaryGpuResidencyLease>,
 }
 
-#[derive(Default)]
 struct AlignmentGpuPrefetchState {
     reads: bool,
     summaries: bool,
@@ -1208,6 +1208,23 @@ struct AlignmentGpuPrefetchState {
     summary_cursor: Option<AlignmentSummaryGpuPrefetchCursor>,
     read_residency: Option<AlignmentGpuResidencyLease>,
     summary_residency: Option<AlignmentSummaryGpuResidencyLease>,
+    page_quantum: usize,
+    summaries_next: bool,
+}
+
+impl Default for AlignmentGpuPrefetchState {
+    fn default() -> Self {
+        Self {
+            reads: false,
+            summaries: false,
+            read_cursor: None,
+            summary_cursor: None,
+            read_residency: None,
+            summary_residency: None,
+            page_quantum: 1,
+            summaries_next: false,
+        }
+    }
 }
 
 /// A recoverable foreground GPU publication refusal. Keeping the original ledger error typed
@@ -1239,6 +1256,22 @@ struct AlignmentGpuPublicationRetry {
     attempt_sequence: u64,
     blocker: AlignmentGpuPublicationBlocker,
     gate: AlignmentGpuPublicationRetryGate,
+}
+
+/// One deterministic cross-owner reclaim cycle for an exact foreground publication. Every source
+/// engine gets at most one correlated eviction request. The cycle either creates enough exact
+/// headroom for one retry or settles as an interactive `BudgetLimited` result; it never polls or
+/// converts capacity pressure into source failure.
+#[derive(Clone, Debug)]
+struct AlignmentCapacityReclaimCycle {
+    request_id: u64,
+    target_revision: u64,
+    attempt_sequence: u64,
+    blocker: AlignmentGpuPublicationBlocker,
+    pressure: GpuBudgetPressure,
+    target_charged: usize,
+    pending_tracks: HashSet<TrackId>,
+    released_bytes: usize,
 }
 
 impl AlignmentGpuPrefetchState {
@@ -1298,6 +1331,8 @@ struct Viewer {
     alignment_gpu_residency_bundle: Option<AlignmentGpuResidencyBundle>,
     alignment_gpu_prefetch: AlignmentGpuPrefetchState,
     alignment_gpu_publication_retry: Option<AlignmentGpuPublicationRetry>,
+    alignment_capacity_reclaim: Option<AlignmentCapacityReclaimCycle>,
+    alignment_capacity_reclaim_clock: u64,
     alignment_gpu_speculation_gate: AlignmentGpuSpeculationGate,
     alignment_panel_scene_stores: HashMap<PanelId, AlignmentPanelSceneStore>,
     alignment_scene_owner_clock: u64,

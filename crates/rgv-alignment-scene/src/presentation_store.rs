@@ -333,12 +333,23 @@ impl AlignmentPresentationStore {
         budget: usize,
     ) -> Result<PresentationStorePressure, AlignmentPresentationStoreError> {
         self.ledger.set_budget(budget)?;
+        self.evict_inactive_until(budget)
+    }
+
+    /// Releases inactive semantic pages toward a shared-ledger headroom target without changing
+    /// the user policy. This is the owner-local half of aggregate foreground reclaim: another
+    /// owner may have encountered pressure even though this store still owns the oldest legal
+    /// eviction candidate.
+    pub fn evict_inactive_until(
+        &mut self,
+        target_charged: usize,
+    ) -> Result<PresentationStorePressure, AlignmentPresentationStoreError> {
         let mut evicted_read_pages = 0_usize;
         let mut evicted_summary_pages = 0_usize;
 
         loop {
             let snapshot = self.ledger.snapshot()?;
-            if snapshot.charged <= budget {
+            if snapshot.charged <= target_charged {
                 break;
             }
             let pins = snapshot
@@ -363,13 +374,13 @@ impl AlignmentPresentationStore {
 
         let snapshot = self.ledger.snapshot()?;
         Ok(PresentationStorePressure {
-            budget,
+            budget: target_charged,
             evicted_read_pages,
             evicted_summary_pages,
             charged: snapshot.charged,
             pinned: snapshot.pinned,
             pinned_overage: snapshot.pinned_overage,
-            remaining_overage: snapshot.charged.saturating_sub(budget),
+            remaining_overage: snapshot.charged.saturating_sub(target_charged),
         })
     }
 

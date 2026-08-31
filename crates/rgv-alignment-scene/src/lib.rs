@@ -127,9 +127,9 @@ pub use revision::{
     SourceFingerprint, SummaryRevision,
 };
 pub use row_atlas::{
-    AlignmentRowActivityBin, AlignmentRowActivityProfile, AlignmentRowAtlas,
-    AlignmentRowAtlasError, AlignmentRowAtlasPins, AlignmentRowConnector, RowAtlasRecord,
-    RowAtlasRecordHit, RowExtent,
+    AlignmentRowActivityBin, AlignmentRowActivityCursor, AlignmentRowActivityProfile,
+    AlignmentRowActivityUpdateStats, AlignmentRowAtlas, AlignmentRowAtlasError,
+    AlignmentRowAtlasPins, AlignmentRowConnector, RowAtlasRecord, RowAtlasRecordHit, RowExtent,
 };
 pub use row_oracle::{AlignmentRowGroup, AlignmentRowGroupKey, RowOracleError};
 pub use scene_camera::{AlignmentSceneCamera, AlignmentSceneCameraError, AlignmentSceneRowDemand};

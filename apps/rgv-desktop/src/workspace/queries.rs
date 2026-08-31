@@ -2152,6 +2152,16 @@ impl Viewer {
                         self.alignment_tracks[track_index].scene_budget_retry = None;
                     }
                 }
+                AlignmentSceneEngineEvent::InactiveEvicted {
+                    request_id,
+                    eviction,
+                } => {
+                    self.observe_alignment_capacity_reclaim(
+                        track_id,
+                        request_id,
+                        eviction.released,
+                    );
+                }
                 AlignmentSceneEngineEvent::Error {
                     owner,
                     request_token,

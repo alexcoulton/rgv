@@ -521,6 +521,8 @@ impl Viewer {
             alignment_gpu_residency_bundle: None,
             alignment_gpu_prefetch: AlignmentGpuPrefetchState::default(),
             alignment_gpu_publication_retry: None,
+            alignment_capacity_reclaim: None,
+            alignment_capacity_reclaim_clock: 0,
             alignment_gpu_speculation_gate: AlignmentGpuSpeculationGate::default(),
             alignment_panel_scene_stores,
             alignment_scene_owner_clock: 0,

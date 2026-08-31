@@ -1,8 +1,38 @@
 use super::super::*;
 
-// A scheduling quantum, not a residency cap. Prepared pages continue across redraws until the
-// complete immutable scene is warm or the shared ledger declines the next batch.
-const ALIGNMENT_GPU_PREFETCH_PAGES_PER_FRAME: usize = 6;
+// Optional work begins at one cancellable page and adapts from measured wall time. This is a
+// scheduler target, not a correctness timeout or residency cap.
+const ALIGNMENT_GPU_PREFETCH_TARGET_QUANTUM: Duration = Duration::from_millis(2);
+const ALIGNMENT_GPU_PREFETCH_MAXIMUM_PAGES_PER_QUANTUM: usize = 64;
+
+impl AlignmentGpuPrefetchState {
+    fn maximum_pages(&self) -> NonZeroUsize {
+        NonZeroUsize::new(
+            self.page_quantum
+                .clamp(1, ALIGNMENT_GPU_PREFETCH_MAXIMUM_PAGES_PER_QUANTUM),
+        )
+        .expect("the adaptive prefetch quantum is non-zero")
+    }
+
+    fn observe_quantum(&mut self, elapsed: Duration, processed_pages: usize) {
+        if processed_pages == 0 || elapsed.is_zero() {
+            return;
+        }
+        let measured = ALIGNMENT_GPU_PREFETCH_TARGET_QUANTUM
+            .as_nanos()
+            .saturating_mul(processed_pages as u128)
+            .checked_div(elapsed.as_nanos().max(1))
+            .unwrap_or(1)
+            .clamp(1, ALIGNMENT_GPU_PREFETCH_MAXIMUM_PAGES_PER_QUANTUM as u128)
+            as usize;
+        let lower = self.page_quantum.saturating_div(2).max(1);
+        let upper = self
+            .page_quantum
+            .saturating_mul(2)
+            .clamp(1, ALIGNMENT_GPU_PREFETCH_MAXIMUM_PAGES_PER_QUANTUM);
+        self.page_quantum = measured.clamp(lower, upper);
+    }
+}
 
 #[derive(Clone)]
 struct CapturedAlignmentLaneSource {
@@ -21,6 +51,7 @@ struct CapturedAlignmentLaneSource {
 struct CapturedAlignmentPanelSceneEpoch {
     panel_frames: HashMap<PanelId, AlignmentPanelSceneFrame>,
     lane_sources: Vec<CapturedAlignmentLaneSource>,
+    panel_scene_stores: HashMap<PanelId, AlignmentPanelSceneStore>,
 }
 
 enum AlignmentGpuCameraCaptureOutcome {
@@ -480,16 +511,12 @@ fn alignment_gpu_bundle_budget_pressure(
             occupied,
             retiring,
             limit,
-        } if candidate <= limit => Some(GpuBudgetPressure::from_budget_failure(
+        } => Some(GpuBudgetPressure::from_budget_failure(
             candidate,
             occupied.saturating_sub(retiring),
             0,
             limit,
         )),
-        // No amount of unrelated cache eviction can make an intrinsically oversized
-        // steady-state candidate fit. Treat this as terminal instead of manufacturing a
-        // misleading reclaim goal from the old bundle's retirement credit.
-        AllocationBundleError::SteadyBudgetExceeded { .. } => None,
         AllocationBundleError::TransitionOverlapBudgetExceeded {
             candidate,
             occupied,
@@ -499,6 +526,17 @@ fn alignment_gpu_bundle_budget_pressure(
         )),
         _ => None,
     }
+}
+
+const fn alignment_gpu_budget_pressure_blocker(
+    pressure: GpuBudgetPressure,
+) -> AlignmentGpuPublicationBlocker {
+    AlignmentGpuPublicationBlocker::Ledger(LedgerError::BudgetExceeded {
+        requested: pressure.requested_bytes,
+        charged: pressure.charged_bytes_at_failure,
+        reserved: pressure.reserved_bytes_at_failure,
+        limit: pressure.limit_bytes,
+    })
 }
 
 /// Translates retained shared-ledger pressure into the exact headroom goal understood by both GPU
@@ -648,7 +686,7 @@ impl AlignmentGpuSpeculationGate {
 
 #[cfg(test)]
 mod alignment_gpu_policy_tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use rgv_alignment_scene::{
         AlignmentPageFamily, AlignmentPageKey, AlignmentSourceRevision, CanonicalGenomicTile,
@@ -659,8 +697,9 @@ mod alignment_gpu_policy_tests {
     use rgv_render::{GpuBudgetPressure, GpuReclaimGoal};
 
     use super::{
-        AlignmentGpuPreparedAuthority, AlignmentGpuReclaimOutcome, AlignmentGpuSpeculationGate,
-        AlignmentGpuSpeculationPhase, alignment_gpu_bundle_budget_pressure,
+        AlignmentGpuPrefetchState, AlignmentGpuPreparedAuthority, AlignmentGpuReclaimOutcome,
+        AlignmentGpuSpeculationGate, AlignmentGpuSpeculationPhase,
+        alignment_gpu_bundle_budget_pressure,
     };
     use rgv_alignment_scene::AllocationBundleError;
 
@@ -757,7 +796,7 @@ mod alignment_gpu_policy_tests {
     }
 
     #[test]
-    fn intrinsically_oversized_steady_candidate_does_not_request_cache_reclaim() {
+    fn intrinsically_oversized_steady_candidate_retains_typed_capacity_pressure() {
         for (occupied, retiring) in [(128, 64), (4_096, 3_500)] {
             let error = AllocationBundleError::SteadyBudgetExceeded {
                 candidate: 1_001,
@@ -765,8 +804,25 @@ mod alignment_gpu_policy_tests {
                 retiring,
                 limit: 1_000,
             };
-            assert_eq!(alignment_gpu_bundle_budget_pressure(&error), None);
+            let pressure = alignment_gpu_bundle_budget_pressure(&error)
+                .expect("an oversized exact candidate remains typed capacity pressure");
+            assert_eq!(pressure.requested_bytes, 1_001);
+            assert!(
+                !GpuReclaimGoal::new(pressure, occupied.saturating_sub(retiring)).is_feasible()
+            );
         }
+    }
+
+    #[test]
+    fn optional_prefetch_quantum_adapts_gradually_from_measured_wall_time() {
+        let mut state = AlignmentGpuPrefetchState::default();
+        assert_eq!(state.maximum_pages().get(), 1);
+        state.observe_quantum(Duration::from_micros(100), 1);
+        assert_eq!(state.maximum_pages().get(), 2);
+        state.observe_quantum(Duration::from_micros(100), 2);
+        assert_eq!(state.maximum_pages().get(), 4);
+        state.observe_quantum(Duration::from_millis(100), 4);
+        assert_eq!(state.maximum_pages().get(), 2);
     }
 }
 
@@ -801,6 +857,166 @@ impl Viewer {
         }
     }
 
+    /// Starts one aggregate foreground-reclaim cycle after the renderer-local owners have
+    /// exhausted their legal eviction candidates. Each live source engine is asked exactly once
+    /// to release inactive semantic/source ownership toward the same ledger target. The existing
+    /// typed retry gate prevents redraws from reopening the GPU transaction while replies arrive.
+    fn defer_alignment_gpu_publication_for_cross_owner_reclaim(
+        &mut self,
+        attempt: &AlignmentScenePublicationAttempt,
+        navigation_candidates: &[AlignmentCommittedLaneAuthority],
+        pressure: GpuBudgetPressure,
+    ) {
+        let blocker = alignment_gpu_budget_pressure_blocker(pressure);
+        self.wait_alignment_navigation_transactions_for_gpu(navigation_candidates);
+        self.defer_alignment_gpu_publication(attempt, blocker);
+
+        let snapshot = match self.alignment_scene_ledger.progress() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.alignment_capacity_reclaim = None;
+                self.data_status =
+                    format!("Could not inspect aggregate alignment capacity: {error}");
+                return;
+            }
+        };
+        if !alignment_gpu_publication_blocker_remains(blocker, &snapshot) {
+            // Renderer-local reclaim already crossed the exact threshold after the failure was
+            // captured. The deferred gate is Ready and will issue the one permitted retry.
+            return;
+        }
+
+        self.alignment_capacity_reclaim_clock = self
+            .alignment_capacity_reclaim_clock
+            .checked_add(1)
+            .expect("alignment capacity reclaim request space was exhausted");
+        let request_id = self.alignment_capacity_reclaim_clock;
+        let target_occupied = pressure
+            .limit_bytes
+            .saturating_sub(pressure.requested_bytes);
+        let target_charged = target_occupied.saturating_sub(snapshot.reserved);
+        let mut pending_tracks = HashSet::new();
+        for track in &self.alignment_tracks {
+            let Some(engine) = &track.scene_engine else {
+                continue;
+            };
+            if engine
+                .try_evict_inactive_for_headroom(request_id, target_charged)
+                .is_ok()
+            {
+                pending_tracks.insert(track.config.id);
+            }
+        }
+        self.alignment_capacity_reclaim = Some(AlignmentCapacityReclaimCycle {
+            request_id,
+            target_revision: attempt.target_revision,
+            attempt_sequence: attempt.sequence,
+            blocker,
+            pressure,
+            target_charged,
+            pending_tracks,
+            released_bytes: 0,
+        });
+        self.data_status = "Reclaiming inactive alignment cache for the current view…".to_owned();
+        self.finish_alignment_capacity_reclaim_if_complete();
+    }
+
+    pub(crate) fn observe_alignment_capacity_reclaim(
+        &mut self,
+        track_id: TrackId,
+        request_id: u64,
+        released_bytes: usize,
+    ) {
+        let completed = {
+            let Some(cycle) = self.alignment_capacity_reclaim.as_mut() else {
+                return;
+            };
+            if cycle.request_id != request_id || !cycle.pending_tracks.remove(&track_id) {
+                return;
+            }
+            cycle.released_bytes = cycle.released_bytes.saturating_add(released_bytes);
+            cycle.pending_tracks.is_empty()
+        };
+        if completed {
+            self.finish_alignment_capacity_reclaim_if_complete();
+        }
+    }
+
+    fn finish_alignment_capacity_reclaim_if_complete(&mut self) {
+        let Some(cycle) = self.alignment_capacity_reclaim.as_ref() else {
+            return;
+        };
+        if !cycle.pending_tracks.is_empty() {
+            return;
+        }
+        let cycle = self
+            .alignment_capacity_reclaim
+            .take()
+            .expect("the completed aggregate reclaim cycle still exists");
+        if cycle.target_revision
+            != self
+                .alignment_scene_publication_authority
+                .desired_target_revision()
+            || cycle.attempt_sequence
+                != self
+                    .alignment_scene_publication_authority
+                    .attempt_sequence()
+        {
+            return;
+        }
+        let snapshot = match self.alignment_scene_ledger.progress() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.alignment_gpu_publication_retry = None;
+                self.data_status =
+                    format!("Could not inspect aggregate alignment capacity: {error}");
+                return;
+            }
+        };
+        if !alignment_gpu_publication_blocker_remains(cycle.blocker, &snapshot) {
+            if let Some(retry) = self.alignment_gpu_publication_retry.as_mut()
+                && retry.target_revision == cycle.target_revision
+                && retry.attempt_sequence == cycle.attempt_sequence
+            {
+                retry.gate = AlignmentGpuPublicationRetryGate::ReadyAfterObservedProgress;
+            }
+            tracing::debug!(
+                request_id = cycle.request_id,
+                released_bytes = cycle.released_bytes,
+                target_charged = cycle.target_charged,
+                "aggregate alignment reclaim satisfied foreground headroom"
+            );
+            self.window.request_redraw();
+            return;
+        }
+
+        self.alignment_gpu_publication_retry = None;
+        let remaining_bytes = snapshot
+            .charged
+            .saturating_add(snapshot.reserved)
+            .saturating_add(cycle.pressure.requested_bytes)
+            .saturating_sub(cycle.pressure.limit_bytes);
+        let message = format!(
+            "Complete alignment presentation is cache-budget limited: {} MiB additional capacity is required ({} MiB configured)",
+            remaining_bytes.saturating_add((1 << 20) - 1) >> 20,
+            cycle.pressure.limit_bytes >> 20,
+        );
+        tracing::warn!(
+            request_id = cycle.request_id,
+            released_bytes = cycle.released_bytes,
+            remaining_bytes,
+            charged_bytes = snapshot.charged,
+            reserved_bytes = snapshot.reserved,
+            pinned_bytes = snapshot.pinned,
+            target_charged = cycle.target_charged,
+            "aggregate alignment reclaim exhausted every registered owner"
+        );
+        self.settle_alignment_navigation_gpu_budget_limited(&message);
+        self.data_status = message;
+        self.display_dirty = true;
+        self.window.request_redraw();
+    }
+
     /// Polls a typed foreground refusal without converting the render loop into a retry clock.
     /// The exact latest target/attempt is retried once after ledger progress; unchanged epochs do
     /// nothing, and a newer attempt discards stale retry authority.
@@ -827,6 +1043,7 @@ impl Viewer {
         ) {
             AlignmentGpuPublicationRetryPoll::Superseded => {
                 self.alignment_gpu_publication_retry = None;
+                self.alignment_capacity_reclaim = None;
             }
             AlignmentGpuPublicationRetryPoll::Waiting(updated) => {
                 self.alignment_gpu_publication_retry = Some(updated);
@@ -837,6 +1054,7 @@ impl Viewer {
                     "retrying alignment GPU publication after ledger progress"
                 );
                 self.alignment_gpu_publication_retry = None;
+                self.alignment_capacity_reclaim = None;
                 self.prepare_alignment_scene_frame_atomic();
             }
         }
@@ -1455,6 +1673,23 @@ impl Viewer {
         self.synchronize_alignment_pending_mirrors();
     }
 
+    fn settle_alignment_navigation_gpu_budget_limited(&mut self, message: &str) {
+        for track in &mut self.alignment_tracks {
+            for projection in track.projections.values_mut() {
+                if projection.navigation.phase() == AlignmentNavigationPhase::WaitingForGpuPressure
+                {
+                    projection.navigation.transition(
+                        AlignmentNavigationPhase::BudgetLimited,
+                        Arc::<str>::from(message),
+                    );
+                    projection.finish_checking();
+                    projection.unavailable = None;
+                }
+            }
+        }
+        self.synchronize_alignment_pending_mirrors();
+    }
+
     /// Ensures the scroll/display derivative catches up after the semantic/native epoch commits.
     /// Worker polling historically rebuilt this cache before GPU publication, which could leave
     /// a Pending or old-target full thumb beside newly committed exact pixels indefinitely.
@@ -1732,6 +1967,16 @@ impl Viewer {
             );
             return;
         };
+        if self
+            .alignment_capacity_reclaim
+            .as_ref()
+            .is_some_and(|cycle| {
+                cycle.target_revision != attempt.target_revision
+                    || cycle.attempt_sequence != attempt.sequence
+            })
+        {
+            self.alignment_capacity_reclaim = None;
+        }
         let target_revision = attempt.target_revision;
         let publication_attempt_sequence = attempt.sequence;
         tracing::trace!(
@@ -1837,6 +2082,7 @@ impl Viewer {
                 "alignment publication attempt was superseded during synchronous preparation"
             );
             self.commit_alignment_navigation_transactions(&bundle);
+            self.alignment_panel_scene_stores = candidate_epoch.panel_scene_stores;
             self.alignment_presented_epoch = Some(PresentedAlignmentEpoch::new(
                 candidate_epoch.panel_frames,
                 bundle,
@@ -1875,6 +2121,7 @@ impl Viewer {
                     "alignment publication attempt was superseded during synchronous preparation"
                 );
                 self.commit_alignment_navigation_transactions(&bundle);
+                self.alignment_panel_scene_stores = candidate_epoch.panel_scene_stores;
                 self.alignment_presented_epoch = Some(PresentedAlignmentEpoch::new(
                     candidate_epoch.panel_frames,
                     bundle,
@@ -1963,9 +2210,26 @@ impl Viewer {
                             lane_authorities,
                             read_authorities,
                         ),
-                    Ok(outcome) => Err(AlignmentGpuBundleFailure::terminal(format!(
-                        "alignment GPU replacement could not reclaim sufficient capacity: {outcome:?}"
-                    ))),
+                    Ok(AlignmentGpuReclaimOutcome::Insufficient { .. }) => {
+                        self.defer_alignment_gpu_publication_for_cross_owner_reclaim(
+                            &attempt,
+                            &navigation_candidates,
+                            pressure,
+                        );
+                        return;
+                    }
+                    Ok(AlignmentGpuReclaimOutcome::Infeasible { required_bytes, .. }) => {
+                        self.wait_alignment_navigation_transactions_for_gpu(&navigation_candidates);
+                        let message = format!(
+                            "Complete alignment presentation is cache-budget limited: the minimum exact presentation exceeds the configured capacity by {} MiB",
+                            required_bytes.saturating_add((1 << 20) - 1) >> 20,
+                        );
+                        self.settle_alignment_navigation_gpu_budget_limited(&message);
+                        self.data_status = message;
+                        self.display_dirty = true;
+                        self.window.request_redraw();
+                        return;
+                    }
                     Err(error) => Err(AlignmentGpuBundleFailure::terminal(format!(
                         "could not coordinate alignment GPU cache reclaim: {error}"
                     ))),
@@ -1986,6 +2250,7 @@ impl Viewer {
                     "alignment publication attempt was superseded during synchronous preparation"
                 );
                 self.commit_alignment_navigation_transactions(&bundle);
+                self.alignment_panel_scene_stores = candidate_epoch.panel_scene_stores;
                 self.alignment_presented_epoch = Some(PresentedAlignmentEpoch::new(
                     candidate_epoch.panel_frames,
                     bundle,
@@ -2031,6 +2296,10 @@ impl Viewer {
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         let mut captured = HashMap::new();
         let mut lane_sources = Vec::new();
+        // The complete semantic panel authority remains private until native GPU publication
+        // succeeds. A rejected/superseded candidate drops this clone and leaves the committed
+        // store byte-for-byte unchanged.
+        let mut panel_scene_stores = self.alignment_panel_scene_stores.clone();
         for panel_id in panel_ids {
             let Some((panel_viewport, contig_name)) = self
                 .panels
@@ -2198,10 +2467,7 @@ impl Viewer {
                     continue;
                 }
             };
-            let store = self
-                .alignment_panel_scene_stores
-                .entry(panel_id)
-                .or_default();
+            let store = panel_scene_stores.entry(panel_id).or_default();
             store.replace_visible_tracks(track_ids.iter().copied());
             if let Err(error) = store.set_coherence_groups(coherence_groups) {
                 self.data_status = format!("Could not set alignment coherence groups: {error}");
@@ -2244,6 +2510,7 @@ impl Viewer {
         CapturedAlignmentPanelSceneEpoch {
             panel_frames: captured,
             lane_sources,
+            panel_scene_stores,
         }
     }
 
@@ -2903,6 +3170,12 @@ impl Viewer {
     /// recaptures a panel epoch, replaces a foreground frame, or increments the camera revision;
     /// repeated redraw quanta therefore accumulate rather than retiring one another.
     pub(crate) fn advance_current_alignment_gpu_prefetch(&mut self) {
+        if self.alignment_optional_work_must_yield() {
+            // Preserve the retargetable cursors and already useful overlap, but do not request a
+            // further redraw from optional work. Input/source/GPU completion will naturally wake
+            // the render loop and resume warming after foreground ownership settles.
+            return;
+        }
         let target_revision = self
             .alignment_scene_publication_authority
             .desired_target_revision();
@@ -3032,6 +3305,21 @@ impl Viewer {
         );
     }
 
+    fn alignment_optional_work_must_yield(&self) -> bool {
+        self.alignment_gpu_publication_retry.is_some()
+            || self.alignment_capacity_reclaim.is_some()
+            || self.panels.iter().any(|panel| {
+                panel.navigation_query_schedule.gesture_active
+                    || panel.navigation_query_schedule.pending.is_some()
+            })
+            || self.alignment_tracks.iter().any(|track| {
+                track
+                    .projections
+                    .values()
+                    .any(|projection| projection.navigation.phase().owner().is_some())
+            })
+    }
+
     fn advance_alignment_gpu_prefetch(
         &mut self,
         read_requests: &[AlignmentGpuSceneRequest<'_>],
@@ -3046,12 +3334,22 @@ impl Viewer {
         }
 
         let mut pressure = false;
+        let maximum_pages = self.alignment_gpu_prefetch.maximum_pages();
+        let summaries_next = self.alignment_gpu_prefetch.summaries_next;
+        let advance_reads = self.alignment_gpu_prefetch.reads
+            && (!self.alignment_gpu_prefetch.summaries || !summaries_next);
+        let advance_summaries = self.alignment_gpu_prefetch.summaries
+            && (!self.alignment_gpu_prefetch.reads || summaries_next);
+        let quantum_started = Instant::now();
+        let mut processed_pages = 0_usize;
+        let mut attempted_quantum = false;
         let read_authority_complete = read_requests.iter().all(|request| {
             let total_rows = u32::try_from(request.scene.atlas().row_count()).unwrap_or(u32::MAX);
             let rows = request.scene.prepared_rows();
             rows.start == 0 && rows.end == total_rows
         });
-        if self.alignment_gpu_prefetch.reads {
+        if advance_reads {
+            attempted_quantum = true;
             let cursor = self
                 .alignment_gpu_prefetch
                 .read_cursor
@@ -3065,10 +3363,11 @@ impl Viewer {
                     cursor,
                     &self.alignment_scene_ledger,
                     publication_attempt_sequence,
-                    NonZeroUsize::new(ALIGNMENT_GPU_PREFETCH_PAGES_PER_FRAME)
-                        .expect("alignment GPU prefetch quantum is non-zero"),
+                    maximum_pages,
                 ) {
                 Ok(prefetch) => {
+                    processed_pages =
+                        processed_pages.saturating_add(prefetch.admission.requested_pages);
                     self.alignment_gpu_prefetch.reads = prefetch.missing_pages_remain;
                     if prefetch.is_complete() {
                         let cursor = self
@@ -3099,7 +3398,8 @@ impl Viewer {
             }
         }
 
-        if self.alignment_gpu_prefetch.summaries && !pressure {
+        if advance_summaries && !pressure {
+            attempted_quantum = true;
             let cursor = self
                 .alignment_gpu_prefetch
                 .summary_cursor
@@ -3113,10 +3413,11 @@ impl Viewer {
                     cursor,
                     &self.alignment_scene_ledger,
                     publication_attempt_sequence,
-                    NonZeroUsize::new(ALIGNMENT_GPU_PREFETCH_PAGES_PER_FRAME)
-                        .expect("alignment summary GPU prefetch quantum is non-zero"),
+                    maximum_pages,
                 ) {
                 Ok(prefetch) => {
+                    processed_pages =
+                        processed_pages.saturating_add(prefetch.admission.requested_pages);
                     self.alignment_gpu_prefetch.summaries = prefetch.missing_pages_remain;
                     if prefetch.is_complete() {
                         let cursor = self
@@ -3143,6 +3444,12 @@ impl Viewer {
                     tracing::debug!(%error, "summary GPU prefetch yielded to foreground capacity");
                 }
             }
+        }
+
+        if attempted_quantum {
+            self.alignment_gpu_prefetch
+                .observe_quantum(quantum_started.elapsed(), processed_pages);
+            self.alignment_gpu_prefetch.summaries_next = !summaries_next;
         }
 
         if pressure {
@@ -4126,6 +4433,7 @@ impl Viewer {
         self.alignment_gpu_residency_bundle = None;
         self.alignment_gpu_prefetch.clear();
         self.alignment_gpu_publication_retry = None;
+        self.alignment_capacity_reclaim = None;
         self.alignment_gpu_speculation_gate.reset();
         self.alignment_scene_publication_authority.reset();
     }

@@ -3908,16 +3908,39 @@ impl AlignmentSummaryGpuRenderer {
         (AlignmentSummaryGpuFrame, AlignmentSummaryGpuPrepareStats),
         AlignmentSummaryGpuPrepareError,
     > {
-        self.prepare_internal(device, queue, requests, Some(ledger), None, true)
+        for request in requests {
+            validate_summary_request(request)?;
+        }
+        let page_manifest = Self::prepared_page_keys(requests)?;
+        self.record_content_manifest_build(page_manifest.len());
+        let authority = AlignmentSummaryGpuContentAuthority {
+            device_generation: self.device_generation,
+            scene_revisions: requests
+                .iter()
+                .map(|request| request.scene.revision())
+                .collect::<Vec<_>>()
+                .into(),
+            scene_allocations: requests
+                .iter()
+                .map(|request| request.scene.metadata_allocation().id())
+                .collect::<Vec<_>>()
+                .into(),
+            content_selectors: summary_content_selectors(requests).into(),
+            page_manifest: page_manifest.into(),
+        };
+        self.capture_resident_camera_frame(device, queue, requests, ledger, &authority, true)
     }
 
-    fn prepare_internal(
+    /// Builds a camera/options frame over a previously minted immutable summary authority. It is
+    /// structurally unable to enumerate the prepared content manifest, admit/retire pages, or
+    /// open a replacement bundle. Slot growth is reserved for initial publication only.
+    fn capture_resident_camera_frame(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         requests: &[AlignmentSummaryGpuSceneRequest<'_>],
-        ledger: Option<&AllocationLedger>,
-        existing_content_authority: Option<&AlignmentSummaryGpuContentAuthority>,
+        ledger: &AllocationLedger,
+        content_authority: &AlignmentSummaryGpuContentAuthority,
         allow_slot_growth: bool,
     ) -> Result<
         (AlignmentSummaryGpuFrame, AlignmentSummaryGpuPrepareStats),
@@ -3926,22 +3949,7 @@ impl AlignmentSummaryGpuRenderer {
         for request in requests {
             validate_summary_request(request)?;
         }
-        let prepared_page_keys = existing_content_authority
-            .is_none()
-            .then(|| Self::prepared_page_keys(requests))
-            .transpose()?;
-        if let Some(prepared_page_keys) = &prepared_page_keys {
-            self.record_content_manifest_build(prepared_page_keys.len());
-        }
-        let prepared_page_count = existing_content_authority.map_or_else(
-            || {
-                prepared_page_keys
-                    .as_ref()
-                    .expect("new summary content authority requires a prepared-page manifest")
-                    .len()
-            },
-            |authority| authority.page_manifest.len(),
-        );
+        let prepared_page_count = content_authority.page_manifest.len();
         let covered = requests
             .iter()
             .map(summary_covered_interval)
@@ -4054,15 +4062,11 @@ impl AlignmentSummaryGpuRenderer {
                         .saturating_add(size_of::<u32>()),
                 ),
             );
-        let _scratch = ledger
-            .map(|ledger| {
-                ledger.reserve_transient(
-                    TransientResourceClass::GpuUpload,
-                    scratch_bytes,
-                    ReservationKind::Transition,
-                )
-            })
-            .transpose()?;
+        let _scratch = ledger.reserve_transient(
+            TransientResourceClass::GpuUpload,
+            scratch_bytes,
+            ReservationKind::Transition,
+        )?;
         let maximum_frame_bytes = alignment_summary_gpu_frame_bytes(
             requests.len(),
             prepared_page_count,
@@ -4075,7 +4079,7 @@ impl AlignmentSummaryGpuRenderer {
         let frame_buffers = if allow_slot_growth {
             self.acquire_frame_buffers(
                 device,
-                ledger.expect("growing a summary frame slot requires a shared ledger"),
+                ledger,
                 uniform_count,
                 overlay_count,
                 maximum_frame_bytes,
@@ -4088,7 +4092,6 @@ impl AlignmentSummaryGpuRenderer {
         let mut overlays = Vec::with_capacity(overlay_count);
         let mut pending_overlay_draws = Vec::with_capacity(overlay_draws);
         let mut scene_revisions = Vec::with_capacity(requests.len());
-        let mut scene_allocations = Vec::with_capacity(requests.len());
         let mut camera_sequences = Vec::with_capacity(requests.len());
         for ((((request, pages), covered), scale_maximum), junction_metrics) in requests
             .iter()
@@ -4098,7 +4101,6 @@ impl AlignmentSummaryGpuRenderer {
             .zip(junction_metrics.iter().copied())
         {
             scene_revisions.push(request.scene.revision());
-            scene_allocations.push(request.scene.metadata_allocation().id());
             camera_sequences.push(request.camera_sequence);
             for page_request in pages {
                 let page = self
@@ -4317,24 +4319,13 @@ impl AlignmentSummaryGpuRenderer {
             });
         }
         pins.push(frame_buffers.frame_allocation.pin()?);
-        let content_authority = existing_content_authority.cloned().unwrap_or_else(|| {
-            AlignmentSummaryGpuContentAuthority {
-                device_generation: self.device_generation,
-                scene_revisions: scene_revisions.clone().into(),
-                scene_allocations: scene_allocations.into(),
-                content_selectors: summary_content_selectors(requests).into(),
-                page_manifest: prepared_page_keys
-                    .expect("new summary content authority requires a prepared-page manifest")
-                    .into(),
-            }
-        });
         let frame = AlignmentSummaryGpuFrame {
             revision: next_revision,
             device_generation: self.device_generation,
             scene_revisions: scene_revisions.into(),
             camera_sequences: camera_sequences.into(),
             resolved_depth_scales: resolved_depth_scales.into(),
-            content_authority,
+            content_authority: content_authority.clone(),
             draws: draws.into(),
             overlay_draws: prepared_overlays.into(),
             buffers: frame_buffers,
@@ -4450,14 +4441,8 @@ impl AlignmentSummaryGpuRenderer {
 
         // Retain exact transient scratch accounting while selecting only a precharged retained
         // frame slot. Transient work does not participate in replacement-bundle single flight.
-        let result = self.prepare_internal(
-            device,
-            queue,
-            requests,
-            Some(ledger),
-            Some(authority),
-            false,
-        );
+        let result =
+            self.capture_resident_camera_frame(device, queue, requests, ledger, authority, false);
         let (mut frame, stats) = match result {
             Ok(prepared) => prepared,
             Err(AlignmentSummaryGpuPrepareError::FrameSlotBusy { slots }) => {

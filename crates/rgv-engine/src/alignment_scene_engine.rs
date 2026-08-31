@@ -20,11 +20,12 @@ use rgv_hts::{
 
 use crate::alignment_scene_coordinator::coordinator_budget_pressure;
 use crate::{
-    AlignmentCoordinatorFrame, AlignmentCoordinatorPressure, AlignmentCoordinatorUpdate,
-    AlignmentReferenceAuthority, AlignmentSceneBuildContract, AlignmentSceneCoordinatorConfigError,
-    AlignmentSceneCoordinatorTelemetry, AlignmentScenePreparationPolicy,
-    AlignmentSceneSourceCoordinator, AlignmentSourceActor, CanonicalAlignmentSourceBackend,
-    EngineQueueError, LocalBamCanonicalBackend, SourceIntentKind, SourceOwnerId,
+    AlignmentCoordinatorEviction, AlignmentCoordinatorFrame, AlignmentCoordinatorPressure,
+    AlignmentCoordinatorUpdate, AlignmentReferenceAuthority, AlignmentSceneBuildContract,
+    AlignmentSceneCoordinatorConfigError, AlignmentSceneCoordinatorTelemetry,
+    AlignmentScenePreparationPolicy, AlignmentSceneSourceCoordinator, AlignmentSourceActor,
+    CanonicalAlignmentSourceBackend, EngineQueueError, LocalBamCanonicalBackend, SourceIntentKind,
+    SourceOwnerId,
     mailbox::{CoalescingReceiver, CoalescingSender, TryMailboxSendError, bounded_coalescing},
 };
 
@@ -63,6 +64,7 @@ pub enum AlignmentSceneEngineOperation {
     PrewarmPresentation,
     SetSourceControl,
     ReduceBudget,
+    EvictInactive,
     PumpSource,
     PumpPresentation,
     RetryResourcePressure,
@@ -171,6 +173,12 @@ pub enum AlignmentSceneEngineEvent {
     BudgetReduced {
         pressure: AlignmentCoordinatorPressure,
     },
+    /// An eviction-only answer from one source/semantic owner participating in an aggregate
+    /// foreground reclaim. The configured ledger policy is unchanged.
+    InactiveEvicted {
+        request_id: u64,
+        eviction: AlignmentCoordinatorEviction,
+    },
     /// A source-local budget reduction was temporarily blocked by the workspace-shared ledger's
     /// prepared GPU replacement. No budget was reported as applied and no lane/source is failed.
     /// The requested value plus the observed policy identity let the desktop discard stale edits
@@ -244,6 +252,10 @@ enum AlignmentSceneEngineRequest<C> {
     SetSourceControl(C),
     ReduceBudget {
         budget: usize,
+    },
+    EvictInactive {
+        request_id: u64,
+        target_charged: usize,
     },
     ClearCacheBudget {
         restore_budget: usize,
@@ -439,6 +451,27 @@ where
 
     pub fn try_reduce_budget(&self, budget: usize) -> Result<(), EngineQueueError> {
         self.try_control(AlignmentSceneEngineRequest::ReduceBudget { budget })
+    }
+
+    /// Asks this source/semantic owner to yield inactive cache capacity without mutating the
+    /// workspace budget. Foreground GPU admission calls this across every registered engine.
+    pub fn try_evict_inactive_for_headroom(
+        &self,
+        request_id: u64,
+        target_charged: usize,
+    ) -> Result<(), EngineQueueError> {
+        let Some(input) = &self.input else {
+            return Err(EngineQueueError::Disconnected);
+        };
+        input
+            .send_latest_system(
+                2,
+                AlignmentSceneEngineRequest::EvictInactive {
+                    request_id,
+                    target_charged,
+                },
+            )
+            .map_err(|_| EngineQueueError::Disconnected)
     }
 
     /// Runs the cache-clear budget pulse as one ordered worker transaction. It must not be
@@ -1302,6 +1335,25 @@ where
                 ),
             }
         }
+        AlignmentSceneEngineRequest::EvictInactive {
+            request_id,
+            target_charged,
+        } => match coordinator.evict_inactive_until(target_charged) {
+            Ok(eviction) => send_control(
+                output,
+                AlignmentSceneEngineEvent::InactiveEvicted {
+                    request_id,
+                    eviction,
+                },
+            ),
+            Err(error) => send_error(
+                output,
+                None,
+                None,
+                AlignmentSceneEngineOperation::EvictInactive,
+                error,
+            ),
+        },
         AlignmentSceneEngineRequest::ClearCacheBudget { restore_budget } => {
             match coordinator.reduce_budget(0) {
                 Ok(_) => match coordinator.reduce_budget(restore_budget) {
@@ -1959,6 +2011,32 @@ mod tests {
             .clone();
         assert!(!observed.is_empty());
         assert!(observed.into_iter().all(|worker| worker != caller));
+    }
+
+    #[test]
+    fn eviction_only_control_preserves_the_configured_budget_and_correlates_its_answer() {
+        let (engine, _, _, _, _) = test_engine();
+        let before = engine.ledger().progress().unwrap();
+
+        engine
+            .try_evict_inactive_for_headroom(73, before.charged.saturating_sub(1))
+            .unwrap();
+        let event = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::InactiveEvicted { request_id: 73, .. }
+            )
+        });
+        let AlignmentSceneEngineEvent::InactiveEvicted {
+            request_id,
+            eviction,
+        } = event
+        else {
+            unreachable!()
+        };
+        assert_eq!(request_id, 73);
+        assert_eq!(eviction.target_charged, before.charged.saturating_sub(1));
+        assert_eq!(engine.ledger().progress().unwrap().budget, before.budget);
     }
 
     #[test]

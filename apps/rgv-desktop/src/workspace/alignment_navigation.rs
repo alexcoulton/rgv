@@ -28,6 +28,7 @@ pub(crate) enum AlignmentNavigationProductState {
     Running,
     Ready,
     Pressure,
+    BudgetLimited,
     Unavailable,
     Failed,
     Superseded,
@@ -67,6 +68,7 @@ pub(crate) enum AlignmentNavigationPhase {
     WaitingForSourcePressure,
     CandidateReady,
     WaitingForGpuPressure,
+    BudgetLimited,
     Committed,
     IndexOverview,
     Unavailable,
@@ -83,6 +85,7 @@ impl AlignmentNavigationPhase {
             Self::CandidateReady => Some(AlignmentNavigationOwner::GpuCandidate),
             Self::WaitingForGpuPressure => Some(AlignmentNavigationOwner::GpuPressure),
             Self::Dormant
+            | Self::BudgetLimited
             | Self::Committed
             | Self::IndexOverview
             | Self::Unavailable
@@ -95,6 +98,7 @@ impl AlignmentNavigationPhase {
         matches!(
             self,
             Self::Committed
+                | Self::BudgetLimited
                 | Self::IndexOverview
                 | Self::Unavailable
                 | Self::Failed
@@ -105,7 +109,11 @@ impl AlignmentNavigationPhase {
     pub(crate) const fn is_settled_current(self) -> bool {
         matches!(
             self,
-            Self::Committed | Self::IndexOverview | Self::Unavailable | Self::Failed
+            Self::Committed
+                | Self::IndexOverview
+                | Self::Unavailable
+                | Self::Failed
+                | Self::BudgetLimited
         )
     }
 
@@ -117,6 +125,7 @@ impl AlignmentNavigationPhase {
             Self::WaitingForSourcePressure => "Waiting for alignment cache capacity",
             Self::CandidateReady => "Preparing alignment presentation",
             Self::WaitingForGpuPressure => "Waiting for GPU cache capacity",
+            Self::BudgetLimited => "Alignment presentation exceeds the cache budget",
             Self::Committed => "Alignment presentation committed",
             Self::IndexOverview => "Index-only alignment overview",
             Self::Unavailable => "Alignment target unavailable",
@@ -473,6 +482,14 @@ impl AlignmentNavigationTransaction {
             AlignmentNavigationPhase::WaitingForGpuPressure => {
                 self.products.gpu = Product::Pressure;
             }
+            AlignmentNavigationPhase::BudgetLimited => {
+                self.products.source = Product::Ready;
+                if self.products.row_atlas != Product::NotRequired {
+                    self.products.row_atlas = Product::Ready;
+                }
+                self.products.semantic_pages = Product::Ready;
+                self.products.gpu = Product::BudgetLimited;
+            }
             AlignmentNavigationPhase::Committed => {
                 self.products.source = Product::Ready;
                 if self.products.row_atlas != Product::NotRequired {
@@ -541,13 +558,22 @@ const fn alignment_navigation_transition_is_legal(
         ),
         Phase::CandidateReady => matches!(
             to,
-            Phase::Committed | Phase::WaitingForGpuPressure | Phase::Failed | Phase::Superseded
+            Phase::Committed
+                | Phase::WaitingForGpuPressure
+                | Phase::BudgetLimited
+                | Phase::Failed
+                | Phase::Superseded
         ),
         Phase::WaitingForGpuPressure => matches!(
             to,
-            Phase::CandidateReady | Phase::Committed | Phase::Failed | Phase::Superseded
+            Phase::CandidateReady
+                | Phase::Committed
+                | Phase::BudgetLimited
+                | Phase::Failed
+                | Phase::Superseded
         ),
         Phase::Committed
+        | Phase::BudgetLimited
         | Phase::IndexOverview
         | Phase::Unavailable
         | Phase::Failed
@@ -698,6 +724,38 @@ mod tests {
             transaction.journal().count(),
             ALIGNMENT_NAVIGATION_JOURNAL_CAPACITY
         );
+    }
+
+    #[test]
+    fn exhausted_gpu_capacity_settles_without_becoming_source_unavailable() {
+        let mut transaction = AlignmentNavigationTransaction::default();
+        transaction.begin(1, AlignmentSceneRequestToken::new(10), "target");
+        transaction.bind_camera(camera(100));
+        transaction.transition(AlignmentNavigationPhase::Running, "source accepted target");
+        transaction.transition(
+            AlignmentNavigationPhase::CandidateReady,
+            "semantic candidate ready",
+        );
+        transaction.transition(
+            AlignmentNavigationPhase::WaitingForGpuPressure,
+            "aggregate reclaim",
+        );
+        transaction.transition(
+            AlignmentNavigationPhase::BudgetLimited,
+            "protected minimum cannot fit",
+        );
+
+        assert!(transaction.is_current_settled(1));
+        assert_eq!(transaction.phase(), AlignmentNavigationPhase::BudgetLimited);
+        assert_eq!(
+            transaction.diagnostic().products.source,
+            AlignmentNavigationProductState::Ready
+        );
+        assert_eq!(
+            transaction.diagnostic().products.gpu,
+            AlignmentNavigationProductState::BudgetLimited
+        );
+        assert_eq!(transaction.diagnostic().owner, None);
     }
 
     #[test]

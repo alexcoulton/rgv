@@ -11,14 +11,15 @@ mod source_actor;
 mod track_engine;
 
 pub use alignment_scene_coordinator::{
-    AlignmentCoordinatorFrame, AlignmentCoordinatorPressure, AlignmentCoordinatorPump,
-    AlignmentCoordinatorUpdate, AlignmentIndividualReadCapability, AlignmentPresentationPump,
-    AlignmentReferenceAuthority, AlignmentReferenceInstallOutcome, AlignmentReferenceRequirement,
-    AlignmentSceneBuildContract, AlignmentSceneCoordinator, AlignmentSceneCoordinatorConfigError,
-    AlignmentSceneCoordinatorError, AlignmentSceneCoordinatorTelemetry,
-    AlignmentSceneOwnerPressure, AlignmentSceneOwnerPublication, AlignmentSceneOwnerRefusal,
-    AlignmentSceneOwnerRetry, AlignmentSceneOwnerWorkState, AlignmentScenePreparationPolicy,
-    AlignmentSceneSourceCoordinator, AlignmentSceneSourcePump, AlignmentVerticalResidency,
+    AlignmentCoordinatorEviction, AlignmentCoordinatorFrame, AlignmentCoordinatorPressure,
+    AlignmentCoordinatorPump, AlignmentCoordinatorUpdate, AlignmentIndividualReadCapability,
+    AlignmentPresentationPump, AlignmentReferenceAuthority, AlignmentReferenceInstallOutcome,
+    AlignmentReferenceRequirement, AlignmentSceneBuildContract, AlignmentSceneCoordinator,
+    AlignmentSceneCoordinatorConfigError, AlignmentSceneCoordinatorError,
+    AlignmentSceneCoordinatorTelemetry, AlignmentSceneOwnerPressure,
+    AlignmentSceneOwnerPublication, AlignmentSceneOwnerRefusal, AlignmentSceneOwnerRetry,
+    AlignmentSceneOwnerWorkState, AlignmentScenePreparationPolicy, AlignmentSceneSourceCoordinator,
+    AlignmentSceneSourcePump, AlignmentVerticalResidency,
     alignment_row_activity_satisfies_contract,
 };
 pub use alignment_scene_engine::{

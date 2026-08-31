@@ -64,11 +64,11 @@ pub use alignment_summary::{
     project_alignment_summary_modification_instance,
 };
 pub use context_scene::{
-    ContextSceneGpuCamera, ContextSceneGpuCoherenceKey, ContextSceneGpuFrame,
-    ContextSceneGpuLaneKey, ContextSceneGpuLaneRequest, ContextSceneGpuPrepareReport,
-    ContextSceneGpuPrepareStats, ContextSceneGpuRejection, ContextSceneGpuRejectionReason,
-    ContextSceneGpuRenderer, ContextSceneGpuRetainedLaneRequest, ContextSceneGpuScissor,
-    project_context_scene_rectangle,
+    ContextSceneGpuCamera, ContextSceneGpuCameraCaptureError, ContextSceneGpuCoherenceKey,
+    ContextSceneGpuFrame, ContextSceneGpuLaneKey, ContextSceneGpuLaneRequest,
+    ContextSceneGpuPrepareReport, ContextSceneGpuPrepareStats, ContextSceneGpuRejection,
+    ContextSceneGpuRejectionReason, ContextSceneGpuRenderer, ContextSceneGpuRetainedLaneRequest,
+    ContextSceneGpuScissor, project_context_scene_rectangle,
 };
 
 /// Renderer-local progress from one cooperative shared-ledger reclaim pass. Retained byte
@@ -167,7 +167,8 @@ impl GpuReclaimGoal {
     /// An intrinsically oversized candidate must fail without purging unrelated caches.
     #[must_use]
     pub const fn is_feasible(self) -> bool {
-        self.required_reclaim_bytes() <= self.baseline_occupied_bytes
+        self.pressure.requested_bytes <= self.pressure.limit_bytes
+            && self.required_reclaim_bytes() <= self.baseline_occupied_bytes
     }
 }
 

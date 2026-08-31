@@ -1116,6 +1116,15 @@ impl EvidenceStore {
     /// Pinned current evidence is never destroyed and remains visible as explicit pinned overage.
     pub fn reduce_budget(&mut self, budget: usize) -> Result<StorePressure, EvidenceStoreError> {
         self.ledger.set_budget(budget)?;
+        self.evict_inactive_until(budget)
+    }
+
+    /// Releases reloadable inactive source/summary/layout cache ownership without changing the
+    /// configured ledger policy. Current evidence remains protected by its published pins.
+    pub fn evict_inactive_until(
+        &mut self,
+        target_charged: usize,
+    ) -> Result<StorePressure, EvidenceStoreError> {
         self.acquisitions
             .sort_by_key(|cached| cached.admitted_revision);
         self.chunks.sort_by_key(|cached| cached.admitted_revision);
@@ -1137,7 +1146,7 @@ impl EvidenceStore {
         let mut evicted_chunks = 0;
         let mut evicted_exact_summaries = 0;
         let mut evicted_row_atlases = 0;
-        while self.ledger.snapshot()?.charged > budget {
+        while self.ledger.snapshot()?.charged > target_charged {
             if !self.row_atlases.is_empty() {
                 self.row_atlases.remove(0);
                 evicted_row_atlases += 1;
