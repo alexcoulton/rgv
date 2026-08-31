@@ -9,8 +9,8 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use rgv_core::{
-    CopyNumberTrackSettings, GenerationClock, InteractionTrackSettings, PanelGeneration, TrackId,
-    VariantTrackSettings,
+    CopyNumberTrackSettings, GenerationClock, GenomicInterval, InteractionTrackSettings,
+    PanelGeneration, TrackId, VariantTrackSettings,
 };
 use rgv_hts::{
     BigBedFeatureFormat, BigBedSource, BigWigSource, CopyNumberQuery, FeatureFormat, FeatureRecord,
@@ -116,7 +116,16 @@ pub enum TrackEngineEvent {
     },
     QueryCompleted {
         request: PanelGeneration,
-        tracks: Vec<TrackSnapshot>,
+        /// Exact buffered horizon used to build every snapshot in this publication.
+        interval: GenomicInterval,
+        /// Successfully published lane identities. Lane payloads arrive independently before
+        /// this settlement marker and are never combined into a panel-wide data authority.
+        completed: Vec<TrackId>,
+    },
+    LaneCompleted {
+        request: PanelGeneration,
+        interval: GenomicInterval,
+        track: TrackSnapshot,
     },
     SearchCompleted {
         generation: u64,
@@ -141,8 +150,7 @@ enum TrackEngineRequest {
         request: PanelGeneration,
         clock: GenerationClock,
         contig: String,
-        start: u64,
-        end: u64,
+        interval: GenomicInterval,
         track_ids: Option<Vec<TrackId>>,
         variant_settings: Vec<(TrackId, VariantTrackSettings)>,
         interaction_settings: Vec<(TrackId, InteractionTrackSettings)>,
@@ -259,15 +267,13 @@ impl TrackEngine {
         request: PanelGeneration,
         clock: GenerationClock,
         contig: String,
-        start: u64,
-        end: u64,
+        interval: GenomicInterval,
     ) -> Result<(), EngineQueueError> {
         self.try_query_with_settings(
             request,
             clock,
             contig,
-            start,
-            end,
+            interval,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -279,16 +285,14 @@ impl TrackEngine {
         request: PanelGeneration,
         clock: GenerationClock,
         contig: String,
-        start: u64,
-        end: u64,
+        interval: GenomicInterval,
         variant_settings: Vec<(TrackId, VariantTrackSettings)>,
     ) -> Result<(), EngineQueueError> {
         self.try_query_with_settings(
             request,
             clock,
             contig,
-            start,
-            end,
+            interval,
             variant_settings,
             Vec::new(),
             Vec::new(),
@@ -301,8 +305,7 @@ impl TrackEngine {
         request: PanelGeneration,
         clock: GenerationClock,
         contig: String,
-        start: u64,
-        end: u64,
+        interval: GenomicInterval,
         variant_settings: Vec<(TrackId, VariantTrackSettings)>,
         interaction_settings: Vec<(TrackId, InteractionTrackSettings)>,
         copy_number_settings: Vec<(TrackId, CopyNumberTrackSettings)>,
@@ -311,8 +314,7 @@ impl TrackEngine {
             request,
             clock,
             contig,
-            start,
-            end,
+            interval,
             None,
             variant_settings,
             interaction_settings,
@@ -326,8 +328,7 @@ impl TrackEngine {
         request: PanelGeneration,
         clock: GenerationClock,
         contig: String,
-        start: u64,
-        end: u64,
+        interval: GenomicInterval,
         track_ids: Vec<TrackId>,
         variant_settings: Vec<(TrackId, VariantTrackSettings)>,
         interaction_settings: Vec<(TrackId, InteractionTrackSettings)>,
@@ -337,8 +338,7 @@ impl TrackEngine {
             request,
             clock,
             contig,
-            start,
-            end,
+            interval,
             Some(track_ids),
             variant_settings,
             interaction_settings,
@@ -352,8 +352,7 @@ impl TrackEngine {
         request: PanelGeneration,
         clock: GenerationClock,
         contig: String,
-        start: u64,
-        end: u64,
+        interval: GenomicInterval,
         track_ids: Option<Vec<TrackId>>,
         variant_settings: Vec<(TrackId, VariantTrackSettings)>,
         interaction_settings: Vec<(TrackId, InteractionTrackSettings)>,
@@ -367,8 +366,7 @@ impl TrackEngine {
                 request,
                 clock,
                 contig,
-                start,
-                end,
+                interval,
                 track_ids,
                 variant_settings,
                 interaction_settings,
@@ -515,8 +513,7 @@ fn worker_loop(
                 request,
                 clock,
                 contig,
-                start,
-                end,
+                interval,
                 track_ids,
                 variant_settings,
                 interaction_settings,
@@ -527,8 +524,7 @@ fn worker_loop(
                 &clock,
                 request,
                 &contig,
-                start,
-                end,
+                interval,
                 track_ids.as_deref(),
                 &variant_settings,
                 &interaction_settings,
@@ -851,8 +847,7 @@ fn query_tracks(
     clock: &GenerationClock,
     request: PanelGeneration,
     contig: &str,
-    start: u64,
-    end: u64,
+    interval: GenomicInterval,
     track_ids: Option<&[TrackId]>,
     variant_settings: &[(TrackId, VariantTrackSettings)],
     interaction_settings: &[(TrackId, InteractionTrackSettings)],
@@ -862,7 +857,7 @@ fn query_tracks(
         return;
     }
     let selected = track_ids.map(|ids| ids.iter().copied().collect::<HashSet<_>>());
-    let mut snapshots = Vec::with_capacity(selected.as_ref().map_or(tracks.len(), HashSet::len));
+    let mut completed = Vec::with_capacity(selected.as_ref().map_or(tracks.len(), HashSet::len));
     for track in tracks {
         if !clock.is_current(request.generation()) {
             break;
@@ -876,13 +871,23 @@ fn query_tracks(
         match query_track(
             track,
             contig,
-            start,
-            end,
+            interval.start(),
+            interval.end(),
             variant_settings,
             interaction_settings,
             copy_number_settings,
         ) {
-            Ok(snapshot) => snapshots.push(snapshot),
+            Ok(snapshot) => {
+                completed.push(snapshot.id);
+                send_event(
+                    output,
+                    TrackEngineEvent::LaneCompleted {
+                        request,
+                        interval,
+                        track: snapshot,
+                    },
+                );
+            }
             Err((id, message)) => send_event(
                 output,
                 TrackEngineEvent::Error {
@@ -898,7 +903,8 @@ fn query_tracks(
             output,
             TrackEngineEvent::QueryCompleted {
                 request,
-                tracks: snapshots,
+                interval,
+                completed,
             },
         );
     }
@@ -1150,6 +1156,9 @@ fn send_event(output: &CoalescingSender<TrackEngineEvent>, event: TrackEngineEve
         TrackEngineEvent::QueryCompleted { request, .. } => {
             output.send_latest_for(request.panel_id().get(), event)
         }
+        TrackEngineEvent::LaneCompleted { request, track, .. } => {
+            output.send_latest_system_for(request.panel_id().get(), track.id.get(), event)
+        }
         TrackEngineEvent::SearchCompleted { .. } => output.send_latest_for(u64::MAX, event),
         TrackEngineEvent::AdjacentFeatureCompleted { .. } => {
             output.send_latest_for(u64::MAX - 1, event)
@@ -1163,7 +1172,7 @@ fn send_event(output: &CoalescingSender<TrackEngineEvent>, event: TrackEngineEve
 
 #[cfg(test)]
 mod tests {
-    use rgv_core::{PanelId, ViewportGeneration};
+    use rgv_core::{ContigId, GenomicInterval, PanelId, ViewportGeneration};
 
     use super::*;
 
@@ -1226,9 +1235,15 @@ mod tests {
 
     fn receive_query(engine: &TrackEngine, timeout_message: &str) -> Vec<TrackSnapshot> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut tracks = Vec::new();
         while std::time::Instant::now() < deadline {
             match engine.try_receive().unwrap() {
-                Some(TrackEngineEvent::QueryCompleted { tracks, .. }) => return tracks,
+                Some(TrackEngineEvent::LaneCompleted { track, .. }) => tracks.push(track),
+                Some(TrackEngineEvent::QueryCompleted { completed, .. }) => {
+                    tracks.retain(|track| completed.contains(&track.id));
+                    tracks.sort_by_key(|track| track.id);
+                    return tracks;
+                }
                 Some(_) | None => std::thread::yield_now(),
             }
         }
@@ -1247,8 +1262,7 @@ mod tests {
                 request,
                 clock,
                 "chr1".to_owned(),
-                100,
-                120,
+                GenomicInterval::new(ContigId::new(0), 100, 120).unwrap(),
                 track_ids,
                 Vec::new(),
                 Vec::new(),
@@ -1276,7 +1290,8 @@ mod tests {
                         PanelId::new(1),
                         ViewportGeneration::new(generation),
                     ),
-                    tracks: Vec::new(),
+                    interval: GenomicInterval::new(ContigId::new(0), 100, 120).unwrap(),
+                    completed: Vec::new(),
                 },
             );
         }
@@ -1289,7 +1304,8 @@ mod tests {
             receiver.try_receive().unwrap(),
             Some(TrackEngineEvent::QueryCompleted {
                 request: PanelGeneration::new(PanelId::new(1), ViewportGeneration::new(32),),
-                tracks: Vec::new(),
+                interval: GenomicInterval::new(ContigId::new(0), 100, 120).unwrap(),
+                completed: Vec::new(),
             })
         );
         assert_eq!(receiver.try_receive().unwrap(), None);
@@ -1306,7 +1322,8 @@ mod tests {
                 &output,
                 TrackEngineEvent::QueryCompleted {
                     request,
-                    tracks: Vec::new(),
+                    interval: GenomicInterval::new(ContigId::new(0), 100, 120).unwrap(),
+                    completed: Vec::new(),
                 },
             );
         }
@@ -1315,14 +1332,16 @@ mod tests {
             receiver.try_receive().unwrap(),
             Some(TrackEngineEvent::QueryCompleted {
                 request: request(2, 1),
-                tracks: Vec::new(),
+                interval: GenomicInterval::new(ContigId::new(0), 100, 120).unwrap(),
+                completed: Vec::new(),
             })
         );
         assert_eq!(
             receiver.try_receive().unwrap(),
             Some(TrackEngineEvent::QueryCompleted {
                 request: request(1, 2),
-                tracks: Vec::new(),
+                interval: GenomicInterval::new(ContigId::new(0), 100, 120).unwrap(),
+                completed: Vec::new(),
             })
         );
         assert_eq!(receiver.try_receive().unwrap(), None);
@@ -1712,7 +1731,12 @@ mod tests {
         let clock = GenerationClock::default();
         let request = PanelGeneration::new(PanelId::new(1), clock.current());
         engine
-            .try_query(request, clock, "chr1".to_owned(), 100, 120)
+            .try_query(
+                request,
+                clock,
+                "chr1".to_owned(),
+                GenomicInterval::new(ContigId::new(0), 100, 120).unwrap(),
+            )
             .unwrap();
         let snapshots = receive_query(&engine, "TDF actor query timed out");
         assert_eq!(snapshots.len(), 2);
@@ -1738,18 +1762,28 @@ mod tests {
         let clock = GenerationClock::default();
         let request = PanelGeneration::new(PanelId::new(1), clock.current());
         engine
-            .try_query(request, clock, "chr1".to_owned(), 100, 120)
+            .try_query(
+                request,
+                clock,
+                "chr1".to_owned(),
+                GenomicInterval::new(ContigId::new(0), 100, 120).unwrap(),
+            )
             .unwrap();
         deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut removed = false;
+        let mut lane_snapshots = Vec::new();
         let mut snapshots = None;
         while std::time::Instant::now() < deadline && (!removed || snapshots.is_none()) {
             match engine.try_receive().unwrap() {
                 Some(TrackEngineEvent::TracksRemoved { ids }) => {
                     removed = ids == [TrackId::new(30)];
                 }
-                Some(TrackEngineEvent::QueryCompleted { tracks, .. }) => {
-                    snapshots = Some(tracks);
+                Some(TrackEngineEvent::LaneCompleted { track, .. }) => {
+                    lane_snapshots.push(track);
+                }
+                Some(TrackEngineEvent::QueryCompleted { completed, .. }) => {
+                    lane_snapshots.retain(|track| completed.contains(&track.id));
+                    snapshots = Some(std::mem::take(&mut lane_snapshots));
                 }
                 Some(_) | None => std::thread::yield_now(),
             }

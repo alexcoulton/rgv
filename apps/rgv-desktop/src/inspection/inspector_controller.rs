@@ -99,31 +99,16 @@ impl Viewer {
         {
             return retained.inspector.clone();
         }
-        let track_id = scene_hit.map_or_else(
-            || {
-                panel
-                    .selected_alignment_track
-                    .unwrap_or_else(|| self.primary_alignment_track_id())
-            },
-            |hit| hit.track,
-        );
-        let legacy_index = if scene_hit.is_none() {
-            Some(panel.selected_record?)
-        } else {
-            None
-        };
-        let query = legacy_index.and_then(|_| self.complete_read_query_for_track(track_id));
-        let scene_snapshot = scene_hit
-            .and_then(|_| self.alignment_scene_snapshot_for_panel_track(panel.id, track_id));
-        let record = if let Some(hit) = scene_hit {
-            scene_snapshot?
-                .inspect_retained(hit.handle)
-                .ok()
-                .flatten()?
-        } else {
-            query?.materialize_record(legacy_index?).ok()?
-        };
-        let reference = query.and_then(|query| query.reference.as_ref());
+        let hit = scene_hit?;
+        let track_id = hit.track;
+        let scene_snapshot = self.alignment_scene_snapshot_for_panel_track(panel.id, track_id)?;
+        let record = scene_snapshot.inspect_retained(hit.handle).ok().flatten()?;
+        let reference = panel.reference_slice.as_deref().filter(|slice| {
+            scene_snapshot.reads().presentation().reference == panel.reference_slice_revision
+                && slice.interval.contig() == scene_snapshot.prepared_interval().contig()
+                && slice.interval.start() <= record.start
+                && slice.interval.end() >= record.end
+        });
         let mate = match (record.mate_contig, record.mate_start) {
             (Some(contig_id), Some(position)) => {
                 let name = self
@@ -154,34 +139,13 @@ impl Viewer {
             |calls| calls.len().to_string(),
         );
         let selected_filters = self.alignment_filters_for_track(track_id);
-        let selected_event = scene_hit
-            .and_then(|hit| alignment_component_event(hit.component, &record))
-            .or_else(|| {
-                let index = legacy_index?;
-                panel
-                    .selected_read_event
-                    .filter(|event| event.record_index == index)
-                    .map(|event| (event.operation_index, event.operation_offset))
-            });
+        let selected_event = alignment_component_event(hit.component, &record);
         let selected_operation_index = selected_event.map(|(operation_index, _)| operation_index);
-        let pair_bounds = query.map_or_else(
-            || {
-                scene_snapshot.map_or(
-                    TemplateLengthBounds {
-                        minimum: selected_filters.minimum_template_length,
-                        maximum: selected_filters.maximum_template_length,
-                    },
-                    |snapshot| {
-                        snapshot
-                            .reads()
-                            .atlas()
-                            .layout_contract()
-                            .pair_length_bounds
-                    },
-                )
-            },
-            |query| effective_template_length_bounds_for_filters(&selected_filters, query),
-        );
+        let pair_bounds = scene_snapshot
+            .reads()
+            .atlas()
+            .layout_contract()
+            .pair_length_bounds;
         let pair = pair_evidence(
             &record,
             self.panels.active().viewport.interval(),
@@ -346,8 +310,23 @@ impl Viewer {
             }
         }
         if let AlignmentColorMode::Ultima(options) = selected_filters.alignment_color_mode {
-            let read_group =
-                legacy_index.and_then(|index| query.and_then(|query| query.read_group(index)));
+            let read_group_id = record.auxiliary_fields.iter().find_map(|field| {
+                (field.tag == *b"RG")
+                    .then_some(&field.value)
+                    .and_then(|value| {
+                        if let AuxValue::String(value) = value {
+                            Some(value.as_bytes())
+                        } else {
+                            None
+                        }
+                    })
+            });
+            let read_group = self
+                .alignment_tracks
+                .iter()
+                .find(|track| track.config.id == track_id)
+                .and_then(|track| track.scene_metadata.as_ref())
+                .and_then(|metadata| read_group_id.and_then(|id| metadata.header.read_group(id)));
             let (maximum_homopolymer_length, maximum_source) =
                 options.maximum_homopolymer_length_override.map_or_else(
                     || {
@@ -548,23 +527,6 @@ impl Viewer {
         })
     }
 
-    pub(crate) fn effective_template_length_bounds(
-        &self,
-        query: &AlignmentQuery,
-    ) -> TemplateLengthBounds {
-        let inferred = query.pairs.inferred_bounds.unwrap_or_default();
-        TemplateLengthBounds {
-            minimum: self
-                .primary_alignment_filters()
-                .minimum_template_length
-                .or(inferred.minimum),
-            maximum: self
-                .primary_alignment_filters()
-                .maximum_template_length
-                .or(inferred.maximum),
-        }
-    }
-
     #[allow(clippy::too_many_lines)]
     pub(crate) fn pileup_inspector_snapshot(&self) -> Option<InspectorSnapshot> {
         if !self
@@ -586,12 +548,40 @@ impl Viewer {
             .active()
             .selected_alignment_track
             .unwrap_or_else(|| self.primary_alignment_track_id());
-        let query = self.alignment_query_for_track(track_id)?;
-        let (index, bin) = query.pileup.bin_at(query.interval, position)?;
-        let bin_interval = query.pileup.bin_interval(query.interval, index)?;
-        let reference_base = (bin_interval.len() == 1)
-            .then(|| query.reference.as_ref()?.base_at(bin_interval.start()))
-            .flatten();
+        let scene = self
+            .presented_alignment_lane(self.panels.active().id, track_id)
+            .and_then(|presented| presented.lane.snapshot.as_ref())?;
+        let site = scene.pileup_site_at(position)?;
+        let contract = scene.summaries().contract();
+        let evidence = site.evidence;
+        let mate_description = match contract.overlapping_mate_policy {
+            OverlappingMatePolicy::CountOnce => format!(
+                "count once (leftmost primary end) · {} overlapping bases removed · exact canonical-tile collapse",
+                evidence.collapsed_mate_bases,
+            ),
+            OverlappingMatePolicy::CountBoth => "count both ends".to_owned(),
+        };
+        let bin_interval = GenomicInterval::new(
+            scene.prepared_interval().contig(),
+            position,
+            position.checked_add(1)?,
+        )
+        .ok()?;
+        let bin = evidence.bin;
+        let reference_base = site.reference_base;
+        let minimum_base_quality = contract.minimum_base_quality;
+        let evidence_description = format!(
+            "all {} eligible reads in exact canonical tile {}-{} · same immutable scene as displayed pixels",
+            evidence.eligible_records,
+            evidence.owner_interval.start() + 1,
+            evidence.owner_interval.end(),
+        );
+        let allele_detail_description = if evidence.allele_observations_available {
+            "exact sequence observations from the published scene".to_owned()
+        } else {
+            "sequence observations were not requested for this scene; depth remains exact"
+                .to_owned()
+        };
         let base_observations = bin.alleles.base_observations();
         let alternate_fraction = reference_base.and_then(|reference_base| {
             (base_observations > 0).then(|| {
@@ -703,44 +693,11 @@ impl Viewer {
             ),
             (
                 "Base quality filter".to_owned(),
-                format!(">= {}", query.pileup.minimum_base_quality),
+                format!(">= {minimum_base_quality}"),
             ),
-            (
-                "Evidence".to_owned(),
-                format!(
-                    "all {} eligible reads · {} reads rendered{}",
-                    query.pileup.provenance.eligible_records,
-                    query.pileup.provenance.rendered_records,
-                    if query.pileup.provenance.all_eligible_records {
-                        ""
-                    } else {
-                        " · incomplete"
-                    }
-                ),
-            ),
-            (
-                "Allele detail".to_owned(),
-                if query.pileup.provenance.allele_observations_available {
-                    "exact sequence observations loaded".to_owned()
-                } else {
-                    "zoom to base detail to load sequence observations".to_owned()
-                },
-            ),
-            (
-                "Overlapping mates".to_owned(),
-                match query.pileup.provenance.overlapping_mate_policy {
-                    OverlappingMatePolicy::CountOnce => format!(
-                        "count once (leftmost primary end) · {} overlapping bases removed{}",
-                        query.pileup.provenance.collapsed_mate_bases,
-                        if query.pileup.provenance.overlap_collapse_complete {
-                            ""
-                        } else {
-                            " · bounded collapse incomplete"
-                        }
-                    ),
-                    OverlappingMatePolicy::CountBoth => "count both ends".to_owned(),
-                },
-            ),
+            ("Evidence".to_owned(), evidence_description),
+            ("Allele detail".to_owned(), allele_detail_description),
+            ("Overlapping mates".to_owned(), mate_description),
         ];
         Some(InspectorSnapshot {
             fields,
@@ -772,10 +729,12 @@ impl Viewer {
             .active()
             .selected_alignment_track
             .unwrap_or_else(|| self.primary_alignment_track_id());
-        let query = self.alignment_query_for_track(track_id)?;
-        let summary = &query.pileup.modifications;
-        let index = summary.bin_index_at(query.interval, position)?;
-        let interval = summary.bin_interval(query.interval, index)?;
+        let scene = self
+            .presented_alignment_lane(self.panels.active().id, track_id)
+            .and_then(|presented| presented.lane.snapshot.as_ref())?;
+        let (summary_interval, summary) = scene.summaries().modification_summary_at(position)?;
+        let index = summary.bin_index_at(summary_interval, position)?;
+        let interval = summary.bin_interval(summary_interval, index)?;
         let locus = if interval.len() == 1 {
             format!(
                 "{}:{}",
@@ -905,16 +864,28 @@ impl Viewer {
             },
             |(track_id, start, end, component)| Some((track_id, start, end, Some(component))),
         )?;
-        let query = self.alignment_query_for_track(track_id)?;
-        let junction = query
-            .junctions
-            .junctions
-            .iter()
+        let scene = self
+            .presented_alignment_lane(self.panels.active().id, track_id)
+            .and_then(|presented| presented.lane.snapshot.as_ref())?;
+        let interval = GenomicInterval::new(scene.prepared_interval().contig(), start, end).ok()?;
+        let junction = scene
+            .summaries()
+            .junctions(interval)
+            .ok()?
+            .into_iter()
             .find(|junction| junction.start == start && junction.end == end)?;
-        let provenance = query.junctions.provenance;
+        let provenance = scene.summaries().junction_provenance_at(start)?;
         let filters = self.alignment_filters_for_track(track_id);
-        let sashimi_value =
-            junction_count_value(&query.junctions, junction, filters.sashimi_count_mode);
+        let sashimi_value = match (
+            filters.sashimi_count_mode,
+            provenance.normalization_mapped_records,
+        ) {
+            (SashimiCountMode::Raw, _) => f64::from(junction.depth),
+            (SashimiCountMode::CountsPerMillion, Some(total)) if total > 0 => {
+                f64::from(junction.depth) * 1_000_000.0 / total as f64
+            }
+            (SashimiCountMode::CountsPerMillion, _) => f64::from(junction.depth),
+        };
         let sashimi_count = match (
             filters.sashimi_count_mode,
             provenance.normalization_mapped_records,
@@ -931,11 +902,11 @@ impl Viewer {
             }
         };
         let focused_component = focused_component
-            .map(|component| focused_junction_component_value(component, junction));
+            .map(|component| focused_junction_component_value(component, &junction));
         let annotation_context = junction_annotation_context(
             &self.tracks,
             &self.panels.active().track_snapshots,
-            self.panels.active().track_snapshot_interval,
+            &self.panels.active().track_snapshot_intervals,
             self.panels.active().viewport.interval(),
         );
         let annotation_status = annotation_context.status(start, end);

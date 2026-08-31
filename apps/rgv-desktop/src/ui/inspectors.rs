@@ -61,7 +61,7 @@ fn panel_view_locus(panel: &ViewPanelController) -> String {
 
 fn inspected_read_item(viewer: &Viewer, panel: &ViewPanelController) -> Option<InspectedPanelItem> {
     let scene_hit = panel.selected_alignment_hit;
-    let track_id = scene_hit
+    let _track_id = scene_hit
         .map(|hit| hit.track)
         .or(panel.selected_alignment_track)
         .or_else(|| {
@@ -70,16 +70,7 @@ fn inspected_read_item(viewer: &Viewer, panel: &ViewPanelController) -> Option<I
                 .as_ref()
                 .map(|pending| pending.track_id)
         })?;
-    let resolved = scene_hit
-        .and_then(|hit| viewer.alignment_scene_record_for_hit(panel.id, hit))
-        .or_else(|| {
-            panel.selected_record.and_then(|index| {
-                viewer
-                    .complete_read_query_for_track_in_panel(track_id, panel.id)?
-                    .materialize_record(index)
-                    .ok()
-            })
-        });
+    let resolved = scene_hit.and_then(|hit| viewer.alignment_scene_record_for_hit(panel.id, hit));
     let (read_name, template_end, locus) = if let Some(record) = resolved {
         let template_end = match (
             record.flags.is_first_in_template(),
@@ -128,10 +119,7 @@ fn inspected_panel_item(
     viewer: &Viewer,
     panel: &ViewPanelController,
 ) -> Option<InspectedPanelItem> {
-    if panel.selected_alignment_hit.is_some()
-        || panel.selected_record.is_some()
-        || panel.pending_read_selection.is_some()
-    {
+    if panel.selected_alignment_hit.is_some() || panel.pending_read_selection.is_some() {
         return inspected_read_item(viewer, panel);
     }
     let (kind, subject) = if let Some(position) = panel.selected_pileup_position {
@@ -745,8 +733,12 @@ pub(crate) fn show_properties(
         let document = alignment_inspector_document(
             inspector,
             format!(
-                "alignment-segment:{}",
-                viewer.panels.active().selected_record.unwrap_or_default()
+                "alignment-segment:{:?}",
+                viewer
+                    .panels
+                    .active()
+                    .selected_alignment_hit
+                    .map(|hit| hit.handle)
             ),
             visible_reference_sequence.as_ref(),
             mate_target_available,

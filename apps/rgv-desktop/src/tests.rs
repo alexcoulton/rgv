@@ -4,6 +4,8 @@ mod automation;
 mod display;
 #[path = "tests/inspection.rs"]
 mod inspection;
+#[path = "tests/scene_fixture.rs"]
+mod scene_fixture;
 #[path = "tests/sources.rs"]
 mod sources;
 #[path = "tests/workspace.rs"]

@@ -10,9 +10,9 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 rgv-core = { version = "0.1.0", path = "../../crates/rgv-core" }
+rgv-alignment-scene = { version = "0.1.0", path = "../../crates/rgv-alignment-scene" }
 rgv-engine = { version = "0.1.0", path = "../../crates/rgv-engine" }
 rgv-hts = { version = "0.1.0", path = "../../crates/rgv-hts" }
-rgv-layout = { version = "0.1.0", path = "../../crates/rgv-layout" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -1,5 +1,4 @@
 use super::super::*;
-use crate::display::alignment;
 
 fn updated_track_pane_selection<T: Copy + Eq>(
     track_order: &[T],
@@ -430,73 +429,6 @@ impl Viewer {
             .map_or(SYNTHETIC_ALIGNMENT_TRACK_ID, |track| track.config.id)
     }
 
-    pub(crate) fn alignment_query_for_track(&self, id: TrackId) -> Option<&Arc<AlignmentQuery>> {
-        if !self
-            .panels
-            .active()
-            .navigation_presentation
-            .permits_staged_display()
-        {
-            return None;
-        }
-        let track = self
-            .alignment_tracks
-            .iter()
-            .find(|track| track.config.id == id)?;
-        if track.scene_engine.is_some() {
-            return None;
-        }
-        track
-            .projection(self.panels.active().id)
-            .filter(|projection| projection.query_is_current())
-            .and_then(|projection| projection.current_query.as_ref())
-    }
-
-    pub(crate) fn complete_read_query_for_track_in_panel(
-        &self,
-        id: TrackId,
-        panel_id: PanelId,
-    ) -> Option<&Arc<AlignmentQuery>> {
-        if !self
-            .panels
-            .get(panel_id)?
-            .navigation_presentation
-            .permits_staged_display()
-        {
-            return None;
-        }
-        let track = self
-            .alignment_tracks
-            .iter()
-            .find(|track| track.config.id == id)?;
-        if track.scene_engine.is_some() {
-            return None;
-        }
-        let projection = track
-            .projection(panel_id)
-            .filter(|projection| projection.query_is_current())?;
-        let query = projection.current_query.as_ref()?;
-        let layout_query = projection.layout_query.as_deref().unwrap_or(query);
-        alignment::individual_read_refusal(
-            query,
-            layout_query,
-            track.config.filters.read_stacking_mode,
-        )
-        .is_none()
-        .then_some(query)
-    }
-
-    pub(crate) fn complete_read_query_for_track(
-        &self,
-        id: TrackId,
-    ) -> Option<&Arc<AlignmentQuery>> {
-        self.complete_read_query_for_track_in_panel(id, self.panels.active().id)
-    }
-
-    pub(crate) fn primary_alignment_query(&self) -> Option<&Arc<AlignmentQuery>> {
-        self.alignment_query_for_track(self.primary_alignment_track_id())
-    }
-
     pub(crate) fn alignment_dictionary_for_track(
         &self,
         id: TrackId,
@@ -638,9 +570,7 @@ impl Viewer {
                     {
                         panel.selected_alignment_track = None;
                         panel.pending_read_selection = None;
-                        panel.pending_read_reveal = None;
-                        panel.selected_record = None;
-                        panel.selected_read_event = None;
+                        panel.pending_alignment_reveal = None;
                         panel.selected_chain = None;
                     }
                 }
@@ -665,46 +595,32 @@ impl Viewer {
             })
     }
 
-    pub(crate) fn shared_sashimi_maximum(&self, count_mode: SashimiCountMode) -> Option<f64> {
-        let selected = &self.panels.active().selected_alignment_tracks;
-        let use_selected = selected.len() > 1;
-        let mut participant_count = 0_usize;
-        let mut maximum = 0.0_f64;
-        for track in self.alignment_tracks.iter().filter(|track| {
-            self.track_presentation
-                .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
-                .unwrap_or(false)
-                && (!use_selected || selected.contains(&track.config.id))
-        }) {
-            let filters = self.alignment_filters_for_track(track.config.id);
-            if filters.sashimi_scale_mode != SashimiScaleMode::Shared
-                || filters.sashimi_count_mode != count_mode
-            {
-                continue;
-            }
-            let Some(query) = self.alignment_query_for_track(track.config.id) else {
-                continue;
-            };
-            if count_mode == SashimiCountMode::CountsPerMillion
-                && query
-                    .junctions
-                    .provenance
-                    .normalization_mapped_records
-                    .is_none()
-            {
-                return None;
-            }
-            participant_count = participant_count.saturating_add(1);
-            for junction in query
-                .junctions
-                .junctions
-                .iter()
-                .filter(|junction| junction.depth >= filters.minimum_junction_depth)
-            {
-                maximum = maximum.max(junction_count_value(&query.junctions, junction, count_mode));
-            }
+    fn sashimi_summary_for_track(
+        &self,
+        track: &AlignmentTrackController,
+        interval: GenomicInterval,
+    ) -> Option<rgv_hts::JunctionSummary> {
+        if track.scene_engine.is_none() {
+            return None;
         }
-        (participant_count > 0 && maximum > 0.0).then_some(maximum)
+        let presented = self.presented_alignment_lane(self.panels.active().id, track.config.id)?;
+        if !presented.lane.summary_current() || !presented.source.semantic_target_complete {
+            return None;
+        }
+        let snapshot = presented.lane.snapshot.as_ref()?;
+        let junctions = snapshot.summaries().junctions(interval).ok()?;
+        Some(rgv_hts::JunctionSummary {
+            junctions,
+            provenance: rgv_hts::JunctionProvenance {
+                eligible_records: snapshot.reads().evidence().record_count(),
+                minimum_flank: snapshot.summaries().contract().minimum_junction_flank,
+                normalization_mapped_records: snapshot
+                    .summaries()
+                    .junction_normalization_mapped_records(),
+                all_eligible_records: true,
+                ..rgv_hts::JunctionProvenance::default()
+            },
+        })
     }
 
     pub(crate) fn sashimi_export_bundle(&self) -> SashimiExportBundle {
@@ -712,13 +628,14 @@ impl Viewer {
         let use_selected = !selected.is_empty();
         let mut omitted_tracks = 0_usize;
         let mut tracks = Vec::new();
+        let interval = self.panels.active().viewport.interval();
         for track in self.alignment_tracks.iter().filter(|track| {
             self.track_presentation
                 .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
                 .unwrap_or(false)
                 && (!use_selected || selected.contains(&track.config.id))
         }) {
-            let Some(query) = self.alignment_query_for_track(track.config.id) else {
+            let Some(junctions) = self.sashimi_summary_for_track(track, interval) else {
                 continue;
             };
             if tracks.len() == MAX_SASHIMI_EXPORT_TRACKS {
@@ -728,7 +645,7 @@ impl Viewer {
             tracks.push(SashimiExportTrack {
                 id: track.config.id,
                 name: self.alignment_track_name_for_id(track.config.id),
-                query: Arc::clone(query),
+                junctions,
                 filters: self.alignment_filters_for_track(track.config.id),
             });
         }
@@ -740,7 +657,7 @@ impl Viewer {
             annotations: junction_annotation_context(
                 &self.tracks,
                 &self.panels.active().track_snapshots,
-                self.panels.active().track_snapshot_interval,
+                &self.panels.active().track_snapshot_intervals,
                 self.panels.active().viewport.interval(),
             ),
         }
@@ -825,16 +742,11 @@ impl Viewer {
             let collect_modifications_changed = track.config.filters.show_modification_frequency
                 != source.show_modification_frequency;
             copy_compatible_alignment_appearance(&mut track.config.filters, &source);
-            for projection in track.projections.values_mut() {
-                projection.alignment_rows = None;
-                projection.cached_layout = None;
-            }
             if collect_modifications_changed
                 && !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_))
             {
                 for projection in track.projections.values_mut() {
-                    projection.advance_query_generation();
-                    projection.pending_query = true;
+                    projection.advance_scene_generation();
                 }
                 query_requested = true;
             }
@@ -983,11 +895,7 @@ impl Viewer {
             track.config.filters.clone_from(&source.filters);
             track.config.maximum_alignments = source.maximum_alignments;
             for projection in track.projections.values_mut() {
-                projection.advance_query_generation();
-                projection.pending_query =
-                    !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
-                projection.alignment_rows = None;
-                projection.cached_layout = None;
+                projection.advance_scene_generation();
             }
         }
         if selected.contains(&self.primary_alignment_track_id()) {
@@ -1088,7 +996,7 @@ impl Viewer {
             panel.pending_queries.tracks = has_engine;
             clear_removed_auxiliary_panel_state(panel, &removed);
         }
-        self.invalidate_navigation_preview_contract("auxiliary track removed");
+        self.invalidate_navigation_contract("auxiliary track removed");
         self.begin_all_panel_refresh_transactions();
         self.request_all_auxiliary_track_queries();
         self.rebuild_all_panel_displays();
@@ -1129,7 +1037,7 @@ impl Viewer {
     pub(crate) fn advance_alignment_generations(&self, panel_id: PanelId) {
         for track in &self.alignment_tracks {
             if let Some(projection) = track.projection(panel_id) {
-                projection.advance_query_generation();
+                projection.advance_scene_generation();
             }
         }
     }
@@ -1159,16 +1067,9 @@ impl Viewer {
             update,
             workspace_limit,
         );
-        if outcome.configuration_changed {
-            for projection in track.projections.values_mut() {
-                projection.alignment_rows = None;
-                projection.cached_layout = None;
-            }
-        }
         if outcome.query_changed && !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_)) {
             for projection in track.projections.values_mut() {
-                projection.advance_query_generation();
-                projection.pending_query = true;
+                projection.advance_scene_generation();
             }
             self.panels.active_mut().pending_queries.alignment = true;
         }

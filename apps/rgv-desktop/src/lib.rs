@@ -45,12 +45,13 @@ use rgv_alignment_scene::{
     AlignmentCamera, AlignmentCoherenceGroupId, AlignmentCoherenceGroupKind,
     AlignmentCoherenceGroupSpec, AlignmentComponent, AlignmentCoverageLaneOptions,
     AlignmentDerivedLaneCapture, AlignmentDerivedLaneKind, AlignmentDerivedLaneOptions,
-    AlignmentHit, AlignmentInteractionState, AlignmentModificationLaneOptions, AlignmentPageKey,
-    AlignmentPanelLaneCapture, AlignmentPanelLanePublication, AlignmentPanelSceneAdmission,
-    AlignmentPanelSceneError, AlignmentPanelSceneFrame, AlignmentPanelSceneStore,
-    AlignmentPresentationScene, AlignmentReadLabelMode, AlignmentRowActivityProfile,
-    AlignmentSashimiLaneOptions, AlignmentSashimiScalePolicy, AlignmentSceneCamera,
-    AlignmentSceneSnapshot, AlignmentStyleContract, AlleleSummaryDetail, AllocationBundleActual,
+    AlignmentHandle, AlignmentHit, AlignmentInteractionState, AlignmentModificationLaneOptions,
+    AlignmentPageKey, AlignmentPanelLaneCapture, AlignmentPanelLanePublication,
+    AlignmentPanelSceneAdmission, AlignmentPanelSceneError, AlignmentPanelSceneFrame,
+    AlignmentPanelSceneStore, AlignmentPresentationScene, AlignmentReadLabelMode,
+    AlignmentRowActivityProfile, AlignmentSashimiLaneOptions, AlignmentSashimiScalePolicy,
+    AlignmentSceneCamera, AlignmentSceneSnapshot, AlignmentStyleContract,
+    AlignmentTraversalDirection, AlleleSummaryDetail, AllocationBundleActual,
     AllocationBundleCommit, AllocationBundleError, AllocationBundleLease, AllocationBundleSlot,
     AllocationBundleSpec, AllocationLedger, AllocationRetirementClaimSet,
     AllocationRetirementToken, CapabilityRequirement, CoverageAlleleInterpretation,
@@ -59,14 +60,15 @@ use rgv_alignment_scene::{
     CpuSummaryCamera, GeometryLod, LayoutContract, LedgerError, LedgerProgress,
     LedgerProgressEpoch, LedgerProgressSubscription, LedgerSnapshot,
     MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract, ReferenceRevision,
-    RowAtlasRevision, RowCoordinateSpaceRevision, SummaryContract,
+    RowAtlasRevision, RowCoordinateSpaceRevision, SummaryContract, SummaryPageFamily,
+    SummarySemanticComponent,
 };
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,
     AutomationAlignmentSelector, AutomationAlignmentState, AutomationAlignmentTrackSnapshot,
     AutomationBatch, AutomationCommand, AutomationCommandResult, AutomationCommandStatus,
-    AutomationCytobandAvailability, AutomationEnvironmentTelemetry, AutomationErrorCode,
-    AutomationEvidenceField, AutomationExportKind, AutomationFrameTelemetry,
+    AutomationContextLaneSnapshot, AutomationCytobandAvailability, AutomationEnvironmentTelemetry,
+    AutomationErrorCode, AutomationEvidenceField, AutomationExportKind, AutomationFrameTelemetry,
     AutomationGenomeSnapshot, AutomationGpuTelemetry, AutomationHistoryNavigation,
     AutomationLandmarkIntegrityState, AutomationLandmarkSnapshot, AutomationLandmarkTrackState,
     AutomationNavigationDestination, AutomationNavigationTelemetry, AutomationOptionScope,
@@ -97,11 +99,11 @@ use rgv_core::{
     MINIMUM_CACHE_BUDGET_MIB, MINIMUM_INTERFACE_SCALE_PERCENT,
     MINIMUM_READ_BROWSING_BUFFER_PERCENT, ModifiedBaseColorMode, MutationColorMode,
     MutationTrackSettings, NavigationHistory, OverlappingMatePolicy, PanelGeneration, PanelId,
-    PanelTrackId, PresentationNodeId, QuantitativeArithmetic, QuantitativeDisplayMode,
-    QuantitativeMissingMode, QuantitativeScaleMode, QuantitativeScaleTransform,
-    QuantitativeTrackSettings, QuantitativeWindowFunction, ReadBaseDisplayMode, ReadStackingMode,
-    ReferenceDictionary, ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus,
-    SampleMetadataTable, SashimiCountMode, SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode,
+    PresentationNodeId, QuantitativeArithmetic, QuantitativeDisplayMode, QuantitativeMissingMode,
+    QuantitativeScaleMode, QuantitativeScaleTransform, QuantitativeTrackSettings,
+    QuantitativeWindowFunction, ReadBaseDisplayMode, ReadStackingMode, ReferenceDictionary,
+    ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus, SampleMetadataTable,
+    SashimiCountMode, SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode,
     SessionAlignmentTrack, SessionDocument, SessionFilters, SessionLocus, SessionPaneTrackState,
     SessionReadPanelState, SessionViewPanel, SmrtKineticsMode, TrackChangeSet, TrackCollection,
     TrackConfig, TrackFormat, TrackId, TrackIntent, TrackKind, TrackSource, UltimaDisplayOptions,
@@ -111,47 +113,41 @@ use rgv_core::{
     WorkspacePresentation, classify_genomic_source, parse_ucsc_cytobands, resolve_contig_alias,
 };
 use rgv_engine::{
-    AlignmentBufferClampReason, AlignmentCacheOutcome, AlignmentCoordinatorFrame,
-    AlignmentIndividualReadCapability, AlignmentQueryPhase, AlignmentReferenceAuthority,
-    AlignmentReferenceRequirement, AlignmentSceneBuildContract, AlignmentSceneEngine,
-    AlignmentSceneEngineEvent, AlignmentSceneEngineOperation, AlignmentSceneFrameCause,
-    AlignmentScenePreparationPolicy, AlignmentSceneRequestToken,
+    AlignmentCoordinatorFrame, AlignmentIndividualReadCapability, AlignmentReferenceAuthority,
+    AlignmentReferenceRequirement, AlignmentSceneBuildContract, AlignmentSceneCoordinatorTelemetry,
+    AlignmentSceneEngine, AlignmentSceneEngineEvent, AlignmentSceneEngineOperation,
+    AlignmentSceneFrameCause, AlignmentScenePreparationPolicy, AlignmentSceneRequestToken,
     AlignmentSceneResourcePressureDisposition, AlignmentSceneSourceMetadata,
-    AlignmentVerticalResidency, AlignmentWorkingSetStats, CacheBudgets, CacheStats,
-    EngineQueueError, LayoutTileKey, LocalAlignmentSceneEngineConfig, LocalBamCanonicalBackend,
-    LocalBamSourceControl, MAX_REFERENCE_QUERY_BASES, ReferenceEngine, ReferenceEngineEvent,
-    ReferenceQueryIdentity, SourceFingerprint, SourceIntentKind, SourceOwnerId, TrackEngine,
+    AlignmentVerticalResidency, EngineQueueError, LocalAlignmentSceneEngineConfig,
+    LocalBamCanonicalBackend, LocalBamSourceControl, MAX_REFERENCE_QUERY_BASES, ReferenceEngine,
+    ReferenceEngineEvent, ReferenceQueryIdentity, SourceIntentKind, SourceOwnerId, TrackEngine,
     TrackEngineEvent, TrackSearchHit, TrackSearchResults, TrackSnapshot, TrackSnapshotData,
-    TrackSpec, TrackSpecKind, WeightedLruCache, alignment_row_activity_satisfies_contract,
+    TrackSpec, TrackSpecKind, alignment_row_activity_satisfies_contract,
 };
 use rgv_hts::{
-    AlignedBaseClassification, AlignmentFilter, AlignmentOpenOptions, AlignmentQuery,
-    AlignmentRecord, AuxPredicate, AuxValue, CigarOpKind, FastaOpenOptions, HttpRangeConfig,
-    IndividualReadStatus, ModificationCode, QUALITY_WEIGHT_SCALE, QueryDetail, QueryOptions,
-    QueryStats, ReferenceSlice, RemoteAuthentication, RemoteIoStats, SequenceData,
-    SupplementarySegment, TemplateLengthBounds, UltimaEventUnavailable, UltimaIndelKind,
-    UltimaQualitySource, UltimaTagOrientation, analyze_ultima_record_with_tag_orientation,
-    bisulfite_strand_is_reverse, classify_aligned_base, decode_modified_bases,
-    decode_supplementary_chain, pair_evidence, smrt_kinetics_series, summarize_bisulfite_record,
-    summarize_sbx_record,
+    AlignedBaseClassification, AlignmentFilter, AlignmentOpenOptions, AlignmentRecord,
+    AuxPredicate, AuxValue, CigarOpKind, FastaOpenOptions, HttpRangeConfig, ModificationCode,
+    QUALITY_WEIGHT_SCALE, QueryDetail, QueryOptions, ReferenceSlice, RemoteAuthentication,
+    RemoteIoStats, SequenceData, SupplementarySegment, TemplateLengthBounds,
+    UltimaEventUnavailable, UltimaIndelKind, UltimaQualitySource, UltimaTagOrientation,
+    analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse, classify_aligned_base,
+    decode_modified_bases, decode_supplementary_chain, pair_evidence, smrt_kinetics_series,
+    summarize_bisulfite_record, summarize_sbx_record,
 };
+#[cfg(test)]
+use rgv_hts::{AlignmentQuery, QueryStats};
 #[cfg(test)]
 use rgv_layout::layout_features;
 use rgv_layout::{
-    AlignmentColorMode, AlignmentGroupMode, AlignmentLayout, AlignmentLayoutOptions,
-    AlignmentLayoutStats, AlignmentOrderDirection, AlignmentRowHistory, AlignmentRowLayout,
-    AlignmentRowReconciliationStats, AlignmentRowScene, AlignmentSortMode,
-    COPY_NUMBER_HEADER_HEIGHT, DisplayList, IndividualReadRefusal, IndividualReadRefusalScope,
-    JunctionAnnotationLookup, JunctionAnnotationStatus, JunctionArcComponent,
-    MAX_HIDDEN_MODIFICATION_CODES, MINIMUM_BASE_GLYPH_PIXEL_WIDTH, MUTATION_HEADER_HEIGHT,
-    QuantitativeRange, RectPrimitive, Rgba, TrackLayoutOptions, alignment_read_name_hash,
-    compose_quantitative_records, copy_number_sample_order, gwas_point_y,
-    junction_arc_distance_to_point, junction_arc_stroke_width, junction_count_value,
-    layout_alignment_query_with_rows, layout_alignment_query_with_rows_and_annotations,
-    layout_copy_number, layout_features_with_label_widths, layout_gwas, layout_interactions,
-    layout_mutations, layout_quantitative, layout_reference_slice_oriented,
-    layout_reference_translation, layout_sashimi, layout_variants, modification_code_color,
-    quantitative_data_range, reconcile_alignment_rows_with_horizon, record_object_id,
+    AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
+    COPY_NUMBER_HEADER_HEIGHT, DisplayList, JunctionAnnotationLookup, JunctionAnnotationStatus,
+    JunctionArcComponent, MAX_HIDDEN_MODIFICATION_CODES, MINIMUM_BASE_GLYPH_PIXEL_WIDTH,
+    MUTATION_HEADER_HEIGHT, QuantitativeRange, RectPrimitive, Rgba, SashimiLayoutOptions,
+    TrackLayoutOptions, alignment_read_name_hash, compose_quantitative_records,
+    copy_number_sample_order, gwas_point_y, junction_count_value, layout_copy_number,
+    layout_features_with_label_widths, layout_gwas, layout_interactions, layout_mutations,
+    layout_quantitative, layout_reference_slice_oriented, layout_reference_translation,
+    layout_sashimi, layout_variants, modification_code_color, quantitative_data_range,
     ultima_quality_color,
 };
 use rgv_render::{
@@ -160,13 +156,16 @@ use rgv_render::{
     AlignmentGpuReplacementError, AlignmentGpuResidencyLease, AlignmentGpuRetirement,
     AlignmentGpuSceneRequest, AlignmentGpuScissor, AlignmentSummaryFrameOverlays,
     AlignmentSummaryGpuCameraCaptureError, AlignmentSummaryGpuFrame,
-    AlignmentSummaryGpuPageAdmissionError, AlignmentSummaryGpuPageKey,
-    AlignmentSummaryGpuPrefetchCursor, AlignmentSummaryGpuPrepareError,
+    AlignmentSummaryGpuLaneOptions, AlignmentSummaryGpuPageAdmissionError,
+    AlignmentSummaryGpuPageKey, AlignmentSummaryGpuPrefetchCursor, AlignmentSummaryGpuPrepareError,
     AlignmentSummaryGpuRenderer, AlignmentSummaryGpuReplacementError,
     AlignmentSummaryGpuResidencyLease, AlignmentSummaryGpuRetirement,
-    AlignmentSummaryGpuSceneRequest, GpuBudgetPressure, GpuReclaimGoal, GpuReclaimReport,
-    NavigationPreviewInstance, NavigationPreviewRenderer, PrepareStats, RectangleRenderer,
-    export_png, navigation_preview_source_uv,
+    AlignmentSummaryGpuSceneRequest, AlignmentSummaryJunctionComponentToken,
+    AlignmentSummaryJunctionInteraction, ContextSceneGpuCamera, ContextSceneGpuCoherenceKey,
+    ContextSceneGpuFrame, ContextSceneGpuLaneKey, ContextSceneGpuLaneRequest,
+    ContextSceneGpuRejection, ContextSceneGpuRejectionReason, ContextSceneGpuRenderer,
+    ContextSceneGpuRetainedLaneRequest, ContextSceneGpuScissor, GpuBudgetPressure, GpuReclaimGoal,
+    GpuReclaimReport, PrepareStats, RectangleRenderer, export_png,
 };
 use runtime::*;
 use sha2::{Digest as _, Sha256};
@@ -186,8 +185,8 @@ use winit::{
     window::{CursorGrabMode, CursorIcon, Theme, Window, WindowAttributes, WindowId},
 };
 use workspace::{
-    alignment_navigation::*, alignments::*, lists::*, navigation::*, navigation_preview::*,
-    panels::*, tracks::replace_panel_track_selection,
+    alignment_navigation::*, alignments::*, context_lanes::*, lists::*, navigation::*,
+    navigation_transaction::*, panels::*, tracks::replace_panel_track_selection,
 };
 use workspace_lists::{
     WorkspaceListImport, WorkspaceListKind, import_workspace_list, region_bed_export,
@@ -341,7 +340,7 @@ struct RemoteSourceRequest {
 struct CachedModificationCodes {
     panel_id: PanelId,
     track_id: TrackId,
-    query: Arc<AlignmentQuery>,
+    authority: Arc<AlignmentSceneSnapshot>,
     codes: Vec<rgv_hts::ModificationCode>,
 }
 
@@ -469,12 +468,7 @@ enum HoverInspectorTarget {
     Modification(TrackId, u64),
     Pileup(TrackId, u64),
     Junction(TrackId, u64, u64, JunctionArcComponent),
-    Record {
-        track_id: TrackId,
-        index: usize,
-        operation_index: Option<usize>,
-        operation_offset: Option<u32>,
-    },
+    Read(AlignmentHit),
 }
 
 impl HoverInspectorTarget {
@@ -482,8 +476,8 @@ impl HoverInspectorTarget {
         match self {
             Self::Modification(track_id, _)
             | Self::Pileup(track_id, _)
-            | Self::Junction(track_id, _, _, _)
-            | Self::Record { track_id, .. } => track_id,
+            | Self::Junction(track_id, _, _, _) => track_id,
+            Self::Read(hit) => hit.track,
         }
     }
 }
@@ -497,21 +491,48 @@ struct JunctionArcKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct ComposedJunctionArcTarget {
-    key: JunctionArcKey,
-    primitive: RectPrimitive,
-    stroke_width: f32,
-    draw_order: u32,
-    interaction_token: u32,
-    content_revision: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
 struct JunctionArcHover {
     key: JunctionArcKey,
     interaction_token: u32,
     distance_points: f32,
     content_revision: u64,
+}
+
+const fn summary_junction_component(
+    component: JunctionArcComponent,
+) -> AlignmentSummaryJunctionComponentToken {
+    match component {
+        JunctionArcComponent::Positive => AlignmentSummaryJunctionComponentToken::Positive,
+        JunctionArcComponent::Negative => AlignmentSummaryJunctionComponentToken::Negative,
+        JunctionArcComponent::Unknown => AlignmentSummaryJunctionComponentToken::Unknown,
+    }
+}
+
+const fn layout_junction_component(
+    component: AlignmentSummaryJunctionComponentToken,
+) -> Option<JunctionArcComponent> {
+    match component {
+        AlignmentSummaryJunctionComponentToken::Positive => Some(JunctionArcComponent::Positive),
+        AlignmentSummaryJunctionComponentToken::Negative => Some(JunctionArcComponent::Negative),
+        AlignmentSummaryJunctionComponentToken::Unknown => Some(JunctionArcComponent::Unknown),
+        AlignmentSummaryJunctionComponentToken::Annotation => None,
+    }
+}
+
+fn native_junction_interaction_token(key: JunctionArcKey) -> u32 {
+    let start = key.start ^ (key.start >> 32);
+    let end = key.end ^ (key.end >> 32);
+    let component = match key.component {
+        JunctionArcComponent::Positive => 1_u64,
+        JunctionArcComponent::Negative => 2_u64,
+        JunctionArcComponent::Unknown => 3_u64,
+    };
+    let mixed = start
+        .wrapping_mul(0x9e37_79b1)
+        .wrapping_add(end.rotate_left(17))
+        .wrapping_add(component);
+    let token = mixed as u32;
+    if token == 0 { 1 } else { token }
 }
 
 const SASHIMI_HIT_DURATION_SAMPLE_CAPACITY: usize = 128;
@@ -526,6 +547,7 @@ enum SashimiHitTestGate {
     PresentationUnsettled,
     OutsidePanel,
     OutsideSashimiLane,
+    SceneUnavailable,
     Tested,
 }
 
@@ -539,6 +561,7 @@ impl SashimiHitTestGate {
             Self::PresentationUnsettled => "presentation unsettled",
             Self::OutsidePanel => "outside active panel",
             Self::OutsideSashimiLane => "outside Sashimi lane",
+            Self::SceneUnavailable => "scene lane unavailable",
             Self::Tested => "curve tested",
         }
     }
@@ -698,13 +721,11 @@ fn clear_removed_alignment_panel_state(
         panel.alignment_selection_anchor = panel.selected_alignment_tracks.last().copied();
     }
     let removed_owned_evidence = panel.selected_alignment_track == Some(removed)
-        || (removed_was_primary
-            && panel.selected_alignment_track.is_none()
-            && panel.selected_record.is_some());
+        || panel
+            .selected_alignment_hit
+            .is_some_and(|hit| hit.track == removed);
     if removed_owned_evidence {
-        panel.selected_record = None;
         panel.selected_alignment_track = None;
-        panel.selected_read_event = None;
         panel.selected_pileup_position = None;
         panel.selected_modification_position = None;
         panel.selected_junction = None;
@@ -719,14 +740,11 @@ fn clear_removed_alignment_panel_state(
         panel.pending_read_selection = None;
     }
     if panel
-        .pending_read_reveal
+        .pending_alignment_reveal
         .is_some_and(|(track_id, _)| track_id == removed)
     {
-        panel.pending_read_reveal = None;
+        panel.pending_alignment_reveal = None;
     }
-    panel.hovered_record = panel
-        .hovered_record
-        .filter(|(track_id, _)| *track_id != removed);
     panel.hovered_alignment_hit = panel
         .hovered_alignment_hit
         .filter(|hit| hit.track != removed);
@@ -739,14 +757,6 @@ fn clear_removed_alignment_panel_state(
     panel.hovered_junction_arc = panel
         .hovered_junction_arc
         .filter(|hover| hover.key.track_id != removed);
-    panel
-        .junction_arc_targets
-        .retain(|target| target.key.track_id != removed);
-    if let Some(cache) = panel.scroll_display_cache.as_mut() {
-        cache
-            .junction_arc_keys
-            .retain(|_, key| key.track_id != removed);
-    }
     if panel.selected_track == Some(TrackFrameKey::Alignment(removed)) {
         panel.selected_track = panel
             .selected_alignment_tracks
@@ -770,6 +780,16 @@ fn clear_removed_auxiliary_panel_state(
     panel
         .track_snapshots
         .retain(|snapshot| !removed.contains(&snapshot.id));
+    panel
+        .track_snapshot_intervals
+        .retain(|track_id, _| !removed.contains(track_id));
+    panel
+        .track_snapshot_generations
+        .retain(|track_id, _| !removed.contains(track_id));
+    panel.context_scene.remove_auxiliary(removed);
+    panel
+        .track_query_error_generations
+        .retain(|track_id, _| !removed.contains(track_id));
     panel.track_frames.retain(
         |frame| !matches!(frame.key, TrackFrameKey::Auxiliary(id) if removed.contains(&id)),
     );
@@ -794,9 +814,6 @@ fn clear_removed_auxiliary_panel_state(
     panel.selected_interaction = panel
         .selected_interaction
         .filter(|selection| !removed.contains(&selection.track_id));
-    panel.hovered_record = panel
-        .hovered_record
-        .filter(|(track_id, _)| !removed.contains(track_id));
     panel.hover_inspector_target = panel
         .hover_inspector_target
         .filter(|target| !removed.contains(&target.track_id()));
@@ -852,8 +869,7 @@ enum VariantPredicateOperator {
 struct AutomationAlignmentHandleTarget {
     panel_id: PanelId,
     track_id: TrackId,
-    query_generation: u64,
-    record_index: usize,
+    handle: AlignmentHandle,
 }
 
 /// Exact camera-and-layout destination for one native alignment publication. This deliberately
@@ -1059,16 +1075,6 @@ impl AlignmentScenePublicationAuthority {
     }
 }
 
-/// One logical rectangle that a successfully prepared native alignment presentation can paint for
-/// a specific panel-camera capture. Navigation preview composition consumes this authority rather
-/// than inferring readiness from the existence of a semantic lane or snapshot.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct AlignmentNativeLiveRegion {
-    panel_id: PanelId,
-    target_revision: u64,
-    clip: CpuClipRect,
-}
-
 /// Exact read-lane authority published with the native frame. Hit testing consumes this record
 /// rather than inferring visibility from a semantic snapshot that may have survived a failed or
 /// superseded GPU replacement.
@@ -1118,7 +1124,6 @@ struct AlignmentGpuFrameBundle {
     prepared_authority: AlignmentGpuPreparedAuthority,
     reads: Option<AlignmentGpuFrame>,
     summaries: Option<AlignmentSummaryGpuFrame>,
-    live_regions: Vec<AlignmentNativeLiveRegion>,
     lane_authorities: Vec<AlignmentCommittedLaneAuthority>,
     read_authorities: Vec<AlignmentNativeReadAuthority>,
 }
@@ -1283,6 +1288,8 @@ struct Viewer {
     queue: wgpu::Queue,
     surface_config: wgpu::SurfaceConfiguration,
     rectangle_renderer: RectangleRenderer,
+    context_scene_gpu_renderer: ContextSceneGpuRenderer,
+    context_scene_gpu_frame: ContextSceneGpuFrame,
     alignment_scene_ledger: AllocationLedger,
     alignment_ledger_progress: LedgerProgressSubscription,
     alignment_gpu_renderer: AlignmentGpuRenderer,
@@ -1296,9 +1303,6 @@ struct Viewer {
     alignment_scene_owner_clock: u64,
     alignment_scene_request_clock: u64,
     alignment_scene_publication_authority: AlignmentScenePublicationAuthority,
-    navigation_preview_renderer: NavigationPreviewRenderer,
-    navigation_texture_revisions: HashMap<PanelId, u64>,
-    navigation_horizon_preview_stats: NavigationHorizonPreviewStats,
     navigation_stale_result_rejections: u64,
     egui_context: egui::Context,
     egui_state: egui_winit::State,
@@ -1341,7 +1345,6 @@ struct Viewer {
     cytoband_path: Option<PathBuf>,
     data_status: String,
     announced_status: String,
-    layout_cache: WeightedLruCache<LayoutTileKey, Arc<AlignmentLayout>>,
     reference_reverse_complement: bool,
     reference_translation_frames: Vec<ReferenceTranslationFrame>,
     reference_genetic_code: GeneticCode,
@@ -1414,9 +1417,10 @@ struct Viewer {
     automation_exit_requested: bool,
     exit_confirmation_open: bool,
     user_exit_requested: bool,
-    cache_budgets: CacheBudgets,
-    cache_coordinator: LiveCacheCoordinatorSnapshot,
-    row_scene_residency_cache: Option<(Vec<(usize, u64)>, usize)>,
+    /// Independent ceiling for non-alignment contextual lane geometry. Alignment resources are
+    /// admitted exclusively through `alignment_scene_ledger`.
+    context_lane_gpu_budget_bytes: usize,
+    alignment_scene_budget: AlignmentSceneBudgetSnapshot,
     locus_editor: String,
     resizing_annotation_track: Option<(TrackFrameKey, f32)>,
     resizing_read_track: Option<(TrackId, f32)>,

@@ -9,11 +9,10 @@ use thiserror::Error;
 use crate::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
     CoverageScaleTransform, DetailLevel, ModifiedBaseColorMode, OverlappingMatePolicy, PanelId,
-    ReadBaseDisplayMode, ReadStackingMode, ReadStackingTransitionReason, ReviewStatus, TrackId,
-    TrackKind, TrackSource,
+    ReadBaseDisplayMode, ReadStackingMode, ReviewStatus, TrackId, TrackKind, TrackSource,
 };
 
-pub const AUTOMATION_SCHEMA_VERSION: u32 = 4;
+pub const AUTOMATION_SCHEMA_VERSION: u32 = 6;
 pub const MINIMUM_AUTOMATION_SCHEMA_VERSION: u32 = 1;
 pub const MAXIMUM_AUTOMATION_COMMANDS: usize = 10_000;
 pub const MAXIMUM_AUTOMATION_STRING_BYTES: usize = 16_384;
@@ -996,27 +995,29 @@ pub struct AutomationWorkspaceSnapshot {
     #[serde(default)]
     pub total_cache_budget_mib: usize,
     #[serde(default)]
-    pub alignment_cache_resident_bytes: usize,
+    pub alignment_scene_budget_bytes: usize,
     #[serde(default)]
-    pub layout_cache_resident_bytes: usize,
+    pub alignment_scene_charged_bytes: usize,
     #[serde(default)]
-    pub row_scene_resident_bytes: usize,
+    pub alignment_scene_reserved_bytes: usize,
     #[serde(default)]
-    pub gpu_slab_resident_bytes: usize,
+    pub alignment_scene_transition_reserve_bytes: usize,
     #[serde(default)]
-    pub measured_cache_resident_bytes: usize,
+    pub alignment_scene_transition_reserved_bytes: usize,
     #[serde(default)]
-    pub decoded_cache_allowance_bytes: usize,
+    pub alignment_scene_transient_budget_bytes: usize,
     #[serde(default)]
-    pub layout_cache_allowance_bytes: usize,
+    pub alignment_scene_transient_bytes: usize,
     #[serde(default)]
-    pub row_scene_cache_allowance_bytes: usize,
+    pub alignment_scene_transient_high_water_bytes: usize,
     #[serde(default)]
-    pub gpu_slab_cache_allowance_bytes: usize,
+    pub alignment_scene_pinned_bytes: usize,
     #[serde(default)]
-    pub cache_over_budget_bytes: usize,
+    pub alignment_scene_pinned_overage_bytes: usize,
     #[serde(default)]
-    pub cache_clamp_reason: Option<String>,
+    pub alignment_scene_active_replacement_bundle: Option<u64>,
+    #[serde(default)]
+    pub alignment_scene_budget_refreshes: u64,
     #[serde(default)]
     pub read_pane_height: f32,
     #[serde(default = "automation_default_true")]
@@ -1302,29 +1303,40 @@ pub struct AutomationPanelSnapshot {
     #[serde(default)]
     pub navigation_transaction_active: bool,
     #[serde(default)]
-    pub navigation_preview_active: bool,
+    pub navigation_target_locus: Option<String>,
     #[serde(default)]
-    pub preview_source_locus: Option<String>,
+    pub navigation_target_generation: Option<u64>,
     #[serde(default)]
-    pub preview_target_locus: Option<String>,
+    pub navigation_age_ms: Option<u64>,
     #[serde(default)]
-    pub preview_source_generation: Option<u64>,
-    #[serde(default)]
-    pub preview_target_generation: Option<u64>,
-    #[serde(default)]
-    pub preview_age_ms: Option<u64>,
-    #[serde(default)]
-    pub preview_kind: Option<String>,
-    #[serde(default)]
-    pub preview_invalidation_reason: Option<String>,
+    pub navigation_invalidation_reason: Option<String>,
     #[serde(default)]
     pub render_lanes: Vec<AutomationRenderLaneSnapshot>,
+    #[serde(default)]
+    pub context_lanes: Vec<AutomationContextLaneSnapshot>,
     #[serde(default)]
     pub read_panel_states: Vec<AutomationReadPanelStateSnapshot>,
     #[serde(default)]
     pub selected_presentation_nodes: Vec<crate::PresentationNodeId>,
     #[serde(default)]
     pub presentation_selection_anchor: Option<crate::PresentationNodeId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationContextLaneSnapshot {
+    pub lane: String,
+    #[serde(default)]
+    pub track_id: Option<TrackId>,
+    pub source_readiness: String,
+    pub gpu_readiness: String,
+    #[serde(default)]
+    pub source_locus: Option<String>,
+    #[serde(default)]
+    pub content_revision: Option<u64>,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub failure: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1471,170 +1483,50 @@ pub struct AutomationAlignmentTrackSnapshot {
     pub refusal_eligible_read_records: usize,
     #[serde(default)]
     pub read_refusal_scope: Option<String>,
+    /// Unified-scene navigation phase for this track in the active panel.
     #[serde(default)]
-    pub row_layout_revision: u64,
+    pub scene_phase: String,
+    /// Immutable scene revision rendered by the committed panel epoch.
     #[serde(default)]
-    pub row_layout_architecture_version: u16,
+    pub scene_revision: Option<String>,
     #[serde(default)]
-    pub row_layout_reconciliation_micros: u64,
+    pub scene_target_revision: u64,
     #[serde(default)]
-    pub row_layout_incumbent_projection_micros: u64,
+    pub scene_prepared_start: Option<u64>,
     #[serde(default)]
-    pub row_layout_history_index_micros: u64,
+    pub scene_prepared_end: Option<u64>,
     #[serde(default)]
-    pub row_layout_allocation_micros: u64,
+    pub scene_record_count: usize,
     #[serde(default)]
-    pub row_layout_history_commit_micros: u64,
+    pub scene_row_count: usize,
     #[serde(default)]
-    pub row_layout_canonical_metrics_micros: u64,
+    pub scene_read_page_count: usize,
     #[serde(default)]
-    pub row_layout_canonical_metrics_deferred: bool,
+    pub scene_summary_page_count: usize,
     #[serde(default)]
-    pub row_layout_scene_projection_micros: u64,
+    pub scene_target_complete: bool,
     #[serde(default)]
-    pub row_layout_scene_hit: bool,
+    pub scene_reads_complete: bool,
     #[serde(default)]
-    pub row_layout_scene_physical_hit: bool,
+    pub scene_reference_ready: bool,
     #[serde(default)]
-    pub row_layout_scene_extended: bool,
+    pub scene_vertical_residency: String,
     #[serde(default)]
-    pub row_layout_exact_camera_hit: bool,
+    pub scene_camera_updates: u64,
     #[serde(default)]
-    pub row_scene_entries: usize,
+    pub scene_camera_only_updates: u64,
     #[serde(default)]
-    pub row_scene_bytes: usize,
+    pub scene_source_acquisitions: u64,
     #[serde(default)]
-    pub row_scene_resident_prepared: bool,
+    pub scene_source_retargets: u64,
     #[serde(default)]
-    pub row_scene_preparation_pending: bool,
+    pub scene_source_refusals: u64,
     #[serde(default)]
-    pub row_layout_compatibility_probes: usize,
+    pub scene_publications: u64,
     #[serde(default)]
-    pub row_layout_rows_reused: usize,
+    pub scene_foreground_submissions: u64,
     #[serde(default)]
-    pub row_layout_rows_appended: usize,
-    #[serde(default)]
-    pub row_layout_retained: usize,
-    #[serde(default)]
-    pub row_layout_restored: usize,
-    #[serde(default)]
-    pub row_layout_added: usize,
-    #[serde(default)]
-    pub row_layout_moved: usize,
-    #[serde(default)]
-    pub row_layout_reservations: usize,
-    #[serde(default)]
-    pub row_layout_history_bytes: usize,
-    #[serde(default)]
-    pub row_layout_islands: usize,
-    #[serde(default)]
-    pub row_layout_evictions: usize,
-    #[serde(default)]
-    pub row_layout_transition_reason: ReadStackingTransitionReason,
-    #[serde(default)]
-    pub row_layout_policy_fingerprint: u64,
-    #[serde(default)]
-    pub row_layout_scale_class: u8,
-    #[serde(default)]
-    pub row_layout_projection_fingerprint: u64,
-    #[serde(default)]
-    pub row_layout_stable_rows: usize,
-    #[serde(default)]
-    pub row_layout_canonical_rows: usize,
-    #[serde(default)]
-    pub row_layout_row_inflation: usize,
-    #[serde(default)]
-    pub row_layout_canonical_displacement: usize,
-    #[serde(default)]
-    pub row_layout_top_first_violations: usize,
-    #[serde(default)]
-    pub row_layout_query_occupied_row_span: usize,
-    #[serde(default)]
-    pub row_layout_query_empty_rows: usize,
-    #[serde(default)]
-    pub row_layout_query_empty_ratio_ppm: u32,
-    #[serde(default)]
-    pub row_layout_horizon_start: u64,
-    #[serde(default)]
-    pub row_layout_horizon_end: u64,
-    #[serde(default)]
-    pub row_layout_horizon_generation: u64,
-    #[serde(default)]
-    pub row_layout_horizon_extensions: usize,
-    #[serde(default)]
-    pub row_layout_horizon_records: usize,
-    #[serde(default)]
-    pub row_layout_horizon_bytes: usize,
-    #[serde(default)]
-    pub row_layout_horizon_truncated: bool,
-    #[serde(default)]
-    pub row_layout_horizon_cache_hit: bool,
-    #[serde(default)]
-    pub browsing_cache_outcome: String,
-    #[serde(default)]
-    pub alignment_query_phase: String,
-    #[serde(default)]
-    pub resident_start: Option<u64>,
-    #[serde(default)]
-    pub resident_end: Option<u64>,
-    #[serde(default)]
-    pub resident_records: usize,
-    #[serde(default)]
-    pub resident_bytes: usize,
-    #[serde(default)]
-    pub requested_buffer_left: u64,
-    #[serde(default)]
-    pub requested_buffer_right: u64,
-    #[serde(default)]
-    pub effective_buffer_left: u64,
-    #[serde(default)]
-    pub effective_buffer_right: u64,
-    #[serde(default)]
-    pub buffer_clamp_reason: Option<String>,
-    #[serde(default)]
-    pub resident_contract_revision: u64,
-    #[serde(default)]
-    pub resident_contains_target: bool,
-    #[serde(default)]
-    pub resident_lookup_micros: u64,
-    #[serde(default)]
-    pub resident_projection_micros: u64,
-    #[serde(default)]
-    pub resident_summary_micros: u64,
-    #[serde(default)]
-    pub resident_summary_tile_hits: usize,
-    #[serde(default)]
-    pub resident_summary_index_bytes: usize,
-    #[serde(default)]
-    pub resident_extensions_requested: u64,
-    #[serde(default)]
-    pub resident_extensions_completed: u64,
-    #[serde(default)]
-    pub resident_extensions_cancelled: u64,
-    #[serde(default)]
-    pub resident_extensions_too_dense: u64,
-    #[serde(default)]
-    pub resident_extensions_failed: u64,
-    #[serde(default)]
-    pub alignment_source_queries: u64,
-    #[serde(default)]
-    pub alignment_foreground_source_queries: u64,
-    #[serde(default)]
-    pub alignment_speculative_source_queries: u64,
-    #[serde(default)]
-    pub alignment_source_queries_avoided: u64,
-    #[serde(default)]
-    pub decoded_alignment_bytes_avoided: u64,
-    #[serde(default)]
-    pub speculative_alignment_records: usize,
-    #[serde(default)]
-    pub speculative_remote_bytes: u64,
-    #[serde(default)]
-    pub speculative_remote_requests: u64,
-    #[serde(default)]
-    pub resident_evictions: u64,
-    #[serde(default, alias = "compact_repack_pending")]
-    pub stable_architecture_rebuild_pending: bool,
+    pub scene_speculation_submissions: u64,
     #[serde(default)]
     pub overlapping_mate_policy: OverlappingMatePolicy,
     #[serde(default)]
@@ -2056,19 +1948,17 @@ pub struct AutomationNavigationTelemetry {
     #[serde(default)]
     pub maximum_frame_ms: Option<f64>,
     #[serde(default)]
-    pub cache_outcome: String,
+    pub scene_phase: String,
     #[serde(default)]
-    pub foreground_source_queries: u64,
+    pub foreground_submissions: u64,
     #[serde(default)]
-    pub speculative_source_queries: u64,
+    pub speculation_submissions: u64,
     #[serde(default)]
-    pub total_source_queries: u64,
+    pub source_acquisitions: u64,
     #[serde(default)]
-    pub row_scene_hit: bool,
+    pub camera_only_updates: u64,
     #[serde(default)]
-    pub row_scene_physical_hit: bool,
-    #[serde(default)]
-    pub row_scene_projection_micros: u64,
+    pub scene_publications: u64,
     #[serde(default)]
     pub gpu_uploaded_bytes: u64,
     #[serde(default)]
@@ -2496,15 +2386,12 @@ mod tests {
                 render_generation: 1,
                 settled: true,
                 navigation_transaction_active: false,
-                navigation_preview_active: false,
-                preview_source_locus: None,
-                preview_target_locus: None,
-                preview_source_generation: None,
-                preview_target_generation: None,
-                preview_age_ms: None,
-                preview_kind: None,
-                preview_invalidation_reason: None,
+                navigation_target_locus: None,
+                navigation_target_generation: None,
+                navigation_age_ms: None,
+                navigation_invalidation_reason: None,
                 render_lanes: Vec::new(),
+                context_lanes: Vec::new(),
                 read_panel_states: Vec::new(),
                 selected_presentation_nodes: Vec::new(),
                 presentation_selection_anchor: None,
@@ -2512,17 +2399,18 @@ mod tests {
             tracks: Vec::new(),
             read_browsing_buffer_percent: crate::DEFAULT_READ_BROWSING_BUFFER_PERCENT,
             total_cache_budget_mib: crate::DEFAULT_CACHE_BUDGET_MIB,
-            alignment_cache_resident_bytes: 0,
-            layout_cache_resident_bytes: 0,
-            row_scene_resident_bytes: 0,
-            gpu_slab_resident_bytes: 0,
-            measured_cache_resident_bytes: 0,
-            decoded_cache_allowance_bytes: 0,
-            layout_cache_allowance_bytes: 0,
-            row_scene_cache_allowance_bytes: 0,
-            gpu_slab_cache_allowance_bytes: 0,
-            cache_over_budget_bytes: 0,
-            cache_clamp_reason: None,
+            alignment_scene_budget_bytes: 0,
+            alignment_scene_charged_bytes: 0,
+            alignment_scene_reserved_bytes: 0,
+            alignment_scene_transition_reserve_bytes: 0,
+            alignment_scene_transition_reserved_bytes: 0,
+            alignment_scene_transient_budget_bytes: 0,
+            alignment_scene_transient_bytes: 0,
+            alignment_scene_transient_high_water_bytes: 0,
+            alignment_scene_pinned_bytes: 0,
+            alignment_scene_pinned_overage_bytes: 0,
+            alignment_scene_active_replacement_bundle: None,
+            alignment_scene_budget_refreshes: 0,
             read_pane_height: 360.0,
             annotation_section_expanded: true,
             read_section_expanded: true,
@@ -2638,9 +2526,8 @@ mod tests {
             serde_json::from_str::<AutomationSelectionSnapshot>(&selection_json).unwrap(),
             selection
         );
-        // Safe navigation metadata deliberately includes
-        // `preview_source_locus`; the privacy boundary forbids source/path/
-        // sequence payload fields, not the word "source" in a semantic key.
+        // Safe semantic lane metadata may include a genomic source locus; the privacy boundary
+        // forbids file source/path/sequence payload fields.
         assert!(!workspace_json.contains("\"source\":"));
         assert!(!workspace_json.contains("\"path\":"));
         assert!(!workspace_json.contains("\"sequence\":"));

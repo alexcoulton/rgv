@@ -88,7 +88,8 @@ const fn alignment_summary_prepare_ledger_error(
         AlignmentSummaryGpuPrepareError::InvalidFrameGeometry
         | AlignmentSummaryGpuPrepareError::InvalidAlternateFraction
         | AlignmentSummaryGpuPrepareError::IncompatibleAlleleScale
-        | AlignmentSummaryGpuPrepareError::UnsupportedAlleleInterpretation(_)
+        | AlignmentSummaryGpuPrepareError::MissingJunctionNormalization
+        | AlignmentSummaryGpuPrepareError::InvalidJunctionScale
         | AlignmentSummaryGpuPrepareError::MissingMandatoryPages { .. }
         | AlignmentSummaryGpuPrepareError::TooManyOverlayPrimitives
         | AlignmentSummaryGpuPrepareError::DynamicUniformAddressSpace
@@ -225,9 +226,8 @@ struct OwnedAlignmentSummaryGpuRequest {
     scene: Arc<AlignmentSceneSnapshot>,
     camera: CpuSummaryCamera,
     scissor: AlignmentGpuScissor,
-    options: AlignmentCoverageLaneOptions,
+    options: AlignmentSummaryGpuLaneOptions,
     overlays: AlignmentSummaryFrameOverlays,
-    live_clip: CpuClipRect,
 }
 
 impl OwnedAlignmentSummaryGpuRequest {
@@ -238,11 +238,13 @@ impl OwnedAlignmentSummaryGpuRequest {
     ) -> AlignmentSummaryGpuSceneRequest<'_> {
         AlignmentSummaryGpuSceneRequest {
             scene: &self.scene,
+            coherence_scope: self.panel_id.get(),
+            lane_identity: self.track_id.get(),
             camera_sequence,
             camera: self.camera,
             screen_size_points,
             scissor: self.scissor,
-            options: self.options.into(),
+            options: self.options.clone(),
             overlays: self.overlays,
         }
     }
@@ -980,12 +982,12 @@ impl Viewer {
         let previous_budget_bytes = self
             .alignment_scene_ledger
             .progress()
-            .map_or(self.cache_coordinator.total_budget_bytes, |snapshot| {
+            .map_or(self.alignment_scene_budget.budget_bytes, |snapshot| {
                 snapshot.budget
             });
         let total_bytes = cache_budget_mib.saturating_mul(1024 * 1024).max(1);
-        self.cache_coordinator.total_budget_bytes = total_bytes;
-        self.rebalance_live_cache_coordinator();
+        self.alignment_scene_budget.budget_bytes = total_bytes;
+        self.refresh_alignment_scene_budget();
         if total_bytes < previous_budget_bytes {
             self.alignment_gpu_residency_bundle = None;
             self.alignment_gpu_prefetch.clear();
@@ -1035,13 +1037,15 @@ impl Viewer {
     /// user-selected ceiling. Each tier may borrow all presently unused
     /// capacity; decoded engines divide their pool from observed residency
     /// rather than retaining a startup-time equal split.
-    pub(crate) fn rebalance_live_cache_coordinator(&mut self) {
+    /// Applies the one enforcing alignment-scene budget. Query-era decoded, row-scene, layout,
+    /// and generic rectangle caches are not alignment authorities and receive no slice of it.
+    pub(crate) fn refresh_alignment_scene_budget(&mut self) {
         let total_budget_bytes = self
             .settings
             .cache_budget_mib
             .saturating_mul(1024 * 1024)
             .max(1);
-        self.cache_coordinator.total_budget_bytes = total_budget_bytes;
+        self.alignment_scene_budget.budget_bytes = total_budget_bytes;
         if let Err(error) = self.alignment_scene_ledger.set_limits(
             total_budget_bytes,
             total_budget_bytes,
@@ -1050,165 +1054,36 @@ impl Viewer {
             self.data_status = format!("Could not apply alignment resource limits: {error}");
         }
 
-        let mut layout_resident_bytes = self.layout_cache.stats().resident_weight;
-        let mut row_scene_resident_bytes = self.row_scene_resident_bytes();
-        let mut gpu_slab_resident_bytes = self
-            .rectangle_renderer
-            .last_prepare_stats()
-            .slab_resident_bytes;
-
-        // Derived state alone can exceed a newly lowered ceiling. Retire only
-        // inactive/LRU objects here; active layout and GPU state remain held by
-        // their presentation owners even if their cache entries are removed.
-        let derived_resident_bytes = layout_resident_bytes
-            .saturating_add(row_scene_resident_bytes)
-            .saturating_add(gpu_slab_resident_bytes);
-        if derived_resident_bytes > total_budget_bytes {
-            let layout_ceiling = total_budget_bytes
-                .saturating_sub(row_scene_resident_bytes)
-                .saturating_sub(gpu_slab_resident_bytes)
-                .max(1);
-            self.layout_cache.set_maximum_weight(
-                NonZeroUsize::new(layout_ceiling).expect("layout ceiling is non-zero"),
-            );
-            layout_resident_bytes = self.layout_cache.stats().resident_weight;
-
-            let gpu_ceiling = total_budget_bytes
-                .saturating_sub(row_scene_resident_bytes)
-                .saturating_sub(layout_resident_bytes)
-                .max(1);
-            self.rectangle_renderer.set_maximum_slab_bytes(gpu_ceiling);
-            gpu_slab_resident_bytes = self
-                .rectangle_renderer
-                .last_prepare_stats()
-                .slab_resident_bytes;
-
-            let row_ceiling = total_budget_bytes
-                .saturating_sub(layout_resident_bytes)
-                .saturating_sub(gpu_slab_resident_bytes);
-            self.trim_inactive_row_scenes(row_ceiling);
-            row_scene_resident_bytes = self.row_scene_resident_bytes();
-        }
-
-        let non_decoded_resident_bytes = layout_resident_bytes
-            .saturating_add(row_scene_resident_bytes)
-            .saturating_add(gpu_slab_resident_bytes);
-        let decoded_allowance_bytes = total_budget_bytes
-            .saturating_sub(non_decoded_resident_bytes)
-            .max(self.alignment_tracks.len().max(1));
-        let mut first_error = None;
         let allowance =
             NonZeroUsize::new(total_budget_bytes).expect("the selected scene budget is non-zero");
+        let mut first_error = None;
         for track in &mut self.alignment_tracks {
-            if track.cache_budget_bytes == allowance {
+            let Some(engine) = &track.scene_engine else {
+                continue;
+            };
+            if track.scene_budget_bytes == allowance {
                 continue;
             }
-            if let Some(engine) = &track.scene_engine {
-                match engine.try_reduce_budget(total_budget_bytes) {
-                    Ok(()) => {
-                        track.cache_budget_bytes = allowance;
-                        track.scene_budget_retry = None;
-                    }
-                    Err(error) => {
-                        first_error.get_or_insert_with(|| error.to_string());
-                    }
+            match engine.try_reduce_budget(total_budget_bytes) {
+                Ok(()) => {
+                    track.scene_budget_bytes = allowance;
+                    track.scene_budget_retry = None;
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| error.to_string());
                 }
             }
         }
 
-        // When current residency fits, every derived tier can borrow the same
-        // free headroom. A growth is observed and rebalanced before the next
-        // display admission. Under pressure, current derived state is pinned
-        // while decoded actors first discard speculative margins.
-        let decoded_resident_bytes = self.decoded_cache_resident_bytes();
-        let measured_resident_bytes = decoded_resident_bytes
-            .saturating_add(layout_resident_bytes)
-            .saturating_add(row_scene_resident_bytes)
-            .saturating_add(gpu_slab_resident_bytes);
-        let free_bytes = total_budget_bytes.saturating_sub(measured_resident_bytes);
-        let layout_allowance_bytes = layout_resident_bytes.saturating_add(free_bytes).max(1);
-        let row_scene_allowance_bytes = row_scene_resident_bytes.saturating_add(free_bytes).max(1);
-        let gpu_slab_allowance_bytes = gpu_slab_resident_bytes.saturating_add(free_bytes).max(1);
-        self.layout_cache.set_maximum_weight(
-            NonZeroUsize::new(layout_allowance_bytes).expect("layout allowance is non-zero"),
-        );
-        self.rectangle_renderer
-            .set_maximum_slab_bytes(gpu_slab_allowance_bytes);
-        self.cache_budgets = CacheBudgets {
-            remote_blocks: 0,
-            decoded_alignments: decoded_allowance_bytes,
-            coverage_summaries: 0,
-            layouts: layout_allowance_bytes,
-            gpu_buffers: gpu_slab_allowance_bytes,
-        };
-        self.cache_coordinator = LiveCacheCoordinatorSnapshot {
-            total_budget_bytes,
-            measured_resident_bytes,
-            decoded_resident_bytes,
-            layout_resident_bytes,
-            row_scene_resident_bytes,
-            gpu_slab_resident_bytes,
-            decoded_allowance_bytes,
-            layout_allowance_bytes,
-            row_scene_allowance_bytes,
-            gpu_slab_allowance_bytes,
-            over_budget_bytes: measured_resident_bytes.saturating_sub(total_budget_bytes),
-            clamp_reason: (measured_resident_bytes > total_budget_bytes)
-                .then_some("decoded eviction settling or authoritative foreground pinned"),
-            rebalances: self.cache_coordinator.rebalances.saturating_add(1),
-        };
+        self.context_lane_gpu_budget_bytes = total_budget_bytes;
+        if let Ok(progress) = self.alignment_scene_ledger.progress() {
+            self.alignment_scene_budget = AlignmentSceneBudgetSnapshot::from_progress(
+                progress,
+                self.alignment_scene_budget.refreshes.saturating_add(1),
+            );
+        }
         if let Some(error) = first_error {
             self.data_status = format!("Could not apply cache budget: {error}");
-        }
-    }
-
-    pub(crate) fn decoded_cache_resident_bytes(&self) -> usize {
-        self.alignment_tracks
-            .iter()
-            .filter_map(|track| track.cache_stats)
-            .fold(0_usize, |total, stats| {
-                total.saturating_add(stats.resident_weight)
-            })
-    }
-
-    pub(crate) fn row_scene_resident_bytes(&mut self) -> usize {
-        let mut scenes = self
-            .alignment_tracks
-            .iter()
-            .flat_map(|track| track.projections.values())
-            .flat_map(|projection| projection.row_scenes.iter().cloned())
-            .collect::<Vec<_>>();
-        scenes.sort_unstable_by_key(|scene| Arc::as_ptr(scene) as usize);
-        scenes.dedup_by(|left, right| Arc::ptr_eq(left, right));
-        let key = scenes
-            .iter()
-            .map(|scene| (Arc::as_ptr(scene) as usize, scene.residency_revision()))
-            .collect::<Vec<_>>();
-        if let Some((cached_key, bytes)) = self.row_scene_residency_cache.as_ref()
-            && cached_key == &key
-        {
-            return *bytes;
-        }
-        let bytes = AlignmentRowScene::estimated_resident_bytes(scenes.iter().map(Arc::as_ref));
-        self.row_scene_residency_cache = Some((key, bytes));
-        bytes
-    }
-
-    fn trim_inactive_row_scenes(&mut self, maximum_bytes: usize) {
-        while self.row_scene_resident_bytes() > maximum_bytes {
-            let mut removed = false;
-            'tracks: for track in &mut self.alignment_tracks {
-                for projection in track.projections.values_mut() {
-                    if projection.row_scenes.len() > 1 {
-                        projection.row_scenes.remove(0);
-                        removed = true;
-                        break 'tracks;
-                    }
-                }
-            }
-            if !removed {
-                break;
-            }
         }
     }
 
@@ -1472,8 +1347,6 @@ impl Viewer {
                 "semantic scene and native GPU derivative committed atomically",
             );
             projection.finish_checking();
-            projection.pending_query = false;
-            projection.settled_generation = Some(projection.clock.current().get());
         }
         self.synchronize_alignment_pending_mirrors();
     }
@@ -1741,9 +1614,8 @@ impl Viewer {
                 read_panel.density_camera = update.native_reads_present;
                 read_panel.row_origin = update.native_reads_present.then_some(row_origin);
                 read_panel.row_height = update.native_reads_present.then_some(row_height);
-                read_panel.row_coordinate_authority = ReadRowCoordinateAuthority::Exact(
-                    ReadRowCoordinateSpace::Unified(profile.row_coordinate_space()),
-                );
+                read_panel.row_coordinate_authority =
+                    ReadRowCoordinateAuthority::Exact(profile.row_coordinate_space());
                 read_panel.row_activity_atlas_revision = Some(profile.atlas_revision());
                 read_panel.materialized_row_range = None;
                 read_panel.total_rows = Some(profile.active_row_end());
@@ -1754,11 +1626,11 @@ impl Viewer {
                     read_panel.clip_top,
                     read_panel.clip_bottom,
                     actual_content_bottom,
-                    ReadRowCoordinateSpace::Unified(profile.row_coordinate_space()),
+                    profile.row_coordinate_space(),
                 )
             };
 
-            let legacy_primary = ReadPanelScrollState {
+            let compatibility_primary = ReadPanelScrollState {
                 scroll_points: panel.vertical_scroll_points,
                 content_origin_points: panel.vertical_content_origin_points,
                 latent_scroll_fraction: panel.latent_vertical_scroll_fraction,
@@ -1772,7 +1644,7 @@ impl Viewer {
                 .entry(update.track_id)
                 .or_insert_with(|| {
                     if update.track_id == primary_track_id {
-                        legacy_primary
+                        compatibility_primary
                     } else {
                         ReadPanelScrollState::default()
                     }
@@ -1927,25 +1799,6 @@ impl Viewer {
             .iter()
             .map(|request| request.borrowed(publication_attempt_sequence, screen_size_points))
             .collect::<Vec<_>>();
-        let live_regions = owned_reads
-            .iter()
-            .filter_map(|request| {
-                request.live_clip.map(|clip| AlignmentNativeLiveRegion {
-                    panel_id: request.panel_id,
-                    target_revision,
-                    clip,
-                })
-            })
-            .chain(
-                owned_summaries
-                    .iter()
-                    .map(|request| AlignmentNativeLiveRegion {
-                        panel_id: request.panel_id,
-                        target_revision,
-                        clip: request.live_clip,
-                    }),
-            )
-            .collect::<Vec<_>>();
         let read_authorities = owned_reads
             .iter()
             .filter_map(|request| {
@@ -1975,7 +1828,6 @@ impl Viewer {
                 },
                 reads: None,
                 summaries: None,
-                live_regions: Vec::new(),
                 lane_authorities,
                 read_authorities: Vec::new(),
             };
@@ -1989,6 +1841,7 @@ impl Viewer {
                 candidate_epoch.panel_frames,
                 bundle,
             ));
+            self.resolve_pending_alignment_scene_selections();
             self.invalidate_stale_alignment_scroll_cache();
             self.alignment_gpu_residency_bundle = None;
             self.alignment_gpu_prefetch.clear();
@@ -2013,7 +1866,6 @@ impl Viewer {
                     ),
                     reads,
                     summaries,
-                    live_regions,
                     lane_authorities,
                     read_authorities,
                 };
@@ -2027,6 +1879,7 @@ impl Viewer {
                     candidate_epoch.panel_frames,
                     bundle,
                 ));
+                self.resolve_pending_alignment_scene_selections();
                 self.invalidate_stale_alignment_scroll_cache();
                 // Camera capture preserves the immutable prepared authority. Keep any in-flight
                 // cursor and its pins instead of restarting complete-scene discovery on every
@@ -2089,7 +1942,6 @@ impl Viewer {
             publication_attempt_sequence,
             &read_requests,
             &summary_requests,
-            live_regions.clone(),
             lane_authorities.clone(),
             read_authorities.clone(),
         );
@@ -2108,7 +1960,6 @@ impl Viewer {
                             publication_attempt_sequence,
                             &read_requests,
                             &summary_requests,
-                            live_regions,
                             lane_authorities,
                             read_authorities,
                         ),
@@ -2139,6 +1990,7 @@ impl Viewer {
                     candidate_epoch.panel_frames,
                     bundle,
                 ));
+                self.resolve_pending_alignment_scene_selections();
                 self.invalidate_stale_alignment_scroll_cache();
                 // Speculation must never delay publication of the frame that satisfied the
                 // foreground camera. The render loop advances this authority only after that
@@ -2408,7 +2260,7 @@ impl Viewer {
     ) {
         let mut reads = Vec::new();
         let mut summaries = Vec::new();
-        let mut unsupported_interpretations = 0_usize;
+        let unsupported_interpretations = 0_usize;
         for (panel_id, frame) in panel_frames {
             for lane in frame.lanes.iter() {
                 let Some(source_authority) = lane_authorities.iter().find(|authority| {
@@ -2463,16 +2315,6 @@ impl Viewer {
                 };
                 debug_assert_eq!(source_authority.source_camera, lane.preparation_camera);
                 for capture in lane.derived_lanes.iter() {
-                    let AlignmentDerivedLaneOptions::Coverage(options) = &capture.options else {
-                        continue;
-                    };
-                    if options.alleles.is_some_and(|alleles| {
-                        alleles.interpretation
-                            != CoverageAlleleInterpretation::GenericReferenceAware
-                    }) {
-                        unsupported_interpretations = unsupported_interpretations.saturating_add(1);
-                        continue;
-                    }
                     let Ok(camera) = CpuSummaryCamera::from_viewport(
                         lane.preparation_camera.viewport(),
                         capture.clip,
@@ -2487,33 +2329,76 @@ impl Viewer {
                     ) else {
                         continue;
                     };
-                    let Some(live_clip) = lane.covered_interval.and_then(|covered| {
-                        alignment_scene_covered_clip(
-                            lane.preparation_camera.viewport(),
-                            capture.clip,
-                            covered,
-                        )
-                    }) else {
+                    if lane
+                        .covered_interval
+                        .and_then(|covered| {
+                            alignment_scene_covered_clip(
+                                lane.preparation_camera.viewport(),
+                                capture.clip,
+                                covered,
+                            )
+                        })
+                        .is_none()
+                    {
                         continue;
-                    };
-                    // Depth is reference-independent. While the optional FASTA product is
-                    // pending, publish exact depth alone; the same immutable lane is upgraded
-                    // with allele/substitution pages when reference authority arrives.
-                    let mut available_options = *options;
-                    if scene.reads().presentation().reference.is_none() {
-                        available_options.alleles = None;
                     }
+                    let (options, selected_position) = match &capture.options {
+                        AlignmentDerivedLaneOptions::Coverage(options) => {
+                            // Depth is reference-independent. While the optional FASTA product
+                            // is pending, publish exact depth alone; the same immutable lane is
+                            // upgraded with allele/substitution pages when reference arrives.
+                            let mut available = *options;
+                            if scene.reads().presentation().reference.is_none() {
+                                available.alleles = None;
+                            }
+                            (
+                                AlignmentSummaryGpuLaneOptions::Coverage(available),
+                                options.depth.selected_position,
+                            )
+                        }
+                        AlignmentDerivedLaneOptions::Modifications(options) => (
+                            AlignmentSummaryGpuLaneOptions::Modifications(options.clone()),
+                            options.selected_position,
+                        ),
+                        AlignmentDerivedLaneOptions::Sashimi(options) => {
+                            (AlignmentSummaryGpuLaneOptions::Sashimi(*options), None)
+                        }
+                    };
+                    let panel = self.panels.get(*panel_id);
+                    let hovered_junction = panel
+                        .and_then(|panel| panel.hovered_junction_arc)
+                        .filter(|hover| hover.key.track_id == lane.track_id)
+                        .map(|hover| AlignmentSummaryJunctionInteraction {
+                            start: hover.key.start,
+                            end: hover.key.end,
+                            component: summary_junction_component(hover.key.component),
+                        });
+                    let selected_junction = panel
+                        .filter(|panel| panel.selected_alignment_track == Some(lane.track_id))
+                        .and_then(|panel| {
+                            panel
+                                .selected_junction
+                                .zip(panel.selected_junction_component)
+                        })
+                        .map(
+                            |((start, end), component)| AlignmentSummaryJunctionInteraction {
+                                start,
+                                end,
+                                component: summary_junction_component(component),
+                            },
+                        );
                     summaries.push(OwnedAlignmentSummaryGpuRequest {
                         panel_id: *panel_id,
                         track_id: lane.track_id,
                         scene: Arc::clone(scene),
                         camera,
                         scissor,
-                        options: available_options,
+                        options,
                         overlays: AlignmentSummaryFrameOverlays {
-                            selected_position: options.depth.selected_position,
+                            selected_position,
+                            hovered_junction,
+                            selected_junction,
                         },
-                        live_clip,
                     });
                 }
             }
@@ -2615,7 +2500,6 @@ impl Viewer {
         publication_attempt_sequence: u64,
         read_requests: &[AlignmentGpuSceneRequest<'_>],
         summary_requests: &[AlignmentSummaryGpuSceneRequest<'_>],
-        live_regions: Vec<AlignmentNativeLiveRegion>,
         lane_authorities: Vec<AlignmentCommittedLaneAuthority>,
         read_authorities: Vec<AlignmentNativeReadAuthority>,
     ) -> std::result::Result<AlignmentGpuFrameBundle, AlignmentGpuBundleFailure> {
@@ -2934,7 +2818,6 @@ impl Viewer {
             prepared_authority,
             reads,
             summaries,
-            live_regions,
             lane_authorities,
             read_authorities,
         })
@@ -3334,6 +3217,71 @@ impl Viewer {
         presented.read_authority.map(|_| snapshot)
     }
 
+    /// Binds cross-panel/name-based read intent to the stable handle in the newly committed scene.
+    /// Query-local record indexes are never introduced on this path. Resolution is deliberately
+    /// performed after the atomic epoch commit, so selection can only name evidence that render,
+    /// picking, and inspection can all observe together.
+    fn resolve_pending_alignment_scene_selections(&mut self) {
+        let Some(epoch) = self.alignment_presented_epoch.as_ref() else {
+            return;
+        };
+        let resolutions = self
+            .panels
+            .iter()
+            .filter_map(|panel| {
+                let pending = panel.pending_read_selection.clone()?;
+                let lane = epoch.panel_frames.get(&panel.id)?.lane(pending.track_id)?;
+                let snapshot = lane.snapshot.as_ref()?;
+                let (handle, record) = pending.matching_scene_record(snapshot.reads())?;
+                let chain = selected_supplementary_chain(&record, &panel.contig_name);
+                let (retained, reveal) = pending.retained_after_resolution(Some(&record));
+                Some((
+                    panel.id,
+                    retained.track_id,
+                    snapshot.revision(),
+                    handle,
+                    chain,
+                    retained,
+                    reveal,
+                ))
+            })
+            .collect::<Vec<_>>();
+        if resolutions.is_empty() {
+            return;
+        }
+        let mut resolved_panels = Vec::with_capacity(resolutions.len());
+        for (panel_id, track_id, scene_revision, handle, chain, retained, reveal) in resolutions {
+            let Some(panel) = self.panels.get_mut(panel_id) else {
+                continue;
+            };
+            panel.pending_read_selection = Some(retained);
+            panel.selected_alignment_track = Some(track_id);
+            panel.selected_alignment_hit = Some(AlignmentHit {
+                track: track_id,
+                scene_revision,
+                handle,
+                component: AlignmentComponent::ReadSpan,
+            });
+            panel.selected_chain = chain;
+            if reveal {
+                panel.pending_alignment_reveal = Some((track_id, handle));
+            }
+            replace_panel_track_selection(
+                panel,
+                TrackFrameKey::Alignment(track_id),
+                ui::TrackPane::Reads,
+            );
+            resolved_panels.push(panel_id);
+        }
+        resolved_panels.sort_unstable();
+        resolved_panels.dedup();
+        for panel_id in resolved_panels {
+            self.synchronize_alignment_scene_interactions(panel_id);
+        }
+        self.display_dirty = true;
+        self.window.request_redraw();
+    }
+
     pub(crate) fn presented_alignment_lane(
         &self,
         panel_id: PanelId,
@@ -3457,7 +3405,6 @@ impl Viewer {
         );
         if failed {
             let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
-            projection.pending_query = false;
             projection.navigation.transition(
                 AlignmentNavigationPhase::Failed,
                 "alignment source is already failed",
@@ -3467,7 +3414,7 @@ impl Viewer {
         if advance_generation {
             self.alignment_tracks[track_index]
                 .projection_mut(panel_id)
-                .advance_query_generation();
+                .advance_scene_generation();
         }
         let token = self.take_alignment_scene_request_token();
         let track_id = self.alignment_tracks[track_index].config.id;
@@ -3475,9 +3422,6 @@ impl Viewer {
         let generation = projection.clock.current().get();
         projection.navigation.bind_identity(panel_id, track_id);
         projection.navigation.begin(generation, token, reason);
-        // Compatibility mirror for diagnostics which have not yet migrated to the transaction.
-        // Runtime queueing and readiness no longer infer authority from this flag.
-        projection.pending_query = true;
         projection.scene_pressure_retry = None;
     }
 
@@ -3493,7 +3437,7 @@ impl Viewer {
             return;
         }
         let viewport = self.panels.active().viewport;
-        let resolution = AlignmentQueryResolution::for_viewport(viewport);
+        let resolution = AlignmentSceneResolution::for_viewport(viewport);
         let panel_id = self.panels.active().id;
         if !resolution.requires_alignment_records() {
             let mut settled = 0_usize;
@@ -3509,13 +3453,11 @@ impl Viewer {
                         // is excluded from capture while `index_only_overview` is true.
                         projection.scene_pressure_retry = None;
                         projection.settle_index_only_overview(resolution);
-                        projection.pending_query = false;
                         retired_tracks.push(track_id);
                         settled = settled.saturating_add(1);
                     }
                     AlignmentTrackLifecycle::Failed(_) => {
                         let projection = track.projection_mut(panel_id);
-                        projection.pending_query = false;
                         projection.index_only_overview = false;
                         projection.navigation.transition(
                             AlignmentNavigationPhase::Failed,
@@ -3533,10 +3475,10 @@ impl Viewer {
                     .or_default()
                     .retire_scene_authority();
                 if panel
-                    .pending_read_reveal
+                    .pending_alignment_reveal
                     .is_some_and(|(pending_track, _)| pending_track == track_id)
                 {
-                    panel.pending_read_reveal = None;
+                    panel.pending_alignment_reveal = None;
                 }
                 if track_id == primary_track_id {
                     panel.vertical_scroll_points = 0.0;
@@ -3573,7 +3515,6 @@ impl Viewer {
                 AlignmentTrackLifecycle::Failed(_)
             ) {
                 let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
-                projection.pending_query = false;
                 projection.navigation.transition(
                     AlignmentNavigationPhase::Failed,
                     "alignment source is disconnected",
@@ -3643,7 +3584,7 @@ impl Viewer {
                     .or_default()
                     .bind_scene_contig(contig, authority_discontinuity);
                 if reset {
-                    panel.pending_read_reveal = None;
+                    panel.pending_alignment_reveal = None;
                     if track_id == primary_track_id {
                         panel.vertical_scroll_points = 0.0;
                         panel.vertical_content_origin_points = 0.0;
@@ -3740,7 +3681,6 @@ impl Viewer {
                         .to_owned(),
                 );
                 let projection = track.projection_mut(panel_id);
-                projection.pending_query = false;
                 projection.navigation.transition(
                     AlignmentNavigationPhase::Failed,
                     "unified alignment scene source is unavailable",
@@ -3825,9 +3765,8 @@ impl Viewer {
             match queue_error {
                 None => {
                     let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
-                    projection.pending_query = false;
                     projection.begin_checking(Instant::now());
-                    projection.last_query_resolution = Some(resolution);
+                    projection.last_scene_resolution = Some(resolution);
                     projection.scene_pressure_retry = None;
                     projection.unavailable = None;
                     projection.index_only_overview = false;
@@ -3841,7 +3780,6 @@ impl Viewer {
                 Some(EngineQueueError::Disconnected) => {
                     let track = &mut self.alignment_tracks[track_index];
                     let projection = track.projection_mut(panel_id);
-                    projection.pending_query = false;
                     projection.navigation.transition(
                         AlignmentNavigationPhase::Failed,
                         "alignment source mailbox disconnected",
@@ -3905,7 +3843,7 @@ impl Viewer {
         configs.push(config);
         match self.replace_alignment_track_controllers(configs) {
             Ok(()) => {
-                self.invalidate_navigation_preview_contract("alignment source set changed");
+                self.invalidate_navigation_contract("alignment source set changed");
                 self.begin_all_panel_refresh_transactions();
                 self.panels.active_mut().pending_queries.alignment = false;
                 self.synthetic = false;
@@ -3986,10 +3924,8 @@ impl Viewer {
             .primary_alignment_limit()
             .min(self.workspace_alignment_limit)
             .max(1);
-        let cache_bytes = alignment_cache_share(
-            self.cache_budgets.decoded_alignments,
-            self.alignment_tracks.len().max(1),
-        );
+        let cache_bytes = NonZeroUsize::new(self.alignment_scene_budget.budget_bytes.max(1))
+            .expect("scene budget is non-zero");
         let controller = spawn_alignment_track_controller(
             configs.remove(0),
             cache_bytes,
@@ -4013,13 +3949,12 @@ impl Viewer {
                 } else {
                     self.alignment_tracks[0] = controller;
                 }
-                self.invalidate_navigation_preview_contract("alignment source changed");
+                self.invalidate_navigation_contract("alignment source changed");
                 self.begin_all_panel_refresh_transactions();
                 self.reconcile_track_presentation();
                 self.panels.active_mut().pending_queries.alignment = false;
                 self.panels.active_mut().selected_chain = None;
                 self.panels.active_mut().display_list = DisplayList::default();
-                self.layout_cache.clear();
                 self.synthetic = false;
                 self.data_status = format!("Opening {}…", source.redacted_label());
                 self.display_dirty = true;
@@ -4067,6 +4002,7 @@ impl Viewer {
                 panel.generation_clock.advance();
                 panel.reference_slice = None;
                 panel.reference_slice_revision = None;
+                panel.reference_slice_generation = None;
                 panel.reference_request_revision = None;
                 panel.reference_request_interval = None;
                 panel.reference_installs_queued.clear();
@@ -4089,7 +4025,7 @@ impl Viewer {
         self.synthetic = false;
         self.primary_alignment_filters_mut().show_reference = true;
         self.data_status = format!("Opening reference genome {source_label}…");
-        self.invalidate_navigation_preview_contract("reference source changed");
+        self.invalidate_navigation_contract("reference source changed");
         self.begin_all_panel_refresh_transactions();
         self.rebuild_all_panel_displays();
         self.display_dirty = true;
@@ -4145,8 +4081,8 @@ impl Viewer {
         &mut self,
         configs: Vec<SessionAlignmentTrack>,
     ) -> Result<()> {
-        let cache_bytes =
-            alignment_cache_share(self.cache_budgets.decoded_alignments, configs.len());
+        let cache_bytes = NonZeroUsize::new(self.alignment_scene_budget.budget_bytes.max(1))
+            .expect("scene budget is non-zero");
         let reference_path = self.reference_source.as_ref().map(source_path);
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         let mut controllers = Vec::with_capacity(configs.len());
@@ -4199,7 +4135,7 @@ impl Viewer {
         controller: AlignmentTrackController,
     ) {
         for projection in controller.projections.values() {
-            projection.advance_query_generation();
+            projection.advance_scene_generation();
         }
         let AlignmentTrackController { scene_engine, .. } = controller;
         if let Some(task) = scene_engine.and_then(AlignmentSceneEngine::retire) {
@@ -4227,7 +4163,6 @@ impl Viewer {
         } else {
             self.apply_primary_alignment_config(None, self.workspace_alignment_limit)?;
         }
-        self.layout_cache.clear();
         Ok(())
     }
 
@@ -4286,10 +4221,10 @@ impl Viewer {
         }
         for track in &self.alignment_tracks {
             for projection in track.projections.values() {
-                projection.advance_query_generation();
+                projection.advance_scene_generation();
             }
         }
-        self.invalidate_navigation_preview_contract("alignment source removed");
+        self.invalidate_navigation_contract("alignment source removed");
         self.begin_all_panel_refresh_transactions();
         self.request_all_alignment_queries();
         self.rebuild_all_panel_displays();

@@ -111,16 +111,6 @@ pub(crate) struct SupplementaryChainDiagram {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReadEventSelection {
-    pub(crate) record_index: usize,
-    pub(crate) operation_index: usize,
-    /// Zero-based offset within an aligned CIGAR operation for a selected
-    /// single-base substitution. Structural read events select the complete
-    /// operation and therefore leave this unset.
-    pub(crate) operation_offset: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FeatureSelection {
     pub(crate) track_id: TrackId,
     pub(crate) record_index: usize,

@@ -11,17 +11,25 @@ use std::{
 
 use bytemuck::{Pod, Zeroable};
 use rgv_alignment_scene::{
-    AlignmentCoverageLaneOptions, AlignmentModificationLaneOptions, AlignmentSceneSnapshot,
-    AllocationBundleActual, AllocationBundleDemand, AllocationBundleError, AllocationBundleLease,
+    AlignmentCoverageLaneOptions, AlignmentModificationLaneOptions, AlignmentSashimiLaneOptions,
+    AlignmentSashimiScalePolicy, AlignmentSceneSnapshot, AllocationBundleActual,
+    AllocationBundleDemand, AllocationBundleError, AllocationBundleLease,
     AllocationBundleReservation, AllocationBundleSlot, AllocationClass, AllocationId,
     AllocationLease, AllocationLedger, AllocationRetirementClaimSet, AllocationRetirementToken,
-    CoverageAlleleInterpretation, CpuSummaryCamera, LedgerError, LedgerProgress,
-    PinnedAllocationLease, ReservationKind, SceneRevision, SummaryPageFamily, SummaryPageKey,
-    SummarySemanticComponent, SummarySemanticPage, TransientResourceClass,
+    BisulfiteObservationToken, CoverageAlleleInterpretation, CpuBisulfiteStrandToken,
+    CpuSummaryCamera, JunctionAnnotationStatus, LedgerError, LedgerProgress, PinnedAllocationLease,
+    ReservationKind, SceneRevision, SummaryPageFamily, SummaryPageKey, SummarySemanticComponent,
+    SummarySemanticPage, TransientResourceClass,
 };
-use rgv_core::{CoverageScaleTransform, GenomicInterval, ModifiedBaseColorMode};
-use rgv_hts::{ModificationBin, ModificationCode, ModificationSeriesKey};
-use rgv_layout::modification_code_color;
+use rgv_core::{
+    BisulfiteContext, CoverageScaleTransform, GenomicInterval, JunctionDisplayMode,
+    ModifiedBaseColorMode, SashimiCountMode,
+};
+use rgv_hts::{JunctionEvidence, ModificationBin, ModificationCode, ModificationSeriesKey};
+use rgv_layout::{
+    MAX_RENDERED_JUNCTION_LABELS, RectPrimitive, RectShape, Rgba, junction_arc_distance_to_point,
+    modification_code_color,
+};
 use thiserror::Error;
 
 use crate::{
@@ -95,6 +103,18 @@ impl AlignmentSummaryGpuPageKey {
         })
     }
 
+    pub fn junctions(page: &SummarySemanticPage) -> Result<Self, AlignmentSummaryGpuPageError> {
+        if page.key().family() != SummaryPageFamily::Junctions {
+            return Err(AlignmentSummaryGpuPageError::UnsupportedFamily(
+                page.key().family(),
+            ));
+        }
+        Ok(Self {
+            semantic: page.key(),
+            companion_depth: None,
+        })
+    }
+
     #[must_use]
     pub const fn semantic(self) -> SummaryPageKey {
         self.semantic
@@ -145,6 +165,14 @@ impl<'a> AlignmentSummaryGpuPageRequest<'a> {
         }
     }
 
+    #[must_use]
+    pub const fn junctions(page: &'a Arc<SummarySemanticPage>) -> Self {
+        Self {
+            page,
+            companion_depth: None,
+        }
+    }
+
     pub fn key(self) -> Result<AlignmentSummaryGpuPageKey, AlignmentSummaryGpuPageError> {
         match self.page.key().family() {
             SummaryPageFamily::Depth if self.companion_depth.is_none() => {
@@ -159,6 +187,9 @@ impl<'a> AlignmentSummaryGpuPageRequest<'a> {
             ),
             SummaryPageFamily::Modifications if self.companion_depth.is_none() => {
                 AlignmentSummaryGpuPageKey::modifications(self.page)
+            }
+            SummaryPageFamily::Junctions if self.companion_depth.is_none() => {
+                AlignmentSummaryGpuPageKey::junctions(self.page)
             }
             family => Err(AlignmentSummaryGpuPageError::UnsupportedFamily(family)),
         }
@@ -210,17 +241,20 @@ pub struct AlignmentSummaryGpuAlleleInstance {
     pub raw: [f32; 3],
     /// `[fraction, aggregate alternate fraction, preceding stack fraction]`.
     pub quality_weighted: [f32; 3],
+    /// `[0 generic / 1 bisulfite, context mask, strand token, observation token]`.
+    pub interpretation: [u32; 4],
 }
 
 impl AlignmentSummaryGpuAlleleInstance {
     fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+        const ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
             0 => Float32x2,
             1 => Float32x2,
             2 => Uint32,
             3 => Uint32,
             4 => Float32x3,
-            5 => Float32x3
+            5 => Float32x3,
+            6 => Uint32x4
         ];
         wgpu::VertexBufferLayout {
             array_stride: size_of::<Self>() as wgpu::BufferAddress,
@@ -260,6 +294,45 @@ impl AlignmentSummaryGpuModificationInstance {
             3 => Float32x4,
             4 => Uint32x4,
             5 => Uint32
+        ];
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &ATTRIBUTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum AlignmentSummaryJunctionComponentToken {
+    Positive = 0,
+    Negative = 1,
+    Unknown = 2,
+    Annotation = 3,
+}
+
+/// Camera-independent splice-junction geometry. Biological extents, evidence thresholds, the
+/// stable prepared-horizon row, strand component, and annotation status are uploaded once. Scale,
+/// collapsed/expanded presentation, clipping, and hover/selection remain frame state.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct AlignmentSummaryGpuJunctionInstance {
+    pub start_offset: [f32; 2],
+    pub end_offset: [f32; 2],
+    /// `[component depth, total depth, minimum left flank, minimum right flank]`.
+    pub evidence: [u32; 4],
+    /// `[expanded row, component token, annotation token, reserved]`.
+    pub identity: [u32; 4],
+}
+
+impl AlignmentSummaryGpuJunctionInstance {
+    fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
+        const ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
+            0 => Float32x2,
+            1 => Float32x2,
+            2 => Uint32x4,
+            3 => Uint32x4
         ];
         wgpu::VertexBufferLayout {
             array_stride: size_of::<Self>() as wgpu::BufferAddress,
@@ -309,12 +382,49 @@ pub struct AlignmentSummaryGpuProjectedAllele {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AlignmentSummaryGpuProjectedBisulfite {
+    pub bounds: AlignmentSummaryGpuProjectedBounds,
+    pub observation: BisulfiteObservationToken,
+    pub strand: CpuBisulfiteStrandToken,
+    pub fraction: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AlignmentSummaryGpuProjectedModification {
     pub bounds: AlignmentSummaryGpuProjectedBounds,
     pub fraction: f64,
     pub code_index: u32,
     pub modified_calls: u32,
     pub canonical_observations: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AlignmentSummaryGpuProjectedJunction {
+    pub bounds: AlignmentSummaryGpuProjectedBounds,
+    pub component: AlignmentSummaryJunctionComponentToken,
+    pub expanded_row: u32,
+    pub stroke_width: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AlignmentSummaryGpuJunctionHit {
+    pub coherence_scope: u64,
+    pub lane_identity: u64,
+    pub evidence: JunctionEvidence,
+    pub annotation: Option<JunctionAnnotationStatus>,
+    pub component: AlignmentSummaryJunctionComponentToken,
+    pub bounds: AlignmentSummaryGpuProjectedBounds,
+    pub distance: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlignmentSummaryGpuJunctionLabel {
+    pub coherence_scope: u64,
+    pub lane_identity: u64,
+    pub evidence: JunctionEvidence,
+    pub x: f64,
+    pub y: f64,
+    pub text: String,
 }
 
 #[must_use]
@@ -352,6 +462,9 @@ pub fn project_alignment_summary_allele_instance(
     minimum_alternate_fraction: f64,
     quality_weighted: bool,
 ) -> Option<AlignmentSummaryGpuProjectedAllele> {
+    if instance.interpretation[0] != 0 {
+        return None;
+    }
     let values = if quality_weighted {
         instance.quality_weighted
     } else {
@@ -387,6 +500,68 @@ pub fn project_alignment_summary_allele_instance(
         allele: allele_token(instance.allele)?,
         fraction,
         aggregate_alternate_fraction: aggregate,
+    })
+}
+
+#[must_use]
+pub fn project_alignment_summary_bisulfite_instance(
+    instance: AlignmentSummaryGpuAlleleInstance,
+    page_start: u64,
+    camera: CpuSummaryCamera,
+    scale_maximum: u32,
+    transform: CoverageScaleTransform,
+    quality_weighted: bool,
+    context: BisulfiteContext,
+) -> Option<AlignmentSummaryGpuProjectedBisulfite> {
+    if instance.interpretation[0] != 1
+        || instance.interpretation[1] & u32::from(bisulfite_context_mask(context)) == 0
+    {
+        return None;
+    }
+    let values = if quality_weighted {
+        instance.quality_weighted
+    } else {
+        instance.raw
+    };
+    let fraction = f64::from(values[0]);
+    let preceding = f64::from(values[2]);
+    if instance.local_depth == 0 || fraction <= 0.0 {
+        return None;
+    }
+    let (x, width) = projected_horizontal(
+        instance.start_offset,
+        instance.end_offset,
+        page_start,
+        camera,
+    )?;
+    let coverage_height =
+        (transformed_depth_fraction(instance.local_depth, scale_maximum, transform)
+            * camera.clip().height)
+            .max(1.0);
+    let semantic_height = fraction * coverage_height;
+    let height = semantic_height.max(1.0).min(coverage_height);
+    let y = (camera.clip().y + camera.clip().height - (preceding + fraction) * coverage_height)
+        .max(camera.clip().y);
+    let strand = match instance.interpretation[2] {
+        0 => CpuBisulfiteStrandToken::Forward,
+        1 => CpuBisulfiteStrandToken::Reverse,
+        _ => return None,
+    };
+    let observation = match instance.interpretation[3] {
+        0 => BisulfiteObservationToken::Protected,
+        1 => BisulfiteObservationToken::Converted,
+        _ => return None,
+    };
+    Some(AlignmentSummaryGpuProjectedBisulfite {
+        bounds: AlignmentSummaryGpuProjectedBounds {
+            x,
+            y,
+            width,
+            height,
+        },
+        observation,
+        strand,
+        fraction,
     })
 }
 
@@ -428,6 +603,93 @@ pub fn project_alignment_summary_modification_instance(
         code_index: instance.code_index,
         modified_calls: instance.modified_calls,
         canonical_observations: instance.canonical_observations,
+    })
+}
+
+/// CPU oracle for the procedural junction vertex/fragment contract. It is also the geometric
+/// basis for scene-native picking, so rendered curves and interaction never reconstruct different
+/// arc bounds from a legacy query.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn project_alignment_summary_junction_instance(
+    instance: AlignmentSummaryGpuJunctionInstance,
+    page_start: u64,
+    camera: CpuSummaryCamera,
+    scale_maximum: f64,
+    normalization: f64,
+    row_count: u32,
+    minimum_depth: u32,
+    minimum_flank: u32,
+    display_mode: JunctionDisplayMode,
+) -> Option<AlignmentSummaryGpuProjectedJunction> {
+    if instance.evidence[1] < minimum_depth
+        || instance.evidence[2] < minimum_flank
+        || instance.evidence[3] < minimum_flank
+        || !scale_maximum.is_finite()
+        || scale_maximum <= 0.0
+        || !normalization.is_finite()
+        || normalization <= 0.0
+    {
+        return None;
+    }
+    let component = match instance.identity[1] {
+        0 => AlignmentSummaryJunctionComponentToken::Positive,
+        1 => AlignmentSummaryJunctionComponentToken::Negative,
+        2 => AlignmentSummaryJunctionComponentToken::Unknown,
+        3 if instance.identity[2] != 0 => AlignmentSummaryJunctionComponentToken::Annotation,
+        _ => return None,
+    };
+    let (x, width) = projected_horizontal(
+        instance.start_offset,
+        instance.end_offset,
+        page_start,
+        camera,
+    )?;
+    let row_count = match display_mode {
+        JunctionDisplayMode::Collapsed => 1,
+        JunctionDisplayMode::Expanded => row_count.max(1),
+    };
+    let row = match display_mode {
+        JunctionDisplayMode::Collapsed => 0,
+        JunctionDisplayMode::Expanded if instance.identity[0] < row_count => instance.identity[0],
+        JunctionDisplayMode::Expanded => return None,
+    };
+    let band_height = camera.clip().height / f64::from(row_count);
+    let baseline = camera.clip().y + (f64::from(row) + 0.5) * band_height;
+    if component == AlignmentSummaryJunctionComponentToken::Annotation {
+        return Some(AlignmentSummaryGpuProjectedJunction {
+            bounds: AlignmentSummaryGpuProjectedBounds {
+                x: x + width * 0.5 - 2.5,
+                y: baseline - 2.5,
+                width: 5.0,
+                height: 5.0,
+            },
+            component,
+            expanded_row: row,
+            stroke_width: 0.0,
+        });
+    }
+    if instance.evidence[0] == 0 {
+        return None;
+    }
+    let value = f64::from(instance.evidence[0]) * normalization;
+    let fraction = (value / scale_maximum).clamp(0.0, 1.0).sqrt();
+    let height = (band_height * 0.45 * (0.18 + 0.82 * fraction)).max(3.0);
+    let y = if component == AlignmentSummaryJunctionComponentToken::Negative {
+        baseline
+    } else {
+        baseline - height
+    };
+    Some(AlignmentSummaryGpuProjectedJunction {
+        bounds: AlignmentSummaryGpuProjectedBounds {
+            x,
+            y,
+            width,
+            height,
+        },
+        component,
+        expanded_row: row,
+        stroke_width: (1.0 + height * 0.075).clamp(1.25, 4.5),
     })
 }
 
@@ -623,6 +885,70 @@ pub struct AlignmentSummaryModificationPageMetadata {
     codes: Vec<ModificationCode>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AlignmentSummaryJunctionEntry {
+    evidence: JunctionEvidence,
+    expanded_row: u32,
+    annotation: Option<JunctionAnnotationStatus>,
+}
+
+impl AlignmentSummaryJunctionEntry {
+    #[must_use]
+    pub const fn evidence(self) -> JunctionEvidence {
+        self.evidence
+    }
+
+    #[must_use]
+    pub const fn expanded_row(self) -> u32 {
+        self.expanded_row
+    }
+
+    #[must_use]
+    pub const fn annotation(self) -> Option<JunctionAnnotationStatus> {
+        self.annotation
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AlignmentSummaryJunctionPageMetadata {
+    entries: Vec<AlignmentSummaryJunctionEntry>,
+    normalization_mapped_records: Option<u64>,
+    maximum_expanded_row: u32,
+}
+
+impl AlignmentSummaryJunctionPageMetadata {
+    #[must_use]
+    pub fn entries(&self) -> &[AlignmentSummaryJunctionEntry] {
+        &self.entries
+    }
+
+    #[must_use]
+    pub const fn normalization_mapped_records(&self) -> Option<u64> {
+        self.normalization_mapped_records
+    }
+
+    #[must_use]
+    pub const fn maximum_expanded_row(&self) -> u32 {
+        self.maximum_expanded_row
+    }
+
+    fn owned_heap_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(size_of::<AlignmentSummaryJunctionEntry>())
+    }
+
+    fn normalization_factor(&self, count_mode: SashimiCountMode) -> Option<f64> {
+        match count_mode {
+            SashimiCountMode::Raw => Some(1.0),
+            SashimiCountMode::CountsPerMillion => self
+                .normalization_mapped_records
+                .filter(|total| *total > 0)
+                .map(|total| 1_000_000.0 / total as f64),
+        }
+    }
+}
+
 impl AlignmentSummaryModificationPageMetadata {
     #[must_use]
     pub fn background_range(&self) -> Range<u32> {
@@ -675,6 +1001,10 @@ pub enum PackedAlignmentSummaryPage {
         instances: Vec<AlignmentSummaryGpuModificationInstance>,
         metadata: AlignmentSummaryModificationPageMetadata,
     },
+    Junctions {
+        instances: Vec<AlignmentSummaryGpuJunctionInstance>,
+        metadata: AlignmentSummaryJunctionPageMetadata,
+    },
 }
 
 impl PackedAlignmentSummaryPage {
@@ -690,6 +1020,7 @@ impl PackedAlignmentSummaryPage {
                 )?,
             ),
             SummaryPageFamily::Modifications => pack_modification_page(request.page),
+            SummaryPageFamily::Junctions => pack_junction_page(request.page),
             family => Err(AlignmentSummaryGpuPageError::UnsupportedFamily(family)),
         }
     }
@@ -700,6 +1031,7 @@ impl PackedAlignmentSummaryPage {
             Self::Depth { instances, .. } => instances.len(),
             Self::Alleles { instances } => instances.len(),
             Self::Modifications { instances, .. } => instances.len(),
+            Self::Junctions { instances, .. } => instances.len(),
         }
     }
 
@@ -709,6 +1041,7 @@ impl PackedAlignmentSummaryPage {
             Self::Depth { instances, .. } => size_of_val(instances.as_slice()),
             Self::Alleles { instances } => size_of_val(instances.as_slice()),
             Self::Modifications { instances, .. } => size_of_val(instances.as_slice()),
+            Self::Junctions { instances, .. } => size_of_val(instances.as_slice()),
         }
     }
 
@@ -719,6 +1052,7 @@ impl PackedAlignmentSummaryPage {
             Self::Depth { range_maximum, .. } => range_maximum.owned_heap_bytes(),
             Self::Alleles { .. } => 0,
             Self::Modifications { metadata, .. } => metadata.owned_heap_bytes(),
+            Self::Junctions { metadata, .. } => metadata.owned_heap_bytes(),
         }
     }
 }
@@ -754,8 +1088,14 @@ fn pack_allele_page(
 ) -> Result<PackedAlignmentSummaryPage, AlignmentSummaryGpuPageError> {
     AlignmentSummaryGpuPageKey::alleles(page, depth_page)?;
     let depth = AlignmentSummaryDepthRangeIndex::build(depth_page)?;
-    let mut instances = Vec::with_capacity(page.primitives().len().saturating_mul(4));
-    for primitive in page.primitives() {
+    let reference_contexts = page
+        .allele_reference_contexts()
+        .filter(|contexts| contexts.len() == page.primitives().len())
+        .ok_or(AlignmentSummaryGpuPageError::MissingReferenceContext(
+            page.key(),
+        ))?;
+    let mut instances = Vec::with_capacity(page.primitives().len().saturating_mul(8));
+    for (primitive_index, primitive) in page.primitives().iter().enumerate() {
         if primitive.start_offset >= primitive.end_offset {
             return Err(AlignmentSummaryGpuPageError::InvalidSemanticSpan {
                 page: page.key(),
@@ -829,13 +1169,172 @@ fn pack_allele_page(
                     safe_fraction(weighted_alternate, weighted_denominator) as f32,
                     weighted_before as f32,
                 ],
+                interpretation: [0; 4],
             });
             raw_before += raw_fraction;
             weighted_before += weighted_fraction;
         }
+
+        let reference_context = reference_contexts[primitive_index];
+        let forward_mask = u32::from(reference_context.context_mask(false));
+        // The CPU oracle deliberately gives forward context precedence at the rare sites where
+        // policies overlap. Encode that precedence once in immutable instance masks.
+        let reverse_mask = u32::from(reference_context.context_mask(true)) & !forward_mask;
+        for (context_mask, strand, strand_alleles, strand_weighted, protected, converted) in [
+            (
+                forward_mask,
+                0_u32,
+                bin.bisulfite_forward_alleles,
+                bin.bisulfite_forward_quality_weighted,
+                b'C',
+                b'T',
+            ),
+            (
+                reverse_mask,
+                1_u32,
+                bin.bisulfite_reverse_alleles,
+                bin.bisulfite_reverse_quality_weighted,
+                b'G',
+                b'A',
+            ),
+        ] {
+            if context_mask == 0 {
+                continue;
+            }
+            let raw_values = [
+                f64::from(strand_alleles.for_base(protected)),
+                f64::from(strand_alleles.for_base(converted)),
+            ];
+            let weighted_values = [
+                strand_weighted.for_base(protected) as f64,
+                strand_weighted.for_base(converted) as f64,
+            ];
+            let raw_total = raw_values.iter().sum::<f64>();
+            let weighted_total = weighted_values.iter().sum::<f64>();
+            let mut raw_before = 0.0_f64;
+            let mut weighted_before = 0.0_f64;
+            for observation in 0..2 {
+                let raw_fraction = safe_fraction(raw_values[observation], raw_denominator);
+                let weighted_fraction =
+                    safe_fraction(weighted_values[observation], weighted_denominator);
+                if raw_fraction == 0.0 && weighted_fraction == 0.0 {
+                    continue;
+                }
+                instances.push(AlignmentSummaryGpuAlleleInstance {
+                    start_offset: split_f64(primitive.start_offset as f64),
+                    end_offset: split_f64(primitive.end_offset as f64),
+                    local_depth,
+                    allele: 0,
+                    raw: [
+                        raw_fraction as f32,
+                        safe_fraction(raw_total, raw_denominator) as f32,
+                        raw_before as f32,
+                    ],
+                    quality_weighted: [
+                        weighted_fraction as f32,
+                        safe_fraction(weighted_total, weighted_denominator) as f32,
+                        weighted_before as f32,
+                    ],
+                    interpretation: [1, context_mask, strand, observation as u32],
+                });
+                raw_before += raw_fraction;
+                weighted_before += weighted_fraction;
+            }
+        }
     }
     instances.shrink_to_fit();
     Ok(PackedAlignmentSummaryPage::Alleles { instances })
+}
+
+fn pack_junction_page(
+    page: &SummarySemanticPage,
+) -> Result<PackedAlignmentSummaryPage, AlignmentSummaryGpuPageError> {
+    AlignmentSummaryGpuPageKey::junctions(page)?;
+    let mut instances = Vec::with_capacity(page.primitives().len().saturating_mul(4));
+    let mut entries = Vec::with_capacity(page.primitives().len());
+    let mut maximum_expanded_row = 0_u32;
+    for primitive in page.primitives() {
+        if primitive.start_offset >= primitive.end_offset {
+            return Err(AlignmentSummaryGpuPageError::InvalidSemanticSpan {
+                page: page.key(),
+                start: primitive.start_offset,
+                end: primitive.end_offset,
+            });
+        }
+        let SummarySemanticComponent::Junction(junction) = primitive.component else {
+            return Err(AlignmentSummaryGpuPageError::UnexpectedSemanticComponent(
+                page.key(),
+            ));
+        };
+        maximum_expanded_row = maximum_expanded_row.max(junction.expanded_row);
+        entries.push(AlignmentSummaryJunctionEntry {
+            evidence: junction.evidence,
+            expanded_row: junction.expanded_row,
+            annotation: junction.annotation,
+        });
+        let annotation = junction.annotation.map_or(0, |status| match status {
+            JunctionAnnotationStatus::Annotated => 1,
+            JunctionAnnotationStatus::Novel => 2,
+            JunctionAnnotationStatus::Unknown => 3,
+        });
+        for (component_depth, component) in [
+            (
+                junction.evidence.positive_depth,
+                AlignmentSummaryJunctionComponentToken::Positive,
+            ),
+            (
+                junction.evidence.negative_depth,
+                AlignmentSummaryJunctionComponentToken::Negative,
+            ),
+            (
+                junction.evidence.unknown_depth,
+                AlignmentSummaryJunctionComponentToken::Unknown,
+            ),
+        ] {
+            if component_depth == 0 {
+                continue;
+            }
+            instances.push(AlignmentSummaryGpuJunctionInstance {
+                start_offset: split_f64(primitive.start_offset as f64),
+                end_offset: split_f64(primitive.end_offset as f64),
+                evidence: [
+                    component_depth,
+                    junction.evidence.depth,
+                    junction.evidence.minimum_left_flank,
+                    junction.evidence.minimum_right_flank,
+                ],
+                identity: [junction.expanded_row, component as u32, annotation, 0],
+            });
+        }
+        if junction.annotation.is_some() {
+            instances.push(AlignmentSummaryGpuJunctionInstance {
+                start_offset: split_f64(primitive.start_offset as f64),
+                end_offset: split_f64(primitive.end_offset as f64),
+                evidence: [
+                    0,
+                    junction.evidence.depth,
+                    junction.evidence.minimum_left_flank,
+                    junction.evidence.minimum_right_flank,
+                ],
+                identity: [
+                    junction.expanded_row,
+                    AlignmentSummaryJunctionComponentToken::Annotation as u32,
+                    annotation,
+                    0,
+                ],
+            });
+        }
+    }
+    instances.shrink_to_fit();
+    entries.shrink_to_fit();
+    Ok(PackedAlignmentSummaryPage::Junctions {
+        instances,
+        metadata: AlignmentSummaryJunctionPageMetadata {
+            entries,
+            normalization_mapped_records: page.key().junction_normalization_mapped_records(),
+            maximum_expanded_row,
+        },
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1025,6 +1524,17 @@ fn safe_fraction(numerator: f64, denominator: f64) -> f64 {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AlignmentSummaryFrameOverlays {
     pub selected_position: Option<u64>,
+    pub hovered_junction: Option<AlignmentSummaryJunctionInteraction>,
+    pub selected_junction: Option<AlignmentSummaryJunctionInteraction>,
+}
+
+/// Stable semantic identity used to restyle one persistent Sashimi component without rebuilding
+/// or uploading its geometry. Coordinates are absolute half-open reference positions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AlignmentSummaryJunctionInteraction {
+    pub start: u64,
+    pub end: u64,
+    pub component: AlignmentSummaryJunctionComponentToken,
 }
 
 /// Typed renderer-facing lane contract. Camera-independent semantic page identity is selected by
@@ -1032,6 +1542,7 @@ pub struct AlignmentSummaryFrameOverlays {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlignmentSummaryGpuLaneOptions {
     Coverage(AlignmentCoverageLaneOptions),
+    Sashimi(AlignmentSashimiLaneOptions),
     Modifications(AlignmentModificationLaneOptions),
 }
 
@@ -1047,8 +1558,18 @@ impl From<AlignmentModificationLaneOptions> for AlignmentSummaryGpuLaneOptions {
     }
 }
 
+impl From<AlignmentSashimiLaneOptions> for AlignmentSummaryGpuLaneOptions {
+    fn from(options: AlignmentSashimiLaneOptions) -> Self {
+        Self::Sashimi(options)
+    }
+}
+
 pub struct AlignmentSummaryGpuSceneRequest<'a> {
     pub scene: &'a Arc<AlignmentSceneSnapshot>,
+    /// Panel-local coherence namespace. Shared scales never cross this stable boundary.
+    pub coherence_scope: u64,
+    /// Stable lane identity within the coherence scope, carried into scene-native interaction.
+    pub lane_identity: u64,
     pub camera_sequence: u64,
     pub camera: CpuSummaryCamera,
     pub screen_size_points: [f32; 2],
@@ -1065,11 +1586,14 @@ fn summary_content_selectors(
         .map(|request| match &request.options {
             AlignmentSummaryGpuLaneOptions::Coverage(options) => {
                 AlignmentSummaryGpuContentSelector::Coverage {
-                    allele_interpretation: options.alleles.map(|alleles| alleles.interpretation),
+                    alleles: options.alleles.is_some(),
                 }
             }
             AlignmentSummaryGpuLaneOptions::Modifications(_) => {
                 AlignmentSummaryGpuContentSelector::Modifications
+            }
+            AlignmentSummaryGpuLaneOptions::Sashimi(_) => {
+                AlignmentSummaryGpuContentSelector::Junctions
             }
         })
         .collect()
@@ -1091,7 +1615,17 @@ struct AlignmentSummaryGpuUniform {
     family: u32,
     hidden_modification_mask: u32,
     modification_color_mode: u32,
-    padding: u32,
+    junction_normalization: f32,
+    junction_row_count: u32,
+    minimum_junction_depth: u32,
+    minimum_junction_flank: u32,
+    junction_display_mode: u32,
+    allele_interpretation: u32,
+    bisulfite_context_mask: u32,
+    padding: [u32; 2],
+    hovered_junction_span: [f32; 4],
+    selected_junction_span: [f32; 4],
+    junction_interaction: [u32; 4],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1100,6 +1634,7 @@ pub struct AlignmentSummaryGpuPrepareStats {
     pub mandatory_pages: usize,
     pub depth_instances: usize,
     pub allele_instances: usize,
+    pub junction_instances: usize,
     pub modification_instances: usize,
     pub overlay_instances: usize,
     pub camera_uniform_bytes: usize,
@@ -1219,6 +1754,7 @@ struct PendingSummaryPageAdmission {
 enum GpuSummaryPageMetadata {
     Depth(AlignmentSummaryDepthRangeIndex),
     Alleles,
+    Junctions(AlignmentSummaryJunctionPageMetadata),
     Modifications(AlignmentSummaryModificationPageMetadata),
 }
 
@@ -1241,6 +1777,18 @@ struct SummaryPageReclaimCandidate {
 #[derive(Clone, Debug)]
 struct PreparedSummaryDraw {
     page: AlignmentSummaryGpuPageKey,
+    coherence_scope: u64,
+    lane_identity: u64,
+    camera: CpuSummaryCamera,
+    page_start: u64,
+    junction_scale_maximum: f32,
+    junction_normalization: f32,
+    junction_row_count: u32,
+    minimum_junction_depth: u32,
+    minimum_junction_flank: u32,
+    junction_display_mode: JunctionDisplayMode,
+    junction_count_mode: SashimiCountMode,
+    show_junction_labels: bool,
     uniform_offset: u32,
     scissor: AlignmentGpuScissor,
     background_range: Range<u32>,
@@ -1250,6 +1798,8 @@ struct PreparedSummaryDraw {
 #[derive(Clone, Debug)]
 struct PendingSummaryDraw {
     page: AlignmentSummaryGpuPageKey,
+    coherence_scope: u64,
+    lane_identity: u64,
     camera: CpuSummaryCamera,
     screen_size: [f32; 2],
     scissor: AlignmentGpuScissor,
@@ -1259,8 +1809,18 @@ struct PendingSummaryDraw {
     minimum_alternate_fraction: f32,
     transform: CoverageScaleTransform,
     quality_weighted: bool,
+    allele_interpretation: CoverageAlleleInterpretation,
     hidden_modification_mask: u32,
     modification_color_mode: ModifiedBaseColorMode,
+    junction_scale_maximum: f32,
+    junction_normalization: f32,
+    junction_row_count: u32,
+    minimum_junction_depth: u32,
+    minimum_junction_flank: u32,
+    junction_display_mode: JunctionDisplayMode,
+    junction_count_mode: SashimiCountMode,
+    show_junction_labels: bool,
+    overlays: AlignmentSummaryFrameOverlays,
     background_range: Range<u32>,
     foreground_range: Range<u32>,
 }
@@ -1270,8 +1830,14 @@ struct SummaryDrawStyle {
     minimum_alternate_fraction: f32,
     transform: CoverageScaleTransform,
     quality_weighted: bool,
+    allele_interpretation: CoverageAlleleInterpretation,
     hidden_modification_mask: u32,
     modification_color_mode: ModifiedBaseColorMode,
+    junction_normalization: f32,
+    junction_row_count: u32,
+    minimum_junction_depth: u32,
+    minimum_junction_flank: u32,
+    junction_display_mode: JunctionDisplayMode,
     background_range: Range<u32>,
     foreground_range: Range<u32>,
 }
@@ -1285,10 +1851,9 @@ struct PreparedSummaryOverlayDraw {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AlignmentSummaryGpuContentSelector {
-    Coverage {
-        allele_interpretation: Option<CoverageAlleleInterpretation>,
-    },
+    Coverage { alleles: bool },
     Modifications,
+    Junctions,
 }
 
 /// Camera-independent content authority for an exact-summary presentation. Replacement
@@ -1353,6 +1918,18 @@ impl AlignmentSummaryGpuFrame {
     #[must_use]
     pub fn overlay_draw_count(&self) -> usize {
         self.overlay_draws.len()
+    }
+
+    /// Whether this exact frame carries a scene-native junction lane for the requested panel and
+    /// track identities. Callers use this to distinguish an authoritative miss from a lane that
+    /// has not yet migrated to the native presenter.
+    #[must_use]
+    pub fn has_junction_lane(&self, coherence_scope: u64, lane_identity: u64) -> bool {
+        self.draws.iter().any(|draw| {
+            draw.page.family() == SummaryPageFamily::Junctions
+                && draw.coherence_scope == coherence_scope
+                && draw.lane_identity == lane_identity
+        })
     }
 
     /// Camera-independent authority which remains valid across pan, zoom, scale, filtering, and
@@ -1526,6 +2103,7 @@ pub struct AlignmentSummaryGpuStagedReplacement {
     admission: AlignmentSummaryGpuBatchAdmission,
     depth_instances: usize,
     allele_instances: usize,
+    junction_instances: usize,
     modification_instances: usize,
     camera_uniform_bytes: usize,
     geometry_uploaded_bytes: usize,
@@ -1568,6 +2146,7 @@ pub struct AlignmentSummaryGpuPublishableReplacement {
 pub struct AlignmentSummaryGpuRenderer {
     depth_pipeline: wgpu::RenderPipeline,
     allele_pipeline: wgpu::RenderPipeline,
+    junction_pipeline: wgpu::RenderPipeline,
     modification_pipeline: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     uniform_layout: wgpu::BindGroupLayout,
@@ -1648,6 +2227,7 @@ impl AlignmentSummaryGpuRenderer {
         let depth_layout = AlignmentSummaryGpuDepthInstance::vertex_buffer_layout();
         let allele_layout = AlignmentSummaryGpuAlleleInstance::vertex_buffer_layout();
         let modification_layout = AlignmentSummaryGpuModificationInstance::vertex_buffer_layout();
+        let junction_layout = AlignmentSummaryGpuJunctionInstance::vertex_buffer_layout();
         let overlay_layout = AlignmentSummaryGpuOverlayInstance::vertex_buffer_layout();
         Self {
             depth_pipeline: pipeline(
@@ -1659,6 +2239,11 @@ impl AlignmentSummaryGpuRenderer {
                 "RGV alignment allele pipeline",
                 "allele_vertex",
                 &[allele_layout],
+            ),
+            junction_pipeline: pipeline(
+                "RGV alignment junction pipeline",
+                "junction_vertex",
+                &[junction_layout],
             ),
             modification_pipeline: pipeline(
                 "RGV alignment modification pipeline",
@@ -1831,6 +2416,7 @@ impl AlignmentSummaryGpuRenderer {
                     1_usize.saturating_add(usize::from(options.alleles.is_some()))
                 }
                 AlignmentSummaryGpuLaneOptions::Modifications(_) => 1,
+                AlignmentSummaryGpuLaneOptions::Sashimi(_) => 1,
             };
             // The immutable content authority covers the complete prepared genomic horizon.
             // Precharge its maximum horizontal camera envelope so zoom-out remains a camera-only
@@ -2336,6 +2922,9 @@ impl AlignmentSummaryGpuRenderer {
                 PackedAlignmentSummaryPage::Modifications { metadata, .. } => {
                     GpuSummaryPageMetadata::Modifications(metadata)
                 }
+                PackedAlignmentSummaryPage::Junctions { metadata, .. } => {
+                    GpuSummaryPageMetadata::Junctions(metadata)
+                }
             };
             staged_pages.push(StagedSummaryPage {
                 key: missing.request.key,
@@ -2449,6 +3038,7 @@ impl AlignmentSummaryGpuRenderer {
             };
             resolved_depth_scales.push(maximum);
         }
+        let junction_metrics = resolve_junction_request_metrics(requests, &visible_pages)?;
 
         let mut pending_draws = Vec::with_capacity(plan.mandatory_draws);
         let mut overlays = Vec::with_capacity(plan.overlay_instances);
@@ -2458,12 +3048,14 @@ impl AlignmentSummaryGpuRenderer {
         let mut camera_sequences = Vec::with_capacity(requests.len());
         let mut depth_instances = 0_usize;
         let mut allele_instances = 0_usize;
+        let mut junction_instances = 0_usize;
         let mut modification_instances = 0_usize;
-        for (((request, pages), covered), scale_maximum) in requests
+        for ((((request, pages), covered), scale_maximum), junction_metrics) in requests
             .iter()
             .zip(&visible_pages)
             .zip(&covered)
             .zip(resolved_depth_scales.iter().copied())
+            .zip(junction_metrics.iter().copied())
         {
             camera_sequences.push(request.camera_sequence);
             for page_request in pages {
@@ -2494,12 +3086,18 @@ impl AlignmentSummaryGpuRenderer {
                         modification_instances =
                             modification_instances.saturating_add(instance_count as usize)
                     }
+                    SummaryPageFamily::Junctions => {
+                        junction_instances =
+                            junction_instances.saturating_add(instance_count as usize)
+                    }
                     family => {
                         return Err(AlignmentSummaryGpuPageError::UnsupportedFamily(family).into());
                     }
                 }
                 pending_draws.push(PendingSummaryDraw {
                     page: page_request.key,
+                    coherence_scope: request.coherence_scope,
+                    lane_identity: request.lane_identity,
                     camera: request.camera,
                     screen_size: request.screen_size_points,
                     scissor: request.scissor,
@@ -2512,8 +3110,30 @@ impl AlignmentSummaryGpuRenderer {
                     minimum_alternate_fraction: style.minimum_alternate_fraction,
                     transform: style.transform,
                     quality_weighted: style.quality_weighted,
+                    allele_interpretation: style.allele_interpretation,
                     hidden_modification_mask: style.hidden_modification_mask,
                     modification_color_mode: style.modification_color_mode,
+                    junction_scale_maximum: junction_metrics
+                        .map_or(1.0, |metrics| metrics.resolved_scale_maximum),
+                    junction_normalization: style.junction_normalization,
+                    junction_row_count: junction_metrics
+                        .map_or(style.junction_row_count, |metrics| metrics.row_count),
+                    minimum_junction_depth: style.minimum_junction_depth,
+                    minimum_junction_flank: style.minimum_junction_flank,
+                    junction_display_mode: style.junction_display_mode,
+                    junction_count_mode: match &request.options {
+                        AlignmentSummaryGpuLaneOptions::Sashimi(options) => {
+                            options.projection.count_mode
+                        }
+                        AlignmentSummaryGpuLaneOptions::Coverage(_)
+                        | AlignmentSummaryGpuLaneOptions::Modifications(_) => SashimiCountMode::Raw,
+                    },
+                    show_junction_labels: matches!(
+                        &request.options,
+                        AlignmentSummaryGpuLaneOptions::Sashimi(options)
+                            if options.projection.show_labels
+                    ),
+                    overlays: request.overlays,
                     background_range: style.background_range,
                     foreground_range: style.foreground_range,
                 });
@@ -2557,15 +3177,35 @@ impl AlignmentSummaryGpuRenderer {
                 request.minimum_alternate_fraction,
                 request.transform,
                 request.quality_weighted,
+                request.allele_interpretation,
                 request.page.family(),
                 request.hidden_modification_mask,
                 request.modification_color_mode,
+                request.junction_scale_maximum,
+                request.junction_normalization,
+                request.junction_row_count,
+                request.minimum_junction_depth,
+                request.minimum_junction_flank,
+                request.junction_display_mode,
+                request.overlays,
             );
             let offset = uniform_index.saturating_mul(self.uniform_stride);
             uniforms[offset..offset + size_of::<AlignmentSummaryGpuUniform>()]
                 .copy_from_slice(bytemuck::bytes_of(&uniform));
             draws.push(PreparedSummaryDraw {
                 page: request.page,
+                coherence_scope: request.coherence_scope,
+                lane_identity: request.lane_identity,
+                camera: request.camera,
+                page_start: request.page_start,
+                junction_scale_maximum: request.junction_scale_maximum,
+                junction_normalization: request.junction_normalization,
+                junction_row_count: request.junction_row_count,
+                minimum_junction_depth: request.minimum_junction_depth,
+                minimum_junction_flank: request.minimum_junction_flank,
+                junction_display_mode: request.junction_display_mode,
+                junction_count_mode: request.junction_count_mode,
+                show_junction_labels: request.show_junction_labels,
                 uniform_offset: u32::try_from(offset)
                     .map_err(|_| AlignmentSummaryGpuPrepareError::DynamicUniformAddressSpace)?,
                 scissor: request.scissor,
@@ -2587,9 +3227,17 @@ impl AlignmentSummaryGpuRenderer {
                 0.0,
                 CoverageScaleTransform::Linear,
                 false,
+                CoverageAlleleInterpretation::GenericReferenceAware,
                 SummaryPageFamily::Depth,
                 0,
                 ModifiedBaseColorMode::ByType,
+                1.0,
+                1.0,
+                1,
+                0,
+                0,
+                JunctionDisplayMode::Collapsed,
+                AlignmentSummaryFrameOverlays::default(),
             );
             let offset = uniform_index.saturating_mul(self.uniform_stride);
             uniforms[offset..offset + size_of::<AlignmentSummaryGpuUniform>()]
@@ -2725,6 +3373,7 @@ impl AlignmentSummaryGpuRenderer {
             admission,
             depth_instances,
             allele_instances,
+            junction_instances,
             modification_instances,
             camera_uniform_bytes: uniforms.len(),
             geometry_uploaded_bytes,
@@ -2982,6 +3631,7 @@ impl AlignmentSummaryGpuRenderer {
             mandatory_pages: staged.plan.mandatory_draws,
             depth_instances: staged.depth_instances,
             allele_instances: staged.allele_instances,
+            junction_instances: staged.junction_instances,
             modification_instances: staged.modification_instances,
             overlay_instances: staged.plan.overlay_instances,
             camera_uniform_bytes: staged.camera_uniform_bytes,
@@ -3093,6 +3743,7 @@ impl AlignmentSummaryGpuRenderer {
                     SummaryPageFamily::Modifications => {
                         page.page.primitives().len().saturating_mul(3)
                     }
+                    SummaryPageFamily::Junctions => page.page.primitives().len().saturating_mul(4),
                     family => {
                         return Err(AlignmentSummaryGpuPageAdmissionError::Page(
                             AlignmentSummaryGpuPageError::UnsupportedFamily(family),
@@ -3207,6 +3858,9 @@ impl AlignmentSummaryGpuRenderer {
                 PackedAlignmentSummaryPage::Modifications { metadata, .. } => {
                     GpuSummaryPageMetadata::Modifications(metadata)
                 }
+                PackedAlignmentSummaryPage::Junctions { metadata, .. } => {
+                    GpuSummaryPageMetadata::Junctions(metadata)
+                }
             };
             let allocation = (candidate.retained_capacity > 0)
                 .then(|| retained.register(candidate.retained_capacity, publication_revision))
@@ -3301,6 +3955,7 @@ impl AlignmentSummaryGpuRenderer {
         let mut page_cache_hits = 0_usize;
         let mut depth_instances = 0_usize;
         let mut allele_instances = 0_usize;
+        let mut junction_instances = 0_usize;
         let mut modification_instances = 0_usize;
         for pages in &visible {
             for request in pages {
@@ -3321,6 +3976,10 @@ impl AlignmentSummaryGpuRenderer {
                     SummaryPageFamily::Modifications => {
                         modification_instances =
                             modification_instances.saturating_add(page.instance_count as usize);
+                    }
+                    SummaryPageFamily::Junctions => {
+                        junction_instances =
+                            junction_instances.saturating_add(page.instance_count as usize);
                     }
                     family => {
                         return Err(AlignmentSummaryGpuPrepareError::Page(
@@ -3366,6 +4025,7 @@ impl AlignmentSummaryGpuRenderer {
             };
             resolved_depth_scales.push(maximum);
         }
+        let junction_metrics = resolve_junction_request_metrics(requests, &visible)?;
 
         let overlay_count = requests.iter().map(summary_overlay_count).sum::<usize>();
         u32::try_from(overlay_count)
@@ -3430,11 +4090,12 @@ impl AlignmentSummaryGpuRenderer {
         let mut scene_revisions = Vec::with_capacity(requests.len());
         let mut scene_allocations = Vec::with_capacity(requests.len());
         let mut camera_sequences = Vec::with_capacity(requests.len());
-        for (((request, pages), covered), scale_maximum) in requests
+        for ((((request, pages), covered), scale_maximum), junction_metrics) in requests
             .iter()
             .zip(&visible)
             .zip(&covered)
             .zip(resolved_depth_scales.iter().copied())
+            .zip(junction_metrics.iter().copied())
         {
             scene_revisions.push(request.scene.revision());
             scene_allocations.push(request.scene.metadata_allocation().id());
@@ -3451,6 +4112,8 @@ impl AlignmentSummaryGpuRenderer {
                 )?;
                 pending_draws.push(PendingSummaryDraw {
                     page: page_request.key,
+                    coherence_scope: request.coherence_scope,
+                    lane_identity: request.lane_identity,
                     camera: request.camera,
                     screen_size: request.screen_size_points,
                     scissor: request.scissor,
@@ -3463,8 +4126,30 @@ impl AlignmentSummaryGpuRenderer {
                     minimum_alternate_fraction: style.minimum_alternate_fraction,
                     transform: style.transform,
                     quality_weighted: style.quality_weighted,
+                    allele_interpretation: style.allele_interpretation,
                     hidden_modification_mask: style.hidden_modification_mask,
                     modification_color_mode: style.modification_color_mode,
+                    junction_scale_maximum: junction_metrics
+                        .map_or(1.0, |metrics| metrics.resolved_scale_maximum),
+                    junction_normalization: style.junction_normalization,
+                    junction_row_count: junction_metrics
+                        .map_or(style.junction_row_count, |metrics| metrics.row_count),
+                    minimum_junction_depth: style.minimum_junction_depth,
+                    minimum_junction_flank: style.minimum_junction_flank,
+                    junction_display_mode: style.junction_display_mode,
+                    junction_count_mode: match &request.options {
+                        AlignmentSummaryGpuLaneOptions::Sashimi(options) => {
+                            options.projection.count_mode
+                        }
+                        AlignmentSummaryGpuLaneOptions::Coverage(_)
+                        | AlignmentSummaryGpuLaneOptions::Modifications(_) => SashimiCountMode::Raw,
+                    },
+                    show_junction_labels: matches!(
+                        &request.options,
+                        AlignmentSummaryGpuLaneOptions::Sashimi(options)
+                            if options.projection.show_labels
+                    ),
+                    overlays: request.overlays,
                     background_range: style.background_range,
                     foreground_range: style.foreground_range,
                 });
@@ -3502,9 +4187,17 @@ impl AlignmentSummaryGpuRenderer {
                 request.minimum_alternate_fraction,
                 request.transform,
                 request.quality_weighted,
+                request.allele_interpretation,
                 request.page.family(),
                 request.hidden_modification_mask,
                 request.modification_color_mode,
+                request.junction_scale_maximum,
+                request.junction_normalization,
+                request.junction_row_count,
+                request.minimum_junction_depth,
+                request.minimum_junction_flank,
+                request.junction_display_mode,
+                request.overlays,
             );
             let offset = uniform_index.saturating_mul(self.uniform_stride);
             uniforms[offset..offset + size_of::<AlignmentSummaryGpuUniform>()]
@@ -3521,6 +4214,18 @@ impl AlignmentSummaryGpuRenderer {
             }
             draws.push(PreparedSummaryDraw {
                 page: request.page,
+                coherence_scope: request.coherence_scope,
+                lane_identity: request.lane_identity,
+                camera: request.camera,
+                page_start: request.page_start,
+                junction_scale_maximum: request.junction_scale_maximum,
+                junction_normalization: request.junction_normalization,
+                junction_row_count: request.junction_row_count,
+                minimum_junction_depth: request.minimum_junction_depth,
+                minimum_junction_flank: request.minimum_junction_flank,
+                junction_display_mode: request.junction_display_mode,
+                junction_count_mode: request.junction_count_mode,
+                show_junction_labels: request.show_junction_labels,
                 uniform_offset,
                 scissor: request.scissor,
                 background_range: request.background_range.clone(),
@@ -3541,9 +4246,17 @@ impl AlignmentSummaryGpuRenderer {
                 0.0,
                 CoverageScaleTransform::Linear,
                 false,
+                CoverageAlleleInterpretation::GenericReferenceAware,
                 SummaryPageFamily::Depth,
                 0,
                 ModifiedBaseColorMode::ByType,
+                1.0,
+                1.0,
+                1,
+                0,
+                0,
+                JunctionDisplayMode::Collapsed,
+                AlignmentSummaryFrameOverlays::default(),
             );
             let offset = uniform_index.saturating_mul(self.uniform_stride);
             uniforms[offset..offset + size_of::<AlignmentSummaryGpuUniform>()]
@@ -3633,6 +4346,7 @@ impl AlignmentSummaryGpuRenderer {
             mandatory_pages,
             depth_instances,
             allele_instances,
+            junction_instances,
             modification_instances,
             overlay_instances: overlays.len(),
             camera_uniform_bytes: uniforms.len(),
@@ -4047,6 +4761,7 @@ impl AlignmentSummaryGpuRenderer {
                 SummaryPageFamily::Depth => &self.depth_pipeline,
                 SummaryPageFamily::Alleles => &self.allele_pipeline,
                 SummaryPageFamily::Modifications => &self.modification_pipeline,
+                SummaryPageFamily::Junctions => &self.junction_pipeline,
                 family => {
                     return Err(AlignmentSummaryGpuRenderError::UnsupportedFamily(family));
                 }
@@ -4090,6 +4805,273 @@ impl AlignmentSummaryGpuRenderer {
             }
         }
         Ok(())
+    }
+
+    /// Hit-tests the exact procedural junction geometry carried by a rendered frame. The same
+    /// immutable metadata and projection oracle drive pixels and picking; no query-local junction
+    /// index or legacy display rectangle participates.
+    #[must_use]
+    pub fn hit_test_junction_lane(
+        &self,
+        frame: &AlignmentSummaryGpuFrame,
+        coherence_scope: u64,
+        lane_identity: u64,
+        x: f64,
+        y: f64,
+        maximum_distance: f64,
+    ) -> Option<AlignmentSummaryGpuJunctionHit> {
+        if frame.device_generation != self.device_generation
+            || !x.is_finite()
+            || !y.is_finite()
+            || !maximum_distance.is_finite()
+            || maximum_distance < 0.0
+        {
+            return None;
+        }
+        let mut best = None::<AlignmentSummaryGpuJunctionHit>;
+        for draw in frame.draws.iter().rev().filter(|draw| {
+            draw.page.family() == SummaryPageFamily::Junctions
+                && draw.coherence_scope == coherence_scope
+                && draw.lane_identity == lane_identity
+        }) {
+            let clip = draw.camera.clip();
+            if x < clip.x - maximum_distance
+                || x > clip.x + clip.width + maximum_distance
+                || y < clip.y - maximum_distance
+                || y > clip.y + clip.height + maximum_distance
+            {
+                continue;
+            }
+            let page = self.page(draw.page)?;
+            let GpuSummaryPageMetadata::Junctions(metadata) = &page.metadata else {
+                continue;
+            };
+            for entry in metadata.entries().iter().copied() {
+                let evidence = entry.evidence();
+                for (depth, component) in [
+                    (
+                        evidence.positive_depth,
+                        AlignmentSummaryJunctionComponentToken::Positive,
+                    ),
+                    (
+                        evidence.negative_depth,
+                        AlignmentSummaryJunctionComponentToken::Negative,
+                    ),
+                    (
+                        evidence.unknown_depth,
+                        AlignmentSummaryJunctionComponentToken::Unknown,
+                    ),
+                ] {
+                    if depth == 0 {
+                        continue;
+                    }
+                    let instance = AlignmentSummaryGpuJunctionInstance {
+                        start_offset: split_f64(
+                            evidence.start.saturating_sub(draw.page_start) as f64
+                        ),
+                        end_offset: split_f64(evidence.end.saturating_sub(draw.page_start) as f64),
+                        evidence: [
+                            depth,
+                            evidence.depth,
+                            evidence.minimum_left_flank,
+                            evidence.minimum_right_flank,
+                        ],
+                        identity: [entry.expanded_row(), component as u32, 0, 0],
+                    };
+                    let Some(projected) = project_alignment_summary_junction_instance(
+                        instance,
+                        draw.page_start,
+                        draw.camera,
+                        f64::from(draw.junction_scale_maximum),
+                        f64::from(draw.junction_normalization),
+                        draw.junction_row_count,
+                        draw.minimum_junction_depth,
+                        draw.minimum_junction_flank,
+                        draw.junction_display_mode,
+                    ) else {
+                        continue;
+                    };
+                    let rectangle = RectPrimitive {
+                        x: projected.bounds.x as f32,
+                        y: projected.bounds.y as f32,
+                        width: projected.bounds.width as f32,
+                        height: projected.bounds.height as f32,
+                        color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+                        object_id: 0,
+                        shape: if component == AlignmentSummaryJunctionComponentToken::Negative {
+                            RectShape::JunctionArcDown
+                        } else {
+                            RectShape::JunctionArcUp
+                        },
+                    };
+                    let Some(distance) =
+                        junction_arc_distance_to_point(rectangle, x as f32, y as f32)
+                            .map(f64::from)
+                    else {
+                        continue;
+                    };
+                    let acquisition = maximum_distance.max(projected.stroke_width * 0.5 + 2.0);
+                    if distance > acquisition
+                        || best.is_some_and(|current| current.distance <= distance)
+                    {
+                        continue;
+                    }
+                    best = Some(AlignmentSummaryGpuJunctionHit {
+                        coherence_scope: draw.coherence_scope,
+                        lane_identity: draw.lane_identity,
+                        evidence,
+                        annotation: entry.annotation(),
+                        component,
+                        bounds: projected.bounds,
+                        distance,
+                    });
+                }
+            }
+        }
+        best
+    }
+
+    /// Projects a bounded set of labels from the same pinned junction pages used for pixels and
+    /// picking. This is presentation-only work: it neither queries the alignment source nor
+    /// rebuilds/uploads persistent geometry.
+    #[must_use]
+    pub fn junction_labels(
+        &self,
+        frame: &AlignmentSummaryGpuFrame,
+    ) -> Vec<AlignmentSummaryGpuJunctionLabel> {
+        if frame.device_generation != self.device_generation {
+            return Vec::new();
+        }
+        let mut labels = Vec::new();
+        let mut lane_counts = BTreeMap::<(u64, u64), usize>::new();
+        let mut occupied = BTreeMap::<(u64, u64), Vec<[f64; 4]>>::new();
+        for draw in frame.draws.iter().filter(|draw| {
+            draw.page.family() == SummaryPageFamily::Junctions && draw.show_junction_labels
+        }) {
+            let lane = (draw.coherence_scope, draw.lane_identity);
+            if lane_counts.get(&lane).copied().unwrap_or_default() >= MAX_RENDERED_JUNCTION_LABELS {
+                continue;
+            }
+            let Some(page) = self.page(draw.page) else {
+                continue;
+            };
+            let GpuSummaryPageMetadata::Junctions(metadata) = &page.metadata else {
+                continue;
+            };
+            for entry in metadata.entries().iter().copied() {
+                if lane_counts.get(&lane).copied().unwrap_or_default()
+                    >= MAX_RENDERED_JUNCTION_LABELS
+                {
+                    break;
+                }
+                let evidence = entry.evidence();
+                let Some((component_depth, component)) = [
+                    (
+                        evidence.positive_depth,
+                        AlignmentSummaryJunctionComponentToken::Positive,
+                    ),
+                    (
+                        evidence.negative_depth,
+                        AlignmentSummaryJunctionComponentToken::Negative,
+                    ),
+                    (
+                        evidence.unknown_depth,
+                        AlignmentSummaryJunctionComponentToken::Unknown,
+                    ),
+                ]
+                .into_iter()
+                .filter(|(depth, _)| *depth > 0)
+                .max_by_key(|(depth, component)| (*depth, std::cmp::Reverse(*component as u32))) else {
+                    continue;
+                };
+                let (Some(start), Some(end)) = (
+                    evidence.start.checked_sub(draw.page_start),
+                    evidence.end.checked_sub(draw.page_start),
+                ) else {
+                    continue;
+                };
+                let instance = AlignmentSummaryGpuJunctionInstance {
+                    start_offset: split_f64(start as f64),
+                    end_offset: split_f64(end as f64),
+                    evidence: [
+                        component_depth,
+                        evidence.depth,
+                        evidence.minimum_left_flank,
+                        evidence.minimum_right_flank,
+                    ],
+                    identity: [entry.expanded_row(), component as u32, 0, 0],
+                };
+                let Some(projected) = project_alignment_summary_junction_instance(
+                    instance,
+                    draw.page_start,
+                    draw.camera,
+                    f64::from(draw.junction_scale_maximum),
+                    f64::from(draw.junction_normalization),
+                    draw.junction_row_count,
+                    draw.minimum_junction_depth,
+                    draw.minimum_junction_flank,
+                    draw.junction_display_mode,
+                ) else {
+                    continue;
+                };
+                let row_count = match draw.junction_display_mode {
+                    JunctionDisplayMode::Collapsed => 1,
+                    JunctionDisplayMode::Expanded => draw.junction_row_count.max(1),
+                };
+                let band_height = draw.camera.clip().height / f64::from(row_count);
+                if projected.bounds.width < 30.0 || band_height < 28.0 {
+                    continue;
+                }
+                let band_top =
+                    draw.camera.clip().y + f64::from(projected.expanded_row) * band_height;
+                let band_bottom = band_top + band_height;
+                let apex = if component == AlignmentSummaryJunctionComponentToken::Negative {
+                    projected.bounds.y + projected.bounds.height - projected.stroke_width * 0.5
+                } else {
+                    projected.bounds.y + projected.stroke_width * 0.5
+                };
+                let y = (if component == AlignmentSummaryJunctionComponentToken::Negative {
+                    apex + 7.0
+                } else {
+                    apex - 7.0
+                })
+                .clamp(band_top + 5.5, band_bottom - 5.5);
+                let x = projected.bounds.x + projected.bounds.width * 0.5;
+                let text = junction_count_label(
+                    evidence,
+                    draw.junction_count_mode,
+                    f64::from(draw.junction_normalization),
+                );
+                let label_width =
+                    ((text.chars().count() as f64) * 6.2 + 2.0).clamp(10.0, projected.bounds.width);
+                let bounds = [
+                    x - label_width * 0.5,
+                    y - 5.5,
+                    x + label_width * 0.5,
+                    y + 5.5,
+                ];
+                let lane_occupied = occupied.entry(lane).or_default();
+                if lane_occupied.iter().any(|other| {
+                    bounds[0] < other[2] + 2.0
+                        && bounds[2] > other[0] - 2.0
+                        && bounds[1] < other[3] + 2.0
+                        && bounds[3] > other[1] - 2.0
+                }) {
+                    continue;
+                }
+                lane_occupied.push(bounds);
+                labels.push(AlignmentSummaryGpuJunctionLabel {
+                    coherence_scope: draw.coherence_scope,
+                    lane_identity: draw.lane_identity,
+                    evidence,
+                    x,
+                    y,
+                    text,
+                });
+                *lane_counts.entry(lane).or_default() += 1;
+            }
+        }
+        labels
     }
 
     /// Drops every device-derived allocation while preserving all scene-owned semantic pages.
@@ -4655,6 +5637,27 @@ fn summary_requests_for_scene(
     } else {
         Some(request.scene.prepared_interval())
     };
+    if matches!(request.options, AlignmentSummaryGpuLaneOptions::Sashimi(_)) {
+        let mut pages = covered
+            .map(|interval| {
+                request
+                    .scene
+                    .summary_pages_for(SummaryPageFamily::Junctions, interval)
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|page| {
+                Ok(OwnedSummaryPageRequest {
+                    key: AlignmentSummaryGpuPageKey::junctions(page)?,
+                    page: Arc::clone(page),
+                    companion_depth: None,
+                })
+            })
+            .collect::<Result<Vec<_>, AlignmentSummaryGpuPageError>>()?;
+        pages.sort_unstable_by_key(|page| page.key);
+        pages.dedup_by_key(|page| page.key);
+        return Ok(pages);
+    }
     if matches!(
         request.options,
         AlignmentSummaryGpuLaneOptions::Modifications(_)
@@ -4682,16 +5685,6 @@ fn summary_requests_for_scene(
     let AlignmentSummaryGpuLaneOptions::Coverage(options) = &request.options else {
         unreachable!("all renderer lane variants were handled above")
     };
-    if let Some(alleles) = options.alleles
-        && !matches!(
-            alleles.interpretation,
-            CoverageAlleleInterpretation::GenericReferenceAware
-        )
-    {
-        return Err(
-            AlignmentSummaryGpuPageError::UnsupportedAlleleInterpretation(alleles.interpretation),
-        );
-    }
     let depth_pages = covered
         .map(|interval| {
             request
@@ -4781,9 +5774,7 @@ fn summary_cursor_page(
                 None
             }
             (
-                AlignmentSummaryGpuContentSelector::Coverage {
-                    allele_interpretation: Some(CoverageAlleleInterpretation::GenericReferenceAware),
-                },
+                AlignmentSummaryGpuContentSelector::Coverage { alleles: true },
                 SummaryPageFamily::Alleles,
             ) => {
                 let Some(companion_key) = key.companion_depth() else {
@@ -4798,6 +5789,11 @@ fn summary_cursor_page(
                 AlignmentSummaryGpuContentSelector::Modifications,
                 SummaryPageFamily::Modifications,
             ) if key.companion_depth().is_none() => None,
+            (AlignmentSummaryGpuContentSelector::Junctions, SummaryPageFamily::Junctions)
+                if key.companion_depth().is_none() =>
+            {
+                None
+            }
             _ => continue,
         };
         let candidate = OwnedSummaryPageRequest {
@@ -4844,6 +5840,9 @@ fn packed_buffer_capacity(
         PackedAlignmentSummaryPage::Modifications { instances, .. } => {
             summary_gpu_buffer_capacity::<AlignmentSummaryGpuModificationInstance>(instances.len())
         }
+        PackedAlignmentSummaryPage::Junctions { instances, .. } => {
+            summary_gpu_buffer_capacity::<AlignmentSummaryGpuJunctionInstance>(instances.len())
+        }
     }
 }
 
@@ -4862,9 +5861,13 @@ fn write_packed_page(
         PackedAlignmentSummaryPage::Modifications { instances, .. } if !instances.is_empty() => {
             queue.write_buffer(buffer, 0, bytemuck::cast_slice(instances));
         }
+        PackedAlignmentSummaryPage::Junctions { instances, .. } if !instances.is_empty() => {
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(instances));
+        }
         PackedAlignmentSummaryPage::Depth { .. }
         | PackedAlignmentSummaryPage::Alleles { .. }
-        | PackedAlignmentSummaryPage::Modifications { .. } => {}
+        | PackedAlignmentSummaryPage::Modifications { .. }
+        | PackedAlignmentSummaryPage::Junctions { .. } => {}
     }
 }
 
@@ -4963,6 +5966,20 @@ fn summary_page_maximum_retained_bytes(
                 .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?;
             buffer
                 .checked_add(dictionary)
+                .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)
+        }
+        SummaryPageFamily::Junctions => {
+            let maximum_instances = primitive_count
+                .checked_mul(4)
+                .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?;
+            let buffer = summary_gpu_buffer_capacity::<AlignmentSummaryGpuJunctionInstance>(
+                maximum_instances,
+            )?;
+            let metadata = primitive_count
+                .checked_mul(size_of::<AlignmentSummaryJunctionEntry>())
+                .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?;
+            buffer
+                .checked_add(metadata)
                 .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)
         }
         family => Err(AlignmentSummaryGpuPageError::UnsupportedFamily(family).into()),
@@ -5070,10 +6087,22 @@ fn summary_uniform(
     minimum_alternate_fraction: f32,
     transform: CoverageScaleTransform,
     quality_weighted: bool,
+    allele_interpretation: CoverageAlleleInterpretation,
     family: SummaryPageFamily,
     hidden_modification_mask: u32,
     modification_color_mode: ModifiedBaseColorMode,
+    junction_scale_maximum: f32,
+    junction_normalization: f32,
+    junction_row_count: u32,
+    minimum_junction_depth: u32,
+    minimum_junction_flank: u32,
+    junction_display_mode: JunctionDisplayMode,
+    overlays: AlignmentSummaryFrameOverlays,
 ) -> AlignmentSummaryGpuUniform {
+    let (hovered_junction_span, hovered_component, hovered_present) =
+        junction_interaction_uniform(overlays.hovered_junction, page_start);
+    let (selected_junction_span, selected_component, selected_present) =
+        junction_interaction_uniform(overlays.selected_junction, page_start);
     AlignmentSummaryGpuUniform {
         screen_size: [screen_size[0].max(1.0), screen_size[1].max(1.0)],
         clip_origin: [camera.clip().x as f32, camera.clip().y as f32],
@@ -5081,7 +6110,11 @@ fn summary_uniform(
         points_per_base: split_f64(1.0 / camera.bases_per_pixel()),
         page_start_from_camera: split_f64(page_start as f64 - camera.exact_start()),
         covered_clip_x,
-        scale_maximum: scale_maximum.max(1) as f32,
+        scale_maximum: if family == SummaryPageFamily::Junctions {
+            junction_scale_maximum.max(f32::EPSILON)
+        } else {
+            scale_maximum.max(1) as f32
+        },
         minimum_alternate_fraction,
         transform: match transform {
             CoverageScaleTransform::Linear => 0,
@@ -5092,6 +6125,7 @@ fn summary_uniform(
             SummaryPageFamily::Depth => 0,
             SummaryPageFamily::Alleles => 1,
             SummaryPageFamily::Modifications => 2,
+            SummaryPageFamily::Junctions => 3,
             _ => u32::MAX,
         },
         hidden_modification_mask,
@@ -5100,7 +6134,85 @@ fn summary_uniform(
             ModifiedBaseColorMode::Mono => 1,
             ModifiedBaseColorMode::ModifiedVsUnmodified => 2,
         },
-        padding: 0,
+        junction_normalization,
+        junction_row_count: junction_row_count.max(1),
+        minimum_junction_depth,
+        minimum_junction_flank,
+        junction_display_mode: match junction_display_mode {
+            JunctionDisplayMode::Collapsed => 0,
+            JunctionDisplayMode::Expanded => 1,
+        },
+        allele_interpretation: match allele_interpretation {
+            CoverageAlleleInterpretation::GenericReferenceAware => 0,
+            CoverageAlleleInterpretation::Bisulfite(_) => 1,
+        },
+        bisulfite_context_mask: match allele_interpretation {
+            CoverageAlleleInterpretation::GenericReferenceAware => 0,
+            CoverageAlleleInterpretation::Bisulfite(context) => {
+                u32::from(bisulfite_context_mask(context))
+            }
+        },
+        padding: [0; 2],
+        hovered_junction_span,
+        selected_junction_span,
+        junction_interaction: [
+            hovered_component,
+            u32::from(hovered_present),
+            selected_component,
+            u32::from(selected_present),
+        ],
+    }
+}
+
+fn junction_interaction_uniform(
+    interaction: Option<AlignmentSummaryJunctionInteraction>,
+    page_start: u64,
+) -> ([f32; 4], u32, bool) {
+    let Some(interaction) = interaction else {
+        return ([0.0; 4], 0, false);
+    };
+    let (Some(start), Some(end)) = (
+        interaction.start.checked_sub(page_start),
+        interaction.end.checked_sub(page_start),
+    ) else {
+        return ([0.0; 4], interaction.component as u32, false);
+    };
+    let start = split_f64(start as f64);
+    let end = split_f64(end as f64);
+    (
+        [start[0], start[1], end[0], end[1]],
+        interaction.component as u32,
+        interaction.start < interaction.end
+            && interaction.component != AlignmentSummaryJunctionComponentToken::Annotation,
+    )
+}
+
+fn junction_count_label(
+    evidence: JunctionEvidence,
+    count_mode: SashimiCountMode,
+    normalization: f64,
+) -> String {
+    match count_mode {
+        SashimiCountMode::Raw => evidence.depth.to_string(),
+        SashimiCountMode::CountsPerMillion => {
+            let value = f64::from(evidence.depth) * normalization;
+            if value < 10.0 {
+                format!("{value:.1} CPM")
+            } else {
+                format!("{value:.0} CPM")
+            }
+        }
+    }
+}
+
+const fn bisulfite_context_mask(context: BisulfiteContext) -> u8 {
+    1 << match context {
+        BisulfiteContext::Cg => 0,
+        BisulfiteContext::Chg => 1,
+        BisulfiteContext::Chh => 2,
+        BisulfiteContext::Hcg => 3,
+        BisulfiteContext::Gch => 4,
+        BisulfiteContext::Wcg => 5,
     }
 }
 
@@ -5121,6 +6233,17 @@ fn validate_summary_request(
     {
         return Err(AlignmentSummaryGpuPrepareError::InvalidFrameGeometry);
     }
+    if let AlignmentSummaryGpuLaneOptions::Sashimi(options) = &request.options {
+        let fixed = match options.scale {
+            AlignmentSashimiScalePolicy::Fixed(maximum) => Some(maximum),
+            AlignmentSashimiScalePolicy::Automatic | AlignmentSashimiScalePolicy::Shared(_) => {
+                options.projection.scale_maximum
+            }
+        };
+        if fixed.is_some_and(|maximum| !maximum.is_finite() || maximum <= 0.0) {
+            return Err(AlignmentSummaryGpuPrepareError::InvalidJunctionScale);
+        }
+    }
     let _ = shared_fixed_scale(&request.options)?;
     Ok(())
 }
@@ -5134,16 +6257,6 @@ fn shared_fixed_scale(
     let Some(alleles) = options.alleles else {
         return Ok(options.depth.scale_maximum);
     };
-    if !matches!(
-        alleles.interpretation,
-        CoverageAlleleInterpretation::GenericReferenceAware
-    ) {
-        return Err(
-            AlignmentSummaryGpuPrepareError::UnsupportedAlleleInterpretation(
-                alleles.interpretation,
-            ),
-        );
-    }
     if !alleles.minimum_fraction.is_finite() || !(0.0..=1.0).contains(&alleles.minimum_fraction) {
         return Err(AlignmentSummaryGpuPrepareError::InvalidAlternateFraction);
     }
@@ -5158,6 +6271,120 @@ fn shared_fixed_scale(
         (_, Some(allele)) => Ok(Some(allele)),
         (None, None) => Ok(None),
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct JunctionRequestMetrics {
+    resolved_scale_maximum: f32,
+    row_count: u32,
+}
+
+fn resolve_junction_request_metrics(
+    requests: &[AlignmentSummaryGpuSceneRequest<'_>],
+    visible_pages: &[Vec<OwnedSummaryPageRequest>],
+) -> Result<Vec<Option<JunctionRequestMetrics>>, AlignmentSummaryGpuPrepareError> {
+    let mut measured = Vec::with_capacity(requests.len());
+    let mut shared_maxima = BTreeMap::<(u64, u64, u8), f64>::new();
+    for (request, pages) in requests.iter().zip(visible_pages) {
+        let AlignmentSummaryGpuLaneOptions::Sashimi(options) = &request.options else {
+            measured.push(None);
+            continue;
+        };
+        let covered = summary_covered_interval(request);
+        let mut maximum = 0.0_f64;
+        let mut maximum_row = 0_u32;
+        let mut any = false;
+        for page in pages {
+            let normalization = match options.projection.count_mode {
+                SashimiCountMode::Raw => 1.0,
+                SashimiCountMode::CountsPerMillion => page
+                    .key
+                    .semantic()
+                    .junction_normalization_mapped_records()
+                    .filter(|total| *total > 0)
+                    .map(|total| 1_000_000.0 / total as f64)
+                    .ok_or(AlignmentSummaryGpuPrepareError::MissingJunctionNormalization)?,
+            };
+            for primitive in page.page.primitives() {
+                let SummarySemanticComponent::Junction(junction) = primitive.component else {
+                    return Err(AlignmentSummaryGpuPrepareError::ResidentMetadataMismatch(
+                        page.key,
+                    ));
+                };
+                let start = page
+                    .page
+                    .interval()
+                    .start()
+                    .saturating_add(primitive.start_offset);
+                let end = page
+                    .page
+                    .interval()
+                    .start()
+                    .saturating_add(primitive.end_offset);
+                if covered.is_none_or(|covered| {
+                    covered.contig() != page.page.interval().contig()
+                        || start >= covered.end()
+                        || end <= covered.start()
+                }) || junction.evidence.depth < options.projection.minimum_depth
+                    || junction.evidence.minimum_left_flank < options.projection.minimum_flank
+                    || junction.evidence.minimum_right_flank < options.projection.minimum_flank
+                {
+                    continue;
+                }
+                any = true;
+                maximum = maximum.max(f64::from(junction.evidence.depth) * normalization);
+                maximum_row = maximum_row.max(junction.expanded_row);
+            }
+        }
+        let row_count = if options.projection.display_mode == JunctionDisplayMode::Expanded {
+            request
+                .scene
+                .summaries()
+                .expanded_junction_row_count()
+                .max(maximum_row.saturating_add(u32::from(any)))
+                .max(1)
+        } else {
+            1
+        };
+        if let AlignmentSashimiScalePolicy::Shared(group) = options.scale {
+            let mode = match options.projection.count_mode {
+                SashimiCountMode::Raw => 0,
+                SashimiCountMode::CountsPerMillion => 1,
+            };
+            shared_maxima
+                .entry((request.coherence_scope, group.get(), mode))
+                .and_modify(|shared| *shared = shared.max(maximum))
+                .or_insert(maximum);
+        }
+        measured.push(Some((maximum, row_count)));
+    }
+    Ok(requests
+        .iter()
+        .zip(measured)
+        .map(|(request, measured)| {
+            let AlignmentSummaryGpuLaneOptions::Sashimi(options) = &request.options else {
+                return None;
+            };
+            let (measured, row_count) = measured.expect("Sashimi request has measured metrics");
+            let maximum = match options.scale {
+                AlignmentSashimiScalePolicy::Automatic => measured,
+                AlignmentSashimiScalePolicy::Fixed(maximum) => maximum,
+                AlignmentSashimiScalePolicy::Shared(group) => {
+                    let mode = match options.projection.count_mode {
+                        SashimiCountMode::Raw => 0,
+                        SashimiCountMode::CountsPerMillion => 1,
+                    };
+                    *shared_maxima
+                        .get(&(request.coherence_scope, group.get(), mode))
+                        .expect("shared Sashimi group was measured in this panel scope")
+                }
+            };
+            Some(JunctionRequestMetrics {
+                resolved_scale_maximum: maximum.max(f64::EPSILON) as f32,
+                row_count,
+            })
+        })
+        .collect())
 }
 
 fn summary_draw_style(
@@ -5184,8 +6411,17 @@ fn summary_draw_style(
                 quality_weighted: options
                     .alleles
                     .is_some_and(|alleles| alleles.quality_weighted),
+                allele_interpretation: options.alleles.map_or(
+                    CoverageAlleleInterpretation::GenericReferenceAware,
+                    |alleles| alleles.interpretation,
+                ),
                 hidden_modification_mask: 0,
                 modification_color_mode: ModifiedBaseColorMode::ByType,
+                junction_normalization: 1.0,
+                junction_row_count: 1,
+                minimum_junction_depth: 0,
+                minimum_junction_flank: 0,
+                junction_display_mode: JunctionDisplayMode::Collapsed,
                 background_range: 0..0,
                 foreground_range: 0..instance_count,
             })
@@ -5213,13 +6449,41 @@ fn summary_draw_style(
                 minimum_alternate_fraction: 0.0,
                 transform: CoverageScaleTransform::Linear,
                 quality_weighted: options.projection.probability_weighted,
+                allele_interpretation: CoverageAlleleInterpretation::GenericReferenceAware,
                 hidden_modification_mask: metadata
                     .hidden_code_mask(&options.projection.hidden_codes),
                 modification_color_mode: options.color_mode,
+                junction_normalization: 1.0,
+                junction_row_count: 1,
+                minimum_junction_depth: 0,
+                minimum_junction_flank: 0,
+                junction_display_mode: JunctionDisplayMode::Collapsed,
                 background_range,
                 foreground_range,
             })
         }
+        (
+            AlignmentSummaryGpuLaneOptions::Sashimi(options),
+            SummaryPageFamily::Junctions,
+            GpuSummaryPageMetadata::Junctions(metadata),
+        ) => Ok(SummaryDrawStyle {
+            minimum_alternate_fraction: 0.0,
+            transform: CoverageScaleTransform::Linear,
+            quality_weighted: false,
+            allele_interpretation: CoverageAlleleInterpretation::GenericReferenceAware,
+            hidden_modification_mask: 0,
+            modification_color_mode: ModifiedBaseColorMode::ByType,
+            junction_normalization: metadata
+                .normalization_factor(options.projection.count_mode)
+                .ok_or(AlignmentSummaryGpuPrepareError::MissingJunctionNormalization)?
+                as f32,
+            junction_row_count: metadata.maximum_expanded_row.saturating_add(1).max(1),
+            minimum_junction_depth: options.projection.minimum_depth,
+            minimum_junction_flank: options.projection.minimum_flank,
+            junction_display_mode: options.projection.display_mode,
+            background_range: 0..0,
+            foreground_range: 0..instance_count,
+        }),
         _ => Err(AlignmentSummaryGpuPrepareError::ResidentMetadataMismatch(
             key,
         )),
@@ -5236,6 +6500,15 @@ fn summary_overlay_count(request: &AlignmentSummaryGpuSceneRequest<'_>) -> usize
             options.depth.selected_position,
         ),
         AlignmentSummaryGpuLaneOptions::Modifications(options) => (0, options.selected_position),
+        AlignmentSummaryGpuLaneOptions::Sashimi(options) => (
+            match options.projection.display_mode {
+                JunctionDisplayMode::Collapsed => 1,
+                JunctionDisplayMode::Expanded => {
+                    request.scene.summaries().expanded_junction_row_count() as usize
+                }
+            },
+            None,
+        ),
     };
     let selected_position = request.overlays.selected_position.or(option_selected);
     let selected = usize::from(
@@ -5252,6 +6525,27 @@ fn append_summary_overlays(
         return;
     }
     let clip = request.camera.clip();
+    if let AlignmentSummaryGpuLaneOptions::Sashimi(options) = &request.options {
+        let row_count = match options.projection.display_mode {
+            JunctionDisplayMode::Collapsed => 1,
+            JunctionDisplayMode::Expanded => request
+                .scene
+                .summaries()
+                .expanded_junction_row_count()
+                .max(1),
+        };
+        let band_height = clip.height / f64::from(row_count);
+        for row in 0..row_count {
+            overlays.push(AlignmentSummaryGpuOverlayInstance {
+                origin: [
+                    clip.x as f32,
+                    (clip.y + (f64::from(row) + 0.5) * band_height) as f32,
+                ],
+                size: [clip.width as f32, 1.0],
+                color: [0.36, 0.38, 0.42, 0.24],
+            });
+        }
+    }
     if matches!(
         &request.options,
         AlignmentSummaryGpuLaneOptions::Coverage(options) if options.depth.show_center_line
@@ -5265,6 +6559,7 @@ fn append_summary_overlays(
     let option_selected = match &request.options {
         AlignmentSummaryGpuLaneOptions::Coverage(options) => options.depth.selected_position,
         AlignmentSummaryGpuLaneOptions::Modifications(options) => options.selected_position,
+        AlignmentSummaryGpuLaneOptions::Sashimi(_) => None,
     };
     if let Some(position) = request.overlays.selected_position.or(option_selected) {
         if request.camera.interval().contains(position) {
@@ -5282,6 +6577,7 @@ fn append_summary_overlays(
                 color: match request.options {
                     AlignmentSummaryGpuLaneOptions::Coverage(_) => [1.0, 0.78, 0.18, 0.92],
                     AlignmentSummaryGpuLaneOptions::Modifications(_) => [0.08, 0.08, 0.08, 0.34],
+                    AlignmentSummaryGpuLaneOptions::Sashimi(_) => [0.16, 0.42, 0.92, 0.40],
                 },
             });
         }
@@ -5445,8 +6741,8 @@ pub enum AlignmentSummaryGpuPageError {
     },
     #[error("allele summary page {0:?} does not carry reference-aware substitutions")]
     MissingReferenceBase(SummaryPageKey),
-    #[error("allele interpretation {0:?} is not supported by the generic substitution GPU slice")]
-    UnsupportedAlleleInterpretation(CoverageAlleleInterpretation),
+    #[error("allele summary page {0:?} does not carry exact bisulfite reference context")]
+    MissingReferenceContext(SummaryPageKey),
     #[error("summary page {0:?} contains a component from another family")]
     UnexpectedSemanticComponent(SummaryPageKey),
     #[error("summary page {page:?} has invalid semantic span {start}..{end}")]
@@ -5518,8 +6814,10 @@ pub enum AlignmentSummaryGpuPrepareError {
     InvalidAlternateFraction,
     #[error("depth and allele lanes must use one shared scale maximum and transform")]
     IncompatibleAlleleScale,
-    #[error("allele interpretation {0:?} is not supported by the generic substitution GPU slice")]
-    UnsupportedAlleleInterpretation(CoverageAlleleInterpretation),
+    #[error("CPM Sashimi rendering requires an exact whole-file mapped-read normalization")]
+    MissingJunctionNormalization,
+    #[error("Sashimi scale maximum must be finite and positive")]
+    InvalidJunctionScale,
     #[error("{missing} mandatory summary GPU pages are not resident")]
     MissingMandatoryPages { missing: usize },
     #[error("summary overlay count exceeds the u32 draw address space")]
@@ -5681,25 +6979,27 @@ mod tests {
     };
 
     use rgv_alignment_scene::{
-        AlignmentPageFamily, AlignmentPageKey, AlignmentPresentationScene, AlignmentReadLabelMode,
-        AlignmentRowAtlas, AlignmentSceneSnapshot, AlignmentSemanticPage, AlignmentSourceRevision,
+        AlignmentCoherenceGroupId, AlignmentPageFamily, AlignmentPageKey,
+        AlignmentPresentationScene, AlignmentReadLabelMode, AlignmentRowAtlas,
+        AlignmentSceneSnapshot, AlignmentSemanticPage, AlignmentSourceRevision,
         AlignmentStyleContract, AlleleSummaryDetail, AllocationBundleSlot, AllocationBundleSpec,
         AllocationClass, AllocationLedger, CanonicalGenomicTile, CanonicalRecordChunk,
         CanonicalRowBlock, CapabilityRequirement, CompleteCoverage, ContractFingerprint,
         CoverageAlleleInterpretation, CpuAlleleProjectionOptions, CpuDepthProjectionOptions,
-        CpuModificationProjectionOptions, CpuSummaryProjectedComponent,
-        CpuSummaryProjectionOptions, CpuSummaryProjector, EvidenceAcquisition, EvidenceChunk,
-        EvidenceRevision, EvidenceRoot, EvidenceRootBuilder, ExactAlleleSummaryTile,
-        ExactDepthSummaryTile, ExactFilterSummaryTile, ExactJunctionSummaryTile,
-        ExactModificationSummaryTile, ExactPairSummaryTile, ExactSummaryRoot,
-        FilteredRecordProvenance, GeometryLod, LayoutContract, PayloadContract, PayloadSidecar,
-        PresentationContract, ReferenceRevision, ReservationKind, RevisionFingerprint,
-        RowAtlasRevision, SceneRevision, SourceChunkId, SourceFingerprint, SummaryContract,
-        SummaryRevision,
+        CpuJunctionProjectionOptions, CpuModificationProjectionOptions,
+        CpuSummaryProjectedComponent, CpuSummaryProjectionOptions, CpuSummaryProjector,
+        EvidenceAcquisition, EvidenceChunk, EvidenceRevision, EvidenceRoot, EvidenceRootBuilder,
+        ExactAlleleSummaryTile, ExactDepthSummaryTile, ExactFilterSummaryTile,
+        ExactJunctionSummaryTile, ExactModificationSummaryTile, ExactPairSummaryTile,
+        ExactSummaryRoot, FilteredRecordProvenance, GeometryLod, LayoutContract, PayloadContract,
+        PayloadSidecar, PresentationContract, ReferenceRevision, ReservationKind,
+        RevisionFingerprint, RowAtlasRevision, SceneRevision, SourceChunkId, SourceFingerprint,
+        SummaryContract, SummaryRevision,
     };
     use rgv_core::{
         AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, BisulfiteContext, ContigId,
-        GenomicInterval, OverlappingMatePolicy, ReadStackingMode, Viewport,
+        GenomicInterval, JunctionDisplayMode, OverlappingMatePolicy, ReadStackingMode,
+        SashimiCountMode, Viewport,
     };
     use rgv_hts::{
         AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
@@ -5974,20 +7274,38 @@ mod tests {
         ledger: &AllocationLedger,
         prepared_interval: Option<GenomicInterval>,
     ) -> Arc<AlignmentSceneSnapshot> {
-        test_snapshot_with_authority(ledger, prepared_interval, NonZeroU64::new(100).unwrap())
+        test_snapshot_with_authority(
+            ledger,
+            prepared_interval,
+            NonZeroU64::new(100).unwrap(),
+            None,
+        )
     }
 
     fn test_snapshot_with_summary_tile_bases(
         ledger: &AllocationLedger,
         tile_bases: NonZeroU64,
     ) -> Arc<AlignmentSceneSnapshot> {
-        test_snapshot_with_authority(ledger, None, tile_bases)
+        test_snapshot_with_authority(ledger, None, tile_bases, None)
+    }
+
+    fn test_snapshot_with_reference(
+        ledger: &AllocationLedger,
+        reference_bases: Vec<u8>,
+    ) -> Arc<AlignmentSceneSnapshot> {
+        test_snapshot_with_authority(
+            ledger,
+            None,
+            NonZeroU64::new(100).unwrap(),
+            Some(reference_bases),
+        )
     }
 
     fn test_snapshot_with_authority(
         ledger: &AllocationLedger,
         prepared_interval: Option<GenomicInterval>,
         tile_bases: NonZeroU64,
+        reference_bases: Option<Vec<u8>>,
     ) -> Arc<AlignmentSceneSnapshot> {
         let (evidence, summaries) = exact_authority_with_tile_bases(ledger, tile_bases);
         let interval = summaries.prepared_interval();
@@ -5995,8 +7313,9 @@ mod tests {
         let reference_revision = ReferenceRevision::new(RevisionFingerprint::new(30, 31));
         let reference = ReferenceSlice {
             interval,
-            bases: vec![b'A'; interval.len() as usize],
+            bases: reference_bases.unwrap_or_else(|| vec![b'A'; interval.len() as usize]),
         };
+        assert_eq!(reference.bases.len(), interval.len() as usize);
         let layout = LayoutContract {
             row_scale_class: 0,
             stacking: ReadStackingMode::Compact,
@@ -6180,6 +7499,8 @@ mod tests {
     ) -> AlignmentSummaryGpuSceneRequest<'a> {
         AlignmentSummaryGpuSceneRequest {
             scene,
+            coherence_scope: 1,
+            lane_identity: 1,
             camera_sequence: sequence,
             camera,
             screen_size_points: [256.0, 96.0],
@@ -6217,6 +7538,51 @@ mod tests {
     ) -> AlignmentSummaryGpuSceneRequest<'a> {
         AlignmentSummaryGpuSceneRequest {
             scene,
+            coherence_scope: 1,
+            lane_identity: 1,
+            camera_sequence: sequence,
+            camera,
+            screen_size_points: [256.0, 96.0],
+            scissor: AlignmentGpuScissor {
+                x: 0,
+                y: 0,
+                width: 256,
+                height: 96,
+            },
+            options: options.into(),
+            overlays: AlignmentSummaryFrameOverlays::default(),
+        }
+    }
+
+    fn sashimi_options(
+        display_mode: JunctionDisplayMode,
+        scale: AlignmentSashimiScalePolicy,
+    ) -> AlignmentSashimiLaneOptions {
+        AlignmentSashimiLaneOptions {
+            projection: CpuJunctionProjectionOptions {
+                minimum_depth: 1,
+                minimum_flank: 0,
+                display_mode,
+                scale_maximum: None,
+                count_mode: SashimiCountMode::Raw,
+                show_labels: true,
+            },
+            scale,
+        }
+    }
+
+    fn sashimi_request<'a>(
+        scene: &'a Arc<AlignmentSceneSnapshot>,
+        sequence: u64,
+        camera: CpuSummaryCamera,
+        coherence_scope: u64,
+        lane_identity: u64,
+        options: AlignmentSashimiLaneOptions,
+    ) -> AlignmentSummaryGpuSceneRequest<'a> {
+        AlignmentSummaryGpuSceneRequest {
+            scene,
+            coherence_scope,
+            lane_identity,
             camera_sequence: sequence,
             camera,
             screen_size_points: [256.0, 96.0],
@@ -6604,6 +7970,246 @@ mod tests {
     }
 
     #[test]
+    fn packed_junctions_have_unique_tile_ownership_and_match_the_stable_cpu_oracle() {
+        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+        let scene = test_snapshot_with_summary_tile_bases(&ledger, NonZeroU64::new(10).unwrap());
+        let camera = camera(scene.prepared_interval());
+        let mut options = sashimi_options(
+            JunctionDisplayMode::Expanded,
+            AlignmentSashimiScalePolicy::Fixed(1.0),
+        );
+        options.projection.scale_maximum = Some(1.0);
+        options.projection.show_labels = false;
+        let cpu = CpuSummaryProjector::project(
+            &scene,
+            1,
+            camera,
+            &CpuSummaryProjectionOptions::Junctions(options.projection),
+        )
+        .unwrap();
+
+        let mut entry_count = 0_usize;
+        let mut gpu = Vec::new();
+        for page in scene
+            .summary_pages()
+            .iter()
+            .filter(|page| page.key().family() == SummaryPageFamily::Junctions)
+        {
+            let PackedAlignmentSummaryPage::Junctions {
+                instances,
+                metadata,
+            } = PackedAlignmentSummaryPage::from_request(
+                AlignmentSummaryGpuPageRequest::junctions(page),
+            )
+            .unwrap()
+            else {
+                unreachable!();
+            };
+            entry_count = entry_count.saturating_add(metadata.entries().len());
+            for entry in metadata.entries() {
+                assert_eq!(
+                    entry.expanded_row(),
+                    scene
+                        .summaries()
+                        .expanded_junction_row(entry.evidence().start, entry.evidence().end)
+                        .unwrap()
+                );
+            }
+            gpu.extend(instances.iter().filter_map(|instance| {
+                project_alignment_summary_junction_instance(
+                    *instance,
+                    page.interval().start(),
+                    camera,
+                    1.0,
+                    1.0,
+                    scene.summaries().expanded_junction_row_count(),
+                    options.projection.minimum_depth,
+                    options.projection.minimum_flank,
+                    options.projection.display_mode,
+                )
+                .filter(|projected| {
+                    projected.component != AlignmentSummaryJunctionComponentToken::Annotation
+                })
+            }));
+        }
+        assert_eq!(entry_count, 1, "one biological junction has one owner page");
+
+        let mut cpu = cpu
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(
+                    primitive.component,
+                    CpuSummaryProjectedComponent::Junction { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        gpu.sort_by(|left, right| {
+            left.bounds
+                .x
+                .total_cmp(&right.bounds.x)
+                .then_with(|| left.bounds.y.total_cmp(&right.bounds.y))
+        });
+        cpu.sort_by(|left, right| {
+            left.x
+                .total_cmp(&right.x)
+                .then_with(|| left.y.total_cmp(&right.y))
+        });
+        assert_eq!(gpu.len(), cpu.len());
+        for (gpu, cpu) in gpu.iter().zip(cpu) {
+            assert_near(gpu.bounds.x, cpu.x);
+            assert_near(gpu.bounds.y, cpu.y);
+            assert_near(gpu.bounds.width, cpu.width);
+            assert_near(gpu.bounds.height, cpu.height);
+        }
+    }
+
+    #[test]
+    fn shared_sashimi_scales_are_coherent_within_but_never_across_panels() {
+        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+        let scene = test_snapshot(&ledger);
+        let group = AlignmentCoherenceGroupId::new(7);
+        let options = sashimi_options(
+            JunctionDisplayMode::Collapsed,
+            AlignmentSashimiScalePolicy::Shared(group),
+        );
+        let full = camera(scene.prepared_interval());
+        let empty = camera(GenomicInterval::new(ContigId::new(0), 0, 5).unwrap());
+
+        let isolated = [
+            sashimi_request(&scene, 1, full, 10, 1, options),
+            sashimi_request(&scene, 1, empty, 20, 2, options),
+        ];
+        let isolated_pages = isolated
+            .iter()
+            .map(|request| summary_requests_for_scene(request, true))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let metrics = resolve_junction_request_metrics(&isolated, &isolated_pages).unwrap();
+        assert_near(f64::from(metrics[0].unwrap().resolved_scale_maximum), 1.0);
+        assert!(metrics[1].unwrap().resolved_scale_maximum <= f32::EPSILON);
+
+        let coherent = [
+            sashimi_request(&scene, 2, full, 10, 1, options),
+            sashimi_request(&scene, 2, empty, 10, 2, options),
+        ];
+        let coherent_pages = coherent
+            .iter()
+            .map(|request| summary_requests_for_scene(request, true))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let metrics = resolve_junction_request_metrics(&coherent, &coherent_pages).unwrap();
+        assert_near(f64::from(metrics[1].unwrap().resolved_scale_maximum), 1.0);
+    }
+
+    #[test]
+    fn native_sashimi_picking_and_hover_capture_reuse_persistent_geometry() {
+        let Some((device, queue)) = headless_device() else {
+            return;
+        };
+        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 12 << 20, 16 << 20);
+        let scene = test_snapshot(&ledger);
+        let camera = camera(GenomicInterval::new(ContigId::new(0), 10, 25).unwrap());
+        let options = sashimi_options(
+            JunctionDisplayMode::Collapsed,
+            AlignmentSashimiScalePolicy::Fixed(1.0),
+        );
+        let first_requests = [sashimi_request(&scene, 1, camera, 31, 41, options)];
+        let mut renderer =
+            AlignmentSummaryGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let (first, first_stats, _) = publish_bundled_summary_frame(
+            &device,
+            &queue,
+            &mut renderer,
+            &first_requests,
+            &ledger,
+            Vec::new(),
+            1,
+            90,
+        );
+        assert!(first_stats.geometry_uploaded_bytes > 0);
+        assert!(first.has_junction_lane(31, 41));
+        let labels = renderer.junction_labels(&first);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].text, "1");
+        assert_eq!(
+            (labels[0].coherence_scope, labels[0].lane_identity),
+            (31, 41)
+        );
+        render_test_frame(&device, &queue, &renderer, &first).unwrap();
+
+        let page = scene
+            .summary_pages()
+            .iter()
+            .find(|page| {
+                page.key().family() == SummaryPageFamily::Junctions && !page.primitives().is_empty()
+            })
+            .unwrap();
+        let PackedAlignmentSummaryPage::Junctions {
+            instances,
+            metadata,
+        } = PackedAlignmentSummaryPage::from_request(AlignmentSummaryGpuPageRequest::junctions(
+            page,
+        ))
+        .unwrap()
+        else {
+            unreachable!();
+        };
+        let instance = *instances
+            .iter()
+            .find(|instance| {
+                instance.identity[1] == AlignmentSummaryJunctionComponentToken::Positive as u32
+            })
+            .unwrap();
+        let projected = project_alignment_summary_junction_instance(
+            instance,
+            page.interval().start(),
+            camera,
+            1.0,
+            1.0,
+            1,
+            1,
+            0,
+            JunctionDisplayMode::Collapsed,
+        )
+        .unwrap();
+        let hit = renderer
+            .hit_test_junction_lane(
+                &first,
+                31,
+                41,
+                projected.bounds.x + projected.bounds.width * 0.5,
+                projected.bounds.y,
+                4.0,
+            )
+            .unwrap();
+        assert_eq!(hit.coherence_scope, 31);
+        assert_eq!(hit.lane_identity, 41);
+        assert_eq!(hit.evidence, metadata.entries()[0].evidence());
+        assert_eq!(
+            hit.component,
+            AlignmentSummaryJunctionComponentToken::Positive
+        );
+
+        let authority = first.content_authority().clone();
+        let evidence = hit.evidence;
+        let mut hovered = sashimi_request(&scene, 2, camera, 31, 41, options);
+        hovered.overlays.hovered_junction = Some(AlignmentSummaryJunctionInteraction {
+            start: evidence.start,
+            end: evidence.end,
+            component: hit.component,
+        });
+        let resident_pages = renderer.resident_page_count();
+        let (second, stats) = renderer
+            .capture_camera_frame(&device, &queue, &authority, &[hovered], &ledger)
+            .unwrap();
+        assert_eq!(stats.geometry_uploaded_bytes, 0);
+        assert_eq!(renderer.resident_page_count(), resident_pages);
+        assert!(second.has_junction_lane(31, 41));
+        render_test_frame(&device, &queue, &renderer, &second).unwrap();
+    }
+
+    #[test]
     fn canonical_gpu_pages_are_clipped_to_the_snapshot_prepared_interval() {
         let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
         let prepared = GenomicInterval::new(ContigId::new(0), 12, 20).unwrap();
@@ -6685,9 +8291,17 @@ mod tests {
             0.0,
             CoverageScaleTransform::Linear,
             false,
+            CoverageAlleleInterpretation::GenericReferenceAware,
             SummaryPageFamily::Depth,
             0,
             ModifiedBaseColorMode::ByType,
+            1.0,
+            1.0,
+            1,
+            0,
+            0,
+            JunctionDisplayMode::Collapsed,
+            AlignmentSummaryFrameOverlays::default(),
         );
         assert_eq!(uniform.covered_clip_x, clip);
     }
@@ -8143,29 +9757,132 @@ mod tests {
     }
 
     #[test]
-    fn bisulfite_interpretation_is_rejected_before_generic_page_admission() {
+    fn bisulfite_interpretation_matches_the_cpu_oracle_and_reuses_allele_pages() {
         let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
-        let scene = test_snapshot(&ledger);
+        let mut reference = vec![b'A'; 100];
+        reference[11] = b'C';
+        reference[12] = b'G';
+        let scene = test_snapshot_with_reference(&ledger, reference);
         let mut options = lane_options(true);
         let mut alleles = options.alleles.unwrap();
         alleles.interpretation = CoverageAlleleInterpretation::Bisulfite(BisulfiteContext::Cg);
+        alleles.quality_weighted = false;
+        alleles.minimum_fraction = 0.99;
         options.alleles = Some(alleles);
-        let error = unique_summary_requests(
-            &[request(
-                &scene,
-                1,
-                camera(scene.prepared_interval()),
-                options,
-            )],
-            true,
+        let camera = camera(scene.prepared_interval());
+        let cpu = CpuSummaryProjector::project(
+            &scene,
+            1,
+            camera,
+            &CpuSummaryProjectionOptions::Alleles(alleles),
         )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            AlignmentSummaryGpuPageError::UnsupportedAlleleInterpretation(
-                CoverageAlleleInterpretation::Bisulfite(BisulfiteContext::Cg)
-            )
+        .unwrap();
+        let allele_page = scene
+            .summary_pages()
+            .iter()
+            .find(|page| page.key().family() == SummaryPageFamily::Alleles)
+            .unwrap();
+        let depth_page = scene
+            .summary_pages()
+            .iter()
+            .find(|page| page.key().family() == SummaryPageFamily::Depth)
+            .unwrap();
+        let PackedAlignmentSummaryPage::Alleles { instances } =
+            PackedAlignmentSummaryPage::from_request(AlignmentSummaryGpuPageRequest::alleles(
+                allele_page,
+                depth_page,
+            ))
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        let mut gpu = instances
+            .iter()
+            .filter_map(|instance| {
+                project_alignment_summary_bisulfite_instance(
+                    *instance,
+                    allele_page.interval().start(),
+                    camera,
+                    1,
+                    CoverageScaleTransform::Linear,
+                    false,
+                    BisulfiteContext::Cg,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut cpu = cpu
+            .primitives
+            .iter()
+            .filter_map(|primitive| {
+                let CpuSummaryProjectedComponent::Bisulfite {
+                    observation,
+                    strand,
+                    fraction_bits,
+                    ..
+                } = primitive.component
+                else {
+                    return None;
+                };
+                Some((
+                    primitive,
+                    observation,
+                    strand,
+                    f64::from_bits(fraction_bits),
+                ))
+            })
+            .collect::<Vec<_>>();
+        gpu.sort_by(|left, right| {
+            left.bounds
+                .x
+                .total_cmp(&right.bounds.x)
+                .then_with(|| left.bounds.y.total_cmp(&right.bounds.y))
+        });
+        cpu.sort_by(|left, right| {
+            left.0
+                .x
+                .total_cmp(&right.0.x)
+                .then_with(|| left.0.y.total_cmp(&right.0.y))
+        });
+        assert!(!gpu.is_empty());
+        assert_eq!(gpu.len(), cpu.len());
+        for (gpu, (cpu, observation, strand, fraction)) in gpu.iter().zip(cpu) {
+            assert_eq!(gpu.observation, observation);
+            assert_eq!(gpu.strand, strand);
+            assert_near(gpu.fraction, fraction);
+            assert_near(gpu.bounds.x, cpu.x);
+            assert_near(gpu.bounds.y, cpu.y);
+            assert_near(gpu.bounds.width, cpu.width);
+            assert_near(gpu.bounds.height, cpu.height);
+        }
+
+        let Some((device, queue)) = headless_device() else {
+            return;
+        };
+        let mut renderer =
+            AlignmentSummaryGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let generic = [request(&scene, 1, camera, lane_options(true))];
+        let (first, _, _) = publish_bundled_summary_frame(
+            &device,
+            &queue,
+            &mut renderer,
+            &generic,
+            &ledger,
+            Vec::new(),
+            1,
+            500,
         );
+        let authority = first.content_authority().clone();
+        let (bisulfite, stats) = renderer
+            .capture_camera_frame(
+                &device,
+                &queue,
+                &authority,
+                &[request(&scene, 2, camera, options)],
+                &ledger,
+            )
+            .unwrap();
+        assert_eq!(stats.geometry_uploaded_bytes, 0);
+        render_test_frame(&device, &queue, &renderer, &bisulfite).unwrap();
     }
 
     #[test]

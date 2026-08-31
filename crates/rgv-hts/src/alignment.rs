@@ -675,6 +675,10 @@ pub struct AlignmentBatch {
 /// allocation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlignmentPayloadBatch {
+    sequence_capability_retained: bool,
+    quality_capability_retained: bool,
+    all_auxiliary_tags_retained: bool,
+    retained_auxiliary_tags: Arc<[[u8; 2]]>,
     source_positions: Vec<Option<AlignmentSourcePosition>>,
     sequence_states: Vec<PackedSequenceState>,
     sequence_offsets: Vec<u32>,
@@ -688,6 +692,10 @@ pub struct AlignmentPayloadBatch {
 impl Default for AlignmentPayloadBatch {
     fn default() -> Self {
         Self {
+            sequence_capability_retained: false,
+            quality_capability_retained: false,
+            all_auxiliary_tags_retained: false,
+            retained_auxiliary_tags: Arc::from([]),
             source_positions: Vec::new(),
             sequence_states: Vec::new(),
             sequence_offsets: vec![0],
@@ -1825,6 +1833,17 @@ impl AlignmentPayloadBatch {
             return Err(AlignmentPayloadError::QualitiesRequireSequence);
         }
         let mut payload = Self::default();
+        payload.sequence_capability_retained = retain_sequence;
+        payload.quality_capability_retained = retain_qualities;
+        payload.all_auxiliary_tags_retained = retained_auxiliary_tags.is_none();
+        payload.retained_auxiliary_tags = retained_auxiliary_tags
+            .map(|tags| {
+                let mut tags = tags.to_vec();
+                tags.sort_unstable();
+                tags.dedup();
+                Arc::<[[u8; 2]]>::from(tags)
+            })
+            .unwrap_or_else(|| Arc::from([]));
         payload.source_positions.reserve(batch.len());
         payload.sequence_states.reserve(batch.len());
         payload.sequence_offsets.reserve(batch.len());
@@ -1929,22 +1948,28 @@ impl AlignmentPayloadBatch {
     /// which the source itself has no sequence remain explicitly `Missing` and still satisfy it.
     #[must_use]
     pub fn has_complete_sequence_capability(&self) -> bool {
-        (0..self.len()).all(|index| !matches!(self.sequence(index), Some(SequenceView::NotLoaded)))
+        self.sequence_capability_retained
+            && (0..self.len())
+                .all(|index| !matches!(self.sequence(index), Some(SequenceView::NotLoaded)))
     }
 
     /// Every present sequence retains qualities; records with no source sequence remain Missing.
     #[must_use]
     pub fn has_complete_quality_capability(&self) -> bool {
-        (0..self.len()).all(|index| {
-            matches!(
-                self.sequence(index),
-                Some(SequenceView::Missing)
-                    | Some(SequenceView::Present {
-                        qualities: Some(_),
-                        ..
-                    })
-            )
-        })
+        self.sequence_capability_retained && self.quality_capability_retained
+    }
+
+    /// Whether every auxiliary field was decoded, including source records which contain none.
+    #[must_use]
+    pub const fn has_all_auxiliary_tag_capability(&self) -> bool {
+        self.all_auxiliary_tags_retained
+    }
+
+    /// Whether a requested tag was considered during decode. Absence from an individual record
+    /// remains a truthful source value rather than evidence that the capability was omitted.
+    #[must_use]
+    pub fn has_auxiliary_tag_capability(&self, tag: [u8; 2]) -> bool {
+        self.all_auxiliary_tags_retained || self.retained_auxiliary_tags.binary_search(&tag).is_ok()
     }
 
     pub fn has_auxiliary_tag(&self, index: usize, tag: [u8; 2]) -> bool {
@@ -2069,6 +2094,11 @@ impl AlignmentPayloadBatch {
                     .saturating_mul(std::mem::size_of::<u32>()),
             )
             .saturating_add(self.auxiliary_data.capacity())
+            .saturating_add(
+                self.retained_auxiliary_tags
+                    .len()
+                    .saturating_mul(std::mem::size_of::<[u8; 2]>()),
+            )
     }
 
     fn auxiliary_bytes(&self, index: usize) -> Option<&[u8]> {
@@ -2581,6 +2611,9 @@ mod tests {
 
         let full = AlignmentPayloadBatch::from_batch(&batch, true, true, None).unwrap();
         assert!(full.validate());
+        assert!(full.has_complete_sequence_capability());
+        assert!(full.has_complete_quality_capability());
+        assert!(full.has_all_auxiliary_tag_capability());
         assert_eq!(full.source_position(0), batch.source_position(0));
         assert_eq!(full.sequence(0), batch.sequence(0));
         assert_eq!(
@@ -2591,6 +2624,11 @@ mod tests {
 
         let selective =
             AlignmentPayloadBatch::from_batch(&batch, true, false, Some(&[*b"RG"])).unwrap();
+        assert!(selective.has_complete_sequence_capability());
+        assert!(!selective.has_complete_quality_capability());
+        assert!(!selective.has_all_auxiliary_tag_capability());
+        assert!(selective.has_auxiliary_tag_capability(*b"RG"));
+        assert!(!selective.has_auxiliary_tag_capability(*b"NM"));
         assert_eq!(
             selective.sequence(0),
             Some(SequenceView::Present {
@@ -2603,6 +2641,28 @@ mod tests {
         assert_eq!(
             AlignmentPayloadBatch::from_batch(&batch, false, true, None).unwrap_err(),
             AlignmentPayloadError::QualitiesRequireSequence
+        );
+    }
+
+    #[test]
+    fn retained_quality_capability_preserves_truthful_source_missingness() {
+        let mut record = complete_record();
+        record.sequence = SequenceData::Present {
+            bases: b"ACGTACGTAA".to_vec(),
+            qualities: None,
+        };
+        let mut batch = AlignmentBatch::default();
+        batch.push(&record).unwrap();
+
+        let payload = AlignmentPayloadBatch::from_batch(&batch, true, true, None).unwrap();
+
+        assert!(payload.has_complete_quality_capability());
+        assert_eq!(
+            payload.sequence(0),
+            Some(SequenceView::Present {
+                bases: b"ACGTACGTAA",
+                qualities: None,
+            })
         );
     }
 

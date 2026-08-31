@@ -1,58 +1,90 @@
 {
-  "schema_version": 1,
-  "branch_policy": "legacy_is_oracle_only_until_atomic_cutover",
-  "entries": [
-    {"symbol":"rgv_hts::AlignmentSource","path":"crates/rgv-hts/src/local.rs","disposition":"adapt","phase":3,"replacement":"AlignmentSourceActor-owned canonical acquisition API"},
-    {"symbol":"rgv_hts::AlignmentOpenOptions","path":"crates/rgv-hts/src/local.rs","disposition":"retain","phase":1,"replacement":"typed source configuration plus source stamp"},
-    {"symbol":"rgv_hts::AlignmentSourceStamp","path":"crates/rgv-hts/src/source_revision.rs","disposition":"retain","phase":1,"replacement":"source revision authority"},
-    {"symbol":"rgv_hts::AlignmentSourcePosition","path":"crates/rgv-hts/src/source_position.rs","disposition":"retain","phase":1,"replacement":"physical record address"},
-    {"symbol":"rgv_hts::LocalAlignmentSource","path":"crates/rgv-hts/src/local.rs","disposition":"adapt","phase":3,"replacement":"BAM decoder owned by source actor"},
-    {"symbol":"rgv_hts::LocalCramAlignmentSource","path":"crates/rgv-hts/src/remote_alignment.rs","disposition":"adapt","phase":3,"replacement":"CRAM decoder owned by source actor"},
-    {"symbol":"rgv_hts::RemoteBamAlignmentSource","path":"crates/rgv-hts/src/remote_alignment.rs","disposition":"adapt","phase":3,"replacement":"range decoder owned by source actor"},
-    {"symbol":"rgv_hts::RemoteCramAlignmentSource","path":"crates/rgv-hts/src/remote_alignment.rs","disposition":"adapt","phase":3,"replacement":"range decoder owned by source actor"},
-    {"symbol":"rgv_hts::QueryOptions","path":"crates/rgv-hts/src/local.rs","disposition":"oracle_only","phase":7,"replacement":"factorised scene contracts"},
-    {"symbol":"rgv_hts::AlignmentQuery","path":"crates/rgv-hts/src/local.rs","disposition":"oracle_only","phase":7,"replacement":"EvidenceRoot plus independent summary roots"},
-
-    {"symbol":"rgv_engine::AlignmentEngine","path":"crates/rgv-engine/src/alignment_engine.rs","disposition":"delete","phase":8,"replacement":"AlignmentSourceActor and scene coordinator"},
-    {"symbol":"rgv_engine::AlignmentEngineRequest","path":"crates/rgv-engine/src/alignment_engine.rs","disposition":"delete","phase":8,"replacement":"latest-wins typed scene intents"},
-    {"symbol":"rgv_engine::AlignmentEngineEvent","path":"crates/rgv-engine/src/alignment_engine.rs","disposition":"replace","phase":7,"replacement":"immutable resource/scene publications"},
-    {"symbol":"rgv_engine::AlignmentResidentWindow","path":"crates/rgv-engine/src/alignment_engine.rs","disposition":"delete","phase":8,"replacement":"canonical source chunk store"},
-    {"symbol":"rgv_engine::AlignmentResidentStore","path":"crates/rgv-engine/src/alignment_engine.rs","disposition":"delete","phase":8,"replacement":"actor-owned immutable evidence roots"},
-    {"symbol":"rgv_engine::ResidentLayoutDonor","path":"crates/rgv-engine/src/alignment_engine.rs","disposition":"delete","phase":8,"replacement":"immutable row atlas sharing"},
-    {"symbol":"rgv_engine::AlignmentBrowsingPolicy","path":"crates/rgv-engine/src/alignment_engine.rs","disposition":"adapt","phase":3,"replacement":"AdmissionPolicy plus foreground/speculation policy"},
-    {"symbol":"rgv_engine::AlignmentWorkingSetStats","path":"crates/rgv-engine/src/alignment_engine.rs","disposition":"adapt","phase":3,"replacement":"allocation-ledger and actor diagnostics"},
-
-    {"symbol":"rgv_layout::AlignmentLayoutOptions","path":"crates/rgv-layout/src/alignment_layout.rs","disposition":"adapt","phase":3,"replacement":"LayoutContract"},
-    {"symbol":"rgv_layout::AlignmentLayout","path":"crates/rgv-layout/src/alignment_layout.rs","disposition":"replace","phase":4,"replacement":"semantic pages over AlignmentRowAtlas"},
-    {"symbol":"rgv_layout::AlignmentRowHistory","path":"crates/rgv-layout/src/alignment_layout.rs","disposition":"adapt","phase":3,"replacement":"immutable atlas construction history"},
-    {"symbol":"rgv_layout::AlignmentRowScene","path":"crates/rgv-layout/src/alignment_layout.rs","disposition":"delete","phase":8,"replacement":"AlignmentRowAtlas"},
-    {"symbol":"rgv_layout::AlignmentRowSceneProjection","path":"crates/rgv-layout/src/alignment_layout.rs","disposition":"delete","phase":8,"replacement":"atlas interval selection"},
-    {"symbol":"rgv_layout::AlignmentRowScene::extend_edges","path":"crates/rgv-layout/src/alignment_layout.rs","disposition":"adapt","phase":3,"replacement":"private immutable atlas extension builder"},
-    {"symbol":"rgv_layout::DisplayList","path":"crates/rgv-layout/src/display.rs","disposition":"retain_non_alignment","phase":8,"replacement":"retained for non-overlapping non-migrated lanes"},
-
-    {"symbol":"rgv_desktop::AlignmentPanelProjection","path":"apps/rgv-desktop/src/workspace/alignments.rs","disposition":"replace","phase":7,"replacement":"published AlignmentLaneScene lease"},
-    {"symbol":"AlignmentPanelProjection::current_query","path":"apps/rgv-desktop/src/workspace/alignments.rs","disposition":"delete","phase":8,"replacement":"EvidenceRoot"},
-    {"symbol":"AlignmentPanelProjection::layout_query","path":"apps/rgv-desktop/src/workspace/alignments.rs","disposition":"delete","phase":8,"replacement":"AlignmentRowAtlas"},
-    {"symbol":"AlignmentPanelProjection::resident_query","path":"apps/rgv-desktop/src/workspace/alignments.rs","disposition":"delete","phase":8,"replacement":"canonical chunk leases"},
-    {"symbol":"AlignmentPanelProjection::cached_layout","path":"apps/rgv-desktop/src/workspace/alignments.rs","disposition":"delete","phase":8,"replacement":"semantic page cache"},
-    {"symbol":"AlignmentPanelProjection::row_scenes","path":"apps/rgv-desktop/src/workspace/alignments.rs","disposition":"delete","phase":8,"replacement":"one immutable row atlas root"},
-    {"symbol":"rgv_desktop::AlignmentRowLayoutTask","path":"apps/rgv-desktop/src/app/tasks.rs","disposition":"delete","phase":8,"replacement":"scene builder jobs"},
-    {"symbol":"rgv_desktop::AlignmentRowSceneTask","path":"apps/rgv-desktop/src/app/tasks.rs","disposition":"delete","phase":8,"replacement":"atlas builder publication"},
-    {"symbol":"rgv_desktop::alignment_record_at_point","path":"apps/rgv-desktop/src/display/hit_test.rs","disposition":"replace","phase":7,"replacement":"stable-handle row interval picker"},
-    {"symbol":"rgv_desktop::NavigationPreviewKind::CompleteHorizon","path":"apps/rgv-desktop/src/workspace/navigation_preview.rs","disposition":"delete","phase":8,"replacement":"live camera over prepared scene pages"},
-    {"symbol":"rgv_desktop::NavigationPreviewSource","path":"apps/rgv-desktop/src/workspace/navigation_preview.rs","disposition":"delete","phase":9,"replacement":"per-lane scene leases"},
-    {"symbol":"rgv_desktop::secondary_alignment_track_layout","path":"apps/rgv-desktop/src/display/alignment.rs","disposition":"replace","phase":7,"replacement":"scene CPU projector then GPU pages"},
-    {"symbol":"rgv_desktop::semantic_export_display_list","path":"apps/rgv-desktop/src/automation/export.rs","disposition":"adapt","phase":7,"replacement":"same-scene semantic export"},
-    {"symbol":"rgv_desktop::RetainedEvidenceSnapshot","path":"apps/rgv-desktop/src/inspection/model.rs","disposition":"adapt","phase":7,"replacement":"stable scene handle plus evidence revision"},
-    {"symbol":"rgv_desktop::sashimi_export_display","path":"apps/rgv-desktop/src/inspection/rna.rs","disposition":"adapt","phase":7,"replacement":"junction summary-root export"},
-
-    {"symbol":"rgv_render::RectangleRenderer","path":"crates/rgv-render/src/lib.rs","disposition":"retain_non_alignment","phase":8,"replacement":"generic renderer for remaining lanes"},
-    {"symbol":"rgv_render::NavigationPreviewRenderer","path":"crates/rgv-render/src/lib.rs","disposition":"delete","phase":9,"replacement":"persistent per-lane GPU pages"},
-    {"symbol":"rgv_render::NAVIGATION_PREVIEW_SHADER","path":"crates/rgv-render/src/lib.rs","disposition":"delete","phase":9,"replacement":"world-coordinate alignment/lane shaders"},
-
-    {"symbol":"rgv_alignment_scene::AlignmentHandle","path":"crates/rgv-alignment-scene/src/identity.rs","disposition":"new_authority","phase":1,"replacement":"none"},
-    {"symbol":"rgv_alignment_scene::CanonicalRecordChunk","path":"crates/rgv-alignment-scene/src/chunk.rs","disposition":"new_authority","phase":1,"replacement":"none"},
-    {"symbol":"rgv_alignment_scene::EvidenceRoot","path":"crates/rgv-alignment-scene/src/evidence.rs","disposition":"new_authority","phase":2,"replacement":"none"},
-    {"symbol":"rgv_alignment_scene::AllocationLedger","path":"crates/rgv-alignment-scene/src/resource.rs","disposition":"new_authority","phase":2,"replacement":"none"}
+  "schema_version": 2,
+  "branch_policy": "unified_alignment_scene_is_the_exclusive_alignment_authority",
+  "production_roots": [
+    "apps/rgv-desktop/src",
+    "crates/rgv-engine/src",
+    "crates/rgv-layout/src",
+    "crates/rgv-render/src"
+  ],
+  "deleted_files": [
+    "crates/rgv-engine/src/alignment_engine.rs",
+    "crates/rgv-layout/src/alignment_layout.rs",
+    "crates/rgv-layout/src/alignment_layout_tests.rs",
+    "crates/rgv-layout/src/alignment_layout/cigar.rs",
+    "crates/rgv-layout/src/alignment_layout/color.rs",
+    "crates/rgv-layout/src/alignment_layout/coverage.rs",
+    "crates/rgv-layout/src/alignment_layout/reads.rs",
+    "crates/rgv-layout/src/alignment_layout/reference.rs",
+    "crates/rgv-layout/src/alignment_layout/rows.rs",
+    "crates/rgv-layout/src/alignment_layout/technologies.rs",
+    "apps/rgv-desktop/src/display/navigation_preview.rs",
+    "apps/rgv-desktop/src/workspace/navigation_preview.rs",
+    "crates/rgv-render/src/navigation_preview.wgsl",
+    "crates/rgv-layout/examples/read_stack_qualification.rs",
+    "benchmarks/dense-layout/Cargo.toml",
+    "benchmarks/dense-layout/src/main.rs",
+    "benchmarks/dense-layout/README.md",
+    "validation/compare_resident_alignment_scene.py"
+  ],
+  "forbidden_identifiers": [
+    "AlignmentEngine",
+    "AlignmentEngineRequest",
+    "AlignmentEngineEvent",
+    "AlignmentResidentWindow",
+    "AlignmentResidentStore",
+    "ResidentLayoutDonor",
+    "AlignmentLayout",
+    "AlignmentRowHistory",
+    "AlignmentRowLayout",
+    "AlignmentRowScene",
+    "AlignmentRowSceneProjection",
+    "AlignmentRowLayoutTask",
+    "AlignmentRowSceneTask",
+    "IndividualReadRefusal",
+    "current_query",
+    "layout_query",
+    "resident_query",
+    "cached_layout",
+    "layout_alignment_query",
+    "reconcile_alignment_rows",
+    "alignment_record_at_point",
+    "record_object_id",
+    "CompleteHorizon",
+    "NavigationPreviewRenderer",
+    "NavigationPreviewSource",
+    "NavigationPreviewKind",
+    "NavigationHorizonPreviewStats",
+    "MAX_PROVISIONAL_HORIZON_RECORDS",
+    "MAX_PROVISIONAL_HORIZON_BYTES",
+    "navigation_preview_texture_bytes",
+    "navigation_preview"
+  ],
+  "retained_boundaries": [
+    {
+      "identifier": "AlignmentSceneEngine",
+      "path": "crates/rgv-engine/src/alignment_scene_engine.rs",
+      "purpose": "exclusive alignment source and presentation coordinator"
+    },
+    {
+      "identifier": "AlignmentPresentationScene",
+      "path": "crates/rgv-alignment-scene/src/presentation_scene.rs",
+      "purpose": "immutable alignment semantic authority"
+    },
+    {
+      "identifier": "DisplayList",
+      "path": "crates/rgv-layout/src/display.rs",
+      "purpose": "non-alignment contextual lane geometry only"
+    },
+    {
+      "identifier": "RectangleRenderer",
+      "path": "crates/rgv-render/src/lib.rs",
+      "purpose": "generic non-genomic chrome and overlay renderer only"
+    },
+    {
+      "identifier": "ContextSceneGpuRenderer",
+      "path": "crates/rgv-render/src/context_scene.rs",
+      "purpose": "persistent GPU authority for reference, genes, and auxiliary contextual lanes"
+    }
   ]
 }

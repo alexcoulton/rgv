@@ -71,15 +71,25 @@ pub(crate) fn verify_mixed_track_truth(root: &Path, manifest: &FixtureManifest) 
 
     let clock = GenerationClock::default();
     let request = PanelGeneration::new(PanelId::new(1), clock.current());
-    engine.try_query(request, clock, "chrVariants".to_owned(), 8_500, 18_100)?;
+    engine.try_query(
+        request,
+        clock,
+        "chrVariants".to_owned(),
+        GenomicInterval::new(rgv_core::ContigId::new(0), 8_500, 18_100)?,
+    )?;
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut lane_snapshots = Vec::new();
     let snapshots = loop {
         ensure!(
             Instant::now() < deadline,
             "MF-10 timed out querying its sources"
         );
         match engine.try_receive()? {
-            Some(TrackEngineEvent::QueryCompleted { tracks, .. }) => break tracks,
+            Some(TrackEngineEvent::LaneCompleted { track, .. }) => lane_snapshots.push(track),
+            Some(TrackEngineEvent::QueryCompleted { completed, .. }) => {
+                lane_snapshots.retain(|track| completed.contains(&track.id));
+                break lane_snapshots;
+            }
             Some(TrackEngineEvent::Error { message, .. }) => {
                 anyhow::bail!("MF-10 query failed: {message}");
             }

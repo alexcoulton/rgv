@@ -4,30 +4,33 @@ use std::{
 };
 
 use rgv_alignment_scene::{
-    AlignmentCoverageLaneOptions, AlignmentInteractionState, AlignmentPageFamily, AlignmentPageKey,
-    AlignmentPresentationScene, AlignmentReadLabelMode, AlignmentRowAtlas, AlignmentSceneSnapshot,
-    AlignmentSemanticPage, AlignmentSourceRevision, AlignmentStyleContract, AlleleSummaryDetail,
-    AllocationBundleActual, AllocationBundleSlot, AllocationBundleSpec, AllocationClass,
-    AllocationLedger, AllocationRetirementClaimSet, AllocationRetirementToken,
+    AlignmentCoverageLaneOptions, AlignmentInteractionState, AlignmentModificationLaneOptions,
+    AlignmentPageFamily, AlignmentPageKey, AlignmentPresentationScene, AlignmentReadLabelMode,
+    AlignmentRowAtlas, AlignmentSashimiLaneOptions, AlignmentSashimiScalePolicy,
+    AlignmentSceneSnapshot, AlignmentSemanticPage, AlignmentSourceRevision, AlignmentStyleContract,
+    AlleleSummaryDetail, AllocationBundleActual, AllocationBundleSlot, AllocationBundleSpec,
+    AllocationClass, AllocationLedger, AllocationRetirementClaimSet, AllocationRetirementToken,
     CanonicalGenomicTile, CanonicalRecordChunk, CanonicalRowBlock, CapabilityRequirement,
     CompleteCoverage, ContractFingerprint, CoverageAlleleInterpretation,
-    CpuAlleleProjectionOptions, CpuClipRect, CpuDepthProjectionOptions, CpuSummaryCamera,
+    CpuAlleleProjectionOptions, CpuClipRect, CpuDepthProjectionOptions,
+    CpuJunctionProjectionOptions, CpuModificationProjectionOptions, CpuSummaryCamera,
     EvidenceAcquisition, EvidenceChunk, EvidenceRevision, EvidenceRoot, EvidenceRootBuilder,
     ExactAlleleSummaryTile, ExactDepthSummaryTile, ExactFilterSummaryTile,
-    ExactJunctionSummaryTile, ExactPairSummaryTile, ExactSummaryRoot, FilteredRecordProvenance,
-    GeometryLod, LayoutContract, PayloadContract, PayloadSidecar, PresentationContract,
-    ReferenceRevision, ReservationKind, RevisionFingerprint, RowAtlasRevision, SceneRevision,
-    SourceChunkId, SourceFingerprint, SummaryContract, SummaryPageFamily, SummaryPageKey,
-    SummaryRevision, SummarySemanticPage,
+    ExactJunctionSummaryTile, ExactModificationSummaryTile, ExactPairSummaryTile, ExactSummaryRoot,
+    FilteredRecordProvenance, GeometryLod, LayoutContract, PayloadContract, PayloadSidecar,
+    PresentationContract, ReferenceRevision, ReservationKind, RevisionFingerprint,
+    RowAtlasRevision, SceneRevision, SourceChunkId, SourceFingerprint, SummaryContract,
+    SummaryPageFamily, SummaryPageKey, SummaryRevision, SummarySemanticPage,
 };
 use rgv_core::{
     AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigId,
-    CoverageScaleTransform, GenomicInterval, OverlappingMatePolicy, ReadStackingMode,
+    CoverageScaleTransform, GenomicInterval, JunctionDisplayMode, ModifiedBaseColorMode,
+    OverlappingMatePolicy, ReadStackingMode, SashimiCountMode,
 };
 use rgv_hts::{
     AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
-    AlignmentSourcePosition, CigarOp, CigarOpKind, ReferenceSlice, SequenceData,
-    TemplateLengthBounds,
+    AlignmentSourcePosition, AuxField, AuxValue, CigarOp, CigarOpKind, ReferenceSlice,
+    SequenceData, TemplateLengthBounds,
 };
 use rgv_render::{
     AlignmentGpuBatchAdmission, AlignmentGpuFrame, AlignmentGpuPrepareStats, AlignmentGpuRenderer,
@@ -110,6 +113,8 @@ fn read_and_multi_lane_summary_replace_as_one_atomic_gpu_bundle() {
     let summary_requests = [
         summary_request(&scene, summary_camera, false),
         summary_request(&scene, summary_camera, true),
+        sashimi_request(&scene, summary_camera),
+        modification_request(&scene, summary_camera),
     ];
     let mut read_renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
     let mut summary_renderer =
@@ -130,14 +135,13 @@ fn read_and_multi_lane_summary_replace_as_one_atomic_gpu_bundle() {
     assert_eq!(first.retired_claims, 0);
     assert!(first.read_stats.geometry_uploaded_bytes > 0);
     assert!(first.summary_stats.geometry_uploaded_bytes > 0);
+    assert!(first.summary_stats.junction_instances > 0);
+    assert!(first.summary_stats.modification_instances > 0);
     assert!(first.read_admission.admitted_pages > 0);
     assert!(first.summary_admission.admitted_pages > 0);
     assert_eq!(first.reads.camera_sequences.as_ref(), [CAMERA_EPOCH]);
-    assert_eq!(
-        first.summaries.camera_sequences.as_ref(),
-        [CAMERA_EPOCH, CAMERA_EPOCH]
-    );
-    assert_eq!(first.summaries.scene_revisions.len(), 2);
+    assert_eq!(first.summaries.camera_sequences.as_ref(), [CAMERA_EPOCH; 4]);
+    assert_eq!(first.summaries.scene_revisions.len(), 4);
 
     // Replace both renderers again from the identical camera and semantic authority. Only the
     // camera/frame presentation objects change; immutable page geometry must stay resident.
@@ -164,7 +168,7 @@ fn read_and_multi_lane_summary_replace_as_one_atomic_gpu_bundle() {
     assert_eq!(second.reads.camera_sequences.as_ref(), [CAMERA_EPOCH]);
     assert_eq!(
         second.summaries.camera_sequences.as_ref(),
-        [CAMERA_EPOCH, CAMERA_EPOCH]
+        [CAMERA_EPOCH; 4]
     );
 
     let steady = ledger.snapshot().unwrap();
@@ -327,6 +331,8 @@ fn summary_request<'a>(
 ) -> AlignmentSummaryGpuSceneRequest<'a> {
     AlignmentSummaryGpuSceneRequest {
         scene,
+        coherence_scope: 1,
+        lane_identity: 1,
         camera_sequence: CAMERA_EPOCH,
         camera,
         screen_size_points: [256.0, 224.0],
@@ -350,6 +356,66 @@ fn summary_request<'a>(
                 transform: CoverageScaleTransform::Linear,
                 interpretation: CoverageAlleleInterpretation::GenericReferenceAware,
             }),
+        }
+        .into(),
+        overlays: AlignmentSummaryFrameOverlays::default(),
+    }
+}
+
+fn sashimi_request(
+    scene: &Arc<AlignmentSceneSnapshot>,
+    camera: CpuSummaryCamera,
+) -> AlignmentSummaryGpuSceneRequest<'_> {
+    AlignmentSummaryGpuSceneRequest {
+        scene,
+        coherence_scope: 1,
+        lane_identity: 2,
+        camera_sequence: CAMERA_EPOCH,
+        camera,
+        screen_size_points: [256.0, 224.0],
+        scissor: AlignmentGpuScissor {
+            x: 0,
+            y: 0,
+            width: 256,
+            height: 96,
+        },
+        options: AlignmentSashimiLaneOptions {
+            projection: CpuJunctionProjectionOptions {
+                minimum_depth: 1,
+                minimum_flank: 0,
+                display_mode: JunctionDisplayMode::Collapsed,
+                scale_maximum: None,
+                count_mode: SashimiCountMode::Raw,
+                show_labels: true,
+            },
+            scale: AlignmentSashimiScalePolicy::Automatic,
+        }
+        .into(),
+        overlays: AlignmentSummaryFrameOverlays::default(),
+    }
+}
+
+fn modification_request(
+    scene: &Arc<AlignmentSceneSnapshot>,
+    camera: CpuSummaryCamera,
+) -> AlignmentSummaryGpuSceneRequest<'_> {
+    AlignmentSummaryGpuSceneRequest {
+        scene,
+        coherence_scope: 1,
+        lane_identity: 3,
+        camera_sequence: CAMERA_EPOCH,
+        camera,
+        screen_size_points: [256.0, 224.0],
+        scissor: AlignmentGpuScissor {
+            x: 0,
+            y: 0,
+            width: 256,
+            height: 96,
+        },
+        options: AlignmentModificationLaneOptions {
+            projection: CpuModificationProjectionOptions::default(),
+            color_mode: ModifiedBaseColorMode::ByType,
+            selected_position: None,
         }
         .into(),
         overlays: AlignmentSummaryFrameOverlays::default(),
@@ -393,7 +459,16 @@ fn exact_authority(ledger: &AllocationLedger) -> (Arc<EvidenceRoot>, Arc<ExactSu
             bases: b"ACGTCACGTC".to_vec(),
             qualities: Some(vec![35; 10]),
         },
-        auxiliary_fields: Vec::new(),
+        auxiliary_fields: vec![
+            AuxField {
+                tag: *b"MM",
+                value: AuxValue::String("C+m,0;".to_owned()),
+            },
+            AuxField {
+                tag: *b"ML",
+                value: AuxValue::UnsignedArray(vec![220]),
+            },
+        ],
     };
     let mut decoded = AlignmentBatch::default();
     decoded
@@ -484,7 +559,7 @@ fn exact_authority(ledger: &AllocationLedger) -> (Arc<EvidenceRoot>, Arc<ExactSu
         minimum_base_quality: 0,
         minimum_junction_flank: 0,
         allele_detail: AlleleSummaryDetail::Counts,
-        collect_modifications: false,
+        collect_modifications: true,
     };
     let depth = ExactDepthSummaryTile::build(
         &evidence,
@@ -538,6 +613,16 @@ fn exact_authority(ledger: &AllocationLedger) -> (Arc<EvidenceRoot>, Arc<ExactSu
         3,
     )
     .unwrap();
+    let modifications = ExactModificationSummaryTile::build(
+        &evidence,
+        tile,
+        100,
+        contract.modifications().unwrap(),
+        ledger,
+        ReservationKind::Normal,
+        3,
+    )
+    .unwrap();
     let summaries = ExactSummaryRoot::build(
         SummaryRevision::new(RevisionFingerprint::new(8, 9)),
         evidence.revision(),
@@ -550,7 +635,7 @@ fn exact_authority(ledger: &AllocationLedger) -> (Arc<EvidenceRoot>, Arc<ExactSu
         vec![junctions],
         vec![pairs],
         vec![filters],
-        Vec::new(),
+        vec![modifications],
         ledger,
         ReservationKind::Normal,
         4,
@@ -640,6 +725,7 @@ fn test_snapshot(ledger: &AllocationLedger) -> Arc<AlignmentSceneSnapshot> {
         SummaryPageFamily::Depth,
         SummaryPageFamily::Alleles,
         SummaryPageFamily::Junctions,
+        SummaryPageFamily::Modifications,
         SummaryPageFamily::Pairs,
         SummaryPageFamily::FilterProvenance,
     ]

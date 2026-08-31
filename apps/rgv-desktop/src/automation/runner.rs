@@ -33,21 +33,20 @@ const MAXIMUM_AUTOMATION_NAVIGATION_SAMPLES: usize = 1_024;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AutomationNavigationState {
-    pub(crate) source_queries: u64,
-    pub(crate) foreground_source_queries: u64,
-    pub(crate) speculative_source_queries: u64,
-    pub(crate) cache_outcome: String,
-    pub(crate) row_scene_hit: bool,
-    pub(crate) row_scene_physical_hit: bool,
-    pub(crate) row_scene_projection_micros: u64,
+    pub(crate) source_acquisitions: u64,
+    pub(crate) foreground_submissions: u64,
+    pub(crate) speculation_submissions: u64,
+    pub(crate) scene_phase: String,
+    pub(crate) camera_only_updates: u64,
+    pub(crate) scene_publications: u64,
 }
 
 struct PendingAutomationNavigation {
     panel_id: PanelId,
     interval: GenomicInterval,
     started: Instant,
-    source_queries_before: u64,
-    speculative_source_queries_before: u64,
+    source_acquisitions_before: u64,
+    speculation_submissions_before: u64,
     first_presented_frame_ms: Option<f64>,
     presented_frames: u64,
     maximum_frame_ms: Option<f64>,
@@ -259,8 +258,8 @@ impl AutomationRunner {
             panel_id,
             interval,
             started: now,
-            source_queries_before: state.source_queries,
-            speculative_source_queries_before: state.speculative_source_queries,
+            source_acquisitions_before: state.source_acquisitions,
+            speculation_submissions_before: state.speculation_submissions,
             first_presented_frame_ms: None,
             presented_frames: 0,
             maximum_frame_ms: None,
@@ -433,17 +432,16 @@ impl PendingAutomationNavigation {
                 .then(|| now.saturating_duration_since(self.started).as_secs_f64() * 1_000.0),
             presented_frames: self.presented_frames,
             maximum_frame_ms: self.maximum_frame_ms,
-            cache_outcome: state.cache_outcome.clone(),
-            foreground_source_queries: state.foreground_source_queries,
-            speculative_source_queries: state
-                .speculative_source_queries
-                .saturating_sub(self.speculative_source_queries_before),
-            total_source_queries: state
-                .source_queries
-                .saturating_sub(self.source_queries_before),
-            row_scene_hit: state.row_scene_hit,
-            row_scene_physical_hit: state.row_scene_physical_hit,
-            row_scene_projection_micros: state.row_scene_projection_micros,
+            scene_phase: state.scene_phase.clone(),
+            foreground_submissions: state.foreground_submissions,
+            speculation_submissions: state
+                .speculation_submissions
+                .saturating_sub(self.speculation_submissions_before),
+            source_acquisitions: state
+                .source_acquisitions
+                .saturating_sub(self.source_acquisitions_before),
+            camera_only_updates: state.camera_only_updates,
+            scene_publications: state.scene_publications,
             gpu_uploaded_bytes: self.gpu_uploaded_bytes,
             gpu_buffer_reallocations: self.gpu_buffer_reallocations,
             gpu_slab_cache_hits: self.gpu_slab_cache_hits,

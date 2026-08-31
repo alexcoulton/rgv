@@ -1,13 +1,11 @@
 pub(crate) mod alignment;
 pub(crate) mod auxiliary;
 pub(crate) mod hit_test;
-pub(crate) mod navigation_preview;
 
 use super::*;
 
 pub(super) const COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT: f32 = 20.0;
 pub(super) const READ_PANE_HEADER_HEIGHT: f32 = ui::TRACK_HEADER_HEIGHT;
-pub(super) const PINNED_ALIGNMENT_REFERENCE_HEIGHT: f32 = 28.0;
 pub(super) const PINNED_ALIGNMENT_COVERAGE_HEIGHT: f32 = 48.0;
 pub(super) const PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT: f32 = 52.0;
 pub(super) const PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT: f32 = 120.0;
@@ -82,9 +80,9 @@ pub(crate) fn alignment_scene_read_extent(
 
 pub(crate) fn resolve_read_panel_overview(
     authoritative: Option<&ui::ScrollbarOverview>,
-    legacy: impl FnOnce() -> ui::ScrollbarOverview,
+    provisional: impl FnOnce() -> ui::ScrollbarOverview,
 ) -> ui::ScrollbarOverview {
-    authoritative.cloned().unwrap_or_else(legacy)
+    authoritative.cloned().unwrap_or_else(provisional)
 }
 
 /// Reconciles one vertical read camera only when the current display cache has settled row
@@ -345,106 +343,6 @@ fn translate_track_frame(frame: &mut TrackFrame, delta: f32) {
     }
 }
 
-pub(crate) fn tag_layout_junction_arcs(
-    rectangles: &mut [RectPrimitive],
-    layout: &AlignmentLayout,
-    track_id: TrackId,
-    next_token: &mut u32,
-    keys: &mut BTreeMap<u32, JunctionArcKey>,
-) {
-    for target in &layout.junction_arc_targets {
-        let index = target.draw_order as usize;
-        let Some(rectangle) = rectangles.get_mut(index) else {
-            continue;
-        };
-        debug_assert_eq!(rectangle.shape, target.primitive.shape);
-        debug_assert_eq!(rectangle.x, target.primitive.x);
-        debug_assert_eq!(rectangle.y, target.primitive.y);
-        let token = *next_token;
-        if token == 0 {
-            continue;
-        }
-        *next_token = next_token.saturating_add(1);
-        rectangle.object_id = token;
-        keys.insert(
-            token,
-            JunctionArcKey {
-                track_id,
-                start: target.start,
-                end: target.end,
-                component: target.component,
-            },
-        );
-    }
-}
-
-fn sashimi_interaction_color(base: Rgba, accent_weight: f32) -> Rgba {
-    let weight = accent_weight.clamp(0.0, 1.0);
-    let accent = Rgba::new(0.16, 0.42, 0.92, 1.0);
-    Rgba::new(
-        base.red + (accent.red - base.red) * weight,
-        base.green + (accent.green - base.green) * weight,
-        base.blue + (accent.blue - base.blue) * weight,
-        1.0,
-    )
-}
-
-pub(crate) fn append_sashimi_interaction_overlays(
-    display: &mut DisplayList,
-    targets: &[ComposedJunctionArcTarget],
-    hovered: Option<JunctionArcHover>,
-    selected_track: Option<TrackId>,
-    selected_junction: Option<(u64, u64)>,
-    selected_component: Option<JunctionArcComponent>,
-) {
-    for target in targets {
-        let selected = selected_track == Some(target.key.track_id)
-            && selected_junction == Some((target.key.start, target.key.end))
-            && selected_component.is_none_or(|component| component == target.key.component);
-        let hovered = hovered.is_some_and(|hover| {
-            hover.content_revision == target.content_revision && hover.key == target.key
-        });
-        if !selected && !hovered {
-            continue;
-        }
-        let mut overlay = target.primitive;
-        overlay.object_id = 0;
-        if selected {
-            overlay.shape = overlay.shape.as_junction_arc_selected();
-            overlay.color =
-                sashimi_interaction_color(overlay.color, if hovered { 0.42 } else { 0.30 });
-        } else {
-            overlay.shape = overlay.shape.as_junction_arc_hover();
-            overlay.color = sashimi_interaction_color(overlay.color, 0.18);
-        }
-        display.rectangles.push(overlay);
-    }
-}
-
-/// Advances semantic Sashimi targets alongside the settled surface they
-/// describe. A preview-texture capture creates a new presentation revision
-/// without changing the already composed arc geometry, so rebuilding layout
-/// here would be both unnecessary and liable to introduce frame churn.
-pub(crate) fn synchronize_junction_interaction_revision(
-    targets: &mut [ComposedJunctionArcTarget],
-    hovered: &mut Option<JunctionArcHover>,
-    content_revision: u64,
-) {
-    for target in targets.iter_mut() {
-        target.content_revision = content_revision;
-    }
-    *hovered = hovered.and_then(|hover| {
-        targets
-            .iter()
-            .find(|target| target.key == hover.key)
-            .map(|target| JunctionArcHover {
-                interaction_token: target.interaction_token,
-                content_revision,
-                ..hover
-            })
-    });
-}
-
 /// Reconciles renderer output with the canonical annotation tree. Renderers
 /// are allowed to omit data content while a source opens, is unavailable at
 /// the locus, or changes implementation; they are not allowed to erase that
@@ -668,440 +566,7 @@ pub(crate) fn pane_layout_snapshot(
     snapshot
 }
 
-/// An initial source-backed scene needs pane geometry before it can request data. Once geometry
-/// exists, the ordinary navigation transaction remains authoritative and blocks premature display
-/// rebuilds until it reaches its commit phase.
-pub(crate) const fn panel_display_rebuild_allowed(
-    phase: NavigationPresentationPhase,
-    has_existing_layout: bool,
-) -> bool {
-    !has_existing_layout
-        || matches!(
-            phase,
-            NavigationPresentationPhase::Committing | NavigationPresentationPhase::Settled
-        )
-}
-
 impl Viewer {
-    /// Legacy query-local row authority retained only as a deletion oracle. Unified local BAM
-    /// production code consumes the immutable scene row atlas and cannot compile this path.
-    #[cfg(any())]
-    pub(crate) fn ensure_alignment_rows(&mut self) -> bool {
-        let track_ids = self
-            .alignment_tracks
-            .iter()
-            .map(|track| track.config.id)
-            .collect::<Vec<_>>();
-        let mut all_ready = true;
-        for track_id in track_ids {
-            all_ready &= self.ensure_alignment_rows_for_track(track_id);
-        }
-        all_ready
-    }
-
-    #[cfg(any())]
-    fn ensure_alignment_rows_for_track(&mut self, track_id: TrackId) -> bool {
-        let panel_id = self.panels.active().id;
-        let viewport = self.panels.active().viewport;
-        let navigation_intervals = self
-            .panels
-            .active()
-            .navigation_history
-            .entries()
-            .copied()
-            .collect::<Vec<_>>();
-        let Some(track_index) = self
-            .alignment_tracks
-            .iter()
-            .position(|track| track.config.id == track_id)
-        else {
-            return true;
-        };
-        if self.alignment_tracks[track_index]
-            .config
-            .filters
-            .alignment_sort_mode
-            == AlignmentSortMode::Base
-            && self.alignment_tracks[track_index]
-                .config
-                .filters
-                .alignment_sort_anchor
-                .is_none()
-        {
-            self.alignment_tracks[track_index]
-                .config
-                .filters
-                .alignment_sort_anchor =
-                alignment_sort_position(AlignmentSortMode::Base, None, viewport);
-        }
-        let filters = self.alignment_tracks[track_index].config.filters.clone();
-        // Row geometry is part of an atomic navigation target. It must be
-        // prepared while the retained drag preview is still visible, before
-        // the presentation enters its live Committing frame. The ordinary
-        // `alignment_query_for_track` accessor deliberately hides query-local
-        // data during Preview, so use the current projection directly here.
-        let Some(query) = self
-            .alignment_tracks
-            .get(track_index)
-            .and_then(|track| track.projection(panel_id))
-            .filter(|projection| projection.query_is_current())
-            .and_then(|projection| projection.current_query.as_ref())
-            .cloned()
-        else {
-            return true;
-        };
-        let layout_query = self.alignment_tracks[track_index]
-            .projection(panel_id)
-            .and_then(|projection| projection.layout_query.clone())
-            .unwrap_or_else(|| Arc::clone(&query));
-        let read_refusal =
-            alignment::individual_read_refusal(&query, &layout_query, filters.read_stacking_mode);
-        // Complete-read capacity is a policy, not a property of the current
-        // horizon population. Keeping it stable lets a row scene extend when
-        // new edge slabs arrive instead of appearing policy-incompatible.
-        let max_rows = self.alignment_tracks[track_index]
-            .config
-            .maximum_alignments
-            .max(1);
-        let observed_pair_length_bounds =
-            effective_template_length_bounds_for_filters(&filters, &layout_query);
-        let pair_length_bounds = self
-            .alignment_tracks
-            .get_mut(track_index)
-            .map(|track| {
-                let projection = track.projection_mut(panel_id);
-                projection
-                    .row_history
-                    .pin_navigation_intervals(&navigation_intervals);
-                projection.row_policy_pair_bounds(&filters, observed_pair_length_bounds)
-            })
-            .unwrap_or(observed_pair_length_bounds);
-        let sort_position = alignment_sort_position(
-            filters.alignment_sort_mode,
-            filters.alignment_sort_anchor,
-            viewport,
-        );
-        let promoted_read_name_hash = self
-            .promoted_read
-            .filter(|(promoted_track_id, _)| *promoted_track_id == track_id)
-            .map(|(_, hash)| hash);
-        let row_scale_class = alignment::alignment_row_scale_class(viewport.bases_per_pixel());
-        let pair_bounds_relevant = alignment_row_pair_bounds_relevant(
-            filters.alignment_group_mode,
-            filters.alignment_sort_mode,
-        );
-        let rows_match = self
-            .alignment_tracks
-            .get(track_index)
-            .and_then(|track| track.projection(panel_id))
-            .and_then(|projection| projection.alignment_rows.as_ref())
-            .is_some_and(|cached| {
-                Arc::ptr_eq(&cached.query, &query)
-                    && Arc::ptr_eq(&cached.layout_query, &layout_query)
-                    && cached.group_mode == filters.alignment_group_mode
-                    && cached.group_order == filters.alignment_group_order
-                    && cached.sort_mode == filters.alignment_sort_mode
-                    && cached.sort_order == filters.alignment_sort_order
-                    && cached.sort_position == sort_position
-                    && cached.promoted_read_name_hash == promoted_read_name_hash
-                    && cached.max_rows == max_rows
-                    && cached.row_scale_class == row_scale_class
-                    && cached.view_as_pairs == filters.view_as_pairs
-                    && cached.stacking_mode == filters.read_stacking_mode
-                    && (!pair_bounds_relevant || cached.pair_length_bounds == pair_length_bounds)
-            });
-        let pending_repack = self
-            .alignment_tracks
-            .get(track_index)
-            .and_then(|track| track.projection(panel_id))
-            .is_some_and(|projection| projection.pending_row_repack);
-        if rows_match && !pending_repack {
-            return true;
-        }
-        let options = AlignmentLayoutOptions {
-            group_mode: filters.alignment_group_mode,
-            group_order: filters.alignment_group_order,
-            sort_mode: filters.alignment_sort_mode,
-            sort_order: filters.alignment_sort_order,
-            sort_position,
-            promoted_read_name_hash,
-            max_rows,
-            row_scale_class,
-            view_as_pairs: filters.view_as_pairs,
-            pair_length_bounds,
-            ..AlignmentLayoutOptions::default()
-        };
-        let repack = pending_repack && filters.read_stacking_mode == ReadStackingMode::Stable;
-        if !repack && filters.read_stacking_mode == ReadStackingMode::Stable {
-            let cached_rows = self.alignment_tracks[track_index]
-                .projection(panel_id)
-                .and_then(|projection| {
-                    projection.row_layout_cache.iter().rev().find(|cached| {
-                        Arc::ptr_eq(&cached.query, &query)
-                            && cached.layout_query.interval == layout_query.interval
-                            && cached.group_mode == filters.alignment_group_mode
-                            && cached.group_order == filters.alignment_group_order
-                            && cached.sort_mode == filters.alignment_sort_mode
-                            && cached.sort_order == filters.alignment_sort_order
-                            && cached.sort_position == sort_position
-                            && cached.promoted_read_name_hash == promoted_read_name_hash
-                            && cached.max_rows == max_rows
-                            && cached.row_scale_class == row_scale_class
-                            && cached.view_as_pairs == filters.view_as_pairs
-                            && (!pair_bounds_relevant
-                                || cached.pair_length_bounds == pair_length_bounds)
-                    })
-                })
-                .cloned();
-            if let Some(mut cached) = cached_rows {
-                cached.layout_query = Arc::clone(&layout_query);
-                cached.reconciliation.exact_camera_hit = true;
-                cached.reconciliation.transition_reason = ReadStackingTransitionReason::Navigation;
-                let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
-                projection.row_layout_request_revision =
-                    projection.row_layout_request_revision.saturating_add(1);
-                projection.row_layout_clock.advance();
-                projection.commit_alignment_rows(cached);
-                projection.cached_layout = None;
-                return true;
-            }
-        }
-        if !repack && filters.read_stacking_mode == ReadStackingMode::Stable {
-            let scenes = self.alignment_tracks[track_index]
-                .projection(panel_id)
-                .map(|projection| projection.row_scenes.clone())
-                .unwrap_or_default();
-            let layout_interval = layout_query.interval;
-            let started = Instant::now();
-            let mut extended_scene = None;
-            let scene_projection = scenes
-                .iter()
-                .rev()
-                .find_map(|scene| {
-                    let scene_interval = scene.interval();
-                    if scene_interval.contig() != layout_interval.contig()
-                        || scene_interval.start() > layout_interval.start()
-                        || scene_interval.end() < layout_interval.end()
-                    {
-                        return None;
-                    }
-                    scene
-                        .project_physical(&query, &options)
-                        .map(|layout| (layout, rgv_layout::AlignmentRowSceneProjection::Physical))
-                })
-                .or_else(|| {
-                    scenes.iter().rev().find_map(|scene| {
-                        let scene_interval = scene.interval();
-                        (scene_interval.contig() == layout_interval.contig()
-                            && scene_interval.start() <= layout_interval.start()
-                            && scene_interval.end() >= layout_interval.end())
-                        .then(|| scene.project_with_outcome(&query, &options))
-                        .flatten()
-                    })
-                })
-                .or_else(|| {
-                    scenes.iter().rev().find_map(|scene| {
-                        let scene_interval = scene.interval();
-                        if scene_interval.contig() != layout_interval.contig()
-                            || layout_interval.start() > scene_interval.start()
-                            || layout_interval.end() < scene_interval.end()
-                        {
-                            return None;
-                        }
-                        let extended = scene.extend_edges(&layout_query, &options)?;
-                        let layout = extended.project(&query, &options)?;
-                        extended_scene = Some(Arc::new(extended));
-                        Some((
-                            layout,
-                            rgv_layout::AlignmentRowSceneProjection::EdgeExtension,
-                        ))
-                    })
-                });
-            if let Some((layout, scene_outcome)) = scene_projection {
-                let scene_projection_micros =
-                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
-                if let Some(scene) = extended_scene {
-                    projection.admit_row_scene(scene);
-                }
-                projection.row_layout_request_revision =
-                    projection.row_layout_request_revision.saturating_add(1);
-                projection.row_layout_clock.advance();
-                let (stable_rows, occupied_rows, occupied_span) =
-                    layout.indexed_row_metrics().unwrap_or_else(|| {
-                        let stable_rows = layout.used_row_count();
-                        (stable_rows, stable_rows, stable_rows)
-                    });
-                let empty_rows = occupied_span.saturating_sub(occupied_rows);
-                let empty_ratio_ppm = if occupied_span == 0 {
-                    0
-                } else {
-                    u32::try_from(empty_rows.saturating_mul(1_000_000) / occupied_span)
-                        .unwrap_or(u32::MAX)
-                };
-                let reconciliation = AlignmentRowReconciliationStats {
-                    revision: projection.row_history.revision(),
-                    architecture_version: rgv_layout::ALIGNMENT_ROW_ARCHITECTURE_VERSION,
-                    reconciliation_micros: scene_projection_micros,
-                    scene_projection_micros,
-                    scene_hit: true,
-                    scene_physical_hit: scene_outcome
-                        != rgv_layout::AlignmentRowSceneProjection::StableIdentity,
-                    scene_extended: scene_outcome
-                        == rgv_layout::AlignmentRowSceneProjection::EdgeExtension,
-                    transition_reason: if scene_outcome
-                        == rgv_layout::AlignmentRowSceneProjection::EdgeExtension
-                    {
-                        ReadStackingTransitionReason::HorizonExtension
-                    } else {
-                        ReadStackingTransitionReason::Navigation
-                    },
-                    policy_fingerprint: alignment_row_policy_fingerprint(&options),
-                    projection_fingerprint: layout.assignment_fingerprint(),
-                    stable_rows,
-                    canonical_rows: stable_rows,
-                    query_occupied_row_span: occupied_span,
-                    query_empty_rows: empty_rows,
-                    query_empty_ratio_ppm: empty_ratio_ppm,
-                    horizon_start: layout_query.interval.start(),
-                    horizon_end: layout_query.interval.end(),
-                    horizon_records: layout_query.batch.len(),
-                    horizon_bytes: layout_query.estimated_bytes(),
-                    horizon_truncated: !layout_query.individual_reads_complete(),
-                    history_bytes: projection.row_history.estimated_bytes(),
-                    contexts: projection.row_history.context_count(),
-                    islands: projection.row_history.island_count(),
-                    assignments: projection.row_history.assignment_count(),
-                    ..AlignmentRowReconciliationStats::default()
-                };
-                projection.commit_alignment_rows(CachedAlignmentRows {
-                    query,
-                    layout_query,
-                    layout: Arc::new(layout),
-                    group_mode: filters.alignment_group_mode,
-                    group_order: filters.alignment_group_order,
-                    sort_mode: filters.alignment_sort_mode,
-                    sort_order: filters.alignment_sort_order,
-                    sort_position,
-                    promoted_read_name_hash,
-                    max_rows,
-                    row_scale_class,
-                    view_as_pairs: filters.view_as_pairs,
-                    pair_length_bounds,
-                    stacking_mode: filters.read_stacking_mode,
-                    reconciliation,
-                });
-                projection.cached_layout = None;
-                return true;
-            }
-        }
-        let key = AlignmentRowLayoutTaskKey {
-            query_identity: Arc::as_ptr(&query) as usize,
-            layout_query_identity: Arc::as_ptr(&layout_query) as usize,
-            group_mode: options.group_mode,
-            group_order: options.group_order,
-            sort_mode: options.sort_mode,
-            sort_order: options.sort_order,
-            sort_position: options.sort_position,
-            promoted_read_name_hash: options.promoted_read_name_hash,
-            max_rows: options.max_rows,
-            row_scale_class: options.row_scale_class,
-            view_as_pairs: options.view_as_pairs,
-            pair_length_bounds: options.pair_length_bounds,
-            stacking_mode: filters.read_stacking_mode,
-            repack,
-        };
-        if self
-            .alignment_row_layout_tasks
-            .iter()
-            .any(|task| task.panel_id == panel_id && task.track_id == track_id && task.key == key)
-        {
-            return false;
-        }
-        let Some((request_revision, history, cancellation_clock, cancellation_generation)) =
-            self.alignment_tracks.get_mut(track_index).map(|track| {
-                let projection = track.projection_mut(panel_id);
-                projection.row_layout_request_revision =
-                    projection.row_layout_request_revision.saturating_add(1);
-                let cancellation_generation = projection.row_layout_clock.advance();
-                (
-                    projection.row_layout_request_revision,
-                    projection.row_history.clone(),
-                    projection.row_layout_clock.clone(),
-                    cancellation_generation,
-                )
-            })
-        else {
-            return true;
-        };
-        match self.start_alignment_row_layout_task(
-            panel_id,
-            track_id,
-            request_revision,
-            key,
-            Arc::clone(&query),
-            Arc::clone(&layout_query),
-            options,
-            filters.read_stacking_mode,
-            repack,
-            read_refusal.is_some(),
-            history,
-            cancellation_clock,
-            cancellation_generation,
-        ) {
-            AlignmentRowLayoutSubmit::Submitted => return false,
-            AlignmentRowLayoutSubmit::QueueFull => {
-                self.data_status = "Read layout queued behind active work…".to_owned();
-                return false;
-            }
-            AlignmentRowLayoutSubmit::Disconnected => {}
-        }
-
-        // Pool disconnection is exceptional. Keep the view usable with a
-        // synchronous fallback while preserving the same transactional key.
-        if let Some(track) = self.alignment_tracks.get_mut(track_index) {
-            let projection = track.projection_mut(panel_id);
-            let (layout, reconciliation) = if read_refusal.is_some() {
-                (
-                    assign_alignment_rows(&query, options, None),
-                    AlignmentRowReconciliationStats::default(),
-                )
-            } else {
-                reconcile_alignment_rows_with_horizon(
-                    &query,
-                    &layout_query,
-                    options,
-                    &mut projection.row_history,
-                    filters.read_stacking_mode,
-                    repack,
-                )
-            };
-            if repack {
-                projection.pending_row_repack = false;
-                projection.row_layout_cache.clear();
-            }
-            projection.commit_alignment_rows(CachedAlignmentRows {
-                query,
-                layout_query,
-                layout: Arc::new(layout),
-                group_mode: filters.alignment_group_mode,
-                group_order: filters.alignment_group_order,
-                sort_mode: filters.alignment_sort_mode,
-                sort_order: filters.alignment_sort_order,
-                sort_position,
-                promoted_read_name_hash,
-                max_rows,
-                row_scale_class,
-                view_as_pairs: filters.view_as_pairs,
-                pair_length_bounds,
-                stacking_mode: filters.read_stacking_mode,
-                reconciliation,
-            });
-        }
-        self.layout_cache.clear();
-        true
-    }
-
     pub(crate) fn rebuild_genomic_display(&mut self) {
         let annotation_auto_fit = self.track_presentation.annotation_pane_auto_fit;
         let annotation_content_height = annotation_auto_fit
@@ -1120,8 +585,6 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     fn rebuild_genomic_display_pass(&mut self, annotation_content_height: Option<f32>) -> f32 {
-        let shared_sashimi_raw = self.shared_sashimi_maximum(SashimiCountMode::Raw);
-        let shared_sashimi_cpm = self.shared_sashimi_maximum(SashimiCountMode::CountsPerMillion);
         let primary_alignment_id = self.primary_alignment_track_id();
         let primary_alignment_name = self.alignment_track_name();
         let primary_source_label = self
@@ -1129,8 +592,11 @@ impl Viewer {
             .map(TrackSource::redacted_label);
         let mut annotation_display = DisplayList::default();
         let mut pinned_display = DisplayList::default();
-        let mut junction_arc_keys = BTreeMap::new();
-        let mut next_junction_arc_token = 1_u32;
+        let mut context_lane_drafts = Vec::<ContextLaneDraft>::new();
+        let mut visible_context_lanes =
+            BTreeMap::<ContextLaneKey, (TrackFrameKey, Option<GenomicInterval>)>::new();
+        let mut pending_context_lanes = BTreeSet::<ContextLaneKey>::new();
+        let mut unavailable_context_lanes = BTreeSet::<ContextLaneKey>::new();
         let geometry = self.canvas_geometry();
         let annotation_section_expanded = self.track_presentation.annotation_section_expanded;
         let read_section_expanded = self.track_presentation.read_section_expanded;
@@ -1189,21 +655,11 @@ impl Viewer {
             .track_presentation
             .pane_track_state(ui::TrackPane::Annotation, primary_alignment_id)
             .is_some_and(|node| node.content_visible);
-        let primary_read_desired = self
-            .track_presentation
-            .pane_track_state(ui::TrackPane::Reads, primary_alignment_id)
-            .is_some_and(|node| node.content_visible);
         let primary_annotation_effective = annotation_section_expanded
             && primary_source_available
             && self
                 .track_presentation
                 .track_content_exposed(ui::TrackPane::Annotation, primary_alignment_id)
-                .unwrap_or(false);
-        let primary_read_effective = read_section_expanded
-            && primary_source_available
-            && self
-                .track_presentation
-                .track_content_exposed(ui::TrackPane::Reads, primary_alignment_id)
                 .unwrap_or(false);
         let previous_read_heights = self
             .panels
@@ -1260,19 +716,6 @@ impl Viewer {
                 }
             }
         }
-        let read_panel_densities = self
-            .alignment_tracks
-            .iter()
-            .map(|track| {
-                (
-                    track.config.id,
-                    self.alignment_density_for_panel_track(
-                        self.panels.active().id,
-                        track.config.id,
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
         let read_pane_layout =
             alignment::read_pane_layout(&read_panel_specs, read_clip_top, scroll_clip_bottom);
         let read_stack_maximum = (read_pane_layout.content_bottom - scroll_clip_bottom).max(0.0);
@@ -1328,17 +771,14 @@ impl Viewer {
             });
         }
         let viewport_interval = self.panels.active().viewport.interval();
-        let junction_annotations = junction_annotation_context(
-            &self.tracks,
-            &self.panels.active().track_snapshots,
-            self.panels.active().track_snapshot_interval,
-            viewport_interval,
+        let target_viewport = self.panels.active().viewport;
+        let generation = self.panels.active().generation_clock.current().get();
+        let desired_context_interval = buffered_context_interval(
+            target_viewport,
+            self.panels.active().contig_length,
+            self.settings.read_browsing_buffer_percent,
+            None,
         );
-        let tracks_overlap_viewport = self
-            .panels
-            .active()
-            .track_snapshot_interval
-            .is_some_and(|loaded| retained_data_overlaps(loaded, viewport_interval));
         let effective_auxiliary_configs = self.effective_auxiliary_presentation_configs();
         let supports_fast_scroll = !effective_auxiliary_configs.iter().any(|track| {
             track.visible
@@ -1364,6 +804,26 @@ impl Viewer {
             } else {
                 frame_top + 26.0
             };
+            let reference_context_interval = buffered_context_interval(
+                target_viewport,
+                self.panels.active().contig_length,
+                self.settings.read_browsing_buffer_percent,
+                Some(MAX_REFERENCE_QUERY_BASES),
+            );
+            if reference_expanded {
+                visible_context_lanes.insert(
+                    ContextLaneKey::Reference,
+                    (TrackFrameKey::Reference, Some(reference_context_interval)),
+                );
+                if self.panels.active().pending_queries.reference
+                    || self.panels.active().reference_settled_generation != Some(generation)
+                {
+                    pending_context_lanes.insert(ContextLaneKey::Reference);
+                }
+                if self.panels.active().reference_query_error_generation == Some(generation) {
+                    unavailable_context_lanes.insert(ContextLaneKey::Reference);
+                }
+            }
             if reference_expanded
                 && let Some(reference) = self
                     .panels
@@ -1375,16 +835,15 @@ impl Viewer {
                     })
                     .filter(|slice| retained_data_overlaps(slice.interval, viewport_interval))
             {
+                let source_viewport =
+                    prepared_context_viewport(reference.interval, target_viewport);
                 let reference_display = layout_reference_slice_oriented(
                     reference,
-                    self.panels.active().viewport,
+                    source_viewport,
                     sequence_top,
                     self.reference_reverse_complement,
                 );
-                pinned_display
-                    .rectangles
-                    .extend(reference_display.rectangles);
-                pinned_display.texts.extend(reference_display.texts);
+                let mut lane_display = reference_display;
                 for (index, frame) in self
                     .reference_translation_frames
                     .iter()
@@ -1393,14 +852,26 @@ impl Viewer {
                 {
                     let translation = layout_reference_translation(
                         reference,
-                        self.panels.active().viewport,
+                        source_viewport,
                         translation_top + index as f32 * 20.0,
                         frame,
                         self.reference_genetic_code,
                     );
-                    pinned_display.rectangles.extend(translation.rectangles);
-                    pinned_display.texts.extend(translation.texts);
+                    lane_display.rectangles.extend(translation.rectangles);
+                    lane_display.texts.extend(translation.texts);
                 }
+                context_lane_drafts.push(ContextLaneDraft {
+                    key: ContextLaneKey::Reference,
+                    generation: self
+                        .panels
+                        .active()
+                        .reference_slice_generation
+                        .expect("every installed reference slice carries its source generation"),
+                    source_viewport,
+                    frame_key: TrackFrameKey::Reference,
+                    frame_top,
+                    display: lane_display,
+                });
             }
             let mut subtracks = Vec::new();
             if reference_expanded {
@@ -1475,8 +946,38 @@ impl Viewer {
             // context must not move the scroll clip boundary underneath it.
             let height = pinned_gene_track_height(&config);
             let bottom = frame_top + height;
+            if !config.collapsed {
+                let key = ContextLaneKey::Auxiliary(config.id);
+                visible_context_lanes.insert(
+                    key,
+                    (
+                        TrackFrameKey::Auxiliary(config.id),
+                        Some(desired_context_interval),
+                    ),
+                );
+                if self.panels.active().pending_queries.tracks
+                    || self.panels.active().track_settled_generation != Some(generation)
+                {
+                    pending_context_lanes.insert(key);
+                }
+                if self
+                    .panels
+                    .active()
+                    .track_query_error_generations
+                    .get(&config.id)
+                    == Some(&generation)
+                {
+                    unavailable_context_lanes.insert(key);
+                }
+            }
             if !config.collapsed
-                && tracks_overlap_viewport
+                && let Some(loaded_interval) = self
+                    .panels
+                    .active()
+                    .track_snapshot_intervals
+                    .get(&config.id)
+                    .copied()
+                    .filter(|loaded| retained_data_overlaps(*loaded, viewport_interval))
                 && let Some(TrackSnapshot {
                     data: TrackSnapshotData::Features(records),
                     ..
@@ -1487,6 +988,7 @@ impl Viewer {
                     .iter()
                     .find(|snapshot| snapshot.id == config.id)
             {
+                let source_viewport = prepared_context_viewport(loaded_interval, target_viewport);
                 let options = TrackLayoutOptions {
                     top: frame_top,
                     height,
@@ -1508,13 +1010,27 @@ impl Viewer {
                 let label_widths = measured_feature_label_widths(&self.egui_context, records);
                 let gene_display = layout_features_with_label_widths(
                     records,
-                    self.panels.active().viewport,
+                    source_viewport,
                     options,
                     Some(&label_widths),
                 )
                 .0;
-                pinned_display.rectangles.extend(gene_display.rectangles);
-                pinned_display.texts.extend(gene_display.texts);
+                context_lane_drafts.push(ContextLaneDraft {
+                    key: ContextLaneKey::Auxiliary(config.id),
+                    generation: self
+                        .panels
+                        .active()
+                        .track_snapshot_generations
+                        .get(&config.id)
+                        .copied()
+                        .expect(
+                            "every installed contextual snapshot carries its source generation",
+                        ),
+                    source_viewport,
+                    frame_key: TrackFrameKey::Auxiliary(config.id),
+                    frame_top,
+                    display: gene_display,
+                });
             }
             self.panels.active_mut().track_frames.push(TrackFrame {
                 key: TrackFrameKey::Auxiliary(config.id),
@@ -1560,686 +1076,11 @@ impl Viewer {
                 collapsed_annotation_group_members.contains(&primary_alignment_id)
             );
         }
-        if self.panels.active().viewport.detail_level() != DetailLevel::Overview
-            && primary_source_available
-            && (primary_annotation_effective || primary_read_effective)
-            && self
-                .alignment_tracks
-                .first()
-                .is_some_and(|track| track.scene_engine.is_none())
-            && let Some(query) = self
-                .alignment_query_for_track(primary_alignment_id)
-                .cloned()
-                .filter(|query| retained_data_overlaps(query.interval, viewport_interval))
-        {
-            let layout_query = self
-                .alignment_tracks
-                .first()
-                .and_then(|track| track.projection(self.panels.active().id))
-                .and_then(|projection| projection.layout_query.clone())
-                .unwrap_or_else(|| Arc::clone(&query));
-            let mut options = AlignmentLayoutOptions::default();
-            let density = read_panel_densities
-                .get(&primary_alignment_id)
-                .copied()
-                .unwrap_or(self.primary_alignment_filters().alignment_density);
-            let annotation_lane_heights =
-                alignment_annotation_lane_heights(self.primary_alignment_filters());
-            let modification_frequency_supported =
-                self.panels.active().viewport.detail_level() != DetailLevel::Overview;
-            let show_modification_frequency =
-                self.primary_alignment_filters().show_modification_frequency
-                    && modification_frequency_supported;
-            let junctions_available = !query.junctions.junctions.is_empty();
-            let show_junctions =
-                self.primary_alignment_filters().show_junctions && junctions_available;
-            let embedded_reference_supported = self.reference_engine.is_none();
-            let embedded_reference =
-                self.primary_alignment_filters().show_reference && embedded_reference_supported;
-            let reference_height = PINNED_ALIGNMENT_REFERENCE_HEIGHT;
-            let frame_top = top;
-            let annotation_group_collapsed =
-                collapsed_annotation_group_members.contains(&primary_alignment_id);
-            let read_group_collapsed = !read_section_expanded
-                || collapsed_read_group_members.contains(&primary_alignment_id);
-            let primary_read_bounds = alignment::read_panel_bounds_for_track(
-                &read_panel_bounds,
-                primary_alignment_id,
-                scroll_clip_bottom,
-                read_group_collapsed,
-            )
-            .unwrap_or(alignment::ReadPanelBounds {
-                key: alignment::ReadPanelKey::Track(primary_alignment_id),
-                top: read_clip_top,
-                bottom: scroll_clip_bottom,
-            });
-            let content_top = frame_top + 22.0;
-            let mut lane_top = content_top;
-            options.show_reference = embedded_reference;
-            options.reference_top = lane_top;
-            if embedded_reference {
-                // Reserve a stable reference band at every horizontal scale. Its
-                // contents appear at base detail, but later lanes must not move
-                // when a horizontal gesture crosses an LOD boundary.
-                lane_top += reference_height;
-            } else if embedded_reference_supported
-                && !self.primary_alignment_filters().show_reference
-            {
-                lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
-            }
-            options.show_coverage = self.primary_alignment_filters().show_coverage;
-            options.coverage_top = lane_top;
-            options.coverage_height = annotation_lane_heights.coverage;
-            options.coverage_scale_maximum =
-                self.primary_alignment_filters().coverage_scale_maximum;
-            options.coverage_scale_transform =
-                self.primary_alignment_filters().coverage_scale_transform;
-            if self.primary_alignment_filters().show_coverage {
-                lane_top += options.coverage_height + 6.0;
-            } else {
-                lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
-            }
-            options.show_junctions = show_junctions;
-            options.junction_top = lane_top;
-            options.junction_height = annotation_lane_heights.junction;
-            options.minimum_junction_depth =
-                self.primary_alignment_filters().minimum_junction_depth;
-            options.junction_display_mode = self.primary_alignment_filters().junction_display_mode;
-            options.junction_count_mode = self.primary_alignment_filters().sashimi_count_mode;
-            options.show_junction_labels = self.primary_alignment_filters().show_junction_labels;
-            options.junction_annotation_fingerprint = junction_annotations.lookup.fingerprint();
-            options.junction_scale_maximum =
-                match self.primary_alignment_filters().sashimi_scale_mode {
-                    SashimiScaleMode::Automatic => None,
-                    SashimiScaleMode::Fixed => Some(f64::from(
-                        self.primary_alignment_filters().sashimi_fixed_scale_maximum,
-                    )),
-                    SashimiScaleMode::Shared => {
-                        match self.primary_alignment_filters().sashimi_count_mode {
-                            SashimiCountMode::Raw => shared_sashimi_raw,
-                            SashimiCountMode::CountsPerMillion => shared_sashimi_cpm,
-                        }
-                    }
-                };
-            if show_junctions {
-                lane_top += options.junction_height + 6.0;
-            } else if junctions_available {
-                lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
-            }
-            options.show_modification_frequency = show_modification_frequency;
-            options.modification_top = lane_top;
-            options.modification_height = annotation_lane_heights.modification;
-            if show_modification_frequency {
-                lane_top += options.modification_height + 8.0;
-            } else if modification_frequency_supported {
-                lane_top += COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT;
-            }
-            let mut annotation_context_bottom = lane_top;
-            options.show_reads = primary_read_effective;
-            options.read_refusal = alignment::individual_read_refusal(
-                &query,
-                &layout_query,
-                self.primary_alignment_filters().read_stacking_mode,
-            );
-            options.reads_top =
-                primary_read_bounds.top + if primary_read_effective { 22.0 } else { 0.0 };
-            let frozen_bottom = if options.show_reads {
-                options.reads_top
-            } else {
-                primary_read_bounds.top + COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT
-            };
-            options.row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
-            options.read_height = (5.0 * density).clamp(1.5, (options.row_height - 1.0).max(1.5));
-            options.color_mode = self.primary_alignment_filters().alignment_color_mode;
-            options.group_mode = self.primary_alignment_filters().alignment_group_mode;
-            options.group_order = self.primary_alignment_filters().alignment_group_order;
-            options.sort_mode = self.primary_alignment_filters().alignment_sort_mode;
-            options.sort_order = self.primary_alignment_filters().alignment_sort_order;
-            options.sort_position = alignment_sort_position(
-                self.primary_alignment_filters().alignment_sort_mode,
-                self.primary_alignment_filters().alignment_sort_anchor,
-                self.panels.active().viewport,
-            );
-            options.view_as_pairs = self.primary_alignment_filters().view_as_pairs;
-            options.pair_length_bounds = self.effective_template_length_bounds(&query);
-            options.minimum_allele_fraction =
-                self.primary_alignment_filters().minimum_allele_fraction;
-            options.quality_weighted_alleles =
-                self.primary_alignment_filters().quality_weighted_alleles;
-            options.show_coverage_center_line =
-                self.primary_alignment_filters().show_coverage_center_line;
-            options.selected_pileup_position = (self.panels.active_mut().selected_alignment_track
-                == Some(primary_alignment_id))
-            .then_some(self.panels.active().selected_pileup_position)
-            .flatten();
-            options.read_base_display_mode =
-                self.primary_alignment_filters().read_base_display_mode;
-            options.shade_read_bases_by_quality =
-                self.primary_alignment_filters().shade_read_bases_by_quality;
-            options.minimum_indel_size = self.primary_alignment_filters().minimum_indel_size;
-            options.minimum_event_label_size =
-                self.primary_alignment_filters().minimum_event_label_size;
-            options.show_modified_bases = self.primary_alignment_filters().show_modified_bases;
-            options.selected_modification_position =
-                (self.panels.active_mut().selected_alignment_track == Some(primary_alignment_id))
-                    .then_some(self.panels.active().selected_modification_position)
-                    .flatten();
-            options.selected_chain_read_name_hash =
-                (self.panels.active_mut().selected_alignment_track == Some(primary_alignment_id))
-                    .then(|| {
-                        self.panels
-                            .active()
-                            .selected_chain
-                            .as_ref()
-                            .map(|chain| alignment_read_name_hash(&chain.read_name))
-                    })
-                    .flatten();
-            options.promoted_read_name_hash = self
-                .promoted_read
-                .filter(|(track_id, _)| *track_id == primary_alignment_id)
-                .map(|(_, hash)| hash);
-            options.selected_chain_read_name_hash = options
-                .selected_chain_read_name_hash
-                .or(options.promoted_read_name_hash);
-            options.minimum_modification_probability = self
-                .primary_alignment_filters()
-                .minimum_modification_probability;
-            options.modified_base_color_mode =
-                self.primary_alignment_filters().modified_base_color_mode;
-            for (slot, code) in options
-                .hidden_modification_codes
-                .iter_mut()
-                .zip(self.primary_hidden_modification_codes())
-            {
-                *slot = Some(code);
-            }
-            annotation_context_bottom = alignment::apply_alignment_annotation_height(
-                &mut options,
-                frame_top,
-                annotation_context_bottom,
-                self.alignment_tracks.first().and_then(|_| {
-                    self.track_presentation
-                        .pane_track_state(ui::TrackPane::Annotation, primary_alignment_id)
-                        .and_then(|node| node.preferred_height)
-                }),
-            );
-            // Complete admission already bounds retained records. The
-            // scrollable primary track must give every complete record a row
-            // opportunity instead of imposing a second display-only cap.
-            options.max_rows = query.batch.len().max(1);
-            let primary_rows = self
-                .alignment_tracks
-                .first()
-                .and_then(|track| track.projection(self.panels.active().id))
-                .and_then(|projection| projection.alignment_rows.as_ref());
-            let total_rows = primary_rows.map_or(options.max_rows, |cached| {
-                if cached.stacking_mode == ReadStackingMode::Stable {
-                    cached.layout.row_capacity()
-                } else {
-                    cached.layout.used_row_count()
-                }
-            });
-            let clip_top = primary_read_bounds.top.max(read_clip_top);
-            let clip_bottom = primary_read_bounds.bottom.min(scroll_clip_bottom);
-            let read_scroll = self
-                .panels
-                .active()
-                .read_panel_scroll_state(primary_alignment_id)
-                .effective_scroll_points();
-            options.materialized_row_range = Some(alignment::materialized_alignment_row_range(
-                options.reads_top,
-                options.row_height,
-                clip_top,
-                clip_bottom,
-                read_scroll,
-                total_rows,
-                alignment::MATERIALIZED_ALIGNMENT_ROW_OVERSCAN,
-            ));
-            if let Some((track_id, record_index)) = self.panels.active().pending_read_reveal
-                && track_id == primary_alignment_id
-                && let Some(row) = primary_rows.and_then(|cached| cached.layout.row(record_index))
-            {
-                let visible_rows = ((clip_bottom - clip_top) / options.row_height)
-                    .ceil()
-                    .max(1.0) as usize;
-                let start = row
-                    .saturating_sub(visible_rows / 2)
-                    .saturating_sub(alignment::MATERIALIZED_ALIGNMENT_ROW_OVERSCAN);
-                options.materialized_row_range = Some((
-                    start,
-                    start
-                        .saturating_add(visible_rows)
-                        .saturating_add(
-                            alignment::MATERIALIZED_ALIGNMENT_ROW_OVERSCAN.saturating_mul(2),
-                        )
-                        .min(total_rows),
-                ));
-            }
-            options.row_layout_revision = self
-                .alignment_tracks
-                .first()
-                .and_then(|track| track.projection(self.panels.active().id))
-                .and_then(|projection| projection.alignment_rows.as_ref())
-                .map_or(0, |cached| cached.reconciliation.revision);
-            let key = alignment_layout_key(
-                PanelTrackId::new(self.panels.active().id, primary_alignment_id),
-                self.primary_alignment_source(),
-                self.panels.active().viewport,
-                query.interval,
-                self.primary_active_filters(),
-                &options,
-                top,
-            );
-            let layout = if let Some(layout) = self.layout_cache.get(&key).cloned() {
-                layout
-            } else {
-                let rows = self
-                    .alignment_tracks
-                    .first()
-                    .and_then(|track| track.projection(self.panels.active().id))
-                    .and_then(|projection| projection.alignment_rows.as_ref())
-                    .expect("alignment rows exist whenever an alignment query exists");
-                let layout = Arc::new(layout_alignment_query_with_rows_and_annotations(
-                    &query,
-                    self.panels.active().viewport,
-                    options,
-                    &rows.layout,
-                    Some(&junction_annotations.lookup),
-                ));
-                let rectangle_weight = layout
-                    .display_list
-                    .rectangles
-                    .len()
-                    .saturating_mul(std::mem::size_of::<rgv_layout::RectPrimitive>());
-                let target_weight = layout
-                    .junction_arc_targets
-                    .len()
-                    .saturating_mul(std::mem::size_of::<rgv_layout::JunctionArcTarget>());
-                let weight = rectangle_weight.saturating_add(target_weight);
-                let _ = self.layout_cache.insert(key, Arc::clone(&layout), weight);
-                layout
-            };
-            if let Some(track) = self.alignment_tracks.first_mut() {
-                track.projection_mut(self.panels.active().id).cached_layout =
-                    Some((key, Arc::clone(&layout)));
-            }
-            let actual_read_content_bottom = if primary_read_effective {
-                let natural_bottom = layout
-                    .display_list
-                    .rectangles
-                    .iter()
-                    .skip(layout.pinned_rectangle_count)
-                    .map(|rectangle| rectangle.y + rectangle.height)
-                    .fold(options.reads_top + options.row_height, f32::max)
-                    + 6.0;
-                let reserved_bottom = if options.read_refusal.is_some() {
-                    natural_bottom
-                } else {
-                    self.alignment_tracks
-                        .first()
-                        .and_then(|track| track.projection(self.panels.active().id))
-                        .and_then(|projection| projection.alignment_rows.as_ref())
-                        .map_or(natural_bottom, |cached| {
-                            let rows = if cached.stacking_mode == ReadStackingMode::Stable {
-                                cached.layout.row_capacity()
-                            } else {
-                                cached.layout.used_row_count()
-                            };
-                            options.reads_top + rows as f32 * options.row_height + 6.0
-                        })
-                };
-                natural_bottom.max(reserved_bottom)
-            } else {
-                frozen_bottom + 6.0
-            };
-            let mut primary_read_display = DisplayList::default();
-            let mut suppressed_annotation_display = DisplayList::default();
-            if primary_annotation_effective {
-                let rectangle_base = pinned_display.rectangles.len();
-                extend_alignment_layers(
-                    &mut pinned_display,
-                    &mut primary_read_display,
-                    &layout,
-                    None,
-                );
-                tag_layout_junction_arcs(
-                    &mut pinned_display.rectangles[rectangle_base..],
-                    &layout,
-                    primary_alignment_id,
-                    &mut next_junction_arc_token,
-                    &mut junction_arc_keys,
-                );
-            } else {
-                extend_alignment_layers(
-                    &mut suppressed_annotation_display,
-                    &mut primary_read_display,
-                    &layout,
-                    None,
-                );
-            }
-            if primary_read_effective
-                && primary_read_bounds.bottom > read_clip_top
-                && primary_read_bounds.top < scroll_clip_bottom
-            {
-                read_panel_displays.push(ReadPanelDisplayCache {
-                    track_id: primary_alignment_id,
-                    presentation_target_revision: 0,
-                    scrollable: primary_read_display,
-                    density_camera: true,
-                    row_origin: Some(options.reads_top),
-                    row_height: Some(options.row_height),
-                    row_coordinate_authority: self
-                        .alignment_tracks
-                        .first()
-                        .and_then(|track| track.projection(self.panels.active().id))
-                        .and_then(|projection| projection.alignment_rows.as_ref())
-                        .map(|cached| {
-                            ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Legacy(
-                                cached.reconciliation.revision,
-                            ))
-                        })
-                        .unwrap_or(ReadRowCoordinateAuthority::Absent),
-                    row_activity_atlas_revision: None,
-                    materialized_row_range: options.materialized_row_range,
-                    total_rows: Some(total_rows),
-                    authoritative_overview: None,
-                    overview: ui::ScrollbarOverview::default(),
-                    actual_content_bottom: actual_read_content_bottom,
-                    clip_top: primary_read_bounds.top.max(read_clip_top),
-                    clip_bottom: primary_read_bounds.bottom.min(scroll_clip_bottom),
-                });
-            }
-            let mut subtracks = {
-                let mut subtracks = Vec::with_capacity(5);
-                if embedded_reference {
-                    subtracks.push(TrackSubtrack {
-                        alignment_subtrack: Some(AlignmentSubtrack::Reference),
-                        label: "Reference".to_owned(),
-                        detail: None,
-                        top: options.reference_top,
-                        bottom: options.reference_top + reference_height,
-                        collapsed: false,
-                        composite_member: None,
-                    });
-                } else if embedded_reference_supported
-                    && !self.primary_alignment_filters().show_reference
-                {
-                    subtracks.push(collapsed_alignment_subtrack(
-                        AlignmentSubtrack::Reference,
-                        options.reference_top,
-                    ));
-                }
-                subtracks
-            };
-            let mut alignment_context_frame = TrackFrame {
-                key: TrackFrameKey::Alignment(primary_alignment_id),
-                channel: ui::TrackPane::Annotation,
-                name: primary_alignment_name.clone(),
-                kind: TrackKind::Alignment,
-                source_label: primary_source_label.clone(),
-                top: frame_top,
-                bottom: annotation_context_bottom.max(frame_top + 22.0),
-                visible: true,
-                collapsed: false,
-                frozen_bottom: None,
-                subtracks: {
-                    if self.primary_alignment_filters().show_coverage {
-                        let scale = alignment::coverage_scale_detail(
-                            layout.stats.maximum_coverage,
-                            self.primary_alignment_filters().coverage_scale_maximum,
-                            self.primary_alignment_filters().coverage_scale_transform,
-                            query.pileup.provenance.exact_depth_complete,
-                        );
-                        subtracks.push(TrackSubtrack {
-                            alignment_subtrack: Some(AlignmentSubtrack::Coverage),
-                            label: "Coverage".to_owned(),
-                            detail: Some(scale),
-                            top: options.coverage_top,
-                            bottom: options.coverage_top + options.coverage_height,
-                            collapsed: false,
-                            composite_member: None,
-                        });
-                    } else {
-                        subtracks.push(collapsed_alignment_subtrack(
-                            AlignmentSubtrack::Coverage,
-                            options.coverage_top,
-                        ));
-                    }
-                    if show_junctions {
-                        subtracks.push(TrackSubtrack {
-                            alignment_subtrack: Some(AlignmentSubtrack::Sashimi),
-                            label: "Sashimi".to_owned(),
-                            detail: Some(sashimi_track_detail(
-                                &layout.stats,
-                                &query.junctions,
-                                self.primary_alignment_filters().sashimi_scale_mode,
-                                self.primary_alignment_filters().sashimi_fixed_scale_maximum,
-                                self.primary_alignment_filters().sashimi_count_mode,
-                            )),
-                            top: options.junction_top,
-                            bottom: options.junction_top + options.junction_height,
-                            collapsed: false,
-                            composite_member: None,
-                        });
-                    } else if junctions_available {
-                        subtracks.push(collapsed_alignment_subtrack(
-                            AlignmentSubtrack::Sashimi,
-                            options.junction_top,
-                        ));
-                    }
-                    if show_modification_frequency {
-                        subtracks.push(TrackSubtrack {
-                            alignment_subtrack: Some(AlignmentSubtrack::Modifications),
-                            label: "Modifications".to_owned(),
-                            detail: Some(format!(
-                                "{} types · {} tagged reads · {} malformed · {} unavailable{}",
-                                query.pileup.modifications.series.len(),
-                                query
-                                    .pileup
-                                    .modifications
-                                    .provenance
-                                    .records_with_modification_tags,
-                                query.pileup.modifications.provenance.malformed_records,
-                                query.pileup.modifications.provenance.unavailable_records,
-                                if query.pileup.modifications.provenance.dropped_series > 0 {
-                                    " · capped"
-                                } else {
-                                    ""
-                                }
-                            )),
-                            top: options.modification_top,
-                            bottom: options.modification_top + options.modification_height,
-                            collapsed: false,
-                            composite_member: None,
-                        });
-                    } else if modification_frequency_supported {
-                        subtracks.push(collapsed_alignment_subtrack(
-                            AlignmentSubtrack::Modifications,
-                            options.modification_top,
-                        ));
-                    }
-                    if primary_read_effective {
-                        let mut read_details = Vec::new();
-                        let overview =
-                            self.panels.active().viewport.detail_level() == DetailLevel::Overview;
-                        if let Some(refusal) = options.read_refusal {
-                            read_details.push(alignment::read_refusal_detail(refusal));
-                        } else if overview {
-                            read_details.push(alignment::overview_read_detail(
-                                query.stats.records_eligible,
-                                query.stats.cancelled,
-                            ));
-                        } else {
-                            read_details.push(format!(
-                                "{} rendered · {} complete reads",
-                                layout.stats.rendered_alignments, query.stats.records_emitted,
-                            ));
-                        }
-                        read_details.extend(alignment::filtered_read_details(query.stats));
-                        if options.read_refusal.is_none() {
-                            if let Some(detail) = alignment::regional_insertion_detail(layout.stats)
-                            {
-                                read_details.push(detail);
-                            }
-                            read_details.push(alignment::row_occupancy_detail(layout.stats));
-                        }
-                        if layout.stats.bisulfite_marks_omitted > 0 {
-                            read_details.push(format!(
-                                "{} bisulfite marks omitted at display cap",
-                                layout.stats.bisulfite_marks_omitted
-                            ));
-                        }
-                        if layout.stats.smrt_kinetics_marks_omitted > 0 {
-                            read_details.push(format!(
-                                "{} PacBio kinetic marks omitted at display cap",
-                                layout.stats.smrt_kinetics_marks_omitted
-                            ));
-                        }
-                        if layout.stats.ultima_quality_marks_omitted > 0 {
-                            read_details.push(format!(
-                                "{} Ultima quality marks omitted at display cap",
-                                layout.stats.ultima_quality_marks_omitted
-                            ));
-                        }
-                        if layout.stats.sbx_tail_marks_omitted > 0 {
-                            read_details.push(format!(
-                                "{} SBX simplex-tail marks omitted at display cap",
-                                layout.stats.sbx_tail_marks_omitted
-                            ));
-                        }
-                        if matches!(
-                            self.primary_alignment_filters().alignment_color_mode,
-                            AlignmentColorMode::SmrtKinetics(_)
-                        ) {
-                            if layout.stats.smrt_kinetics_unavailable_records > 0 {
-                                read_details.push(format!(
-                                    "{} reads missing the selected PacBio kinetic array or sequence",
-                                    layout.stats.smrt_kinetics_unavailable_records
-                                ));
-                            }
-                            if layout.stats.smrt_kinetics_malformed_records > 0 {
-                                read_details.push(format!(
-                                    "{} malformed PacBio kinetic arrays",
-                                    layout.stats.smrt_kinetics_malformed_records
-                                ));
-                            }
-                        }
-                        if matches!(
-                            self.primary_alignment_filters().alignment_color_mode,
-                            AlignmentColorMode::Ultima(_)
-                        ) {
-                            if layout.stats.ultima_unavailable_records > 0 {
-                                read_details.push(format!(
-                                    "{} reads missing Ultima sequence, qualities, or tp",
-                                    layout.stats.ultima_unavailable_records
-                                ));
-                            }
-                            if layout.stats.ultima_malformed_records > 0 {
-                                read_details.push(format!(
-                                    "{} reads with malformed Ultima evidence",
-                                    layout.stats.ultima_malformed_records
-                                ));
-                            }
-                            if layout.stats.ultima_unavailable_events > 0 {
-                                read_details.push(format!(
-                                    "{} indels shown without Ultima quality evidence",
-                                    layout.stats.ultima_unavailable_events
-                                ));
-                            }
-                        }
-                        if matches!(
-                            self.primary_alignment_filters().alignment_color_mode,
-                            AlignmentColorMode::Sbx(_)
-                        ) {
-                            if layout.stats.sbx_unavailable_records > 0 {
-                                read_details.push(format!(
-                                    "{} reads missing usable SBX sequence/qualities",
-                                    layout.stats.sbx_unavailable_records
-                                ));
-                            }
-                            if layout.stats.sbx_unavailable_insertions > 0 {
-                                read_details.push(format!(
-                                    "{} SBX insertions shown without quality classification",
-                                    layout.stats.sbx_unavailable_insertions
-                                ));
-                            }
-                        }
-                        if matches!(
-                            self.primary_alignment_filters().alignment_color_mode,
-                            AlignmentColorMode::Bisulfite(_)
-                        ) && query.reference.is_none()
-                        {
-                            read_details.push(
-                                "bisulfite conversion unavailable: load a matching reference FASTA"
-                                    .to_owned(),
-                            );
-                        }
-                        subtracks.push(TrackSubtrack {
-                            alignment_subtrack: Some(AlignmentSubtrack::Reads),
-                            label: "Reads".to_owned(),
-                            detail: (!read_details.is_empty()).then(|| read_details.join(" · ")),
-                            top: options.reads_top,
-                            bottom: actual_read_content_bottom.max(options.reads_top),
-                            collapsed: false,
-                            composite_member: None,
-                        });
-                    } else {
-                        subtracks.push(collapsed_alignment_subtrack(
-                            AlignmentSubtrack::Reads,
-                            options.reads_top,
-                        ));
-                    }
-                    subtracks
-                },
-            };
-            let reads = alignment_context_frame
-                .subtracks
-                .iter()
-                .position(|subtrack| subtrack.alignment_subtrack == Some(AlignmentSubtrack::Reads))
-                .map(|index| alignment_context_frame.subtracks.remove(index))
-                .into_iter()
-                .collect();
-            if !annotation_group_collapsed {
-                if !primary_annotation_effective {
-                    alignment_context_frame.bottom = alignment_context_frame.top + 26.0;
-                    alignment_context_frame.subtracks.clear();
-                    alignment_context_frame.collapsed = !primary_annotation_desired;
-                }
-                top = alignment_context_frame.bottom;
-                self.panels
-                    .active_mut()
-                    .track_frames
-                    .push(alignment_context_frame);
-            }
-            if !read_group_collapsed {
-                self.panels.active_mut().track_frames.push(TrackFrame {
-                    key: TrackFrameKey::Alignment(primary_alignment_id),
-                    channel: ui::TrackPane::Reads,
-                    name: format!("Reads · {primary_alignment_name}"),
-                    kind: TrackKind::Alignment,
-                    source_label: primary_source_label.clone(),
-                    top: primary_read_bounds.top,
-                    bottom: primary_read_bounds
-                        .bottom
-                        .max(primary_read_bounds.top + 22.0),
-                    visible: true,
-                    collapsed: !primary_read_desired,
-                    frozen_bottom: Some(frozen_bottom),
-                    subtracks: reads,
-                });
-            }
-        } else if self.primary_alignment_source().is_some()
+        if self.primary_alignment_source().is_some()
             && !collapsed_annotation_group_members.contains(&primary_alignment_id)
         {
-            let index_only_overview = self
-                .alignment_tracks
-                .first()
-                .and_then(|track| track.projection(self.panels.active().id))
-                .is_some_and(|projection| projection.index_only_overview)
-                || self.panels.active().viewport.detail_level() == DetailLevel::Overview;
-            if let Some(track) = self.alignment_tracks.first_mut() {
-                track.projection_mut(self.panels.active().id).cached_layout = None;
-            }
+            let index_only_overview =
+                self.panels.active().viewport.detail_level() == DetailLevel::Overview;
             let mut frame = if index_only_overview {
                 let bottom = top + 48.0;
                 TrackFrame {
@@ -2285,46 +1126,29 @@ impl Viewer {
             top = frame.bottom;
             self.panels.active_mut().track_frames.push(frame);
         }
-        let selected_alignment_track = self.panels.active().selected_alignment_track;
-        let selected_chain_read_name_hash = self
-            .panels
-            .active()
-            .selected_chain
-            .as_ref()
-            .map(|chain| alignment_read_name_hash(&chain.read_name));
-        let promoted_read = self.promoted_read;
-        let navigation_intervals = self
-            .panels
-            .active()
-            .navigation_history
-            .entries()
-            .copied()
+        let secondary_tracks = self
+            .alignment_tracks
+            .iter()
+            .skip(1)
+            .map(|track| {
+                (
+                    track.config.clone(),
+                    track.lifecycle.clone(),
+                    track.scene_engine.is_some(),
+                )
+            })
             .collect::<Vec<_>>();
-        let active_panel_id = self.panels.active().id;
-        let active_viewport = self.panels.active().viewport;
-        let active_contig_name = self.panels.active().contig_name.clone();
-        for track in self.alignment_tracks.iter_mut().skip(1) {
-            let track_id = track.config.id;
+        for (config, lifecycle, scene_backed) in secondary_tracks {
+            let track_id = config.id;
             let annotation_group_collapsed = collapsed_annotation_group_members.contains(&track_id);
-            let read_group_collapsed =
-                !read_section_expanded || collapsed_read_group_members.contains(&track_id);
             let annotation_desired = self
                 .track_presentation
                 .pane_track_state(ui::TrackPane::Annotation, track_id)
-                .is_some_and(|node| node.content_visible);
-            let read_desired = self
-                .track_presentation
-                .pane_track_state(ui::TrackPane::Reads, track_id)
                 .is_some_and(|node| node.content_visible);
             let annotation_effective = self
                 .track_presentation
                 .track_content_exposed(ui::TrackPane::Annotation, track_id)
                 .unwrap_or(false);
-            let read_effective = read_section_expanded
-                && self
-                    .track_presentation
-                    .track_content_exposed(ui::TrackPane::Reads, track_id)
-                    .unwrap_or(false);
             if let Some((group, members, _)) =
                 annotation_group_headers_by_anchor.get(&track_id).copied()
             {
@@ -2347,217 +1171,83 @@ impl Viewer {
                 });
                 top = bottom;
             }
-            let read_bounds = alignment::read_panel_bounds_for_track(
-                &read_panel_bounds,
-                track_id,
-                scroll_clip_bottom,
-                read_group_collapsed,
-            )
-            .unwrap_or(alignment::ReadPanelBounds {
-                key: alignment::ReadPanelKey::Track(track_id),
-                top: scroll_clip_bottom,
-                bottom: scroll_clip_bottom,
-            });
-            let read_effective_scroll = self
-                .panels
-                .active()
-                .read_panel_scroll_state(track_id)
-                .effective_scroll_points();
-            let pending_read_reveal_index = self
-                .panels
-                .active()
-                .pending_read_reveal
-                .filter(|(reveal_track, _)| *reveal_track == track_id)
-                .map(|(_, index)| index);
-            let (layout, mut frame, mut read_frame) = secondary_alignment_track_layout(
-                active_panel_id,
-                track,
-                active_viewport,
-                &active_contig_name,
-                top,
-                read_bounds.top,
-                read_bounds.bottom,
-                read_bounds.top.max(read_clip_top),
-                read_bounds.bottom.min(scroll_clip_bottom),
-                read_effective_scroll,
-                pending_read_reveal_index,
-                read_panel_densities
-                    .get(&track_id)
-                    .copied()
-                    .unwrap_or(track.config.filters.alignment_density),
-                self.track_presentation
-                    .pane_track_state(ui::TrackPane::Annotation, track_id)
-                    .and_then(|node| node.preferred_height),
-                read_effective,
-                (selected_alignment_track == Some(track_id))
-                    .then_some(selected_chain_read_name_hash)
-                    .flatten(),
-                promoted_read
-                    .filter(|(promoted_track, _)| *promoted_track == track_id)
-                    .map(|(_, hash)| hash),
-                shared_sashimi_raw,
-                shared_sashimi_cpm,
-                &junction_annotations.lookup,
-                &navigation_intervals,
-            );
-            if let Some(layout) = layout {
-                // CPU semantic picking resolves the owning TrackId from the frame.
-                // Keep GPU object IDs clear because they are only unique within
-                // one alignment query, not across the complete workspace.
-                if annotation_effective {
-                    let rectangle_base = annotation_display.rectangles.len();
-                    annotation_display.rectangles.extend(
-                        layout
-                            .display_list
-                            .rectangles
-                            .iter()
-                            .take(layout.pinned_rectangle_count)
-                            .copied()
-                            .map(|mut rectangle| {
-                                rectangle.object_id = 0;
-                                rectangle
-                            }),
-                    );
-                    annotation_display.texts.extend(
-                        layout
-                            .display_list
-                            .texts
-                            .iter()
-                            .take(layout.pinned_text_count)
-                            .cloned(),
-                    );
-                    tag_layout_junction_arcs(
-                        &mut annotation_display.rectangles[rectangle_base..],
-                        &layout,
-                        track_id,
-                        &mut next_junction_arc_token,
-                        &mut junction_arc_keys,
-                    );
+            if annotation_group_collapsed {
+                continue;
+            }
+
+            let overview = self.panels.active().viewport.detail_level() == DetailLevel::Overview;
+            let mut frame = if overview {
+                let bottom = top + 48.0;
+                TrackFrame {
+                    key: TrackFrameKey::Alignment(track_id),
+                    channel: ui::TrackPane::Annotation,
+                    name: config.name.clone(),
+                    kind: TrackKind::Alignment,
+                    source_label: Some(config.source.redacted_label()),
+                    top,
+                    bottom,
+                    visible: true,
+                    collapsed: !annotation_desired,
+                    frozen_bottom: None,
+                    subtracks: vec![TrackSubtrack {
+                        alignment_subtrack: None,
+                        label: "Index-only overview".to_owned(),
+                        detail: Some(
+                            "BAI/CSI occupancy · no alignment records requested".to_owned(),
+                        ),
+                        top: top + 22.0,
+                        bottom,
+                        collapsed: false,
+                        composite_member: None,
+                    }],
                 }
-                let read_display = DisplayList {
-                    rectangles: layout
-                        .display_list
-                        .rectangles
-                        .iter()
-                        .skip(layout.pinned_rectangle_count)
-                        .copied()
-                        .map(|mut rectangle| {
-                            rectangle.object_id = 0;
-                            rectangle
-                        })
-                        .collect(),
-                    texts: layout
-                        .display_list
-                        .texts
-                        .iter()
-                        .skip(layout.pinned_text_count)
-                        .cloned()
-                        .collect(),
+            } else if scene_backed {
+                alignment::alignment_scene_annotation_frame(
+                    &config,
+                    self.panels.active().viewport,
+                    top,
+                    self.track_presentation
+                        .pane_track_state(ui::TrackPane::Annotation, track_id)
+                        .and_then(|node| node.preferred_height),
+                )
+            } else {
+                let bottom = top + 48.0;
+                let detail = match lifecycle {
+                    AlignmentTrackLifecycle::Failed(message) => Some(message),
+                    AlignmentTrackLifecycle::Opening => Some("Opening alignment source".to_owned()),
+                    AlignmentTrackLifecycle::Ready => {
+                        Some("Unified alignment scene source is unavailable".to_owned())
+                    }
                 };
-                if read_effective
-                    && read_bounds.bottom > read_clip_top
-                    && read_bounds.top < scroll_clip_bottom
-                {
-                    let natural_bottom = read_display
-                        .rectangles
-                        .iter()
-                        .map(|rectangle| rectangle.y + rectangle.height)
-                        .fold(read_bounds.top + 22.0, f32::max)
-                        + 6.0;
-                    let density = read_panel_densities
-                        .get(&track_id)
-                        .copied()
-                        .unwrap_or(track.config.filters.alignment_density);
-                    let row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
-                    let projection = track.projection(self.panels.active().id);
-                    let read_refused = projection
-                        .and_then(|projection| {
-                            let query = projection.current_query.as_deref()?;
-                            let layout_query = projection.layout_query.as_deref().unwrap_or(query);
-                            alignment::individual_read_refusal(
-                                query,
-                                layout_query,
-                                track.config.filters.read_stacking_mode,
-                            )
-                        })
-                        .is_some();
-                    let row_authority = projection
-                        .and_then(|projection| projection.alignment_rows.as_ref())
-                        .map(|cached| {
-                            ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Legacy(
-                                cached.reconciliation.revision,
-                            ))
-                        })
-                        .unwrap_or(ReadRowCoordinateAuthority::Absent);
-                    let total_rows = projection
-                        .and_then(|projection| projection.alignment_rows.as_ref())
-                        .map(|cached| {
-                            if cached.stacking_mode == ReadStackingMode::Stable {
-                                cached.layout.row_capacity()
-                            } else {
-                                cached.layout.used_row_count()
-                            }
-                        });
-                    let materialized_row_range = Some((
-                        layout.stats.materialized_row_start,
-                        layout.stats.materialized_row_end,
-                    ));
-                    let reserved_bottom = if read_refused {
-                        natural_bottom
-                    } else {
-                        projection
-                            .and_then(|projection| projection.alignment_rows.as_ref())
-                            .map_or(natural_bottom, |cached| {
-                                let rows = if cached.stacking_mode == ReadStackingMode::Stable {
-                                    cached.layout.row_capacity()
-                                } else {
-                                    cached.layout.used_row_count()
-                                };
-                                read_bounds.top
-                                    + READ_PANE_HEADER_HEIGHT
-                                    + rows as f32 * row_height
-                                    + 6.0
-                            })
-                    };
-                    read_panel_displays.push(ReadPanelDisplayCache {
-                        track_id,
-                        presentation_target_revision: 0,
-                        scrollable: read_display,
-                        density_camera: true,
-                        row_origin: Some(read_bounds.top + READ_PANE_HEADER_HEIGHT),
-                        row_height: Some(row_height),
-                        row_coordinate_authority: row_authority,
-                        row_activity_atlas_revision: None,
-                        materialized_row_range,
-                        total_rows,
-                        authoritative_overview: None,
-                        overview: ui::ScrollbarOverview::default(),
-                        actual_content_bottom: natural_bottom.max(reserved_bottom),
-                        clip_top: read_bounds.top.max(read_clip_top),
-                        clip_bottom: read_bounds.bottom.min(scroll_clip_bottom),
-                    });
+                TrackFrame {
+                    key: TrackFrameKey::Alignment(track_id),
+                    channel: ui::TrackPane::Annotation,
+                    name: config.name.clone(),
+                    kind: TrackKind::Alignment,
+                    source_label: Some(config.source.redacted_label()),
+                    top,
+                    bottom,
+                    visible: true,
+                    collapsed: !annotation_desired,
+                    frozen_bottom: None,
+                    subtracks: vec![TrackSubtrack {
+                        alignment_subtrack: None,
+                        label: "Unavailable".to_owned(),
+                        detail,
+                        top: top + 22.0,
+                        bottom,
+                        collapsed: false,
+                        composite_member: None,
+                    }],
                 }
+            };
+            if !annotation_effective {
+                frame.bottom = frame.top + 26.0;
+                frame.subtracks.clear();
+                frame.collapsed = !annotation_desired;
             }
-            if !annotation_group_collapsed {
-                if !annotation_effective {
-                    frame.bottom = frame.top + 26.0;
-                    frame.collapsed = !annotation_desired;
-                    frame.subtracks.clear();
-                }
-                top = frame.bottom;
-                self.panels.active_mut().track_frames.push(frame);
-            }
-            if !read_group_collapsed && let Some(read_frame) = read_frame.as_mut() {
-                read_frame.collapsed = !read_desired;
-                if !read_effective {
-                    read_frame.bottom = read_frame.top + READ_PANE_HEADER_HEIGHT;
-                    read_frame.frozen_bottom = Some(read_frame.bottom);
-                    read_frame.subtracks.clear();
-                }
-            }
-            if !read_group_collapsed && let Some(read_frame) = read_frame {
-                self.panels.active_mut().track_frames.push(read_frame);
-            }
+            top = frame.bottom;
+            self.panels.active_mut().track_frames.push(frame);
         }
         // Read-pane controls are a projection of the presentation tree, not
         // of query/render availability. Preserve every exposed restore row
@@ -2651,11 +1341,7 @@ impl Viewer {
                         ReadRowCoordinateAuthority::Absent
                     }
                 },
-                |profile| {
-                    ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Unified(
-                        profile.row_coordinate_space(),
-                    ))
-                },
+                |profile| ReadRowCoordinateAuthority::Exact(profile.row_coordinate_space()),
             );
             let read_state_message = (!index_only_overview)
                 .then(|| {
@@ -2845,7 +1531,36 @@ impl Viewer {
             };
             let bottom = top + height;
             let mut subtracks = quantitative_overlay_subtracks(&members, top, height);
-            if visible && !collapsed && tracks_overlap_viewport {
+            if visible && !collapsed {
+                for member in members
+                    .iter()
+                    .filter(|member| member.visible && !member.collapsed)
+                {
+                    let key = ContextLaneKey::Auxiliary(member.id);
+                    visible_context_lanes.insert(
+                        key,
+                        (
+                            TrackFrameKey::Auxiliary(config.id),
+                            Some(desired_context_interval),
+                        ),
+                    );
+                    if self.panels.active().pending_queries.tracks
+                        || self.panels.active().track_settled_generation != Some(generation)
+                    {
+                        pending_context_lanes.insert(key);
+                    }
+                    if self
+                        .panels
+                        .active()
+                        .track_query_error_generations
+                        .get(&member.id)
+                        == Some(&generation)
+                    {
+                        unavailable_context_lanes.insert(key);
+                    }
+                }
+            }
+            if visible && !collapsed {
                 for member in members
                     .iter()
                     .filter(|member| member.visible && !member.collapsed)
@@ -2859,6 +1574,18 @@ impl Viewer {
                     else {
                         continue;
                     };
+                    let Some(loaded_interval) = self
+                        .panels
+                        .active()
+                        .track_snapshot_intervals
+                        .get(&member.id)
+                        .copied()
+                        .filter(|loaded| retained_data_overlaps(*loaded, viewport_interval))
+                    else {
+                        continue;
+                    };
+                    let source_viewport =
+                        prepared_context_viewport(loaded_interval, target_viewport);
                     let options = TrackLayoutOptions {
                         top,
                         height,
@@ -2924,7 +1651,7 @@ impl Viewer {
                                 measured_feature_label_widths(&self.egui_context, records);
                             layout_features_with_label_widths(
                                 records,
-                                self.panels.active().viewport,
+                                source_viewport,
                                 options,
                                 Some(&label_widths),
                             )
@@ -2933,7 +1660,7 @@ impl Viewer {
                         TrackSnapshotData::Variants(records) => {
                             layout_variants(
                                 &records.records,
-                                self.panels.active().viewport,
+                                source_viewport,
                                 options,
                                 &member.variant,
                             )
@@ -2965,13 +1692,7 @@ impl Viewer {
                                     composite_member: None,
                                 });
                             }
-                            layout_gwas(
-                                &query.records,
-                                self.panels.active().viewport,
-                                options,
-                                &member.gwas,
-                            )
-                            .0
+                            layout_gwas(&query.records, source_viewport, options, &member.gwas).0
                         }
                         TrackSnapshotData::Quantitative(_) => {
                             let shared_range = (member.quantitative.scale_mode
@@ -2980,7 +1701,7 @@ impl Viewer {
                                     shared_quantitative_range(
                                         &effective_auxiliary_configs,
                                         &self.panels.active().track_snapshots,
-                                        self.panels.active().viewport,
+                                        source_viewport,
                                         member.quantitative.scale_transform,
                                         member.quantitative.scale_group,
                                     )
@@ -2989,14 +1710,14 @@ impl Viewer {
                             quantitative_display_records(
                                 member,
                                 &self.panels.active().track_snapshots,
-                                self.panels.active().viewport,
+                                source_viewport,
                             )
                             .map_or_else(
                                 DisplayList::default,
                                 |records| {
                                     layout_quantitative(
                                         &records,
-                                        self.panels.active().viewport,
+                                        source_viewport,
                                         options,
                                         &member.quantitative,
                                         shared_range,
@@ -3018,7 +1739,7 @@ impl Viewer {
                                 .flatten();
                             let layout = layout_copy_number(
                                 query,
-                                self.panels.active().viewport,
+                                source_viewport,
                                 options,
                                 &effective_copy_number_settings,
                                 &member.quantitative,
@@ -3052,7 +1773,7 @@ impl Viewer {
                         TrackSnapshotData::Mutations(query) => {
                             let layout = layout_mutations(
                                 query,
-                                self.panels.active().viewport,
+                                source_viewport,
                                 options,
                                 &effective_mutation_settings,
                                 self.panels.annotation_scroll_points
@@ -3080,17 +1801,29 @@ impl Viewer {
                             layout_interactions(
                                 &query.records,
                                 &self.panels.active().contig_name,
-                                self.panels.active().viewport,
+                                source_viewport,
                                 options,
                                 &member.interaction,
                             )
                             .0
                         }
                     };
-                    annotation_display
-                        .rectangles
-                        .extend(track_display.rectangles);
-                    annotation_display.texts.extend(track_display.texts);
+                    context_lane_drafts.push(ContextLaneDraft {
+                        key: ContextLaneKey::Auxiliary(member.id),
+                        generation: self
+                            .panels
+                            .active()
+                            .track_snapshot_generations
+                            .get(&member.id)
+                            .copied()
+                            .expect(
+                                "every installed contextual snapshot carries its source generation",
+                            ),
+                        source_viewport,
+                        frame_key: TrackFrameKey::Auxiliary(config.id),
+                        frame_top: top,
+                        display: track_display,
+                    });
                 }
             }
             self.panels.active_mut().track_frames.push(TrackFrame {
@@ -3220,6 +1953,10 @@ impl Viewer {
                 .retain(|frame| frame.channel != ui::TrackPane::Annotation);
             annotation_display = DisplayList::default();
             pinned_display = DisplayList::default();
+            visible_context_lanes.clear();
+            context_lane_drafts.clear();
+            pending_context_lanes.clear();
+            unavailable_context_lanes.clear();
             top = annotation_clip_top;
         }
         self.panels
@@ -3231,8 +1968,45 @@ impl Viewer {
                     .then_with(|| left.top.total_cmp(&right.top))
                     .then_with(|| left.bottom.total_cmp(&right.bottom))
             });
+        {
+            let frames = self.panels.active().track_frames.clone();
+            let coherence_groups =
+                context_lane_coherence_groups(&effective_auxiliary_configs, &visible_context_lanes);
+            let panel = self.panels.active_mut();
+            panel.context_scene.reconcile(
+                generation,
+                target_viewport,
+                &visible_context_lanes,
+                context_lane_drafts,
+                &pending_context_lanes,
+                &unavailable_context_lanes,
+                &coherence_groups,
+            );
+            panel
+                .context_scene
+                .project_content(target_viewport, &frames);
+        }
+        let mut annotation_semantic_display = annotation_display.clone();
+        annotation_semantic_display.rectangles.extend(
+            self.panels
+                .active()
+                .context_scene
+                .projected
+                .rectangles
+                .iter()
+                .copied(),
+        );
+        annotation_semantic_display.texts.extend(
+            self.panels
+                .active()
+                .context_scene
+                .projected
+                .texts
+                .iter()
+                .cloned(),
+        );
         let measured_annotation_content_height = (top - annotation_clip_top).max(0.0);
-        let annotation_content_bottom = annotation_display
+        let annotation_content_bottom = annotation_semantic_display
             .rectangles
             .iter()
             .map(|rectangle| rectangle.y + rectangle.height)
@@ -3325,7 +2099,7 @@ impl Viewer {
         }
         let annotation_overview = ui::scrollbar_overview(
             &annotation_frames,
-            &annotation_display,
+            &annotation_semantic_display,
             annotation_clip_top,
             annotation_content_bottom,
             annotation_clip_top,
@@ -3336,7 +2110,6 @@ impl Viewer {
         self.panels.active_mut().scroll_display_cache = Some(PanelScrollDisplayCache {
             annotations: annotation_display,
             pinned: pinned_display,
-            junction_arc_keys,
             annotation_overview,
             annotation_content_bottom,
             annotation_clip_top,
@@ -3371,6 +2144,16 @@ impl Viewer {
             return false;
         };
         let active_panel_id = self.panels.active().id;
+        let native_junction_labels = self
+            .alignment_presented_epoch
+            .as_ref()
+            .and_then(|epoch| epoch.gpu_bundle.as_ref())
+            .filter(|bundle| {
+                alignment_gpu_bundle_is_current(bundle, &self.alignment_scene_publication_authority)
+            })
+            .and_then(|bundle| bundle.summaries.as_ref())
+            .map(|frame| self.alignment_summary_gpu_renderer.junction_labels(frame))
+            .unwrap_or_default();
         let active_drag = self
             .vertical_overview_drag
             .filter(|drag| drag.density_dragging && drag.panel_id == active_panel_id);
@@ -3412,20 +2195,24 @@ impl Viewer {
             })
             .collect::<Vec<_>>();
         let primary_track_id = self.primary_alignment_track_id();
-        let pending_read_reveal =
+        let pending_alignment_reveal =
             self.panels
                 .active()
-                .pending_read_reveal
-                .and_then(|(track_id, record_index)| {
-                    let row = self
-                        .alignment_tracks
-                        .iter()
-                        .find(|track| track.config.id == track_id)?
-                        .projection(active_panel_id)?
-                        .alignment_rows
-                        .as_ref()?
-                        .layout
-                        .row(record_index)?;
+                .pending_alignment_reveal
+                .and_then(|(track_id, handle)| {
+                    let presented = self.presented_alignment_lane(active_panel_id, track_id)?;
+                    let row = usize::try_from(
+                        presented
+                            .lane
+                            .snapshot
+                            .as_ref()?
+                            .reads()
+                            .atlas()
+                            .record(handle)?
+                            .record
+                            .row(),
+                    )
+                    .ok()?;
                     Some((track_id, row))
                 });
         let annotation_scroll = if self.track_presentation.annotation_section_expanded {
@@ -3446,7 +2233,7 @@ impl Viewer {
             .pane_layout
             .annotation
             .reproject_scroll(annotation_scroll);
-        let legacy_primary = ReadPanelScrollState {
+        let compatibility_primary = ReadPanelScrollState {
             scroll_points: panel.vertical_scroll_points,
             content_origin_points: panel.vertical_content_origin_points,
             latent_scroll_fraction: panel.latent_vertical_scroll_fraction,
@@ -3472,7 +2259,7 @@ impl Viewer {
                 .entry(*track_id)
                 .or_insert_with(|| {
                     if *track_id == primary_track_id {
-                        legacy_primary
+                        compatibility_primary
                     } else {
                         ReadPanelScrollState::default()
                     }
@@ -3499,7 +2286,7 @@ impl Viewer {
             }
             let maximum_scroll = (state.content_bottom_points - clip_bottom).max(0.0);
             if let (Some((reveal_track, row)), Some(row_origin), Some(row_height)) =
-                (pending_read_reveal, *row_origin, *row_height)
+                (pending_alignment_reveal, *row_origin, *row_height)
                 && reveal_track == *track_id
             {
                 let maximum_effective = (maximum_scroll - state.content_origin_points).max(0.0);
@@ -3514,7 +2301,7 @@ impl Viewer {
                 state.scroll_points = state.content_origin_points + effective_scroll;
                 state.latent_scroll_fraction = (maximum_scroll > f32::EPSILON)
                     .then_some((state.scroll_points / maximum_scroll).clamp(0.0, 1.0));
-                panel.pending_read_reveal = None;
+                panel.pending_alignment_reveal = None;
             }
             if let Some((row_height, coordinate_space)) = exact_row_camera
                 && row_height > f32::EPSILON
@@ -3586,6 +2373,18 @@ impl Viewer {
             panel_rect.left(),
             panel_rect.right(),
         );
+        display.texts.extend(
+            native_junction_labels
+                .into_iter()
+                .filter(|label| label.coherence_scope == active_panel_id.get())
+                .map(|label| rgv_layout::TextPrimitive {
+                    x: label.x as f32,
+                    y: label.y as f32,
+                    text: label.text,
+                    font_size: 10.0,
+                    color: Rgba::new(0.10, 0.10, 0.12, 0.94),
+                }),
+        );
         let (interaction_enabled, content_revision) = {
             let presentation = &self.panels.active().navigation_presentation;
             (
@@ -3593,49 +2392,17 @@ impl Viewer {
                 presentation.committed_content_revision,
             )
         };
-        let mut junction_arc_targets =
-            std::mem::take(&mut self.panels.active_mut().junction_arc_targets);
-        junction_arc_targets.clear();
-        let junction_arc_keys = &self
-            .panels
-            .active()
-            .scroll_display_cache
-            .as_ref()
-            .expect("scroll display cache was observed above")
-            .junction_arc_keys;
-        for (draw_order, rectangle) in display.rectangles.iter_mut().enumerate() {
-            if !rectangle.shape.is_junction_arc() {
-                continue;
-            }
-            let interaction_token = std::mem::take(&mut rectangle.object_id);
-            if !interaction_enabled || interaction_token == 0 {
-                continue;
-            }
-            let Some(key) = junction_arc_keys.get(&interaction_token).copied() else {
-                continue;
-            };
-            junction_arc_targets.push(ComposedJunctionArcTarget {
-                key,
-                primitive: *rectangle,
-                stroke_width: junction_arc_stroke_width(rectangle.height),
-                draw_order: u32::try_from(draw_order).unwrap_or(u32::MAX),
-                interaction_token,
-                content_revision,
-            });
-        }
         let previous_hover = self.panels.active().hovered_junction_arc;
-        let valid_hover = previous_hover.and_then(|hover| {
-            if hover.content_revision != content_revision {
-                return None;
-            }
-            junction_arc_targets
-                .iter()
-                .find(|target| target.key == hover.key)
-                .map(|target| JunctionArcHover {
-                    interaction_token: target.interaction_token,
-                    ..hover
-                })
+        let native_hover_authority = previous_hover.is_some_and(|hover| {
+            self.native_junction_lane_is_present(active_panel_id, hover.key.track_id)
         });
+        let valid_hover = (interaction_enabled && native_hover_authority)
+            .then_some(previous_hover)
+            .flatten()
+            .map(|hover| JunctionArcHover {
+                content_revision,
+                ..hover
+            });
         if valid_hover != previous_hover {
             self.panels.active_mut().hovered_junction_arc = valid_hover;
             self.window.set_cursor(if valid_hover.is_some() {
@@ -3652,31 +2419,28 @@ impl Viewer {
                 self.panels.active_mut().hover_inspector_target = None;
             }
         }
-        let panel = self.panels.active();
-        let hovered_junction_arc = panel.hovered_junction_arc;
-        let hover_overlay_count = hovered_junction_arc.map_or(0, |hover| {
-            junction_arc_targets
-                .iter()
-                .filter(|target| {
-                    hover.content_revision == target.content_revision && hover.key == target.key
-                })
-                .count()
-        });
-        let selected_alignment_track = panel.selected_alignment_track;
-        let selected_junction = panel.selected_junction;
-        let selected_junction_component = panel.selected_junction_component;
-        append_sashimi_interaction_overlays(
-            &mut display,
-            &junction_arc_targets,
-            hovered_junction_arc,
-            selected_alignment_track,
-            selected_junction,
-            selected_junction_component,
-        );
         self.sashimi_interaction_diagnostics
-            .latest_hover_overlay_count = hover_overlay_count;
-        self.panels.active_mut().junction_arc_targets = junction_arc_targets;
+            .latest_hover_overlay_count = usize::from(valid_hover.is_some());
         self.add_region_overlays(&mut display);
+        let generic_display = display.clone();
+        let mut contextual_display = DisplayList::default();
+        self.panels
+            .active()
+            .context_scene
+            .projected
+            .append_scrolled_and_clipped_vertical(
+                annotation_scroll,
+                annotation_clip_top,
+                annotation_clip_bottom,
+                &mut contextual_display,
+            );
+        contextual_display.translate_and_clip_horizontal(
+            panel_rect.left(),
+            panel_rect.left(),
+            panel_rect.right(),
+        );
+        display.rectangles.extend(contextual_display.rectangles);
+        display.texts.extend(contextual_display.texts);
         let capacity_grew = display.rectangles.capacity() > rectangle_capacity
             || display.texts.capacity() > text_capacity;
         if let Some(started) = trace_started {
@@ -3687,7 +2451,9 @@ impl Viewer {
                 capacity_grew,
             );
         }
-        self.panels.active_mut().display_list = display;
+        let panel = self.panels.active_mut();
+        panel.generic_display_list = generic_display;
+        panel.display_list = display;
         true
     }
 
@@ -3702,6 +2468,29 @@ impl Viewer {
             || !self.active_panel_materialization_covers_scroll()
             || !self.rebuild_active_panel_from_scroll_cache()
         {
+            return false;
+        }
+        self.composite_display_list = composite_panel_display_lists(&self.panels);
+        self.prepare_rectangle_renderer();
+        true
+    }
+
+    /// Reprojects immutable contextual-lane leases under the desired genomic camera. This is the
+    /// horizontal-navigation hot path: it performs no source query, parsing, feature packing, or
+    /// label measurement. Each lane retains independent readiness and contributes only its own
+    /// geometry.
+    pub(crate) fn reproject_active_context_lanes(&mut self) -> bool {
+        if self.synthetic || self.panels.active().scroll_display_cache.is_none() {
+            return false;
+        }
+        let target = self.panels.active().viewport;
+        let frames = self.panels.active().track_frames.clone();
+        {
+            let panel = self.panels.active_mut();
+            panel.context_scene.update_target_readiness(target);
+            panel.context_scene.project_content(target, &frames);
+        }
+        if !self.rebuild_active_panel_from_scroll_cache() {
             return false;
         }
         self.composite_display_list = composite_panel_display_lists(&self.panels);
@@ -3909,23 +2698,9 @@ impl Viewer {
     pub(crate) fn rebuild_all_panel_displays(&mut self) {
         let active_id = self.panels.active().id;
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
-        // Source-backed alignment cameras are derived from committed pane geometry. On the first
-        // load there is no retained presentation to preserve and no track-frame geometry yet, so
-        // refusing every display rebuild creates a cycle: navigation waits for data, data waits
-        // for a camera, and the camera waits for layout. Permit exactly that empty-layout
-        // bootstrap while retaining the normal transactional gate once a panel has a layout.
-        let rebuildable_panel_ids = panel_ids
-            .iter()
-            .copied()
-            .filter(|panel_id| {
-                self.panels.get(*panel_id).is_some_and(|panel| {
-                    panel_display_rebuild_allowed(
-                        panel.navigation_presentation.phase,
-                        !panel.track_frames.is_empty(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
+        // Alignment and contextual lanes publish independently. No panel-wide transaction may
+        // prevent a ready lane from rebuilding its own presentation.
+        let rebuildable_panel_ids = panel_ids;
         let requested_annotation_scroll = self.panels.annotation_scroll_points;
         self.shared_annotation_frame_heights.clear();
         for panel_id in &rebuildable_panel_ids {
@@ -4137,10 +2912,11 @@ impl Viewer {
     }
 
     fn prepare_rectangle_renderer(&mut self) {
+        self.prepare_context_scene_renderer();
         // Layout and row-scene residency may have changed while rebuilding the
         // display. Give the GPU tier precisely the currently unused headroom
         // before admitting or reusing a slab.
-        self.rebalance_live_cache_coordinator();
+        self.refresh_alignment_scene_budget();
         let trace_started = self.interaction_trace.is_active().then(Instant::now);
         if trace_started.is_some() {
             self.interaction_trace
@@ -4148,45 +2924,10 @@ impl Viewer {
         }
         let logical_height = self.surface_config.height as f32 / self.window.scale_factor() as f32;
         let logical_width = self.surface_config.width as f32 / self.window.scale_factor() as f32;
-        let mut render_display = DisplayList::default();
+        let render_display = composite_panel_generic_display_lists(&self.panels);
         let mut rectangle_slab_key = 0xcbf2_9ce4_8422_2325_u64;
-        let primary_track_id = self.primary_alignment_track_id();
-        let active_panel_id = self.panels.active().id;
-        for panel in self.panels.iter() {
-            let source = if matches!(
-                panel.navigation_presentation.preview_kind,
-                Some(NavigationPreviewKind::CompleteHorizon)
-            ) && panel.navigation_presentation.shows_retained_preview()
-            {
-                panel.navigation_provisional_display.as_ref()
-            } else {
-                Some(&panel.display_list)
-            };
-            if let Some(source) = source {
-                let selected_object_id = (panel.navigation_presentation.is_interactive()
-                    && panel.selected_alignment_track == Some(primary_track_id))
-                .then_some(panel.selected_record)
-                .flatten()
-                .and_then(|index| u32::try_from(index + 1).ok());
-                let hovered_object_id = (panel.id == active_panel_id
-                    && panel.navigation_presentation.is_interactive())
-                .then_some(panel.hovered_record)
-                .flatten()
-                .filter(|(track_id, _)| *track_id == primary_track_id)
-                .and_then(|(_, index)| u32::try_from(index + 1).ok());
-                render_display
-                    .rectangles
-                    .extend(source.rectangles.iter().copied().map(|mut rectangle| {
-                        let selected = selected_object_id
-                            .is_some_and(|object_id| rectangle.object_id == object_id);
-                        let hovered = hovered_object_id
-                            .is_some_and(|object_id| rectangle.object_id == object_id);
-                        rectangle.color =
-                            read_interaction_highlight_color(rectangle.color, selected, hovered);
-                        mix_rectangle_slab_key(&mut rectangle_slab_key, rectangle);
-                        rectangle
-                    }));
-            }
+        for rectangle in &render_display.rectangles {
+            mix_rectangle_slab_key(&mut rectangle_slab_key, *rectangle);
         }
         self.rectangle_renderer.prepare_with_slab_key(
             &self.device,
@@ -4196,11 +2937,11 @@ impl Viewer {
             None,
             None,
             Some(rectangle_slab_key),
-            self.cache_budgets.gpu_buffers,
+            self.context_lane_gpu_budget_bytes,
         );
         // A newly admitted slab becomes part of the next decoded/layout
         // allowance immediately rather than waiting for another interaction.
-        self.rebalance_live_cache_coordinator();
+        self.refresh_alignment_scene_budget();
         if let Some(started) = trace_started {
             let stats = self.rectangle_renderer.last_prepare_stats();
             self.interaction_trace.record_renderer_prepare(
@@ -4213,6 +2954,141 @@ impl Viewer {
             );
         }
         self.display_upload_pending_metrics = true;
+    }
+
+    fn prepare_context_scene_renderer(&mut self) {
+        let scale_factor = self.window.scale_factor() as f32;
+        let logical_height = self.surface_config.height as f32 / scale_factor.max(f32::EPSILON);
+        let logical_width = self.surface_config.width as f32 / scale_factor.max(f32::EPSILON);
+        let annotation_scroll = self.panels.annotation_scroll_points;
+        let surface_width = self.surface_config.width;
+        let surface_height = self.surface_config.height;
+        let requests = self
+            .panels
+            .iter()
+            .flat_map(|panel| {
+                let Some(panel_layout) = self.workspace_layout.panel(panel.id) else {
+                    return Vec::new().into_iter();
+                };
+                let Some(cache) = panel.scroll_display_cache.as_ref() else {
+                    return Vec::new().into_iter();
+                };
+                panel
+                    .context_scene
+                    .gpu_publications()
+                    .filter_map(|publication| {
+                        let desired = publication.desired;
+                        if !desired
+                            .source_viewport
+                            .interval()
+                            .overlaps(panel.viewport.interval())
+                        {
+                            return None;
+                        }
+                        let camera_for = |lease: &ContextLaneLease| {
+                            let frame = panel
+                                .track_frames
+                                .iter()
+                                .find(|frame| frame.key == lease.frame_key)?;
+                            let lane_top =
+                                (frame.top - annotation_scroll).max(cache.annotation_clip_top);
+                            let lane_bottom = (frame.bottom - annotation_scroll)
+                                .min(cache.annotation_clip_bottom);
+                            let logical_clip = egui::Rect::from_min_max(
+                                egui::pos2(panel_layout.canvas.left(), lane_top),
+                                egui::pos2(panel_layout.canvas.right(), lane_bottom.max(lane_top)),
+                            );
+                            let physical = self.workspace_layout.physical_rect_scissor(
+                                logical_clip,
+                                scale_factor,
+                                surface_width,
+                                surface_height,
+                            );
+                            Some(ContextSceneGpuCamera {
+                                source_exact_start: lease.source_viewport.exact_start(),
+                                source_bases_per_pixel: lease.source_viewport.bases_per_pixel(),
+                                target_exact_start: panel.viewport.exact_start(),
+                                target_bases_per_pixel: panel.viewport.bases_per_pixel(),
+                                panel_left: panel_layout.canvas.left(),
+                                frame_top: frame.top,
+                                vertical_scroll: annotation_scroll,
+                                scissor: ContextSceneGpuScissor {
+                                    x: physical.x,
+                                    y: physical.y,
+                                    width: physical.width,
+                                    height: physical.height,
+                                },
+                                selected_object_id: None,
+                                hovered_object_id: None,
+                            })
+                        };
+                        let camera = camera_for(desired)?;
+                        let retained = publication.retained.and_then(|lease| {
+                            lease
+                                .source_viewport
+                                .interval()
+                                .overlaps(panel.viewport.interval())
+                                .then(|| camera_for(lease))
+                                .flatten()
+                                .map(|camera| ContextSceneGpuRetainedLaneRequest {
+                                    content_revision: lease.revision,
+                                    camera,
+                                    rectangles: &lease.display.rectangles,
+                                })
+                        });
+                        Some(ContextSceneGpuLaneRequest {
+                            key: ContextSceneGpuLaneKey::new(
+                                panel.id.get(),
+                                desired.key.numeric_id(),
+                            ),
+                            content_revision: desired.revision,
+                            camera,
+                            rectangles: &desired.display.rectangles,
+                            retained,
+                            coherence_group: publication.coherence_group.map(|group| {
+                                ContextSceneGpuCoherenceKey::new(panel.id.get(), group)
+                            }),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
+            .collect::<Vec<_>>();
+        let report = self.context_scene_gpu_renderer.prepare(
+            &self.device,
+            &self.queue,
+            [logical_width, logical_height],
+            &requests,
+            self.context_lane_gpu_budget_bytes,
+        );
+        drop(requests);
+
+        let mut semantic_projection_changed = false;
+        for panel in self.panels.iter_mut() {
+            semantic_projection_changed |= panel.context_scene.apply_gpu_publication(
+                panel.id,
+                panel.viewport,
+                &report.frame,
+                &report.rejections,
+            );
+        }
+        self.context_scene_gpu_frame = report.frame;
+        if semantic_projection_changed {
+            let active_id = self.panels.active().id;
+            let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+            for panel_id in panel_ids {
+                self.panels.activate(panel_id);
+                let target = self.panels.active().viewport;
+                let frames = self.panels.active().track_frames.clone();
+                self.panels
+                    .active_mut()
+                    .context_scene
+                    .project_content(target, &frames);
+                let _ = self.rebuild_active_panel_from_scroll_cache();
+            }
+            self.panels.activate(active_id);
+            self.composite_display_list = composite_panel_display_lists(&self.panels);
+        }
     }
 }
 
@@ -4234,20 +3110,4 @@ fn mix_rectangle_slab_key(hash: &mut u64, rectangle: RectPrimitive) {
             *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
-}
-
-pub(crate) fn read_interaction_highlight_color(color: Rgba, selected: bool, hovered: bool) -> Rgba {
-    let (target, amount) = if selected {
-        ([0.16, 0.42, 0.92], 0.58)
-    } else if hovered {
-        ([0.28, 0.52, 0.94], 0.26)
-    } else {
-        return color;
-    };
-    Rgba::new(
-        color.red * (1.0 - amount) + target[0] * amount,
-        color.green * (1.0 - amount) + target[1] * amount,
-        color.blue * (1.0 - amount) + target[2] * amount,
-        1.0,
-    )
 }

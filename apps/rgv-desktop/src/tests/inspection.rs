@@ -1,5 +1,4 @@
 use super::super::*;
-use rgv_layout::RectShape;
 
 #[test]
 fn pathological_cigar_is_summarized_without_losing_exact_copy_text() {
@@ -33,291 +32,6 @@ fn ordinary_cigar_remains_inline() {
 }
 
 #[test]
-fn pileup_pointer_maps_canvas_pixels_to_an_exact_query_bin() {
-    let interval = GenomicInterval::new(ContigId::new(0), 100, 104).unwrap();
-    let query = AlignmentQuery {
-        interval,
-        header: Arc::default(),
-        batch: rgv_hts::AlignmentBatch::default(),
-        pileup: rgv_hts::PileupSummary::from_depths([1; 4]),
-        junctions: rgv_hts::JunctionSummary::default(),
-        pairs: rgv_hts::PairSummary::default(),
-        reference: None,
-        stats: QueryStats::default(),
-    };
-    let viewport = Viewport::new(interval, 400.0).unwrap();
-    let canvas = egui::Rect::from_min_max(egui::pos2(50.0, 100.0), egui::pos2(450.0, 300.0));
-    assert_eq!(
-        pileup_position_from_pointer(&query, viewport, canvas, egui::pos2(250.0, 180.0)),
-        Some(102)
-    );
-    assert_eq!(
-        pileup_position_from_pointer(&query, viewport, canvas, egui::pos2(20.0, 180.0)),
-        None
-    );
-}
-
-#[test]
-fn modification_pointer_maps_canvas_pixels_even_when_only_errors_were_aggregated() {
-    let interval = GenomicInterval::new(ContigId::new(0), 100, 104).unwrap();
-    let mut pileup = rgv_hts::PileupSummary::from_depths([1; 4]);
-    pileup.modifications.bin_count = 4;
-    pileup.modifications.provenance.malformed_records = 1;
-    let query = AlignmentQuery {
-        interval,
-        header: Arc::default(),
-        batch: rgv_hts::AlignmentBatch::default(),
-        pileup,
-        junctions: rgv_hts::JunctionSummary::default(),
-        pairs: rgv_hts::PairSummary::default(),
-        reference: None,
-        stats: QueryStats::default(),
-    };
-    let viewport = Viewport::new(interval, 400.0).unwrap();
-    let canvas = egui::Rect::from_min_max(egui::pos2(50.0, 100.0), egui::pos2(450.0, 300.0));
-    assert_eq!(
-        modification_position_from_pointer(&query, viewport, canvas, egui::pos2(250.0, 180.0)),
-        Some(102)
-    );
-    assert_eq!(
-        modification_position_from_pointer(&query, viewport, canvas, egui::pos2(20.0, 180.0)),
-        None
-    );
-}
-
-fn test_junction_arc_target(
-    track_id: TrackId,
-    start: u64,
-    component: JunctionArcComponent,
-    primitive: RectPrimitive,
-    draw_order: u32,
-    content_revision: u64,
-) -> ComposedJunctionArcTarget {
-    ComposedJunctionArcTarget {
-        key: JunctionArcKey {
-            track_id,
-            start,
-            end: start + 100,
-            component,
-        },
-        primitive,
-        stroke_width: junction_arc_stroke_width(primitive.height),
-        draw_order,
-        interaction_token: draw_order + 1,
-        content_revision,
-    }
-}
-
-fn test_up_arc(y: f32, height: f32) -> RectPrimitive {
-    RectPrimitive {
-        x: 20.0,
-        y,
-        width: 100.0,
-        height,
-        color: Rgba::new(0.84, 0.30, 0.38, 0.82),
-        object_id: 0,
-        shape: RectShape::JunctionArcUp,
-    }
-}
-
-fn arc_apex(primitive: RectPrimitive) -> egui::Pos2 {
-    let stroke = junction_arc_stroke_width(primitive.height);
-    let y = if primitive.shape.is_junction_arc_up() {
-        primitive.y + stroke * 0.5
-    } else {
-        primitive.y + primitive.height - stroke * 0.5
-    };
-    egui::pos2(primitive.x + primitive.width * 0.5, y)
-}
-
-#[test]
-fn junction_selection_uses_pointer_y_and_nearest_visible_curve() {
-    let track = TrackId::new(7);
-    let broad = test_junction_arc_target(
-        track,
-        100,
-        JunctionArcComponent::Positive,
-        test_up_arc(0.0, 40.0),
-        1,
-        9,
-    );
-    let shallow = test_junction_arc_target(
-        track,
-        200,
-        JunctionArcComponent::Unknown,
-        test_up_arc(20.0, 12.0),
-        2,
-        9,
-    );
-    let targets = [broad, shallow];
-
-    assert_eq!(
-        junction_arc_target_at_point(&targets, track, arc_apex(shallow.primitive), None, 9)
-            .unwrap()
-            .key,
-        shallow.key,
-        "a visually shallow curve must not be stolen by a broader prominent arc"
-    );
-    assert_eq!(
-        junction_arc_target_at_point(&targets, track, arc_apex(broad.primitive), None, 9)
-            .unwrap()
-            .key,
-        broad.key,
-        "the same screen X must resolve differently at the broad curve's Y"
-    );
-}
-
-#[test]
-fn junction_selection_uses_draw_order_then_semantic_key_for_exact_ties() {
-    let track = TrackId::new(7);
-    let primitive = test_up_arc(0.0, 20.0);
-    let lower =
-        test_junction_arc_target(track, 100, JunctionArcComponent::Positive, primitive, 1, 9);
-    let upper =
-        test_junction_arc_target(track, 200, JunctionArcComponent::Positive, primitive, 2, 9);
-    assert_eq!(
-        junction_arc_target_at_point(&[lower, upper], track, arc_apex(primitive), None, 9)
-            .unwrap()
-            .key,
-        upper.key
-    );
-
-    let semantic_first = ComposedJunctionArcTarget {
-        draw_order: 2,
-        ..lower
-    };
-    assert_eq!(
-        junction_arc_target_at_point(
-            &[upper, semantic_first],
-            track,
-            arc_apex(primitive),
-            None,
-            9,
-        )
-        .unwrap()
-        .key,
-        semantic_first.key
-    );
-}
-
-#[test]
-fn junction_hover_hysteresis_retains_then_transfers_the_current_target() {
-    let track = TrackId::new(7);
-    let first = test_junction_arc_target(
-        track,
-        100,
-        JunctionArcComponent::Positive,
-        test_up_arc(0.0, 16.0),
-        1,
-        9,
-    );
-    let coincident = test_junction_arc_target(
-        track,
-        200,
-        JunctionArcComponent::Unknown,
-        first.primitive,
-        2,
-        9,
-    );
-    let current = JunctionArcHover {
-        key: first.key,
-        interaction_token: first.interaction_token,
-        distance_points: 0.0,
-        content_revision: 9,
-    };
-    assert_eq!(
-        junction_arc_target_at_point(
-            &[first, coincident],
-            track,
-            arc_apex(first.primitive),
-            Some(current),
-            9,
-        )
-        .unwrap()
-        .key,
-        first.key,
-        "a current target within its exit radius must not flicker at a tie"
-    );
-
-    let distant = test_junction_arc_target(
-        track,
-        300,
-        JunctionArcComponent::Negative,
-        RectPrimitive {
-            y: 50.0,
-            shape: RectShape::JunctionArcDown,
-            ..first.primitive
-        },
-        3,
-        9,
-    );
-    assert_eq!(
-        junction_arc_target_at_point(
-            &[first, distant],
-            track,
-            arc_apex(distant.primitive),
-            Some(current),
-            9,
-        )
-        .unwrap()
-        .key,
-        distant.key,
-        "leaving the exit radius must transfer acquisition promptly"
-    );
-}
-
-#[test]
-fn junction_selection_rejects_other_tracks_and_stale_revisions() {
-    let track = TrackId::new(7);
-    let target = test_junction_arc_target(
-        track,
-        100,
-        JunctionArcComponent::Positive,
-        test_up_arc(0.0, 20.0),
-        1,
-        9,
-    );
-    let point = arc_apex(target.primitive);
-    assert!(junction_arc_target_at_point(&[target], TrackId::new(8), point, None, 9).is_none());
-    assert!(junction_arc_target_at_point(&[target], track, point, None, 10).is_none());
-    assert!(junction_arc_target_at_point(&[], track, point, None, 9).is_none());
-}
-
-#[test]
-fn junction_probe_distinguishes_published_targets_from_a_curve_distance_miss() {
-    let track = TrackId::new(7);
-    let target = test_junction_arc_target(
-        track,
-        100,
-        JunctionArcComponent::Positive,
-        test_up_arc(0.0, 20.0),
-        1,
-        9,
-    );
-    let miss = egui::pos2(
-        target.primitive.x + target.primitive.width * 0.5,
-        target.primitive.y + target.primitive.height,
-    );
-
-    let result = junction_arc_hit_test_at_point(&[target], track, miss, None, 9);
-
-    assert_eq!(result.gate, SashimiHitTestGate::Tested);
-    assert_eq!(result.lane_track_id, Some(track));
-    assert_eq!(result.total_targets, 1);
-    assert_eq!(result.track_targets, 1);
-    assert_eq!(result.current_revision_targets, 1);
-    assert_eq!(result.bounds_candidates, 1);
-    assert_eq!(result.curve_evaluations, 1);
-    assert!(result.hover.is_none());
-    assert!(result.nearest_curve_distance.is_some());
-    assert!(result.nearest_acquisition_radius.is_some());
-    assert!(
-        result.nearest_curve_distance.unwrap() > result.nearest_acquisition_radius.unwrap(),
-        "a diagnostic miss must preserve the measured distance and acquisition threshold"
-    );
-}
-
-#[test]
 fn junction_inspector_names_the_focused_component_and_its_support() {
     let junction = rgv_hts::JunctionEvidence {
         positive_depth: 7,
@@ -345,125 +59,6 @@ fn junction_inspector_names_the_focused_component_and_its_support() {
             &junction,
         ),
         "unknown strand · 2 supporting reads"
-    );
-}
-
-#[test]
-fn opposite_strand_components_with_shared_endpoints_are_individually_acquired() {
-    let track = TrackId::new(7);
-    let up = test_junction_arc_target(
-        track,
-        100,
-        JunctionArcComponent::Positive,
-        test_up_arc(0.0, 20.0),
-        1,
-        9,
-    );
-    let down = test_junction_arc_target(
-        track,
-        100,
-        JunctionArcComponent::Negative,
-        RectPrimitive {
-            shape: RectShape::JunctionArcDown,
-            ..up.primitive
-        },
-        2,
-        9,
-    );
-    assert_eq!(
-        junction_arc_target_at_point(&[up, down], track, arc_apex(up.primitive), None, 9)
-            .unwrap()
-            .key
-            .component,
-        JunctionArcComponent::Positive
-    );
-    assert_eq!(
-        junction_arc_target_at_point(&[up, down], track, arc_apex(down.primitive), None, 9)
-            .unwrap()
-            .key
-            .component,
-        JunctionArcComponent::Negative
-    );
-}
-
-#[test]
-fn thin_and_thick_junction_arcs_share_the_minimum_acquisition_comfort() {
-    let track = TrackId::new(7);
-    for (index, height) in [3.0, 40.0].into_iter().enumerate() {
-        let target = test_junction_arc_target(
-            track,
-            100 + index as u64 * 200,
-            JunctionArcComponent::Positive,
-            test_up_arc(0.0, height),
-            index as u32,
-            9,
-        );
-        let mut point = arc_apex(target.primitive);
-        point.y += JUNCTION_ARC_MINIMUM_ACQUISITION_RADIUS - 0.1;
-        assert!(junction_arc_target_at_point(&[target], track, point, None, 9).is_some());
-    }
-}
-
-#[test]
-#[ignore = "release-only Sashimi hard-cap performance gate"]
-fn maximum_density_junction_hit_test_stays_below_half_a_millisecond_at_p95() {
-    const SAMPLE_COUNT: usize = 201;
-    const P95_LIMIT_NANOS: u128 = 500_000;
-    let track = TrackId::new(7);
-    let primitive = test_up_arc(0.0, 40.0);
-    let components = [
-        JunctionArcComponent::Positive,
-        JunctionArcComponent::Negative,
-        JunctionArcComponent::Unknown,
-    ];
-    let mut targets = Vec::with_capacity(rgv_layout::MAX_RENDERED_JUNCTIONS * components.len());
-    for index in 0..rgv_layout::MAX_RENDERED_JUNCTIONS {
-        for (component_index, component) in components.into_iter().enumerate() {
-            let draw_order = u32::try_from(index * components.len() + component_index).unwrap();
-            targets.push(test_junction_arc_target(
-                track,
-                100 + index as u64 * 200,
-                component,
-                RectPrimitive {
-                    shape: if component == JunctionArcComponent::Negative {
-                        RectShape::JunctionArcDown
-                    } else {
-                        RectShape::JunctionArcUp
-                    },
-                    ..primitive
-                },
-                draw_order,
-                9,
-            ));
-        }
-    }
-    let point = arc_apex(primitive);
-    std::hint::black_box(junction_arc_hit_test_at_point(
-        &targets, track, point, None, 9,
-    ));
-
-    let mut durations = [0_u128; SAMPLE_COUNT];
-    for duration in &mut durations {
-        let started = std::time::Instant::now();
-        std::hint::black_box(junction_arc_hit_test_at_point(
-            &targets, track, point, None, 9,
-        ));
-        *duration = started.elapsed().as_nanos();
-    }
-    durations.sort_unstable();
-    let median = durations[(SAMPLE_COUNT - 1) / 2];
-    let p95 = durations[((SAMPLE_COUNT - 1) * 95) / 100];
-    let maximum = durations[SAMPLE_COUNT - 1];
-    eprintln!(
-        "Sashimi hard-cap hit test: median {:.3} ms, p95 {:.3} ms, max {:.3} ms",
-        median as f64 / 1_000_000.0,
-        p95 as f64 / 1_000_000.0,
-        maximum as f64 / 1_000_000.0,
-    );
-    assert!(
-        p95 < P95_LIMIT_NANOS,
-        "hard-cap nearest-curve p95 was {:.3} ms",
-        p95 as f64 / 1_000_000.0,
     );
 }
 
@@ -505,7 +100,12 @@ fn junction_annotation_requires_adjacent_exons_from_the_same_transcript() {
     }];
     let loaded = GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap();
     let viewport = GenomicInterval::new(ContigId::new(0), 50, 900).unwrap();
-    let context = junction_annotation_context(&configs, &snapshots, Some(loaded), viewport);
+    let context = junction_annotation_context(
+        &configs,
+        &snapshots,
+        &BTreeMap::from([(TrackId::new(7), loaded)]),
+        viewport,
+    );
     assert_eq!(
         context.status(200, 300),
         JunctionAnnotationStatus::Annotated
@@ -513,7 +113,12 @@ fn junction_annotation_requires_adjacent_exons_from_the_same_transcript() {
     assert_eq!(context.labels(200, 300), &["GENE1"]);
     assert_eq!(context.status(400, 500), JunctionAnnotationStatus::Novel);
 
-    let incomplete = junction_annotation_context(&configs, &snapshots, Some(viewport), viewport);
+    let incomplete = junction_annotation_context(
+        &configs,
+        &snapshots,
+        &BTreeMap::from([(TrackId::new(7), viewport)]),
+        viewport,
+    );
     assert_eq!(
         incomplete.status(400, 500),
         JunctionAnnotationStatus::Unknown
@@ -566,7 +171,7 @@ fn rna_exports_preserve_filters_annotation_scaling_and_bounds() {
     let track = SashimiExportTrack {
         id: TrackId::new(1),
         name: "RNA sample".to_owned(),
-        query,
+        junctions: query.junctions.clone(),
         filters,
     };
     let annotations = JunctionAnnotationContext {
@@ -783,7 +388,7 @@ fn variant_alignment_summary_is_observational_and_allele_specific_when_exact() {
 }
 
 #[test]
-fn read_event_selection_and_preview_follow_cigar_coordinates() {
+fn read_event_details_and_preview_follow_cigar_coordinates() {
     let mut bases = vec![b'A'; 5];
     bases.extend(std::iter::repeat_n(b'C', 1_000));
     bases.extend(std::iter::repeat_n(b'G', 5));
@@ -827,27 +432,6 @@ fn read_event_selection_and_preview_follow_cigar_coordinates() {
         auxiliary_fields: Vec::new(),
     };
 
-    assert_eq!(
-        find_read_event(&record, None, 105.1, 0.5, true),
-        Some(ReadEventHit {
-            operation_index: 1,
-            operation_offset: None,
-        })
-    );
-    assert_eq!(
-        find_read_event(&record, None, 200.0, 0.5, true),
-        Some(ReadEventHit {
-            operation_index: 3,
-            operation_offset: None,
-        })
-    );
-    assert_eq!(
-        find_read_event(&record, None, 610.0, 0.5, true),
-        Some(ReadEventHit {
-            operation_index: 4,
-            operation_offset: None,
-        })
-    );
     let insertion = read_event_details(&record, 1, None, None, "chr1").unwrap();
     assert_eq!(
         insertion.copy_sequence.as_deref().map(str::len),
@@ -904,24 +488,6 @@ fn individual_substitution_selection_reports_exact_read_and_reference_evidence()
         auxiliary_fields: Vec::new(),
     };
 
-    assert_eq!(
-        find_read_event(&record, Some(&reference), 104.25, 0.5, true),
-        Some(ReadEventHit {
-            operation_index: 0,
-            operation_offset: Some(4),
-        })
-    );
-    assert_eq!(
-        find_read_event(&record, Some(&reference), 103.25, 0.5, true),
-        None,
-        "a matching base is not a selectable substitution"
-    );
-    assert_eq!(
-        find_read_event(&record, Some(&reference), 104.25, 0.5, false),
-        None,
-        "substitution hit testing follows the visible base-mark threshold"
-    );
-
     let details = read_event_details(&record, 0, Some(4), Some(&reference), "chr1").unwrap();
     for expected in [
         ("Selected event", "Base substitution"),
@@ -942,14 +508,6 @@ fn individual_substitution_selection_reports_exact_read_and_reference_evidence()
 
     let mut explicit = record.clone();
     explicit.cigar[0].kind = CigarOpKind::SequenceMismatch;
-    assert_eq!(
-        find_read_event(&explicit, None, 103.25, 0.5, true),
-        Some(ReadEventHit {
-            operation_index: 0,
-            operation_offset: Some(3),
-        }),
-        "an explicit CIGAR X remains selectable without loaded reference bases"
-    );
     let explicit_details = read_event_details(&explicit, 0, Some(3), None, "chr1").unwrap();
     assert!(explicit_details.fields.contains(&(
         "Substitution evidence".to_owned(),
@@ -960,14 +518,6 @@ fn individual_substitution_selection_reports_exact_read_and_reference_evidence()
         interval,
         bases: vec![b'A'; 10],
     };
-    assert_eq!(
-        find_read_event(&explicit, Some(&conflict_reference), 103.25, 0.5, true),
-        Some(ReadEventHit {
-            operation_index: 0,
-            operation_offset: Some(3),
-        }),
-        "an explicit X that contradicts equal bases remains selectable as a warning"
-    );
     let conflict =
         read_event_details(&explicit, 0, Some(3), Some(&conflict_reference), "chr1").unwrap();
     for expected in [
@@ -1376,57 +926,6 @@ fn custom_style_tags_follow_sam_tag_syntax() {
     assert_eq!(parse_style_tag("X1"), Some(*b"X1"));
     assert_eq!(parse_style_tag("1X"), None);
     assert_eq!(parse_style_tag("ABC"), None);
-    assert_ne!(
-        alignment_color_mode_fingerprint(AlignmentColorMode::Tag(*b"NM")),
-        alignment_color_mode_fingerprint(AlignmentColorMode::Tag(*b"HP"))
-    );
-    let smrt_modes = [
-        SmrtKineticsMode::SubreadIpd,
-        SmrtKineticsMode::SubreadPulseWidth,
-        SmrtKineticsMode::CcsForwardIpd,
-        SmrtKineticsMode::CcsForwardPulseWidth,
-        SmrtKineticsMode::CcsReverseIpd,
-        SmrtKineticsMode::CcsReversePulseWidth,
-    ];
-    let fingerprints = smrt_modes
-        .map(|mode| alignment_color_mode_fingerprint(AlignmentColorMode::SmrtKinetics(mode)));
-    assert_eq!(
-        fingerprints
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        6
-    );
-    let sbx_default = SbxDisplayOptions::default();
-    assert_ne!(
-        alignment_color_mode_fingerprint(AlignmentColorMode::Sbx(sbx_default)),
-        alignment_color_mode_fingerprint(AlignmentColorMode::Sbx(SbxDisplayOptions {
-            simplex_tail_mode: SbxSimplexTailMode::Hide,
-            ..sbx_default
-        }))
-    );
-    let ultima_default = UltimaDisplayOptions::default();
-    assert_ne!(
-        alignment_color_mode_fingerprint(AlignmentColorMode::Ultima(ultima_default)),
-        alignment_color_mode_fingerprint(AlignmentColorMode::Ultima(UltimaDisplayOptions {
-            quality_mode: UltimaQualityMode::Minimum,
-            ..ultima_default
-        }))
-    );
-    assert_ne!(
-        alignment_color_mode_fingerprint(AlignmentColorMode::Ultima(ultima_default)),
-        alignment_color_mode_fingerprint(AlignmentColorMode::Ultima(UltimaDisplayOptions {
-            maximum_homopolymer_length_override: Some(12),
-            ..ultima_default
-        }))
-    );
-    assert_ne!(
-        alignment_color_mode_fingerprint(AlignmentColorMode::Sbx(sbx_default)),
-        alignment_color_mode_fingerprint(AlignmentColorMode::Sbx(SbxDisplayOptions {
-            discordant_quality_maximum: 11,
-            ..sbx_default
-        }))
-    );
 }
 
 #[test]

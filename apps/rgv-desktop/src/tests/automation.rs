@@ -1,145 +1,9 @@
 use super::super::*;
 use crate::automation::auxiliary_position_snapshot_is_current;
 
-fn automation_read_query(
-    eligible_records: usize,
-    emitted_records: usize,
-    limit: usize,
-    individual_reads: IndividualReadStatus,
-) -> AlignmentQuery {
-    AlignmentQuery {
-        interval: GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
-        header: Arc::default(),
-        batch: rgv_hts::AlignmentBatch::default(),
-        pileup: rgv_hts::PileupSummary::default(),
-        junctions: rgv_hts::JunctionSummary::default(),
-        pairs: rgv_hts::PairSummary::default(),
-        reference: None,
-        stats: QueryStats {
-            records_eligible: eligible_records,
-            records_emitted: emitted_records,
-            complete_read_limit: limit,
-            individual_reads,
-            ..QueryStats::default()
-        },
-    }
-}
-
 #[test]
-fn automation_read_presentation_reports_complete_or_zero_records() {
-    let complete = automation_read_query(20, 20, 50_000, IndividualReadStatus::Complete);
-    let foreground_dense = automation_read_query(
-        50_001,
-        0,
-        50_000,
-        IndividualReadStatus::TooDense { limit: 50_000 },
-    );
-    let horizon_dense = automation_read_query(
-        70_000,
-        0,
-        50_000,
-        IndividualReadStatus::TooDense { limit: 50_000 },
-    );
-
-    let admitted = automation_read_presentation_fields(
-        Some(&complete),
-        Some(&complete),
-        ReadStackingMode::Stable,
-        false,
-        false,
-        80_000,
-    );
-    assert_eq!(admitted.state, AutomationReadPresentationState::Complete);
-    assert_eq!(admitted.requested_limit, 80_000);
-    assert_eq!(admitted.effective_limit, 50_000);
-    assert_eq!(admitted.eligible_records, 20);
-    assert_eq!(admitted.complete_records, 20);
-    assert_eq!(admitted.refusal_eligible_records, 0);
-    assert_eq!(admitted.refusal_scope, None);
-
-    let refused = automation_read_presentation_fields(
-        Some(&foreground_dense),
-        Some(&foreground_dense),
-        ReadStackingMode::Compact,
-        false,
-        false,
-        50_000,
-    );
-    assert_eq!(refused.state, AutomationReadPresentationState::TooDense);
-    assert_eq!(refused.eligible_records, 50_001);
-    assert_eq!(refused.complete_records, 0);
-    assert_eq!(refused.refusal_eligible_records, 50_001);
-    assert_eq!(refused.refusal_scope.as_deref(), Some("foreground"));
-
-    let admitted_with_dense_horizon = automation_read_presentation_fields(
-        Some(&complete),
-        Some(&horizon_dense),
-        ReadStackingMode::Stable,
-        false,
-        false,
-        50_000,
-    );
-    assert_eq!(
-        admitted_with_dense_horizon.state,
-        AutomationReadPresentationState::Complete
-    );
-    assert_eq!(admitted_with_dense_horizon.eligible_records, 20);
-    assert_eq!(admitted_with_dense_horizon.complete_records, 20);
-    assert_eq!(admitted_with_dense_horizon.refusal_eligible_records, 0);
-    assert_eq!(admitted_with_dense_horizon.refusal_scope, None);
-
-    let compact = automation_read_presentation_fields(
-        Some(&complete),
-        Some(&horizon_dense),
-        ReadStackingMode::Compact,
-        false,
-        false,
-        50_000,
-    );
-    assert_eq!(compact.state, AutomationReadPresentationState::Complete);
-    assert_eq!(compact.complete_records, 20);
-}
-
-#[test]
-fn automation_read_presentation_prioritises_transitional_and_failure_states() {
-    let complete = automation_read_query(20, 20, 50_000, IndividualReadStatus::Complete);
-    let checking = automation_read_presentation_fields(
-        Some(&complete),
-        Some(&complete),
-        ReadStackingMode::Stable,
-        true,
-        false,
-        50_000,
-    );
-    assert_eq!(checking.state, AutomationReadPresentationState::Checking);
-
-    let failed = automation_read_presentation_fields(
-        Some(&complete),
-        Some(&complete),
-        ReadStackingMode::Stable,
-        true,
-        true,
-        50_000,
-    );
-    assert_eq!(failed.state, AutomationReadPresentationState::Failed);
-
-    let unavailable = automation_read_presentation_fields(
-        None,
-        None,
-        ReadStackingMode::Stable,
-        false,
-        false,
-        50_000,
-    );
-    assert_eq!(
-        unavailable.state,
-        AutomationReadPresentationState::Unavailable
-    );
-}
-
-#[test]
-fn inspector_redesign_keeps_automation_schema_version_four() {
-    assert_eq!(AUTOMATION_SCHEMA_VERSION, 4);
+fn unified_scene_budget_uses_automation_schema_version_six() {
+    assert_eq!(AUTOMATION_SCHEMA_VERSION, 6);
 }
 
 #[test]
@@ -158,7 +22,10 @@ fn settled_auxiliary_snapshot_supports_exact_base_selection_without_refetch() {
         name: "Genes".to_owned(),
         data: TrackSnapshotData::Features(Vec::new()),
     });
-    panel.track_snapshot_interval = Some(interval);
+    panel.track_snapshot_intervals.insert(track_id, interval);
+    panel
+        .track_snapshot_generations
+        .insert(track_id, panel.generation_clock.current().get());
     panel.track_settled_generation = Some(panel.generation_clock.current().get());
 
     assert!(auxiliary_position_snapshot_is_current(
@@ -231,8 +98,8 @@ fn automation_navigation_telemetry_separates_foreground_and_speculative_work() {
         PanelId::new(1),
         interval,
         &AutomationNavigationState {
-            source_queries: 7,
-            speculative_source_queries: 3,
+            source_acquisitions: 7,
+            speculation_submissions: 3,
             ..AutomationNavigationState::default()
         },
         started,
@@ -257,13 +124,12 @@ fn automation_navigation_telemetry_separates_foreground_and_speculative_work() {
         }),
         true,
         &AutomationNavigationState {
-            source_queries: 9,
-            foreground_source_queries: 0,
-            speculative_source_queries: 5,
-            cache_outcome: "ResidentExtension".to_owned(),
-            row_scene_hit: true,
-            row_scene_physical_hit: true,
-            row_scene_projection_micros: 3_100,
+            source_acquisitions: 9,
+            foreground_submissions: 2,
+            speculation_submissions: 5,
+            scene_phase: "committed".to_owned(),
+            camera_only_updates: 4,
+            scene_publications: 1,
         },
     );
 
@@ -271,9 +137,12 @@ fn automation_navigation_telemetry_separates_foreground_and_speculative_work() {
     assert!(sample.complete);
     assert_eq!(sample.input_to_first_presented_frame_ms, Some(8.0));
     assert_eq!(sample.input_to_authoritative_frame_ms, Some(21.0));
-    assert_eq!(sample.foreground_source_queries, 0);
-    assert_eq!(sample.speculative_source_queries, 2);
-    assert_eq!(sample.total_source_queries, 2);
+    assert_eq!(sample.foreground_submissions, 2);
+    assert_eq!(sample.speculation_submissions, 2);
+    assert_eq!(sample.source_acquisitions, 2);
+    assert_eq!(sample.scene_phase, "committed");
+    assert_eq!(sample.camera_only_updates, 4);
+    assert_eq!(sample.scene_publications, 1);
     assert_eq!(sample.gpu_uploaded_bytes, 144);
     assert_eq!(sample.gpu_buffer_reallocations, 1);
     assert_eq!(sample.gpu_slab_cache_hits, 1);
@@ -561,18 +430,29 @@ fn automation_report_writes_replace_the_previous_file_atomically() {
 }
 
 #[test]
-fn alignment_projection_generation_distinguishes_old_data_from_settled_data() {
+fn alignment_projection_generation_distinguishes_committed_scene_from_new_target() {
     let mut projection = AlignmentPanelProjection::default();
-    projection.settled_generation = Some(projection.clock.current().get());
-    assert_eq!(
-        projection.settled_generation,
-        Some(projection.clock.current().get())
+    projection
+        .navigation
+        .bind_identity(PanelId::new(1), TrackId::new(1));
+    projection.navigation.begin(
+        projection.clock.current().get(),
+        AlignmentSceneRequestToken::new(1),
+        "test target",
     );
-    projection.clock.advance();
-    assert_ne!(
-        projection.settled_generation,
-        Some(projection.clock.current().get())
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::Running, "source accepted");
+    projection.navigation.transition(
+        AlignmentNavigationPhase::CandidateReady,
+        "scene candidate ready",
     );
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::Committed, "scene committed");
+    assert!(projection.scene_is_current());
+    projection.advance_scene_generation();
+    assert!(!projection.scene_is_current());
 }
 
 #[test]
@@ -632,60 +512,33 @@ fn automation_read_evidence_excludes_private_identities_and_sequence() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
-fn automation_structured_exports_preserve_active_interval_semantics() {
-    let interval = GenomicInterval::new(ContigId::new(0), 100, 110).unwrap();
-    let mut batch = rgv_hts::AlignmentBatch::default();
-    batch
-        .push(&AlignmentRecord {
-            contig: ContigId::new(0),
-            start: 101,
-            end: 106,
-            flags: rgv_hts::AlignmentFlags::from_bits(0x10),
-            mapping_quality: Some(42),
-            mate_contig: None,
-            mate_start: None,
-            template_length: 0,
-            read_name: b"read-1".to_vec(),
-            cigar: vec![rgv_hts::CigarOp {
-                kind: CigarOpKind::Match,
-                len: 5,
-            }],
-            sequence: SequenceData::NotLoaded,
-            auxiliary_fields: Vec::new(),
-        })
-        .unwrap();
-    let alignment_tracks = vec![AutomationAlignmentExportTrack {
-        id: TrackId::new(1),
+fn structured_alignment_exports_use_the_committed_scene_authority() {
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+    let tracks = [AutomationAlignmentExportTrack {
+        id: TrackId::new(7),
         name: "Tumour".to_owned(),
-        query: Arc::new(AlignmentQuery {
-            interval,
-            header: Arc::default(),
-            batch,
-            pileup: rgv_hts::PileupSummary::from_depths([3, 4]),
-            junctions: rgv_hts::JunctionSummary::default(),
-            pairs: rgv_hts::PairSummary::default(),
-            reference: None,
-            stats: QueryStats {
-                records_seen: 1,
-                records_eligible: 1,
-                records_emitted: 1,
-                truncated: false,
-                cancelled: false,
-                ..QueryStats::default()
-            },
-        }),
+        complete_read_limit: 50_000,
+        authority: AutomationAlignmentExportAuthority {
+            snapshot: super::scene_fixture::alignment_scene_snapshot(),
+        },
     }];
-    let alignment = automation_alignments_export("GRCh38", "chr1", interval, &alignment_tracks);
-    let pileup = automation_pileup_export("GRCh38", "chr1", interval, &alignment_tracks);
-    assert!(alignment.contains("read-1\t0x0010\t42\t5M"));
-    assert!(alignment.contains("read_presentation=complete"));
-    assert!(alignment.contains("complete_read_limit="));
-    assert!(!alignment.contains("retained_truncated"));
-    assert!(alignment.contains("\t102\t106\t"));
-    assert!(pileup.contains("eligible_records=0"));
-    assert!(pileup.contains("\t101\t105\t3\t"));
 
+    let alignments = automation_alignments_export("GRCh38", "chr1", interval, &tracks).unwrap();
+    let pileup = automation_pileup_export("GRCh38", "chr1", interval, &tracks).unwrap();
+
+    assert!(alignments.contains("authority=committed_scene"));
+    assert!(alignments.contains("read_presentation=complete"));
+    assert!(alignments.contains("scene-export-read\t0x0063\t60\t5M3N5M"));
+    assert!(alignments.contains("exported_records=1"));
+    assert!(pileup.contains("authority=committed_scene"));
+    assert!(pileup.contains("all_eligible_records=true"));
+    assert!(pileup.contains("\tchr1\t11\t11\t1\t"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn automation_auxiliary_exports_preserve_active_interval_semantics() {
+    let interval = GenomicInterval::new(ContigId::new(0), 100, 110).unwrap();
     let variant = TrackSnapshot {
         id: TrackId::new(2),
         name: "Calls".to_owned(),

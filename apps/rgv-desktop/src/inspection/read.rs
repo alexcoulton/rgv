@@ -806,15 +806,6 @@ pub(crate) const fn complement_base(base: u8) -> u8 {
     }
 }
 
-pub(crate) fn fnv64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 pub(crate) fn format_cigar(cigar: &[rgv_hts::CigarOp]) -> String {
     if cigar.is_empty() {
         return "*".to_owned();

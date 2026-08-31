@@ -886,6 +886,12 @@ enum LocalAlignmentEncoding {
 }
 
 impl LocalAlignmentSource {
+    /// Immutable parsed SAM header metadata retained for scene-backed inspection.
+    #[must_use]
+    pub fn header_metadata(&self) -> &Arc<AlignmentHeaderMetadata> {
+        &self.header
+    }
+
     /// Exact mapped-record total obtained from constant-time local BAM index statistics when it
     /// is available. Scene-owned CPM summaries carry this as an explicit source dependency.
     #[must_use]

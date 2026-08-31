@@ -3,6 +3,17 @@ use std::{
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
+use thiserror::Error;
+
+/// Non-blocking scheduling failure shared by the bounded source, reference, and contextual-lane
+/// actors. This is deliberately independent of any particular data engine.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum EngineQueueError {
+    #[error("the bounded engine queue is full")]
+    Full,
+    #[error("the engine actor is disconnected")]
+    Disconnected,
+}
 
 struct Stamped<T> {
     sequence: u128,

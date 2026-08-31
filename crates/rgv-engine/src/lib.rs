@@ -1,6 +1,5 @@
 //! Bounded background scheduling and cache coordination for RGV.
 
-mod alignment_engine;
 mod alignment_scene_coordinator;
 mod alignment_scene_engine;
 mod cache;
@@ -11,10 +10,6 @@ mod scheduler;
 mod source_actor;
 mod track_engine;
 
-pub use alignment_engine::{
-    AlignmentBrowsingPolicy, AlignmentBufferClampReason, AlignmentCacheOutcome, AlignmentEngine,
-    AlignmentEngineEvent, AlignmentQueryPhase, AlignmentWorkingSetStats, EngineQueueError,
-};
 pub use alignment_scene_coordinator::{
     AlignmentCoordinatorFrame, AlignmentCoordinatorPressure, AlignmentCoordinatorPump,
     AlignmentCoordinatorUpdate, AlignmentIndividualReadCapability, AlignmentPresentationPump,
@@ -39,6 +34,7 @@ pub use cache::{
 pub use local_bam_source::{
     LocalBamCanonicalBackend, LocalBamCanonicalBackendError, LocalBamSourceControl,
 };
+pub use mailbox::EngineQueueError;
 pub use reference_engine::{
     MAX_REFERENCE_QUERY_BASES, ReferenceEngine, ReferenceEngineEvent, ReferenceQueryIdentity,
 };

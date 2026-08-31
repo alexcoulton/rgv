@@ -104,7 +104,13 @@ impl ApplicationHandler for Application {
                 viewer.cursor_moved(position, egui_response.consumed);
             }
             WindowEvent::CursorLeft { .. } => {
-                if viewer.panels.active_mut().hovered_record.take().is_some() {
+                if viewer
+                    .panels
+                    .active_mut()
+                    .hovered_alignment_hit
+                    .take()
+                    .is_some()
+                {
                     viewer.display_dirty = true;
                     viewer.window.request_redraw();
                 }

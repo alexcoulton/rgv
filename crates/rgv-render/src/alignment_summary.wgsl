@@ -12,7 +12,17 @@ struct SummaryUniform {
     family: u32,
     hidden_modification_mask: u32,
     modification_color_mode: u32,
-    padding: u32,
+    junction_normalization: f32,
+    junction_row_count: u32,
+    minimum_junction_depth: u32,
+    minimum_junction_flank: u32,
+    junction_display_mode: u32,
+    allele_interpretation: u32,
+    bisulfite_context_mask: u32,
+    padding: vec2<u32>,
+    hovered_junction_span: vec4<f32>,
+    selected_junction_span: vec4<f32>,
+    junction_interaction: vec4<u32>,
 };
 
 @group(0) @binding(0)
@@ -33,6 +43,7 @@ struct AlleleInput {
     @location(3) allele: u32,
     @location(4) raw: vec3<f32>,
     @location(5) quality_weighted: vec3<f32>,
+    @location(6) interpretation: vec4<u32>,
 };
 
 struct ModificationInput {
@@ -43,6 +54,14 @@ struct ModificationInput {
     @location(3) by_type_color: vec4<f32>,
     @location(4) identity: vec4<u32>,
     @location(5) shape: u32,
+};
+
+struct JunctionInput {
+    @builtin(vertex_index) vertex_index: u32,
+    @location(0) start_offset: vec2<f32>,
+    @location(1) end_offset: vec2<f32>,
+    @location(2) evidence: vec4<u32>,
+    @location(3) identity: vec4<u32>,
 };
 
 struct OverlayInput {
@@ -56,6 +75,11 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) @interpolate(flat) visible: u32,
+    @location(2) local: vec2<f32>,
+    @location(3) @interpolate(flat) pixel_size: vec2<f32>,
+    @location(4) @interpolate(flat) shape: u32,
+    @location(5) @interpolate(flat) stroke: f32,
+    @location(6) @interpolate(flat) junction_component: u32,
 };
 
 fn corner(vertex_index: u32) -> vec2<f32> {
@@ -127,6 +151,28 @@ fn rectangle_output(
     );
     output.color = color;
     output.visible = visible;
+    output.local = corner(vertex_index);
+    output.pixel_size = size;
+    output.shape = 0u;
+    output.stroke = 0.0;
+    output.junction_component = 3u;
+    return output;
+}
+
+fn junction_output(
+    vertex_index: u32,
+    origin: vec2<f32>,
+    size: vec2<f32>,
+    color: vec4<f32>,
+    visible: u32,
+    shape: u32,
+    stroke: f32,
+    junction_component: u32,
+) -> VertexOutput {
+    var output = rectangle_output(vertex_index, origin, size, color, visible);
+    output.shape = shape;
+    output.stroke = stroke;
+    output.junction_component = junction_component;
     return output;
 }
 
@@ -169,12 +215,16 @@ fn allele_vertex(input: AlleleInput) -> VertexOutput {
     if frame.quality_weighted != 0u {
         values = input.quality_weighted;
     }
+    let generic = input.interpretation.x == 0u && frame.allele_interpretation == 0u;
+    let bisulfite = input.interpretation.x == 1u
+        && frame.allele_interpretation == 1u
+        && (input.interpretation.y & frame.bisulfite_context_mask) != 0u;
     let semantically_visible = select(
         0u,
         1u,
         input.local_depth > 0u
             && values.x > 0.0
-            && values.y >= frame.minimum_alternate_fraction,
+            && ((generic && values.y >= frame.minimum_alternate_fraction) || bisulfite),
     );
     let left = max(project_x(input.start_offset), frame.covered_clip_x.x);
     let semantic_right = min(project_x(input.end_offset), frame.covered_clip_x.y);
@@ -191,11 +241,19 @@ fn allele_vertex(input: AlleleInput) -> VertexOutput {
             - (values.z + values.x) * coverage_height,
         frame.clip_origin.y,
     );
+    var color = allele_color(input.allele);
+    if bisulfite {
+        color = select(
+            vec4<f32>(0.86, 0.46, 0.12, 1.0),
+            vec4<f32>(0.18, 0.62, 0.78, 1.0),
+            input.interpretation.w == 1u,
+        );
+    }
     return rectangle_output(
         input.vertex_index,
         vec2<f32>(left, top),
         vec2<f32>(right - left, height),
-        allele_color(input.allele),
+        color,
         visible,
     );
 }
@@ -244,6 +302,108 @@ fn modification_vertex(input: ModificationInput) -> VertexOutput {
     );
 }
 
+fn junction_annotation_color(annotation: u32) -> vec4<f32> {
+    if annotation == 1u {
+        return vec4<f32>(0.16, 0.58, 0.28, 1.0);
+    }
+    if annotation == 2u {
+        return vec4<f32>(0.92, 0.48, 0.10, 1.0);
+    }
+    return vec4<f32>(0.46, 0.48, 0.52, 0.92);
+}
+
+fn junction_interaction_matches(
+    input: JunctionInput,
+    span: vec4<f32>,
+    component: u32,
+    present: u32,
+) -> bool {
+    return present != 0u
+        && input.identity.y == component
+        && all(input.start_offset == span.xy)
+        && all(input.end_offset == span.zw);
+}
+
+@vertex
+fn junction_vertex(input: JunctionInput) -> VertexOutput {
+    var visible = select(
+        0u,
+        1u,
+        input.evidence.y >= frame.minimum_junction_depth
+            && input.evidence.z >= frame.minimum_junction_flank
+            && input.evidence.w >= frame.minimum_junction_flank,
+    );
+    let left = max(project_x(input.start_offset), frame.covered_clip_x.x);
+    let semantic_right = min(project_x(input.end_offset), frame.covered_clip_x.y);
+    visible *= select(0u, 1u, semantic_right > left);
+    let right = max(semantic_right, left + 1.0);
+    var row = 0u;
+    var row_count = 1u;
+    if frame.junction_display_mode != 0u {
+        row = input.identity.x;
+        row_count = max(frame.junction_row_count, 1u);
+        visible *= select(0u, 1u, row < row_count);
+    }
+    let band_height = frame.clip_size.y / f32(row_count);
+    let baseline = frame.clip_origin.y + (f32(row) + 0.5) * band_height;
+    let component = input.identity.y;
+    if component == 3u {
+        visible *= select(0u, 1u, input.identity.z != 0u);
+        return junction_output(
+            input.vertex_index,
+            vec2<f32>((left + right) * 0.5 - 2.5, baseline - 2.5),
+            vec2<f32>(5.0, 5.0),
+            junction_annotation_color(input.identity.z),
+            visible,
+            0u,
+            0.0,
+            3u,
+        );
+    }
+    visible *= select(0u, 1u, input.evidence.x > 0u);
+    let component_value = f32(input.evidence.x) * frame.junction_normalization;
+    let fraction = sqrt(clamp(component_value / max(frame.scale_maximum, 0.000001), 0.0, 1.0));
+    let height = max(band_height * 0.45 * (0.18 + 0.82 * fraction), 3.0);
+    let downward = component == 1u;
+    let top = select(baseline - height, baseline, downward);
+    var color = vec4<f32>(0.42, 0.45, 0.50, 0.76);
+    if component == 0u {
+        color = vec4<f32>(0.84, 0.30, 0.38, 0.82);
+    } else if component == 1u {
+        color = vec4<f32>(0.25, 0.45, 0.82, 0.82);
+    }
+    let hovered = junction_interaction_matches(
+        input,
+        frame.hovered_junction_span,
+        frame.junction_interaction.x,
+        frame.junction_interaction.y,
+    );
+    let selected = junction_interaction_matches(
+        input,
+        frame.selected_junction_span,
+        frame.junction_interaction.z,
+        frame.junction_interaction.w,
+    );
+    var stroke = clamp(1.0 + height * 0.075, 1.25, 4.5);
+    if selected {
+        color = mix(color, vec4<f32>(0.16, 0.42, 0.92, 1.0), 0.38);
+        stroke = min(stroke + 2.0, 6.5);
+    } else if hovered {
+        color = mix(color, vec4<f32>(0.16, 0.42, 0.92, 1.0), 0.22);
+        stroke = min(stroke + 1.25, 5.75);
+    }
+    return junction_output(
+        input.vertex_index,
+        vec2<f32>(left, top),
+        vec2<f32>(right - left, height),
+        color,
+        visible,
+        select(1u, 2u, downward),
+        stroke,
+        component,
+    );
+}
+
 @vertex
 fn overlay_vertex(input: OverlayInput) -> VertexOutput {
     return rectangle_output(
@@ -260,5 +420,37 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if input.visible == 0u {
         discard;
     }
-    return input.color;
+    var color = input.color;
+    if input.shape == 1u || input.shape == 2u {
+        let inner_height = max(input.pixel_size.y - input.stroke, 0.0);
+        let parabola = 4.0 * (input.local.x - 0.5) * (input.local.x - 0.5);
+        var curve_y = input.stroke * 0.5 + inner_height * parabola;
+        if input.shape == 2u {
+            curve_y = input.pixel_size.y - input.stroke * 0.5 - inner_height * parabola;
+        }
+        let distance = abs(input.local.y * input.pixel_size.y - curve_y);
+        var alpha = 1.0 - smoothstep(input.stroke * 0.5, input.stroke * 0.5 + 1.0, distance);
+        if input.pixel_size.x >= 12.0 && input.junction_component < 2u {
+            let marker_fraction = select(0.70, 0.30, input.junction_component == 1u);
+            let marker_x = input.pixel_size.x * marker_fraction;
+            let marker_parabola = 4.0 * (marker_fraction - 0.5) * (marker_fraction - 0.5);
+            var marker_y = input.stroke * 0.5 + inner_height * marker_parabola;
+            if input.shape == 2u {
+                marker_y = input.pixel_size.y - input.stroke * 0.5 - inner_height * marker_parabola;
+            }
+            let point = input.local * input.pixel_size;
+            let delta = point - vec2<f32>(marker_x, marker_y);
+            if abs(delta.x) <= 3.0 && abs(delta.y) <= 3.0 {
+                let directed_x = select(delta.x, -delta.x, input.junction_component == 1u);
+                let chevron_distance = abs(abs(delta.y) - 0.5 * (2.0 - directed_x));
+                let marker_alpha = 1.0 - smoothstep(0.65, 1.45, chevron_distance);
+                alpha = max(alpha, marker_alpha);
+            }
+        }
+        if alpha <= 0.0 {
+            discard;
+        }
+        color.a *= alpha;
+    }
+    return color;
 }

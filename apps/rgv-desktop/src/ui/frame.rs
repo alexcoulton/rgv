@@ -301,9 +301,7 @@ impl Viewer {
                 })
             });
         let settings_alignment_id = editing_alignment_id.unwrap_or(primary_alignment_id);
-        let settings_query = self
-            .alignment_query_for_track(settings_alignment_id)
-            .cloned();
+        let settings_pair_summary = self.alignment_pair_summary_for_track(settings_alignment_id);
         let available_modification_codes = editing_alignment_id.map_or_else(Vec::new, |track_id| {
             self.available_modification_codes(track_id)
         });
@@ -565,9 +563,7 @@ impl Viewer {
         let mut read_stacking_mode = settings_filters.read_stacking_mode;
         let mut compact_repack_requested = false;
         let mut view_as_pairs = settings_filters.view_as_pairs;
-        let pair_summary = settings_query
-            .as_deref()
-            .map_or_else(Default::default, |query| query.pairs);
+        let pair_summary = settings_pair_summary.unwrap_or_default();
         let inferred_pair_bounds = pair_summary.inferred_bounds.unwrap_or_default();
         let mut override_pair_bounds = settings_filters.minimum_template_length.is_some()
             || settings_filters.maximum_template_length.is_some();
@@ -766,16 +762,6 @@ impl Viewer {
             .composite_display_list
             .texts
             .iter()
-            .filter(|text| {
-                self.workspace_layout
-                    .panels
-                    .iter()
-                    .find(|layout| {
-                        text.x >= layout.canvas.left() && text.x <= layout.canvas.right()
-                    })
-                    .and_then(|layout| self.panels.get(layout.panel_id))
-                    .is_some_and(|panel| panel.navigation_presentation.permits_staged_display())
-            })
             .cloned()
             .collect::<Vec<_>>();
         let selected_track = self.panels.active().selected_track;
@@ -821,7 +807,7 @@ impl Viewer {
             .iter()
             .map(|panel| {
                 let mut genome_overview = ui::GenomeOverviewData::default();
-                let mut query_fallback_overview = ui::GenomeOverviewData::default();
+                let mut scene_overview = ui::GenomeOverviewData::default();
                 for track in &self.alignment_tracks {
                     let index_bins = track
                         .dictionary
@@ -836,25 +822,24 @@ impl Viewer {
                     if let Some(index_bins) = index_bins {
                         genome_overview.add_index_density(index_bins);
                     }
-                    let query = track
-                        .projection(panel.id)
-                        .and_then(|projection| projection.current_query.as_ref());
-                    let query_matches_contig = track
-                        .dictionary
-                        .as_ref()
-                        .and_then(|dictionary| dictionary.id_by_name(&panel.contig_name))
-                        .zip(query.map(|query| query.interval.contig()))
-                        .is_some_and(|(expected, actual)| expected == actual);
-                    if query_matches_contig && let Some(query) = query {
-                        query_fallback_overview.add_depths(
-                            panel.contig_length,
-                            query.interval,
-                            query.pileup.bins.iter().map(|bin| bin.depth),
-                        );
+                    if let Some(snapshot) = self
+                        .presented_alignment_lane(panel.id, track.config.id)
+                        .and_then(|presented| presented.lane.snapshot.as_ref())
+                    {
+                        let interval = snapshot.prepared_interval();
+                        let bins = usize::try_from(interval.len().min(2_048)).unwrap_or(2_048);
+                        if let Ok(depths) = snapshot.summaries().project_depth_bins(interval, bins)
+                        {
+                            scene_overview.add_depths(
+                                panel.contig_length,
+                                interval,
+                                depths.into_iter().map(|bin| bin.depth),
+                            );
+                        }
                     }
                 }
-                query_fallback_overview.normalize_logarithmically();
-                genome_overview.merge_max(&query_fallback_overview);
+                scene_overview.normalize_logarithmically();
+                genome_overview.merge_max(&scene_overview);
                 (
                     panel.id,
                     panel.contig_name.clone(),
@@ -2350,16 +2335,23 @@ impl Viewer {
                                             .suffix("×"),
                                     );
                                 });
-                            } else if let Some(stats) = self
+                            } else if let Some(maximum) = self
                                 .alignment_tracks
                                 .first()
-                                .and_then(|track| track.projection(active_panel_id))
-                                .and_then(|projection| projection.cached_layout.as_ref())
-                                .map(|(_, layout)| layout.stats)
+                                .and_then(|track| {
+                                    self.presented_alignment_lane(active_panel_id, track.config.id)
+                                })
+                                .and_then(|presented| presented.lane.snapshot.as_ref())
+                                .and_then(|snapshot| {
+                                    snapshot
+                                        .summaries()
+                                        .maximum_depth(self.panels.active().viewport.interval())
+                                        .ok()
+                                })
                             {
                                 ui.small(format!(
                                     "Coverage autoscale: current maximum {}×",
-                                    stats.maximum_coverage
+                                    maximum
                                 ));
                             }
                             alignment_style_controls(
@@ -3017,10 +3009,8 @@ impl Viewer {
             for panel in self.panels.iter_mut() {
                 panel
                     .navigation_presentation
-                    .invalidate_preview("workspace layout changed");
-                panel.navigation_provisional_display = None;
+                    .invalidate_contract("workspace layout changed");
             }
-            self.discard_navigation_preview_texture();
         }
         if !committed_canvas_geometry.approximately_equals(new_canvas_geometry) {
             let width_changed = (committed_canvas_geometry.genomic.width()
@@ -3232,7 +3222,7 @@ impl Viewer {
             alignment_configuration_changed = true;
         }
         if alignment_configuration_changed {
-            self.invalidate_navigation_preview_contract("alignment track layout changed");
+            self.invalidate_navigation_contract("alignment track layout changed");
             self.rebuild_genomic_display();
             self.display_dirty = true;
         }
@@ -3563,7 +3553,7 @@ impl Viewer {
         self.review_items = review_items;
         self.review_status_filter = review_status_filter;
         if regions_changed {
-            self.invalidate_navigation_preview_contract("region overlays changed");
+            self.invalidate_navigation_contract("region overlays changed");
             self.rebuild_all_panel_displays();
             self.display_dirty = true;
         } else if review_changed {
@@ -3916,6 +3906,8 @@ impl Viewer {
             self.alignment_gpu_renderer.discard_device_resources();
             self.alignment_summary_gpu_renderer
                 .discard_device_resources();
+            self.context_scene_gpu_renderer.discard_all();
+            self.context_scene_gpu_frame = ContextSceneGpuFrame::default();
             self.alignment_gpu_speculation_gate.reset();
             let budget = self
                 .settings
@@ -3933,7 +3925,6 @@ impl Viewer {
             }
         }
         if clear_cache_requested {
-            self.layout_cache.clear();
             // Dropping the native derivative is not itself a navigation transaction. Reissue
             // every current alignment target with a fresh request token so cache clearing cannot
             // leave a formerly committed projection beside an empty presented epoch. The source
@@ -4022,7 +4013,7 @@ impl Viewer {
             self.reference_reverse_complement = reference_reverse_complement;
             self.reference_translation_frames = reference_translation_frames;
             self.reference_genetic_code = reference_genetic_code;
-            self.invalidate_navigation_preview_contract("reference presentation changed");
+            self.invalidate_navigation_contract("reference presentation changed");
             self.rebuild_all_panel_displays();
             self.display_dirty = true;
         }
@@ -4120,8 +4111,7 @@ impl Viewer {
                 .copied()
                 .map(modification_code_label)
                 .collect();
-            self.invalidate_navigation_preview_contract("alignment presentation changed");
-            self.layout_cache.clear();
+            self.invalidate_navigation_contract("alignment presentation changed");
             self.rebuild_genomic_display();
             self.display_dirty = true;
         }
@@ -4271,7 +4261,7 @@ impl Viewer {
                 .into_iter()
                 .collect::<HashSet<_>>();
         if track_configuration_changed {
-            self.invalidate_navigation_preview_contract("auxiliary track presentation changed");
+            self.invalidate_navigation_contract("auxiliary track presentation changed");
             self.reconcile_track_presentation();
             self.rebuild_genomic_display();
             self.display_dirty = true;
@@ -4347,12 +4337,7 @@ impl Viewer {
             if reference_query_changed {
                 self.query_options_changed();
             } else {
-                if let Some(track) = self.alignment_tracks.first_mut() {
-                    track.projection_mut(active_panel_id).alignment_rows = None;
-                }
-                self.layout_cache.clear();
-                self.rebuild_genomic_display();
-                self.display_dirty = true;
+                self.query_options_changed();
             }
         }
         if editing_primary_settings {
@@ -4465,18 +4450,8 @@ impl Viewer {
                 },
             );
         }
-        if compact_repack_requested
-            && let Some(track) = self
-                .alignment_tracks
-                .iter_mut()
-                .find(|track| track.config.id == settings_alignment_id)
-        {
-            let projection = track.projection_mut(active_panel_id);
-            projection.pending_row_repack = true;
-            projection.alignment_rows = None;
-            projection.cached_layout = None;
-            self.rebuild_genomic_display();
-            self.display_dirty = true;
+        if compact_repack_requested {
+            self.query_options_changed();
         }
         if apply_bulk_alignment_appearance
             && let Err(error) =

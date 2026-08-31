@@ -1,9 +1,8 @@
 use super::super::*;
 use crate::display::alignment::{
     INDEX_ONLY_READ_NOTICE, ReadPanelKey, ReadPanelSpec, alignment_scene_annotation_frame,
-    index_only_read_display, index_only_read_notice, individual_read_refusal,
-    materialized_alignment_row_range, read_pane_layout, read_panel_bounds,
-    read_panel_bounds_for_track, read_refusal_detail, read_state_display,
+    index_only_read_display, index_only_read_notice, materialized_alignment_row_range,
+    read_pane_layout, read_panel_bounds, read_state_display,
 };
 use crate::display::auxiliary::{
     feature_layout_row_count, feature_record_index_at_display_point,
@@ -12,17 +11,15 @@ use crate::display::auxiliary::{
 use crate::display::{
     ANNOTATION_PANE_BACKGROUND, PINNED_ALIGNMENT_COVERAGE_HEIGHT,
     PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT, PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
-    PINNED_ALIGNMENT_MODIFICATION_HEIGHT, PINNED_ALIGNMENT_REFERENCE_HEIGHT,
-    READ_PANE_HEADER_HEIGHT, SYNTHETIC_READ_ROW_STRIDE, alignment_activity_overview_from_counts,
-    alignment_annotation_lane_heights, alignment_scene_read_extent,
-    annotation_frame_content_height, append_annotation_pane_background,
-    ensure_annotation_presentation_frames, pane_layout_snapshot, pinned_gene_track_height,
-    primary_pinned_gene_id, read_interaction_highlight_color, read_panel_scrollbar_maximum,
+    PINNED_ALIGNMENT_MODIFICATION_HEIGHT, READ_PANE_HEADER_HEIGHT, SYNTHETIC_READ_ROW_STRIDE,
+    alignment_activity_overview_from_counts, alignment_annotation_lane_heights,
+    alignment_scene_read_extent, annotation_frame_content_height,
+    append_annotation_pane_background, ensure_annotation_presentation_frames, pane_layout_snapshot,
+    pinned_gene_track_height, primary_pinned_gene_id, read_panel_scrollbar_maximum,
     reconcile_read_panel_scroll_for_authority, reflow_annotation_presentation,
     reflow_annotation_presentation_with_heights, resolve_read_panel_overview,
     synthetic_read_rows_for_bounds, synthetic_section_display, track_section_geometry,
 };
-use rgv_layout::RectShape;
 
 #[test]
 fn alignment_row_materialization_tracks_vertical_camera_with_overscan() {
@@ -80,7 +77,7 @@ fn scene_active_row_end_controls_scroll_extent_and_shrink_clamps_the_camera() {
 fn pending_row_authority_presents_retained_thumb_as_provisional_without_moving_camera() {
     let lineage =
         RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
-    let coordinate_space = ReadRowCoordinateSpace::Unified(lineage);
+    let coordinate_space = lineage;
     let mut state = ReadPanelScrollState {
         scroll_points: 353.5,
         content_origin_points: 3.5,
@@ -144,7 +141,7 @@ fn pending_row_authority_presents_retained_thumb_as_provisional_without_moving_c
 fn stale_exact_scroll_cache_is_provisional_until_the_committed_target_rebuilds_it() {
     let lineage =
         RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(13, 17));
-    let exact = ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Unified(lineage));
+    let exact = ReadRowCoordinateAuthority::Exact(lineage);
     let current = current_read_row_authority(4, 5, false, exact);
     let state = ReadPanelScrollState {
         scroll_points: 240.0,
@@ -168,7 +165,7 @@ fn stale_exact_scroll_cache_is_provisional_until_the_committed_target_rebuilds_i
 fn vertical_only_target_change_keeps_exact_scroll_authority() {
     let lineage =
         RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(13, 17));
-    let exact = ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Unified(lineage));
+    let exact = ReadRowCoordinateAuthority::Exact(lineage);
 
     assert_eq!(current_read_row_authority(4, 5, true, exact), exact);
 }
@@ -179,8 +176,7 @@ fn same_target_new_row_atlas_revokes_old_exact_scroll_authority() {
         RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(19, 23));
     let old_atlas = RowAtlasRevision::new(rgv_alignment_scene::RevisionFingerprint::new(29, 31));
     let new_atlas = RowAtlasRevision::new(rgv_alignment_scene::RevisionFingerprint::new(37, 41));
-    let exact =
-        ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Unified(coordinate_space));
+    let exact = ReadRowCoordinateAuthority::Exact(coordinate_space);
 
     assert!(read_row_cache_matches_committed_activity(
         7,
@@ -457,16 +453,6 @@ fn read_stack_overflow_preserves_every_header_and_reports_parent_extent() {
             .windows(2)
             .all(|rows| (rows[0].bottom - rows[1].top).abs() < f32::EPSILON)
     );
-}
-
-#[test]
-fn collapsed_alignment_without_a_read_panel_keeps_annotation_header_bounds() {
-    let track_id = TrackId::new(303);
-    let fallback = read_panel_bounds_for_track(&[], track_id, 600.0, true).unwrap();
-
-    assert_eq!(fallback.key, ReadPanelKey::Track(track_id));
-    assert_eq!((fallback.top, fallback.bottom), (600.0, 600.0));
-    assert!(read_panel_bounds_for_track(&[], track_id, 600.0, false).is_none());
 }
 
 #[test]
@@ -899,7 +885,6 @@ fn pinned_context_heights_are_fixed_layout_dimensions() {
     gene.collapsed = true;
     assert!((pinned_gene_track_height(&gene) - 26.0).abs() < f32::EPSILON);
 
-    assert!((PINNED_ALIGNMENT_REFERENCE_HEIGHT - 28.0).abs() < f32::EPSILON);
     assert!((PINNED_ALIGNMENT_COVERAGE_HEIGHT - 48.0).abs() < f32::EPSILON);
     assert!((PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT - 52.0).abs() < f32::EPSILON);
     assert!((PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT - 120.0).abs() < f32::EPSILON);
@@ -1100,338 +1085,6 @@ fn checking_read_state_is_visible_but_never_interactive() {
 }
 
 #[test]
-fn overview_read_detail_distinguishes_present_empty_and_incomplete_data() {
-    assert_eq!(
-        overview_read_detail(31, false),
-        "31 present · hidden at this zoom"
-    );
-    assert_eq!(overview_read_detail(0, false), "no alignments in region");
-    assert_eq!(
-        overview_read_detail(31, true),
-        "31+ found · overview incomplete"
-    );
-}
-
-#[test]
-fn filtered_read_details_report_ignored_unmapped_records() {
-    let details = filtered_read_details(rgv_hts::QueryStats {
-        records_filtered_unmapped: 3,
-        ..rgv_hts::QueryStats::default()
-    });
-    assert_eq!(details, ["3 unmapped ignored"]);
-}
-
-#[test]
-fn read_refusal_uses_the_visible_query_not_the_wider_layout_horizon() {
-    let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
-    let query = |eligible, limit, status| AlignmentQuery {
-        interval,
-        header: Arc::default(),
-        batch: rgv_hts::AlignmentBatch::default(),
-        pileup: rgv_hts::PileupSummary::default(),
-        junctions: rgv_hts::JunctionSummary::default(),
-        pairs: rgv_hts::PairSummary::default(),
-        reference: None,
-        stats: QueryStats {
-            records_eligible: eligible,
-            complete_read_limit: limit,
-            individual_reads: status,
-            ..QueryStats::default()
-        },
-    };
-    let complete = query(20, 50_000, IndividualReadStatus::Complete);
-    let foreground_dense = query(
-        50_001,
-        50_000,
-        IndividualReadStatus::TooDense { limit: 50_000 },
-    );
-    let horizon_dense = query(
-        70_000,
-        50_000,
-        IndividualReadStatus::TooDense { limit: 50_000 },
-    );
-
-    let foreground = individual_read_refusal(
-        &foreground_dense,
-        &foreground_dense,
-        ReadStackingMode::Compact,
-    )
-    .unwrap();
-    assert_eq!(foreground.scope, IndividualReadRefusalScope::Foreground);
-    assert!(read_refusal_detail(foreground).contains("50001 eligible reads"));
-
-    assert!(individual_read_refusal(&complete, &horizon_dense, ReadStackingMode::Stable).is_none());
-    assert!(
-        individual_read_refusal(&complete, &horizon_dense, ReadStackingMode::Compact).is_none()
-    );
-}
-
-#[test]
-fn alignment_layer_partition_keeps_the_header_out_of_the_read_scroll() {
-    let primitive = |y, object_id| rgv_layout::RectPrimitive {
-        x: 0.0,
-        y,
-        width: 10.0,
-        height: 5.0,
-        color: rgv_layout::Rgba::new(0.5, 0.5, 0.5, 1.0),
-        object_id,
-        shape: Default::default(),
-    };
-    let text = |y, value: &str| rgv_layout::TextPrimitive {
-        x: 5.0,
-        y,
-        text: value.to_owned(),
-        font_size: 10.0,
-        color: rgv_layout::Rgba::new(0.0, 0.0, 0.0, 1.0),
-    };
-    let layout = AlignmentLayout {
-        junction_arc_targets: Vec::new(),
-        display_list: DisplayList {
-            rectangles: vec![primitive(120.0, 0), primitive(280.0, 1)],
-            texts: vec![text(120.0, "A"), text(280.0, "G")],
-        },
-        pinned_rectangle_count: 1,
-        pinned_text_count: 1,
-        stats: AlignmentLayoutStats::default(),
-    };
-    let mut pinned = DisplayList::default();
-    let mut scrollable = DisplayList::default();
-
-    extend_alignment_layers(&mut pinned, &mut scrollable, &layout, None);
-
-    assert_eq!(pinned.rectangles, vec![primitive(120.0, 0)]);
-    assert_eq!(pinned.texts, vec![text(120.0, "A")]);
-    assert_eq!(scrollable.rectangles, vec![primitive(280.0, 1)]);
-    assert_eq!(scrollable.texts, vec![text(280.0, "G")]);
-}
-
-#[test]
-fn sashimi_composition_tags_exact_layout_primitives_with_typed_keys() {
-    let primitive = RectPrimitive {
-        x: 10.0,
-        y: 20.0,
-        width: 80.0,
-        height: 18.0,
-        color: Rgba::new(0.84, 0.30, 0.38, 0.82),
-        object_id: 0,
-        shape: RectShape::JunctionArcUp,
-    };
-    let layout = AlignmentLayout {
-        display_list: DisplayList {
-            rectangles: vec![primitive],
-            texts: Vec::new(),
-        },
-        junction_arc_targets: vec![rgv_layout::JunctionArcTarget {
-            junction_index: 3,
-            start: 100,
-            end: 200,
-            component: JunctionArcComponent::Positive,
-            primitive,
-            stroke_width: junction_arc_stroke_width(primitive.height),
-            draw_order: 0,
-        }],
-        pinned_rectangle_count: 1,
-        pinned_text_count: 0,
-        stats: AlignmentLayoutStats::default(),
-    };
-    let track = TrackId::new(7);
-    let mut rectangles = layout.display_list.rectangles.clone();
-    let mut next_token = 1;
-    let mut keys = BTreeMap::new();
-
-    crate::display::tag_layout_junction_arcs(
-        &mut rectangles,
-        &layout,
-        track,
-        &mut next_token,
-        &mut keys,
-    );
-
-    assert_eq!(rectangles[0].object_id, 1);
-    assert_eq!(next_token, 2);
-    assert_eq!(
-        keys.get(&1),
-        Some(&JunctionArcKey {
-            track_id: track,
-            start: 100,
-            end: 200,
-            component: JunctionArcComponent::Positive,
-        })
-    );
-    assert_eq!(
-        RectPrimitive {
-            object_id: 0,
-            ..rectangles[0]
-        },
-        primitive
-    );
-}
-
-#[test]
-fn sashimi_overlays_distinguish_hover_component_from_biological_selection() {
-    let track = TrackId::new(7);
-    let target = |component, shape, color, token| ComposedJunctionArcTarget {
-        key: JunctionArcKey {
-            track_id: track,
-            start: 100,
-            end: 200,
-            component,
-        },
-        primitive: RectPrimitive {
-            x: 10.0,
-            y: 20.0,
-            width: 80.0,
-            height: 18.0,
-            color,
-            object_id: 0,
-            shape,
-        },
-        stroke_width: junction_arc_stroke_width(18.0),
-        draw_order: token,
-        interaction_token: token,
-        content_revision: 4,
-    };
-    let positive = target(
-        JunctionArcComponent::Positive,
-        RectShape::JunctionArcUp,
-        Rgba::new(0.84, 0.30, 0.38, 0.82),
-        1,
-    );
-    let negative = target(
-        JunctionArcComponent::Negative,
-        RectShape::JunctionArcDown,
-        Rgba::new(0.25, 0.45, 0.82, 0.82),
-        2,
-    );
-    let unknown = target(
-        JunctionArcComponent::Unknown,
-        RectShape::JunctionArcUp,
-        Rgba::new(0.42, 0.45, 0.50, 0.76),
-        3,
-    );
-    let targets = [positive, negative, unknown];
-    let mut component_display = DisplayList::default();
-    crate::display::append_sashimi_interaction_overlays(
-        &mut component_display,
-        &targets,
-        Some(JunctionArcHover {
-            key: negative.key,
-            interaction_token: negative.interaction_token,
-            distance_points: 0.0,
-            content_revision: 4,
-        }),
-        Some(track),
-        Some((100, 200)),
-        Some(JunctionArcComponent::Positive),
-    );
-    assert_eq!(component_display.rectangles.len(), 2);
-    assert_eq!(
-        component_display.rectangles[0].shape,
-        RectShape::JunctionArcSelectedUp
-    );
-    assert_eq!(
-        component_display.rectangles[1].shape,
-        RectShape::JunctionArcHoverDown
-    );
-    assert_ne!(
-        component_display.rectangles[0].color,
-        Rgba::new(0.08, 0.08, 0.10, 1.0),
-        "selected interaction feedback must preserve strand identity rather than turn black"
-    );
-
-    let mut endpoint_display = DisplayList::default();
-    crate::display::append_sashimi_interaction_overlays(
-        &mut endpoint_display,
-        &targets,
-        None,
-        Some(track),
-        Some((100, 200)),
-        None,
-    );
-    assert_eq!(endpoint_display.rectangles.len(), 3);
-    assert!(endpoint_display.rectangles.iter().all(|rectangle| matches!(
-        rectangle.shape,
-        RectShape::JunctionArcSelectedUp | RectShape::JunctionArcSelectedDown
-    )));
-}
-
-#[test]
-fn settled_capture_revision_retags_targets_and_rebinds_hover_without_relayout() {
-    let key = JunctionArcKey {
-        track_id: TrackId::new(7),
-        start: 100,
-        end: 200,
-        component: JunctionArcComponent::Positive,
-    };
-    let primitive = RectPrimitive {
-        x: 10.0,
-        y: 20.0,
-        width: 80.0,
-        height: 18.0,
-        color: Rgba::new(0.84, 0.30, 0.38, 0.82),
-        object_id: 0,
-        shape: RectShape::JunctionArcUp,
-    };
-    let mut targets = vec![ComposedJunctionArcTarget {
-        key,
-        primitive,
-        stroke_width: junction_arc_stroke_width(primitive.height),
-        draw_order: 4,
-        interaction_token: 17,
-        content_revision: 3,
-    }];
-    let mut hovered = Some(JunctionArcHover {
-        key,
-        interaction_token: 9,
-        distance_points: 1.25,
-        content_revision: 3,
-    });
-
-    crate::display::synchronize_junction_interaction_revision(&mut targets, &mut hovered, 4);
-
-    assert_eq!(targets[0].content_revision, 4);
-    assert_eq!(targets[0].primitive, primitive);
-    assert_eq!(hovered.unwrap().content_revision, 4);
-    assert_eq!(hovered.unwrap().interaction_token, 17);
-
-    targets.clear();
-    crate::display::synchronize_junction_interaction_revision(&mut targets, &mut hovered, 5);
-    assert!(
-        hovered.is_none(),
-        "a missing semantic target must clear hover"
-    );
-}
-
-#[test]
-fn alignment_layer_partition_clips_reads_to_the_resized_group() {
-    let layout = AlignmentLayout {
-        junction_arc_targets: Vec::new(),
-        display_list: DisplayList {
-            rectangles: vec![rgv_layout::RectPrimitive {
-                x: 0.0,
-                y: 280.0,
-                width: 10.0,
-                height: 10.0,
-                color: rgv_layout::Rgba::new(0.5, 0.5, 0.5, 1.0),
-                object_id: 1,
-                shape: Default::default(),
-            }],
-            texts: Vec::new(),
-        },
-        pinned_rectangle_count: 0,
-        pinned_text_count: 0,
-        stats: AlignmentLayoutStats::default(),
-    };
-    let mut pinned = DisplayList::default();
-    let mut scrollable = DisplayList::default();
-
-    extend_alignment_layers(&mut pinned, &mut scrollable, &layout, Some((250.0, 284.0)));
-
-    assert_eq!(scrollable.rectangles.len(), 1);
-    assert!((scrollable.rectangles[0].height - 4.0).abs() < f32::EPSILON);
-}
-
-#[test]
 fn horizontal_track_overview_drag_scales_density_logarithmically() {
     assert!((density_from_horizontal_drag(1.0, 0.0) - 1.0).abs() < f32::EPSILON);
     assert!(density_from_horizontal_drag(1.0, 50.0) > 1.0);
@@ -1524,74 +1177,26 @@ fn mate_reveal_centers_the_stable_row_without_repacking_it() {
 }
 
 #[test]
-fn read_highlights_are_baked_per_panel_without_object_id_collisions() {
-    let original = Rgba::new(0.9, 0.3, 0.2, 0.8);
-    let selected = read_interaction_highlight_color(original, true, false);
-    let hovered = read_interaction_highlight_color(original, false, true);
-
-    assert_eq!(
-        read_interaction_highlight_color(original, false, false),
-        original
-    );
-    assert_eq!(selected.alpha, 1.0);
-    assert_eq!(hovered.alpha, 1.0);
-    assert!(selected.blue > hovered.blue);
-    assert!(selected.red < hovered.red);
-}
-
-#[test]
-fn stable_row_camera_preserves_row_and_offset_across_layout_and_density_changes() {
-    let anchor =
-        capture_stable_row_camera(10.5 * 7.0, 7.0, ReadRowCoordinateSpace::Legacy(4)).unwrap();
-    assert_eq!(anchor.row, 10);
-    assert!((anchor.offset_fraction - 0.5).abs() < f32::EPSILON);
-    assert_eq!(
-        reproject_stable_row_camera(anchor, 7.0, ReadRowCoordinateSpace::Legacy(4)),
-        None
-    );
-    assert_eq!(
-        reproject_stable_row_camera(anchor, 14.0, ReadRowCoordinateSpace::Legacy(5)),
-        Some(10.5 * 14.0)
-    );
-}
-
-#[test]
 fn unified_row_camera_survives_stable_lineage_but_resets_after_a_repack() {
     let stable =
         RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(1, 2));
     let repacked =
         RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(1, 3));
-    let anchor =
-        capture_stable_row_camera(10.5 * 7.0, 7.0, ReadRowCoordinateSpace::Unified(stable))
-            .unwrap();
+    let anchor = capture_stable_row_camera(10.5 * 7.0, 7.0, stable).unwrap();
 
+    assert_eq!(reproject_stable_row_camera(anchor, 7.0, stable), None);
     assert_eq!(
-        reproject_stable_row_camera(anchor, 7.0, ReadRowCoordinateSpace::Unified(stable)),
-        None
-    );
-    assert_eq!(
-        reproject_stable_row_camera(anchor, 14.0, ReadRowCoordinateSpace::Unified(stable)),
+        reproject_stable_row_camera(anchor, 14.0, stable),
         Some(10.5 * 14.0)
     );
     assert_eq!(
-        reproject_stable_row_camera(anchor, 7.0, ReadRowCoordinateSpace::Unified(repacked)),
+        reproject_stable_row_camera(anchor, 7.0, repacked),
         Some(0.0)
     );
 }
 
 #[test]
-fn read_detail_primitives_remain_pickable_as_their_parent_record() {
-    assert_eq!(alignment_record_index(1), Some(0));
-    assert_eq!(
-        alignment_record_index(rgv_layout::read_detail_object_id(7)),
-        Some(6)
-    );
-    assert_eq!(alignment_record_index(0), None);
-    assert_eq!(alignment_record_index(1_000_000), None);
-}
-
-#[test]
-fn alignment_picking_routes_by_stable_track_frame_before_record_id() {
+fn alignment_lane_routing_uses_stable_track_frames() {
     let frames = vec![
         TrackFrame {
             key: TrackFrameKey::Alignment(TrackId::new(10)),
@@ -1620,25 +1225,10 @@ fn alignment_picking_routes_by_stable_track_frame_before_record_id() {
             subtracks: Vec::new(),
         },
     ];
-    let display = DisplayList {
-        rectangles: vec![rgv_layout::RectPrimitive {
-            x: 50.0,
-            y: 225.0,
-            width: 100.0,
-            height: 10.0,
-            color: rgv_layout::Rgba::new(0.5, 0.5, 0.5, 1.0),
-            object_id: 8,
-            shape: Default::default(),
-        }],
-        texts: Vec::new(),
-    };
-
     assert_eq!(
         alignment_track_at_content_y(&frames, 225.0),
         Some(TrackId::new(11))
     );
-    assert_eq!(alignment_record_at_point(&display, 75.0, 230.0), Some(7));
-    assert_eq!(alignment_record_at_point(&display, 25.0, 230.0), None);
 }
 
 #[test]
@@ -1771,134 +1361,6 @@ fn collapsed_alignment_lanes_are_not_pickable() {
         ),
         None
     );
-}
-
-#[test]
-fn layout_cache_distinguishes_prefetch_query_intervals() {
-    let viewport = Viewport::new(
-        GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
-        1_000.0,
-    )
-    .unwrap();
-    let narrow = GenomicInterval::new(ContigId::new(0), 50, 250).unwrap();
-    let broad = GenomicInterval::new(ContigId::new(0), 0, 500).unwrap();
-    let filters = ActiveFilters {
-        alignment: AlignmentFilter::default(),
-        include_secondary: false,
-        include_supplementary: false,
-    };
-    let options = AlignmentLayoutOptions::default();
-    let narrow_key = alignment_layout_key(
-        PanelTrackId::new(PanelId::new(1), TrackId::new(1)),
-        None,
-        viewport,
-        narrow,
-        &filters,
-        &options,
-        126.0,
-    );
-    let broad_key = alignment_layout_key(
-        PanelTrackId::new(PanelId::new(1), TrackId::new(1)),
-        None,
-        viewport,
-        broad,
-        &filters,
-        &options,
-        126.0,
-    );
-    assert_ne!(narrow_key, broad_key);
-}
-
-#[test]
-fn layout_cache_identity_includes_panel_and_track() {
-    let viewport = Viewport::new(
-        GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
-        1_000.0,
-    )
-    .unwrap();
-    let filters = ActiveFilters {
-        alignment: AlignmentFilter::default(),
-        include_secondary: false,
-        include_supplementary: false,
-    };
-    let key = |panel, track| {
-        alignment_layout_key(
-            PanelTrackId::new(PanelId::new(panel), TrackId::new(track)),
-            None,
-            viewport,
-            viewport.interval(),
-            &filters,
-            &AlignmentLayoutOptions::default(),
-            126.0,
-        )
-    };
-
-    assert_ne!(key(1, 1), key(2, 1));
-    assert_ne!(key(1, 1), key(1, 2));
-}
-
-#[test]
-fn layout_cache_distinguishes_subtrack_visibility_and_coverage_scale() {
-    let viewport = Viewport::new(
-        GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
-        1_000.0,
-    )
-    .unwrap();
-    let interval = viewport.interval();
-    let filters = ActiveFilters {
-        alignment: AlignmentFilter::default(),
-        include_secondary: false,
-        include_supplementary: false,
-    };
-    let baseline = AlignmentLayoutOptions::default();
-    let baseline_key = alignment_layout_key(
-        PanelTrackId::new(PanelId::new(1), TrackId::new(1)),
-        None,
-        viewport,
-        interval,
-        &filters,
-        &baseline,
-        126.0,
-    );
-    for changed in [
-        AlignmentLayoutOptions {
-            show_reference: false,
-            ..baseline
-        },
-        AlignmentLayoutOptions {
-            show_coverage: false,
-            ..baseline
-        },
-        AlignmentLayoutOptions {
-            show_reads: false,
-            ..baseline
-        },
-        AlignmentLayoutOptions {
-            coverage_scale_maximum: Some(100),
-            ..baseline
-        },
-        AlignmentLayoutOptions {
-            promoted_read_name_hash: Some(alignment_read_name_hash(b"selected")),
-            ..baseline
-        },
-        AlignmentLayoutOptions {
-            row_layout_revision: 7,
-            ..baseline
-        },
-    ] {
-        assert_ne!(
-            baseline_key,
-            alignment_layout_key(
-                PanelTrackId::new(PanelId::new(1), TrackId::new(1)),
-                None,
-                viewport,
-                interval,
-                &filters,
-                &changed,
-                126.0,
-            )
-        );
-    }
 }
 
 #[test]

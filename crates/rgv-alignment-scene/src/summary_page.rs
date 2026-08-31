@@ -147,6 +147,11 @@ impl SummaryPageKey {
     }
 
     #[must_use]
+    pub const fn junction_normalization_mapped_records(self) -> Option<u64> {
+        self.junction_normalization_mapped_records
+    }
+
+    #[must_use]
     pub const fn tile(self) -> CanonicalGenomicTile {
         self.tile
     }
@@ -266,6 +271,12 @@ impl SummaryAlleleReferenceContext {
         mask & bisulfite_context_bit(context) != 0
     }
 
+    /// Stable bitset for every exact bisulfite context supported at this reference position.
+    #[must_use]
+    pub const fn context_mask(self, reverse: bool) -> u8 {
+        if reverse { self.reverse } else { self.forward }
+    }
+
     /// Exact uppercase FASTA base at a genomic offset in `-2..=2`; `None` is possible only past
     /// a true contig boundary because page construction validates the complete bounded halo.
     #[must_use]
@@ -318,6 +329,9 @@ const fn bisulfite_context_bit(context: BisulfiteContext) -> u8 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AnnotatedJunctionSemantic {
     pub evidence: JunctionEvidence,
+    /// Stable expanded-layout row assigned across the complete immutable prepared horizon.
+    /// Collapsed presentation ignores this value.
+    pub expanded_row: u32,
     /// `None` means no annotation authority was requested for this scene. `Some(Unknown)` means
     /// an authority exists but does not certify this junction's interval.
     pub annotation: Option<JunctionAnnotationStatus>,
@@ -698,6 +712,9 @@ fn emit_junctions(
             end_offset: junction.end.saturating_sub(interval.start()),
             component: SummarySemanticComponent::Junction(AnnotatedJunctionSemantic {
                 evidence: junction,
+                expanded_row: root
+                    .expanded_junction_row(junction.start, junction.end)
+                    .expect("every exact root junction has an expanded-row assignment"),
                 annotation: annotation
                     .map(|index| index.status(interval.contig(), junction.start, junction.end)),
             }),
@@ -1509,6 +1526,18 @@ mod tests {
         Arc::clone(candidate.snapshot())
     }
 
+    #[test]
+    fn exact_pileup_site_keeps_depth_when_allele_detail_is_not_requested() {
+        let ledger = AllocationLedger::new(64 << 20, 0);
+        let evidence = cross_tile_evidence(&ledger);
+        let summaries = cross_tile_root(&evidence, 3, 111, &ledger);
+        let site = summaries.pileup_site_evidence_at(82).unwrap();
+        assert_eq!(site.bin.depth, 1);
+        assert_eq!(site.bin.alleles.base_observations(), 0);
+        assert!(!site.allele_observations_available);
+        assert_eq!(site.eligible_records, 1);
+    }
+
     fn cross_tile_junction_frame(
         snapshot: &Arc<AlignmentSceneSnapshot>,
         interval: GenomicInterval,
@@ -2246,6 +2275,16 @@ mod tests {
             snapshot.summaries().evidence_revision()
         );
         assert!(snapshot.metadata_allocation().snapshot().unwrap().pins > 0);
+        let allele_site = snapshot.allele_site_at(10).unwrap();
+        assert_eq!(allele_site.evidence.owner_interval, interval);
+        assert_eq!(allele_site.evidence.eligible_records, 1);
+        assert_eq!(allele_site.evidence.bin.alleles.a, 1);
+        assert_eq!(allele_site.reference_base, None);
+        let pileup_site = snapshot.pileup_site_at(10).unwrap();
+        assert_eq!(pileup_site.evidence.bin.depth, 1);
+        assert!(pileup_site.evidence.allele_observations_available);
+        assert!(snapshot.allele_site_at(interval.end()).is_none());
+        assert!(snapshot.pileup_site_at(interval.end()).is_none());
 
         let summary_camera = crate::CpuSummaryCamera::new(
             interval,

@@ -41,22 +41,24 @@ pub(crate) fn rgba_to_color32(color: rgv_layout::Rgba) -> egui::Color32 {
     )
 }
 
-pub(crate) fn collect_modification_codes(query: &AlignmentQuery) -> Vec<ModificationCode> {
+fn collect_scene_modification_codes(snapshot: &AlignmentSceneSnapshot) -> Vec<ModificationCode> {
     let mut codes = std::collections::BTreeSet::new();
-    for series in &query.pileup.modifications.series {
-        codes.insert(series.key.code);
-    }
-    for index in 0..query.batch.len().min(10_000) {
-        let Ok(record) = query.materialize_record(index) else {
-            continue;
-        };
-        let Ok(calls) = decode_modified_bases(&record) else {
-            continue;
-        };
-        for call in calls {
-            codes.insert(call.code);
-            if codes.len() >= MAX_HIDDEN_MODIFICATION_CODES {
+    for tile in snapshot.summaries().modification_tiles() {
+        for series in &tile.summary().series {
+            codes.insert(series.key.code);
+            if codes.len() == MAX_HIDDEN_MODIFICATION_CODES {
                 return codes.into_iter().collect();
+            }
+        }
+    }
+    if let Ok(discovered) = snapshot
+        .reads()
+        .modification_codes(10_000, MAX_HIDDEN_MODIFICATION_CODES)
+    {
+        for code in discovered {
+            codes.insert(code);
+            if codes.len() == MAX_HIDDEN_MODIFICATION_CODES {
+                break;
             }
         }
     }
@@ -69,25 +71,60 @@ impl Viewer {
         track_id: TrackId,
     ) -> Vec<ModificationCode> {
         let panel_id = self.panels.active().id;
-        let Some(query) = self.alignment_query_for_track(track_id).cloned() else {
+        let Some(authority) = self
+            .alignment_tracks
+            .iter()
+            .find(|track| track.config.id == track_id && track.scene_engine.is_some())
+            .and_then(|_| self.presented_alignment_lane(panel_id, track_id))
+            .filter(|presented| {
+                presented.lane.summary_current() && presented.source.semantic_target_complete
+            })
+            .and_then(|presented| presented.lane.snapshot.as_ref())
+            .cloned()
+        else {
             self.modification_code_cache = None;
             return Vec::new();
         };
         if let Some(cache) = &self.modification_code_cache
             && cache.panel_id == panel_id
             && cache.track_id == track_id
-            && Arc::ptr_eq(&cache.query, &query)
+            && Arc::ptr_eq(&cache.authority, &authority)
         {
             return cache.codes.clone();
         }
-        let codes = collect_modification_codes(&query);
+        let codes = collect_scene_modification_codes(&authority);
         self.modification_code_cache = Some(CachedModificationCodes {
             panel_id,
             track_id,
-            query,
+            authority,
             codes: codes.clone(),
         });
         codes
+    }
+
+    pub(crate) fn alignment_pair_summary_for_track(
+        &self,
+        track_id: TrackId,
+    ) -> Option<rgv_hts::PairSummary> {
+        let panel_id = self.panels.active().id;
+        let track = self
+            .alignment_tracks
+            .iter()
+            .find(|track| track.config.id == track_id)?;
+        if track.scene_engine.is_none() {
+            return None;
+        }
+        let presented = self.presented_alignment_lane(panel_id, track_id)?;
+        if !presented.lane.summary_current() || !presented.source.semantic_target_complete {
+            return None;
+        }
+        presented
+            .lane
+            .snapshot
+            .as_ref()?
+            .summaries()
+            .pair_summary(self.panels.active().viewport.interval())
+            .ok()
     }
 }
 

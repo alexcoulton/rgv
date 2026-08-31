@@ -1,14 +1,17 @@
 # Unified alignment-scene implementation and legacy-removal plan
 
 Status: recovery R0–R6 complete on `feature/unified-alignment-scene`. R0–R5 pass their automated
-gates and the user accepted the R6 native checkpoint on 31 August 2026. Broader Phase 7 feature
-expansion is unblocked; its remaining product-family gates and Phase 8 deletion are still open.
+gates and the user accepted the R6 native checkpoint on 31 August 2026. Phase 7 semantic cutover,
+Phase 8 exclusive-renderer deletion, and Phase 9 contextual-lane migration are now implemented,
+desktop-integrated, and automated-qualified. Their combined native visual acceptance remains open
+for the user checkpoint requested after implementation.
 
-Current execution authority: `UNIFIED_ALIGNMENT_SCENE_RECOVERY_PLAN.md`. Its automated R0–R5
-frontier now proves the bounded control plane, owned navigation liveness, and single scene-backed
-local-BAM authority. Its user-reviewed R6 record accepts the minimum native navigation and
-interaction behaviour. Phase 7 feature expansion may proceed, while Phase 8 deletion remains
-gated on migration and qualification of the remaining consumers.
+Current execution authority: this plan, at the combined Phase 7–9 manual visual checkpoint.
+`UNIFIED_ALIGNMENT_SCENE_RECOVERY_PLAN.md` is the completed recovery record: its automated R0–R5
+frontier proves the bounded control plane, owned navigation liveness, and single scene-backed
+local-BAM authority, and its user-reviewed R6 record accepts the minimum native navigation and
+interaction behaviour. After the new Phase 7–9 checkpoint is accepted, the next implementation
+frontier is Phase 10 remote/CRAM qualification and production soak.
 
 The branch is no longer headless-only. Commit `1a923fa` implemented the headless scene
 architecture and also cut the local-BAM read lane over to immutable scene frames, persistent GPU
@@ -19,10 +22,10 @@ geometry, terminal Complete-read refusal settlement, and command-line Complete-r
 propagation.
 
 That desktop slice entered before the complete Phase 6 gate had passed. This was a sequencing
-deviation, not a change of architecture. It does not waive any gate below: local-BAM read pixels
-are only the first Phase 7 slice, the all-consumer cutover is incomplete, and Phase 8 destructive
-deletion cannot complete until the remaining consumers have migrated and qualification has
-passed.
+deviation, not a change of architecture. The subsequent work completed the all-consumer cutover,
+deleted the superseded alignment authorities, and moved contextual genomic lanes to independent
+camera-driven scene leases. The historical sequencing does not waive the manual acceptance or
+Phase 10 gates below.
 
 The native test that initiated recovery invalidated the previous execution frontier. Under rapid
 pan, zoom, and contig changes, that build could remain permanently on `Updating view...` while its
@@ -54,12 +57,41 @@ accepted phase.
 | 2 — scene store and resource ledger | Implemented headlessly; gate evidence present | Immutable current/candidate publication, allocation-level charging, leases, pins, reservations, independent summary roots, pressure policy, and high-water tests exist. Production-wide pressure/soak evidence remains part of later qualification. |
 | 3 — source actor and row atlas | Implemented for the local-BAM backend | Latest-wins/fair scheduling, resumable canonical decode, cancellation salvage, immutable row-atlas publication, stable-handle indexes, and clean-vs-incremental fingerprints exist. Other production source backends remain outside this scope. |
 | 4 — semantic pages and CPU reference path | Broadly implemented; qualification open | Read primitives, specialist modes, exact summary pages, CPU projection, stable picking, inspection, and export APIs exist. One captured panel epoch now projects typed Coverage, Sashimi, and Modifications results with explicit Pending/Unavailable/Ready states; shared Raw and CPM Sashimi scales are resolved atomically from the complete coherence group. The feature-matrix test currently proves inventory integrity, not exhaustive independent-oracle parity for every product mode. |
-| 5 — persistent GPU pages | Read and coverage/allele renderers integrated; shared reclaim and camera-only capture implemented; remaining product families open | Read world-coordinate pages, admission/pinning, prefetch, camera uniforms, overlays, unchanged-page reuse, device-resource discard, and CPU/GPU geometry tests exist. Summary-page identity is based on compatible tile content and family dependencies rather than whole-root publication revisions, so widening a prepared horizon does not inherently rekey unchanged coverage tiles. A sibling persistent renderer draws exact coverage and generic reference-aware substitutions. Shared-ledger reclaim now composes one exact goal across both renderers, protects both foreground candidates, retires speculative full-scene pins, batches deterministic LRU eviction, and suppresses rewarming until authority or budget genuinely changes. The ledger has a tested single-flight replacement-bundle primitive which separately proves steady-state base fit and bounded old/new overlap. Read and summary renderers each precharge a two-slot camera ring and expose a content-authority-checked camera-only capture path with no retained allocation, page-table replacement, or unchanged-geometry upload; transient scratch remains ledger-accounted. The desktop atomically captures and privately stages the supported read-plus-summary candidate with renderer-owned retirement tokens. Full manual visual acceptance, bisulfite GPU interpretation, junction/modification GPU families, exhaustive framebuffer equivalence, and a same-scene desktop software presenter remain open. |
+| 5 — persistent GPU pages | All required local-BAM product families implemented and desktop-integrated; qualification open | Read world-coordinate pages, admission/pinning, prefetch, camera uniforms, overlays, unchanged-page reuse, device-resource discard, and CPU/GPU geometry tests exist. The persistent summary renderer now owns exact coverage, generic reference-aware substitutions, bisulfite protected/converted calls, junction/Sashimi arcs and labels, and modification frequency. Generic and bisulfite interpretation reuse the same immutable allele pages and change only frame presentation. Junctions have deterministic cross-tile ownership, stable expanded rows, strand chevrons, Raw/CPM and panel-scoped shared scale, bounded labels, native picking, and uniform-only hover/selection restyling. Shared-ledger reclaim and one replacement bundle cover reads and every requested summary family; the atomic integration test proves first admission and zero unchanged-geometry upload on a repeat publication containing all families. Read and summary renderers retain their precharged two-slot camera rings and content-authority-checked camera-only capture paths. Full manual visual acceptance, exhaustive framebuffer equivalence, and a same-scene desktop software presenter remain open. |
 | 6 — camera navigation | **Recovery R0–R6 complete and accepted** | The control plane is constant-cost/event-driven, navigation has one owned transaction, camera-only capture and bounded prefetch/reclaim are implemented, deterministic rapid-navigation/resource traces pass, and the user accepted the minimum native continuity, flicker, scroll, and interaction checkpoint on 31 August 2026. |
-| 7 — desktop semantic cutover | **Unified local-BAM recovery cutover implemented; broader Phase 7 unblocked** | The supported local-BAM path consumes the committed scene epoch for rows, pixels, coverage/substitutions, picking, stable-handle selection, and status. Legacy query/row/display code is disconnected or compile-disabled for that path and remains only at the unsupported-source boundary pending later Phase 8 deletion. Remaining product-family integration and qualification may now proceed. |
-| 8 — exclusive renderer and deletion | **Blocked behind remaining Phase 7 migration** | Legacy authority must be removed deliberately after every required scene-backed replacement is integrated and qualified, not retained as a fallback or deleted prematurely. |
-| 9 — contextual lanes | Not started | Genes, reference, annotations, and other contextual lanes still use the generic display/retained panel presentation path. |
+| 7 — desktop semantic cutover | **Implemented, integrated, and automated-qualified; manual acceptance pending** | The supported local-BAM path consumes one committed scene epoch for rows, read pixels, every derived-lane pixel family, picking, stable-handle selection/navigation, inspection, structured and Sashimi export, automation/MCP read handles, selection snapshots, settings properties, and committed diagnostics. Bulk alignment search/export streams the immutable scene rather than duplicating its complete record population. Focused multi-track/multi-panel, coherence, selection, inspection, export, automation, pressure, and device-resource tests pass. Unsupported sources fail explicitly without semantic fallback. |
+| 8 — exclusive renderer and deletion | **Implemented and automated-qualified; manual acceptance pending** | The old alignment engine, exact-camera layout/row-scene system, query-local picking authority, alignment rectangle construction, CompleteHorizon/retained-preview implementation, and dense-layout compatibility harness have been deleted. The generic GPU composite excludes alignment and contextual scene rectangles. A machine-readable source inventory now fails if any deleted file or forbidden authority returns. |
+| 9 — contextual lanes | **Implemented, integrated, and automated-qualified; manual acceptance pending** | Reference, built-in genes, and every auxiliary genomic format publish immutable per-lane leases and persistent GPU geometry under the live panel camera. Source and GPU candidates commit together; rejected replacements retain their exact prior lane, and transitive coherence groups replace all-or-nothing. The whole-panel navigation texture and shader are deleted. Focused tests cover camera-only projection, offscreen admission, strict budget lowering, lane-local rejection, retained replacement, panel isolation, and transitive coherence. |
 | 10 — remote qualification and soak | Not started for the unified scene | HTS-layer remote and CRAM infrastructure is useful foundation work, but the production scene backend intentionally supports local BAM only. Local CRAM, remote BAM/CRAM, pressure soak, and memory reconciliation remain open. |
+
+Combined Phase 7–9 automated validation on 31 August 2026 passes: 1,143 workspace/all-target tests
+passed with one intentionally ignored public-network fixture. This includes alignment scene
+154/154 plus dependency, feature-matrix, and source-inventory gates; desktop 394/394; engine
+101/101; HTS 183 passed with one network-only ignore; layout 54/54; renderer 76/76 plus the atomic
+all-family GPU bundle test; and the MCP and validation suites. Workspace all-target compilation,
+formatting, and diff validation also pass. Strict Clippy remains blocked by documented pre-existing
+repository-wide pedantic lint debt (including oversized legacy functions and excessive-bool data
+schemas); a continuation pass with only those baseline lint classes suppressed reached additional
+pre-existing HTS lint debt. Neither run identified a compiler warning or failing Phase 7–9 test.
+These are implementation/integration results, not a substitute for the pending native visual
+checkpoint.
+
+Real-data headless checks on the same source revision also pass. The 9,999,081,048-byte ENCODE RNA
+BAM at `chr7:5525619-5530525` admitted 693,350 complete records and 57,861 rows once under a 2 GiB
+scene budget; three subsequent working-set camera publications took 10.9–12.9 ms, performed zero
+additional source acquisitions, and sampled approximately 715 MiB RSS. The 10,339,495,604-byte
+HG002 exome admitted 4,838 records and 522 rows under a 1 GiB budget, then published its camera in
+0.025 ms. A four-track/two-panel paired synthetic workload published eight shared projections and
+48/48 camera-only updates without further source work. These checks establish local RNA, exome,
+multi-track, and multi-panel scene operation; WGS and representative private long-read visual data
+remain part of the user/broader qualification matrix rather than being inferred from these runs.
+
+The older manual-suite structural verifier is not counted as passing evidence here. It currently
+stops before exercising the viewer because a prior documentation-reorganisation commit left its
+generated source digests stale, and its tree verifier rejects a tracked in-suite IGV symlink. An
+attempted regeneration was discarded after it exposed those pre-existing harness contradictions;
+resolving that separate fixture-maintenance debt must not be confused with Phase 7–9 scene
+correctness or with the pending manual visual pass.
 
 ### Post-MVP stabilization incorporated into this plan
 
@@ -82,10 +114,10 @@ These changes directly advance Phases 3, 6, and 7 and strengthen Phase 2/3 publi
 They do not complete derived-lane migration, all-consumer cutover, legacy deletion, contextual-lane
 migration, or remote qualification.
 
-### Camera-publication incident correction awaiting native acceptance
+### Historical camera-publication incident correction
 
-The current native build is **not visually accepted**. The preceding build repeatedly produced
-the following behaviour during zoom in/out at ACTB:
+The build preceding the accepted R6 checkpoint repeatedly produced the following behaviour during
+zoom in/out at ACTB:
 `replacement GPU transition bundle <id> is already active`, and a pending zoom could display a
 full-height vertical thumb even though the locus contained many scrollable rows. The changing
 bundle IDs show repeated short-lived ownership collisions, not one leaked bundle and not evidence
@@ -179,24 +211,20 @@ reclaim indexes. On 31 August 2026 the independent affected suites passed: engin
 alignment scene 153/153, renderer 78/78 plus its integration test, and desktop 435 passed with one
 intentional ignore; workspace all-target compilation, formatting, and diff validation also passed.
 These results complete automated recovery R0–R5. The user subsequently accepted the native R6
-checkpoint on 31 August 2026 after assessing the corrected RNA/GRCh38/GENCODE build.
+checkpoint on 31 August 2026 after assessing the corrected RNA/GRCh38/GENCODE build. That
+acceptance applies to recovery navigation behaviour; the newer Phase 7B derived-lane expansion
+still requires its own visual checkpoint.
 
 ### Current execution frontier
 
-1. Qualify the integrated coverage/generic-substitution GPU slice under partial evidence, pressure,
-   collapsed-Reads, multi-track failure, selection, and manual visual tests; then connect the same
-   exact, same-epoch model to persistent bisulfite, junction/Sashimi, and modification GPU pages,
-   including selection and picking.
-2. Finish whole-candidate GPU admission for genuine content changes: read and derived renderers
-   must privately plan and stage every missing page, page-table replacement, precharged camera
-   ring, and frame allocation under one shared replacement bundle. Opaque renderer-owned
-   retirement tokens must prove the exact old allocations credited to steady-state fit; remove
-   the transitional multi-phase retry loops. Camera-only movement inside the bounded interaction
-   envelope must never enter this transaction.
-3. Complete Phase 7C by moving every remaining product consumer to scene handles and one panel
-   scene epoch: export, automation, MCP, keyboard/mate navigation, properties, and diagnostics.
-4. Pass the Phase 7 atomic gate before deleting legacy authorities under Phase 8.
-5. Continue with contextual-lane migration and remote/CRAM qualification only after those gates.
+1. Launch the automated-qualified build with the RNA/GRCh38/GENCODE ACTB and BAP1 fixture and ask
+   the user to perform the combined Phase 7–9 visual checkpoint. Exercise live pan, zoom, vertical
+   scroll, collapsed Reads, multi-track/multi-panel use, hover/selection, coverage, generic
+   substitutions, Sashimi, modifications, reference, genes, and auxiliary contextual lanes.
+2. Record and correct any native visual or interaction discrepancy without restoring a deleted
+   query/layout/texture authority. Re-run the affected automated gates after every correction.
+3. Once the user accepts the checkpoint, record Phase 7–9 as accepted and begin Phase 10 local
+   CRAM, remote BAM/CRAM, adversarial cancellation/pressure, and production-soak qualification.
 
 ## Decision
 
@@ -1012,32 +1040,41 @@ Gate:
 Delivery milestones used for progress tracking do not weaken the atomic gate:
 
 - **7A — read lane:** publish local-BAM scene frames and use scene read pages, stable-handle
-  hover/picking/selection, and inspection. Substantially implemented; final Phase 6/manual
-  qualification remains open.
+  hover/picking/selection, and inspection. Implemented, integrated, automated-qualified, and
+  accepted at the recovery R6 checkpoint.
 - **7B — derived lanes:** render coverage, alleles, junctions/Sashimi, modifications, and required
   reference interpretation from the same snapshot and epoch. Typed lane capture and atomic
   headless projection exist, including shared Raw/CPM Sashimi scales. Exact coverage and generic
-  reference-aware substitutions now have persistent scene-native GPU pixels in the desktop, with
-  partial-authority/pressure/failure-isolation qualification in progress. Bisulfite interpretation,
-  junction/Sashimi and modification GPU pixels, and derived-lane interaction remain open; no
-  missing family is silently supplied by a legacy semantic fallback.
-- **7C — remaining consumers:** migrate keyboard and mate navigation, export, automation, MCP,
-  properties, diagnostics, multi-track, and multi-panel coherence. Remains open.
+  reference-aware substitutions, exact bisulfite interpretation, junction/Sashimi, and
+  modification frequency now have persistent scene-native GPU pixels in the desktop. Sashimi
+  picking/hover/selection/labels and coverage/modification selection plus scene-backed inspectors
+  are connected. One atomic integration test admits reads and all summary families together and
+  proves repeat capture does not upload unchanged geometry. Automated equivalence, pressure, and
+  coherence gates pass; combined manual visual qualification remains open. No missing family is
+  silently supplied by a legacy semantic fallback.
+- **7C — remaining consumers:** keyboard/mate/name/supplementary navigation, promotion, variant
+  evidence, visible consensus, derived-lane inspectors, structured and Sashimi exports, general
+  automation/MCP read handles, automation selection provenance, settings properties, and committed
+  diagnostics now consume stable scene handles or the committed panel scene. Scene alignment
+  search/export uses streaming action queries; an all-name supplementary index is allocated only
+  when that semantic selector explicitly requires it. Multi-track/multi-panel coherence and
+  committed-scene automation/export tests pass; combined manual visual qualification remains open.
 
-These milestones describe delivery order only. Until 7A–7C all pass together, Phase 7 remains
-partial and Phase 8 cannot delete the corresponding oracle or legacy code.
+These milestones describe delivery order only. 7A–7C now pass their combined automated gate and
+the corresponding Phase 8 authorities have been deleted. Manual acceptance remains a separate
+claim and is intentionally pending the user checkpoint.
 
 #### Phase 7B semantic wiring checklist
 
 | Product behaviour | Semantic authority | Native pixels | Remaining acceptance work |
 | --- | --- | --- | --- |
 | Exact coverage depth | Same-epoch depth summary pages and CPU oracle implemented | Persistent GPU pages integrated | Partial-edge, collapsed-Reads, multi-track isolation, and transition-pressure control paths have focused tests; framebuffer, cross-renderer pressure, and manual visual qualification remain |
-| Generic base substitutions | Reference-revision-keyed allele pages and reference-aware CPU oracle implemented | Persistent GPU allele pages integrated on the coverage scale | Manual zoom/threshold/quality-weight/selection checks and exhaustive CPU/GPU equivalence |
-| Bisulfite protected/converted calls | Strand/context-aware CPU oracle implemented with exact ±2 reference context | Deliberately unavailable in the GPU presenter | Add a semantically exact native presenter; never reinterpret these calls as generic substitutions |
+| Generic base substitutions | Reference-revision-keyed allele pages and reference-aware CPU oracle implemented | Persistent GPU allele pages integrated on the coverage scale | Manual zoom/threshold/quality-weight/selection checks and exhaustive framebuffer equivalence |
+| Bisulfite protected/converted calls | Strand/context-aware CPU oracle implemented with exact ±2 reference context | Integrated on the same persistent allele pages as generic calls; interpretation is camera/frame state | Manual context/strand/zoom qualification and broader framebuffer equivalence; focused CPU-oracle and zero-reupload tests pass |
 | Coverage selection marker | Typed same-epoch selected-position overlay implemented | Native overlay integrated | CPU/GPU geometry parity is tested; manual interaction qualification remains |
-| Junctions and Sashimi | Exact junction pages, CPU projection, Raw/CPM normalization, and atomic shared-scale groups implemented | Not yet integrated | Define non-duplicating cross-tile GPU ownership, render persistent arcs, then add picking/labels and manual qualification |
-| Modification frequency | Exact modification pages and typed CPU projection implemented | Not yet integrated | Add persistent native pages/pixels, selection, picking, labels, and manual qualification |
-| Derived-lane inspection/export/automation | Stable semantic components exist in the scene model | Not applicable | Route each consumer through the captured panel epoch and stable handles under 7C |
+| Junctions and Sashimi | Exact junction pages, stable global expanded rows, CPU projection, Raw/CPM normalization, and atomic panel-scoped shared-scale groups implemented | Persistent non-duplicated arc/marker pages, strand chevrons, baselines, bounded labels, native picking, and uniform-only interaction integrated | Manual collapsed/expanded, shared-scale, label, selection, and rapid-navigation qualification plus broader framebuffer equivalence |
+| Modification frequency | Exact modification pages and typed CPU projection implemented | Persistent native pages, colour modes, selection marker, and scene-backed inspection integrated | Manual probability/hidden-code/colour/selection qualification and explicit pixel-hit/label decisions |
+| Derived-lane inspection/export/automation | Pileup, modification, and Sashimi inspectors; variant evidence; structured/Sashimi exports; stable automation handles; settings; and diagnostics consume the captured/committed scene epoch | Not applicable | Qualify exports and automation across multi-track/multi-panel use; unsupported sources retain the explicit legacy boundary until qualified |
 
 “Integrated” in this table means the production desktop invokes the new path. It does not mean the
 behaviour is qualified or manually accepted; those claims require the remaining gates in the last
@@ -1065,11 +1102,13 @@ Gate:
 6. Remove the temporary scene-to-legacy pixel adapter.
 7. Keep generic `DisplayList`/`RectangleRenderer` only for non-migrated, non-overlapping lanes.
 
-Current implementation note: for a supported local BAM, the scene renderer owns read pixels at
-runtime and the old alignment event loop cannot run as a fallback. This is runtime pixel authority,
-not renderer-code exclusivity or Phase 8 completion. Query-era projection fields, display-list
-construction, query-local interaction, `CompleteHorizon`, retained navigation textures, and the
-legacy engine remain present until their Phase 7 replacements pass.
+Current implementation note: the scene renderer is the exclusive alignment pixel and interaction
+authority for a supported local BAM. Query-era projection fields, alignment display-list
+construction, query-local interaction, `CompleteHorizon`, retained navigation textures, the old
+alignment engine/layout tree, and its dense-layout compatibility harness are physically deleted.
+`validation/alignment-scene-source-inventory.json` and its production-source test guard both file
+deletion and forbidden identifiers. Generic `DisplayList` remains only as semantic CPU projection
+and non-scene chrome/overlay infrastructure; its GPU composite excludes scene-owned rectangles.
 
 Gate:
 
@@ -1087,9 +1126,15 @@ Gate:
 3. Keep cross-track coherence groups explicit where scales/comparisons are shared.
 4. Remove the whole-panel navigation texture after its last consumer migrates.
 
-Current implementation note: this phase has not started. Alignment read regions can already be
-excluded from the retained preview, but genes, reference, annotation, and other contextual regions
-still require the existing presentation path.
+Current implementation note: reference, built-in genes, and every auxiliary genomic lane now
+produce immutable lane-local geometry over a buffered source viewport. Persistent per-lane GPU
+buffers apply pan/zoom/vertical movement through camera state; text and semantic hit/export data
+are projected from the same immutable lease without parsing or row packing on the input path.
+Source candidates become committed leases only after their exact GPU revision is admitted.
+Independent lanes fail independently, while overlay/shared-scale/arithmetic memberships form
+transitive all-or-nothing coherence units. A rejected replacement retains its explicit committed
+revision, and an unavailable lane cannot cover a ready sibling. The whole-panel navigation texture,
+desktop preview modules, and preview shader are deleted.
 
 Gate:
 
@@ -1143,9 +1188,16 @@ fallbacks.
 | `hold_commit_until_end` for camera-ready scene lanes | live camera + atomic scene publication | Phase 8 |
 | Panel-wide retained texture | per-lane scene protocol | Phase 9 |
 
+Phase 8–9 implementation has now removed every area in this table from production authority. The
+checked-in deletion inventory additionally names the deleted source files and fails if they
+reappear. Historical names may remain in this plan, the accepted ADR, compatibility-only session
+schema language, and test fixtures; none is a reachable production rendering or interaction path.
+
 Retain `WeightedLruCache` for unrelated caches where entry ownership really matches allocation
-ownership. Retain `DisplayList` and the generic rectangle renderer for non-alignment lanes until
-their own migration; deleting them globally is outside the alignment cutover.
+ownership. Retain `DisplayList` as the CPU semantic/text/picking/export projection and retain the
+generic rectangle renderer for non-scene chrome and overlays. Contextual and alignment scene
+rectangles are excluded from that GPU input, so deleting these general utilities globally is
+outside the alignment/context cutover.
 
 ## Validation strategy
 

@@ -251,35 +251,38 @@ pub(crate) fn show_system_dialogs(
                         ui.small(
                             "The 1× default targets one viewport or visible row-window on each side. 0× disables speculative adjacent preparation but keeps canonical page reuse. Remote sources acquire genomic margins conservatively and stop at hard transfer bounds.",
                         );
-                        let cache = viewer.cache_coordinator;
+                        let budget = viewer.alignment_scene_budget;
                         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
                         ui.group(|ui| {
                             ui.label(format!(
-                                "Resident cache: {:.1} / {:.1} MiB",
-                                mib(cache.measured_resident_bytes),
-                                mib(cache.total_budget_bytes),
+                                "Alignment scene: {:.1} / {:.1} MiB retained",
+                                mib(budget.charged_bytes),
+                                mib(budget.budget_bytes),
                             ));
                             ui.small(format!(
-                                "Decoded reads + summaries {:.1} MiB (allowance {:.1}) · layouts {:.1} MiB (allowance {:.1})",
-                                mib(cache.decoded_resident_bytes),
-                                mib(cache.decoded_allowance_bytes),
-                                mib(cache.layout_resident_bytes),
-                                mib(cache.layout_allowance_bytes),
+                                "Reserved {:.1} MiB (transition {:.1} / {:.1}) · temporary {:.1} / {:.1} MiB (peak {:.1})",
+                                mib(budget.reserved_bytes),
+                                mib(budget.reserved_transition_bytes),
+                                mib(budget.transition_reserve_bytes),
+                                mib(budget.transient_bytes),
+                                mib(budget.transient_budget_bytes),
+                                mib(budget.transient_high_water_bytes),
                             ));
                             ui.small(format!(
-                                "Row scenes {:.1} MiB (allowance {:.1}) · GPU slabs {:.1} MiB (allowance {:.1})",
-                                mib(cache.row_scene_resident_bytes),
-                                mib(cache.row_scene_allowance_bytes),
-                                mib(cache.gpu_slab_resident_bytes),
-                                mib(cache.gpu_slab_allowance_bytes),
+                                "Pinned {:.1} MiB · replacement bundle {} · {} ledger refreshes",
+                                mib(budget.pinned_bytes),
+                                budget.active_replacement_bundle.map_or_else(
+                                    || "none".to_owned(),
+                                    |bundle| bundle.to_string(),
+                                ),
+                                budget.refreshes,
                             ));
-                            if cache.over_budget_bytes > 0 {
+                            if budget.pinned_overage_bytes > 0 {
                                 ui.colored_label(
                                     egui::Color32::DARK_RED,
                                     format!(
-                                        "Settling {:.1} MiB above budget: {}",
-                                        mib(cache.over_budget_bytes),
-                                        cache.clamp_reason.unwrap_or("current evidence is pinned"),
+                                        "Committed scene pins {:.1} MiB above the selected budget",
+                                        mib(budget.pinned_overage_bytes),
                                     ),
                                 );
                             }
@@ -290,40 +293,40 @@ pub(crate) fn show_system_dialogs(
                                 .first()
                                 .and_then(|track| track.projection(active_panel_id))
                             {
-                                let working_set = projection.working_set;
-                                let viewport_bases = viewer
-                                    .panels
-                                    .active()
-                                    .viewport
-                                    .interval()
-                                    .len()
-                                    .max(1) as f64;
+                                let viewport = viewer.panels.active().viewport.interval();
+                                let viewport_bases = viewport.len().max(1) as f64;
+                                let prepared = projection
+                                    .scene_frame
+                                    .as_ref()
+                                    .and_then(|frame| frame.snapshot.as_ref())
+                                    .map(|snapshot| snapshot.prepared_interval());
+                                let left = prepared.map_or(0, |interval| {
+                                    viewport.start().saturating_sub(interval.start())
+                                });
+                                let right = prepared.map_or(0, |interval| {
+                                    interval.end().saturating_sub(viewport.end())
+                                });
+                                let requested = projection.scene_policy.map_or(
+                                    (0.0, 0.0),
+                                    |policy| (policy.behind_viewports, policy.ahead_viewports),
+                                );
                                 ui.small(format!(
-                                    "Effective read margin: {:.2}× left / {:.2}× right (requested {:.2}× / {:.2}×)",
-                                    working_set.effective_margin_left as f64 / viewport_bases,
-                                    working_set.effective_margin_right as f64 / viewport_bases,
-                                    working_set.requested_margin_left as f64 / viewport_bases,
-                                    working_set.requested_margin_right as f64 / viewport_bases,
+                                    "Prepared scene margin: {:.2}× left / {:.2}× right (requested {:.2}× / {:.2}×)",
+                                    left as f64 / viewport_bases,
+                                    right as f64 / viewport_bases,
+                                    requested.0,
+                                    requested.1,
                                 ));
-                                if projection.query_phase
-                                    == AlignmentQueryPhase::ExtendingBrowsingBuffer
-                                {
-                                    ui.small(format!(
-                                        "Prefetch active · {} completed / {} requested · {} cancelled",
-                                        working_set.extensions_completed,
-                                        working_set.extensions_requested,
-                                        working_set.extensions_cancelled,
-                                    ));
-                                }
-                                if let Some(reason) = working_set.clamp_reason {
-                                    ui.small(format!(
-                                        "Browsing buffer clamped by {reason:?}: requested {} + {} bp, admitted {} + {} bp",
-                                        working_set.requested_margin_left,
-                                        working_set.requested_margin_right,
-                                        working_set.effective_margin_left,
-                                        working_set.effective_margin_right,
-                                    ));
-                                }
+                                ui.small(format!(
+                                    "Scene {:?} · vertical {:?} · {} source acquisitions · {} camera-only updates",
+                                    projection.navigation.phase(),
+                                    projection
+                                        .scene_frame
+                                        .as_ref()
+                                        .map_or(AlignmentVerticalResidency::ViewportBounded, |frame| frame.vertical_residency),
+                                    projection.scene_telemetry.source_acquisitions,
+                                    projection.scene_telemetry.camera_only_updates,
+                                ));
                             }
                         });
                         ui.separator();

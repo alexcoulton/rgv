@@ -477,17 +477,6 @@ pub(crate) fn interaction_record_index_at_position(
         .map(|(index, _, _, _, _)| index)
 }
 
-pub(crate) fn effective_template_length_bounds_for_filters(
-    filters: &SessionFilters,
-    query: &AlignmentQuery,
-) -> TemplateLengthBounds {
-    let inferred = query.pairs.inferred_bounds.unwrap_or_default();
-    TemplateLengthBounds {
-        minimum: filters.minimum_template_length.or(inferred.minimum),
-        maximum: filters.maximum_template_length.or(inferred.maximum),
-    }
-}
-
 pub(crate) fn alignment_sort_position(
     mode: AlignmentSortMode,
     fixed_anchor: Option<u64>,
@@ -558,50 +547,4 @@ pub(crate) fn gwas_record_index_at_point(
                 .then_with(|| left.1.cmp(&right.1))
         })
         .map(|(_, record_index)| record_index)
-}
-
-pub(crate) fn sashimi_track_detail(
-    stats: &AlignmentLayoutStats,
-    summary: &rgv_hts::JunctionSummary,
-    scale_mode: SashimiScaleMode,
-    fixed_maximum: u32,
-    count_mode: SashimiCountMode,
-) -> String {
-    let mut detail = format!("{} shown", stats.rendered_junctions);
-    if stats.hidden_junctions > 0 {
-        let _ = write!(detail, " · {} filtered/capped", stats.hidden_junctions);
-    }
-    match count_mode {
-        SashimiCountMode::Raw => {
-            let _ = write!(detail, " · max {} reads", stats.maximum_junction_depth);
-        }
-        SashimiCountMode::CountsPerMillion if stats.junction_normalization_available => {
-            let _ = write!(
-                detail,
-                " · max {:.1} CPM / {} mapped reads",
-                stats.maximum_junction_value,
-                summary
-                    .provenance
-                    .normalization_mapped_records
-                    .unwrap_or_default()
-            );
-        }
-        SashimiCountMode::CountsPerMillion => {
-            let _ = write!(
-                detail,
-                " · CPM unavailable (index has no mapped-read total; raw fallback max {})",
-                stats.maximum_junction_depth
-            );
-        }
-    }
-    let scale = match scale_mode {
-        SashimiScaleMode::Automatic => "auto scale".to_owned(),
-        SashimiScaleMode::Fixed => format!("fixed scale {fixed_maximum}"),
-        SashimiScaleMode::Shared if stats.junction_normalization_available => {
-            "shared visible-track scale".to_owned()
-        }
-        SashimiScaleMode::Shared => "shared scale unavailable; per-track fallback".to_owned(),
-    };
-    let _ = write!(detail, " · {scale}");
-    detail
 }

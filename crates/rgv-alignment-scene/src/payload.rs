@@ -48,6 +48,17 @@ impl PayloadSidecar {
         {
             return Err(PayloadSidecarError::MissingQualityCapability);
         }
+        if contract.all_auxiliary_tags() && !payload.has_all_auxiliary_tag_capability() {
+            return Err(PayloadSidecarError::MissingAllAuxiliaryCapability);
+        }
+        if !contract.all_auxiliary_tags()
+            && contract
+                .auxiliary_tags()
+                .iter()
+                .any(|tag| !payload.has_auxiliary_tag_capability(*tag))
+        {
+            return Err(PayloadSidecarError::MissingAuxiliaryTagCapability);
+        }
         let allocation_snapshot = allocation.snapshot()?;
         if allocation_snapshot.class != AllocationClass::PayloadSidecar {
             return Err(PayloadSidecarError::WrongAllocationClass {
@@ -156,6 +167,10 @@ pub enum PayloadSidecarError {
     MissingSequenceCapability,
     #[error("payload contract promises quality capability which is not retained")]
     MissingQualityCapability,
+    #[error("payload contract promises every auxiliary tag but only a filtered set was retained")]
+    MissingAllAuxiliaryCapability,
+    #[error("payload contract promises an auxiliary tag which was not considered during decode")]
+    MissingAuxiliaryTagCapability,
     #[error("payload sidecar uses allocation class {actual:?} instead of PayloadSidecar")]
     WrongAllocationClass { actual: AllocationClass },
     #[error("payload allocation capacity is {actual} bytes; expected exactly {expected}")]

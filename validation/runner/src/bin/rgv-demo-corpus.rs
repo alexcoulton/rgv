@@ -700,8 +700,11 @@ fn verify_tracks_query(engine: &TrackEngine) -> Result<()> {
             request,
             clock,
             CONTIG.to_owned(),
-            u64::from(8_500_u32),
-            u64::from(16_000_u32),
+            GenomicInterval::new(
+                rgv_core::ContigId::new(0),
+                u64::from(8_500_u32),
+                u64::from(16_000_u32),
+            )?,
         )
         .context("failed to queue generated demo query")?;
     let snapshots = receive_track_snapshots(engine)?;
@@ -732,6 +735,7 @@ fn verify_tracks_query(engine: &TrackEngine) -> Result<()> {
 
 fn receive_track_snapshots(engine: &TrackEngine) -> Result<Vec<rgv_engine::TrackSnapshot>> {
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut tracks = Vec::new();
     loop {
         anyhow::ensure!(
             Instant::now() < deadline,
@@ -741,7 +745,11 @@ fn receive_track_snapshots(engine: &TrackEngine) -> Result<Vec<rgv_engine::Track
             .try_receive()
             .context("demo track engine disconnected")?
         {
-            Some(TrackEngineEvent::QueryCompleted { tracks, .. }) => return Ok(tracks),
+            Some(TrackEngineEvent::LaneCompleted { track, .. }) => tracks.push(track),
+            Some(TrackEngineEvent::QueryCompleted { completed, .. }) => {
+                tracks.retain(|track| completed.contains(&track.id));
+                return Ok(tracks);
+            }
             Some(TrackEngineEvent::Error { message, .. }) => {
                 anyhow::bail!("generated demo track query failed: {message}");
             }

@@ -466,16 +466,14 @@ impl WorkspaceLayoutSnapshot {
         )
     }
 
-    pub(crate) fn physical_canvas_scissor(
+    pub(crate) fn physical_rect_scissor(
         &self,
-        panel_id: rgv_core::PanelId,
+        rect: egui::Rect,
         scale_factor: f32,
         surface_width: u32,
         surface_height: u32,
-    ) -> Option<PhysicalScissor> {
-        self.panel(panel_id).map(|panel| {
-            physical_scissor_for_rect(panel.canvas, scale_factor, surface_width, surface_height)
-        })
+    ) -> PhysicalScissor {
+        physical_scissor_for_rect(rect, scale_factor, surface_width, surface_height)
     }
 }
 
@@ -900,14 +898,12 @@ mod tests {
                                 );
                                 assert!(layout.panel_at(panel.header.center()).is_none());
                                 for scale in [1.0, 2.0] {
-                                    let scissor = layout
-                                        .physical_canvas_scissor(
-                                            panel.panel_id,
-                                            scale,
-                                            (window_width * scale).ceil() as u32,
-                                            (800.0 * scale).ceil() as u32,
-                                        )
-                                        .unwrap();
+                                    let scissor = layout.physical_rect_scissor(
+                                        panel.canvas,
+                                        scale,
+                                        (window_width * scale).ceil() as u32,
+                                        (800.0 * scale).ceil() as u32,
+                                    );
                                     assert!(scissor.width > 0);
                                     assert!(scissor.height > 0);
                                     assert!(

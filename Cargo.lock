@@ -4022,19 +4022,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rgv-dense-layout-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "rgv-core",
- "rgv-hts",
- "rgv-layout",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "rgv-desktop"
 version = "0.1.0"
 dependencies = [
@@ -4113,10 +4100,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rgv-alignment-scene",
  "rgv-core",
  "rgv-engine",
  "rgv-hts",
- "rgv-layout",
  "serde",
  "serde_json",
  "sha2",

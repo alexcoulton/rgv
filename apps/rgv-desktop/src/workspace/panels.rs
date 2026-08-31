@@ -9,9 +9,10 @@ pub(crate) struct PendingQueries {
 }
 
 pub(crate) struct PanelScrollDisplayCache {
+    /// CPU-side annotation chrome. Contextual rectangles are projected separately for semantic
+    /// hit testing and are rendered exclusively by `ContextSceneGpuRenderer`.
     pub(crate) annotations: DisplayList,
     pub(crate) pinned: DisplayList,
-    pub(crate) junction_arc_keys: BTreeMap<u32, JunctionArcKey>,
     pub(crate) annotation_overview: ScrollbarOverview,
     pub(crate) annotation_content_bottom: f32,
     pub(crate) annotation_clip_top: f32,
@@ -23,7 +24,7 @@ pub(crate) struct PanelScrollDisplayCache {
 pub(crate) struct ReadPanelDisplayCache {
     pub(crate) track_id: TrackId,
     /// Target revision of the committed native epoch which supplied unified row authority. Zero
-    /// denotes legacy, absent, or desired-but-not-yet-presented state.
+    /// denotes absent or desired-but-not-yet-presented state.
     pub(crate) presentation_target_revision: u64,
     pub(crate) scrollable: DisplayList,
     pub(crate) density_camera: bool,
@@ -32,14 +33,13 @@ pub(crate) struct ReadPanelDisplayCache {
     pub(crate) row_height: Option<f32>,
     pub(crate) row_coordinate_authority: ReadRowCoordinateAuthority,
     /// Immutable activity atlas revision which supplied exact vertical extent and navigator
-    /// density. `None` is required for Pending/Absent and every legacy CPU cache.
+    /// density. `None` is required for Pending/Absent authority.
     pub(crate) row_activity_atlas_revision: Option<RowAtlasRevision>,
     pub(crate) materialized_row_range: Option<(usize, usize)>,
     pub(crate) total_rows: Option<usize>,
     /// Optional semantic authority for the read navigator miniature. `Some(empty)` is
     /// deliberately distinct from `None`: a unified scene can truthfully report that the
-    /// current genomic camera has no occupied rows even though its legacy CPU display list is
-    /// empty for an unrelated reason.
+    /// current genomic camera has no occupied rows; `None` means row authority is unavailable.
     pub(crate) authoritative_overview: Option<ScrollbarOverview>,
     pub(crate) overview: ScrollbarOverview,
     pub(crate) actual_content_bottom: f32,
@@ -47,15 +47,8 @@ pub(crate) struct ReadPanelDisplayCache {
     pub(crate) clip_bottom: f32,
 }
 
-/// Identity of the row coordinate space used by a vertical read camera. Legacy CPU layouts have
-/// only their reconciliation revision; unified scenes carry the atlas lineage explicitly. The
-/// variants keep those domains disjoint so an unrelated scene revision can never accidentally
-/// preserve a row camera.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReadRowCoordinateSpace {
-    Legacy(u64),
-    Unified(RowCoordinateSpaceRevision),
-}
+/// Identity of the immutable scene row atlas used by a vertical read camera.
+pub(crate) type ReadRowCoordinateSpace = RowCoordinateSpaceRevision;
 
 /// Whether the current display cache can describe the vertical row coordinate space exactly.
 ///
@@ -93,8 +86,7 @@ impl ReadRowCoordinateAuthority {
 /// Downgrades an old unified cache to provisional authority when native publication moves to a
 /// target whose row semantics differ. A vertical camera, clip, or surface-only change may advance
 /// the full pixel target while the same genomic row profile remains exact; callers prove that
-/// narrower compatibility independently. Legacy caches use revision zero and remain governed by
-/// their own lineage.
+/// narrower compatibility independently.
 pub(crate) const fn current_read_row_authority(
     cached_target_revision: u64,
     current_target_revision: u64,
@@ -130,10 +122,7 @@ pub(crate) fn read_row_cache_matches_committed_activity(
     match committed_activity {
         Some((coordinate_space, atlas_revision, active_row_end)) => {
             cached_target_revision == committed_target_revision
-                && cached_authority
-                    == ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Unified(
-                        coordinate_space,
-                    ))
+                && cached_authority == ReadRowCoordinateAuthority::Exact(coordinate_space)
                 && cached_atlas_revision == Some(atlas_revision)
                 && cached_total_rows == Some(active_row_end)
         }
@@ -226,28 +215,28 @@ impl PendingReadSelection {
         Some(selection)
     }
 
-    #[cfg(test)]
-    pub(crate) fn matching_index(&self, query: &AlignmentQuery) -> Option<usize> {
-        (0..query.batch.len()).find(|index| {
-            query.batch.read_name(*index) == Some(self.read_name.as_slice())
-                && self
+    pub(crate) fn matching_scene_record(
+        &self,
+        scene: &AlignmentPresentationScene,
+    ) -> Option<(rgv_alignment_scene::AlignmentHandle, AlignmentRecord)> {
+        scene
+            .handles_for_read_name(&self.read_name)
+            .into_iter()
+            .find_map(|handle| {
+                let record = scene.inspect_retained(handle).ok().flatten()?;
+                (self
                     .target_contig
-                    .is_none_or(|contig| query.batch.contig(*index) == Some(contig))
-                && self
-                    .target_start
-                    .is_none_or(|start| query.batch.start(*index) == Some(start))
-                && self.template_end.is_none_or(|read_end| {
-                    query
-                        .batch
-                        .flags(*index)
-                        .is_some_and(|flags| template_read_end(flags) == Some(read_end))
-                })
-        })
+                    .is_none_or(|contig| record.contig == contig)
+                    && self.target_start.is_none_or(|start| record.start == start)
+                    && self
+                        .template_end
+                        .is_none_or(|read_end| template_read_end(record.flags) == Some(read_end)))
+                .then_some((handle, record))
+            })
     }
 
     /// Keeps the exact semantic identity after binding it to one query-local
     /// record index. Reveal is a one-shot navigation request; identity is not.
-    #[cfg(test)]
     pub(crate) fn retained_after_resolution(
         mut self,
         record: Option<&AlignmentRecord>,
@@ -331,7 +320,6 @@ pub(crate) struct ViewPanelController {
     pub(crate) requested_locus: Option<String>,
     pub(crate) contig_name: String,
     pub(crate) contig_length: u64,
-    pub(crate) selected_record: Option<usize>,
     pub(crate) selected_alignment_track: Option<TrackId>,
     pub(crate) selected_alignment_tracks: Vec<TrackId>,
     pub(crate) alignment_selection_anchor: Option<TrackId>,
@@ -339,7 +327,6 @@ pub(crate) struct ViewPanelController {
     /// is separate from annotation selection even though both use the same IDs.
     pub(crate) selected_read_tracks: Vec<TrackId>,
     pub(crate) read_selection_anchor: Option<TrackId>,
-    pub(crate) selected_read_event: Option<ReadEventSelection>,
     pub(crate) selected_pileup_position: Option<u64>,
     pub(crate) selected_modification_position: Option<u64>,
     pub(crate) selected_junction: Option<(u64, u64)>,
@@ -353,24 +340,28 @@ pub(crate) struct ViewPanelController {
     pub(crate) selected_interaction: Option<InteractionSelection>,
     pub(crate) selected_chain: Option<SelectedSupplementaryChain>,
     pub(crate) retained_evidence: Option<RetainedEvidenceSnapshot>,
-    /// Durable semantic identity of the selected read. `selected_record` is
-    /// merely this identity's index in the current alignment query.
+    /// Durable semantic identity used to resolve a read after cross-locus navigation.
     pub(crate) pending_read_selection: Option<PendingReadSelection>,
-    pub(crate) pending_read_reveal: Option<(TrackId, usize)>,
-    pub(crate) hovered_record: Option<(TrackId, usize)>,
+    /// Stable-handle reveal request for the unified scene path. Query-local record indexes never
+    /// cross this boundary.
+    pub(crate) pending_alignment_reveal: Option<(TrackId, rgv_alignment_scene::AlignmentHandle)>,
     /// Stable scene hit captured from the same immutable panel frame used for rendering.
     pub(crate) hovered_alignment_hit: Option<AlignmentHit>,
     pub(crate) selected_alignment_hit: Option<AlignmentHit>,
     pub(crate) hover_inspector_target: Option<HoverInspectorTarget>,
     pub(crate) hovered_junction_arc: Option<JunctionArcHover>,
-    pub(crate) junction_arc_targets: Vec<ComposedJunctionArcTarget>,
     pub(crate) display_list: DisplayList,
-    /// Non-evidentiary read geometry derived from a complete canonical horizon.
-    /// It is rendered above the retained texture with zero object IDs only.
-    pub(crate) navigation_provisional_display: Option<DisplayList>,
+    /// Rectangle subset owned by the generic renderer. Contextual lane rectangles remain in
+    /// `display_list` for picking/export but must never be uploaded through this path.
+    pub(crate) generic_display_list: DisplayList,
+    /// Immutable contextual-lane leases and their current CPU reference projection. Alignment
+    /// pixels live in the unified alignment scene; this scene owns only reference, genes, and
+    /// auxiliary annotations.
+    pub(crate) context_scene: PanelContextScene,
     pub(crate) scroll_display_cache: Option<PanelScrollDisplayCache>,
     pub(crate) reference_slice: Option<Arc<ReferenceSlice>>,
     pub(crate) reference_slice_revision: Option<ReferenceRevision>,
+    pub(crate) reference_slice_generation: Option<u64>,
     /// Exact authority requested from the FASTA actor for this panel generation. Alignment Base
     /// scenes can require a wider interval than the ordinary visible reference row.
     pub(crate) reference_request_revision: Option<ReferenceRevision>,
@@ -383,7 +374,11 @@ pub(crate) struct ViewPanelController {
     pub(crate) reference_settled_generation: Option<u64>,
     pub(crate) pending_queries: PendingQueries,
     pub(crate) track_snapshots: Vec<TrackSnapshot>,
-    pub(crate) track_snapshot_interval: Option<GenomicInterval>,
+    /// Buffered source horizon owned independently by each contextual track snapshot.
+    pub(crate) track_snapshot_intervals: BTreeMap<TrackId, GenomicInterval>,
+    pub(crate) track_snapshot_generations: BTreeMap<TrackId, u64>,
+    /// Exact buffered horizon of the currently queued contextual-track request.
+    pub(crate) track_request_interval: Option<GenomicInterval>,
     pub(crate) track_settled_generation: Option<u64>,
     pub(crate) vertical_scroll_points: f32,
     /// Position of the laid-out scrollable content inside the density-expanded
@@ -412,7 +407,8 @@ pub(crate) struct ViewPanelController {
     pub(crate) navigation_presentation: NavigationPresentation,
     pub(crate) navigation_query_schedule: NavigationQuerySchedule,
     pub(crate) reference_query_error_generation: Option<u64>,
-    pub(crate) track_query_error_generation: Option<u64>,
+    /// Per-lane terminal failures for the current contextual query generation.
+    pub(crate) track_query_error_generations: BTreeMap<TrackId, u64>,
 }
 
 pub(crate) const INITIAL_PANEL_ID: PanelId = PanelId::new(1);
@@ -667,6 +663,21 @@ pub(crate) fn composite_panel_display_lists(panels: &PanelWorkspace) -> DisplayL
     composite
 }
 
+/// GPU input for the generic rectangle path. Contextual and alignment scene rectangles are
+/// deliberately absent even though they remain in each panel's semantic `display_list`.
+pub(crate) fn composite_panel_generic_display_lists(panels: &PanelWorkspace) -> DisplayList {
+    let mut composite = DisplayList::default();
+    for panel in panels.iter() {
+        composite
+            .rectangles
+            .extend(panel.generic_display_list.rectangles.iter().copied());
+        composite
+            .texts
+            .extend(panel.generic_display_list.texts.iter().cloned());
+    }
+    composite
+}
+
 pub(crate) fn maximum_annotation_frame_heights(
     panels: &PanelWorkspace,
 ) -> BTreeMap<PresentationNodeId, f32> {
@@ -739,13 +750,11 @@ impl ViewPanelController {
             requested_locus,
             contig_name,
             contig_length,
-            selected_record: None,
             selected_alignment_track: None,
             selected_alignment_tracks: Vec::new(),
             alignment_selection_anchor: None,
             selected_read_tracks: Vec::new(),
             read_selection_anchor: None,
-            selected_read_event: None,
             selected_pileup_position: None,
             selected_modification_position: None,
             selected_junction: None,
@@ -760,25 +769,27 @@ impl ViewPanelController {
             selected_chain: None,
             retained_evidence: None,
             pending_read_selection: None,
-            pending_read_reveal: None,
-            hovered_record: None,
+            pending_alignment_reveal: None,
             hovered_alignment_hit: None,
             selected_alignment_hit: None,
             hover_inspector_target: None,
             hovered_junction_arc: None,
-            junction_arc_targets: Vec::new(),
             display_list: DisplayList::default(),
-            navigation_provisional_display: None,
+            generic_display_list: DisplayList::default(),
+            context_scene: PanelContextScene::default(),
             scroll_display_cache: None,
             reference_slice: None,
             reference_slice_revision: None,
+            reference_slice_generation: None,
             reference_request_revision: None,
             reference_request_interval: None,
             reference_installs_queued: BTreeMap::new(),
             reference_settled_generation: None,
             pending_queries: PendingQueries::default(),
             track_snapshots: Vec::new(),
-            track_snapshot_interval: None,
+            track_snapshot_intervals: BTreeMap::new(),
+            track_snapshot_generations: BTreeMap::new(),
+            track_request_interval: None,
             track_settled_generation: None,
             vertical_scroll_points: 0.0,
             vertical_content_origin_points: 0.0,
@@ -799,7 +810,7 @@ impl ViewPanelController {
             ),
             navigation_query_schedule: NavigationQuerySchedule::default(),
             reference_query_error_generation: None,
-            track_query_error_generation: None,
+            track_query_error_generations: BTreeMap::new(),
         }
     }
 
@@ -820,6 +831,7 @@ impl ViewPanelController {
     pub(crate) fn settle_reference_open_failure(&mut self) {
         self.reference_slice = None;
         self.reference_slice_revision = None;
+        self.reference_slice_generation = None;
         self.reference_request_revision = None;
         self.reference_request_interval = None;
         self.reference_installs_queued.clear();
@@ -833,13 +845,11 @@ impl ViewPanelController {
         self.selected_track = None;
         self.selected_presentation_nodes.clear();
         self.presentation_selection_anchor = None;
-        self.selected_record = None;
         self.selected_alignment_track = None;
         self.selected_alignment_tracks.clear();
         self.alignment_selection_anchor = None;
         self.selected_read_tracks.clear();
         self.read_selection_anchor = None;
-        self.selected_read_event = None;
         self.selected_pileup_position = None;
         self.selected_modification_position = None;
         self.selected_junction = None;
@@ -854,13 +864,11 @@ impl ViewPanelController {
         self.selected_chain = None;
         self.retained_evidence = None;
         self.pending_read_selection = None;
-        self.pending_read_reveal = None;
-        self.hovered_record = None;
+        self.pending_alignment_reveal = None;
         self.hovered_alignment_hit = None;
         self.selected_alignment_hit = None;
         self.hover_inspector_target = None;
         self.hovered_junction_arc = None;
-        self.junction_arc_targets.clear();
     }
 }
 

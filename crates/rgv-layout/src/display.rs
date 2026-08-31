@@ -216,20 +216,10 @@ pub struct TextPrimitive {
     pub color: Rgba,
 }
 
-/// Marks a primitive as read detail that must keep its semantic color when the
-/// parent alignment is selected or hovered. The remaining bits still identify
-/// the owning alignment for hit testing.
-pub const READ_DETAIL_OBJECT_BIT: u32 = 1 << 31;
-const RECORD_OBJECT_MASK: u32 = !READ_DETAIL_OBJECT_BIT;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Direction {
     Left,
     Right,
-}
-
-pub const fn read_detail_object_id(object_id: u32) -> u32 {
-    object_id | READ_DETAIL_OBJECT_BIT
 }
 
 /// Width of a read's directional terminal in screen points.
@@ -251,10 +241,6 @@ pub fn breakend_bracket_dimensions(width: f32, height: f32) -> (f32, f32) {
     let bar_width = width.min(2.0);
     let stem_half_height = (height * 0.14).max(height.min(1.0)).min(height * 0.5);
     (bar_width, stem_half_height)
-}
-
-pub const fn record_object_id(object_id: u32) -> u32 {
-    object_id & RECORD_OBJECT_MASK
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -533,30 +519,6 @@ mod tests {
                 .iter()
                 .all(|rect| rect.x + rect.width <= 800.0)
         );
-    }
-
-    #[test]
-    fn read_detail_ids_preserve_the_parent_record_id() {
-        let detail_id = read_detail_object_id(42);
-        assert_ne!(detail_id, 42);
-        assert_eq!(record_object_id(detail_id), 42);
-        assert_eq!(record_object_id(42), 42);
-    }
-
-    #[test]
-    fn shape_metadata_does_not_change_record_identity() {
-        let mut primitive = RectPrimitive {
-            x: 0.0,
-            y: 0.0,
-            width: 10.0,
-            height: 5.0,
-            color: Rgba::new(0.0, 0.0, 0.0, 1.0),
-            object_id: read_detail_object_id(42),
-            shape: RectShape::DirectionalTerminalLeft,
-        };
-        assert_eq!(record_object_id(primitive.object_id), 42);
-        primitive.shape = RectShape::BreakendJoinAfter;
-        assert_eq!(record_object_id(primitive.object_id), 42);
     }
 
     #[test]

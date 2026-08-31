@@ -1,17 +1,55 @@
 use super::super::*;
-#[cfg(any())]
-use crate::display::alignment;
 
 impl Viewer {
     pub(crate) fn visible_consensus(&self) -> Option<BoundedSequenceCopy> {
-        let query = self.primary_alignment_query()?;
-        let visible = query
-            .interval
-            .intersection(self.panels.active().viewport.interval())?;
-        let bases = query
-            .pileup
-            .consensus(query.interval, visible, query.reference.as_ref())?;
-        Some(bounded_sequence_copy(&bases))
+        let track_id = self.primary_alignment_track_id();
+        if let Some(presented) = self
+            .presented_alignment_lane(self.panels.active().id, track_id)
+            .filter(|presented| presented.lane.summary_current())
+            && let Some(snapshot) = presented.lane.snapshot.as_ref()
+        {
+            let visible = snapshot
+                .prepared_interval()
+                .intersection(self.panels.active().viewport.interval())?;
+            let reference = self.panels.active().reference_slice.as_deref().filter(|_| {
+                snapshot.reads().presentation().reference
+                    == self.panels.active().reference_slice_revision
+            });
+            let mut bases = Vec::with_capacity(usize::try_from(visible.len()).ok()?);
+            for position in visible.start()..visible.end() {
+                let support = snapshot
+                    .summaries()
+                    .allele_site_evidence_at(position)?
+                    .bin
+                    .quality_weighted;
+                let candidates = [
+                    (b'A', support.a),
+                    (b'C', support.c),
+                    (b'G', support.g),
+                    (b'T', support.t),
+                    (b'N', support.n),
+                ];
+                let total = support.total();
+                let base = if total == 0 {
+                    reference
+                        .and_then(|reference| reference.base_at(position))
+                        .map_or(b'N', |base| base.to_ascii_uppercase())
+                } else {
+                    let (base, maximum) = candidates
+                        .into_iter()
+                        .max_by_key(|(_, value)| *value)
+                        .unwrap();
+                    if maximum.saturating_mul(2) > total {
+                        base
+                    } else {
+                        b'N'
+                    }
+                };
+                bases.push(base);
+            }
+            return Some(bounded_sequence_copy(&bases));
+        }
+        None
     }
 
     pub(crate) fn visible_reference_sequence(&self) -> Option<BoundedSequenceCopy> {
@@ -20,11 +58,7 @@ impl Viewer {
             .active()
             .reference_slice
             .as_deref()
-            .filter(|_| self.panels.active().reference_slice_revision == self.reference_revision)
-            .or_else(|| {
-                self.primary_alignment_query()
-                    .and_then(|query| query.reference.as_ref())
-            })?;
+            .filter(|_| self.panels.active().reference_slice_revision == self.reference_revision)?;
         let visible = self
             .panels
             .active()
@@ -40,12 +74,13 @@ impl Viewer {
     }
 
     pub(crate) fn selected_mate_target(&self) -> Option<(PendingReadSelection, String)> {
-        let track_id = self.panels.active().selected_alignment_track?;
-        let index = self.panels.active().selected_record?;
-        let record = self
-            .complete_read_query_for_track(track_id)?
-            .materialize_record(index)
-            .ok()?;
+        let panel = self.panels.active();
+        let track_id = panel
+            .selected_alignment_hit
+            .map(|hit| hit.track)
+            .or(panel.selected_alignment_track)?;
+        let record =
+            self.alignment_scene_record_for_hit(panel.id, panel.selected_alignment_hit?)?;
         let locus = mate_locus(
             &record,
             self.alignment_dictionary_for_track(track_id)?,
@@ -201,87 +236,5 @@ impl Viewer {
         self.activate_view_panel(origin);
         self.display_dirty = true;
         Ok((opened, requested))
-    }
-
-    #[cfg(any())]
-    pub(crate) fn resolve_pending_read_selection(
-        &mut self,
-        panel_id: PanelId,
-        track_id: TrackId,
-        query: &AlignmentQuery,
-    ) {
-        let Some(pending_selection) = self
-            .panels
-            .get(panel_id)
-            .and_then(|panel| panel.pending_read_selection.clone())
-        else {
-            return;
-        };
-        if pending_selection.track_id != track_id {
-            return;
-        }
-        let complete = self
-            .alignment_tracks
-            .iter()
-            .find(|track| track.config.id == track_id)
-            .and_then(|track| {
-                let projection = track.projection(panel_id)?;
-                let layout_query = projection.layout_query.as_deref().unwrap_or(query);
-                Some(
-                    alignment::individual_read_refusal(
-                        query,
-                        layout_query,
-                        track.config.filters.read_stacking_mode,
-                    )
-                    .is_none(),
-                )
-            })
-            .unwrap_or(false);
-        if !complete {
-            if let Some(panel) = self.panels.get_mut(panel_id) {
-                panel.selected_record = None;
-                panel.selected_read_event = None;
-                panel.selected_chain = None;
-            }
-            return;
-        }
-        let Some(index) = pending_selection.matching_index(query) else {
-            // The selected read may be outside this query's interval. Its old
-            // numeric index is unsafe against the new batch, but retain the
-            // stable pending identity so it can reappear after navigation.
-            if let Some(panel) = self.panels.get_mut(panel_id) {
-                panel.selected_record = None;
-                panel.selected_read_event = None;
-            }
-            return;
-        };
-        let contig_name = self
-            .panels
-            .get(panel_id)
-            .map(|panel| panel.contig_name.clone())
-            .unwrap_or_default();
-        let selected_record = query.materialize_record(index).ok();
-        let selected_chain = selected_record
-            .as_ref()
-            .and_then(|record| selected_supplementary_chain(record, &contig_name));
-        let (retained_selection, reveal) =
-            pending_selection.retained_after_resolution(selected_record.as_ref());
-        if let Some(panel) = self.panels.get_mut(panel_id) {
-            if reveal {
-                panel.pending_read_reveal = Some((track_id, index));
-            }
-            // Record indexes belong to one query batch. Keep the exact read
-            // identity as the panel's durable selection so every later zoom,
-            // pan, or workspace refresh can bind it again.
-            panel.pending_read_selection = Some(retained_selection);
-            panel.selected_record = Some(index);
-            panel.selected_alignment_track = Some(track_id);
-            replace_panel_track_selection(
-                panel,
-                TrackFrameKey::Alignment(track_id),
-                ui::TrackPane::Reads,
-            );
-            panel.selected_chain = selected_chain;
-        }
     }
 }

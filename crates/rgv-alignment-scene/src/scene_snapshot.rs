@@ -12,11 +12,29 @@ use thiserror::Error;
 use crate::summary_page::required_summary_page_keys;
 use crate::{
     AlignmentExportError, AlignmentExportRecord, AlignmentHandle, AlignmentPresentationScene,
-    AllocationClass, AllocationLease, AllocationLedger, CanonicalGenomicTile, ExactSummaryPins,
-    ExactSummaryRoot, JunctionAnnotationIndex, JunctionAnnotationPins, LedgerError,
-    PinnedAllocationLease, ReservationKind, SceneRevision, SummaryPageFamily, SummaryPageKey,
-    SummaryRevision, SummarySemanticPage,
+    AllocationClass, AllocationLease, AllocationLedger, CanonicalGenomicTile,
+    ExactAlleleSiteEvidence, ExactPileupSiteEvidence, ExactSummaryPins, ExactSummaryRoot,
+    JunctionAnnotationIndex, JunctionAnnotationPins, LedgerError, PinnedAllocationLease,
+    ReservationKind, SceneRevision, SummaryPageFamily, SummaryPageKey, SummaryRevision,
+    SummarySemanticComponent, SummarySemanticPage,
 };
+
+/// Scene-backed allele observation used by inspection and automation consumers. The base counts
+/// and tile provenance come from the exact summary root; the optional reference base comes from
+/// the immutable, reference-revision-keyed semantic page presented in the same snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AlignmentSceneAlleleSite {
+    pub evidence: ExactAlleleSiteEvidence,
+    pub reference_base: Option<u8>,
+}
+
+/// Scene-backed coverage/pileup fact. Exact depth is always present; allele observations and their
+/// same-snapshot reference interpretation remain explicit optional capabilities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AlignmentScenePileupSite {
+    pub evidence: ExactPileupSiteEvidence,
+    pub reference_base: Option<u8>,
+}
 
 /// The complete immutable semantic authority for one alignment track revision.
 ///
@@ -216,6 +234,57 @@ impl AlignmentSceneSnapshot {
         }
         pages.sort_unstable_by_key(|page| page.key());
         pages
+    }
+
+    /// Resolves the exact allele fact and its same-snapshot reference interpretation at one base.
+    /// This method never constructs or consults a mutable viewport query.
+    #[must_use]
+    pub fn allele_site_at(&self, position: u64) -> Option<AlignmentSceneAlleleSite> {
+        let evidence = self.summaries.allele_site_evidence_at(position)?;
+        let (bin, reference_base) = self.allele_semantic_at(position)?;
+        debug_assert_eq!(bin, evidence.bin);
+        Some(AlignmentSceneAlleleSite {
+            evidence,
+            reference_base,
+        })
+    }
+
+    /// Resolves exact coverage at one base even when the scene did not request sequence detail.
+    /// If allele detail exists, its counts and reference interpretation come from the same
+    /// immutable snapshot and are merged into the returned pileup fact.
+    #[must_use]
+    pub fn pileup_site_at(&self, position: u64) -> Option<AlignmentScenePileupSite> {
+        let evidence = self.summaries.pileup_site_evidence_at(position)?;
+        let reference_base = self
+            .allele_semantic_at(position)
+            .map(|(_, reference_base)| reference_base)
+            .unwrap_or(None);
+        Some(AlignmentScenePileupSite {
+            evidence,
+            reference_base,
+        })
+    }
+
+    fn allele_semantic_at(&self, position: u64) -> Option<(rgv_hts::PileupBin, Option<u8>)> {
+        let end = position.checked_add(1)?;
+        let interval =
+            GenomicInterval::new(self.prepared_interval().contig(), position, end).ok()?;
+        let page = self
+            .summary_pages_for(SummaryPageFamily::Alleles, interval)
+            .into_iter()
+            .next()?;
+        let offset = position.checked_sub(page.interval().start())?;
+        page.primitives().iter().find_map(|primitive| {
+            (primitive.start_offset <= offset && offset < primitive.end_offset)
+                .then_some(primitive.component)
+                .and_then(|component| match component {
+                    SummarySemanticComponent::Alleles {
+                        bin,
+                        reference_base,
+                    } => Some((bin, reference_base)),
+                    _ => None,
+                })
+        })
     }
 
     /// Maximum canonical summary tiles any camera with this genomic span can expose inside the

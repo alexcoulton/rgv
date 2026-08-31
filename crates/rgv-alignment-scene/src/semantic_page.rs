@@ -3821,6 +3821,22 @@ mod tests {
         assert!(scene.contains_handle(hit.handle));
         assert!(
             scene
+                .edge_handle(crate::AlignmentTraversalDirection::Next)
+                .is_some()
+        );
+        assert!(
+            scene
+                .edge_handle(crate::AlignmentTraversalDirection::Previous)
+                .is_some()
+        );
+        let hit_record = scene.inspect_retained(hit.handle).unwrap().unwrap();
+        assert!(
+            scene
+                .handles_for_read_name(&hit_record.read_name)
+                .contains(&hit.handle)
+        );
+        assert!(
+            scene
                 .adjacent_handle(hit.handle, crate::AlignmentTraversalDirection::Next)
                 .is_some()
         );
@@ -3832,6 +3848,42 @@ mod tests {
             .export_full(GenomicInterval::new(ContigId::new(0), 0, 300).unwrap())
             .unwrap();
         assert_eq!(exported.len(), 3);
+        let mut streamed = Vec::new();
+        scene
+            .for_each_full(
+                GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+                |record| {
+                    streamed.push(record);
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(streamed, exported);
+        let mut stopped_after_one = 0;
+        scene
+            .for_each_full(
+                GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+                |_| {
+                    stopped_after_one += 1;
+                    false
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped_after_one, 1);
+        let mut identities = Vec::new();
+        scene
+            .for_each_identity(
+                GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+                |handle, read_name, flags| {
+                    identities.push((handle, read_name.to_vec(), flags));
+                },
+            )
+            .unwrap();
+        assert_eq!(identities.len(), exported.len());
+        assert_eq!(
+            scene.modification_codes(10, 10).unwrap(),
+            vec![rgv_hts::ModificationCode::Letter(b'm')]
+        );
         assert_eq!(
             scene.inspect_retained(hit.handle).unwrap().unwrap(),
             exported

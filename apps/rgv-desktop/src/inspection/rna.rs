@@ -14,7 +14,7 @@ pub(crate) struct JunctionAnnotationContext {
 pub(crate) struct SashimiExportTrack {
     pub(crate) id: TrackId,
     pub(crate) name: String,
-    pub(crate) query: Arc<AlignmentQuery>,
+    pub(crate) junctions: rgv_hts::JunctionSummary,
     pub(crate) filters: SessionFilters,
 }
 
@@ -30,7 +30,14 @@ pub(crate) struct SashimiExportBundle {
 pub(crate) struct AutomationAlignmentExportTrack {
     pub(crate) id: TrackId,
     pub(crate) name: String,
-    pub(crate) query: Arc<AlignmentQuery>,
+    pub(crate) complete_read_limit: usize,
+    pub(crate) authority: AutomationAlignmentExportAuthority,
+}
+
+/// Immutable authority behind one structured alignment export.
+#[derive(Clone)]
+pub(crate) struct AutomationAlignmentExportAuthority {
+    pub(crate) snapshot: Arc<AlignmentSceneSnapshot>,
 }
 
 impl JunctionAnnotationContext {
@@ -47,12 +54,13 @@ impl JunctionAnnotationContext {
 pub(crate) fn junction_annotation_context(
     configs: &TrackCollection,
     snapshots: &[TrackSnapshot],
-    loaded_interval: Option<GenomicInterval>,
+    loaded_intervals: &BTreeMap<TrackId, GenomicInterval>,
     viewport_interval: GenomicInterval,
 ) -> JunctionAnnotationContext {
     let mut source_tracks = 0_usize;
     let mut processed_records = 0_usize;
     let mut source_records_truncated = false;
+    let mut all_source_intervals_complete = true;
     let mut transcripts = BTreeMap::<(u64, String), (Vec<(u64, u64)>, BTreeSet<String>)>::new();
 
     for config in configs
@@ -60,6 +68,11 @@ pub(crate) fn junction_annotation_context(
         .iter()
         .filter(|config| config.visible && config.kind == TrackKind::GeneModel)
     {
+        all_source_intervals_complete &= loaded_intervals.get(&config.id).is_some_and(|loaded| {
+            loaded.contig() == viewport_interval.contig()
+                && loaded.start() < viewport_interval.start()
+                && loaded.end() > viewport_interval.end()
+        });
         let Some(records) = snapshots
             .iter()
             .find(|snapshot| snapshot.id == config.id)
@@ -148,11 +161,8 @@ pub(crate) fn junction_annotation_context(
             }
         }
     }
-    let complete_for_interval = loaded_interval.is_some_and(|loaded| {
-        loaded.contig() == viewport_interval.contig()
-            && loaded.start() < viewport_interval.start()
-            && loaded.end() > viewport_interval.end()
-    }) && !source_records_truncated;
+    let complete_for_interval =
+        source_tracks > 0 && all_source_intervals_complete && !source_records_truncated;
     JunctionAnnotationContext {
         lookup: JunctionAnnotationLookup::new(annotated, source_tracks, complete_for_interval),
         labels,
@@ -193,7 +203,7 @@ pub(crate) fn junction_bed_export(
     viewport: GenomicInterval,
     annotations: &JunctionAnnotationContext,
 ) -> String {
-    let provenance = track.query.junctions.provenance;
+    let provenance = track.junctions.provenance;
     let mut output = String::new();
     for line in [
         "# RGV splice junction BED export v1".to_owned(),
@@ -204,15 +214,11 @@ pub(crate) fn junction_bed_export(
             track.filters.minimum_junction_depth, provenance.minimum_flank
         ),
         format!(
-            "# provenance\teligible_records={}\tspliced_records={}\tsupporting_records={}\tobservations_retained={}\tobservations_filtered_by_flank={}\tall_eligible_records={}\tdropped_distinct={}\tdropped_per_record={}",
+            "# provenance\tauthority=committed_scene\texact_events=true\teligible_records={}\tall_eligible_records=true\tnormalization_mapped_records={}",
             provenance.eligible_records,
-            provenance.spliced_records,
-            provenance.supporting_spliced_records,
-            provenance.junction_observations_retained,
-            provenance.junction_observations_filtered_by_flank,
-            provenance.all_eligible_records,
-            provenance.dropped_distinct_junctions,
-            provenance.dropped_record_junction_observations,
+            provenance
+                .normalization_mapped_records
+                .map_or_else(|| ".".to_owned(), |value| value.to_string()),
         ),
         "# columns\tchrom\tstart\tend\tname\tscore\tstrand\tdepth\tpositive\tnegative\tunknown\tminimum_left_flank\tminimum_right_flank\tannotation_status\tannotation_labels".to_owned(),
     ] {
@@ -220,7 +226,7 @@ pub(crate) fn junction_bed_export(
             return output;
         }
     }
-    for junction in track.query.junctions.junctions.iter().filter(|junction| {
+    for junction in track.junctions.junctions.iter().filter(|junction| {
         junction.depth >= track.filters.minimum_junction_depth
             && junction.start < viewport.end()
             && junction.end > viewport.start()
@@ -295,17 +301,12 @@ pub(crate) fn sashimi_export_display(bundle: &SashimiExportBundle) -> (DisplayLi
             font_size: 12.0,
             color: rgv_layout::Rgba::new(0.08, 0.08, 0.10, 1.0),
         });
-        let options = AlignmentLayoutOptions {
-            show_reference: false,
-            show_coverage: false,
-            show_junctions: true,
-            show_reads: false,
-            show_modification_frequency: false,
-            junction_top: top + 24.0,
-            junction_height: lane_height,
-            minimum_junction_depth: track.filters.minimum_junction_depth,
-            junction_display_mode: track.filters.junction_display_mode,
-            junction_scale_maximum: match track.filters.sashimi_scale_mode {
+        let options = SashimiLayoutOptions {
+            top: top + 24.0,
+            height: lane_height,
+            minimum_depth: track.filters.minimum_junction_depth,
+            display_mode: track.filters.junction_display_mode,
+            scale_maximum: match track.filters.sashimi_scale_mode {
                 SashimiScaleMode::Automatic => None,
                 SashimiScaleMode::Fixed => {
                     Some(f64::from(track.filters.sashimi_fixed_scale_maximum))
@@ -315,13 +316,11 @@ pub(crate) fn sashimi_export_display(bundle: &SashimiExportBundle) -> (DisplayLi
                     SashimiCountMode::CountsPerMillion => shared_cpm,
                 },
             },
-            junction_count_mode: track.filters.sashimi_count_mode,
-            show_junction_labels: track.filters.show_junction_labels,
-            junction_annotation_fingerprint: bundle.annotations.lookup.fingerprint(),
-            ..AlignmentLayoutOptions::default()
+            count_mode: track.filters.sashimi_count_mode,
+            show_labels: track.filters.show_junction_labels,
         };
         let layout = layout_sashimi(
-            &track.query.junctions,
+            &track.junctions,
             bundle.viewport,
             options,
             Some(&bundle.annotations.lookup),
@@ -364,7 +363,6 @@ pub(crate) fn sashimi_export_shared_maximum(
         || (count_mode == SashimiCountMode::CountsPerMillion
             && participants.iter().any(|track| {
                 track
-                    .query
                     .junctions
                     .provenance
                     .normalization_mapped_records
@@ -377,14 +375,13 @@ pub(crate) fn sashimi_export_shared_maximum(
         .into_iter()
         .flat_map(|track| {
             track
-                .query
                 .junctions
                 .junctions
                 .iter()
                 .filter(move |junction| junction.depth >= track.filters.minimum_junction_depth)
                 .map(move |junction| {
                     junction_count_value(
-                        &track.query.junctions,
+                        &track.junctions,
                         junction,
                         track.filters.sashimi_count_mode,
                     )

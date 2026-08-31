@@ -14,8 +14,8 @@ use rgv_alignment_scene::{
 };
 use rgv_core::ReferenceDictionary;
 use rgv_hts::{
-    AlignmentIndexOverview, AlignmentOpenOptions, AlignmentSource, LocalAlignmentSource,
-    QueryOptions,
+    AlignmentHeaderMetadata, AlignmentIndexOverview, AlignmentOpenOptions, AlignmentSource,
+    LocalAlignmentSource, QueryOptions,
 };
 
 use crate::alignment_scene_coordinator::coordinator_budget_pressure;
@@ -92,6 +92,7 @@ impl AlignmentSceneResourcePressureDisposition {
 #[derive(Clone, Debug)]
 pub struct AlignmentSceneSourceMetadata {
     pub dictionary: ReferenceDictionary,
+    pub header: Arc<AlignmentHeaderMetadata>,
     pub index_overview: Option<Arc<AlignmentIndexOverview>>,
     pub source_revision: AlignmentSourceRevision,
     pub record_contract: ContractFingerprint,
@@ -583,6 +584,7 @@ impl AlignmentSceneEngine<LocalBamCanonicalBackend> {
                 };
                 let dictionary = source.reference_dictionary().clone();
                 let index_overview = source.index_overview().cloned().map(Arc::new);
+                let header = Arc::clone(source.header_metadata());
                 let normalization_mapped_records = source.normalization_mapped_records();
                 let backend = match LocalBamCanonicalBackend::new(source, config.query_options) {
                     Ok(backend) => backend,
@@ -611,6 +613,7 @@ impl AlignmentSceneEngine<LocalBamCanonicalBackend> {
                     AlignmentSceneEngineEvent::SourceOpened {
                         metadata: AlignmentSceneSourceMetadata {
                             dictionary,
+                            header,
                             index_overview,
                             source_revision,
                             record_contract,

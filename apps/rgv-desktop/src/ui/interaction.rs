@@ -1,45 +1,5 @@
 use super::super::*;
 
-#[cfg(test)]
-fn alignment_query_supports_gesture_detail(
-    query: &AlignmentQuery,
-    interval: GenomicInterval,
-    detail: DetailLevel,
-    bases_per_pixel: f64,
-    reference_available: bool,
-) -> bool {
-    if !query.interval.contains_interval(interval) {
-        return false;
-    }
-    if matches!(detail, DetailLevel::Reads | DetailLevel::Bases)
-        && (0..query.batch.len()).any(|index| {
-            matches!(
-                query.batch.sequence(index),
-                None | Some(rgv_hts::SequenceView::NotLoaded)
-            )
-        })
-    {
-        return false;
-    }
-    bases_per_pixel > MAXIMUM_BASE_MARK_BASES_PER_PIXEL
-        || !reference_available
-        || query
-            .reference
-            .as_ref()
-            .is_some_and(|reference| reference.interval.contains_interval(interval))
-}
-
-fn read_selection_for_query_refresh(
-    selected_track: Option<TrackId>,
-    selected_record: Option<usize>,
-    query_track: TrackId,
-    query: &AlignmentQuery,
-) -> Option<PendingReadSelection> {
-    let track_id = selected_track.filter(|selected| *selected == query_track)?;
-    let record = query.materialize_record(selected_record?).ok()?;
-    PendingReadSelection::for_record(track_id, &record)
-}
-
 fn pointer_targets_unobstructed_canvas(
     canvas_contains_pointer: bool,
     canvas_layer: Option<egui::LayerId>,
@@ -86,14 +46,6 @@ impl Viewer {
             self.prepare_alignment_scene_frame();
             self.window.request_redraw();
         }
-        let hovered = (!consumed && !self.dragging && self.cursor_in_genomic_canvas())
-            .then(|| self.record_at_cursor())
-            .flatten();
-        if hovered != self.panels.active_mut().hovered_record {
-            self.panels.active_mut().hovered_record = hovered;
-            self.display_dirty = true;
-            self.window.request_redraw();
-        }
         let cursor_in_genomic_canvas = self.cursor_in_genomic_canvas();
         let should_hit_test_junction_arc = !consumed && !self.dragging && cursor_in_genomic_canvas;
         let junction_hit_started = self.diagnostics_open.then(Instant::now);
@@ -108,7 +60,6 @@ impl Viewer {
                 } else {
                     SashimiHitTestGate::PointerConsumed
                 },
-                total_targets: self.panels.active().junction_arc_targets.len(),
                 ..JunctionArcHitTestResult::default()
             }
         };
@@ -145,6 +96,11 @@ impl Viewer {
         }
         if junction_arc_changed {
             self.panels.active_mut().hovered_junction_arc = hovered_junction_arc;
+            if junction_hit.native_authority {
+                // Hover is frame state for persistent junction pages. Recapture uniforms from the
+                // already-published scene; no source query or geometry upload is involved.
+                self.prepare_alignment_scene_frame();
+            }
             self.window.set_cursor(if hovered_junction_arc.is_some() {
                 CursorIcon::Pointer
             } else {
@@ -187,14 +143,8 @@ impl Viewer {
                 track_id, start, end, component,
             ));
         }
-        let (track_id, index) = self.record_at_cursor()?;
-        let event = self.read_event_at_cursor(track_id, index);
-        Some(HoverInspectorTarget::Record {
-            track_id,
-            index,
-            operation_index: event.map(|event| event.operation_index),
-            operation_offset: event.and_then(|event| event.operation_offset),
-        })
+        self.alignment_scene_hit_at_cursor()
+            .map(HoverInspectorTarget::Read)
     }
 
     pub(crate) fn zoom(&mut self, delta: MouseScrollDelta) {
@@ -266,7 +216,7 @@ impl Viewer {
         if (next - state.scroll_points).abs() <= f32::EPSILON {
             return;
         }
-        self.invalidate_navigation_preview_contract("read panel vertical scroll changed");
+        self.invalidate_navigation_contract("read panel vertical scroll changed");
         let primary_track_id = self.primary_alignment_track_id();
         let latent_fraction = {
             let state = self
@@ -298,7 +248,7 @@ impl Viewer {
         if (next - self.panels.annotation_scroll_points).abs() <= f32::EPSILON {
             return;
         }
-        self.invalidate_navigation_preview_contract("annotation vertical scroll changed");
+        self.invalidate_navigation_contract("annotation vertical scroll changed");
         if !self.refresh_shared_annotation_scroll_display(next) {
             self.display_dirty = true;
         }
@@ -388,11 +338,9 @@ impl Viewer {
 
     pub(crate) fn viewport_changed(&mut self) {
         self.remember_current_locus();
-        self.panels.active_mut().hovered_record = None;
         self.panels.active_mut().hovered_alignment_hit = None;
         self.panels.active_mut().hover_inspector_target = None;
         self.panels.active_mut().hovered_junction_arc = None;
-        self.panels.active_mut().junction_arc_targets.clear();
         self.window.set_cursor(CursorIcon::Default);
         self.synchronize_alignment_scene_interactions(self.panels.active().id);
         self.begin_viewport_navigation(false, false);
@@ -400,11 +348,9 @@ impl Viewer {
 
     pub(crate) fn viewport_gesture_changed(&mut self) {
         self.remember_current_locus();
-        self.panels.active_mut().hovered_record = None;
         self.panels.active_mut().hovered_alignment_hit = None;
         self.panels.active_mut().hover_inspector_target = None;
         self.panels.active_mut().hovered_junction_arc = None;
-        self.panels.active_mut().junction_arc_targets.clear();
         self.window.set_cursor(CursorIcon::Default);
         self.synchronize_alignment_scene_interactions(self.panels.active().id);
         let hold_commit_until_end = self.dragging
@@ -421,33 +367,7 @@ impl Viewer {
     /// detail levels. Contig/start and template-end identity disambiguate
     /// paired or supplementary records which legitimately share that name.
     pub(crate) fn retain_active_read_selection_for_query_refresh(&mut self) {
-        let Some(track_id) = self.panels.active().selected_alignment_track else {
-            return;
-        };
-        if self.panels.active().pending_read_selection.is_some() {
-            // The semantic identity is the authority once it has been
-            // captured. A record index may already belong to a replacement
-            // query, so never use it to overwrite that identity during a
-            // later refresh.
-            return;
-        }
-        if self.panels.active().selected_record.is_none() {
-            return;
-        }
-        let Some(pending) = self
-            .complete_read_query_for_track(track_id)
-            .and_then(|query| {
-                read_selection_for_query_refresh(
-                    self.panels.active().selected_alignment_track,
-                    self.panels.active().selected_record,
-                    track_id,
-                    query,
-                )
-            })
-        else {
-            return;
-        };
-        self.panels.active_mut().pending_read_selection = Some(pending);
+        // Stable scene handles, not query-local record indexes, retain selection across refreshes.
     }
 
     #[allow(clippy::too_many_lines)]
@@ -958,7 +878,7 @@ impl Viewer {
             self.interaction_trace
                 .record_once(InteractionTraceStage::DensityChanged);
         } else if scroll_changed {
-            self.invalidate_navigation_preview_contract("read panel vertical scroll changed");
+            self.invalidate_navigation_contract("read panel vertical scroll changed");
             if self.synthetic || !self.refresh_active_panel_scroll_display() {
                 self.display_dirty = true;
             }
@@ -1002,20 +922,14 @@ impl Viewer {
     pub(crate) fn query_options_changed(&mut self) {
         self.remember_current_locus();
         self.display_dirty = true;
-        self.layout_cache.clear();
-        self.invalidate_navigation_preview_contract("query or presentation options changed");
+        self.invalidate_navigation_contract("query or presentation options changed");
         if !self.synthetic && (self.has_alignment_engine() || self.track_engine.is_some()) {
             for panel in &mut self.panels.panels {
                 panel.generation_clock.advance();
             }
             for track in &mut self.alignment_tracks {
                 for projection in track.projections.values_mut() {
-                    projection.advance_query_generation();
-                    // Retain the last committed query only as non-visible
-                    // history. Generation gates replace its read geometry and
-                    // interactions with the neutral Checking state until the
-                    // replacement query and layout horizon commit together.
-                    projection.cached_layout = None;
+                    projection.advance_scene_generation();
                 }
             }
             self.begin_all_panel_refresh_transactions();
@@ -1161,14 +1075,6 @@ impl Viewer {
                 panel.viewport = viewport;
             }
         }
-        for track in &mut self.alignment_tracks {
-            for id in &ids {
-                let projection = track.projection_mut(*id);
-                projection.alignment_rows = None;
-                projection.cached_layout = None;
-            }
-        }
-        self.layout_cache.clear();
         self.display_dirty = true;
     }
 
@@ -1246,7 +1152,7 @@ impl Viewer {
         );
         panel.content_bottom_points = self.canvas_geometry().viewport.top();
         anyhow::ensure!(self.panels.push(panel), "view panel identity collision");
-        self.invalidate_navigation_preview_contract("view panel added");
+        self.invalidate_navigation_contract("view panel added");
         self.synchronize_panel_widths();
         self.activate_view_panel(id);
         self.request_all_panel_queries();
@@ -1259,12 +1165,12 @@ impl Viewer {
         }
         for track in &mut self.alignment_tracks {
             if let Some(projection) = track.projections.remove(&id) {
-                projection.advance_query_generation();
+                projection.advance_scene_generation();
             }
         }
         let removed = self.panels.remove(id).is_some();
         if removed {
-            self.invalidate_navigation_preview_contract("view panel removed");
+            self.invalidate_navigation_contract("view panel removed");
             self.synchronize_panel_widths();
             self.refresh_active_panel_context();
             self.request_all_panel_queries();
@@ -1276,7 +1182,7 @@ impl Viewer {
     pub(crate) fn move_view_panel(&mut self, id: PanelId, new_index: usize) -> bool {
         let moved = self.panels.move_panel(id, new_index);
         if moved {
-            self.invalidate_navigation_preview_contract("view panel order changed");
+            self.invalidate_navigation_contract("view panel order changed");
             self.display_dirty = true;
             self.rebuild_all_panel_displays();
         }
@@ -1457,250 +1363,6 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hover_targets_distinguish_substitutions_inside_one_cigar_operation() {
-        let target = |operation_offset| HoverInspectorTarget::Record {
-            track_id: TrackId::new(1),
-            index: 7,
-            operation_index: Some(2),
-            operation_offset: Some(operation_offset),
-        };
-        assert_ne!(target(3), target(4));
-    }
-
-    fn gesture_query(interval: GenomicInterval) -> AlignmentQuery {
-        AlignmentQuery {
-            interval,
-            header: Arc::default(),
-            batch: rgv_hts::AlignmentBatch::default(),
-            pileup: rgv_hts::PileupSummary::default(),
-            junctions: rgv_hts::JunctionSummary::default(),
-            pairs: rgv_hts::PairSummary::default(),
-            reference: None,
-            stats: QueryStats::default(),
-        }
-    }
-
-    #[test]
-    fn selected_read_identity_survives_query_refresh_boundaries() {
-        let interval = GenomicInterval::new(ContigId::new(0), 100, 110).unwrap();
-        let mut query = gesture_query(interval);
-        query
-            .batch
-            .push(&AlignmentRecord {
-                contig: ContigId::new(0),
-                start: 101,
-                end: 106,
-                flags: rgv_hts::AlignmentFlags::from_bits(0),
-                mapping_quality: Some(42),
-                mate_contig: None,
-                mate_start: None,
-                template_length: 0,
-                read_name: b"selected-read".to_vec(),
-                cigar: vec![rgv_hts::CigarOp {
-                    kind: rgv_hts::CigarOpKind::Match,
-                    len: 5,
-                }],
-                sequence: rgv_hts::SequenceData::NotLoaded,
-                auxiliary_fields: Vec::new(),
-            })
-            .unwrap();
-        let track_id = TrackId::new(7);
-
-        assert_eq!(
-            read_selection_for_query_refresh(Some(track_id), Some(0), track_id, &query),
-            PendingReadSelection::for_record(track_id, &query.materialize_record(0).unwrap())
-        );
-        assert_eq!(
-            read_selection_for_query_refresh(Some(track_id), Some(1), track_id, &query),
-            None
-        );
-        assert_eq!(
-            read_selection_for_query_refresh(Some(TrackId::new(8)), Some(0), track_id, &query),
-            None
-        );
-    }
-
-    #[test]
-    fn mate_selection_targets_the_exact_opposite_template_end() {
-        let contig = ContigId::new(0);
-        let interval = GenomicInterval::new(contig, 50, 260).unwrap();
-        let mut query = gesture_query(interval);
-        let record = |start, flags, mate_start| AlignmentRecord {
-            contig,
-            start,
-            end: start + 40,
-            flags: rgv_hts::AlignmentFlags::from_bits(flags),
-            mapping_quality: Some(60),
-            mate_contig: Some(contig),
-            mate_start: Some(mate_start),
-            template_length: 140,
-            read_name: b"paired-read".to_vec(),
-            cigar: Vec::new(),
-            sequence: rgv_hts::SequenceData::NotLoaded,
-            auxiliary_fields: Vec::new(),
-        };
-        let first = record(100, 0x41, 200);
-        let last = record(200, 0x81, 100);
-        query.batch.push(&first).unwrap();
-        query.batch.push(&last).unwrap();
-        let track_id = TrackId::new(7);
-
-        assert_eq!(
-            PendingReadSelection::for_record(track_id, &first)
-                .unwrap()
-                .matching_index(&query),
-            Some(0)
-        );
-        assert_eq!(
-            PendingReadSelection::for_mate(track_id, &first)
-                .unwrap()
-                .matching_index(&query),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn resolved_read_identity_rebinds_when_zoom_out_changes_its_index() {
-        let contig = ContigId::new(0);
-        let interval = GenomicInterval::new(contig, 50, 300).unwrap();
-        let record = |name: &[u8], start| AlignmentRecord {
-            contig,
-            start,
-            end: start + 25,
-            flags: rgv_hts::AlignmentFlags::from_bits(0),
-            mapping_quality: Some(60),
-            mate_contig: None,
-            mate_start: None,
-            template_length: 0,
-            read_name: name.to_vec(),
-            cigar: Vec::new(),
-            sequence: rgv_hts::SequenceData::NotLoaded,
-            auxiliary_fields: Vec::new(),
-        };
-        let selected = record(b"selected-read", 150);
-        let track_id = TrackId::new(7);
-        let identity = PendingReadSelection::for_record(track_id, &selected).unwrap();
-
-        let mut wider_query = gesture_query(interval);
-        wider_query
-            .batch
-            .push(&record(b"newly-fetched-read", 75))
-            .unwrap();
-        wider_query.batch.push(&selected).unwrap();
-        assert_eq!(identity.matching_index(&wider_query), Some(1));
-
-        let rebound_record = wider_query.materialize_record(1).unwrap();
-        let (retained, reveal) = identity.retained_after_resolution(Some(&rebound_record));
-        assert!(!reveal);
-        assert_eq!(retained.matching_index(&wider_query), Some(1));
-
-        let mut widest_query = gesture_query(interval);
-        widest_query
-            .batch
-            .push(&record(b"another-new-read", 55))
-            .unwrap();
-        widest_query
-            .batch
-            .push(&record(b"newly-fetched-read", 75))
-            .unwrap();
-        widest_query.batch.push(&selected).unwrap();
-        assert_eq!(retained.matching_index(&widest_query), Some(2));
-    }
-
-    #[test]
-    fn mate_panel_identities_rebind_independently_after_zoom_out() {
-        let contig = ContigId::new(0);
-        let interval = GenomicInterval::new(contig, 50, 350).unwrap();
-        let paired_record = |start, flags, mate_start| AlignmentRecord {
-            contig,
-            start,
-            end: start + 40,
-            flags: rgv_hts::AlignmentFlags::from_bits(flags),
-            mapping_quality: Some(60),
-            mate_contig: Some(contig),
-            mate_start: Some(mate_start),
-            template_length: 140,
-            read_name: b"paired-read".to_vec(),
-            cigar: Vec::new(),
-            sequence: rgv_hts::SequenceData::NotLoaded,
-            auxiliary_fields: Vec::new(),
-        };
-        let unrelated = |name: &[u8], start| AlignmentRecord {
-            read_name: name.to_vec(),
-            ..paired_record(start, 0, start)
-        };
-        let first = paired_record(100, 0x41, 200);
-        let last = paired_record(200, 0x81, 100);
-        let track_id = TrackId::new(7);
-        let source_identity = PendingReadSelection::for_record(track_id, &first).unwrap();
-        let mate_identity = PendingReadSelection::for_mate(track_id, &first).unwrap();
-
-        let mut source_query = gesture_query(interval);
-        source_query
-            .batch
-            .push(&unrelated(b"source-prefix", 60))
-            .unwrap();
-        source_query.batch.push(&first).unwrap();
-        source_query.batch.push(&last).unwrap();
-
-        let mut mate_query = gesture_query(interval);
-        mate_query
-            .batch
-            .push(&unrelated(b"mate-prefix-a", 150))
-            .unwrap();
-        mate_query
-            .batch
-            .push(&unrelated(b"mate-prefix-b", 175))
-            .unwrap();
-        mate_query.batch.push(&last).unwrap();
-
-        assert_eq!(source_identity.matching_index(&source_query), Some(1));
-        assert_eq!(mate_identity.matching_index(&mate_query), Some(2));
-
-        let mate_record = mate_query.materialize_record(2).unwrap();
-        let (retained_mate, reveal) = mate_identity.retained_after_resolution(Some(&mate_record));
-        assert!(reveal);
-        assert_eq!(retained_mate.matching_index(&mate_query), Some(2));
-        let (_, reveal_again) = retained_mate.retained_after_resolution(Some(&mate_record));
-        assert!(!reveal_again);
-    }
-
-    #[test]
-    fn gesture_query_refines_immediately_when_crossing_base_mark_threshold() {
-        let contig = ContigId::new(0);
-        let loaded = GenomicInterval::new(contig, 100, 300).unwrap();
-        let visible = GenomicInterval::new(contig, 150, 200).unwrap();
-        let mut query = gesture_query(loaded);
-
-        assert!(alignment_query_supports_gesture_detail(
-            &query,
-            visible,
-            DetailLevel::Reads,
-            MAXIMUM_BASE_MARK_BASES_PER_PIXEL + 0.01,
-            true,
-        ));
-        assert!(!alignment_query_supports_gesture_detail(
-            &query,
-            visible,
-            DetailLevel::Reads,
-            MAXIMUM_BASE_MARK_BASES_PER_PIXEL,
-            true,
-        ));
-
-        query.reference = Some(ReferenceSlice {
-            interval: loaded,
-            bases: vec![b'A'; loaded.len() as usize],
-        });
-        assert!(alignment_query_supports_gesture_detail(
-            &query,
-            visible,
-            DetailLevel::Reads,
-            MAXIMUM_BASE_MARK_BASES_PER_PIXEL,
-            true,
-        ));
-    }
 
     #[test]
     fn native_canvas_pointer_survives_coarse_egui_area_consumption() {

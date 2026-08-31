@@ -908,11 +908,21 @@ fn project_junctions(
     let maximum = options.scale_maximum.unwrap_or(measurement.maximum);
     frame.scale_maximum = Some(maximum);
     let rows = if options.display_mode == JunctionDisplayMode::Expanded {
-        expanded_junction_rows(&junctions)
+        junctions
+            .iter()
+            .map(|junction| junction.expanded_row)
+            .collect()
     } else {
         vec![0; junctions.len()]
     };
-    let row_count = rows.iter().copied().max().unwrap_or(0).saturating_add(1);
+    // Expanded row identity belongs to the complete immutable summary root, not the visible
+    // slice. Keeping the root's row count prevents the same junction from moving vertically when
+    // a pan changes which neighbouring arcs happen to be on screen.
+    let row_count = if options.display_mode == JunctionDisplayMode::Expanded {
+        scene.summaries().expanded_junction_row_count().max(1)
+    } else {
+        1
+    };
     let band_height = camera.clip.height / row_count.max(1) as f64;
     for row in 0..row_count {
         push(
@@ -1424,26 +1434,6 @@ fn horizontal(camera: CpuSummaryCamera, start: u64, end: u64) -> (f64, f64) {
     let end = end.min(camera.interval().end());
     let x = camera.x(start);
     (x, (camera.x(end) - x).max(1.0))
-}
-
-fn expanded_junction_rows(junctions: &[AnnotatedJunctionSemantic]) -> Vec<u32> {
-    let mut ends = Vec::<u64>::new();
-    junctions
-        .iter()
-        .map(|junction| {
-            if let Some((row, end)) = ends
-                .iter_mut()
-                .enumerate()
-                .find(|(_, end)| **end <= junction.evidence.start)
-            {
-                *end = junction.evidence.end;
-                u32::try_from(row).unwrap_or(u32::MAX)
-            } else {
-                ends.push(junction.evidence.end);
-                u32::try_from(ends.len() - 1).unwrap_or(u32::MAX)
-            }
-        })
-        .collect()
 }
 
 fn junction_value(

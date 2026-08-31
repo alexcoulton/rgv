@@ -2,9 +2,8 @@ use super::super::*;
 use crate::display::alignment;
 
 /// Canonical presentation partition used by the first desktop qualification slice. This is a
-/// cache/page granularity, never an evidence or display cap. It deliberately matches the proven
-/// legacy layout tile scale so comparative traces have one fewer independent variable; Phase 6
-/// measurements may replace it without changing scene identity or completeness semantics.
+/// cache/page granularity, never an evidence or display cap. Measurements may replace it without
+/// changing scene identity or completeness semantics.
 const DESKTOP_ALIGNMENT_SCENE_TILE_BASES: u64 = 32_768;
 const DESKTOP_ALIGNMENT_SCENE_ROW_BLOCK_ROWS: u32 = 256;
 
@@ -269,25 +268,6 @@ pub(crate) struct EmptyAlignmentState {
     pub(crate) maximum_alignments: usize,
 }
 
-#[derive(Clone)]
-pub(crate) struct CachedAlignmentRows {
-    pub(crate) query: Arc<AlignmentQuery>,
-    pub(crate) layout_query: Arc<AlignmentQuery>,
-    pub(crate) layout: Arc<AlignmentRowLayout>,
-    pub(crate) group_mode: AlignmentGroupMode,
-    pub(crate) group_order: AlignmentOrderDirection,
-    pub(crate) sort_mode: AlignmentSortMode,
-    pub(crate) sort_order: AlignmentOrderDirection,
-    pub(crate) sort_position: Option<u64>,
-    pub(crate) promoted_read_name_hash: Option<u64>,
-    pub(crate) max_rows: usize,
-    pub(crate) row_scale_class: u8,
-    pub(crate) view_as_pairs: bool,
-    pub(crate) pair_length_bounds: TemplateLengthBounds,
-    pub(crate) stacking_mode: ReadStackingMode,
-    pub(crate) reconciliation: AlignmentRowReconciliationStats,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AlignmentTrackLifecycle {
     Opening,
@@ -424,7 +404,7 @@ pub(crate) fn alignment_scene_pressure_after_relief(
 
 /// Independent retry authority for one source coordinator's application-wide budget edit. The
 /// controller records the requested value as soon as it queues the original command, so this
-/// state—not `cache_budget_bytes`—tracks whether that command actually reached the ledger and
+/// state—not `scene_budget_bytes`—tracks whether that command actually reached the ledger and
 /// completed the coordinator-local eviction pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AlignmentSceneBudgetRetry {
@@ -890,64 +870,31 @@ mod alignment_scene_budget_retry_tests {
 #[derive(Default)]
 pub(crate) struct AlignmentPanelProjection {
     pub(crate) clock: GenerationClock,
-    pub(crate) settled_generation: Option<u64>,
     pub(crate) unavailable: Option<String>,
     /// The viewport is at overview detail and is intentionally represented by
     /// the alignment index rather than a BAM/CRAM record query.
     pub(crate) index_only_overview: bool,
-    pub(crate) pending_query: bool,
-    /// Truthful engine phase for the current query generation.
-    pub(crate) query_phase: AlignmentQueryPhase,
     /// Generation and start time of the in-flight exact viewport check. Its
     /// visible notice is delayed so fast queries do not flash a banner during
     /// ordinary panning.
     pub(crate) checking_started: Option<(u64, Instant)>,
     pub(crate) checking_notice_visible: bool,
-    pub(crate) current_query: Option<Arc<AlignmentQuery>>,
-    /// Scale-appropriate fixed-neighbourhood query used to establish a canonical
-    /// row architecture without coupling row density to the full decoded buffer.
-    pub(crate) layout_query: Option<Arc<AlignmentQuery>>,
-    /// Settled decoded browsing-buffer resident used to prepare derived scene
-    /// state speculatively before the camera enters it.
-    pub(crate) resident_query: Option<Arc<AlignmentQuery>>,
-    /// Presentation contract under which `layout_query` was accepted. This
-    /// makes provisional horizon reuse reject stale policy/configuration data.
-    pub(crate) layout_query_contract_revision: u64,
-    pub(crate) layout_query_cache_hit: bool,
-    pub(crate) working_set: AlignmentWorkingSetStats,
-    pub(crate) query_stats: Option<QueryStats>,
-    pub(crate) alignment_rows: Option<CachedAlignmentRows>,
-    /// Dedicated cancellation generation for row sweeps. Query generations
-    /// and layout generations advance independently, so this clock changes
-    /// only when a distinct row-layout request supersedes existing work.
-    pub(crate) row_layout_clock: GenerationClock,
-    /// Query-independent stable row assignments. Ordinary query replacement,
-    /// Overview LOD, filters, and rendering changes must not clear this.
-    pub(crate) row_history: AlignmentRowHistory,
-    /// Bounded persistent immutable-storage row scenes. Multiple entries preserve
-    /// exact-return physical mappings across real layout-horizon transitions.
-    pub(crate) row_scenes: Vec<Arc<AlignmentRowScene>>,
-    pub(crate) pending_row_repack: bool,
-    /// Frozen inferred bounds used only by pair-classification-dependent row
-    /// policies. Live query statistics may continue to change independently.
-    pub(crate) row_pair_policy_bounds: Option<TemplateLengthBounds>,
-    pub(crate) row_pair_policy_override: (Option<u64>, Option<u64>),
-    pub(crate) cached_layout: Option<(LayoutTileKey, Arc<AlignmentLayout>)>,
-    pub(crate) last_query_resolution: Option<AlignmentQueryResolution>,
+    pub(crate) last_scene_resolution: Option<AlignmentSceneResolution>,
     /// Unified-scene lane identity and latest immutable worker publication. The worker camera is
     /// acquisition intent only; rendering captures this snapshot against the UI's current camera.
     pub(crate) scene_owner: Option<SourceOwnerId>,
     pub(crate) scene_contig: Option<ContigId>,
     pub(crate) scene_contract: Option<AlignmentSceneBuildContract>,
     pub(crate) scene_policy: Option<AlignmentScenePreparationPolicy>,
-    /// Sole liveness authority for the latest unified-scene target. Legacy query fields below are
-    /// retained temporarily for unsupported-source diagnostics, but cannot settle this record.
+    /// Sole liveness authority for the latest unified-scene target. No query-local state can
+    /// settle or publish this record.
     pub(crate) navigation: AlignmentNavigationTransaction,
     /// Last exact pressure resume admitted for this request at a specific shared-ledger epoch.
     /// It is scheduling state only and never authorizes scene publication.
     pub(crate) scene_pressure_retry: Option<AlignmentScenePressureRetry>,
     pub(crate) scene_frame: Option<AlignmentCoordinatorFrame>,
     pub(crate) scene_frame_request_token: Option<AlignmentSceneRequestToken>,
+    pub(crate) scene_telemetry: AlignmentSceneCoordinatorTelemetry,
     pub(crate) scene_interaction: AlignmentInteractionState,
 }
 
@@ -959,11 +906,9 @@ impl AlignmentPanelProjection {
             Arc::<str>::from(message.clone()),
         );
         self.finish_checking();
-        self.pending_query = false;
         self.scene_pressure_retry = None;
         self.unavailable = Some(message);
         self.index_only_overview = false;
-        self.settled_generation = Some(self.clock.current().get());
     }
 
     pub(crate) fn settle_unavailable(&mut self, message: String) {
@@ -972,23 +917,14 @@ impl AlignmentPanelProjection {
             Arc::<str>::from(message.clone()),
         );
         self.finish_checking();
-        self.pending_query = false;
         self.scene_pressure_retry = None;
-        self.current_query = None;
-        self.layout_query = None;
-        self.resident_query = None;
-        self.layout_query_cache_hit = false;
-        self.alignment_rows = None;
-        self.cached_layout = None;
         self.unavailable = Some(message);
         self.index_only_overview = false;
-        self.settled_generation = Some(self.clock.current().get());
     }
 
-    /// Starts a new query generation and immediately invalidates any row
-    /// candidate that was derived from the previous settled query.
-    pub(crate) fn advance_query_generation(&self) -> ViewportGeneration {
-        self.row_layout_clock.advance();
+    /// Starts a new immutable-scene generation. Previously committed scene pixels remain valid
+    /// until a complete replacement epoch is ready.
+    pub(crate) fn advance_scene_generation(&self) -> ViewportGeneration {
         self.clock.advance()
     }
 
@@ -997,13 +933,13 @@ impl AlignmentPanelProjection {
     /// comparison also covers a request that has been queued and is still
     /// running. A previous query must not be reprojected or exposed through
     /// interaction while either condition is true.
-    pub(crate) fn query_is_current(&self) -> bool {
+    pub(crate) fn scene_is_current(&self) -> bool {
         self.navigation
             .is_current_settled(self.clock.current().get())
     }
 
-    pub(crate) fn query_is_checking(&self) -> bool {
-        !self.query_is_current()
+    pub(crate) fn scene_is_checking(&self) -> bool {
+        !self.scene_is_current()
     }
 
     pub(crate) fn begin_checking(&mut self, now: Instant) {
@@ -1011,12 +947,11 @@ impl AlignmentPanelProjection {
         if self.checking_started.map(|(seen, _)| seen) != Some(generation) {
             self.checking_started = Some((generation, now));
             self.checking_notice_visible = false;
-            self.query_phase = AlignmentQueryPhase::Queued;
         }
     }
 
     pub(crate) fn reveal_checking_notice_if_due(&mut self, now: Instant) -> bool {
-        if self.checking_notice_visible || !self.query_is_checking() {
+        if self.checking_notice_visible || !self.scene_is_checking() {
             return false;
         }
         let generation = self.clock.current().get();
@@ -1035,50 +970,18 @@ impl AlignmentPanelProjection {
     pub(crate) fn finish_checking(&mut self) {
         self.checking_started = None;
         self.checking_notice_visible = false;
-        self.query_phase = AlignmentQueryPhase::Ready;
     }
 
-    pub(crate) fn row_policy_pair_bounds(
-        &mut self,
-        filters: &SessionFilters,
-        observed: TemplateLengthBounds,
-    ) -> TemplateLengthBounds {
-        if !alignment_row_pair_bounds_relevant(
-            filters.alignment_group_mode,
-            filters.alignment_sort_mode,
-        ) {
-            return observed;
-        }
-        let explicit = (
-            filters.minimum_template_length,
-            filters.maximum_template_length,
-        );
-        if self.row_pair_policy_override != explicit {
-            self.row_pair_policy_override = explicit;
-            self.row_pair_policy_bounds = None;
-        }
-        *self.row_pair_policy_bounds.get_or_insert(observed)
-    }
-
-    pub(crate) fn settle_index_only_overview(&mut self, resolution: AlignmentQueryResolution) {
+    pub(crate) fn settle_index_only_overview(&mut self, resolution: AlignmentSceneResolution) {
         debug_assert!(!resolution.requires_alignment_records());
         self.navigation.transition(
             AlignmentNavigationPhase::IndexOverview,
             "viewport uses exact index-only alignment overview",
         );
         self.finish_checking();
-        self.pending_query = false;
-        self.current_query = None;
-        self.layout_query = None;
-        self.resident_query = None;
-        self.layout_query_cache_hit = false;
-        self.query_stats = None;
-        self.alignment_rows = None;
-        self.cached_layout = None;
         self.unavailable = None;
         self.index_only_overview = true;
-        self.last_query_resolution = Some(resolution);
-        self.settled_generation = Some(self.clock.current().get());
+        self.last_scene_resolution = Some(resolution);
     }
 }
 
@@ -1086,13 +989,13 @@ pub(crate) const READ_CHECKING_NOTICE_DELAY: Duration = Duration::from_millis(15
 const RESIZE_COVERAGE_BIN_STEP: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AlignmentQueryResolution {
+pub(crate) struct AlignmentSceneResolution {
     pub(crate) detail: DetailLevel,
     pub(crate) coverage_bins: usize,
     pub(crate) collect_alleles: bool,
 }
 
-impl AlignmentQueryResolution {
+impl AlignmentSceneResolution {
     pub(crate) fn for_viewport(viewport: Viewport) -> Self {
         let visible_bases = usize::try_from(viewport.interval().len()).unwrap_or(usize::MAX);
         let (coverage_bins, collect_alleles) = alignment_coverage_query_plan(
@@ -1136,16 +1039,14 @@ pub(crate) struct AlignmentTrackController {
     pub(crate) filter_editor: FilterEditor,
     pub(crate) active_filters: ActiveFilters,
     pub(crate) projections: HashMap<PanelId, AlignmentPanelProjection>,
-    pub(crate) cache_stats: Option<CacheStats>,
-    /// Last decoded-cache allowance accepted by the engine actor. Keeping the
-    /// applied value here prevents a frame-by-frame rebalance from flooding
+    /// Last shared scene-ledger limit submitted to the engine actor. Keeping the applied value
+    /// here prevents a frame-by-frame update from flooding
     /// the bounded actor queue while its statistics event is in flight.
-    pub(crate) cache_budget_bytes: NonZeroUsize,
+    pub(crate) scene_budget_bytes: NonZeroUsize,
     /// Typed, progress-gated authority proving that the latest queued budget edit still needs a
-    /// coordinator-local retry. This is deliberately separate from `cache_budget_bytes`, which
+    /// coordinator-local retry. This is deliberately separate from `scene_budget_bytes`, which
     /// records submission and cannot prove worker completion.
     pub(crate) scene_budget_retry: Option<AlignmentSceneBudgetRetry>,
-    pub(crate) remote_io_stats: Option<RemoteIoStats>,
 }
 
 pub(crate) struct AlignmentSettingsDraft {
@@ -1217,7 +1118,7 @@ impl Viewer {
             }
         }
         if changed {
-            self.invalidate_navigation_preview_contract("read density changed");
+            self.invalidate_navigation_contract("read density changed");
         }
         changed
     }
@@ -1250,7 +1151,7 @@ impl Viewer {
         state.density = Some(density);
         let changed = (previous - density).abs() > f32::EPSILON;
         if changed {
-            self.invalidate_navigation_preview_contract("read density changed");
+            self.invalidate_navigation_contract("read density changed");
         }
         changed
     }
@@ -1366,100 +1267,38 @@ impl Viewer {
     }
 }
 
-pub(crate) fn alignment_cache_share(total_bytes: usize, track_count: usize) -> NonZeroUsize {
-    NonZeroUsize::new((total_bytes.max(1) / track_count.max(1)).max(1)).unwrap()
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct LiveCacheCoordinatorSnapshot {
-    pub(crate) total_budget_bytes: usize,
-    pub(crate) measured_resident_bytes: usize,
-    pub(crate) decoded_resident_bytes: usize,
-    pub(crate) layout_resident_bytes: usize,
-    pub(crate) row_scene_resident_bytes: usize,
-    pub(crate) gpu_slab_resident_bytes: usize,
-    pub(crate) decoded_allowance_bytes: usize,
-    pub(crate) layout_allowance_bytes: usize,
-    pub(crate) row_scene_allowance_bytes: usize,
-    pub(crate) gpu_slab_allowance_bytes: usize,
-    /// Measured bytes temporarily above the selected ceiling while actor-side
-    /// eviction settles or an authoritative foreground object remains pinned.
-    pub(crate) over_budget_bytes: usize,
-    pub(crate) clamp_reason: Option<&'static str>,
-    pub(crate) rebalances: u64,
+pub(crate) struct AlignmentSceneBudgetSnapshot {
+    pub(crate) budget_bytes: usize,
+    pub(crate) transition_reserve_bytes: usize,
+    pub(crate) transient_budget_bytes: usize,
+    pub(crate) charged_bytes: usize,
+    pub(crate) reserved_bytes: usize,
+    pub(crate) reserved_transition_bytes: usize,
+    pub(crate) transient_bytes: usize,
+    pub(crate) transient_high_water_bytes: usize,
+    pub(crate) pinned_bytes: usize,
+    pub(crate) pinned_overage_bytes: usize,
+    pub(crate) active_replacement_bundle: Option<u64>,
+    pub(crate) refreshes: u64,
 }
 
-/// Divides a live decoded-read pool without an irrevocable equal split.
-/// Existing residency is preserved when it fits; remaining capacity follows
-/// observed per-track demand. Under pressure, every track receives a
-/// proportional non-zero allowance and its engine evicts speculation first.
-#[cfg(test)]
-pub(crate) fn adaptive_alignment_cache_shares(
-    total_bytes: usize,
-    resident_bytes: &[usize],
-) -> Vec<NonZeroUsize> {
-    if resident_bytes.is_empty() {
-        return Vec::new();
-    }
-    let track_count = resident_bytes.len();
-    let total_bytes = total_bytes.max(track_count);
-    let resident_total = resident_bytes
-        .iter()
-        .fold(0_usize, |total, resident| total.saturating_add(*resident));
-    let mut shares = vec![1_usize; track_count];
-
-    if resident_total <= total_bytes {
-        shares.clone_from_slice(resident_bytes);
-        let assigned = shares.iter().sum::<usize>();
-        let free = total_bytes.saturating_sub(assigned);
-        let demand_floor = (total_bytes / track_count / 4).max(1);
-        let weights = resident_bytes
-            .iter()
-            .map(|resident| (*resident).max(demand_floor))
-            .collect::<Vec<_>>();
-        distribute_cache_bytes(&mut shares, free, &weights);
-    } else {
-        let weights = resident_bytes
-            .iter()
-            .map(|resident| (*resident).max(1))
-            .collect::<Vec<_>>();
-        distribute_cache_bytes(
-            &mut shares,
-            total_bytes.saturating_sub(track_count),
-            &weights,
-        );
-    }
-
-    shares
-        .into_iter()
-        .map(|share| NonZeroUsize::new(share.max(1)).unwrap())
-        .collect()
-}
-
-#[cfg(test)]
-fn distribute_cache_bytes(shares: &mut [usize], bytes: usize, weights: &[usize]) {
-    if bytes == 0 || shares.is_empty() {
-        return;
-    }
-    let weight_total = weights
-        .iter()
-        .fold(0_u128, |total, weight| {
-            total.saturating_add(*weight as u128)
-        })
-        .max(1);
-    let mut distributed = 0_usize;
-    for (share, weight) in shares.iter_mut().zip(weights) {
-        let portion = ((bytes as u128).saturating_mul(*weight as u128) / weight_total)
-            .min(usize::MAX as u128) as usize;
-        *share = share.saturating_add(portion);
-        distributed = distributed.saturating_add(portion);
-    }
-    let mut remainder = bytes.saturating_sub(distributed);
-    let mut index = 0_usize;
-    while remainder > 0 {
-        shares[index] = shares[index].saturating_add(1);
-        remainder -= 1;
-        index = (index + 1) % shares.len();
+impl AlignmentSceneBudgetSnapshot {
+    pub(crate) fn from_progress(progress: LedgerProgress, refreshes: u64) -> Self {
+        Self {
+            budget_bytes: progress.budget,
+            transition_reserve_bytes: progress.transition_reserve,
+            transient_budget_bytes: progress.transient_budget,
+            charged_bytes: progress.charged,
+            reserved_bytes: progress.reserved,
+            reserved_transition_bytes: progress.reserved_transition,
+            transient_bytes: progress.transient,
+            transient_high_water_bytes: progress.transient_high_water,
+            pinned_bytes: progress.pinned,
+            pinned_overage_bytes: progress.pinned_overage,
+            active_replacement_bundle: progress.active_replacement_bundle,
+            refreshes,
+        }
     }
 }
 
@@ -1766,31 +1605,6 @@ pub(crate) const fn alignment_color_mode_needs_reference(color_mode: AlignmentCo
     )
 }
 
-pub(crate) fn allocate_workspace_records(total_records: usize, requests: &[usize]) -> Vec<usize> {
-    let mut allocations = vec![0; requests.len()];
-    let mut remaining = total_records;
-    let mut active = requests
-        .iter()
-        .enumerate()
-        .filter_map(|(index, request)| (*request > 0).then_some(index))
-        .collect::<Vec<_>>();
-
-    while remaining > 0 && !active.is_empty() {
-        let share = (remaining / active.len()).max(1);
-        for &index in &active {
-            if remaining == 0 {
-                break;
-            }
-            let outstanding = requests[index].saturating_sub(allocations[index]);
-            let grant = outstanding.min(share).min(remaining);
-            allocations[index] = allocations[index].saturating_add(grant);
-            remaining -= grant;
-        }
-        active.retain(|&index| allocations[index] < requests[index]);
-    }
-    allocations
-}
-
 #[cfg(test)]
 pub(crate) fn updated_alignment_selection(
     selected: &[TrackId],
@@ -1845,20 +1659,6 @@ pub(crate) fn move_ordered_item<T>(
     let item = items.remove(old_index);
     items.insert(new_index, item);
     true
-}
-
-pub(crate) fn interval_for_track(
-    dictionary: &ReferenceDictionary,
-    contig_name: &str,
-    viewport_interval: GenomicInterval,
-) -> Option<GenomicInterval> {
-    let contig_id = dictionary.id_by_name(contig_name)?;
-    let contig_length = dictionary.get(contig_id)?.length();
-    let start = viewport_interval.start();
-    if start >= contig_length {
-        return None;
-    }
-    GenomicInterval::new(contig_id, start, viewport_interval.end().min(contig_length)).ok()
 }
 
 pub(crate) fn commit_alignment_settings_draft(
@@ -1970,13 +1770,6 @@ pub(crate) fn copy_compatible_alignment_appearance(
         .clone_from(&source.hidden_modification_codes);
 }
 
-pub(crate) fn alignment_row_pair_bounds_relevant(
-    group_mode: AlignmentGroupMode,
-    sort_mode: AlignmentSortMode,
-) -> bool {
-    group_mode == AlignmentGroupMode::UnexpectedPair || sort_mode == AlignmentSortMode::PairStatus
-}
-
 pub(crate) fn spawn_alignment_track_controller(
     config: SessionAlignmentTrack,
     cache_bytes: NonZeroUsize,
@@ -2042,10 +1835,8 @@ pub(crate) fn spawn_alignment_track_controller(
         filter_editor,
         active_filters,
         projections: alignment_panel_projections(panel_ids),
-        cache_stats: None,
-        cache_budget_bytes: cache_bytes,
+        scene_budget_bytes: cache_bytes,
         scene_budget_retry: None,
-        remote_io_stats: None,
     })
 }
 

@@ -1,7 +1,6 @@
 use egui::Context;
 
 use super::super::*;
-use crate::display::alignment;
 
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticsSnapshot {
@@ -11,9 +10,8 @@ pub struct DiagnosticsSnapshot {
     pub alignment_tracks: Vec<String>,
     pub layout: Option<String>,
     pub data_cache: Option<String>,
-    pub cache_coordinator: Option<String>,
+    pub alignment_scene_budget: Option<String>,
     pub remote: Option<String>,
-    pub layout_cache: String,
     pub gpu_upload: String,
     pub navigation: String,
     pub interaction: Option<String>,
@@ -23,12 +21,6 @@ pub struct DiagnosticsSnapshot {
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn diagnostics_snapshot(&self) -> DiagnosticsSnapshot {
-        let mut rendered = 0_usize;
-        let mut hidden = 0_usize;
-        let mut primitives = 0_usize;
-        let mut cache_bytes = 0_usize;
-        let mut cache_hits = 0_u64;
-        let mut cache_misses = 0_u64;
         let mut remote_requests = 0_u64;
         let mut remote_bytes = 0_u64;
         let mut remote_cache_hits = 0_u64;
@@ -57,14 +49,14 @@ impl Viewer {
                     continue;
                 };
                 let transaction = projection.navigation.diagnostic();
-                let scene = projection.scene_frame.as_ref().map_or_else(
-                    || "scene frame absent".to_owned(),
+                let staged_source = projection.scene_frame.as_ref().map_or_else(
+                    || "staged source frame absent".to_owned(),
                     |frame| {
                         let records = frame.snapshot.as_ref().map_or(0, |snapshot| {
                             snapshot.reads().evidence().record_count()
                         });
                         format!(
-                            "scene {} records · genomic {:?} · rows {:?}/{:?} · reference {:?} (products current {}) · reads {:?} · vertical {:?}",
+                            "staged source {} records · genomic {:?} · rows {:?}/{:?} · reference {:?} (products current {}) · reads {:?} · vertical {:?}",
                             records,
                             frame.covered_interval,
                             frame.covered_rows,
@@ -76,6 +68,42 @@ impl Viewer {
                         )
                     },
                 );
+                let committed = self
+                    .presented_alignment_lane(active_panel_id, track.config.id)
+                    .map_or_else(
+                        || "committed presentation unavailable for desired target".to_owned(),
+                        |presented| {
+                            presented.lane.snapshot.as_ref().map_or_else(
+                                || {
+                                    format!(
+                                        "committed target {} · no semantic snapshot · summaries current {} · reads {:?}",
+                                        presented.target_revision,
+                                        presented.lane.summary_current(),
+                                        presented.source.individual_reads,
+                                    )
+                                },
+                                |snapshot| {
+                                    format!(
+                                        "committed target {} · scene {:?} · prepared {:?} · {} records / {} atlas rows · read pages {} · summary pages {} (depth {} allele {} junction {} modification {}) · summaries current {} · read pixel authority {} · reads {:?}",
+                                        presented.target_revision,
+                                        snapshot.revision(),
+                                        snapshot.prepared_interval(),
+                                        snapshot.reads().evidence().record_count(),
+                                        snapshot.reads().atlas().row_count(),
+                                        snapshot.reads().pages().len(),
+                                        snapshot.summary_pages().len(),
+                                        snapshot.summaries().depth_tiles().len(),
+                                        snapshot.summaries().allele_tiles().len(),
+                                        snapshot.summaries().junction_tiles().len(),
+                                        snapshot.summaries().modification_tiles().len(),
+                                        presented.lane.summary_current(),
+                                        presented.read_authority.is_some(),
+                                        presented.source.individual_reads,
+                                    )
+                                },
+                            )
+                        },
+                    );
                 let recent = projection
                     .navigation
                     .journal()
@@ -107,7 +135,7 @@ impl Viewer {
                         format!(" · INVARIANT FAILURE: {failure}")
                     });
                 alignment_tracks.push(format!(
-                    "{} · unified scene · panel {:?} track {:?} · g{} t{} · {:?} ({}) · owner {:?} · products {:?} · camera {:?} · {} · journal {}/64 [{}]{}{}",
+                    "{} · unified scene · panel {:?} track {:?} · g{} t{} · {:?} ({}) · owner {:?} · products {:?} · camera {:?} · {} · {} · journal {}/64 [{}]{}{}",
                     track.config.name,
                     transaction.panel_id,
                     transaction.track_id,
@@ -120,7 +148,8 @@ impl Viewer {
                     transaction.owner,
                     transaction.products,
                     transaction.desired_camera.map(|camera| camera.interval()),
-                    scene,
+                    committed,
+                    staged_source,
                     transaction.journal_entries,
                     recent,
                     transaction
@@ -131,181 +160,15 @@ impl Viewer {
                 ));
                 continue;
             }
-            if let Some(stats) = projection
-                .and_then(|projection| projection.cached_layout.as_ref())
-                .map(|(_, layout)| &layout.stats)
-            {
-                rendered = rendered.saturating_add(stats.rendered_alignments);
-                hidden = hidden.saturating_add(stats.hidden_alignments);
-                primitives = primitives.saturating_add(stats.primitive_count);
-            }
-            if let Some(stats) = track.cache_stats {
-                cache_bytes = cache_bytes.saturating_add(stats.resident_weight);
-                cache_hits = cache_hits.saturating_add(stats.hits);
-                cache_misses = cache_misses.saturating_add(stats.misses);
-            }
-            if let Some(stats) = track.remote_io_stats {
-                remote_requests = remote_requests.saturating_add(stats.requests);
-                remote_bytes = remote_bytes.saturating_add(stats.response_bytes);
-                remote_cache_hits = remote_cache_hits.saturating_add(stats.cache_hits);
-                remote_cancellations = remote_cancellations.saturating_add(stats.cancellations);
-            }
-            let lifecycle = if let Some(message) =
-                projection.and_then(|projection| projection.unavailable.as_deref())
-            {
-                format!("unavailable: {message}")
-            } else {
-                match &track.lifecycle {
-                    AlignmentTrackLifecycle::Opening => "opening".to_owned(),
-                    AlignmentTrackLifecycle::Ready
-                        if projection.is_some_and(AlignmentPanelProjection::query_is_checking) =>
-                    {
-                        format!(
-                            "checking ({:?})",
-                            projection.expect("checking projection exists").query_phase
-                        )
-                    }
-                    AlignmentTrackLifecycle::Ready => "ready".to_owned(),
-                    AlignmentTrackLifecycle::Failed(message) => format!("failed: {message}"),
-                }
-            };
-            let records = projection.map_or_else(
-                || "no result".to_owned(),
-                |projection| {
-                    if projection.query_is_checking() {
-                        return "checking current viewport".to_owned();
-                    }
-                    let Some(query) = projection.current_query.as_deref() else {
-                        return "no result".to_owned();
-                    };
-                    let layout_query = projection.layout_query.as_deref().unwrap_or(query);
-                    alignment::individual_read_refusal(
-                        query,
-                        layout_query,
-                        track.config.filters.read_stacking_mode,
-                    )
-                    .map_or_else(
-                        || {
-                            format!(
-                                "complete · {} records · limit {}",
-                                query.stats.records_eligible, query.stats.complete_read_limit
-                            )
-                        },
-                        |refusal| {
-                            format!(
-                                "too dense · {} eligible · limit {} · 0 individual records",
-                                refusal.eligible_records, refusal.limit
-                            )
-                        },
-                    )
-                },
-            );
-            let cache = track.cache_stats.map_or_else(
-                || "cache n/a".to_owned(),
-                |stats| format!("cache {} MiB", stats.resident_weight / (1024 * 1024)),
-            );
-            let working_set = projection.map_or_else(
-                || "working set n/a".to_owned(),
-                |projection| {
-                    let stats = projection.working_set;
-                    let resident = stats.resident_start.zip(stats.resident_end).map_or_else(
-                        || "resident none".to_owned(),
-                        |(start, end)| {
-                            format!(
-                                "resident {}-{} · {} records · {:.1} MiB",
-                                start.saturating_add(1),
-                                end,
-                                stats.resident_records,
-                                stats.resident_bytes as f64 / (1024.0 * 1024.0),
-                            )
-                        },
-                    );
-                    format!(
-                        "{:?} · {resident} · buffer L {}/{} bp R {}/{} bp{} · derive lookup/projection/summary {}/{}/{} µs · summary tiles {} hit / {:.1} MiB · source queries {} foreground / {} speculative / {} total · extensions {}/{} complete, {} cancelled, {} dense, {} failed · {} source queries avoided · {:.1} MiB decode avoided",
-                        stats.cache_outcome,
-                        stats.effective_margin_left,
-                        stats.requested_margin_left,
-                        stats.effective_margin_right,
-                        stats.requested_margin_right,
-                        stats.clamp_reason.map_or_else(String::new, |reason| format!(" · clamp {reason:?}")),
-                        stats.lookup_micros,
-                        stats.projection_micros,
-                        stats.summary_micros,
-                        stats.summary_tile_hits,
-                        stats.summary_index_bytes as f64 / (1024.0 * 1024.0),
-                        stats.foreground_source_queries,
-                        stats.speculative_source_queries,
-                        stats.source_queries,
-                        stats.extensions_completed,
-                        stats.extensions_requested,
-                        stats.extensions_cancelled,
-                        stats.extensions_too_dense,
-                        stats.extensions_failed,
-                        stats.source_queries_avoided,
-                        stats.decoded_bytes_avoided as f64 / (1024.0 * 1024.0),
-                    )
-                },
-            );
-            let row_scenes = projection.map_or_else(
-                || "row scenes n/a".to_owned(),
-                |projection| {
-                    let bytes = AlignmentRowScene::estimated_resident_bytes(
-                        projection.row_scenes.iter().map(Arc::as_ref),
-                    );
-                    let reconciliation = projection
-                        .alignment_rows
-                        .as_ref()
-                        .map(|rows| rows.reconciliation)
-                        .unwrap_or_default();
-                    format!(
-                        "row scenes {} / {:.1} MiB · {}{} · {}{}{}{} · {} µs",
-                        projection.row_scenes.len(),
-                        bytes as f64 / (1024.0 * 1024.0),
-                        if projection.resident_query.as_ref().is_some_and(|resident| {
-                            projection
-                                .row_scenes
-                                .iter()
-                                .any(|scene| scene.interval().contains_interval(resident.interval))
-                        }) {
-                            "resident prepared"
-                        } else {
-                            "resident unprepared"
-                        },
-                        "",
-                        if reconciliation.scene_hit {
-                            "hit"
-                        } else {
-                            "miss"
-                        },
-                        if reconciliation.scene_physical_hit {
-                            " physical"
-                        } else {
-                            ""
-                        },
-                        if reconciliation.scene_extended {
-                            " extended"
-                        } else {
-                            ""
-                        },
-                        if reconciliation.exact_camera_hit {
-                            " exact-camera"
-                        } else {
-                            ""
-                        },
-                        reconciliation.scene_projection_micros,
-                    )
-                },
-            );
             alignment_tracks.push(format!(
-                "{} · {} · {} · {} · {} · {}",
-                track.config.name, lifecycle, records, cache, working_set, row_scenes
+                "{} · unsupported by unified alignment scene backend · {:?}",
+                track.config.name, track.lifecycle,
             ));
         }
 
-        let layout_cache = self.layout_cache.stats();
         let upload = self.rectangle_renderer.last_prepare_stats();
-        let navigation_preview = self.navigation_preview_renderer.stats();
-        let navigation_counters = self.panels.iter().fold([0_u64; 10], |mut counters, panel| {
+        let context_gpu = self.context_scene_gpu_renderer.last_prepare_stats();
+        let navigation_counters = self.panels.iter().fold([0_u64; 7], |mut counters, panel| {
             let schedule = &panel.navigation_query_schedule;
             counters[0] = counters[0].saturating_add(schedule.input_updates);
             counters[1] = counters[1].saturating_add(schedule.coalesced_updates);
@@ -313,10 +176,7 @@ impl Viewer {
             counters[3] = counters[3].saturating_add(schedule.gesture_end_dispatches);
             counters[4] = counters[4].saturating_add(schedule.cancelled_targets);
             counters[5] = counters[5].saturating_add(schedule.committed_targets);
-            counters[6] = counters[6].saturating_add(schedule.preview_frames);
-            counters[7] = counters[7].saturating_add(schedule.neutral_frames_after_commit);
-            counters[8] = counters[8].max(schedule.last_transaction_preview_frames);
-            counters[9] = counters[9].max(schedule.last_commit_micros);
+            counters[6] = counters[6].max(schedule.last_commit_micros);
             counters
         });
         let diagnostic_now = Instant::now();
@@ -370,7 +230,7 @@ impl Viewer {
         );
         let sashimi_interaction = format!(
             "{latest_sashimi_probe}\nSashimi totals · {} targets · {} hit tests / {} bounds candidates / {} curve evaluations · {} acquisitions / {} transfers / {} clears / {} hysteresis retentions / {} stale rejected · {} hover redraws / {} hover layout rebuilds · hit median/p95/max {}/{}/{} µs",
-            self.panels.active().junction_arc_targets.len(),
+            latest_result.total_targets,
             self.sashimi_interaction_diagnostics.hit_tests,
             self.sashimi_interaction_diagnostics.bounds_candidates,
             self.sashimi_interaction_diagnostics.curve_evaluations,
@@ -422,32 +282,14 @@ impl Viewer {
                 .panels
                 .iter()
                 .map(|panel| {
-                    let source = panel
-                        .navigation_presentation
-                        .source
-                        .as_ref()
-                        .map(|source| {
-                            format!(
-                                " · source {}:{}-{}@{}",
-                                panel.contig_name,
-                                source.interval.start().saturating_add(1),
-                                source.interval.end(),
-                                source.generation,
-                            )
-                        })
-                        .unwrap_or_default();
                     let transaction = if panel.navigation_presentation.is_unsettled() {
                         format!(
-                            " · target @{} · {} ms · {}",
+                            " · target @{} · {} ms · acquiring independent lanes",
                             panel.navigation_presentation.target_generation,
                             panel
                                 .navigation_presentation
                                 .age(diagnostic_now)
                                 .as_millis(),
-                            panel
-                                .navigation_presentation
-                                .preview_kind
-                                .map_or("neutral", NavigationPreviewKind::label),
                         )
                     } else {
                         String::new()
@@ -457,8 +299,43 @@ impl Viewer {
                         .invalidation_reason
                         .as_deref()
                         .map_or_else(String::new, |reason| format!(" · invalidated: {reason}"));
+                    let contextual = if panel.context_scene.lanes.is_empty() {
+                        String::new()
+                    } else {
+                        let lanes = panel
+                            .context_scene
+                            .lanes
+                            .iter()
+                            .map(|(key, state)| {
+                                let name = match key {
+                                    ContextLaneKey::Reference => "reference".to_owned(),
+                                    ContextLaneKey::Auxiliary(track_id) => {
+                                        format!("track {}", track_id.get())
+                                    }
+                                };
+                                format!(
+                                    "{name}={}/{}@{}{}",
+                                    state.readiness.label(),
+                                    state.gpu_readiness.label(),
+                                    state
+                                        .lease
+                                        .as_ref()
+                                        .map_or(0, |lease| lease.generation),
+                                    state
+                                        .gpu_failure
+                                        .as_deref()
+                                        .map_or_else(String::new, |failure| format!("!{failure}")),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(
+                            " · context [{lanes}] · {} coherence groups",
+                            panel.context_scene.coherence_groups.len()
+                        )
+                    };
                     format!(
-                        "panel {} · {}:{}-{} · generation {} · {:?}{source}{transaction}{invalidation}{}",
+                        "panel {} · {}:{}-{} · generation {} · {:?}{transaction}{invalidation}{contextual}{}",
                         panel.id.get(),
                         panel.contig_name,
                         panel.viewport.interval().start().saturating_add(1),
@@ -474,47 +351,14 @@ impl Viewer {
                 })
                 .collect(),
             alignment_tracks,
-            layout: (rendered > 0 || hidden > 0).then(|| {
-                format!(
-                    "workspace layout rev {} · {} recomputes · {} settled resize queries · {rendered} shown · {hidden} hidden · {primitives} primitives",
-                    self.workspace_layout.revision,
-                    self.workspace_layout_recomputations,
-                    self.resize_query_refreshes,
-                )
-            }),
-            data_cache: (!self.alignment_tracks.is_empty()).then(|| {
-                format!(
-                    "alignment caches {} MiB · {} hits / {} misses",
-                    cache_bytes / (1024 * 1024),
-                    cache_hits,
-                    cache_misses
-                )
-            }),
-            cache_coordinator: (!self.alignment_tracks.is_empty()).then(|| {
-                let cache = self.cache_coordinator;
-                let legacy = format!(
-                    "cache coordinator {:.1}/{:.1} MiB · decoded {:.1}/{:.1} · layout {:.1}/{:.1} · rows {:.1}/{:.1} · GPU {:.1}/{:.1}{} · {} rebalances",
-                    cache.measured_resident_bytes as f64 / (1024.0 * 1024.0),
-                    cache.total_budget_bytes as f64 / (1024.0 * 1024.0),
-                    cache.decoded_resident_bytes as f64 / (1024.0 * 1024.0),
-                    cache.decoded_allowance_bytes as f64 / (1024.0 * 1024.0),
-                    cache.layout_resident_bytes as f64 / (1024.0 * 1024.0),
-                    cache.layout_allowance_bytes as f64 / (1024.0 * 1024.0),
-                    cache.row_scene_resident_bytes as f64 / (1024.0 * 1024.0),
-                    cache.row_scene_allowance_bytes as f64 / (1024.0 * 1024.0),
-                    cache.gpu_slab_resident_bytes as f64 / (1024.0 * 1024.0),
-                    cache.gpu_slab_allowance_bytes as f64 / (1024.0 * 1024.0),
-                    if cache.over_budget_bytes > 0 {
-                        format!(
-                            " · {:.1} MiB over ({})",
-                            cache.over_budget_bytes as f64 / (1024.0 * 1024.0),
-                            cache.clamp_reason.unwrap_or("foreground pinned")
-                        )
-                    } else {
-                        String::new()
-                    },
-                    cache.rebalances,
-                );
+            layout: Some(format!(
+                "workspace layout rev {} · {} recomputes · {} settled resize queries",
+                self.workspace_layout.revision,
+                self.workspace_layout_recomputations,
+                self.resize_query_refreshes,
+            )),
+            data_cache: None,
+            alignment_scene_budget: (!self.alignment_tracks.is_empty()).then(|| {
                 let scene = alignment_ledger_progress.map_or_else(
                     || "scene ledger unavailable".to_owned(),
                     |progress| {
@@ -548,7 +392,7 @@ impl Viewer {
                     },
                 );
                 format!(
-                    "{scene}\n{legacy}\nBudget scope: scene-owned CPU/GPU allocations only; wgpu driver copies, allocator retention, UI, generic tracks, and process runtime memory are outside the ledger and explain any RSS difference."
+                    "{scene}\nBudget scope: scene-owned CPU/GPU allocations only; wgpu driver copies, allocator retention, UI, generic tracks, and process runtime memory are outside the ledger and explain any RSS difference."
                 )
             }),
             remote: (remote_requests > 0).then(|| {
@@ -557,46 +401,28 @@ impl Viewer {
                     remote_bytes as f64 / (1024.0 * 1024.0)
                 )
             }),
-            layout_cache: format!(
-                "layout cache {} MiB · {} hits / {} misses",
-                layout_cache.resident_weight / (1024 * 1024),
-                layout_cache.hits,
-                layout_cache.misses
-            ),
             gpu_upload: format!(
-                "GPU upload {} KiB{} · slabs {} entries / {} MiB / {} · preview {}x{} px @ {:.2}x · {} MiB · {} captures / {} composites / {} invalidations / {} fallbacks · horizon {} checks / {} hits / {} misses / {} budget fallbacks · {} µs / {} rectangles",
+                "GPU upload {} KiB{} · generic slabs {} entries / {} MiB / {} · contextual {} lanes / {:.2} MiB · {} KiB geometry / {} camera writes / {} rejected",
                 upload.uploaded_bytes / 1024,
                 if upload.truncated { " · capped" } else { "" },
                 upload.slab_entries,
                 upload.slab_resident_bytes / (1024 * 1024),
                 if upload.slab_cache_hit { "hit" } else { "miss" },
-                navigation_preview.width,
-                navigation_preview.height,
-                self.window.scale_factor(),
-                navigation_preview.allocated_bytes / (1024 * 1024),
-                navigation_preview.texture_captures,
-                navigation_preview.texture_composites,
-                navigation_preview.texture_invalidations,
-                navigation_preview.texture_fallbacks,
-                self.navigation_horizon_preview_stats.eligibility_checks,
-                self.navigation_horizon_preview_stats.hits,
-                self.navigation_horizon_preview_stats.misses,
-                self.navigation_horizon_preview_stats.budget_fallbacks,
-                self.navigation_horizon_preview_stats.last_build_micros,
-                self.navigation_horizon_preview_stats.last_rectangle_count,
+                context_gpu.resident_lanes,
+                context_gpu.resident_bytes as f64 / (1024.0 * 1024.0),
+                context_gpu.uploaded_bytes / 1024,
+                context_gpu.camera_writes,
+                context_gpu.rejected_lanes,
             ),
             navigation: format!(
-                "navigation {} inputs / {} coalesced / {} dispatched / {} release-dispatched / {} cancelled / {} committed · {} preview frames / {} neutral-after-commit · last {} frames / {:.2} ms · {} stale results rejected · row layout {} active / {} cancelled",
+                "navigation {} inputs / {} coalesced / {} dispatched / {} release-dispatched / {} cancelled / {} committed · last {:.2} ms · {} stale results rejected · row layout {} active / {} cancelled",
                 navigation_counters[0],
                 navigation_counters[1],
                 navigation_counters[2],
                 navigation_counters[3],
                 navigation_counters[4],
                 navigation_counters[5],
-                navigation_counters[6],
-                navigation_counters[7],
-                navigation_counters[8],
-                navigation_counters[9] as f64 / 1_000.0,
+                navigation_counters[6] as f64 / 1_000.0,
                 self.navigation_stale_result_rejections,
                 0,
                 0,
@@ -684,7 +510,7 @@ pub fn show_diagnostics(context: &Context, open: &mut bool, snapshot: &Diagnosti
             if let Some(cache) = &snapshot.data_cache {
                 ui.monospace(cache);
             }
-            if let Some(cache) = &snapshot.cache_coordinator {
+            if let Some(cache) = &snapshot.alignment_scene_budget {
                 ui.monospace(cache);
             }
             if let Some(remote) = &snapshot.remote {
@@ -709,7 +535,6 @@ pub fn show_diagnostics(context: &Context, open: &mut bool, snapshot: &Diagnosti
                 ui.strong("Genome landmarks");
                 ui.monospace(landmarks);
             }
-            ui.monospace(&snapshot.layout_cache);
             ui.monospace(&snapshot.gpu_upload);
             ui.monospace(&snapshot.navigation);
             if let Some(interaction) = &snapshot.interaction {

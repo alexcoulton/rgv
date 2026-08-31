@@ -101,7 +101,7 @@ impl Viewer {
         }
         let source_label = config.source.redacted_label();
         self.tracks.push(config);
-        self.invalidate_navigation_preview_contract("auxiliary track added");
+        self.invalidate_navigation_contract("auxiliary track added");
         self.reconcile_track_presentation();
         self.synthetic = false;
         self.data_status = format!("Opening track {source_label}…");
@@ -308,7 +308,6 @@ impl Viewer {
             None
         };
         self.refresh_active_panel_context();
-        self.layout_cache.clear();
         self.replace_alignment_track_controllers(session.alignment_tracks.clone())?;
         if alignment.is_some() {
             "Opening alignment tracks…".clone_into(&mut self.data_status);

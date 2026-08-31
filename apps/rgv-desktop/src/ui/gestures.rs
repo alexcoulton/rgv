@@ -60,39 +60,6 @@ pub(crate) fn retained_data_overlaps(loaded: GenomicInterval, viewport: GenomicI
     loaded.overlaps(viewport)
 }
 
-pub(crate) fn extend_alignment_layers(
-    pinned: &mut DisplayList,
-    scrollable: &mut DisplayList,
-    layout: &AlignmentLayout,
-    scrollable_clip: Option<(f32, f32)>,
-) {
-    debug_assert!(layout.pinned_rectangle_count <= layout.display_list.rectangles.len());
-    debug_assert!(layout.pinned_text_count <= layout.display_list.texts.len());
-    let rectangle_boundary = layout
-        .pinned_rectangle_count
-        .min(layout.display_list.rectangles.len());
-    let text_boundary = layout
-        .pinned_text_count
-        .min(layout.display_list.texts.len());
-    pinned.rectangles.extend(
-        layout.display_list.rectangles[..rectangle_boundary]
-            .iter()
-            .copied(),
-    );
-    pinned
-        .texts
-        .extend(layout.display_list.texts[..text_boundary].iter().cloned());
-    let mut read_layer = DisplayList {
-        rectangles: layout.display_list.rectangles[rectangle_boundary..].to_vec(),
-        texts: layout.display_list.texts[text_boundary..].to_vec(),
-    };
-    if let Some((top, bottom)) = scrollable_clip {
-        read_layer.scroll_and_clip_vertical(0.0, top, bottom);
-    }
-    scrollable.rectangles.append(&mut read_layer.rectangles);
-    scrollable.texts.append(&mut read_layer.texts);
-}
-
 pub(crate) fn overview_pan_gain(span: f64, contig_length: u64) -> f64 {
     let visible_fraction = span / contig_length.max(1) as f64;
     2.5 + 5.5 * visible_fraction.clamp(0.0, 1.0).sqrt()
@@ -218,15 +185,9 @@ pub(crate) fn reproject_stable_row_camera(
     coordinate_space: ReadRowCoordinateSpace,
 ) -> Option<f32> {
     if anchor.coordinate_space != coordinate_space {
-        // A change involving a unified coordinate space denotes a genuine repack or a switch of
-        // row authorities (stable extensions inherit their lineage). The old row number has no
-        // meaning in the new atlas, so begin at its first row instead of projecting a misleading
-        // camera position.
-        if matches!(anchor.coordinate_space, ReadRowCoordinateSpace::Unified(_))
-            || matches!(coordinate_space, ReadRowCoordinateSpace::Unified(_))
-        {
-            return Some(0.0);
-        }
+        // A new immutable atlas denotes a genuine repack. The old row number has no meaning in
+        // the new coordinate space, so begin at its first row.
+        return Some(0.0);
     } else if (anchor.row_height - row_height).abs() <= f32::EPSILON {
         return None;
     }

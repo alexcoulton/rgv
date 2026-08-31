@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     mem::size_of,
     num::{NonZeroU32, NonZeroU64},
     ops::Range,
@@ -7,7 +7,7 @@ use std::{
 };
 
 use rgv_core::GenomicInterval;
-use rgv_hts::{AlignmentRecord, PackedRecordError};
+use rgv_hts::{AlignmentRecord, ModificationCode, PackedRecordError, decode_modified_bases};
 use thiserror::Error;
 
 use crate::{
@@ -389,6 +389,22 @@ impl AlignmentPresentationScene {
         &self,
         interval: GenomicInterval,
     ) -> Result<Vec<AlignmentExportRecord>, AlignmentExportError> {
+        let mut records = Vec::new();
+        self.for_each_full(interval, |record| {
+            records.push(record);
+            true
+        })?;
+        Ok(records)
+    }
+
+    /// Visits the lossless retained population in exact source order without constructing a
+    /// second all-record vector. This is the action-query path for complete automation scans and
+    /// streaming exports over very deep scenes.
+    pub fn for_each_full(
+        &self,
+        interval: GenomicInterval,
+        mut visit: impl FnMut(AlignmentExportRecord) -> bool,
+    ) -> Result<(), AlignmentExportError> {
         if !self.prepared_interval.contains_interval(interval) {
             return Err(AlignmentExportError::UnpreparedInterval(interval));
         }
@@ -400,7 +416,6 @@ impl AlignmentPresentationScene {
             return Err(AlignmentExportError::FullPayloadUnavailable);
         }
         let selection = self.evidence.select(interval)?;
-        let mut records = Vec::with_capacity(selection.len());
         for reference in selection.records() {
             let chunk = self
                 .evidence
@@ -410,13 +425,73 @@ impl AlignmentPresentationScene {
             let payload = chunk
                 .payload()
                 .ok_or(AlignmentExportError::FullPayloadUnavailable)?;
-            records.push(AlignmentExportRecord {
+            if !visit(AlignmentExportRecord {
                 handle: reference.handle,
                 record: payload
                     .materialize_retained_record(chunk.chunk(), reference.record as usize)?,
-            });
+            }) {
+                break;
+            }
         }
-        Ok(records)
+        Ok(())
+    }
+
+    /// Visits stable handle, read name, and flags without materializing sequence/quality/tag
+    /// payload. Callers use this bounded view to prepare name/chain counts before one complete
+    /// streaming record pass.
+    pub fn for_each_identity(
+        &self,
+        interval: GenomicInterval,
+        mut visit: impl FnMut(AlignmentHandle, &[u8], rgv_hts::AlignmentFlags),
+    ) -> Result<(), AlignmentExportError> {
+        if !self.prepared_interval.contains_interval(interval) {
+            return Err(AlignmentExportError::UnpreparedInterval(interval));
+        }
+        let selection = self.evidence.select(interval)?;
+        for (index, reference) in selection.records().iter().enumerate() {
+            let record = selection
+                .record_view(index)
+                .ok_or(AlignmentExportError::InvalidEvidenceRecord)?;
+            visit(reference.handle, record.read_name(), record.flags());
+        }
+        Ok(())
+    }
+
+    /// Discovers modified-base codes from a bounded prefix of the exact retained population.
+    /// This action query exists for settings/property surfaces and never participates in frame
+    /// rendering. Malformed individual tags are skipped, matching the legacy settings behavior.
+    pub fn modification_codes(
+        &self,
+        maximum_records: usize,
+        maximum_codes: usize,
+    ) -> Result<Vec<ModificationCode>, AlignmentExportError> {
+        if maximum_records == 0 || maximum_codes == 0 {
+            return Ok(Vec::new());
+        }
+        let mut codes = BTreeSet::new();
+        let mut examined = 0_usize;
+        for chunk in self.evidence.chunks() {
+            for index in 0..chunk.chunk().batch().len() {
+                if examined == maximum_records || codes.len() == maximum_codes {
+                    return Ok(codes.into_iter().collect());
+                }
+                examined = examined.saturating_add(1);
+                let record = chunk.payload().map_or_else(
+                    || chunk.chunk().batch().materialize_record(index),
+                    |payload| payload.materialize_retained_record(chunk.chunk(), index),
+                )?;
+                let Ok(calls) = decode_modified_bases(&record) else {
+                    continue;
+                };
+                for call in calls {
+                    codes.insert(call.code);
+                    if codes.len() == maximum_codes {
+                        return Ok(codes.into_iter().collect());
+                    }
+                }
+            }
+        }
+        Ok(codes.into_iter().collect())
     }
 
     #[must_use]
@@ -485,13 +560,7 @@ impl AlignmentPresentationScene {
         handle: AlignmentHandle,
         direction: AlignmentTraversalDirection,
     ) -> Option<AlignmentHandle> {
-        let mut ordered = self
-            .atlas
-            .records_for_rows(self.prepared_rows.clone(), self.prepared_interval)
-            .into_iter()
-            .map(|hit| hit.record.handle())
-            .collect::<Vec<_>>();
-        ordered.dedup();
+        let ordered = self.ordered_handles();
         let index = ordered.iter().position(|candidate| *candidate == handle)?;
         match direction {
             AlignmentTraversalDirection::Previous => index
@@ -499,6 +568,39 @@ impl AlignmentPresentationScene {
                 .and_then(|index| ordered.get(index).copied()),
             AlignmentTraversalDirection::Next => ordered.get(index.saturating_add(1)).copied(),
         }
+    }
+
+    /// First or last handle in the immutable row-atlas traversal order. This is the stable-handle
+    /// equivalent of selecting the edge item in a query-local display list.
+    #[must_use]
+    pub fn edge_handle(&self, direction: AlignmentTraversalDirection) -> Option<AlignmentHandle> {
+        let ordered = self.ordered_handles();
+        match direction {
+            AlignmentTraversalDirection::Previous => ordered.last().copied(),
+            AlignmentTraversalDirection::Next => ordered.first().copied(),
+        }
+    }
+
+    /// Resolves all physical records with a read name from the scene's exact evidence root.
+    /// True duplicates remain separate stable handles. This action-oriented lookup is used for
+    /// cross-panel read restoration and never becomes a render-page identity.
+    #[must_use]
+    pub fn handles_for_read_name(&self, read_name: &[u8]) -> Vec<AlignmentHandle> {
+        self.matching_read_name_handles(read_name)
+            .into_iter()
+            .map(|(handle, _)| handle)
+            .collect()
+    }
+
+    fn ordered_handles(&self) -> Vec<AlignmentHandle> {
+        let mut ordered = self
+            .atlas
+            .records_for_rows(self.prepared_rows.clone(), self.prepared_interval)
+            .into_iter()
+            .map(|hit| hit.record.handle())
+            .collect::<Vec<_>>();
+        ordered.dedup();
+        ordered
     }
 
     fn read_name_and_flags(

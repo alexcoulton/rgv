@@ -133,7 +133,10 @@ pub use row_atlas::{
 };
 pub use row_oracle::{AlignmentRowGroup, AlignmentRowGroupKey, RowOracleError};
 pub use scene_camera::{AlignmentSceneCamera, AlignmentSceneCameraError, AlignmentSceneRowDemand};
-pub use scene_snapshot::{AlignmentSceneSnapshot, AlignmentSceneSnapshotError};
+pub use scene_snapshot::{
+    AlignmentSceneAlleleSite, AlignmentScenePileupSite, AlignmentSceneSnapshot,
+    AlignmentSceneSnapshotError,
+};
 pub use semantic_page::{
     AlignmentBodyColorToken, AlignmentComponent, AlignmentGeometryToken, AlignmentLabelKind,
     AlignmentOperation, AlignmentPageKey, AlignmentSemanticLabel, AlignmentSemanticPage,
@@ -153,6 +156,7 @@ pub use summary_page::{
     SummarySemanticPrimitive,
 };
 pub use summary_root::{
-    ExactSummaryPins, ExactSummaryQueryError, ExactSummaryRoot, ExactSummaryRootError,
+    ExactAlleleSiteEvidence, ExactPileupSiteEvidence, ExactSummaryPins, ExactSummaryQueryError,
+    ExactSummaryRoot, ExactSummaryRootError,
 };
 pub use tile::{CanonicalGenomicTile, CanonicalTileError};

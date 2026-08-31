@@ -372,78 +372,84 @@ pub(crate) fn automation_alignments_export(
     contig: &str,
     interval: GenomicInterval,
     tracks: &[AutomationAlignmentExportTrack],
-) -> String {
+) -> Result<String> {
     let mut output = automation_export_header("alignment", assembly, contig, interval);
     if !push_automation_export_line(
         &mut output,
         "track_id\ttrack_name\tcontig\tstart\tend\tread_name\tflags\tmapq\tcigar\tmate_contig_id\tmate_start\ttemplate_length",
     ) {
-        return output;
+        return Ok(output);
     }
     for track in tracks {
-        let query = &track.query;
+        let snapshot = &track.authority.snapshot;
+        let exported_records = snapshot.reads().evidence().select(interval)?.len();
+        let prepared = snapshot.prepared_interval();
+        let provenance = snapshot.summaries().filter_provenance(prepared).ok();
+        let unavailable = || ".".to_owned();
         let _ = push_automation_export_line(
             &mut output,
             &format!(
-                "# track_provenance\t{}\t{}\tread_presentation=complete\tcomplete_read_limit={}\trecords_seen={}\trecords_eligible={}\tcomplete_records={}\tunmapped_ignored={}\tsecondary_filtered={}\tsupplementary_filtered={}\tuser_filtered={}\tduplicate_filtered={}\tqc_failed_filtered={}",
+                "# track_provenance\t{}\t{}\tauthority=committed_scene\tread_presentation=complete\tcomplete_read_limit={}\tprepared_start={}\tprepared_end={}\texported_records={}\tfilter_provenance_exact={}\trecords_seen={}\trecords_eligible={}\tunmapped_ignored={}\tsecondary_filtered={}\tsupplementary_filtered={}\tuser_filtered={}",
                 track.id.get(),
                 sanitized_tsv_field(&track.name, 4_096),
-                query.stats.complete_read_limit,
-                query.stats.records_seen,
-                query.stats.records_eligible,
-                query.batch.len(),
-                query.stats.records_filtered_unmapped,
-                query.stats.records_filtered_secondary,
-                query.stats.records_filtered_supplementary,
-                query.stats.records_filtered_user,
-                query.stats.records_filtered_duplicate,
-                query.stats.records_filtered_qc_failed,
+                track.complete_read_limit,
+                prepared.start().saturating_add(1),
+                prepared.end(),
+                exported_records,
+                provenance.is_some(),
+                provenance.map_or_else(unavailable, |value| value.records_seen.to_string()),
+                provenance.map_or_else(
+                    || snapshot.reads().evidence().record_count().to_string(),
+                    |value| value.eligible_records.to_string(),
+                ),
+                provenance.map_or_else(unavailable, |value| value.unmapped.to_string()),
+                provenance.map_or_else(unavailable, |value| value.secondary.to_string()),
+                provenance.map_or_else(unavailable, |value| value.supplementary.to_string()),
+                provenance.map_or_else(unavailable, |value| value.user_filter.to_string()),
             ),
         );
-        for index in 0..query.batch.len() {
-            let start = query.batch.start(index).expect("validated start");
-            let end = query.batch.end(index).expect("validated end");
-            if start >= interval.end() || end <= interval.start() {
-                continue;
-            }
-            let line = format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t0x{:04x}\t{}\t{}\t{}\t{}\t{}",
-                track.id.get(),
-                sanitized_tsv_field(&track.name, 4_096),
-                sanitized_tsv_field(contig, 4_096),
-                start.saturating_add(1),
-                end,
-                sanitized_tsv_field(
-                    &String::from_utf8_lossy(query.batch.read_name(index).unwrap_or_default()),
-                    1_024,
-                ),
-                query.batch.flags(index).expect("validated flags").bits(),
-                query
-                    .batch
-                    .mapping_quality(index)
-                    .flatten()
-                    .map_or_else(|| ".".to_owned(), |value| value.to_string()),
-                format_cigar(query.batch.cigar(index).unwrap_or_default()),
-                query
-                    .batch
-                    .mate_contig(index)
-                    .flatten()
-                    .map_or_else(|| ".".to_owned(), |value| value.get().to_string()),
-                query.batch.mate_start(index).flatten().map_or_else(
-                    || ".".to_owned(),
-                    |value| value.saturating_add(1).to_string()
-                ),
-                query
-                    .batch
-                    .template_length(index)
-                    .expect("validated template length"),
+        let mut output_complete = true;
+        snapshot.reads().for_each_full(interval, |exported| {
+            output_complete = push_automation_export_line(
+                &mut output,
+                &automation_alignment_record_line(track, contig, &exported.record),
             );
-            if !push_automation_export_line(&mut output, &line) {
-                return output;
-            }
+            output_complete
+        })?;
+        if !output_complete {
+            return Ok(output);
         }
     }
-    output
+    Ok(output)
+}
+
+fn automation_alignment_record_line(
+    track: &AutomationAlignmentExportTrack,
+    contig: &str,
+    record: &AlignmentRecord,
+) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t0x{:04x}\t{}\t{}\t{}\t{}\t{}",
+        track.id.get(),
+        sanitized_tsv_field(&track.name, 4_096),
+        sanitized_tsv_field(contig, 4_096),
+        record.start.saturating_add(1),
+        record.end,
+        sanitized_tsv_field(&String::from_utf8_lossy(&record.read_name), 1_024),
+        record.flags.bits(),
+        record
+            .mapping_quality
+            .map_or_else(|| ".".to_owned(), |value| value.to_string()),
+        format_cigar(&record.cigar),
+        record
+            .mate_contig
+            .map_or_else(|| ".".to_owned(), |value| value.get().to_string()),
+        record.mate_start.map_or_else(
+            || ".".to_owned(),
+            |value| value.saturating_add(1).to_string()
+        ),
+        record.template_length,
+    )
 }
 
 pub(crate) fn automation_pileup_export(
@@ -451,65 +457,78 @@ pub(crate) fn automation_pileup_export(
     contig: &str,
     interval: GenomicInterval,
     tracks: &[AutomationAlignmentExportTrack],
-) -> String {
+) -> Result<String> {
     let mut output = automation_export_header("pileup", assembly, contig, interval);
     if !push_automation_export_line(
         &mut output,
         "track_id\ttrack_name\tcontig\tstart\tend\tdepth\tforward_depth\treverse_depth\tA\tC\tG\tT\tN\tinsertion\tdeletion\tmean_base_quality\tmean_mapping_quality",
     ) {
-        return output;
+        return Ok(output);
     }
     for track in tracks {
-        let query = &track.query;
-        let provenance = query.pileup.provenance;
+        let snapshot = &track.authority.snapshot;
+        snapshot.summaries().project_depth_bins(interval, 1)?;
+        let contract = snapshot.summaries().contract();
+        let allele_available = contract.allele_detail != AlleleSummaryDetail::None;
         let _ = push_automation_export_line(
             &mut output,
             &format!(
-                "# track_provenance\t{}\t{}\teligible_records={}\trendered_records={}\tall_eligible_records={}\talleles_available={}\toverlap_collapse_complete={}",
+                "# track_provenance\t{}\t{}\tauthority=committed_scene\tresolution=single_base\tzero_depth_sites=omitted\teligible_records={}\tall_eligible_records=true\talleles_available={}\toverlap_collapse_complete=true\toverlapping_mate_policy={:?}",
                 track.id.get(),
                 sanitized_tsv_field(&track.name, 4_096),
-                provenance.eligible_records,
-                provenance.rendered_records,
-                provenance.all_eligible_records,
-                provenance.allele_observations_available,
-                provenance.overlap_collapse_complete,
+                snapshot.reads().evidence().record_count(),
+                allele_available,
+                contract.overlapping_mate_policy,
             ),
         );
-        for (index, bin) in query.pileup.bins.iter().copied().enumerate() {
-            let Some(bin_interval) = query.pileup.bin_interval(query.interval, index) else {
+        for position in interval.start()..interval.end() {
+            let Some(evidence) = snapshot.summaries().pileup_site_evidence_at(position) else {
                 continue;
             };
-            if !bin_interval.overlaps(interval) {
+            if evidence.bin.depth == 0 && evidence.bin.alleles == rgv_hts::AlleleSupport::default()
+            {
                 continue;
             }
-            let line = format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                track.id.get(),
-                sanitized_tsv_field(&track.name, 4_096),
-                sanitized_tsv_field(contig, 4_096),
-                bin_interval.start().saturating_add(1),
-                bin_interval.end(),
-                bin.depth,
-                bin.forward_depth,
-                bin.reverse_depth,
-                bin.alleles.a,
-                bin.alleles.c,
-                bin.alleles.g,
-                bin.alleles.t,
-                bin.alleles.n,
-                bin.alleles.insertion,
-                bin.alleles.deletion,
-                bin.mean_base_quality()
-                    .map_or_else(|| ".".to_owned(), |value| format!("{value:.4}")),
-                bin.mean_mapping_quality()
-                    .map_or_else(|| ".".to_owned(), |value| format!("{value:.4}")),
-            );
-            if !push_automation_export_line(&mut output, &line) {
-                return output;
+            let site = GenomicInterval::new(interval.contig(), position, position + 1)?;
+            if !push_automation_export_line(
+                &mut output,
+                &automation_pileup_line(track, contig, site, evidence.bin),
+            ) {
+                return Ok(output);
             }
         }
     }
-    output
+    Ok(output)
+}
+
+fn automation_pileup_line(
+    track: &AutomationAlignmentExportTrack,
+    contig: &str,
+    interval: GenomicInterval,
+    bin: rgv_hts::PileupBin,
+) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        track.id.get(),
+        sanitized_tsv_field(&track.name, 4_096),
+        sanitized_tsv_field(contig, 4_096),
+        interval.start().saturating_add(1),
+        interval.end(),
+        bin.depth,
+        bin.forward_depth,
+        bin.reverse_depth,
+        bin.alleles.a,
+        bin.alleles.c,
+        bin.alleles.g,
+        bin.alleles.t,
+        bin.alleles.n,
+        bin.alleles.insertion,
+        bin.alleles.deletion,
+        bin.mean_base_quality()
+            .map_or_else(|| ".".to_owned(), |value| format!("{value:.4}")),
+        bin.mean_mapping_quality()
+            .map_or_else(|| ".".to_owned(), |value| format!("{value:.4}")),
+    )
 }
 
 pub(crate) fn automation_modifications_export(
@@ -517,81 +536,120 @@ pub(crate) fn automation_modifications_export(
     contig: &str,
     interval: GenomicInterval,
     tracks: &[AutomationAlignmentExportTrack],
-) -> String {
+) -> Result<String> {
     let mut output = automation_export_header("modified-base", assembly, contig, interval);
     if !push_automation_export_line(
         &mut output,
         "track_id\ttrack_name\tcontig\tstart\tend\tcanonical_base\tmodification_code\tmodification_strand\timplicit_mode\thaplotype\tmodified_calls\tcanonical_observations\tforward_modified_calls\treverse_modified_calls\traw_fraction\tweighted_fraction\tmean_probability\tmissing_probability_calls",
     ) {
-        return output;
+        return Ok(output);
     }
     for track in tracks {
-        let query = &track.query;
-        let summary = &query.pileup.modifications;
-        let provenance = summary.provenance;
+        let snapshot = &track.authority.snapshot;
+        anyhow::ensure!(
+            snapshot.summaries().contract().collect_modifications,
+            "modified-base summaries are unavailable in the committed scene; enable modified-base frequency and allow the scene to settle before exporting"
+        );
+        let summaries = snapshot.summaries().modification_summaries(interval)?;
         let _ = push_automation_export_line(
             &mut output,
             &format!(
-                "# track_provenance\t{}\t{}\teligible_records={}\ttagged_records={}\tdecoded_calls={}\tmalformed_records={}\tunavailable_records={}\tdropped_series={}\tall_eligible_records={}",
+                "# track_provenance\t{}\t{}\tauthority=committed_scene\tresolution=single_base\ttile_count={}\tall_eligible_records=true\tmodifications_enabled={}",
                 track.id.get(),
                 sanitized_tsv_field(&track.name, 4_096),
-                provenance.eligible_records,
-                provenance.records_with_modification_tags,
-                provenance.decoded_calls,
-                provenance.malformed_records,
-                provenance.unavailable_records,
-                provenance.dropped_series,
-                provenance.all_eligible_records,
+                summaries.len(),
+                true,
             ),
         );
-        for series in &summary.series {
-            for (index, bin) in series.bins.iter().copied().enumerate() {
-                if bin.canonical_observations == 0
-                    && bin.modified_calls == 0
-                    && bin.missing_probability_calls == 0
-                {
-                    continue;
-                }
-                let Some(bin_interval) = summary.bin_interval(query.interval, index) else {
-                    continue;
-                };
-                if !bin_interval.overlaps(interval) {
-                    continue;
-                }
-                let line = format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        for (owner, summary) in summaries {
+            let provenance = summary.provenance;
+            let _ = push_automation_export_line(
+                &mut output,
+                &format!(
+                    "# tile_provenance\t{}\t{}\t{}\t{}\teligible_records={}\ttagged_records={}\tdecoded_calls={}\tmalformed_records={}\tunavailable_records={}\tdropped_series={}\tall_eligible_records={}",
                     track.id.get(),
                     sanitized_tsv_field(&track.name, 4_096),
-                    sanitized_tsv_field(contig, 4_096),
-                    bin_interval.start().saturating_add(1),
-                    bin_interval.end(),
-                    char::from(series.key.canonical_base),
-                    modification_code_label(series.key.code),
-                    series.key.modification_strand,
-                    series.key.implicit_mode,
-                    series
-                        .key
-                        .haplotype
-                        .map_or_else(|| ".".to_owned(), |value| value.to_string()),
-                    bin.modified_calls,
-                    bin.canonical_observations,
-                    bin.forward_modified_calls,
-                    bin.reverse_modified_calls,
-                    bin.raw_fraction()
-                        .map_or_else(|| ".".to_owned(), |value| format!("{value:.6}")),
-                    bin.weighted_fraction()
-                        .map_or_else(|| ".".to_owned(), |value| format!("{value:.6}")),
-                    bin.mean_probability()
-                        .map_or_else(|| ".".to_owned(), |value| format!("{value:.4}")),
-                    bin.missing_probability_calls,
-                );
-                if !push_automation_export_line(&mut output, &line) {
-                    return output;
-                }
+                    owner.start().saturating_add(1),
+                    owner.end(),
+                    provenance.eligible_records,
+                    provenance.records_with_modification_tags,
+                    provenance.decoded_calls,
+                    provenance.malformed_records,
+                    provenance.unavailable_records,
+                    provenance.dropped_series,
+                    provenance.all_eligible_records,
+                ),
+            );
+            if !append_automation_modification_summary(
+                &mut output,
+                track,
+                contig,
+                interval,
+                owner,
+                summary,
+            ) {
+                return Ok(output);
             }
         }
     }
-    output
+    Ok(output)
+}
+
+fn append_automation_modification_summary(
+    output: &mut String,
+    track: &AutomationAlignmentExportTrack,
+    contig: &str,
+    requested: GenomicInterval,
+    owner: GenomicInterval,
+    summary: &rgv_hts::ModificationSummary,
+) -> bool {
+    for series in &summary.series {
+        for (index, bin) in series.bins.iter().copied().enumerate() {
+            if bin.canonical_observations == 0
+                && bin.modified_calls == 0
+                && bin.missing_probability_calls == 0
+            {
+                continue;
+            }
+            let Some(bin_interval) = summary.bin_interval(owner, index) else {
+                continue;
+            };
+            if !bin_interval.overlaps(requested) {
+                continue;
+            }
+            let line = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                track.id.get(),
+                sanitized_tsv_field(&track.name, 4_096),
+                sanitized_tsv_field(contig, 4_096),
+                bin_interval.start().saturating_add(1),
+                bin_interval.end(),
+                char::from(series.key.canonical_base),
+                modification_code_label(series.key.code),
+                series.key.modification_strand,
+                series.key.implicit_mode,
+                series
+                    .key
+                    .haplotype
+                    .map_or_else(|| ".".to_owned(), |value| value.to_string()),
+                bin.modified_calls,
+                bin.canonical_observations,
+                bin.forward_modified_calls,
+                bin.reverse_modified_calls,
+                bin.raw_fraction()
+                    .map_or_else(|| ".".to_owned(), |value| format!("{value:.6}")),
+                bin.weighted_fraction()
+                    .map_or_else(|| ".".to_owned(), |value| format!("{value:.6}")),
+                bin.mean_probability()
+                    .map_or_else(|| ".".to_owned(), |value| format!("{value:.4}")),
+                bin.missing_probability_calls,
+            );
+            if !push_automation_export_line(output, &line) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub(crate) fn automation_junctions_export(
@@ -599,62 +657,65 @@ pub(crate) fn automation_junctions_export(
     contig: &str,
     interval: GenomicInterval,
     tracks: &[AutomationAlignmentExportTrack],
-) -> String {
+) -> Result<String> {
     let mut output = automation_export_header("junction", assembly, contig, interval);
     if !push_automation_export_line(
         &mut output,
         "track_id\ttrack_name\tcontig\tstart\tend\tdepth\tminimum_left_flank\tminimum_right_flank\tmaximum_left_flank\tmaximum_right_flank\tpositive_depth\tnegative_depth\tunknown_depth\ttagged_positive_depth\ttagged_negative_depth\tfallback_positive_depth\tfallback_negative_depth\tinvalid_strand_depth",
     ) {
-        return output;
+        return Ok(output);
     }
     for track in tracks {
-        let query = &track.query;
-        let provenance = query.junctions.provenance;
+        let snapshot = &track.authority.snapshot;
+        let junctions = snapshot.summaries().junctions(interval)?;
         let _ = push_automation_export_line(
             &mut output,
             &format!(
-                "# track_provenance\t{}\t{}\teligible_records={}\tspliced_records={}\tobservations_examined={}\tobservations_retained={}\tdropped_distinct={}\tall_eligible_records={}",
+                "# track_provenance\t{}\t{}\tauthority=committed_scene\texact_events=true\tjunction_count={}\tminimum_flank={}\tall_eligible_records=true",
                 track.id.get(),
                 sanitized_tsv_field(&track.name, 4_096),
-                provenance.eligible_records,
-                provenance.spliced_records,
-                provenance.junction_observations_examined,
-                provenance.junction_observations_retained,
-                provenance.dropped_distinct_junctions,
-                provenance.all_eligible_records,
+                junctions.len(),
+                snapshot.summaries().contract().minimum_junction_flank,
             ),
         );
-        for junction in &query.junctions.junctions {
-            if junction.start >= interval.end() || junction.end <= interval.start() {
-                continue;
-            }
-            let line = format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                track.id.get(),
-                sanitized_tsv_field(&track.name, 4_096),
-                sanitized_tsv_field(contig, 4_096),
-                junction.start.saturating_add(1),
-                junction.end,
-                junction.depth,
-                junction.minimum_left_flank,
-                junction.minimum_right_flank,
-                junction.maximum_left_flank,
-                junction.maximum_right_flank,
-                junction.positive_depth,
-                junction.negative_depth,
-                junction.unknown_depth,
-                junction.tagged_positive_depth,
-                junction.tagged_negative_depth,
-                junction.fallback_positive_depth,
-                junction.fallback_negative_depth,
-                junction.invalid_strand_depth,
-            );
-            if !push_automation_export_line(&mut output, &line) {
-                return output;
+        for junction in junctions {
+            if !push_automation_export_line(
+                &mut output,
+                &automation_junction_line(track, contig, &junction),
+            ) {
+                return Ok(output);
             }
         }
     }
-    output
+    Ok(output)
+}
+
+fn automation_junction_line(
+    track: &AutomationAlignmentExportTrack,
+    contig: &str,
+    junction: &rgv_hts::JunctionEvidence,
+) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        track.id.get(),
+        sanitized_tsv_field(&track.name, 4_096),
+        sanitized_tsv_field(contig, 4_096),
+        junction.start.saturating_add(1),
+        junction.end,
+        junction.depth,
+        junction.minimum_left_flank,
+        junction.minimum_right_flank,
+        junction.maximum_left_flank,
+        junction.maximum_right_flank,
+        junction.positive_depth,
+        junction.negative_depth,
+        junction.unknown_depth,
+        junction.tagged_positive_depth,
+        junction.tagged_negative_depth,
+        junction.fallback_positive_depth,
+        junction.fallback_negative_depth,
+        junction.invalid_strand_depth,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
