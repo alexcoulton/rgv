@@ -22,6 +22,7 @@ rgv-engine = { version = "0.1.0", path = "../../crates/rgv-engine" }
 rgv-hts = { version = "0.1.0", path = "../../crates/rgv-hts" }
 rgv-layout = { version = "0.1.0", path = "../../crates/rgv-layout" }
 rgv-render = { version = "0.1.0", path = "../../crates/rgv-render" }
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

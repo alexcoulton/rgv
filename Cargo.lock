@@ -4040,6 +4040,7 @@ dependencies = [
  "rgv-hts",
  "rgv-layout",
  "rgv-render",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

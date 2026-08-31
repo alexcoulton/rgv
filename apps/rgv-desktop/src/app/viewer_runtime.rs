@@ -499,7 +499,19 @@ impl Viewer {
             })?,
             0,
         );
-        Ok(Self {
+        let settings_path = options
+            .settings_path
+            .clone()
+            .unwrap_or_else(default_settings_path);
+        let diagnostic_trace_directory =
+            options.diagnostic_trace_dir.clone().unwrap_or_else(|| {
+                settings_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("diagnostic-traces")
+            });
+        let start_diagnostic_trace = options.start_diagnostic_trace;
+        let mut viewer = Self {
             application_instance_id,
             workspace_revision: 1,
             last_saved_workspace_revision: 1,
@@ -655,6 +667,12 @@ impl Viewer {
             remote_source_editor: RemoteSourceEditor::default(),
             diagnostics_open: false,
             interaction_trace: InteractionTraceRecorder::default(),
+            manual_diagnostic_trace: ManualDiagnosticTraceRecorder::new(),
+            manual_diagnostic_trace_runtime: ManualDiagnosticTraceRuntime::new(
+                diagnostic_trace_directory,
+                adapter_info.name.clone(),
+                format!("{:?}", adapter_info.backend),
+            ),
             sashimi_interaction_diagnostics: SashimiInteractionDiagnostics::default(),
             command_search: String::new(),
             annotation_search_generation: 0,
@@ -662,7 +680,7 @@ impl Viewer {
             annotation_search_results: TrackSearchResults::default(),
             pending_annotation_navigation: None,
             settings,
-            settings_path: options.settings_path.unwrap_or_else(default_settings_path),
+            settings_path,
             current_session_path: options.session,
             unresolved_session_sources: options
                 .loaded_session
@@ -694,7 +712,11 @@ impl Viewer {
             captured_motion: (0.0, 0.0),
             captured_motion_distance: 0.0,
             suppress_horizontal_overview_click: false,
-        })
+        };
+        if start_diagnostic_trace {
+            viewer.start_manual_diagnostic_trace("launch option");
+        }
+        Ok(viewer)
     }
 
     pub(crate) fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -814,6 +836,10 @@ impl Viewer {
         let paint_jobs = self
             .egui_context
             .tessellate(full_output.shapes, full_output.pixels_per_point);
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::Tessellation,
+            tessellation_started.elapsed(),
+        );
         if self.interaction_trace.is_active() {
             self.interaction_trace.record_phase(
                 InteractionTraceStage::EguiTessellationFinished,
@@ -865,12 +891,20 @@ impl Viewer {
                 Some(frame)
             }
             wgpu::CurrentSurfaceTexture::Timeout => {
+                self.record_manual_diagnostic_frame_phase(
+                    ManualDiagnosticFramePhase::SurfaceAcquisition,
+                    surface_started.elapsed(),
+                );
                 self.pending_native_window_capture = capture_task;
                 self.window.request_redraw();
                 return;
             }
             wgpu::CurrentSurfaceTexture::Occluded => {
                 if self.automation.is_none() {
+                    self.record_manual_diagnostic_frame_phase(
+                        ManualDiagnosticFramePhase::SurfaceAcquisition,
+                        surface_started.elapsed(),
+                    );
                     self.pending_native_window_capture = capture_task;
                     return;
                 }
@@ -880,19 +914,21 @@ impl Viewer {
                 // GPU captures can progress without stealing focus.
                 None
             }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.pending_native_window_capture = capture_task;
-                self.reconfigure_surface();
-                self.window.request_redraw();
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.record_manual_diagnostic_frame_phase(
+                    ManualDiagnosticFramePhase::SurfaceAcquisition,
+                    surface_started.elapsed(),
+                );
                 self.pending_native_window_capture = capture_task;
                 self.reconfigure_surface();
                 self.window.request_redraw();
                 return;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
+                self.record_manual_diagnostic_frame_phase(
+                    ManualDiagnosticFramePhase::SurfaceAcquisition,
+                    surface_started.elapsed(),
+                );
                 self.pending_native_window_capture = capture_task;
                 tracing::warn!("surface validation failed while acquiring a frame");
                 self.window.request_redraw();
@@ -927,6 +963,10 @@ impl Viewer {
                 surface_started.elapsed(),
             );
         }
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::SurfaceAcquisition,
+            surface_started.elapsed(),
+        );
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -939,6 +979,10 @@ impl Viewer {
             &mut encoder,
             &paint_jobs,
             &screen_descriptor,
+        );
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::EguiBuffers,
+            egui_buffers_started.elapsed(),
         );
         if self.interaction_trace.is_active() {
             self.interaction_trace.record_phase(
@@ -1027,6 +1071,10 @@ impl Viewer {
                 queue_started.elapsed(),
             );
         }
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::QueueSubmission,
+            queue_started.elapsed(),
+        );
         let present_started = Instant::now();
         if let Some(surface_frame) = surface_frame {
             surface_frame.present();
@@ -1037,6 +1085,10 @@ impl Viewer {
                 present_started.elapsed(),
             );
         }
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::Present,
+            present_started.elapsed(),
+        );
         if let (Some(task), Some((buffer, padded_bytes_per_row))) = (capture_task, capture_readback)
         {
             let pixels = self.read_native_window_capture(&buffer, padded_bytes_per_row);

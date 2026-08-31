@@ -232,6 +232,7 @@ impl Viewer {
         let announce_status = self.announced_status != data_status;
         let active_panel_id = self.panels.active().id;
         let diagnostics = self.diagnostics_snapshot();
+        let manual_trace = self.manual_diagnostic_trace_snapshot();
         let inspector = self.inspector_snapshot();
         let pileup_inspector = self.pileup_inspector_snapshot();
         let modification_inspector = self.modification_inspector_snapshot();
@@ -857,6 +858,7 @@ impl Viewer {
         let mut genomic_canvas_layer_id = None;
         let mut pane_divider_rect = None;
         let mut diagnostics_open = self.diagnostics_open;
+        let mut manual_trace_action = None;
         let mut metadata_open = self.open_panel == Some(UiPanel::Metadata);
         let mut regions_open = self.open_panel == Some(UiPanel::Regions);
         let mut review_open = self.open_panel == Some(UiPanel::Review);
@@ -2914,7 +2916,12 @@ impl Viewer {
             metadata_bulk_quantitative_separate_requested = workspace_dialogs.metadata_bulk_quantitative_separate_requested;
             metadata_bulk_remove_requested = workspace_dialogs.metadata_bulk_remove_requested;
             metadata_track_rows = workspace_dialogs.metadata_track_rows;
-            ui::show_diagnostics(ui.ctx(), &mut diagnostics_open, &diagnostics);
+            manual_trace_action = ui::show_diagnostics(
+                ui.ctx(),
+                &mut diagnostics_open,
+                &diagnostics,
+                &manual_trace,
+            );
             let mut system_dialogs = ui::system_dialogs::SystemDialogDraft {
                 exit_confirmation_open,
                 exit_requested: false,
@@ -2989,6 +2996,15 @@ impl Viewer {
         self.exit_confirmation_open = exit_confirmation_open;
         self.user_exit_requested |= user_exit_requested;
         self.diagnostics_open = diagnostics_open;
+        match manual_trace_action {
+            Some(ui::ManualInteractionTraceAction::Start) => {
+                self.start_manual_diagnostic_trace("Diagnostics window");
+            }
+            Some(ui::ManualInteractionTraceAction::StopAndSave) => {
+                self.stop_and_save_manual_diagnostic_trace();
+            }
+            None => {}
+        }
         self.recovery_open = recovery_open && !dismiss_recovery && recovery_requested.is_none();
         let properties_resize_active =
             native_properties_resize_active || self.automation_properties_resize_active;

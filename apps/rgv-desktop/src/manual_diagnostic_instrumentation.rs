@@ -1,0 +1,1141 @@
+use super::*;
+
+const MANUAL_TRACE_STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const MANUAL_TRACE_WHEEL_IDLE_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ManualDiagnosticFramePhase {
+    PollBackground,
+    ApplyCapturedMotion,
+    FirstDisplayRebuild,
+    Shell,
+    SecondDisplayRebuild,
+    Tessellation,
+    SurfaceAcquisition,
+    EguiBuffers,
+    QueueSubmission,
+    Present,
+    Prefetch,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ManualDiagnosticFrameTimings {
+    frame_id: u64,
+    poll_background_us: u64,
+    apply_captured_motion_us: u64,
+    first_display_rebuild_us: u64,
+    shell_us: u64,
+    second_display_rebuild_us: u64,
+    tessellation_us: u64,
+    surface_acquisition_us: u64,
+    egui_buffers_us: u64,
+    queue_submission_us: u64,
+    present_us: u64,
+    prefetch_us: u64,
+}
+
+struct PendingManualDiagnosticFailure {
+    category: String,
+    name: String,
+    message: String,
+}
+
+impl ManualDiagnosticFrameTimings {
+    fn set(&mut self, phase: ManualDiagnosticFramePhase, duration: Duration) {
+        let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+        match phase {
+            ManualDiagnosticFramePhase::PollBackground => self.poll_background_us = micros,
+            ManualDiagnosticFramePhase::ApplyCapturedMotion => {
+                self.apply_captured_motion_us = micros;
+            }
+            ManualDiagnosticFramePhase::FirstDisplayRebuild => {
+                self.first_display_rebuild_us = micros;
+            }
+            ManualDiagnosticFramePhase::Shell => self.shell_us = micros,
+            ManualDiagnosticFramePhase::SecondDisplayRebuild => {
+                self.second_display_rebuild_us = micros;
+            }
+            ManualDiagnosticFramePhase::Tessellation => self.tessellation_us = micros,
+            ManualDiagnosticFramePhase::SurfaceAcquisition => {
+                self.surface_acquisition_us = micros;
+            }
+            ManualDiagnosticFramePhase::EguiBuffers => self.egui_buffers_us = micros,
+            ManualDiagnosticFramePhase::QueueSubmission => self.queue_submission_us = micros,
+            ManualDiagnosticFramePhase::Present => self.present_us = micros,
+            ManualDiagnosticFramePhase::Prefetch => self.prefetch_us = micros,
+        }
+    }
+}
+
+pub(crate) struct ManualDiagnosticTraceRuntime {
+    output_directory: PathBuf,
+    gpu_adapter: String,
+    gpu_backend: String,
+    pub(crate) last_saved_path: Option<PathBuf>,
+    pub(crate) failure: Option<String>,
+    frame_clock: u64,
+    current_frame: Option<ManualDiagnosticFrameTimings>,
+    pointer_interaction: Option<ManualDiagnosticInteractionId>,
+    wheel_interaction: Option<ManualDiagnosticInteractionId>,
+    wheel_last_event: Option<Instant>,
+    last_state_sample: Option<Instant>,
+    last_state: Option<serde_json::Value>,
+    last_observed_data_status: String,
+    pending_critical_failure: Option<PendingManualDiagnosticFailure>,
+}
+
+impl ManualDiagnosticTraceRuntime {
+    pub(crate) fn new(output_directory: PathBuf, gpu_adapter: String, gpu_backend: String) -> Self {
+        Self {
+            output_directory,
+            gpu_adapter,
+            gpu_backend,
+            last_saved_path: None,
+            failure: None,
+            frame_clock: 0,
+            current_frame: None,
+            pointer_interaction: None,
+            wheel_interaction: None,
+            wheel_last_event: None,
+            last_state_sample: None,
+            last_state: None,
+            last_observed_data_status: String::new(),
+            pending_critical_failure: None,
+        }
+    }
+
+    fn reset_for_recording(&mut self, current_data_status: &str) {
+        self.last_saved_path = None;
+        self.failure = None;
+        self.current_frame = None;
+        self.pointer_interaction = None;
+        self.wheel_interaction = None;
+        self.wheel_last_event = None;
+        self.last_state_sample = None;
+        self.last_state = None;
+        self.last_observed_data_status = current_data_status.to_owned();
+        self.pending_critical_failure = None;
+    }
+}
+
+impl Viewer {
+    pub(crate) fn start_manual_diagnostic_trace(&mut self, trigger: &str) {
+        self.manual_diagnostic_trace_runtime
+            .reset_for_recording(&self.data_status);
+        let panel = self.panels.active();
+        let source_kinds = self
+            .alignment_tracks
+            .iter()
+            .map(|track| {
+                serde_json::json!({
+                    "track_id": track.config.id.get(),
+                    "source_kind": match &track.config.source {
+                        TrackSource::Local { .. } => "local",
+                        TrackSource::Remote { .. } => "remote",
+                    },
+                    "maximum_alignments": track.config.maximum_alignments,
+                })
+            })
+            .collect::<Vec<_>>();
+        let metadata = object_fields(serde_json::json!({
+            "trigger": trigger,
+            "application_version": env!("CARGO_PKG_VERSION"),
+            "application_instance_id": self.application_instance_id,
+            "operating_system": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+            "gpu_adapter": self.manual_diagnostic_trace_runtime.gpu_adapter,
+            "gpu_backend": self.manual_diagnostic_trace_runtime.gpu_backend,
+            "surface_width_pixels": self.surface_config.width,
+            "surface_height_pixels": self.surface_config.height,
+            "scale_factor": self.window.scale_factor(),
+            "cache_budget_mib": self.settings.cache_budget_mib,
+            "read_browsing_buffer_percent": self.settings.read_browsing_buffer_percent,
+            "workspace_alignment_limit": self.workspace_alignment_limit,
+            "active_locus": {
+                "panel_id": panel.id.get(),
+                "contig": panel.contig_name,
+                "start": panel.viewport.interval().start(),
+                "end": panel.viewport.interval().end(),
+                "exact_start": panel.viewport.exact_start(),
+                "span": panel.viewport.span(),
+                "pixel_width": panel.viewport.pixel_width(),
+            },
+            "alignment_tracks": source_kinds,
+            "privacy": "No sequence, read names, auxiliary-tag values, credentials, or remote URLs are intentionally recorded. User-visible diagnostic/status text and genomic loci are included.",
+        }));
+        let session = self.manual_diagnostic_trace.start_with_metadata(metadata);
+        tracing::info!(
+            session_id = session.as_str(),
+            output_directory = %self.manual_diagnostic_trace_runtime.output_directory.display(),
+            "manual diagnostic trace started"
+        );
+        self.diagnostics_open = true;
+        self.window.request_redraw();
+    }
+
+    pub(crate) fn stop_and_save_manual_diagnostic_trace(&mut self) {
+        if !self.manual_diagnostic_trace.stop() {
+            return;
+        }
+        self.save_manual_diagnostic_trace("manual stop");
+        self.window.request_redraw();
+    }
+
+    pub(crate) fn save_recording_manual_diagnostic_trace_before_exit(&mut self) {
+        if matches!(
+            self.manual_diagnostic_trace.status().state,
+            ManualDiagnosticTraceState::Recording
+        ) {
+            let fields = object_fields(serde_json::json!({ "reason": "application exit" }));
+            self.manual_diagnostic_trace
+                .record("lifecycle", "application_exit", fields);
+            let _ = self.manual_diagnostic_trace.stop();
+            self.save_manual_diagnostic_trace("application exit");
+        } else {
+            self.save_frozen_manual_diagnostic_trace_if_needed();
+        }
+    }
+
+    pub(crate) fn manual_diagnostic_trace_snapshot(&self) -> ui::ManualInteractionTraceSnapshot {
+        let status = self.manual_diagnostic_trace.status();
+        let retained_duration = match (status.first_elapsed_us, status.last_elapsed_us) {
+            (Some(first), Some(last)) => Duration::from_micros(last.saturating_sub(first)),
+            _ => Duration::ZERO,
+        };
+        ui::ManualInteractionTraceSnapshot {
+            state: match status.state {
+                ManualDiagnosticTraceState::Inactive => ui::ManualInteractionTraceState::Idle,
+                ManualDiagnosticTraceState::Recording => ui::ManualInteractionTraceState::Recording,
+                ManualDiagnosticTraceState::Frozen => ui::ManualInteractionTraceState::Frozen,
+            },
+            event_count: status.retained_events,
+            dropped_event_count: status
+                .dropped_events
+                .saturating_add(status.overwritten_events),
+            retained_duration,
+            saved_path: self
+                .manual_diagnostic_trace_runtime
+                .last_saved_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            failure: self.manual_diagnostic_trace_runtime.failure.clone(),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn record_manual_window_event(&mut self, event: &WindowEvent, consumed: bool) {
+        if !self.manual_diagnostic_trace_is_recording() {
+            return;
+        }
+        self.finish_idle_manual_wheel_interaction();
+        let pointer = || {
+            serde_json::json!({
+                "x_physical": self.cursor.x,
+                "y_physical": self.cursor.y,
+                "scale_factor": self.window.scale_factor(),
+                "egui_consumed": consumed,
+            })
+        };
+        match event {
+            WindowEvent::MouseInput { state, button, .. } => {
+                let mut fields = object_fields(pointer());
+                fields.insert(
+                    "button".to_owned(),
+                    serde_json::json!(format!("{button:?}")),
+                );
+                fields.insert("state".to_owned(), serde_json::json!(format!("{state:?}")));
+                if *button == MouseButton::Left && *state == ElementState::Pressed {
+                    if let Some(previous) = self
+                        .manual_diagnostic_trace_runtime
+                        .pointer_interaction
+                        .take()
+                    {
+                        self.manual_diagnostic_trace.end_interaction(
+                            previous,
+                            "input",
+                            "pointer_superseded",
+                            ManualDiagnosticTraceFields::new(),
+                        );
+                    }
+                    self.manual_diagnostic_trace_runtime.pointer_interaction = self
+                        .manual_diagnostic_trace
+                        .begin_interaction("input", "pointer_press", fields);
+                } else if *button == MouseButton::Left && *state == ElementState::Released {
+                    if let Some(id) = self
+                        .manual_diagnostic_trace_runtime
+                        .pointer_interaction
+                        .take()
+                    {
+                        self.manual_diagnostic_trace.end_interaction(
+                            id,
+                            "input",
+                            "pointer_release",
+                            fields,
+                        );
+                    } else {
+                        self.manual_diagnostic_trace.record(
+                            "input",
+                            "pointer_release_without_press",
+                            fields,
+                        );
+                    }
+                } else {
+                    self.manual_diagnostic_trace
+                        .record("input", "mouse_button", fields);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(id) = self.manual_diagnostic_trace_runtime.pointer_interaction {
+                    let fields = object_fields(serde_json::json!({
+                        "x_physical": position.x,
+                        "y_physical": position.y,
+                        "egui_consumed": consumed,
+                        "canvas_dragging": self.dragging,
+                        "vertical_scrollbar_dragging": self.vertical_overview_drag.is_some(),
+                    }));
+                    self.manual_diagnostic_trace.record_interaction(
+                        id,
+                        "input",
+                        "pointer_move",
+                        fields,
+                    );
+                }
+            }
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                if self
+                    .manual_diagnostic_trace_runtime
+                    .wheel_interaction
+                    .is_none()
+                {
+                    self.manual_diagnostic_trace_runtime.wheel_interaction =
+                        self.manual_diagnostic_trace.begin_interaction(
+                            "input",
+                            "wheel_begin",
+                            object_fields(serde_json::json!({
+                                "x_physical": self.cursor.x,
+                                "y_physical": self.cursor.y,
+                                "shift": self.modifiers.shift_key(),
+                            })),
+                        );
+                }
+                self.manual_diagnostic_trace_runtime.wheel_last_event = Some(Instant::now());
+                let (delta_kind, delta_x, delta_y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => ("line", f64::from(*x), f64::from(*y)),
+                    MouseScrollDelta::PixelDelta(position) => ("pixel", position.x, position.y),
+                };
+                let fields = object_fields(serde_json::json!({
+                    "delta_kind": delta_kind,
+                    "delta_x": delta_x,
+                    "delta_y": delta_y,
+                    "phase": format!("{phase:?}"),
+                    "egui_consumed": consumed,
+                    "shift": self.modifiers.shift_key(),
+                    "cursor_in_genomic_canvas": self.cursor_in_genomic_canvas(),
+                }));
+                if let Some(id) = self.manual_diagnostic_trace_runtime.wheel_interaction {
+                    self.manual_diagnostic_trace.record_interaction(
+                        id,
+                        "input",
+                        "wheel_delta",
+                        fields,
+                    );
+                    if matches!(
+                        phase,
+                        winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
+                    ) {
+                        self.manual_diagnostic_trace.end_interaction(
+                            id,
+                            "input",
+                            "wheel_end",
+                            ManualDiagnosticTraceFields::new(),
+                        );
+                        self.manual_diagnostic_trace_runtime.wheel_interaction = None;
+                        self.manual_diagnostic_trace_runtime.wheel_last_event = None;
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                let fields = object_fields(serde_json::json!({
+                    "key": format!("{:?}", event.logical_key),
+                    "repeat": event.repeat,
+                    "egui_consumed": consumed,
+                    "control": self.modifiers.control_key(),
+                    "super": self.modifiers.super_key(),
+                    "shift": self.modifiers.shift_key(),
+                    "alt": self.modifiers.alt_key(),
+                }));
+                if let Some(id) = self.manual_diagnostic_trace.begin_interaction(
+                    "input",
+                    "keyboard_press",
+                    fields,
+                ) {
+                    self.manual_diagnostic_trace.end_interaction(
+                        id,
+                        "input",
+                        "keyboard_dispatch",
+                        ManualDiagnosticTraceFields::new(),
+                    );
+                }
+            }
+            WindowEvent::Resized(size) => {
+                self.manual_diagnostic_trace.record(
+                    "window",
+                    "resized",
+                    object_fields(serde_json::json!({
+                        "width": size.width,
+                        "height": size.height,
+                    })),
+                );
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.manual_diagnostic_trace.record(
+                    "window",
+                    "scale_factor_changed",
+                    object_fields(serde_json::json!({ "scale_factor": scale_factor })),
+                );
+            }
+            WindowEvent::Focused(focused) => {
+                self.manual_diagnostic_trace.record(
+                    "window",
+                    "focus_changed",
+                    object_fields(serde_json::json!({ "focused": focused })),
+                );
+            }
+            WindowEvent::RedrawRequested => {
+                self.manual_diagnostic_trace.record(
+                    "frame",
+                    "redraw_requested",
+                    ManualDiagnosticTraceFields::new(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn record_manual_device_event(&mut self, event: &DeviceEvent) {
+        if !self.manual_diagnostic_trace_is_recording() {
+            return;
+        }
+        if let DeviceEvent::MouseMotion { delta } = event
+            && let Some(id) = self.manual_diagnostic_trace_runtime.pointer_interaction
+        {
+            self.manual_diagnostic_trace.record_interaction(
+                id,
+                "input",
+                "raw_mouse_motion",
+                object_fields(serde_json::json!({
+                    "delta_x": delta.0,
+                    "delta_y": delta.1,
+                    "overview_capture": format!("{:?}", self.overview_capture),
+                })),
+            );
+        }
+    }
+
+    pub(crate) fn begin_manual_diagnostic_frame(&mut self) {
+        if !self.manual_diagnostic_trace_is_recording() {
+            self.manual_diagnostic_trace_runtime.current_frame = None;
+            return;
+        }
+        self.finish_idle_manual_wheel_interaction();
+        self.manual_diagnostic_trace_runtime.frame_clock = self
+            .manual_diagnostic_trace_runtime
+            .frame_clock
+            .saturating_add(1);
+        let frame_id = self.manual_diagnostic_trace_runtime.frame_clock;
+        self.manual_diagnostic_trace_runtime.current_frame = Some(ManualDiagnosticFrameTimings {
+            frame_id,
+            ..ManualDiagnosticFrameTimings::default()
+        });
+        self.manual_diagnostic_trace.record(
+            "frame",
+            "begin",
+            object_fields(serde_json::json!({
+                "frame_id": frame_id,
+                "display_dirty": self.display_dirty,
+                "publication_retry_pending": self.alignment_gpu_publication_retry.is_some(),
+            })),
+        );
+    }
+
+    pub(crate) fn record_manual_diagnostic_frame_phase(
+        &mut self,
+        phase: ManualDiagnosticFramePhase,
+        duration: Duration,
+    ) {
+        if let Some(frame) = self.manual_diagnostic_trace_runtime.current_frame.as_mut() {
+            frame.set(phase, duration);
+        }
+    }
+
+    pub(crate) fn finish_manual_diagnostic_frame(&mut self, total: Duration) {
+        let Some(frame) = self.manual_diagnostic_trace_runtime.current_frame.take() else {
+            self.save_frozen_manual_diagnostic_trace_if_needed();
+            return;
+        };
+        let interaction_id = self
+            .manual_diagnostic_trace_runtime
+            .pointer_interaction
+            .or(self.manual_diagnostic_trace_runtime.wheel_interaction)
+            .map(ManualDiagnosticInteractionId::get);
+        self.manual_diagnostic_trace.record(
+            "frame",
+            "present_cycle_finished",
+            object_fields(serde_json::json!({
+                "frame_id": frame.frame_id,
+                "causal_interaction_id": interaction_id,
+                "total_us": duration_micros(total),
+                "poll_background_us": frame.poll_background_us,
+                "apply_captured_motion_us": frame.apply_captured_motion_us,
+                "first_display_rebuild_us": frame.first_display_rebuild_us,
+                "shell_us": frame.shell_us,
+                "second_display_rebuild_us": frame.second_display_rebuild_us,
+                "tessellation_us": frame.tessellation_us,
+                "surface_acquisition_us": frame.surface_acquisition_us,
+                "egui_buffers_us": frame.egui_buffers_us,
+                "queue_submission_us": frame.queue_submission_us,
+                "present_us": frame.present_us,
+                "prefetch_us": frame.prefetch_us,
+                "display_dirty_after": self.display_dirty,
+            })),
+        );
+        self.record_manual_diagnostic_state_if_needed(frame.frame_id);
+        if let Some(failure) = self
+            .manual_diagnostic_trace_runtime
+            .pending_critical_failure
+            .take()
+        {
+            self.freeze_manual_diagnostic_trace(
+                &failure.category,
+                &failure.name,
+                &failure.message,
+                ManualDiagnosticTraceFields::new(),
+            );
+        }
+        self.record_manual_data_status_change();
+        self.save_frozen_manual_diagnostic_trace_if_needed();
+    }
+
+    pub(crate) fn record_manual_navigation_intent(&mut self, kind: &str) {
+        if !self.manual_diagnostic_trace_is_recording() {
+            return;
+        }
+        let panel = self.panels.active();
+        let causal_interaction_id = self
+            .manual_diagnostic_trace_runtime
+            .pointer_interaction
+            .or(self.manual_diagnostic_trace_runtime.wheel_interaction)
+            .map(ManualDiagnosticInteractionId::get);
+        self.manual_diagnostic_trace.record(
+            "navigation",
+            kind,
+            object_fields(serde_json::json!({
+                "panel_id": panel.id.get(),
+                "contig": panel.contig_name,
+                "start": panel.viewport.interval().start(),
+                "end": panel.viewport.interval().end(),
+                "exact_start": panel.viewport.exact_start(),
+                "span": panel.viewport.span(),
+                "pixel_width": panel.viewport.pixel_width(),
+                "causal_interaction_id": causal_interaction_id,
+                "dragging": self.dragging,
+                "horizontal_overview_drag": self.horizontal_overview_drag.is_some(),
+                "vertical_overview_drag": self.vertical_overview_drag.is_some(),
+            })),
+        );
+    }
+
+    pub(crate) fn record_manual_diagnostic_event(
+        &mut self,
+        category: &str,
+        name: &str,
+        fields: serde_json::Value,
+    ) {
+        if !self.manual_diagnostic_trace_is_recording() {
+            return;
+        }
+        self.manual_diagnostic_trace
+            .record(category, name, object_fields(fields));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_manual_vertical_scroll_intent(
+        &mut self,
+        track_id: TrackId,
+        requested: f32,
+        previous: f32,
+        maximum: f32,
+        applied: f32,
+        source: &str,
+    ) {
+        if !self.manual_diagnostic_trace_is_recording() {
+            return;
+        }
+        let causal_interaction_id = self
+            .manual_diagnostic_trace_runtime
+            .pointer_interaction
+            .or(self.manual_diagnostic_trace_runtime.wheel_interaction)
+            .map(ManualDiagnosticInteractionId::get);
+        self.manual_diagnostic_trace.record(
+            "vertical_navigation",
+            "scroll_intent",
+            object_fields(serde_json::json!({
+                "panel_id": self.panels.active().id.get(),
+                "track_id": track_id.get(),
+                "source": source,
+                "causal_interaction_id": causal_interaction_id,
+                "requested_points": requested,
+                "previous_points": previous,
+                "maximum_points": maximum,
+                "applied_points": applied,
+                "row_authority": format!("{:?}", self.read_panel_row_authority(track_id)),
+            })),
+        );
+    }
+
+    pub(crate) fn freeze_manual_diagnostic_trace(
+        &mut self,
+        category: &str,
+        name: &str,
+        message: &str,
+        mut fields: ManualDiagnosticTraceFields,
+    ) {
+        if !self.manual_diagnostic_trace_is_recording() {
+            return;
+        }
+        fields.insert("message".to_owned(), serde_json::json!(message));
+        fields.insert(
+            "viewer_state".to_owned(),
+            self.manual_diagnostic_state_snapshot(),
+        );
+        if self
+            .manual_diagnostic_trace
+            .freeze_on_critical_failure(category, name, fields)
+        {
+            self.manual_diagnostic_trace_runtime.failure = Some(message.to_owned());
+            self.save_frozen_manual_diagnostic_trace_if_needed();
+            self.diagnostics_open = true;
+            self.window.request_redraw();
+        }
+    }
+
+    pub(crate) fn queue_manual_diagnostic_trace_failure(
+        &mut self,
+        category: &str,
+        name: &str,
+        message: &str,
+        fields: ManualDiagnosticTraceFields,
+    ) {
+        if !self.manual_diagnostic_trace_is_recording() {
+            return;
+        }
+        self.manual_diagnostic_trace
+            .record(category, format!("{name}_detected"), fields);
+        self.manual_diagnostic_trace_runtime
+            .pending_critical_failure = Some(PendingManualDiagnosticFailure {
+            category: category.to_owned(),
+            name: name.to_owned(),
+            message: message.to_owned(),
+        });
+    }
+
+    pub(crate) fn manual_diagnostic_trace_is_recording(&self) -> bool {
+        matches!(
+            self.manual_diagnostic_trace.status().state,
+            ManualDiagnosticTraceState::Recording
+        )
+    }
+
+    fn finish_idle_manual_wheel_interaction(&mut self) {
+        let expired = self
+            .manual_diagnostic_trace_runtime
+            .wheel_last_event
+            .is_some_and(|last| last.elapsed() >= MANUAL_TRACE_WHEEL_IDLE_INTERVAL);
+        if !expired {
+            return;
+        }
+        if let Some(id) = self
+            .manual_diagnostic_trace_runtime
+            .wheel_interaction
+            .take()
+        {
+            self.manual_diagnostic_trace.end_interaction(
+                id,
+                "input",
+                "wheel_idle_end",
+                ManualDiagnosticTraceFields::new(),
+            );
+        }
+        self.manual_diagnostic_trace_runtime.wheel_last_event = None;
+    }
+
+    fn record_manual_diagnostic_state_if_needed(&mut self, frame_id: u64) {
+        if !self.manual_diagnostic_trace_is_recording() {
+            return;
+        }
+        let now = Instant::now();
+        let interval_elapsed = self
+            .manual_diagnostic_trace_runtime
+            .last_state_sample
+            .is_none_or(|last| {
+                now.saturating_duration_since(last) >= MANUAL_TRACE_STATE_SAMPLE_INTERVAL
+            });
+        if !interval_elapsed {
+            return;
+        }
+        let state = self.manual_diagnostic_state_snapshot();
+        let changed = self.manual_diagnostic_trace_runtime.last_state.as_ref() != Some(&state);
+        self.manual_diagnostic_trace_runtime.last_state = Some(state.clone());
+        self.manual_diagnostic_trace_runtime.last_state_sample = Some(now);
+        self.manual_diagnostic_trace.record(
+            "state",
+            if changed { "changed" } else { "periodic" },
+            object_fields(serde_json::json!({
+                "frame_id": frame_id,
+                "snapshot": state,
+            })),
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn manual_diagnostic_state_snapshot(&self) -> serde_json::Value {
+        let panel = self.panels.active();
+        let tracks = self
+            .alignment_tracks
+            .iter()
+            .map(|track| {
+                let projection = track.projection(panel.id);
+                let (navigation, staged, telemetry) = projection.map_or_else(
+                    || (serde_json::Value::Null, serde_json::Value::Null, serde_json::Value::Null),
+                    |projection| {
+                        let diagnostic = projection.navigation.diagnostic();
+                        let navigation = serde_json::json!({
+                            "generation": diagnostic.generation,
+                            "request_token": diagnostic.request_token.map(AlignmentSceneRequestToken::get),
+                            "phase": format!("{:?}", diagnostic.phase),
+                            "owner": format!("{:?}", diagnostic.owner),
+                            "products": format!("{:?}", diagnostic.products),
+                            "desired_camera": diagnostic.desired_camera.map(|camera| format!("{:?}", camera)),
+                            "detail": diagnostic.detail.as_deref(),
+                            "invariant_failure": diagnostic.invariant_failure.as_deref(),
+                            "journal_entries": diagnostic.journal_entries,
+                        });
+                        let staged = projection.scene_frame.as_ref().map_or(
+                            serde_json::Value::Null,
+                            |frame| {
+                                serde_json::json!({
+                                    "camera_sequence": frame.camera_sequence,
+                                    "covered_interval": format!("{:?}", frame.covered_interval),
+                                    "covered_rows": { "start": frame.covered_rows.start, "end": frame.covered_rows.end },
+                                    "requested_rows": { "start": frame.requested_rows.start, "end": frame.requested_rows.end },
+                                    "individual_reads": format!("{:?}", frame.individual_reads),
+                                    "vertical_residency": format!("{:?}", frame.vertical_residency),
+                                    "scene_contracts_current": frame.scene_contracts_current,
+                                    "visible_complete": frame.visible_complete(),
+                                    "record_count": frame.snapshot.as_ref().map_or(0, |snapshot| snapshot.reads().evidence().record_count()),
+                                    "atlas_rows": frame.snapshot.as_ref().map_or(0, |snapshot| snapshot.reads().atlas().row_count()),
+                                    "read_pages": frame.snapshot.as_ref().map_or(0, |snapshot| snapshot.reads().pages().len()),
+                                    "summary_pages": frame.snapshot.as_ref().map_or(0, |snapshot| snapshot.summary_pages().len()),
+                                })
+                            },
+                        );
+                        let work = projection.scene_telemetry;
+                        let last_pump = work.last_vertical_residency_pump.map(|pump| {
+                            serde_json::json!({
+                                "checkpoint": pump.checkpoint,
+                                "current_scene": format!("{:?}", pump.current_scene),
+                                "published_scene": pump.published_scene.map(|scene| format!("{:?}", scene)),
+                                "current_rows": { "start": pump.current_prepared_rows.start, "end": pump.current_prepared_rows.end },
+                                "target_rows": { "start": pump.target_prepared_rows.start, "end": pump.target_prepared_rows.end },
+                                "total_rows": pump.total_rows,
+                                "current_read_pages": pump.current_read_pages,
+                                "current_summary_pages": pump.current_summary_pages,
+                                "target_read_pages": pump.target_read_pages,
+                                "target_summary_pages": pump.target_summary_pages,
+                                "prepare_elapsed_nanoseconds": pump.prepare_elapsed_nanoseconds,
+                                "pump_elapsed_nanoseconds": pump.pump_elapsed_nanoseconds,
+                                "outcome": format!("{:?}", pump.outcome),
+                            })
+                        });
+                        let telemetry = serde_json::json!({
+                            "camera_updates": work.camera_updates,
+                            "camera_only_updates": work.camera_only_updates,
+                            "source_work_started": work.source_work_started,
+                            "source_checkpoints": work.source_checkpoints,
+                            "source_retargets": work.source_retargets,
+                            "source_yields": work.source_yields,
+                            "source_acquisitions": work.source_acquisitions,
+                            "source_refusals": work.source_refusals,
+                            "row_atlas_candidates": work.row_atlas_candidates,
+                            "presentation_candidates": work.presentation_candidates,
+                            "scene_publications": work.scene_publications,
+                            "foreground_submissions": work.foreground_submissions,
+                            "speculation_submissions": work.speculation_submissions,
+                            "vertical_checkpoints": work.vertical_residency_checkpoints,
+                            "vertical_publications": work.vertical_residency_publications,
+                            "vertical_completions": work.vertical_residency_completions,
+                            "vertical_budget_limits": work.vertical_residency_budget_limits,
+                            "vertical_failures": work.vertical_residency_failures,
+                            "vertical_read_page_occurrences": work.vertical_residency_read_page_occurrences,
+                            "vertical_summary_page_occurrences": work.vertical_residency_summary_page_occurrences,
+                            "vertical_prepare_nanoseconds": work.vertical_residency_prepare_nanoseconds,
+                            "vertical_pump_nanoseconds": work.vertical_residency_pump_nanoseconds,
+                            "row_activity_queries": work.row_activity_queries,
+                            "row_activity_cache_hits": work.row_activity_cache_hits,
+                            "row_activity_cursor_updates": work.row_activity_cursor_updates,
+                            "row_activity_rebuilds": work.row_activity_rebuilds,
+                            "row_activity_intervals_examined": work.row_activity_intervals_examined,
+                            "row_activity_intervals_changed": work.row_activity_intervals_changed,
+                            "last_vertical_pump": last_pump,
+                        });
+                        (navigation, staged, telemetry)
+                    },
+                );
+                let scroll = panel.read_panel_scroll_state(track.config.id);
+                let (clip_top, clip_bottom, actual_content_bottom) = self
+                    .read_panel_metrics(track.config.id)
+                    .unwrap_or((0.0, 0.0, 0.0));
+                let scroll_maximum = self
+                    .read_panel_metrics(track.config.id)
+                    .map_or(0.0, |(_, bottom, _)| {
+                        self.read_panel_presented_scroll_maximum(track.config.id, bottom)
+                    });
+                let presented = self
+                    .presented_alignment_lane(panel.id, track.config.id)
+                    .map_or(serde_json::Value::Null, |presented| {
+                        serde_json::json!({
+                            "target_revision": presented.target_revision,
+                            "source_request_token": presented.source.source_request_token.get(),
+                            "desired_request_token": presented.source.desired_request_token.get(),
+                            "source_camera": format!("{:?}", presented.source.source_camera),
+                            "individual_reads": format!("{:?}", presented.source.individual_reads),
+                            "vertical_residency": format!("{:?}", presented.source.vertical_residency),
+                            "summary_current": presented.lane.summary_current(),
+                            "reads_complete": presented.lane.reads_complete(),
+                            "read_authority": presented.read_authority.is_some(),
+                            "covered_rows": { "start": presented.lane.covered_rows.start, "end": presented.lane.covered_rows.end },
+                            "requested_rows": { "start": presented.lane.requested_rows.start, "end": presented.lane.requested_rows.end },
+                        })
+                    });
+                serde_json::json!({
+                    "track_id": track.config.id.get(),
+                    "lifecycle": format!("{:?}", track.lifecycle),
+                    "navigation": navigation,
+                    "staged": staged,
+                    "telemetry": telemetry,
+                    "presented": presented,
+                    "row_authority": format!("{:?}", self.read_panel_row_authority(track.config.id)),
+                    "scroll": {
+                        "points": scroll.scroll_points,
+                        "effective_points": scroll.effective_scroll_points(),
+                        "content_origin_points": scroll.content_origin_points,
+                        "content_bottom_points": scroll.content_bottom_points,
+                        "latent_fraction": scroll.latent_scroll_fraction,
+                        "maximum_points": scroll_maximum,
+                        "clip_top": clip_top,
+                        "clip_bottom": clip_bottom,
+                        "actual_content_bottom": actual_content_bottom,
+                        "density": self.alignment_density_for_panel_track(panel.id, track.config.id),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let read_ops = self.alignment_gpu_renderer.operation_counters();
+        let summary_ops = self.alignment_summary_gpu_renderer.operation_counters();
+        let rectangle_ops = self.rectangle_renderer.operation_counters();
+        let context_ops = self.context_scene_gpu_renderer.operation_counters();
+        let read_stats = self.alignment_gpu_last_prepare_stats;
+        let summary_stats = self.alignment_summary_gpu_last_prepare_stats;
+        let budget = self.alignment_scene_budget;
+        let presented_epoch = self.alignment_presented_epoch.as_ref().map_or(
+            serde_json::Value::Null,
+            |epoch| {
+                epoch.gpu_bundle.as_ref().map_or(serde_json::Value::Null, |bundle| {
+                    serde_json::json!({
+                        "target_revision": bundle.target_revision,
+                        "publication_attempt_sequence": bundle.publication_attempt_sequence,
+                        "panel_frames": epoch.panel_frames.len(),
+                        "lane_authorities": bundle.lane_authorities.len(),
+                        "read_authorities": bundle.read_authorities.len(),
+                        "has_read_frame": bundle.reads.is_some(),
+                        "has_summary_frame": bundle.summaries.is_some(),
+                        "is_current": alignment_gpu_bundle_is_current(bundle, &self.alignment_scene_publication_authority),
+                    })
+                })
+            },
+        );
+        serde_json::json!({
+            "active_panel": {
+                "panel_id": panel.id.get(),
+                "contig": panel.contig_name,
+                "start": panel.viewport.interval().start(),
+                "end": panel.viewport.interval().end(),
+                "exact_start": panel.viewport.exact_start(),
+                "span": panel.viewport.span(),
+                "pixel_width": panel.viewport.pixel_width(),
+                "bases_per_pixel": panel.viewport.bases_per_pixel(),
+                "generation": panel.generation_clock.current().get(),
+                "navigation_phase": format!("{:?}", panel.navigation_presentation.phase),
+                "navigation_target_generation": panel.navigation_presentation.target_generation,
+                "navigation_target": format!("{:?}", panel.navigation_presentation.target_interval),
+                "navigation_notice_visible": panel.navigation_presentation.notice_visible,
+                "navigation_invalidation": panel.navigation_presentation.invalidation_reason,
+                "committed_content_revision": panel.navigation_presentation.committed_content_revision,
+            },
+            "workspace": {
+                "layout_revision": self.workspace_layout.revision,
+                "layout_recomputations": self.workspace_layout_recomputations,
+                "navigation_contract_revision": self.navigation_contract_revision,
+                "stale_result_rejections": self.navigation_stale_result_rejections,
+                "surface_width": self.surface_config.width,
+                "surface_height": self.surface_config.height,
+                "scale_factor": self.window.scale_factor(),
+                "display_dirty": self.display_dirty,
+            },
+            "input": {
+                "dragging": self.dragging,
+                "horizontal_overview_drag": self.horizontal_overview_drag.is_some(),
+                "vertical_overview_drag": self.vertical_overview_drag.is_some(),
+                "overview_capture": format!("{:?}", self.overview_capture),
+            },
+            "publication": {
+                "committed_target_revision": self.alignment_scene_publication_authority.target_revision,
+                "desired_target_revision": self.alignment_scene_publication_authority.desired_target_revision(),
+                "attempt_sequence": self.alignment_scene_publication_authority.attempt_sequence(),
+                "retry_pending": self.alignment_gpu_publication_retry.is_some(),
+                "capacity_reclaim_pending": self.alignment_capacity_reclaim.is_some(),
+                "last_budget_pressure": self.alignment_last_gpu_budget_pressure.map(|pressure| format!("{pressure:?}")),
+                "presented_epoch": presented_epoch,
+            },
+            "budget": {
+                "budget_bytes": budget.budget_bytes,
+                "transition_reserve_bytes": budget.transition_reserve_bytes,
+                "transient_budget_bytes": budget.transient_budget_bytes,
+                "charged_bytes": budget.charged_bytes,
+                "reserved_bytes": budget.reserved_bytes,
+                "reserved_transition_bytes": budget.reserved_transition_bytes,
+                "transient_bytes": budget.transient_bytes,
+                "transient_high_water_bytes": budget.transient_high_water_bytes,
+                "pinned_bytes": budget.pinned_bytes,
+                "pinned_overage_bytes": budget.pinned_overage_bytes,
+                "active_replacement_bundle": budget.active_replacement_bundle,
+                "refreshes": budget.refreshes,
+            },
+            "prefetch": {
+                "reads": self.alignment_gpu_prefetch.reads,
+                "summaries": self.alignment_gpu_prefetch.summaries,
+                "read_remaining_pages": self.alignment_gpu_prefetch.read_cursor.as_ref().map(AlignmentGpuPrefetchCursor::remaining_pages),
+                "summary_remaining_pages": self.alignment_gpu_prefetch.summary_cursor.as_ref().map(AlignmentSummaryGpuPrefetchCursor::remaining_pages),
+                "read_retention_limited": self.alignment_gpu_prefetch.read_retention_limited,
+                "summary_retention_limited": self.alignment_gpu_prefetch.summary_retention_limited,
+                "read_retained_bytes": self.alignment_gpu_prefetch.read_cursor.as_ref().map(AlignmentGpuPrefetchCursor::retained_bytes),
+                "summary_retained_bytes": self.alignment_gpu_prefetch.summary_cursor.as_ref().map(AlignmentSummaryGpuPrefetchCursor::retained_bytes),
+            },
+            "gpu": {
+                "read_prepare": {
+                    "scenes": read_stats.scenes,
+                    "mandatory_pages": read_stats.mandatory_pages,
+                    "base_instances": read_stats.base_instances,
+                    "overlay_instances": read_stats.overlay_instances,
+                    "page_pin_acquisitions": read_stats.page_pin_acquisitions,
+                    "geometry_uploaded_bytes": read_stats.geometry_uploaded_bytes,
+                    "page_cache_hits": read_stats.page_cache_hits,
+                    "page_cache_misses": read_stats.page_cache_misses,
+                    "resident_pages": read_stats.resident_pages,
+                    "resident_gpu_bytes": read_stats.resident_gpu_bytes,
+                },
+                "summary_prepare": {
+                    "scenes": summary_stats.scenes,
+                    "mandatory_pages": summary_stats.mandatory_pages,
+                    "depth_instances": summary_stats.depth_instances,
+                    "allele_instances": summary_stats.allele_instances,
+                    "junction_instances": summary_stats.junction_instances,
+                    "modification_instances": summary_stats.modification_instances,
+                    "page_pin_acquisitions": summary_stats.page_pin_acquisitions,
+                    "geometry_uploaded_bytes": summary_stats.geometry_uploaded_bytes,
+                    "page_cache_hits": summary_stats.page_cache_hits,
+                    "page_cache_misses": summary_stats.page_cache_misses,
+                    "resident_pages": summary_stats.resident_pages,
+                    "resident_gpu_bytes": summary_stats.resident_gpu_bytes,
+                },
+                "read_operations": {
+                    "manifest_builds": read_ops.content_manifest_builds,
+                    "manifest_pages_enumerated": read_ops.content_manifest_pages_enumerated,
+                    "prefetch_keys_inspected": read_ops.prefetch_authority_keys_inspected,
+                    "reclaim_keys_inspected": read_ops.reclaim_authority_keys_inspected,
+                },
+                "summary_operations": {
+                    "manifest_builds": summary_ops.content_manifest_builds,
+                    "manifest_pages_enumerated": summary_ops.content_manifest_pages_enumerated,
+                    "prefetch_keys_inspected": summary_ops.prefetch_authority_keys_inspected,
+                    "reclaim_keys_inspected": summary_ops.reclaim_authority_keys_inspected,
+                },
+                "context_operations": {
+                    "content_preparations": context_ops.content_preparations,
+                    "camera_capture_attempts": context_ops.camera_capture_attempts,
+                    "camera_captures": context_ops.camera_captures,
+                    "content_replacement_requests": context_ops.content_replacement_requests,
+                    "invalid_camera_captures": context_ops.invalid_camera_captures,
+                    "immutable_upload_bytes": context_ops.immutable_upload_bytes,
+                    "camera_writes": context_ops.camera_writes,
+                },
+                "generic_operations": {
+                    "preparations": rectangle_ops.preparations,
+                    "instances_examined": rectangle_ops.instances_examined,
+                    "slab_cache_hits": rectangle_ops.slab_cache_hits,
+                    "uploaded_bytes": rectangle_ops.uploaded_bytes,
+                    "buffer_reallocations": rectangle_ops.buffer_reallocations,
+                },
+            },
+            "tracks": tracks,
+            "data_status": self.data_status,
+        })
+    }
+
+    fn record_manual_data_status_change(&mut self) {
+        if !self.manual_diagnostic_trace_is_recording()
+            || self
+                .manual_diagnostic_trace_runtime
+                .last_observed_data_status
+                == self.data_status
+        {
+            return;
+        }
+        let previous = std::mem::replace(
+            &mut self
+                .manual_diagnostic_trace_runtime
+                .last_observed_data_status,
+            self.data_status.clone(),
+        );
+        let fields = object_fields(serde_json::json!({
+            "previous": previous,
+            "current": self.data_status,
+        }));
+        if manual_trace_status_is_critical(&self.data_status) {
+            let message = self.data_status.clone();
+            self.freeze_manual_diagnostic_trace(
+                "failure",
+                "critical_data_status",
+                &message,
+                fields,
+            );
+        } else {
+            self.manual_diagnostic_trace
+                .record("status", "data_status_changed", fields);
+        }
+    }
+
+    fn save_frozen_manual_diagnostic_trace_if_needed(&mut self) {
+        if matches!(
+            self.manual_diagnostic_trace.status().state,
+            ManualDiagnosticTraceState::Frozen
+        ) && self
+            .manual_diagnostic_trace_runtime
+            .last_saved_path
+            .is_none()
+        {
+            self.save_manual_diagnostic_trace("critical failure");
+        }
+    }
+
+    fn save_manual_diagnostic_trace(&mut self, reason: &str) {
+        let payload = match self.manual_diagnostic_trace.export_payload() {
+            Ok(payload) => payload,
+            Err(error) => {
+                let message = format!("could not serialize manual trace: {error}");
+                self.manual_diagnostic_trace_runtime.failure = Some(message.clone());
+                tracing::error!(%error, "could not serialize manual diagnostic trace");
+                return;
+            }
+        };
+        let directory = self
+            .manual_diagnostic_trace_runtime
+            .output_directory
+            .clone();
+        let path = directory.join(&payload.suggested_filename);
+        let result = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&directory)?;
+            let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+            temporary.write_all(&payload.bytes)?;
+            temporary.as_file_mut().sync_all()?;
+            temporary.persist(&path).map_err(|error| error.error)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.manual_diagnostic_trace_runtime.last_saved_path = Some(path.clone());
+                tracing::info!(
+                    %reason,
+                    path = %path.display(),
+                    media_type = payload.media_type,
+                    bytes = payload.bytes.len(),
+                    "manual diagnostic trace saved"
+                );
+            }
+            Err(error) => {
+                let message = format!("could not save trace to {}: {error}", path.display());
+                self.manual_diagnostic_trace_runtime.failure = Some(message.clone());
+                tracing::error!(%error, path = %path.display(), "could not save manual diagnostic trace");
+            }
+        }
+    }
+}
+
+pub(crate) fn object_fields(value: serde_json::Value) -> ManualDiagnosticTraceFields {
+    value.as_object().cloned().unwrap_or_default()
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn manual_trace_status_is_critical(status: &str) -> bool {
+    [
+        "Could not capture alignment scene",
+        "Could not resolve alignment scene lanes",
+        "Could not prepare one atomic alignment GPU presentation",
+        "Could not capture the current alignment camera presentation",
+        "Could not inventory mandatory alignment GPU pages",
+        "Could not inventory mandatory summary GPU pages",
+        "Could not inspect alignment GPU budget",
+        "alignment source backend failed",
+        "Read source failed",
+    ]
+    .iter()
+    .any(|needle| status.contains(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_terminal_alignment_statuses_trigger_automatic_freeze() {
+        assert!(manual_trace_status_is_critical(
+            "Could not capture alignment scene: camera mismatch"
+        ));
+        assert!(manual_trace_status_is_critical(
+            "Complete reads unavailable: alignment source backend failed"
+        ));
+        assert!(!manual_trace_status_is_critical("Updating view…"));
+        assert!(!manual_trace_status_is_critical(
+            "Complete alignment presentation is cache-budget limited"
+        ));
+    }
+
+    #[test]
+    fn frame_phase_timings_replace_their_exact_slot() {
+        let mut timings = ManualDiagnosticFrameTimings::default();
+        timings.set(
+            ManualDiagnosticFramePhase::FirstDisplayRebuild,
+            Duration::from_micros(41),
+        );
+        timings.set(
+            ManualDiagnosticFramePhase::QueueSubmission,
+            Duration::from_micros(7),
+        );
+        assert_eq!(timings.first_display_rebuild_us, 41);
+        assert_eq!(timings.queue_submission_us, 7);
+        assert_eq!(timings.shell_us, 0);
+    }
+}

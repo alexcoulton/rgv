@@ -19,6 +19,8 @@ mod display;
 mod inspection;
 mod interaction_trace;
 mod launch;
+mod manual_diagnostic_instrumentation;
+mod manual_diagnostic_trace;
 mod runtime;
 mod sources;
 mod ui;
@@ -41,6 +43,13 @@ use egui_wgpu::{RendererOptions, ScreenDescriptor};
 use inspection::{auxiliary::*, document::*, model::*, read::*, rna::*, variant::*};
 use interaction_trace::{InteractionTraceRecorder, InteractionTraceStage};
 use launch::*;
+use manual_diagnostic_instrumentation::{
+    ManualDiagnosticFramePhase, ManualDiagnosticTraceRuntime, object_fields,
+};
+use manual_diagnostic_trace::{
+    ManualDiagnosticInteractionId, ManualDiagnosticTraceFields, ManualDiagnosticTraceRecorder,
+    ManualDiagnosticTraceState,
+};
 use rgv_alignment_scene::{
     AlignmentCamera, AlignmentCoherenceGroupId, AlignmentCoherenceGroupKind,
     AlignmentCoherenceGroupSpec, AlignmentComponent, AlignmentCoverageLaneOptions,
@@ -1450,6 +1459,8 @@ struct Viewer {
     remote_source_editor: RemoteSourceEditor,
     diagnostics_open: bool,
     interaction_trace: InteractionTraceRecorder,
+    manual_diagnostic_trace: ManualDiagnosticTraceRecorder,
+    manual_diagnostic_trace_runtime: ManualDiagnosticTraceRuntime,
     sashimi_interaction_diagnostics: SashimiInteractionDiagnostics,
     command_search: String,
     annotation_search_generation: u64,

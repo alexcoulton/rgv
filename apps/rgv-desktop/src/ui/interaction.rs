@@ -213,6 +213,14 @@ impl Viewer {
         let state = self.panels.active().read_panel_scroll_state(track_id);
         let maximum = self.read_panel_presented_scroll_maximum(track_id, clip_bottom);
         let next = requested.clamp(0.0, maximum);
+        self.record_manual_vertical_scroll_intent(
+            track_id,
+            requested,
+            state.scroll_points,
+            maximum,
+            next,
+            "scroll command",
+        );
         if (next - state.scroll_points).abs() <= f32::EPSILON {
             return;
         }
@@ -343,6 +351,7 @@ impl Viewer {
         self.panels.active_mut().hovered_junction_arc = None;
         self.window.set_cursor(CursorIcon::Default);
         self.synchronize_alignment_scene_interactions(self.panels.active().id);
+        self.record_manual_navigation_intent("discrete_viewport_change");
         self.begin_viewport_navigation(false, false);
     }
 
@@ -353,6 +362,7 @@ impl Viewer {
         self.panels.active_mut().hovered_junction_arc = None;
         self.window.set_cursor(CursorIcon::Default);
         self.synchronize_alignment_scene_interactions(self.panels.active().id);
+        self.record_manual_navigation_intent("gesture_viewport_change");
         let hold_commit_until_end = self.dragging
             || self.horizontal_overview_drag.is_some()
             || self.overview_capture == Some(OverviewCapture::Horizontal);
@@ -849,6 +859,14 @@ impl Viewer {
         let next_scroll = drag.virtual_scroll_fraction * maximum;
         let previous_state = self.panels.active().read_panel_scroll_state(drag.track_id);
         let previous_effective_scroll = previous_state.effective_scroll_points();
+        self.record_manual_vertical_scroll_intent(
+            drag.track_id,
+            next_scroll,
+            previous_state.scroll_points,
+            maximum,
+            next_scroll.clamp(0.0, maximum),
+            "density scrollbar drag",
+        );
         let camera_padding = vertical_density_camera_padding(viewport_height, density);
         let zoom_scroll = zoom_fraction * maximum;
         let content_origin = (zoom_scroll - previous_effective_scroll).clamp(0.0, camera_padding);
@@ -1229,7 +1247,7 @@ impl Viewer {
         self.panels.active().live_read_panel_at_y(screen_y)
     }
 
-    fn read_panel_metrics(&self, track_id: TrackId) -> Option<(f32, f32, f32)> {
+    pub(crate) fn read_panel_metrics(&self, track_id: TrackId) -> Option<(f32, f32, f32)> {
         let panel = self.panels.active();
         let allocation = panel.live_read_panel_rect(track_id)?;
         let actual_content_bottom = panel
@@ -1242,7 +1260,7 @@ impl Viewer {
         Some((allocation.top(), allocation.bottom(), actual_content_bottom))
     }
 
-    fn read_panel_row_authority(&self, track_id: TrackId) -> ReadRowCoordinateAuthority {
+    pub(crate) fn read_panel_row_authority(&self, track_id: TrackId) -> ReadRowCoordinateAuthority {
         let current_target_revision = self
             .alignment_scene_publication_authority
             .desired_target_revision();
@@ -1271,7 +1289,11 @@ impl Viewer {
         )
     }
 
-    fn read_panel_presented_scroll_maximum(&self, track_id: TrackId, clip_bottom: f32) -> f32 {
+    pub(crate) fn read_panel_presented_scroll_maximum(
+        &self,
+        track_id: TrackId,
+        clip_bottom: f32,
+    ) -> f32 {
         crate::display::read_panel_scrollbar_maximum(
             self.panels.active().read_panel_scroll_state(track_id),
             clip_bottom,

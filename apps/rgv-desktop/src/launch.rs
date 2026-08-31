@@ -109,6 +109,12 @@ pub(super) struct LaunchOptions {
     /// Override the platform settings-file location.
     #[arg(long)]
     pub(super) settings_path: Option<PathBuf>,
+    /// Directory used for manual interaction traces and automatic critical-failure snapshots.
+    #[arg(long)]
+    pub(super) diagnostic_trace_dir: Option<PathBuf>,
+    /// Begin a bounded manual interaction trace as soon as the viewer is initialized.
+    #[arg(long)]
+    pub(super) start_diagnostic_trace: bool,
     /// Run a versioned deterministic automation batch.
     #[arg(long)]
     pub(super) batch: Option<PathBuf>,
@@ -689,6 +695,25 @@ impl RunMarker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_diagnostic_trace_launch_is_explicit_and_selects_its_output_directory() {
+        let default = LaunchOptions::parse_from(["rgv"]);
+        assert!(!default.start_diagnostic_trace);
+        assert!(default.diagnostic_trace_dir.is_none());
+
+        let enabled = LaunchOptions::parse_from([
+            "rgv",
+            "--start-diagnostic-trace",
+            "--diagnostic-trace-dir",
+            "diagnostic-traces",
+        ]);
+        assert!(enabled.start_diagnostic_trace);
+        assert_eq!(
+            enabled.diagnostic_trace_dir,
+            Some(PathBuf::from("diagnostic-traces"))
+        );
+    }
 
     #[test]
     fn unavailable_catalogue_never_trusts_a_saved_builtin_path() {

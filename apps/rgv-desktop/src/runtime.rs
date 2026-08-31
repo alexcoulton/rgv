@@ -58,18 +58,23 @@ impl ApplicationHandler for Application {
         }
 
         let egui_response = viewer.egui_state.on_window_event(&viewer.window, &event);
+        viewer.record_manual_window_event(&event, egui_response.consumed);
         // egui-winit reports `repaint: true` for `RedrawRequested`. Honouring
         // that response after rendering this same event creates an endless
         // RedrawRequested -> request_redraw feedback loop.
         let request_egui_redraw = should_request_egui_redraw(&event, egui_response.repaint);
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                viewer.save_recording_manual_diagnostic_trace_before_exit();
+                event_loop.exit();
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && !event.repeat
                     && is_exit_shortcut(&event.logical_key, viewer.modifiers) =>
             {
                 if confirm_or_exit(&mut viewer.exit_confirmation_open) {
+                    viewer.save_recording_manual_diagnostic_trace_before_exit();
                     event_loop.exit();
                 } else {
                     viewer.window.request_redraw();
@@ -86,6 +91,7 @@ impl ApplicationHandler for Application {
                     viewer.command_search.clear();
                     viewer.window.request_redraw();
                 } else {
+                    viewer.save_recording_manual_diagnostic_trace_before_exit();
                     event_loop.exit();
                 }
             }
@@ -270,6 +276,7 @@ impl ApplicationHandler for Application {
         let Some(viewer) = self.viewer.as_mut() else {
             return;
         };
+        viewer.record_manual_device_event(&event);
         if let DeviceEvent::MouseMotion { delta } = event {
             viewer.capture_mouse_motion(delta);
         }
@@ -282,6 +289,7 @@ impl ApplicationHandler for Application {
             viewer.maybe_start_autosave(now);
             viewer.advance_automation(now);
             if viewer.automation_exit_requested || viewer.user_exit_requested {
+                viewer.save_recording_manual_diagnostic_trace_before_exit();
                 event_loop.exit();
                 return;
             }

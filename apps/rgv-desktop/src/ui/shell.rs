@@ -16,17 +16,43 @@ impl Viewer {
     /// Poll, prepare, compose, and submit one application frame.
     pub(crate) fn render(&mut self) {
         let frame_started = Instant::now();
+        self.begin_manual_diagnostic_frame();
+        let phase_started = Instant::now();
         self.poll_background_work();
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::PollBackground,
+            phase_started.elapsed(),
+        );
+        let phase_started = Instant::now();
         self.apply_captured_motion();
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::ApplyCapturedMotion,
+            phase_started.elapsed(),
+        );
 
+        let phase_started = Instant::now();
         self.rebuild_display_list();
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::FirstDisplayRebuild,
+            phase_started.elapsed(),
+        );
         let raw_input = self.egui_state.take_egui_input(&self.window);
+        let phase_started = Instant::now();
         let (full_output, repaint_delay) = self.render_shell_frame(raw_input);
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::Shell,
+            phase_started.elapsed(),
+        );
         // Shell layout is resolved by egui. If it changed the committed
         // workspace geometry, rebuild before submitting this same frame so
         // native GPU primitives, egui chrome, scissoring, and hit geometry
         // never describe different layout revisions on screen.
+        let phase_started = Instant::now();
         self.rebuild_display_list();
+        self.record_manual_diagnostic_frame_phase(
+            ManualDiagnosticFramePhase::SecondDisplayRebuild,
+            phase_started.elapsed(),
+        );
         let prepared_stats = std::mem::take(&mut self.display_upload_pending_metrics)
             .then(|| self.rectangle_renderer.last_prepare_stats());
         self.submit_ui_frame(full_output, prepared_stats, frame_started, repaint_delay);
@@ -39,8 +65,14 @@ impl Viewer {
             self.alignment_gpu_prefetch.summaries,
         );
         if prefetch {
+            let phase_started = Instant::now();
             self.advance_current_alignment_gpu_prefetch();
+            self.record_manual_diagnostic_frame_phase(
+                ManualDiagnosticFramePhase::Prefetch,
+                phase_started.elapsed(),
+            );
         }
+        self.finish_manual_diagnostic_frame(frame_started.elapsed());
     }
 }
 

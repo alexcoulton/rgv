@@ -14,7 +14,10 @@ pub(crate) mod track_settings;
 mod tracks;
 pub(crate) mod workspace_dialogs;
 
-pub use diagnostics::{show_diagnostics, toggled_diagnostics};
+pub(crate) use diagnostics::{
+    ManualInteractionTraceAction, ManualInteractionTraceSnapshot, ManualInteractionTraceState,
+    show_diagnostics, toggled_diagnostics,
+};
 pub use menu::{SEARCHABLE_COMMANDS, UiCommand, command_matches};
 pub use navigation::{GenomeOverviewData, OverviewInteraction, paint_genome_context};
 pub use status::status_bar;

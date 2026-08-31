@@ -1581,6 +1581,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::alignment_scene_coordinator::AlignmentVerticalResidencyPumpOutcome;
     use crate::{
         AlignmentSceneCoordinatorError, AlignmentSourceActor, AlignmentSourceActorError,
         AlignmentSourceIntentSpec, CanonicalDecodeCheckpoint, LocalBamCanonicalBackend,
@@ -2786,9 +2787,25 @@ mod tests {
             unreachable!("matching event is a complete vertical frame")
         };
         assert!(frame.visible_complete());
-        assert_eq!(frame.snapshot.unwrap().reads().prepared_rows(), 0..13);
+        let scene = frame.snapshot.unwrap();
+        assert_eq!(scene.reads().prepared_rows(), 0..13);
         assert!(telemetry.vertical_residency_checkpoints > 0);
         assert_eq!(telemetry.vertical_residency_completions, 1);
+        let trace = telemetry
+            .last_vertical_residency_pump
+            .expect("the complete engine frame carries its semantic pump trace");
+        assert_eq!(
+            trace.outcome,
+            AlignmentVerticalResidencyPumpOutcome::Completed
+        );
+        assert_eq!(trace.published_scene, Some(scene.revision()));
+        assert_eq!(trace.target_prepared_rows.start, 0);
+        assert_eq!(trace.target_prepared_rows.end, 13);
+        assert_eq!(
+            trace.target_read_pages,
+            Some(u64::try_from(scene.reads().pages().len()).unwrap())
+        );
+        assert!(trace.pump_elapsed_nanoseconds >= trace.prepare_elapsed_nanoseconds);
     }
 
     #[test]

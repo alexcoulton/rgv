@@ -1,6 +1,58 @@
+use std::time::Duration;
+
 use egui::Context;
 
 use super::super::*;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ManualInteractionTraceState {
+    #[default]
+    Idle,
+    Recording,
+    Frozen,
+}
+
+impl ManualInteractionTraceState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Recording => "Recording",
+            Self::Frozen => "Frozen after critical failure",
+        }
+    }
+
+    const fn allows(self, action: ManualInteractionTraceAction) -> bool {
+        matches!(
+            (self, action),
+            (
+                Self::Idle | Self::Frozen,
+                ManualInteractionTraceAction::Start
+            ) | (Self::Recording, ManualInteractionTraceAction::StopAndSave)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManualInteractionTraceAction {
+    Start,
+    StopAndSave,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManualInteractionTraceSnapshot {
+    pub state: ManualInteractionTraceState,
+    pub event_count: usize,
+    pub dropped_event_count: u64,
+    pub retained_duration: Duration,
+    pub saved_path: Option<String>,
+    pub failure: Option<String>,
+}
+
+impl ManualInteractionTraceSnapshot {
+    pub(crate) const fn allows(&self, action: ManualInteractionTraceAction) -> bool {
+        self.state.allows(action)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticsSnapshot {
@@ -570,11 +622,19 @@ impl Viewer {
     }
 }
 
-pub fn show_diagnostics(context: &Context, open: &mut bool, snapshot: &DiagnosticsSnapshot) {
+pub(crate) fn show_diagnostics(
+    context: &Context,
+    open: &mut bool,
+    snapshot: &DiagnosticsSnapshot,
+    manual_trace: &ManualInteractionTraceSnapshot,
+) -> Option<ManualInteractionTraceAction> {
+    let mut manual_trace_action = None;
     egui::Window::new("Diagnostics")
         .open(open)
         .default_width(420.0)
         .show(context, |ui| {
+            manual_trace_action = show_manual_interaction_trace(ui, manual_trace);
+            ui.separator();
             ui.monospace(&snapshot.frame);
             if let Some(workspace) = &snapshot.workspace {
                 ui.monospace(workspace);
@@ -616,6 +676,84 @@ pub fn show_diagnostics(context: &Context, open: &mut bool, snapshot: &Diagnosti
                 ui.monospace(interaction);
             }
         });
+    manual_trace_action
+}
+
+fn show_manual_interaction_trace(
+    ui: &mut egui::Ui,
+    snapshot: &ManualInteractionTraceSnapshot,
+) -> Option<ManualInteractionTraceAction> {
+    ui.strong("Manual interaction trace");
+    ui.label("Record a real browsing interaction and save its timing trace for diagnosis.");
+
+    egui::Grid::new("manual_interaction_trace_status")
+        .num_columns(2)
+        .spacing([12.0, 3.0])
+        .show(ui, |ui| {
+            ui.label("State");
+            ui.monospace(snapshot.state.label());
+            ui.end_row();
+
+            ui.label("Events retained");
+            ui.monospace(snapshot.event_count.to_string());
+            ui.end_row();
+
+            ui.label("Events dropped");
+            ui.monospace(snapshot.dropped_event_count.to_string());
+            ui.end_row();
+
+            ui.label("Time retained");
+            ui.monospace(format_retained_duration(snapshot.retained_duration));
+            ui.end_row();
+        });
+
+    if let Some(path) = &snapshot.saved_path {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Saved to");
+            ui.monospace(path);
+        });
+    } else {
+        ui.label("Saved path: none");
+    }
+    if let Some(failure) = &snapshot.failure {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("Failure captured: {failure}"),
+        );
+    } else {
+        ui.label("Trace failure: none");
+    }
+
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                snapshot.allows(ManualInteractionTraceAction::Start),
+                egui::Button::new("Start"),
+            )
+            .clicked()
+        {
+            action = Some(ManualInteractionTraceAction::Start);
+        }
+        if ui
+            .add_enabled(
+                snapshot.allows(ManualInteractionTraceAction::StopAndSave),
+                egui::Button::new("Stop & Save"),
+            )
+            .clicked()
+        {
+            action = Some(ManualInteractionTraceAction::StopAndSave);
+        }
+    });
+    action
+}
+
+fn format_retained_duration(duration: Duration) -> String {
+    if duration < Duration::from_secs(1) {
+        format!("{} ms", duration.as_millis())
+    } else {
+        format!("{:.2} s", duration.as_secs_f64())
+    }
 }
 
 pub const fn toggled_diagnostics(open: bool) -> bool {
@@ -630,5 +768,50 @@ mod tests {
     fn diagnostics_visibility_toggles_without_enabling_collection() {
         assert!(toggled_diagnostics(false));
         assert!(!toggled_diagnostics(true));
+    }
+
+    #[test]
+    fn manual_trace_actions_follow_the_capture_state() {
+        for (state, start_allowed, stop_allowed) in [
+            (ManualInteractionTraceState::Idle, true, false),
+            (ManualInteractionTraceState::Recording, false, true),
+            (ManualInteractionTraceState::Frozen, true, false),
+        ] {
+            let snapshot = ManualInteractionTraceSnapshot {
+                state,
+                ..ManualInteractionTraceSnapshot::default()
+            };
+            assert_eq!(
+                snapshot.allows(ManualInteractionTraceAction::Start),
+                start_allowed
+            );
+            assert_eq!(
+                snapshot.allows(ManualInteractionTraceAction::StopAndSave),
+                stop_allowed
+            );
+        }
+    }
+
+    #[test]
+    fn manual_trace_state_labels_distinguish_frozen_state() {
+        assert_eq!(ManualInteractionTraceState::Idle.label(), "Idle");
+        assert_eq!(ManualInteractionTraceState::Recording.label(), "Recording");
+        assert_eq!(
+            ManualInteractionTraceState::Frozen.label(),
+            "Frozen after critical failure"
+        );
+    }
+
+    #[test]
+    fn retained_duration_uses_milliseconds_then_seconds() {
+        assert_eq!(format_retained_duration(Duration::ZERO), "0 ms");
+        assert_eq!(
+            format_retained_duration(Duration::from_millis(999)),
+            "999 ms"
+        );
+        assert_eq!(
+            format_retained_duration(Duration::from_millis(1_250)),
+            "1.25 s"
+        );
     }
 }

@@ -2097,7 +2097,9 @@ impl Viewer {
         // committed epoch retains ownership for rollback, but render/hit/live-region consumers
         // stale-gate it immediately when the actual camera or layout target changed.
         let scale_factor = self.window.scale_factor();
+        let capture_started = Instant::now();
         let mut candidate_epoch = self.capture_alignment_panel_scene_epoch(0);
+        let capture_elapsed = capture_started.elapsed();
         let target = AlignmentSceneTargetIdentity::from_panel_frames(
             self.workspace_layout.revision,
             [self.surface_config.width, self.surface_config.height],
@@ -2128,6 +2130,17 @@ impl Viewer {
             )
         };
         let Some(attempt) = attempt else {
+            self.record_manual_diagnostic_event(
+                "alignment_publication",
+                "same_target_retry_coalesced",
+                serde_json::json!({
+                    "desired_target_revision": self.alignment_scene_publication_authority.desired_target_revision(),
+                    "publication_attempt_sequence": self.alignment_scene_publication_authority.attempt_sequence(),
+                    "capture_elapsed_us": capture_elapsed.as_micros(),
+                    "panel_frames": candidate_epoch.panel_frames.len(),
+                    "lane_sources": candidate_epoch.lane_sources.len(),
+                }),
+            );
             tracing::trace!(
                 target_revision = self
                     .alignment_scene_publication_authority
@@ -2151,6 +2164,22 @@ impl Viewer {
         }
         let target_revision = attempt.target_revision;
         let publication_attempt_sequence = attempt.sequence;
+        self.record_manual_diagnostic_event(
+            "alignment_publication",
+            "atomic_prepare_started",
+            serde_json::json!({
+                "target_revision": target_revision,
+                "publication_attempt_sequence": publication_attempt_sequence,
+                "target_changed": attempt.target_changed,
+                "retry_was_pending": retry_was_pending,
+                "capture_elapsed_us": capture_elapsed.as_micros(),
+                "panel_frames": candidate_epoch.panel_frames.len(),
+                "lane_sources": candidate_epoch.lane_sources.len(),
+                "workspace_layout_revision": self.workspace_layout.revision,
+                "surface": [self.surface_config.width, self.surface_config.height],
+                "scale_factor": scale_factor,
+            }),
+        );
         tracing::trace!(
             target_revision,
             publication_attempt_sequence,
@@ -2218,6 +2247,18 @@ impl Viewer {
             .iter()
             .map(|request| request.borrowed(publication_attempt_sequence, screen_size_points))
             .collect::<Vec<_>>();
+        self.record_manual_diagnostic_event(
+            "alignment_publication",
+            "gpu_requests_collected",
+            serde_json::json!({
+                "target_revision": target_revision,
+                "publication_attempt_sequence": publication_attempt_sequence,
+                "read_requests": read_requests.len(),
+                "summary_requests": summary_requests.len(),
+                "unsupported_interpretations": unsupported_interpretations,
+                "lane_authorities": lane_authorities.len(),
+            }),
+        );
         let read_authorities = owned_reads
             .iter()
             .filter_map(|request| {
@@ -2266,6 +2307,16 @@ impl Viewer {
             self.alignment_gpu_residency_bundle = None;
             self.alignment_gpu_prefetch.clear();
             self.alignment_gpu_speculation_gate.reset();
+            self.record_manual_diagnostic_event(
+                "alignment_publication",
+                "empty_epoch_committed",
+                serde_json::json!({
+                    "target_revision": target_revision,
+                    "publication_attempt_sequence": publication_attempt_sequence,
+                    "panel_frames": self.alignment_presented_epoch.as_ref().map_or(0, |epoch| epoch.panel_frames.len()),
+                    "reason": "no native read or summary GPU requests were captured",
+                }),
+            );
             return;
         }
 
@@ -2308,13 +2359,43 @@ impl Viewer {
                 if self.alignment_gpu_prefetch.pending() {
                     self.window.request_redraw();
                 }
+                self.record_manual_diagnostic_event(
+                    "alignment_publication",
+                    "camera_only_capture_committed",
+                    serde_json::json!({
+                        "target_revision": target_revision,
+                        "publication_attempt_sequence": publication_attempt_sequence,
+                        "read_requests": read_requests.len(),
+                        "summary_requests": summary_requests.len(),
+                    }),
+                );
                 return;
             }
-            AlignmentGpuCameraCaptureOutcome::ContentReplacementRequired => {}
+            AlignmentGpuCameraCaptureOutcome::ContentReplacementRequired => {
+                self.record_manual_diagnostic_event(
+                    "alignment_publication",
+                    "content_replacement_required",
+                    serde_json::json!({
+                        "target_revision": target_revision,
+                        "publication_attempt_sequence": publication_attempt_sequence,
+                        "read_requests": read_requests.len(),
+                        "summary_requests": summary_requests.len(),
+                    }),
+                );
+            }
             AlignmentGpuCameraCaptureOutcome::Deferred(blocker) => {
                 // Camera-ring or other non-content pressure is not evidence that the source or
                 // immutable scene failed. Retain the coherent prior epoch for a later retry.
                 tracing::debug!(?blocker, "deferring alignment camera-only capture");
+                self.record_manual_diagnostic_event(
+                    "alignment_publication",
+                    "camera_capture_deferred",
+                    serde_json::json!({
+                        "target_revision": target_revision,
+                        "publication_attempt_sequence": publication_attempt_sequence,
+                        "blocker": format!("{blocker:?}"),
+                    }),
+                );
                 self.wait_alignment_navigation_transactions_for_gpu(&navigation_candidates);
                 self.defer_alignment_gpu_publication(&attempt, blocker);
                 return;
@@ -2324,6 +2405,19 @@ impl Viewer {
                 self.fail_alignment_navigation_gpu_candidates(&navigation_candidates, &error);
                 self.data_status =
                     format!("Could not capture the current alignment camera presentation: {error}");
+                let message = self.data_status.clone();
+                self.freeze_manual_diagnostic_trace(
+                    "alignment_publication",
+                    "camera_capture_terminal",
+                    &message,
+                    object_fields(serde_json::json!({
+                        "target_revision": target_revision,
+                        "publication_attempt_sequence": publication_attempt_sequence,
+                        "error": error,
+                        "read_requests": read_requests.len(),
+                        "summary_requests": summary_requests.len(),
+                    })),
+                );
                 return;
             }
         }
@@ -2333,6 +2427,18 @@ impl Viewer {
             Err(error) => {
                 self.data_status =
                     format!("Could not inventory mandatory alignment GPU pages: {error}");
+                let message = self.data_status.clone();
+                self.freeze_manual_diagnostic_trace(
+                    "alignment_publication",
+                    "read_page_inventory_failed",
+                    &message,
+                    object_fields(serde_json::json!({
+                        "target_revision": target_revision,
+                        "publication_attempt_sequence": publication_attempt_sequence,
+                        "error": error.to_string(),
+                        "read_requests": read_requests.len(),
+                    })),
+                );
                 return;
             }
         };
@@ -2342,13 +2448,46 @@ impl Viewer {
                 Err(error) => {
                     self.data_status =
                         format!("Could not inventory mandatory summary GPU pages: {error}");
+                    let message = self.data_status.clone();
+                    self.freeze_manual_diagnostic_trace(
+                        "alignment_publication",
+                        "summary_page_inventory_failed",
+                        &message,
+                        object_fields(serde_json::json!({
+                            "target_revision": target_revision,
+                            "publication_attempt_sequence": publication_attempt_sequence,
+                            "error": error.to_string(),
+                            "summary_requests": summary_requests.len(),
+                        })),
+                    );
                     return;
                 }
             };
+        self.record_manual_diagnostic_event(
+            "alignment_publication",
+            "mandatory_pages_inventoried",
+            serde_json::json!({
+                "target_revision": target_revision,
+                "publication_attempt_sequence": publication_attempt_sequence,
+                "read_pages": protected_read_pages.len(),
+                "summary_pages": protected_summary_pages.len(),
+            }),
+        );
         let budget_bytes = match self.alignment_scene_ledger.progress() {
             Ok(snapshot) => snapshot.budget,
             Err(error) => {
                 self.data_status = format!("Could not inspect alignment GPU budget: {error}");
+                let message = self.data_status.clone();
+                self.freeze_manual_diagnostic_trace(
+                    "alignment_publication",
+                    "ledger_inspection_failed",
+                    &message,
+                    object_fields(serde_json::json!({
+                        "target_revision": target_revision,
+                        "publication_attempt_sequence": publication_attempt_sequence,
+                        "error": error.to_string(),
+                    })),
+                );
                 return;
             }
         };
@@ -2460,6 +2599,18 @@ impl Viewer {
                 if self.alignment_gpu_prefetch.pending() {
                     self.window.request_redraw();
                 }
+                self.record_manual_diagnostic_event(
+                    "alignment_publication",
+                    "content_replacement_committed",
+                    serde_json::json!({
+                        "target_revision": target_revision,
+                        "publication_attempt_sequence": publication_attempt_sequence,
+                        "read_requests": read_requests.len(),
+                        "summary_requests": summary_requests.len(),
+                        "prefetch_reads": self.alignment_gpu_prefetch.reads,
+                        "prefetch_summaries": self.alignment_gpu_prefetch.summaries,
+                    }),
+                );
             }
             Err(failure) => {
                 self.alignment_gpu_prefetch.clear();
@@ -2480,6 +2631,20 @@ impl Viewer {
                 );
                 self.fail_alignment_navigation_gpu_candidates(&navigation_candidates, &message);
                 self.data_status = message;
+                let message = self.data_status.clone();
+                self.freeze_manual_diagnostic_trace(
+                    "alignment_publication",
+                    "content_replacement_terminal",
+                    &message,
+                    object_fields(serde_json::json!({
+                        "target_revision": target_revision,
+                        "publication_attempt_sequence": publication_attempt_sequence,
+                        "failure": failure.message,
+                        "pressure": failure.pressure.map(|pressure| format!("{pressure:?}")),
+                        "read_requests": read_requests.len(),
+                        "summary_requests": summary_requests.len(),
+                    })),
+                );
             }
         }
     }
@@ -2491,6 +2656,7 @@ impl Viewer {
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         let mut captured = HashMap::new();
         let mut lane_sources = Vec::new();
+        let mut critical_capture_failure = None;
         // The complete semantic panel authority remains private until native GPU publication
         // succeeds. A rejected/superseded candidate drops this clone and leaves the committed
         // store byte-for-byte unchanged.
@@ -2626,6 +2792,26 @@ impl Viewer {
             }
             if let Some(error) = capture_error {
                 self.data_status = format!("Could not resolve alignment scene lanes: {error}");
+                critical_capture_failure.get_or_insert_with(|| {
+                    (
+                        self.data_status.clone(),
+                        object_fields(serde_json::json!({
+                            "panel_id": panel_id.get(),
+                            "panel_contig": contig_name,
+                            "panel_viewport": {
+                                "start": panel_viewport.interval().start(),
+                                "end": panel_viewport.interval().end(),
+                                "exact_start": panel_viewport.exact_start(),
+                                "span": panel_viewport.span(),
+                                "pixel_width": panel_viewport.pixel_width(),
+                            },
+                            "camera_revision": camera_revision,
+                            "workspace_layout_revision": self.workspace_layout.revision,
+                            "surface": [self.surface_config.width, self.surface_config.height],
+                            "lane_capture_count": lane_captures.len(),
+                        })),
+                    )
+                });
                 continue;
             }
             let track_ids = lane_captures
@@ -2699,6 +2885,40 @@ impl Viewer {
                     }
                 }
             }
+            let diagnostic_lanes = self.manual_diagnostic_trace_is_recording().then(|| {
+                lane_captures
+                    .iter()
+                    .map(|capture| {
+                        let preparation = capture.preparation_camera.viewport();
+                        serde_json::json!({
+                            "track_id": capture.track_id.get(),
+                            "preparation_viewport": {
+                                "start": preparation.interval().start(),
+                                "end": preparation.interval().end(),
+                                "exact_start": preparation.exact_start(),
+                                "span": preparation.span(),
+                                "pixel_width": preparation.pixel_width(),
+                            },
+                            "visible_rows": {
+                                "start": capture.preparation_camera.visible_rows().start,
+                                "end": capture.preparation_camera.visible_rows().end,
+                            },
+                            "read_camera": capture.read_camera.map(|camera| {
+                                let viewport = camera.viewport();
+                                serde_json::json!({
+                                    "start": viewport.interval().start(),
+                                    "end": viewport.interval().end(),
+                                    "exact_start": viewport.exact_start(),
+                                    "span": viewport.span(),
+                                    "pixel_width": viewport.pixel_width(),
+                                    "clip": format!("{:?}", camera.clip()),
+                                })
+                            }),
+                            "derived_lane_count": capture.derived_lanes.len(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
             match store.capture(panel_id, camera_revision, panel_viewport, lane_captures) {
                 Ok(frame) => {
                     captured.insert(panel_id, frame);
@@ -2706,8 +2926,37 @@ impl Viewer {
                 }
                 Err(error) => {
                     self.data_status = format!("Could not capture alignment scene: {error}");
+                    critical_capture_failure.get_or_insert_with(|| {
+                        (
+                            self.data_status.clone(),
+                            object_fields(serde_json::json!({
+                                "error": format!("{error:?}"),
+                                "panel_id": panel_id.get(),
+                                "panel_contig": contig_name,
+                                "panel_viewport": {
+                                    "start": panel_viewport.interval().start(),
+                                    "end": panel_viewport.interval().end(),
+                                    "exact_start": panel_viewport.exact_start(),
+                                    "span": panel_viewport.span(),
+                                    "pixel_width": panel_viewport.pixel_width(),
+                                },
+                                "camera_revision": camera_revision,
+                                "workspace_layout_revision": self.workspace_layout.revision,
+                                "surface": [self.surface_config.width, self.surface_config.height],
+                                "lanes": diagnostic_lanes.unwrap_or_default(),
+                            })),
+                        )
+                    });
                 }
             }
+        }
+        if let Some((message, fields)) = critical_capture_failure {
+            self.queue_manual_diagnostic_trace_failure(
+                "alignment_publication",
+                "panel_scene_capture_failed",
+                &message,
+                fields,
+            );
         }
         CapturedAlignmentPanelSceneEpoch {
             panel_frames: captured,
