@@ -1,4 +1,5 @@
 pub(super) mod alignment_management;
+pub(super) mod alignment_navigation;
 pub(super) mod alignments;
 pub(super) mod landmarks;
 pub(super) mod lists;

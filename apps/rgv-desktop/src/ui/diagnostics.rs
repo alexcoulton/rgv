@@ -41,9 +41,96 @@ impl Viewer {
         }
 
         let active_panel_id = self.panels.active().id;
+        let alignment_ledger_progress = self.alignment_scene_ledger.progress().ok();
+        let alignment_ledger_operations = self.alignment_scene_ledger.operation_counters().ok();
+        let read_gpu_operations = self.alignment_gpu_renderer.operation_counters();
+        let summary_gpu_operations = self.alignment_summary_gpu_renderer.operation_counters();
         let mut alignment_tracks = Vec::with_capacity(self.alignment_tracks.len());
         for track in &self.alignment_tracks {
             let projection = track.projection(active_panel_id);
+            if track.scene_engine.is_some() {
+                let Some(projection) = projection else {
+                    alignment_tracks.push(format!(
+                        "{} · unified scene · no panel transaction",
+                        track.config.name
+                    ));
+                    continue;
+                };
+                let transaction = projection.navigation.diagnostic();
+                let scene = projection.scene_frame.as_ref().map_or_else(
+                    || "scene frame absent".to_owned(),
+                    |frame| {
+                        let records = frame.snapshot.as_ref().map_or(0, |snapshot| {
+                            snapshot.reads().evidence().record_count()
+                        });
+                        format!(
+                            "scene {} records · genomic {:?} · rows {:?}/{:?} · reference {:?} (products current {}) · reads {:?} · vertical {:?}",
+                            records,
+                            frame.covered_interval,
+                            frame.covered_rows,
+                            frame.requested_rows,
+                            frame.reference_requirement,
+                            frame.reference_products_current,
+                            frame.individual_reads,
+                            frame.vertical_residency,
+                        )
+                    },
+                );
+                let recent = projection
+                    .navigation
+                    .journal()
+                    .rev()
+                    .take(4)
+                    .map(|entry| {
+                        format!(
+                            "p{:?}/track{:?} g{} t{} {:?}->{:?} owner={:?} products={:?} camera={:?}: {}",
+                            entry.panel_id,
+                            entry.track_id,
+                            entry.generation,
+                            entry
+                                .request_token
+                                .map_or(0, AlignmentSceneRequestToken::get),
+                            entry.from,
+                            entry.to,
+                            entry.owner,
+                            entry.products,
+                            entry.camera.map(|camera| camera.interval()),
+                            entry.reason,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let invariant = transaction
+                    .invariant_failure
+                    .as_deref()
+                    .map_or_else(String::new, |failure| {
+                        format!(" · INVARIANT FAILURE: {failure}")
+                    });
+                alignment_tracks.push(format!(
+                    "{} · unified scene · panel {:?} track {:?} · g{} t{} · {:?} ({}) · owner {:?} · products {:?} · camera {:?} · {} · journal {}/64 [{}]{}{}",
+                    track.config.name,
+                    transaction.panel_id,
+                    transaction.track_id,
+                    transaction.generation,
+                    transaction
+                        .request_token
+                        .map_or(0, AlignmentSceneRequestToken::get),
+                    transaction.phase,
+                    transaction.phase.status(),
+                    transaction.owner,
+                    transaction.products,
+                    transaction.desired_camera.map(|camera| camera.interval()),
+                    scene,
+                    transaction.journal_entries,
+                    recent,
+                    transaction
+                        .detail
+                        .as_deref()
+                        .map_or_else(String::new, |detail| format!(" · {detail}")),
+                    invariant,
+                ));
+                continue;
+            }
             if let Some(stats) = projection
                 .and_then(|projection| projection.cached_layout.as_ref())
                 .map(|(_, layout)| &layout.stats)
@@ -184,14 +271,7 @@ impl Viewer {
                         } else {
                             "resident unprepared"
                         },
-                        if self.alignment_row_scene_tasks.iter().any(|task| {
-                            task.track_id == track.config.id
-                                && task.panel_id == self.panels.active().id
-                        }) {
-                            " (preparing)"
-                        } else {
-                            ""
-                        },
+                        "",
                         if reconciliation.scene_hit {
                             "hit"
                         } else {
@@ -412,7 +492,7 @@ impl Viewer {
             }),
             cache_coordinator: (!self.alignment_tracks.is_empty()).then(|| {
                 let cache = self.cache_coordinator;
-                format!(
+                let legacy = format!(
                     "cache coordinator {:.1}/{:.1} MiB · decoded {:.1}/{:.1} · layout {:.1}/{:.1} · rows {:.1}/{:.1} · GPU {:.1}/{:.1}{} · {} rebalances",
                     cache.measured_resident_bytes as f64 / (1024.0 * 1024.0),
                     cache.total_budget_bytes as f64 / (1024.0 * 1024.0),
@@ -434,6 +514,41 @@ impl Viewer {
                         String::new()
                     },
                     cache.rebalances,
+                );
+                let scene = alignment_ledger_progress.map_or_else(
+                    || "scene ledger unavailable".to_owned(),
+                    |progress| {
+                        let retained = progress.retained;
+                        let operations = alignment_ledger_operations.unwrap_or_default();
+                        format!(
+                            "scene ledger {:.1}/{:.1} MiB charged · evidence {:.1} · summaries {:.1} · rows {:.1} · semantic {:.1} · GPU/frames {:.1} · reserved {:.1} · transient {:.1} (peak {:.1}) · pinned {:.1} · replacement {:?} · ledger inventories {} / {} records enumerated · prepared-manifest builds read {} ({} pages), summary {} ({} pages) · bounded prefetch keys inspected read {}, summary {} · indexed reclaim keys inspected read {}, summary {}",
+                            progress.charged as f64 / (1024.0 * 1024.0),
+                            progress.budget as f64 / (1024.0 * 1024.0),
+                            retained.evidence_bytes() as f64 / (1024.0 * 1024.0),
+                            retained.summary_bytes() as f64 / (1024.0 * 1024.0),
+                            retained.row_atlas_bytes() as f64 / (1024.0 * 1024.0),
+                            retained.semantic_scene_bytes() as f64 / (1024.0 * 1024.0),
+                            retained.gpu_bytes() as f64 / (1024.0 * 1024.0),
+                            progress.reserved as f64 / (1024.0 * 1024.0),
+                            progress.transient as f64 / (1024.0 * 1024.0),
+                            progress.transient_high_water as f64 / (1024.0 * 1024.0),
+                            progress.pinned as f64 / (1024.0 * 1024.0),
+                            progress.active_replacement_bundle,
+                            operations.full_inventory_snapshots,
+                            operations.allocation_records_enumerated,
+                            read_gpu_operations.content_manifest_builds,
+                            read_gpu_operations.content_manifest_pages_enumerated,
+                            summary_gpu_operations.content_manifest_builds,
+                            summary_gpu_operations.content_manifest_pages_enumerated,
+                            read_gpu_operations.prefetch_authority_keys_inspected,
+                            summary_gpu_operations.prefetch_authority_keys_inspected,
+                            read_gpu_operations.reclaim_authority_keys_inspected,
+                            summary_gpu_operations.reclaim_authority_keys_inspected,
+                        )
+                    },
+                );
+                format!(
+                    "{scene}\n{legacy}\nBudget scope: scene-owned CPU/GPU allocations only; wgpu driver copies, allocator retention, UI, generic tracks, and process runtime memory are outside the ledger and explain any RSS difference."
                 )
             }),
             remote: (remote_requests > 0).then(|| {
@@ -483,8 +598,8 @@ impl Viewer {
                 navigation_counters[8],
                 navigation_counters[9] as f64 / 1_000.0,
                 self.navigation_stale_result_rejections,
-                self.alignment_row_layout_tasks.len(),
-                self.alignment_row_layout_cancellations,
+                0,
+                0,
             ),
             interaction: Some(self.interaction_trace.snapshot().map_or(
                 sashimi_interaction.clone(),

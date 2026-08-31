@@ -9,11 +9,12 @@ use rgv_core::GenomicInterval;
 use rgv_hts::ReferenceSlice;
 use thiserror::Error;
 
+use crate::summary_page::required_summary_page_keys;
 use crate::{
     AlignmentPageKey, AlignmentPresentationScene, AlignmentPresentationSceneError,
     AlignmentRowAtlas, AlignmentSceneSnapshot, AlignmentSceneSnapshotError, AlignmentSemanticPage,
     AllocationLedger, CanonicalGenomicTile, CanonicalRowBlock, ExactSummaryRoot,
-    JunctionAnnotationIndex, LedgerError, PresentationContract, ReservationKind,
+    JunctionAnnotationIndex, LedgerError, PresentationContract, ReferenceRevision, ReservationKind,
     RevisionFingerprint, SceneRevision, SemanticPageError, SummaryPageFamily, SummaryPageKey,
     SummarySemanticPage, SummarySemanticPageError,
 };
@@ -188,30 +189,28 @@ impl AlignmentPresentationStore {
             revision_number,
         )?;
 
-        let families = required_summary_families(summaries);
-        let summary_tiles = summaries
-            .depth_tiles()
-            .iter()
-            .filter(|tile| tile.depth().interval().overlaps(prepared_interval))
-            .map(|tile| tile.tile())
-            .collect::<Vec<_>>();
-        let mut summary_pages =
-            Vec::with_capacity(summary_tiles.len().saturating_mul(families.len()));
-        for tile in summary_tiles {
-            for family in families.iter().copied() {
-                summary_pages.push(self.summary_page(
-                    SummaryPageKey::new_with_annotation(
-                        summaries,
-                        tile,
-                        family,
-                        annotation.map(Arc::as_ref),
-                    ),
+        let summary_keys = required_summary_page_keys(
+            summaries,
+            prepared_interval,
+            presentation.reference,
+            annotation.map(Arc::as_ref),
+        );
+        let mut summary_pages = Vec::with_capacity(summary_keys.len());
+        for key in summary_keys {
+            summary_pages.push(
+                self.summary_page(
+                    key,
                     summaries,
+                    presentation
+                        .reference
+                        .zip(reference)
+                        .map(|(revision, reference)| (revision, reference, contig_length))
+                        .filter(|_| key.family() == SummaryPageFamily::Alleles),
                     annotation.map(Arc::as_ref),
                     reservation_kind,
                     revision_number,
-                )?);
-            }
+                )?,
+            );
         }
         let snapshot = AlignmentSceneSnapshot::new_with_annotation(
             revision,
@@ -318,7 +317,7 @@ impl AlignmentPresentationStore {
                 && ranges_overlap(cached.page.row_range(), rows.clone())
         });
         self.summary_pages
-            .retain(|_, cached| cached.page.interval().overlaps(target));
+            .retain(|_, cached| cached.page.indexed_interval().overlaps(target));
         PresentationCacheDiscard {
             read_pages: read_pages_before.saturating_sub(self.read_pages.len()),
             summary_pages: summary_pages_before.saturating_sub(self.summary_pages.len()),
@@ -415,6 +414,7 @@ impl AlignmentPresentationStore {
         &mut self,
         key: SummaryPageKey,
         summaries: &Arc<ExactSummaryRoot>,
+        reference: Option<(ReferenceRevision, &ReferenceSlice, u64)>,
         annotation: Option<&JunctionAnnotationIndex>,
         reservation_kind: ReservationKind,
         revision: u64,
@@ -424,9 +424,10 @@ impl AlignmentPresentationStore {
             self.ledger.touch(cached.page.allocation().id(), revision)?;
             return Ok(Arc::clone(&cached.page));
         }
-        let page = SummarySemanticPage::build(
+        let page = SummarySemanticPage::build_with_dependencies(
             key,
             summaries,
+            reference,
             annotation,
             &self.ledger,
             reservation_kind,
@@ -610,22 +611,6 @@ fn covering_row_blocks(rows: Range<u32>, block_rows: NonZeroU32) -> Vec<Canonica
 
 fn ranges_overlap(left: Range<u32>, right: Range<u32>) -> bool {
     left.start < right.end && right.start < left.end
-}
-
-fn required_summary_families(root: &ExactSummaryRoot) -> Vec<SummaryPageFamily> {
-    let mut families = vec![
-        SummaryPageFamily::Depth,
-        SummaryPageFamily::Junctions,
-        SummaryPageFamily::Pairs,
-        SummaryPageFamily::FilterProvenance,
-    ];
-    if root.contract().allele_detail != crate::AlleleSummaryDetail::None {
-        families.push(SummaryPageFamily::Alleles);
-    }
-    if root.contract().collect_modifications {
-        families.push(SummaryPageFamily::Modifications);
-    }
-    families
 }
 
 #[derive(Debug, Error)]

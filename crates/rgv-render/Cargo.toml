@@ -12,14 +12,14 @@ bytemuck.workspace = true
 epaint_default_fonts.workspace = true
 image.workspace = true
 rgv-alignment-scene = { version = "0.1.0", path = "../rgv-alignment-scene" }
+rgv-core = { version = "0.1.0", path = "../rgv-core" }
+rgv-hts = { version = "0.1.0", path = "../rgv-hts" }
 rgv-layout = { version = "0.1.0", path = "../rgv-layout" }
 thiserror.workspace = true
 wgpu.workspace = true
 
 [dev-dependencies]
 pollster.workspace = true
-rgv-core = { version = "0.1.0", path = "../rgv-core" }
-rgv-hts = { version = "0.1.0", path = "../rgv-hts" }
 tempfile.workspace = true
 
 [lints]

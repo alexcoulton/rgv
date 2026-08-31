@@ -33,18 +33,33 @@ use control_service::{ControlRequest, ControlService, ControlStatusMetadata, rea
 #[cfg(test)]
 use display::reference_bases_label;
 use display::{alignment::*, auxiliary::*, hit_test::*};
+use display::{
+    alignment_row_activity_overview, alignment_scene_read_extent,
+    reconcile_read_panel_scroll_for_authority,
+};
 use egui_wgpu::{RendererOptions, ScreenDescriptor};
 use inspection::{auxiliary::*, document::*, model::*, read::*, rna::*, variant::*};
 use interaction_trace::{InteractionTraceRecorder, InteractionTraceStage};
 use launch::*;
 use rgv_alignment_scene::{
-    AlignmentCamera, AlignmentComponent, AlignmentHit, AlignmentInteractionState,
-    AlignmentPanelSceneFrame, AlignmentPanelSceneStore, AlignmentPresentationScene,
-    AlignmentReadLabelMode, AlignmentRowActivityProfile, AlignmentSceneSnapshot,
-    AlignmentStyleContract, AlleleSummaryDetail, AllocationLedger, CapabilityRequirement,
-    CpuAlignmentProjector, CpuClipRect, GeometryLod, LayoutContract,
+    AlignmentCamera, AlignmentCoherenceGroupId, AlignmentCoherenceGroupKind,
+    AlignmentCoherenceGroupSpec, AlignmentComponent, AlignmentCoverageLaneOptions,
+    AlignmentDerivedLaneCapture, AlignmentDerivedLaneKind, AlignmentDerivedLaneOptions,
+    AlignmentHit, AlignmentInteractionState, AlignmentModificationLaneOptions, AlignmentPageKey,
+    AlignmentPanelLaneCapture, AlignmentPanelLanePublication, AlignmentPanelSceneAdmission,
+    AlignmentPanelSceneError, AlignmentPanelSceneFrame, AlignmentPanelSceneStore,
+    AlignmentPresentationScene, AlignmentReadLabelMode, AlignmentRowActivityProfile,
+    AlignmentSashimiLaneOptions, AlignmentSashimiScalePolicy, AlignmentSceneCamera,
+    AlignmentSceneSnapshot, AlignmentStyleContract, AlleleSummaryDetail, AllocationBundleActual,
+    AllocationBundleCommit, AllocationBundleError, AllocationBundleLease, AllocationBundleSlot,
+    AllocationBundleSpec, AllocationLedger, AllocationRetirementClaimSet,
+    AllocationRetirementToken, CapabilityRequirement, CoverageAlleleInterpretation,
+    CpuAlignmentProjector, CpuAlleleProjectionOptions, CpuClipRect, CpuDepthProjectionOptions,
+    CpuJunctionProjectionOptions, CpuModificationProjectionOptions, CpuProjectionError,
+    CpuSummaryCamera, GeometryLod, LayoutContract, LedgerError, LedgerProgress,
+    LedgerProgressEpoch, LedgerProgressSubscription, LedgerSnapshot,
     MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract, ReferenceRevision,
-    RowCoordinateSpaceRevision, SummaryContract,
+    RowAtlasRevision, RowCoordinateSpaceRevision, SummaryContract,
 };
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,
@@ -85,29 +100,29 @@ use rgv_core::{
     PanelTrackId, PresentationNodeId, QuantitativeArithmetic, QuantitativeDisplayMode,
     QuantitativeMissingMode, QuantitativeScaleMode, QuantitativeScaleTransform,
     QuantitativeTrackSettings, QuantitativeWindowFunction, ReadBaseDisplayMode, ReadStackingMode,
-    ReadStackingTransitionReason, ReferenceDictionary, ReferenceTranslationFrame, RegionOfInterest,
-    ReviewItem, ReviewStatus, SampleMetadataTable, SashimiCountMode, SashimiScaleMode,
-    SbxDisplayOptions, SbxSimplexTailMode, SessionAlignmentTrack, SessionDocument, SessionFilters,
-    SessionLocus, SessionPaneTrackState, SessionReadPanelState, SessionViewPanel, SmrtKineticsMode,
-    TrackChangeSet, TrackCollection, TrackConfig, TrackFormat, TrackId, TrackIntent, TrackKind,
-    TrackSource, UltimaDisplayOptions, UltimaQualityMode, UnresolvedSessionSource,
-    VariantColorMode, VariantFieldComparison, VariantFieldPredicate, VariantFieldScope,
-    VariantGenotypeFilter, VariantGenotypeGrouping, VariantMissingValueRule, VariantTrackSettings,
-    VariantTypeGroup, Viewport, ViewportGeneration, WorkspacePresentation, classify_genomic_source,
-    parse_ucsc_cytobands, resolve_contig_alias,
+    ReferenceDictionary, ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus,
+    SampleMetadataTable, SashimiCountMode, SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode,
+    SessionAlignmentTrack, SessionDocument, SessionFilters, SessionLocus, SessionPaneTrackState,
+    SessionReadPanelState, SessionViewPanel, SmrtKineticsMode, TrackChangeSet, TrackCollection,
+    TrackConfig, TrackFormat, TrackId, TrackIntent, TrackKind, TrackSource, UltimaDisplayOptions,
+    UltimaQualityMode, UnresolvedSessionSource, VariantColorMode, VariantFieldComparison,
+    VariantFieldPredicate, VariantFieldScope, VariantGenotypeFilter, VariantGenotypeGrouping,
+    VariantMissingValueRule, VariantTrackSettings, VariantTypeGroup, Viewport, ViewportGeneration,
+    WorkspacePresentation, classify_genomic_source, parse_ucsc_cytobands, resolve_contig_alias,
 };
 use rgv_engine::{
     AlignmentBufferClampReason, AlignmentCacheOutcome, AlignmentCoordinatorFrame,
     AlignmentIndividualReadCapability, AlignmentQueryPhase, AlignmentReferenceAuthority,
     AlignmentReferenceRequirement, AlignmentSceneBuildContract, AlignmentSceneEngine,
-    AlignmentSceneEngineEvent, AlignmentSceneFrameCause, AlignmentScenePreparationPolicy,
-    AlignmentSceneRequestToken, AlignmentSceneSourceMetadata, AlignmentVerticalResidency,
-    AlignmentWorkingSetStats, CacheBudgets, CacheStats, EngineQueueError, LayoutTileKey,
-    LocalAlignmentSceneEngineConfig, LocalBamCanonicalBackend, LocalBamSourceControl,
-    MAX_REFERENCE_QUERY_BASES, ReferenceEngine, ReferenceEngineEvent, ReferenceQueryIdentity,
-    Scheduler, SchedulerError, SourceFingerprint, SourceOwnerId, TrackEngine, TrackEngineEvent,
-    TrackSearchHit, TrackSearchResults, TrackSnapshot, TrackSnapshotData, TrackSpec, TrackSpecKind,
-    WeightedLruCache, WorkItem,
+    AlignmentSceneEngineEvent, AlignmentSceneEngineOperation, AlignmentSceneFrameCause,
+    AlignmentScenePreparationPolicy, AlignmentSceneRequestToken,
+    AlignmentSceneResourcePressureDisposition, AlignmentSceneSourceMetadata,
+    AlignmentVerticalResidency, AlignmentWorkingSetStats, CacheBudgets, CacheStats,
+    EngineQueueError, LayoutTileKey, LocalAlignmentSceneEngineConfig, LocalBamCanonicalBackend,
+    LocalBamSourceControl, MAX_REFERENCE_QUERY_BASES, ReferenceEngine, ReferenceEngineEvent,
+    ReferenceQueryIdentity, SourceFingerprint, SourceIntentKind, SourceOwnerId, TrackEngine,
+    TrackEngineEvent, TrackSearchHit, TrackSearchResults, TrackSnapshot, TrackSnapshotData,
+    TrackSpec, TrackSpecKind, WeightedLruCache, alignment_row_activity_satisfies_contract,
 };
 use rgv_hts::{
     AlignedBaseClassification, AlignmentFilter, AlignmentOpenOptions, AlignmentQuery,
@@ -130,20 +145,28 @@ use rgv_layout::{
     JunctionAnnotationLookup, JunctionAnnotationStatus, JunctionArcComponent,
     MAX_HIDDEN_MODIFICATION_CODES, MINIMUM_BASE_GLYPH_PIXEL_WIDTH, MUTATION_HEADER_HEIGHT,
     QuantitativeRange, RectPrimitive, Rgba, TrackLayoutOptions, alignment_read_name_hash,
-    alignment_row_policy_fingerprint, assign_alignment_rows, compose_quantitative_records,
-    copy_number_sample_order, gwas_point_y, junction_arc_distance_to_point,
-    junction_arc_stroke_width, junction_count_value, layout_alignment_query_with_rows,
-    layout_alignment_query_with_rows_and_annotations, layout_copy_number,
-    layout_features_with_label_widths, layout_gwas, layout_interactions, layout_mutations,
-    layout_quantitative, layout_reference_slice_oriented, layout_reference_translation,
-    layout_sashimi, layout_variants, modification_code_color, quantitative_data_range,
-    reconcile_alignment_rows_with_horizon, reconcile_alignment_rows_with_horizon_scene_cancellable,
-    record_object_id, ultima_quality_color,
+    compose_quantitative_records, copy_number_sample_order, gwas_point_y,
+    junction_arc_distance_to_point, junction_arc_stroke_width, junction_count_value,
+    layout_alignment_query_with_rows, layout_alignment_query_with_rows_and_annotations,
+    layout_copy_number, layout_features_with_label_widths, layout_gwas, layout_interactions,
+    layout_mutations, layout_quantitative, layout_reference_slice_oriented,
+    layout_reference_translation, layout_sashimi, layout_variants, modification_code_color,
+    quantitative_data_range, reconcile_alignment_rows_with_horizon, record_object_id,
+    ultima_quality_color,
 };
 use rgv_render::{
-    AlignmentGpuFrame, AlignmentGpuRenderer, AlignmentGpuResidencyLease, AlignmentGpuSceneRequest,
-    AlignmentGpuScissor, NavigationPreviewInstance, NavigationPreviewRenderer, PrepareStats,
-    RectangleRenderer, export_png, navigation_preview_source_uv,
+    AlignmentGpuCameraCaptureError, AlignmentGpuFrame, AlignmentGpuPageAdmissionError,
+    AlignmentGpuPrefetchCursor, AlignmentGpuPrepareError, AlignmentGpuRenderer,
+    AlignmentGpuReplacementError, AlignmentGpuResidencyLease, AlignmentGpuRetirement,
+    AlignmentGpuSceneRequest, AlignmentGpuScissor, AlignmentSummaryFrameOverlays,
+    AlignmentSummaryGpuCameraCaptureError, AlignmentSummaryGpuFrame,
+    AlignmentSummaryGpuPageAdmissionError, AlignmentSummaryGpuPageKey,
+    AlignmentSummaryGpuPrefetchCursor, AlignmentSummaryGpuPrepareError,
+    AlignmentSummaryGpuRenderer, AlignmentSummaryGpuReplacementError,
+    AlignmentSummaryGpuResidencyLease, AlignmentSummaryGpuRetirement,
+    AlignmentSummaryGpuSceneRequest, GpuBudgetPressure, GpuReclaimGoal, GpuReclaimReport,
+    NavigationPreviewInstance, NavigationPreviewRenderer, PrepareStats, RectangleRenderer,
+    export_png, navigation_preview_source_uv,
 };
 use runtime::*;
 use sha2::{Digest as _, Sha256};
@@ -163,8 +186,8 @@ use winit::{
     window::{CursorGrabMode, CursorIcon, Theme, Window, WindowAttributes, WindowId},
 };
 use workspace::{
-    alignments::*, lists::*, navigation::*, navigation_preview::*, panels::*,
-    tracks::replace_panel_track_selection,
+    alignment_navigation::*, alignments::*, lists::*, navigation::*, navigation_preview::*,
+    panels::*, tracks::replace_panel_track_selection,
 };
 use workspace_lists::{
     WorkspaceListImport, WorkspaceListKind, import_workspace_list, region_bed_export,
@@ -833,6 +856,420 @@ struct AutomationAlignmentHandleTarget {
     record_index: usize,
 }
 
+/// Exact camera-and-layout destination for one native alignment publication. This deliberately
+/// excludes scene content, styling, hover, and selection: those can require a newer publication
+/// attempt without making pixels from the last successful attempt geometrically untruthful.
+#[derive(Clone, Debug, PartialEq)]
+struct AlignmentSceneTargetIdentity {
+    workspace_layout_revision: u64,
+    surface_size: [u32; 2],
+    scale_factor: f64,
+    panels: Vec<AlignmentPanelTargetIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AlignmentPanelTargetIdentity {
+    panel_id: PanelId,
+    viewport: Viewport,
+    lanes: Vec<AlignmentLaneTargetIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AlignmentLaneTargetIdentity {
+    track_id: TrackId,
+    preparation_camera: AlignmentSceneCamera,
+    read_camera: Option<AlignmentCamera>,
+    derived_lanes: Vec<AlignmentDerivedLaneTargetIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AlignmentDerivedLaneTargetIdentity {
+    kind: AlignmentDerivedLaneKind,
+    clip: CpuClipRect,
+}
+
+impl AlignmentSceneTargetIdentity {
+    fn from_panel_frames(
+        workspace_layout_revision: u64,
+        surface_size: [u32; 2],
+        scale_factor: f64,
+        frames: &HashMap<PanelId, AlignmentPanelSceneFrame>,
+    ) -> Self {
+        let mut panels = frames
+            .values()
+            .map(|frame| {
+                let mut lanes = frame
+                    .lanes
+                    .iter()
+                    .map(|lane| AlignmentLaneTargetIdentity {
+                        track_id: lane.track_id,
+                        preparation_camera: lane.preparation_camera,
+                        read_camera: lane.read_camera,
+                        derived_lanes: lane
+                            .derived_lanes
+                            .iter()
+                            .map(|derived| AlignmentDerivedLaneTargetIdentity {
+                                kind: derived.kind(),
+                                clip: derived.clip,
+                            })
+                            .collect(),
+                    })
+                    .collect::<Vec<_>>();
+                lanes.sort_by_key(|lane| lane.track_id);
+                AlignmentPanelTargetIdentity {
+                    panel_id: frame.panel_id,
+                    viewport: frame.viewport,
+                    lanes,
+                }
+            })
+            .collect::<Vec<_>>();
+        panels.sort_by_key(|panel| panel.panel_id);
+        Self {
+            workspace_layout_revision,
+            surface_size,
+            scale_factor,
+            panels,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AlignmentScenePublicationAttempt {
+    target: AlignmentSceneTargetIdentity,
+    target_revision: u64,
+    sequence: u64,
+    target_changed: bool,
+}
+
+/// Separates live camera/layout identity from attempts to publish content for that target. A
+/// recoverable failure therefore cannot invalidate a still-exact prior frame merely because a
+/// hover, selection, or same-target scene refresh tried to replace it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct AlignmentScenePublicationAuthority {
+    /// Last target whose semantic/native epoch committed successfully. It continues to own
+    /// rollback resources even while a newer desired target is being prepared.
+    target: Option<AlignmentSceneTargetIdentity>,
+    target_revision: u64,
+    target_revision_clock: u64,
+    /// Current live camera/layout target. Render, hit, live-region, and scroll exactness gate on
+    /// this identity immediately; a failed changed-target attempt cannot present old pixels as
+    /// though they described the new destination.
+    desired_target: Option<AlignmentSceneTargetIdentity>,
+    desired_target_revision: u64,
+    attempt_sequence: u64,
+}
+
+impl AlignmentScenePublicationAuthority {
+    fn begin_attempt(
+        &mut self,
+        target: &AlignmentSceneTargetIdentity,
+    ) -> AlignmentScenePublicationAttempt {
+        self.attempt_sequence = self
+            .attempt_sequence
+            .checked_add(1)
+            .expect("alignment scene publication attempt space was exhausted");
+        let target_changed = self.target.as_ref() != Some(target);
+        let target_revision = if !target_changed {
+            self.target_revision
+        } else if self.desired_target.as_ref() == Some(target) {
+            self.desired_target_revision
+        } else {
+            self.target_revision_clock
+                .checked_add(1)
+                .expect("alignment scene target revision space was exhausted")
+        };
+        self.target_revision_clock = self.target_revision_clock.max(target_revision);
+        self.desired_target = Some(target.clone());
+        self.desired_target_revision = target_revision;
+        AlignmentScenePublicationAttempt {
+            target: target.clone(),
+            target_revision,
+            sequence: self.attempt_sequence,
+            target_changed,
+        }
+    }
+
+    /// Transfers committed ownership only after semantic and native publication succeeded.
+    /// Same-target failure therefore retains exact pixels/hits; changed-target failure leaves the
+    /// old resources privately owned for rollback while desired-target gating keeps them off the
+    /// live render and interaction paths.
+    fn commit_attempt(&mut self, attempt: &AlignmentScenePublicationAttempt) -> bool {
+        if attempt.sequence != self.attempt_sequence {
+            return false;
+        }
+        if self.desired_target.as_ref() != Some(&attempt.target)
+            || self.desired_target_revision != attempt.target_revision
+        {
+            return false;
+        }
+        self.target = Some(attempt.target.clone());
+        self.target_revision = attempt.target_revision;
+        true
+    }
+
+    const fn desired_target_revision(&self) -> u64 {
+        self.desired_target_revision
+    }
+
+    fn desired_target_matches(&self, target: &AlignmentSceneTargetIdentity) -> bool {
+        self.desired_target.as_ref() == Some(target)
+    }
+
+    /// Whether the committed row profile remains an exact semantic authority for one lane even
+    /// though the complete pixel target changed. Row activity depends on the lane's genomic
+    /// interval and atlas lineage, not its visible-row camera, clip, scale factor, or surface
+    /// allocation. Atlas-lineage changes are reconciled separately when a semantic epoch commits.
+    fn committed_row_target_matches_desired(&self, panel_id: PanelId, track_id: TrackId) -> bool {
+        fn lane(
+            target: &AlignmentSceneTargetIdentity,
+            panel_id: PanelId,
+            track_id: TrackId,
+        ) -> Option<&AlignmentLaneTargetIdentity> {
+            target
+                .panels
+                .iter()
+                .find(|panel| panel.panel_id == panel_id)
+                .and_then(|panel| panel.lanes.iter().find(|lane| lane.track_id == track_id))
+        }
+        let (Some(committed), Some(desired)) = (
+            self.target
+                .as_ref()
+                .and_then(|target| lane(target, panel_id, track_id)),
+            self.desired_target
+                .as_ref()
+                .and_then(|target| lane(target, panel_id, track_id)),
+        ) else {
+            return false;
+        };
+        committed.read_camera.is_some()
+            && desired.read_camera.is_some()
+            && committed.preparation_camera.interval() == desired.preparation_camera.interval()
+    }
+
+    const fn attempt_sequence(&self) -> u64 {
+        self.attempt_sequence
+    }
+
+    const fn authorizes_target(&self, revision: u64) -> bool {
+        revision != 0 && revision == self.desired_target_revision
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// One logical rectangle that a successfully prepared native alignment presentation can paint for
+/// a specific panel-camera capture. Navigation preview composition consumes this authority rather
+/// than inferring readiness from the existence of a semantic lane or snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AlignmentNativeLiveRegion {
+    panel_id: PanelId,
+    target_revision: u64,
+    clip: CpuClipRect,
+}
+
+/// Exact read-lane authority published with the native frame. Hit testing consumes this record
+/// rather than inferring visibility from a semantic snapshot that may have survived a failed or
+/// superseded GPU replacement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AlignmentNativeReadAuthority {
+    panel_id: PanelId,
+    track_id: TrackId,
+    target_revision: u64,
+    source_request_token: AlignmentSceneRequestToken,
+    desired_request_token: AlignmentSceneRequestToken,
+    source_camera: AlignmentSceneCamera,
+    scene_revision: rgv_alignment_scene::SceneRevision,
+    clip: CpuClipRect,
+}
+
+/// Source provenance committed beside one panel lane, including lanes whose exact pixels or
+/// vertical activity are still pending. This is presentation authority, not worker staging state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AlignmentCommittedLaneAuthority {
+    panel_id: PanelId,
+    track_id: TrackId,
+    target_revision: u64,
+    source_request_token: AlignmentSceneRequestToken,
+    desired_request_token: AlignmentSceneRequestToken,
+    source_camera: AlignmentSceneCamera,
+    individual_reads: AlignmentIndividualReadCapability,
+    semantic_target_complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AlignmentGpuPreparedAuthority {
+    read_pages: Arc<[AlignmentPageKey]>,
+    summary_pages: Arc<[AlignmentSummaryGpuPageKey]>,
+}
+
+/// The only published native alignment presentation. Reads and every supported derived lane are
+/// assigned together after one shared replacement bundle settles, so the render loop cannot
+/// observe a mixture of camera epochs. A rolled-back older bundle may remain owned for the next
+/// retry. It remains visible after a failed same-target attempt, but is stale-gated as soon as the
+/// exact camera/layout target changes. Renderer-local sequences must match the successful attempt.
+struct AlignmentGpuFrameBundle {
+    target_revision: u64,
+    publication_attempt_sequence: u64,
+    /// Exact immutable prepared-page authority minted by the content replacement. Camera-only
+    /// frames and redraw-driven prefetch clone this authority instead of rebuilding complete
+    /// scene manifests on the UI thread.
+    prepared_authority: AlignmentGpuPreparedAuthority,
+    reads: Option<AlignmentGpuFrame>,
+    summaries: Option<AlignmentSummaryGpuFrame>,
+    live_regions: Vec<AlignmentNativeLiveRegion>,
+    lane_authorities: Vec<AlignmentCommittedLaneAuthority>,
+    read_authorities: Vec<AlignmentNativeReadAuthority>,
+}
+
+/// The single presentation commit point for semantic panel captures and their native derivative.
+/// `gpu_bundle` is `None` only synchronously while a replacement transaction has detached the old
+/// resources; no render, display, or hit-test code runs in that interval.
+struct PresentedAlignmentEpoch {
+    panel_frames: HashMap<PanelId, AlignmentPanelSceneFrame>,
+    gpu_bundle: Option<AlignmentGpuFrameBundle>,
+}
+
+impl PresentedAlignmentEpoch {
+    fn new(
+        panel_frames: HashMap<PanelId, AlignmentPanelSceneFrame>,
+        gpu_bundle: AlignmentGpuFrameBundle,
+    ) -> Self {
+        Self {
+            panel_frames,
+            gpu_bundle: Some(gpu_bundle),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PresentedAlignmentLane<'a> {
+    target_revision: u64,
+    lane: &'a rgv_alignment_scene::AlignmentPanelLaneFrame,
+    source: &'a AlignmentCommittedLaneAuthority,
+    read_authority: Option<&'a AlignmentNativeReadAuthority>,
+}
+
+fn alignment_gpu_sequences_match_attempt(
+    publication_attempt_sequence: u64,
+    read_sequences: Option<&[u64]>,
+    summary_sequences: Option<&[u64]>,
+) -> bool {
+    read_sequences.is_none_or(|sequences| {
+        sequences
+            .iter()
+            .all(|sequence| *sequence == publication_attempt_sequence)
+    }) && summary_sequences.is_none_or(|sequences| {
+        sequences
+            .iter()
+            .all(|sequence| *sequence == publication_attempt_sequence)
+    })
+}
+
+fn alignment_gpu_bundle_is_current(
+    bundle: &AlignmentGpuFrameBundle,
+    authority: &AlignmentScenePublicationAuthority,
+) -> bool {
+    // Desired, rather than merely committed, target authority is intentional: an old rollback
+    // epoch must never render or answer hits as if it described a newer camera/layout target.
+    authority.authorizes_target(bundle.target_revision)
+        && alignment_gpu_sequences_match_attempt(
+            bundle.publication_attempt_sequence,
+            bundle
+                .reads
+                .as_ref()
+                .map(|frame| frame.camera_sequences.as_ref()),
+            bundle
+                .summaries
+                .as_ref()
+                .map(|frame| frame.camera_sequences.as_ref()),
+        )
+}
+
+/// Speculative complete-scene pins are one unit because either renderer may need their shared
+/// budget for the next foreground bundle. Partial acquisition is never published here.
+struct AlignmentGpuResidencyBundle {
+    authority: AlignmentGpuPreparedAuthority,
+    _reads: Option<AlignmentGpuResidencyLease>,
+    _summaries: Option<AlignmentSummaryGpuResidencyLease>,
+}
+
+#[derive(Default)]
+struct AlignmentGpuPrefetchState {
+    reads: bool,
+    summaries: bool,
+    read_cursor: Option<AlignmentGpuPrefetchCursor>,
+    summary_cursor: Option<AlignmentSummaryGpuPrefetchCursor>,
+    read_residency: Option<AlignmentGpuResidencyLease>,
+    summary_residency: Option<AlignmentSummaryGpuResidencyLease>,
+}
+
+/// A recoverable foreground GPU publication refusal. Keeping the original ledger error typed
+/// lets the scheduler determine whether the exact obstruction still exists without parsing a
+/// user-facing diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AlignmentGpuPublicationBlocker {
+    Ledger(LedgerError),
+    /// A shared-ledger policy edit raced a replacement plan. The mismatch itself proves that the
+    /// refused plan is obsolete, so the next attempt must re-snapshot and re-plan exactly once.
+    PolicyRevisionChanged {
+        planned: u64,
+        current: u64,
+    },
+}
+
+/// Progress gate for one exact desired-target publication attempt. `Ready` is used only when the
+/// refusal itself proves that the obstruction settled before it could be recorded (for example,
+/// the reported replacement bundle is no longer active in the first post-error snapshot).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AlignmentGpuPublicationRetryGate {
+    AwaitingLedgerProgress(LedgerProgressEpoch),
+    ReadyAfterObservedProgress,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AlignmentGpuPublicationRetry {
+    target_revision: u64,
+    attempt_sequence: u64,
+    blocker: AlignmentGpuPublicationBlocker,
+    gate: AlignmentGpuPublicationRetryGate,
+}
+
+impl AlignmentGpuPrefetchState {
+    const fn pending(&self) -> bool {
+        self.reads || self.summaries
+    }
+
+    fn reset(&mut self, reads: bool, summaries: bool) {
+        *self = Self {
+            reads,
+            summaries,
+            ..Self::default()
+        };
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AlignmentGpuSpeculationPhase {
+    #[default]
+    Eligible,
+    Warming,
+    Resident,
+    Suppressed,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct AlignmentGpuSpeculationGate {
+    authority: Option<AlignmentGpuPreparedAuthority>,
+    budget_bytes: usize,
+    phase: AlignmentGpuSpeculationPhase,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct Viewer {
     application_instance_id: String,
@@ -847,20 +1284,22 @@ struct Viewer {
     surface_config: wgpu::SurfaceConfiguration,
     rectangle_renderer: RectangleRenderer,
     alignment_scene_ledger: AllocationLedger,
+    alignment_ledger_progress: LedgerProgressSubscription,
     alignment_gpu_renderer: AlignmentGpuRenderer,
-    alignment_gpu_frame: Option<AlignmentGpuFrame>,
-    alignment_gpu_residency: Option<AlignmentGpuResidencyLease>,
-    alignment_gpu_prefetch_pending: bool,
+    alignment_summary_gpu_renderer: AlignmentSummaryGpuRenderer,
+    alignment_presented_epoch: Option<PresentedAlignmentEpoch>,
+    alignment_gpu_residency_bundle: Option<AlignmentGpuResidencyBundle>,
+    alignment_gpu_prefetch: AlignmentGpuPrefetchState,
+    alignment_gpu_publication_retry: Option<AlignmentGpuPublicationRetry>,
+    alignment_gpu_speculation_gate: AlignmentGpuSpeculationGate,
     alignment_panel_scene_stores: HashMap<PanelId, AlignmentPanelSceneStore>,
-    alignment_panel_frames: HashMap<PanelId, AlignmentPanelSceneFrame>,
     alignment_scene_owner_clock: u64,
     alignment_scene_request_clock: u64,
-    alignment_scene_camera_revision: u64,
+    alignment_scene_publication_authority: AlignmentScenePublicationAuthority,
     navigation_preview_renderer: NavigationPreviewRenderer,
     navigation_texture_revisions: HashMap<PanelId, u64>,
     navigation_horizon_preview_stats: NavigationHorizonPreviewStats,
     navigation_stale_result_rejections: u64,
-    alignment_row_layout_cancellations: u64,
     egui_context: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
@@ -875,13 +1314,6 @@ struct Viewer {
     alignment_tracks: Vec<AlignmentTrackController>,
     empty_alignment: EmptyAlignmentState,
     alignment_retirement_tasks: Vec<JoinHandle<()>>,
-    alignment_row_layout_tasks: Vec<AlignmentRowLayoutTask>,
-    alignment_row_layout_scheduler_clock: GenerationClock,
-    alignment_row_layout_scheduler:
-        Scheduler<AlignmentRowLayoutWork, CompletedAlignmentRowLayoutWork>,
-    alignment_row_scene_tasks: Vec<AlignmentRowSceneTask>,
-    alignment_row_scene_scheduler_clock: GenerationClock,
-    alignment_row_scene_scheduler: Scheduler<AlignmentRowSceneWork, CompletedAlignmentRowSceneWork>,
     reference_engine: Option<ReferenceEngine>,
     /// Identity of the currently open FASTA handle. A panel slice is usable only when it carries
     /// this same revision; reopening an equivalent path still creates a distinct authority.

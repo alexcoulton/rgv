@@ -1,9 +1,9 @@
 use super::super::*;
 use crate::display::alignment::{
-    INDEX_ONLY_READ_NOTICE, ReadPanelKey, ReadPanelSpec, index_only_read_display,
-    index_only_read_notice, individual_read_refusal, materialized_alignment_row_range,
-    read_pane_layout, read_panel_bounds, read_panel_bounds_for_track, read_refusal_detail,
-    read_state_display,
+    INDEX_ONLY_READ_NOTICE, ReadPanelKey, ReadPanelSpec, alignment_scene_annotation_frame,
+    index_only_read_display, index_only_read_notice, individual_read_refusal,
+    materialized_alignment_row_range, read_pane_layout, read_panel_bounds,
+    read_panel_bounds_for_track, read_refusal_detail, read_state_display,
 };
 use crate::display::auxiliary::{
     feature_layout_row_count, feature_record_index_at_display_point,
@@ -77,7 +77,7 @@ fn scene_active_row_end_controls_scroll_extent_and_shrink_clamps_the_camera() {
 }
 
 #[test]
-fn pending_row_authority_hides_stale_extent_without_forgetting_the_stable_camera() {
+fn pending_row_authority_presents_retained_thumb_as_provisional_without_moving_camera() {
     let lineage =
         RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
     let coordinate_space = ReadRowCoordinateSpace::Unified(lineage);
@@ -107,8 +107,8 @@ fn pending_row_authority_hides_stale_extent_without_forgetting_the_stable_camera
     assert_eq!(state, settled, "pending work must remain purely latent");
     assert_eq!(
         read_panel_scrollbar_maximum(state, 500.0, ReadRowCoordinateAuthority::Pending),
-        0.0,
-        "the stale internal bound must never become the presented scrollbar extent"
+        600.0,
+        "pending activity must not flash a full-height zero-maximum thumb"
     );
     assert_eq!(
         read_panel_scrollbar_maximum(state, 500.0, ReadRowCoordinateAuthority::Absent),
@@ -138,6 +138,74 @@ fn pending_row_authority_hides_stale_extent_without_forgetting_the_stable_camera
         ),
         400.0
     );
+}
+
+#[test]
+fn stale_exact_scroll_cache_is_provisional_until_the_committed_target_rebuilds_it() {
+    let lineage =
+        RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(13, 17));
+    let exact = ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Unified(lineage));
+    let current = current_read_row_authority(4, 5, false, exact);
+    let state = ReadPanelScrollState {
+        scroll_points: 240.0,
+        content_bottom_points: 1_100.0,
+        ..ReadPanelScrollState::default()
+    };
+
+    assert_eq!(current, ReadRowCoordinateAuthority::Pending);
+    assert!(
+        !current.is_exact(),
+        "stale metrics must not remain interactive"
+    );
+    assert_eq!(
+        read_panel_scrollbar_maximum(state, 500.0, current),
+        600.0,
+        "the provisional waypoint must not collapse to a full-height zero-maximum thumb"
+    );
+}
+
+#[test]
+fn vertical_only_target_change_keeps_exact_scroll_authority() {
+    let lineage =
+        RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(13, 17));
+    let exact = ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Unified(lineage));
+
+    assert_eq!(current_read_row_authority(4, 5, true, exact), exact);
+}
+
+#[test]
+fn same_target_new_row_atlas_revokes_old_exact_scroll_authority() {
+    let coordinate_space =
+        RowCoordinateSpaceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(19, 23));
+    let old_atlas = RowAtlasRevision::new(rgv_alignment_scene::RevisionFingerprint::new(29, 31));
+    let new_atlas = RowAtlasRevision::new(rgv_alignment_scene::RevisionFingerprint::new(37, 41));
+    let exact =
+        ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Unified(coordinate_space));
+
+    assert!(read_row_cache_matches_committed_activity(
+        7,
+        exact,
+        Some(old_atlas),
+        Some(800),
+        7,
+        Some((coordinate_space, old_atlas, 800)),
+    ));
+    assert!(!read_row_cache_matches_committed_activity(
+        7,
+        exact,
+        Some(old_atlas),
+        Some(800),
+        7,
+        Some((coordinate_space, new_atlas, 800)),
+    ));
+    assert!(read_row_cache_matches_committed_activity(
+        7,
+        ReadRowCoordinateAuthority::Pending,
+        None,
+        Some(800),
+        7,
+        None,
+    ));
 }
 
 #[test]
@@ -753,6 +821,7 @@ fn annotation_tree_does_not_duplicate_a_composite_member_row() {
         subtracks: Vec::new(),
     };
     overlay.subtracks.push(TrackSubtrack {
+        alignment_subtrack: None,
         label: "member".to_owned(),
         detail: None,
         top: 22.0,
@@ -862,6 +931,41 @@ fn read_density_does_not_change_alignment_annotation_lane_heights() {
     assert_eq!(
         alignment_annotation_lane_heights(&filters).junction,
         PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT
+    );
+}
+
+#[test]
+fn unified_annotation_lane_layout_exists_without_a_legacy_query() {
+    let mut config = SessionAlignmentTrack::new(
+        TrackId::new(77),
+        "RNA scene".to_owned(),
+        TrackSource::Local {
+            path: "rna.bam".to_owned(),
+        },
+    );
+    config.filters.show_coverage = true;
+    config.filters.show_junctions = true;
+    config.filters.show_modification_frequency = true;
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 10_100).unwrap(),
+        800.0,
+    )
+    .unwrap();
+
+    let frame = alignment_scene_annotation_frame(&config, viewport, 30.0, None);
+    assert_eq!(frame.key, TrackFrameKey::Alignment(config.id));
+    assert!(frame.bottom > frame.top + 22.0);
+    assert_eq!(
+        frame
+            .subtracks
+            .iter()
+            .map(|subtrack| (subtrack.alignment_subtrack, subtrack.collapsed))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(AlignmentSubtrack::Coverage), false),
+            (Some(AlignmentSubtrack::Sashimi), false),
+            (Some(AlignmentSubtrack::Modifications), false),
+        ]
     );
 }
 
@@ -1552,6 +1656,7 @@ fn alignment_lane_picking_distinguishes_scrolled_read_groups() {
             collapsed: false,
             frozen_bottom: Some(322.0),
             subtracks: vec![TrackSubtrack {
+                alignment_subtrack: Some(AlignmentSubtrack::Reads),
                 label: "Reads".to_owned(),
                 detail: None,
                 top: 325.0,
@@ -1572,6 +1677,7 @@ fn alignment_lane_picking_distinguishes_scrolled_read_groups() {
             collapsed: false,
             frozen_bottom: Some(522.0),
             subtracks: vec![TrackSubtrack {
+                alignment_subtrack: Some(AlignmentSubtrack::Reads),
                 label: "Reads".to_owned(),
                 detail: None,
                 top: 525.0,
@@ -1584,19 +1690,43 @@ fn alignment_lane_picking_distinguishes_scrolled_read_groups() {
 
     assert_eq!(
         alignment_lane_at_screen_y(
-            &frames, "Reads", 350.0, 0.0, 0.0, 300.0, 100.0, 100.0, 800.0,
+            &frames,
+            AlignmentSubtrack::Reads,
+            350.0,
+            0.0,
+            0.0,
+            300.0,
+            100.0,
+            100.0,
+            800.0,
         ),
         Some(TrackId::new(10))
     );
     assert_eq!(
         alignment_lane_at_screen_y(
-            &frames, "Reads", 350.0, 200.0, 0.0, 300.0, 100.0, 100.0, 800.0,
+            &frames,
+            AlignmentSubtrack::Reads,
+            350.0,
+            200.0,
+            0.0,
+            300.0,
+            100.0,
+            100.0,
+            800.0,
         ),
         Some(TrackId::new(11))
     );
     assert_eq!(
         alignment_lane_at_screen_y(
-            &frames, "Reads", 250.0, 200.0, 0.0, 300.0, 100.0, 100.0, 800.0,
+            &frames,
+            AlignmentSubtrack::Reads,
+            250.0,
+            200.0,
+            0.0,
+            300.0,
+            100.0,
+            100.0,
+            800.0,
         ),
         None,
         "a read lane must not be pickable through the annotation pane"
@@ -1617,6 +1747,7 @@ fn collapsed_alignment_lanes_are_not_pickable() {
         collapsed: false,
         frozen_bottom: Some(180.0),
         subtracks: vec![TrackSubtrack {
+            alignment_subtrack: Some(AlignmentSubtrack::Coverage),
             label: "Coverage".to_owned(),
             detail: None,
             top: 122.0,
@@ -1628,7 +1759,15 @@ fn collapsed_alignment_lanes_are_not_pickable() {
 
     assert_eq!(
         alignment_lane_at_screen_y(
-            &frames, "Coverage", 130.0, 0.0, 0.0, 180.0, 180.0, 100.0, 500.0,
+            &frames,
+            AlignmentSubtrack::Coverage,
+            130.0,
+            0.0,
+            0.0,
+            180.0,
+            180.0,
+            100.0,
+            500.0,
         ),
         None
     );

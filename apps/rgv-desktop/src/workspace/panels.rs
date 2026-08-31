@@ -22,12 +22,18 @@ pub(crate) struct PanelScrollDisplayCache {
 
 pub(crate) struct ReadPanelDisplayCache {
     pub(crate) track_id: TrackId,
+    /// Target revision of the committed native epoch which supplied unified row authority. Zero
+    /// denotes legacy, absent, or desired-but-not-yet-presented state.
+    pub(crate) presentation_target_revision: u64,
     pub(crate) scrollable: DisplayList,
     pub(crate) density_camera: bool,
     /// World-space y coordinate of stable read row zero.
     pub(crate) row_origin: Option<f32>,
     pub(crate) row_height: Option<f32>,
     pub(crate) row_coordinate_authority: ReadRowCoordinateAuthority,
+    /// Immutable activity atlas revision which supplied exact vertical extent and navigator
+    /// density. `None` is required for Pending/Absent and every legacy CPU cache.
+    pub(crate) row_activity_atlas_revision: Option<RowAtlasRevision>,
     pub(crate) materialized_row_range: Option<(usize, usize)>,
     pub(crate) total_rows: Option<usize>,
     /// Optional semantic authority for the read navigator miniature. `Some(empty)` is
@@ -53,10 +59,10 @@ pub(crate) enum ReadRowCoordinateSpace {
 
 /// Whether the current display cache can describe the vertical row coordinate space exactly.
 ///
-/// `Pending` is deliberately not an extent authority: it is used while a compatible retained
-/// scene overlaps the new genomic camera but does not contain it yet. The previous vertical
-/// camera remains latent during that short acquisition window, while the scrollbar itself stays
-/// empty until a camera-exact profile arrives.
+/// `Pending` is deliberately not an extent authority: it is used while truthful pixels can be
+/// shown for the new genomic camera before its exact activity profile arrives. The previous
+/// vertical camera and thumb geometry remain visible as a provisional, noninteractive waypoint;
+/// exact row consumers continue to reject it until the committed profile arrives.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadRowCoordinateAuthority {
     Absent,
@@ -80,6 +86,61 @@ impl ReadRowCoordinateAuthority {
         match self {
             Self::Exact(coordinate_space) => Some(coordinate_space),
             Self::Absent | Self::Pending => None,
+        }
+    }
+}
+
+/// Downgrades an old unified cache to provisional authority when native publication moves to a
+/// target whose row semantics differ. A vertical camera, clip, or surface-only change may advance
+/// the full pixel target while the same genomic row profile remains exact; callers prove that
+/// narrower compatibility independently. Legacy caches use revision zero and remain governed by
+/// their own lineage.
+pub(crate) const fn current_read_row_authority(
+    cached_target_revision: u64,
+    current_target_revision: u64,
+    committed_row_target_still_exact: bool,
+    authority: ReadRowCoordinateAuthority,
+) -> ReadRowCoordinateAuthority {
+    if cached_target_revision == 0
+        || cached_target_revision == current_target_revision
+        || committed_row_target_still_exact
+    {
+        authority
+    } else {
+        match authority {
+            ReadRowCoordinateAuthority::Exact(_) | ReadRowCoordinateAuthority::Pending => {
+                ReadRowCoordinateAuthority::Pending
+            }
+            ReadRowCoordinateAuthority::Absent => ReadRowCoordinateAuthority::Absent,
+        }
+    }
+}
+
+/// Compares one cached scrollbar derivative with the exact row authority committed beside native
+/// pixels. Target revision alone is insufficient because an exact worker publication can replace
+/// the row atlas/profile without moving the camera.
+pub(crate) fn read_row_cache_matches_committed_activity(
+    cached_target_revision: u64,
+    cached_authority: ReadRowCoordinateAuthority,
+    cached_atlas_revision: Option<RowAtlasRevision>,
+    cached_total_rows: Option<usize>,
+    committed_target_revision: u64,
+    committed_activity: Option<(RowCoordinateSpaceRevision, RowAtlasRevision, usize)>,
+) -> bool {
+    match committed_activity {
+        Some((coordinate_space, atlas_revision, active_row_end)) => {
+            cached_target_revision == committed_target_revision
+                && cached_authority
+                    == ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Unified(
+                        coordinate_space,
+                    ))
+                && cached_atlas_revision == Some(atlas_revision)
+                && cached_total_rows == Some(active_row_end)
+        }
+        None => {
+            cached_target_revision == committed_target_revision
+                && cached_authority == ReadRowCoordinateAuthority::Pending
+                && cached_atlas_revision.is_none()
         }
     }
 }
@@ -165,6 +226,7 @@ impl PendingReadSelection {
         Some(selection)
     }
 
+    #[cfg(test)]
     pub(crate) fn matching_index(&self, query: &AlignmentQuery) -> Option<usize> {
         (0..query.batch.len()).find(|index| {
             query.batch.read_name(*index) == Some(self.read_name.as_slice())
@@ -185,6 +247,7 @@ impl PendingReadSelection {
 
     /// Keeps the exact semantic identity after binding it to one query-local
     /// record index. Reveal is a one-shot navigation request; identity is not.
+    #[cfg(test)]
     pub(crate) fn retained_after_resolution(
         mut self,
         record: Option<&AlignmentRecord>,

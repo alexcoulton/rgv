@@ -11,7 +11,7 @@ struct Stamped<T> {
 
 struct MailboxState<T> {
     controls: VecDeque<Stamped<T>>,
-    latest: VecDeque<(u64, Stamped<T>)>,
+    latest: VecDeque<(u128, Stamped<T>)>,
     next_sequence: u128,
     sender_open: bool,
     receiver_open: bool,
@@ -109,6 +109,32 @@ impl<T> CoalescingSender<T> {
     /// value supersedes only that owner's unread value; other panels retain
     /// their own latest result.
     pub(crate) fn send_latest_for(&self, owner: u64, value: T) -> Result<(), T> {
+        self.send_latest_for_key(u128::from(owner), value)
+    }
+
+    /// Publishes replaceable process-wide work outside the owner key space. A policy retry is
+    /// source-scoped rather than panel-owned, so even `u64::MAX` must remain a valid owner key.
+    pub(crate) fn send_latest_system(&self, key: u64, value: T) -> Result<(), T> {
+        self.send_latest_for_key(u128::from(u64::MAX) + 1 + u128::from(key), value)
+    }
+
+    /// Publishes owner-scoped work in a system namespace without colliding with viewport-owner
+    /// keys or another system work class. This is used for resumptions which must neither fill a
+    /// control FIFO nor replace an unread newer camera.
+    pub(crate) fn send_latest_system_for(
+        &self,
+        namespace: u64,
+        owner: u64,
+        value: T,
+    ) -> Result<(), T> {
+        let width = u128::from(u64::MAX) + 1;
+        let key = width
+            .saturating_mul(u128::from(namespace).saturating_add(1))
+            .saturating_add(u128::from(owner));
+        self.send_latest_for_key(key, value)
+    }
+
+    fn send_latest_for_key(&self, key: u128, value: T) -> Result<(), T> {
         let mut state = self.inner.state.lock().expect("mailbox mutex poisoned");
         if !state.receiver_open {
             return Err(value);
@@ -116,12 +142,12 @@ impl<T> CoalescingSender<T> {
         if let Some(index) = state
             .latest
             .iter()
-            .position(|(candidate, _)| *candidate == owner)
+            .position(|(candidate, _)| *candidate == key)
         {
             state.latest.remove(index);
         }
         let stamped = stamp(&mut state, value);
-        state.latest.push_back((owner, stamped));
+        state.latest.push_back((key, stamped));
         self.inner.has_data.notify_one();
         Ok(())
     }
@@ -237,6 +263,32 @@ mod tests {
 
         assert_eq!(receiver.try_receive().unwrap(), Some("panel 2"));
         assert_eq!(receiver.try_receive().unwrap(), Some("panel 1 new"));
+        assert_eq!(receiver.try_receive().unwrap(), None);
+    }
+
+    #[test]
+    fn system_latest_key_cannot_replace_the_maximum_owner_key() {
+        let (sender, receiver) = bounded_coalescing(1);
+        sender.send_latest_for(u64::MAX, "owner").unwrap();
+        sender.send_latest_system(0, "old policy").unwrap();
+        sender.send_latest_system(0, "new policy").unwrap();
+
+        assert_eq!(receiver.try_receive().unwrap(), Some("owner"));
+        assert_eq!(receiver.try_receive().unwrap(), Some("new policy"));
+        assert_eq!(receiver.try_receive().unwrap(), None);
+    }
+
+    #[test]
+    fn owner_scoped_system_namespaces_do_not_replace_cameras_or_each_other() {
+        let (sender, receiver) = bounded_coalescing(1);
+        sender.send_latest_for(7, "camera").unwrap();
+        sender.send_latest_system_for(1, 7, "old retry").unwrap();
+        sender.send_latest_system_for(2, 7, "other work").unwrap();
+        sender.send_latest_system_for(1, 7, "new retry").unwrap();
+
+        assert_eq!(receiver.try_receive().unwrap(), Some("camera"));
+        assert_eq!(receiver.try_receive().unwrap(), Some("other work"));
+        assert_eq!(receiver.try_receive().unwrap(), Some("new retry"));
         assert_eq!(receiver.try_receive().unwrap(), None);
     }
 

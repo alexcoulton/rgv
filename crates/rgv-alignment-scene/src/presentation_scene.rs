@@ -1,4 +1,10 @@
-use std::{collections::HashSet, mem::size_of, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    mem::size_of,
+    num::{NonZeroU32, NonZeroU64},
+    ops::Range,
+    sync::Arc,
+};
 
 use rgv_core::GenomicInterval;
 use rgv_hts::{AlignmentRecord, PackedRecordError};
@@ -7,9 +13,17 @@ use thiserror::Error;
 use crate::{
     AlignmentHandle, AlignmentPageFamily, AlignmentPageKey, AlignmentRowAtlas,
     AlignmentRowAtlasPins, AlignmentSemanticPage, AllocationClass, AllocationLease,
-    AllocationLedger, CapabilityRequirement, EvidencePins, EvidenceRoot, EvidenceSelectionError,
-    LedgerError, PinnedAllocationLease, PresentationContract, ReservationKind, SceneRevision,
+    AllocationLedger, CanonicalGenomicTile, CanonicalRowBlock, CapabilityRequirement, EvidencePins,
+    EvidenceRoot, EvidenceSelectionError, LedgerError, PinnedAllocationLease, PresentationContract,
+    ReservationKind, SceneRevision,
 };
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct AlignmentPageSpatialKey {
+    tile: CanonicalGenomicTile,
+    row_block: CanonicalRowBlock,
+    family: AlignmentPageFamily,
+}
 
 /// One immutable, interaction-ready alignment presentation authority. Evidence, rows, mandatory
 /// CPU semantic pages, and their pins enter and leave publication together.
@@ -22,6 +36,11 @@ pub struct AlignmentPresentationScene {
     prepared_interval: GenomicInterval,
     prepared_rows: Range<u32>,
     pages: Arc<[Arc<AlignmentSemanticPage>]>,
+    page_keys: Arc<[AlignmentPageKey]>,
+    page_index: HashMap<AlignmentPageSpatialKey, usize>,
+    page_tile_bases: NonZeroU64,
+    page_row_block_rows: NonZeroU32,
+    maximum_handle_primitives_per_page: usize,
     metadata_allocation: AllocationLease,
     _pins: AlignmentPresentationScenePins,
 }
@@ -57,7 +76,46 @@ impl AlignmentPresentationScene {
             &pages,
         )?;
         pages.sort_unstable_by_key(|page| page.key());
-        let metadata_bytes = scene_metadata_bytes(pages.len());
+        let first_key = pages
+            .first()
+            .expect("validated interaction-ready scenes contain semantic pages")
+            .key();
+        let page_tile_bases = first_key.genomic_tile().bases();
+        let page_row_block_rows = first_key.row_block().rows();
+        let mut page_index = HashMap::with_capacity(pages.len());
+        for (index, page) in pages.iter().enumerate() {
+            let key = page.key();
+            let spatial = AlignmentPageSpatialKey {
+                tile: key.genomic_tile(),
+                row_block: key.row_block(),
+                family: key.family(),
+            };
+            assert!(
+                page_index.insert(spatial, index).is_none(),
+                "validated presentation pages have unique spatial identities"
+            );
+        }
+        page_index.shrink_to_fit();
+        let mut page_keys = pages.iter().map(|page| page.key()).collect::<Vec<_>>();
+        // Warm one horizontal browsing band at a time. Visible pages are admitted atomically by
+        // the foreground replacement; this ordering then fills every prepared genomic tile for
+        // the nearest/top row block before proceeding deeper down the stack.
+        page_keys.sort_unstable_by_key(|key| {
+            (
+                key.row_block(),
+                key.genomic_tile(),
+                key.family(),
+                key.lod(),
+                *key,
+            )
+        });
+        let page_keys = page_keys.into();
+        let maximum_handle_primitives_per_page = pages
+            .iter()
+            .map(|page| page_maximum_handle_primitives(page))
+            .max()
+            .unwrap_or(0);
+        let metadata_bytes = scene_metadata_bytes(pages.len(), page_index.capacity());
         let mut reservation = ledger.reserve(
             AllocationClass::PresentationScene,
             metadata_bytes,
@@ -80,6 +138,11 @@ impl AlignmentPresentationScene {
             prepared_interval,
             prepared_rows,
             pages: pages.into(),
+            page_keys,
+            page_index,
+            page_tile_bases,
+            page_row_block_rows,
+            maximum_handle_primitives_per_page,
             metadata_allocation,
             _pins: AlignmentPresentationScenePins {
                 _evidence: evidence_pins,
@@ -125,6 +188,111 @@ impl AlignmentPresentationScene {
         &self.pages
     }
 
+    /// Exact sorted immutable page authority, constructed on the scene worker rather than during
+    /// a UI-frame replacement.
+    #[must_use]
+    pub const fn page_keys(&self) -> &Arc<[AlignmentPageKey]> {
+        &self.page_keys
+    }
+
+    /// Largest non-label primitive count owned by one stable handle in one canonical page. The
+    /// renderer combines this worker-built scalar with its exact camera-page envelope, avoiding a
+    /// complete primitive scan and avoiding buffers sized for pages that cannot be visible at once.
+    #[must_use]
+    pub const fn maximum_handle_primitives_per_page(&self) -> usize {
+        self.maximum_handle_primitives_per_page
+    }
+
+    /// Conservative number of canonical pages which any camera of the supplied genomic/row span
+    /// can expose inside this scene. Boundary crossings account for one additional tile/block;
+    /// the result is clamped to the prepared authority.
+    #[must_use]
+    pub fn camera_page_envelope(&self, genomic_bases: u64, visible_rows: u32) -> usize {
+        if genomic_bases == 0 || visible_rows == 0 || self.prepared_rows.is_empty() {
+            return 0;
+        }
+        let tile_bases = self.page_tile_bases.get();
+        let prepared_first_tile = self.prepared_interval.start() / tile_bases;
+        let prepared_last_tile = self.prepared_interval.end().saturating_sub(1) / tile_bases;
+        let prepared_tiles = prepared_last_tile
+            .saturating_sub(prepared_first_tile)
+            .saturating_add(1);
+        let camera_tiles = genomic_bases
+            .saturating_sub(1)
+            .checked_div(tile_bases)
+            .unwrap_or(0)
+            .saturating_add(2)
+            .min(prepared_tiles);
+
+        let block_rows = self.page_row_block_rows.get();
+        let prepared_first_block = self.prepared_rows.start / block_rows;
+        let prepared_last_block = self.prepared_rows.end.saturating_sub(1) / block_rows;
+        let prepared_blocks = prepared_last_block
+            .saturating_sub(prepared_first_block)
+            .saturating_add(1);
+        let camera_blocks = visible_rows
+            .saturating_sub(1)
+            .checked_div(block_rows)
+            .unwrap_or(0)
+            .saturating_add(2)
+            .min(prepared_blocks);
+        usize::try_from(camera_tiles)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(usize::try_from(camera_blocks).unwrap_or(usize::MAX))
+            .saturating_mul(self.presentation.required_page_families().len())
+            .min(self.pages.len())
+    }
+
+    /// Exact primitive count for the current stable-handle interaction set. A supplementary chain
+    /// may contain more than three handles, so replacement planning takes the maximum of this
+    /// indexed result and the baseline envelope. Cost is proportional to selected handles and
+    /// the canonical pages those handles occupy, never the complete scene.
+    #[must_use]
+    pub fn interaction_overlay_instances(
+        &self,
+        interaction: &crate::AlignmentInteractionState,
+    ) -> usize {
+        let mut handles =
+            HashSet::with_capacity(interaction.selected_chain().len().saturating_add(2));
+        handles.extend(interaction.hovered());
+        handles.extend(interaction.selected());
+        handles.extend(interaction.selected_chain().iter().copied());
+        handles.into_iter().fold(0_usize, |total, handle| {
+            let Some(hit) = self.atlas.record(handle) else {
+                return total;
+            };
+            let record = hit.record;
+            let Ok(interval) = GenomicInterval::new(
+                self.prepared_interval.contig(),
+                record.start(),
+                record.end().max(record.start().saturating_add(1)),
+            ) else {
+                return total;
+            };
+            let count = self
+                .visible_pages(interval, record.row()..record.row().saturating_add(1))
+                .into_iter()
+                .flat_map(|page| page.primitives())
+                .filter(|primitive| {
+                    primitive.handle == handle
+                        && !matches!(primitive.component, crate::AlignmentComponent::Label { .. })
+                })
+                .count();
+            total.saturating_add(count)
+        })
+    }
+
+    /// Resolves one immutable semantic page by its complete content identity. Scene construction
+    /// keeps the page table sorted, so redraw-time cursors can advance through a previously
+    /// minted authority without rebuilding or hashing the complete page manifest.
+    #[must_use]
+    pub fn page_for_key(&self, key: AlignmentPageKey) -> Option<&Arc<AlignmentSemanticPage>> {
+        self.pages
+            .binary_search_by_key(&key, |page| page.key())
+            .ok()
+            .map(|index| &self.pages[index])
+    }
+
     #[must_use]
     pub const fn metadata_allocation(&self) -> &AllocationLease {
         &self.metadata_allocation
@@ -143,11 +311,49 @@ impl AlignmentPresentationScene {
         interval: GenomicInterval,
         rows: Range<u32>,
     ) -> Vec<&Arc<AlignmentSemanticPage>> {
-        self.pages
-            .iter()
-            .filter(|page| page.interval().overlaps(interval))
-            .filter(|page| ranges_overlap(page.row_range(), rows.clone()))
-            .collect()
+        let Some(interval) = interval.intersection(self.prepared_interval) else {
+            return Vec::new();
+        };
+        let rows = rows.start.max(self.prepared_rows.start)..rows.end.min(self.prepared_rows.end);
+        if rows.start >= rows.end {
+            return Vec::new();
+        }
+        let first_tile = interval.start() / self.page_tile_bases.get();
+        let last_tile = interval.end().saturating_sub(1) / self.page_tile_bases.get();
+        let first_row_block = rows.start / self.page_row_block_rows.get();
+        let last_row_block = rows.end.saturating_sub(1) / self.page_row_block_rows.get();
+        let families = self.presentation.required_page_families();
+        let capacity = usize::try_from(last_tile.saturating_sub(first_tile).saturating_add(1))
+            .unwrap_or(usize::MAX)
+            .saturating_mul(
+                usize::try_from(
+                    last_row_block
+                        .saturating_sub(first_row_block)
+                        .saturating_add(1),
+                )
+                .unwrap_or(usize::MAX),
+            )
+            .saturating_mul(families.len());
+        let mut visible = Vec::with_capacity(capacity.min(self.pages.len()));
+        for tile_coordinate in first_tile..=last_tile {
+            let tile =
+                CanonicalGenomicTile::new(interval.contig(), tile_coordinate, self.page_tile_bases);
+            for row_coordinate in first_row_block..=last_row_block {
+                let row_block = CanonicalRowBlock::new(row_coordinate, self.page_row_block_rows);
+                for family in families.iter().copied() {
+                    let spatial = AlignmentPageSpatialKey {
+                        tile,
+                        row_block,
+                        family,
+                    };
+                    if let Some(index) = self.page_index.get(&spatial).copied() {
+                        visible.push(&self.pages[index]);
+                    }
+                }
+            }
+        }
+        visible.sort_unstable_by_key(|page| page.key());
+        visible
     }
 
     /// Materialises the payload retained by this immutable scene for one stable handle. Hover and
@@ -449,13 +655,29 @@ fn validate_mandatory_coverage(
     Ok(())
 }
 
-const fn ranges_overlap(left: Range<u32>, right: Range<u32>) -> bool {
-    left.start < right.end && left.end > right.start
-}
-
-const fn scene_metadata_bytes(pages: usize) -> usize {
+const fn scene_metadata_bytes(pages: usize, page_index_capacity: usize) -> usize {
     size_of::<AlignmentPresentationScene>()
         .saturating_add(pages.saturating_mul(size_of::<Arc<AlignmentSemanticPage>>()))
+        .saturating_add(pages.saturating_mul(size_of::<AlignmentPageKey>()))
+        // Hash-table bucket/control overhead is implementation-specific. Charge two key/value
+        // widths per reserved bucket so the index is conservatively inside the scene budget.
+        .saturating_add(
+            page_index_capacity
+                .saturating_mul(size_of::<(AlignmentPageSpatialKey, usize)>())
+                .saturating_mul(2),
+        )
+}
+
+fn page_maximum_handle_primitives(page: &AlignmentSemanticPage) -> usize {
+    let mut by_handle = HashMap::<AlignmentHandle, usize>::new();
+    for primitive in page
+        .primitives()
+        .iter()
+        .filter(|primitive| !matches!(primitive.component, crate::AlignmentComponent::Label { .. }))
+    {
+        *by_handle.entry(primitive.handle).or_default() += 1;
+    }
+    by_handle.into_values().max().unwrap_or(0)
 }
 
 #[derive(Debug, Error)]

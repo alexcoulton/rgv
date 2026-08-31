@@ -1184,11 +1184,46 @@ impl Viewer {
         let scale = self.window.scale_factor().max(f64::EPSILON);
         let x = self.cursor.x / scale;
         let y = self.cursor.y / scale;
-        let frame = self.alignment_panel_frames.get(&self.panels.active().id)?;
+        let panel_id = self.panels.active().id;
+        let epoch = self.alignment_presented_epoch.as_ref()?;
+        let frame = epoch.panel_frames.get(&panel_id)?;
+        let bundle = epoch.gpu_bundle.as_ref()?;
+        let reads = bundle.reads.as_ref()?;
+        if !alignment_gpu_bundle_is_current(bundle, &self.alignment_scene_publication_authority)
+            || frame.camera_revision != bundle.target_revision
+            || reads
+                .camera_sequences
+                .iter()
+                .any(|sequence| *sequence != bundle.publication_attempt_sequence)
+        {
+            return None;
+        }
         frame
             .lanes
             .iter()
             .filter_map(|lane| {
+                lane.read_camera?;
+                let scene = lane.snapshot.as_ref()?.reads();
+                let source = bundle.lane_authorities.iter().find(|authority| {
+                    authority.panel_id == panel_id
+                        && authority.track_id == lane.track_id
+                        && authority.target_revision == bundle.target_revision
+                        && authority.source_camera == lane.preparation_camera
+                })?;
+                let authority = bundle.read_authorities.iter().find(|authority| {
+                    authority.panel_id == panel_id
+                        && authority.track_id == lane.track_id
+                        && authority.target_revision == bundle.target_revision
+                        && authority.source_request_token == source.source_request_token
+                        && authority.desired_request_token == source.desired_request_token
+                        && authority.source_camera == lane.preparation_camera
+                        && authority.scene_revision == scene.revision()
+                })?;
+                let clip = authority.clip;
+                if x < clip.x || x >= clip.x + clip.width || y < clip.y || y >= clip.y + clip.height
+                {
+                    return None;
+                }
                 CpuAlignmentProjector::pick_panel_lane(lane, x, y)
                     .ok()
                     .flatten()

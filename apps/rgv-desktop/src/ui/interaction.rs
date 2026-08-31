@@ -1247,10 +1247,6 @@ impl Viewer {
         panel.content_bottom_points = self.canvas_geometry().viewport.top();
         anyhow::ensure!(self.panels.push(panel), "view panel identity collision");
         self.invalidate_navigation_preview_contract("view panel added");
-        for track in &mut self.alignment_tracks {
-            track.projection_mut(id).pending_query =
-                !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
-        }
         self.synchronize_panel_widths();
         self.activate_view_panel(id);
         self.request_all_panel_queries();
@@ -1341,7 +1337,14 @@ impl Viewer {
     }
 
     fn read_panel_row_authority(&self, track_id: TrackId) -> ReadRowCoordinateAuthority {
-        self.panels
+        let current_target_revision = self
+            .alignment_scene_publication_authority
+            .desired_target_revision();
+        let row_target_compatible = self
+            .alignment_scene_publication_authority
+            .committed_row_target_matches_desired(self.panels.active().id, track_id);
+        let Some(panel) = self
+            .panels
             .active()
             .scroll_display_cache
             .as_ref()
@@ -1351,9 +1354,15 @@ impl Viewer {
                     .iter()
                     .find(|panel| panel.track_id == track_id)
             })
-            .map_or(ReadRowCoordinateAuthority::Absent, |panel| {
-                panel.row_coordinate_authority
-            })
+        else {
+            return ReadRowCoordinateAuthority::Absent;
+        };
+        current_read_row_authority(
+            panel.presentation_target_revision,
+            current_target_revision,
+            row_target_compatible,
+            panel.row_coordinate_authority,
+        )
     }
 
     fn read_panel_presented_scroll_maximum(&self, track_id: TrackId, clip_bottom: f32) -> f32 {

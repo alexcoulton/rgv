@@ -42,6 +42,15 @@ impl Viewer {
         panel_id: PanelId,
         target: NavigationQueryTarget,
     ) {
+        // Unified scene lanes retain and reproject their semantic pages directly. Query-local
+        // read geometry is neither a preview nor a fallback for a supported source.
+        if self
+            .alignment_tracks
+            .iter()
+            .any(|track| track.scene_engine.is_some())
+        {
+            return;
+        }
         self.navigation_horizon_preview_stats.eligibility_checks = self
             .navigation_horizon_preview_stats
             .eligibility_checks
@@ -213,10 +222,9 @@ impl Viewer {
                             && frame.key == TrackFrameKey::Alignment(track.config.id)
                     })
                     .and_then(|frame| {
-                        frame
-                            .subtracks
-                            .iter()
-                            .find(|subtrack| subtrack.label == "Reads")
+                        frame.subtracks.iter().find(|subtrack| {
+                            subtrack.alignment_subtrack == Some(AlignmentSubtrack::Reads)
+                        })
                     })
                     .map_or(read_panel.clip_top + ui::TRACK_HEADER_HEIGHT, |subtrack| {
                         subtrack.top

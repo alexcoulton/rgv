@@ -132,19 +132,19 @@ pub(crate) fn reconcile_read_panel_scroll_for_authority(
     exact
 }
 
-/// An unsettled read scene may retain its old content bound internally solely to preserve the
-/// camera. Neither pending nor absent row authority exposes that stale bound through the live
-/// scrollbar.
+/// Pending activity keeps the last exact thumb geometry visible as a provisional, noninteractive
+/// waypoint. It does not promote the retained bound to exact row authority: gesture code still
+/// rejects every non-`Exact` state. `Absent` has no presented lane and exposes no extent.
 pub(crate) fn read_panel_scrollbar_maximum(
     state: ReadPanelScrollState,
     clip_bottom: f32,
     authority: ReadRowCoordinateAuthority,
 ) -> f32 {
     match authority {
-        ReadRowCoordinateAuthority::Exact(_) => {
+        ReadRowCoordinateAuthority::Exact(_) | ReadRowCoordinateAuthority::Pending => {
             (state.content_bottom_points - clip_bottom).max(0.0)
         }
-        ReadRowCoordinateAuthority::Absent | ReadRowCoordinateAuthority::Pending => 0.0,
+        ReadRowCoordinateAuthority::Absent => 0.0,
     }
 }
 
@@ -289,9 +289,13 @@ pub(crate) fn reference_bases_label(reverse_complement: bool) -> String {
     }
 }
 
-pub(super) fn collapsed_alignment_subtrack(label: &str, top: f32) -> TrackSubtrack {
+pub(super) fn collapsed_alignment_subtrack(
+    alignment_subtrack: AlignmentSubtrack,
+    top: f32,
+) -> TrackSubtrack {
     TrackSubtrack {
-        label: label.to_owned(),
+        alignment_subtrack: Some(alignment_subtrack),
+        label: alignment_subtrack.label().to_owned(),
         detail: None,
         top,
         bottom: top + COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT,
@@ -679,6 +683,9 @@ pub(crate) const fn panel_display_rebuild_allowed(
 }
 
 impl Viewer {
+    /// Legacy query-local row authority retained only as a deletion oracle. Unified local BAM
+    /// production code consumes the immutable scene row atlas and cannot compile this path.
+    #[cfg(any())]
     pub(crate) fn ensure_alignment_rows(&mut self) -> bool {
         let track_ids = self
             .alignment_tracks
@@ -692,6 +699,7 @@ impl Viewer {
         all_ready
     }
 
+    #[cfg(any())]
     fn ensure_alignment_rows_for_track(&mut self, track_id: TrackId) -> bool {
         let panel_id = self.panels.active().id;
         let viewport = self.panels.active().viewport;
@@ -1095,9 +1103,6 @@ impl Viewer {
     }
 
     pub(crate) fn rebuild_genomic_display(&mut self) {
-        if !self.ensure_alignment_rows() {
-            return;
-        }
         let annotation_auto_fit = self.track_presentation.annotation_pane_auto_fit;
         let annotation_content_height = annotation_auto_fit
             .then(|| annotation_frame_content_height(&self.panels.active().track_frames))
@@ -1408,6 +1413,7 @@ impl Viewer {
                     None
                 };
                 subtracks.push(TrackSubtrack {
+                    alignment_subtrack: None,
                     label: reference_bases_label(self.reference_reverse_complement),
                     detail: reference_detail,
                     top: sequence_top,
@@ -1421,6 +1427,7 @@ impl Viewer {
                         .copied()
                         .enumerate()
                         .map(|(index, frame)| TrackSubtrack {
+                            alignment_subtrack: None,
                             label: format!("Translation {}", frame.label()),
                             detail: Some(format!("{:?}", self.reference_genetic_code)),
                             top: translation_top + index as f32 * 20.0,
@@ -1556,6 +1563,10 @@ impl Viewer {
         if self.panels.active().viewport.detail_level() != DetailLevel::Overview
             && primary_source_available
             && (primary_annotation_effective || primary_read_effective)
+            && self
+                .alignment_tracks
+                .first()
+                .is_some_and(|track| track.scene_engine.is_none())
             && let Some(query) = self
                 .alignment_query_for_track(primary_alignment_id)
                 .cloned()
@@ -1912,6 +1923,7 @@ impl Viewer {
             {
                 read_panel_displays.push(ReadPanelDisplayCache {
                     track_id: primary_alignment_id,
+                    presentation_target_revision: 0,
                     scrollable: primary_read_display,
                     density_camera: true,
                     row_origin: Some(options.reads_top),
@@ -1927,6 +1939,7 @@ impl Viewer {
                             ))
                         })
                         .unwrap_or(ReadRowCoordinateAuthority::Absent),
+                    row_activity_atlas_revision: None,
                     materialized_row_range: options.materialized_row_range,
                     total_rows: Some(total_rows),
                     authoritative_overview: None,
@@ -1940,6 +1953,7 @@ impl Viewer {
                 let mut subtracks = Vec::with_capacity(5);
                 if embedded_reference {
                     subtracks.push(TrackSubtrack {
+                        alignment_subtrack: Some(AlignmentSubtrack::Reference),
                         label: "Reference".to_owned(),
                         detail: None,
                         top: options.reference_top,
@@ -1951,7 +1965,7 @@ impl Viewer {
                     && !self.primary_alignment_filters().show_reference
                 {
                     subtracks.push(collapsed_alignment_subtrack(
-                        "Reference",
+                        AlignmentSubtrack::Reference,
                         options.reference_top,
                     ));
                 }
@@ -1977,6 +1991,7 @@ impl Viewer {
                             query.pileup.provenance.exact_depth_complete,
                         );
                         subtracks.push(TrackSubtrack {
+                            alignment_subtrack: Some(AlignmentSubtrack::Coverage),
                             label: "Coverage".to_owned(),
                             detail: Some(scale),
                             top: options.coverage_top,
@@ -1986,12 +2001,13 @@ impl Viewer {
                         });
                     } else {
                         subtracks.push(collapsed_alignment_subtrack(
-                            "Coverage",
+                            AlignmentSubtrack::Coverage,
                             options.coverage_top,
                         ));
                     }
                     if show_junctions {
                         subtracks.push(TrackSubtrack {
+                            alignment_subtrack: Some(AlignmentSubtrack::Sashimi),
                             label: "Sashimi".to_owned(),
                             detail: Some(sashimi_track_detail(
                                 &layout.stats,
@@ -2007,12 +2023,13 @@ impl Viewer {
                         });
                     } else if junctions_available {
                         subtracks.push(collapsed_alignment_subtrack(
-                            "Sashimi",
+                            AlignmentSubtrack::Sashimi,
                             options.junction_top,
                         ));
                     }
                     if show_modification_frequency {
                         subtracks.push(TrackSubtrack {
+                            alignment_subtrack: Some(AlignmentSubtrack::Modifications),
                             label: "Modifications".to_owned(),
                             detail: Some(format!(
                                 "{} types · {} tagged reads · {} malformed · {} unavailable{}",
@@ -2037,7 +2054,7 @@ impl Viewer {
                         });
                     } else if modification_frequency_supported {
                         subtracks.push(collapsed_alignment_subtrack(
-                            "Modifications",
+                            AlignmentSubtrack::Modifications,
                             options.modification_top,
                         ));
                     }
@@ -2158,6 +2175,7 @@ impl Viewer {
                             );
                         }
                         subtracks.push(TrackSubtrack {
+                            alignment_subtrack: Some(AlignmentSubtrack::Reads),
                             label: "Reads".to_owned(),
                             detail: (!read_details.is_empty()).then(|| read_details.join(" · ")),
                             top: options.reads_top,
@@ -2166,7 +2184,10 @@ impl Viewer {
                             composite_member: None,
                         });
                     } else {
-                        subtracks.push(collapsed_alignment_subtrack("Reads", options.reads_top));
+                        subtracks.push(collapsed_alignment_subtrack(
+                            AlignmentSubtrack::Reads,
+                            options.reads_top,
+                        ));
                     }
                     subtracks
                 },
@@ -2174,7 +2195,7 @@ impl Viewer {
             let reads = alignment_context_frame
                 .subtracks
                 .iter()
-                .position(|subtrack| subtrack.label == "Reads")
+                .position(|subtrack| subtrack.alignment_subtrack == Some(AlignmentSubtrack::Reads))
                 .map(|index| alignment_context_frame.subtracks.remove(index))
                 .into_iter()
                 .collect();
@@ -2219,23 +2240,21 @@ impl Viewer {
             if let Some(track) = self.alignment_tracks.first_mut() {
                 track.projection_mut(self.panels.active().id).cached_layout = None;
             }
-            let visible = true;
-            let collapsed = !primary_annotation_desired;
-            let natural_bottom = top + if index_only_overview { 48.0 } else { 26.0 };
-            let bottom = natural_bottom;
-            self.panels.active_mut().track_frames.push(TrackFrame {
-                key: TrackFrameKey::Alignment(primary_alignment_id),
-                channel: ui::TrackPane::Annotation,
-                name: primary_alignment_name,
-                kind: TrackKind::Alignment,
-                source_label: primary_source_label,
-                top,
-                bottom,
-                visible,
-                collapsed,
-                frozen_bottom: None,
-                subtracks: index_only_overview
-                    .then(|| TrackSubtrack {
+            let mut frame = if index_only_overview {
+                let bottom = top + 48.0;
+                TrackFrame {
+                    key: TrackFrameKey::Alignment(primary_alignment_id),
+                    channel: ui::TrackPane::Annotation,
+                    name: primary_alignment_name,
+                    kind: TrackKind::Alignment,
+                    source_label: primary_source_label,
+                    top,
+                    bottom,
+                    visible: true,
+                    collapsed: !primary_annotation_desired,
+                    frozen_bottom: None,
+                    subtracks: vec![TrackSubtrack {
+                        alignment_subtrack: None,
                         label: "Index-only overview".to_owned(),
                         detail: Some(
                             "BAI/CSI occupancy · no alignment records requested".to_owned(),
@@ -2244,11 +2263,27 @@ impl Viewer {
                         bottom,
                         collapsed: false,
                         composite_member: None,
-                    })
-                    .into_iter()
-                    .collect(),
-            });
-            top = bottom;
+                    }],
+                }
+            } else if let Some(config) = self.alignment_tracks.first().map(|track| &track.config) {
+                alignment::alignment_scene_annotation_frame(
+                    config,
+                    self.panels.active().viewport,
+                    top,
+                    self.track_presentation
+                        .pane_track_state(ui::TrackPane::Annotation, primary_alignment_id)
+                        .and_then(|node| node.preferred_height),
+                )
+            } else {
+                unreachable!("the primary source exists only with a primary track")
+            };
+            if !primary_annotation_effective {
+                frame.bottom = frame.top + 26.0;
+                frame.subtracks.clear();
+                frame.collapsed = !primary_annotation_desired;
+            }
+            top = frame.bottom;
+            self.panels.active_mut().track_frames.push(frame);
         }
         let selected_alignment_track = self.panels.active().selected_alignment_track;
         let selected_chain_read_name_hash = self
@@ -2486,11 +2521,13 @@ impl Viewer {
                     };
                     read_panel_displays.push(ReadPanelDisplayCache {
                         track_id,
+                        presentation_target_revision: 0,
                         scrollable: read_display,
                         density_camera: true,
                         row_origin: Some(read_bounds.top + READ_PANE_HEADER_HEIGHT),
                         row_height: Some(row_height),
                         row_coordinate_authority: row_authority,
+                        row_activity_atlas_revision: None,
                         materialized_row_range,
                         total_rows,
                         authoritative_overview: None,
@@ -2562,20 +2599,64 @@ impl Viewer {
                         .and_then(|overview| overview.contig_mapped_record_count(contig))
                 });
             let projection = track.projection(self.panels.active().id);
-            let scene_frame = projection.and_then(|projection| projection.scene_frame.as_ref());
-            let scene_snapshot = (!index_only_overview)
-                .then(|| scene_frame.and_then(|frame| frame.snapshot.as_ref()))
+            let unified_lane_desired = !index_only_overview
+                && projection.is_some_and(|projection| {
+                    projection.scene_owner.is_some()
+                        && projection.navigation.desired_camera().is_some()
+                });
+            let presented = (!index_only_overview)
+                .then(|| self.presented_alignment_lane(self.panels.active().id, track_id))
                 .flatten();
-            let row_activity = (!index_only_overview)
-                .then(|| scene_frame.and_then(|frame| frame.row_activity.as_deref()))
+            let committed_row_activity = (!index_only_overview)
+                .then(|| {
+                    self.committed_alignment_row_activity_for_desired_target(
+                        self.panels.active().id,
+                        track_id,
+                    )
+                })
                 .flatten();
-            let row_coordinate_authority = match (scene_snapshot, row_activity) {
-                (_, Some(profile)) => ReadRowCoordinateAuthority::Exact(
-                    ReadRowCoordinateSpace::Unified(profile.row_coordinate_space()),
-                ),
-                (Some(_), None) => ReadRowCoordinateAuthority::Pending,
-                (None, None) => ReadRowCoordinateAuthority::Absent,
-            };
+            let row_activity = presented
+                .and_then(|presented| {
+                    presented
+                        .lane
+                        .row_activity
+                        .as_ref()
+                        .filter(|profile| {
+                            profile.interval() == presented.source.source_camera.interval()
+                        })
+                        .cloned()
+                })
+                .or_else(|| {
+                    committed_row_activity
+                        .as_ref()
+                        .map(|(_, profile)| Arc::clone(profile))
+                });
+            let native_reads_present =
+                presented.is_some_and(|presented| presented.read_authority.is_some());
+            let presentation_target_revision = presented.map_or_else(
+                || {
+                    committed_row_activity
+                        .as_ref()
+                        .map_or(0, |(target_revision, _)| *target_revision)
+                },
+                |presented| presented.target_revision,
+            );
+            let committed_read_capability =
+                presented.map(|presented| presented.source.individual_reads);
+            let row_coordinate_authority = row_activity.as_ref().map_or_else(
+                || {
+                    if unified_lane_desired {
+                        ReadRowCoordinateAuthority::Pending
+                    } else {
+                        ReadRowCoordinateAuthority::Absent
+                    }
+                },
+                |profile| {
+                    ReadRowCoordinateAuthority::Exact(ReadRowCoordinateSpace::Unified(
+                        profile.row_coordinate_space(),
+                    ))
+                },
+            );
             let read_state_message = (!index_only_overview)
                 .then(|| {
                     if let Some(message) =
@@ -2587,13 +2668,16 @@ impl Viewer {
                             AlignmentTrackLifecycle::Opening => {
                                 Some("Opening read source…".to_owned())
                             }
-                            AlignmentTrackLifecycle::Ready => match scene_frame
-                                .map(|frame| frame.individual_reads)
+                            AlignmentTrackLifecycle::Ready => match committed_read_capability
                                 .unwrap_or(AlignmentIndividualReadCapability::Pending)
                             {
-                                AlignmentIndividualReadCapability::Complete { .. } => None,
+                                AlignmentIndividualReadCapability::Complete { .. }
+                                    if native_reads_present => None,
+                                AlignmentIndividualReadCapability::Complete { .. } => {
+                                    Some("Preparing complete reads…".to_owned())
+                                }
                                 AlignmentIndividualReadCapability::Pending
-                                    if scene_snapshot.is_some() => None,
+                                    if native_reads_present => None,
                                 AlignmentIndividualReadCapability::Pending => {
                                     Some("Preparing complete reads…".to_owned())
                                 }
@@ -2617,7 +2701,7 @@ impl Viewer {
             let density = self.alignment_density_for_panel_track(self.panels.active().id, track_id);
             let row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
             let (total_rows, scene_content_bottom) =
-                row_activity.map_or((None, bottom), |profile| {
+                row_activity.as_deref().map_or((None, bottom), |profile| {
                     let (active_row_end, content_bottom) = alignment_scene_read_extent(
                         profile.active_row_end(),
                         content_top,
@@ -2650,20 +2734,38 @@ impl Viewer {
                             )
                         })
                 };
+                let retained_pending_overview = row_coordinate_authority
+                    .is_pending()
+                    .then(|| {
+                        self.panels
+                            .active()
+                            .scroll_display_cache
+                            .as_ref()
+                            .and_then(|cache| {
+                                cache.read_panels.iter().find(|panel| {
+                                    panel.track_id == track_id
+                                        && panel.row_coordinate_authority.is_exact()
+                                })
+                            })
+                            .map(|panel| panel.overview.clone())
+                    })
+                    .flatten();
                 read_panel_displays.push(ReadPanelDisplayCache {
                     track_id,
+                    presentation_target_revision,
                     scrollable,
-                    density_camera: scene_snapshot.is_some(),
-                    row_origin: scene_snapshot.is_some().then_some(content_top),
-                    row_height: scene_snapshot.is_some().then_some(row_height),
+                    density_camera: native_reads_present,
+                    row_origin: native_reads_present.then_some(content_top),
+                    row_height: native_reads_present.then_some(row_height),
                     row_coordinate_authority,
+                    row_activity_atlas_revision: row_activity
+                        .as_deref()
+                        .map(AlignmentRowActivityProfile::atlas_revision),
                     materialized_row_range: None,
                     total_rows,
-                    authoritative_overview: match row_activity {
+                    authoritative_overview: match row_activity.as_deref() {
                         Some(profile) => Some(alignment_row_activity_overview(profile)),
-                        None if row_coordinate_authority.is_pending() => {
-                            Some(ui::ScrollbarOverview::default())
-                        }
+                        None if row_coordinate_authority.is_pending() => retained_pending_overview,
                         None => None,
                     },
                     overview: ui::ScrollbarOverview::default(),
@@ -2685,6 +2787,7 @@ impl Viewer {
                 frozen_bottom: Some(if desired { content_top } else { bottom }),
                 subtracks: if desired {
                     vec![TrackSubtrack {
+                        alignment_subtrack: Some(AlignmentSubtrack::Reads),
                         label: "Reads".to_owned(),
                         detail: read_state_message,
                         top: content_top,
@@ -2693,7 +2796,10 @@ impl Viewer {
                         composite_member: None,
                     }]
                 } else {
-                    vec![collapsed_alignment_subtrack("Reads", bounds.top)]
+                    vec![collapsed_alignment_subtrack(
+                        AlignmentSubtrack::Reads,
+                        bounds.top,
+                    )]
                 },
             });
         }
@@ -2838,6 +2944,7 @@ impl Viewer {
                                 || query.provenance.source_rows_ignored > 0
                             {
                                 subtracks.push(TrackSubtrack {
+                                    alignment_subtrack: None,
                                     label: if query.provenance.records_truncated {
                                         "Sampled points".to_owned()
                                     } else {
@@ -2924,6 +3031,7 @@ impl Viewer {
                                 subtracks.extend(layout.visible_rows.iter().filter_map(|row| {
                                     query.samples.get(row.sample_index).map(|sample| {
                                         TrackSubtrack {
+                                            alignment_subtrack: None,
                                             label: sample.clone(),
                                             detail: query
                                                 .sample_sort_values
@@ -2955,6 +3063,7 @@ impl Viewer {
                                 subtracks.extend(layout.visible_rows.iter().filter_map(|row| {
                                     query.samples.get(row.sample_index).map(|sample| {
                                         TrackSubtrack {
+                                            alignment_subtrack: None,
                                             label: sample.clone(),
                                             detail: Some("MAF tumour sample".to_owned()),
                                             top: row.top,
@@ -3265,6 +3374,9 @@ impl Viewer {
         let active_drag = self
             .vertical_overview_drag
             .filter(|drag| drag.density_dragging && drag.panel_id == active_panel_id);
+        let current_alignment_target_revision = self
+            .alignment_scene_publication_authority
+            .desired_target_revision();
         let read_panel_metrics = self
             .panels
             .active()
@@ -3282,7 +3394,16 @@ impl Viewer {
                     read_panel.density_camera,
                     read_panel.row_origin,
                     read_panel.row_height,
-                    read_panel.row_coordinate_authority,
+                    current_read_row_authority(
+                        read_panel.presentation_target_revision,
+                        current_alignment_target_revision,
+                        self.alignment_scene_publication_authority
+                            .committed_row_target_matches_desired(
+                                active_panel_id,
+                                read_panel.track_id,
+                            ),
+                        read_panel.row_coordinate_authority,
+                    ),
                     self.alignment_density_for_panel_track(
                         self.panels.active().id,
                         read_panel.track_id,
@@ -3927,6 +4048,7 @@ impl Viewer {
                     frozen_bottom: None,
                     subtracks: if annotation_content_visible {
                         vec![TrackSubtrack {
+                            alignment_subtrack: Some(AlignmentSubtrack::Coverage),
                             label: "Coverage".to_owned(),
                             detail: None,
                             top: annotation_content_top,
@@ -3958,6 +4080,7 @@ impl Viewer {
                     frozen_bottom: Some(read_content_top.min(read_bottom)),
                     subtracks: if read_content_visible {
                         vec![TrackSubtrack {
+                            alignment_subtrack: Some(AlignmentSubtrack::Reads),
                             label: "Reads".to_owned(),
                             detail: None,
                             top: read_content_top,

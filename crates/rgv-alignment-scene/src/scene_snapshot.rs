@@ -1,15 +1,21 @@
-use std::{collections::HashSet, mem::size_of, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    mem::size_of,
+    num::NonZeroU64,
+    sync::Arc,
+};
 
 use rgv_core::GenomicInterval;
 use rgv_hts::AlignmentRecord;
 use thiserror::Error;
 
+use crate::summary_page::required_summary_page_keys;
 use crate::{
     AlignmentExportError, AlignmentExportRecord, AlignmentHandle, AlignmentPresentationScene,
-    AllocationClass, AllocationLease, AllocationLedger, ExactSummaryPins, ExactSummaryRoot,
-    JunctionAnnotationIndex, JunctionAnnotationPins, LedgerError, PinnedAllocationLease,
-    ReservationKind, SceneRevision, SummaryPageFamily, SummaryPageKey, SummaryRevision,
-    SummarySemanticPage,
+    AllocationClass, AllocationLease, AllocationLedger, CanonicalGenomicTile, ExactSummaryPins,
+    ExactSummaryRoot, JunctionAnnotationIndex, JunctionAnnotationPins, LedgerError,
+    PinnedAllocationLease, ReservationKind, SceneRevision, SummaryPageFamily, SummaryPageKey,
+    SummaryRevision, SummarySemanticPage,
 };
 
 /// The complete immutable semantic authority for one alignment track revision.
@@ -24,6 +30,8 @@ pub struct AlignmentSceneSnapshot {
     summaries: Arc<ExactSummaryRoot>,
     annotation: Option<Arc<JunctionAnnotationIndex>>,
     summary_pages: Arc<[Arc<SummarySemanticPage>]>,
+    summary_tile_index: HashMap<(SummaryPageFamily, CanonicalGenomicTile), usize>,
+    summary_tile_bases: Option<NonZeroU64>,
     metadata_allocation: AllocationLease,
     _pins: AlignmentSceneSnapshotPins,
 }
@@ -77,7 +85,20 @@ impl AlignmentSceneSnapshot {
             &summary_pages,
         )?;
         summary_pages.sort_unstable_by_key(|page| page.key());
-        let metadata_bytes = snapshot_metadata_bytes(summary_pages.len());
+        let summary_tile_bases = summary_pages.first().map(|page| page.key().tile().bases());
+        let mut summary_tile_index = HashMap::with_capacity(summary_pages.len());
+        for (index, page) in summary_pages.iter().enumerate() {
+            let key = page.key();
+            assert!(
+                summary_tile_index
+                    .insert((key.family(), key.tile()), index)
+                    .is_none(),
+                "validated summary pages have unique family/tile identities"
+            );
+        }
+        summary_tile_index.shrink_to_fit();
+        let metadata_bytes =
+            snapshot_metadata_bytes(summary_pages.len(), summary_tile_index.capacity());
         let mut reservation = ledger.reserve(
             AllocationClass::PresentationScene,
             metadata_bytes,
@@ -101,6 +122,8 @@ impl AlignmentSceneSnapshot {
             summaries,
             annotation,
             summary_pages: summary_pages.into(),
+            summary_tile_index,
+            summary_tile_bases,
             metadata_allocation,
             _pins: AlignmentSceneSnapshotPins {
                 _summaries: summary_pins,
@@ -136,16 +159,90 @@ impl AlignmentSceneSnapshot {
         &self.summary_pages
     }
 
+    /// Resolves one exact summary page without scanning the snapshot. This supports bounded GPU
+    /// warm-up cursors whose authority was minted by an earlier atomic replacement.
+    #[must_use]
+    pub fn summary_page_for_key(&self, key: SummaryPageKey) -> Option<&Arc<SummarySemanticPage>> {
+        self.summary_pages
+            .binary_search_by_key(&key, |page| page.key())
+            .ok()
+            .map(|index| &self.summary_pages[index])
+    }
+
+    /// Selects pages by their complete semantic index rather than only their owner tile. A
+    /// returned junction page can therefore begin before `interval` while owning an overlapping
+    /// long junction.
     #[must_use]
     pub fn summary_pages_for(
         &self,
         family: SummaryPageFamily,
         interval: GenomicInterval,
     ) -> Vec<&Arc<SummarySemanticPage>> {
-        self.summary_pages
-            .iter()
-            .filter(|page| page.key().family() == family && page.interval().overlaps(interval))
-            .collect()
+        let Some(interval) = interval.intersection(self.prepared_interval()) else {
+            return Vec::new();
+        };
+        // Junction and pair dependencies can own facts whose indexed interval begins before
+        // their canonical tile. Those sparse specialist families retain the general scan. The
+        // high-frequency depth/allele/modification camera path uses direct canonical tile lookup.
+        if matches!(
+            family,
+            SummaryPageFamily::Junctions | SummaryPageFamily::Pairs
+        ) {
+            return self
+                .summary_pages
+                .iter()
+                .filter(|page| {
+                    page.key().family() == family && page.indexed_interval().overlaps(interval)
+                })
+                .collect();
+        }
+        let Some(tile_bases) = self.summary_tile_bases else {
+            return Vec::new();
+        };
+        let first = interval.start() / tile_bases.get();
+        let last = interval.end().saturating_sub(1) / tile_bases.get();
+        let capacity = usize::try_from(last.saturating_sub(first).saturating_add(1))
+            .unwrap_or(usize::MAX)
+            .min(self.summary_pages.len());
+        let mut pages = Vec::with_capacity(capacity);
+        for coordinate in first..=last {
+            let tile = CanonicalGenomicTile::new(interval.contig(), coordinate, tile_bases);
+            if let Some(index) = self.summary_tile_index.get(&(family, tile)).copied() {
+                let page = &self.summary_pages[index];
+                if page.indexed_interval().overlaps(interval) {
+                    pages.push(page);
+                }
+            }
+        }
+        pages.sort_unstable_by_key(|page| page.key());
+        pages
+    }
+
+    /// Maximum canonical summary tiles any camera with this genomic span can expose inside the
+    /// prepared authority, including a boundary crossing. Used to size frame uniforms without
+    /// treating all retained summary pages as simultaneously visible.
+    #[must_use]
+    pub fn summary_tile_envelope(&self, genomic_bases: u64) -> usize {
+        let Some(tile_bases) = self.summary_tile_bases else {
+            return 0;
+        };
+        if genomic_bases == 0 {
+            return 0;
+        }
+        let tile_bases = tile_bases.get();
+        let prepared = self.prepared_interval();
+        let first = prepared.start() / tile_bases;
+        let last = prepared.end().saturating_sub(1) / tile_bases;
+        let prepared_tiles = last.saturating_sub(first).saturating_add(1);
+        let camera_tiles = genomic_bases
+            .saturating_sub(1)
+            .checked_div(tile_bases)
+            .unwrap_or(0)
+            .saturating_add(2)
+            .min(prepared_tiles);
+        usize::try_from(camera_tiles)
+            .unwrap_or(usize::MAX)
+            .min(self.summary_pages.len())
     }
 
     #[must_use]
@@ -211,7 +308,6 @@ fn validate_authority(
         return Err(AlignmentSceneSnapshotError::SummaryCoverageMismatch);
     }
 
-    let required_families = required_summary_families(summaries);
     let mut actual = HashSet::<SummaryPageKey>::with_capacity(pages.len());
     for page in pages {
         let key = page.key();
@@ -219,50 +315,42 @@ fn validate_authority(
             return Err(AlignmentSceneSnapshotError::DuplicateSummaryPage(key));
         }
         if key
-            != SummaryPageKey::new_with_annotation(summaries, key.tile(), key.family(), annotation)
+            != SummaryPageKey::new_with_dependencies(
+                summaries,
+                key.tile(),
+                key.family(),
+                reads.presentation().reference,
+                annotation,
+            )
         {
             return Err(AlignmentSceneSnapshotError::SummaryPageAuthorityMismatch(
                 key,
             ));
         }
     }
-    for tile in summaries
-        .depth_tiles()
-        .iter()
-        .filter(|tile| tile.depth().interval().overlaps(reads.prepared_interval()))
-        .map(|tile| tile.tile())
-    {
-        for family in required_families.iter().copied() {
-            let expected = SummaryPageKey::new_with_annotation(summaries, tile, family, annotation);
-            if !actual.contains(&expected) {
-                return Err(AlignmentSceneSnapshotError::MissingMandatorySummaryPage(
-                    expected,
-                ));
-            }
+    for expected in required_summary_page_keys(
+        summaries,
+        reads.prepared_interval(),
+        reads.presentation().reference,
+        annotation,
+    ) {
+        if !actual.contains(&expected) {
+            return Err(AlignmentSceneSnapshotError::MissingMandatorySummaryPage(
+                expected,
+            ));
         }
     }
     Ok(())
 }
 
-fn required_summary_families(root: &ExactSummaryRoot) -> Vec<SummaryPageFamily> {
-    let mut families = vec![
-        SummaryPageFamily::Depth,
-        SummaryPageFamily::Junctions,
-        SummaryPageFamily::Pairs,
-        SummaryPageFamily::FilterProvenance,
-    ];
-    if root.contract().allele_detail != crate::AlleleSummaryDetail::None {
-        families.push(SummaryPageFamily::Alleles);
-    }
-    if root.contract().collect_modifications {
-        families.push(SummaryPageFamily::Modifications);
-    }
-    families
-}
-
-const fn snapshot_metadata_bytes(summary_pages: usize) -> usize {
+const fn snapshot_metadata_bytes(summary_pages: usize, summary_index_capacity: usize) -> usize {
     size_of::<AlignmentSceneSnapshot>()
         .saturating_add(summary_pages.saturating_mul(size_of::<Arc<SummarySemanticPage>>()))
+        .saturating_add(
+            summary_index_capacity
+                .saturating_mul(size_of::<((SummaryPageFamily, CanonicalGenomicTile), usize)>())
+                .saturating_mul(2),
+        )
 }
 
 #[derive(Debug, Error)]

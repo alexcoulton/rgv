@@ -1,15 +1,180 @@
 //! GPU rendering infrastructure for genomic display lists.
 
 mod alignment_scene;
+mod alignment_summary;
+
+/// Constant-size policy view accepted by replacement planners. Desktop code supplies
+/// `LedgerProgress`; explicit inventory tests may supply `LedgerSnapshot`. Planning never needs
+/// to enumerate allocation records merely to capture the budget-policy revision.
+pub trait AlignmentLedgerPolicyView {
+    fn policy_revision(&self) -> u64;
+}
+
+impl AlignmentLedgerPolicyView for rgv_alignment_scene::LedgerProgress {
+    fn policy_revision(&self) -> u64 {
+        self.policy_revision
+    }
+}
+
+impl AlignmentLedgerPolicyView for rgv_alignment_scene::LedgerSnapshot {
+    fn policy_revision(&self) -> u64 {
+        self.policy_revision
+    }
+}
 
 pub use alignment_scene::{
-    AlignmentGpuBatchAdmission, AlignmentGpuFrame, AlignmentGpuFrameBuildError,
+    AlignmentGpuBatchAdmission, AlignmentGpuCameraCaptureError, AlignmentGpuContentAuthority,
+    AlignmentGpuContentReplacementReason, AlignmentGpuFrame, AlignmentGpuFrameBuildError,
     AlignmentGpuInstance, AlignmentGpuPageAdmission, AlignmentGpuPageAdmissionError,
-    AlignmentGpuPrefetchProgress, AlignmentGpuPrepareError, AlignmentGpuPrepareStats,
-    AlignmentGpuProjectedBounds, AlignmentGpuRenderError, AlignmentGpuRenderer,
-    AlignmentGpuResidencyError, AlignmentGpuResidencyLease, AlignmentGpuSceneRequest,
-    AlignmentGpuScissor, AlignmentGpuShape, PackedAlignmentPage, project_alignment_gpu_instance,
+    AlignmentGpuPrefetchCursor, AlignmentGpuPrefetchCursorError, AlignmentGpuPrefetchProgress,
+    AlignmentGpuPrepareError, AlignmentGpuPrepareStats, AlignmentGpuProjectedBounds,
+    AlignmentGpuPublishableReplacement, AlignmentGpuReadyReplacement, AlignmentGpuRenderError,
+    AlignmentGpuRenderer, AlignmentGpuRendererOperationCounters, AlignmentGpuReplacementError,
+    AlignmentGpuReplacementPlan, AlignmentGpuResidencyError, AlignmentGpuResidencyLease,
+    AlignmentGpuRetirement, AlignmentGpuSceneRequest, AlignmentGpuScissor, AlignmentGpuShape,
+    AlignmentGpuStagedReplacement, PackedAlignmentPage, project_alignment_gpu_instance,
 };
+pub use alignment_summary::{
+    AlignmentSummaryAlleleToken, AlignmentSummaryDepthRangeIndex, AlignmentSummaryFrameOverlays,
+    AlignmentSummaryGpuAlleleInstance, AlignmentSummaryGpuBatchAdmission,
+    AlignmentSummaryGpuCameraCaptureError, AlignmentSummaryGpuContentAuthority,
+    AlignmentSummaryGpuContentReplacementReason, AlignmentSummaryGpuDepthInstance,
+    AlignmentSummaryGpuFrame, AlignmentSummaryGpuFrameBuildError, AlignmentSummaryGpuLaneOptions,
+    AlignmentSummaryGpuModificationInstance, AlignmentSummaryGpuPageAdmission,
+    AlignmentSummaryGpuPageAdmissionError, AlignmentSummaryGpuPageError,
+    AlignmentSummaryGpuPageKey, AlignmentSummaryGpuPageRequest, AlignmentSummaryGpuPrefetchCursor,
+    AlignmentSummaryGpuPrefetchCursorError, AlignmentSummaryGpuPrefetchProgress,
+    AlignmentSummaryGpuPrepareError, AlignmentSummaryGpuPrepareStats,
+    AlignmentSummaryGpuProjectedAllele, AlignmentSummaryGpuProjectedBounds,
+    AlignmentSummaryGpuProjectedModification, AlignmentSummaryGpuPublishableReplacement,
+    AlignmentSummaryGpuReadyReplacement, AlignmentSummaryGpuRenderError,
+    AlignmentSummaryGpuRenderer, AlignmentSummaryGpuRendererOperationCounters,
+    AlignmentSummaryGpuReplacementError, AlignmentSummaryGpuReplacementPlan,
+    AlignmentSummaryGpuResidencyError, AlignmentSummaryGpuResidencyLease,
+    AlignmentSummaryGpuRetirement, AlignmentSummaryGpuSceneRequest,
+    AlignmentSummaryGpuStagedReplacement, AlignmentSummaryModificationPageMetadata,
+    PackedAlignmentSummaryPage, project_alignment_summary_allele_instance,
+    project_alignment_summary_depth_instance, project_alignment_summary_modification_instance,
+};
+
+/// Renderer-local progress from one cooperative shared-ledger reclaim pass. Retained byte
+/// counts include only allocations owned by the renderer receiving the request; ledger charged
+/// counts intentionally cover every owner sharing that ledger.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[must_use]
+pub struct GpuReclaimReport {
+    pub pressure: GpuBudgetPressure,
+    pub baseline_occupied_bytes: usize,
+    pub pages_before: usize,
+    pub pages_after: usize,
+    pub retained_bytes_before: usize,
+    pub retained_bytes_after: usize,
+    pub ledger_charged_before: usize,
+    pub ledger_charged_after: usize,
+    /// True when the shared ledger has released the failure-time deficit measured by the common
+    /// reclaim goal after this renderer has exhausted its safe candidates.
+    pub headroom_satisfied: bool,
+}
+
+/// Exact persistent retained-budget pressure reported by a failed GPU candidate. Failure-time
+/// charged and reserved totals are retained because earlier reservations from the same atomic
+/// candidate unwind before a coordinator can run. Re-evaluating only the post-unwind ledger can
+/// otherwise repeat an aggregate reservation failure without reclaiming anything.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GpuBudgetPressure {
+    pub requested_bytes: usize,
+    pub charged_bytes_at_failure: usize,
+    pub reserved_bytes_at_failure: usize,
+    pub limit_bytes: usize,
+}
+
+impl GpuBudgetPressure {
+    #[must_use]
+    pub const fn from_budget_failure(
+        requested_bytes: usize,
+        charged_bytes_at_failure: usize,
+        reserved_bytes_at_failure: usize,
+        limit_bytes: usize,
+    ) -> Self {
+        Self {
+            requested_bytes,
+            charged_bytes_at_failure,
+            reserved_bytes_at_failure,
+            limit_bytes,
+        }
+    }
+
+    /// Durable retained capacity that must disappear before the exact candidate is retried.
+    /// Candidate-local reservations are deliberately included: they will be recreated by the
+    /// retry and cannot count as reclaimed merely because they unwind with the error.
+    #[must_use]
+    pub const fn required_reclaim_bytes(self) -> usize {
+        self.charged_bytes_at_failure
+            .saturating_add(self.reserved_bytes_at_failure)
+            .saturating_add(self.requested_bytes)
+            .saturating_sub(self.limit_bytes)
+    }
+}
+
+/// One composable reclaim target shared by every GPU cache owner participating in a retry. The
+/// baseline is captured once after the failed candidate has unwound. Sequential renderer passes
+/// use this same value, so the second pass releases only the remainder left by the first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GpuReclaimGoal {
+    pub pressure: GpuBudgetPressure,
+    pub baseline_occupied_bytes: usize,
+}
+
+impl GpuReclaimGoal {
+    #[must_use]
+    pub const fn new(pressure: GpuBudgetPressure, baseline_occupied_bytes: usize) -> Self {
+        Self {
+            pressure,
+            baseline_occupied_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn required_reclaim_bytes(self) -> usize {
+        self.pressure.required_reclaim_bytes()
+    }
+
+    #[must_use]
+    pub const fn released_bytes_at(self, occupied_bytes: usize) -> usize {
+        self.baseline_occupied_bytes.saturating_sub(occupied_bytes)
+    }
+
+    #[must_use]
+    pub const fn is_satisfied_at(self, occupied_bytes: usize) -> bool {
+        self.released_bytes_at(occupied_bytes) >= self.required_reclaim_bytes()
+    }
+
+    /// Whether releasing every byte present at the post-unwind baseline could satisfy this goal.
+    /// An intrinsically oversized candidate must fail without purging unrelated caches.
+    #[must_use]
+    pub const fn is_feasible(self) -> bool {
+        self.required_reclaim_bytes() <= self.baseline_occupied_bytes
+    }
+}
+
+impl GpuReclaimReport {
+    #[must_use]
+    pub const fn reclaimed_pages(&self) -> usize {
+        self.pages_before.saturating_sub(self.pages_after)
+    }
+
+    #[must_use]
+    pub const fn released_retained_bytes(&self) -> usize {
+        self.retained_bytes_before
+            .saturating_sub(self.retained_bytes_after)
+    }
+
+    #[must_use]
+    pub const fn released_ledger_bytes(&self) -> usize {
+        self.ledger_charged_before
+            .saturating_sub(self.ledger_charged_after)
+    }
+}
 
 use ab_glyph::{Font, FontRef, ScaleFont, point};
 use bytemuck::{Pod, Zeroable};

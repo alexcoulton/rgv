@@ -73,6 +73,42 @@ fn subtract_physical_regions(
     remainder
 }
 
+/// Resolves only successfully prepared native presentations from the current panel-camera
+/// captures. Semantic lane existence is deliberately insufficient: pending, unsupported, failed,
+/// and stale-camera presentations leave the retained navigation preview visible.
+fn alignment_native_live_regions<'a>(
+    regions: impl IntoIterator<Item = &'a AlignmentNativeLiveRegion>,
+    current_camera_revisions: &HashMap<PanelId, u64>,
+    scale_factor: f32,
+    surface_width: u32,
+    surface_height: u32,
+) -> HashMap<PanelId, Vec<[u32; 4]>> {
+    let mut live = HashMap::<PanelId, Vec<[u32; 4]>>::new();
+    for region in regions {
+        if current_camera_revisions.get(&region.panel_id) != Some(&region.target_revision) {
+            continue;
+        }
+        if let Some(scissor) = workspace::alignment_management::alignment_clip_gpu_scissor(
+            region.clip,
+            scale_factor,
+            surface_width,
+            surface_height,
+        ) {
+            live.entry(region.panel_id).or_default().push([
+                scissor.x,
+                scissor.y,
+                scissor.width,
+                scissor.height,
+            ]);
+        }
+    }
+    for regions in live.values_mut() {
+        regions.sort_unstable();
+        regions.dedup();
+    }
+    live
+}
+
 /// Builds the alignment-track configuration used at launch.
 ///
 /// A track restored from a session remains wholly session-owned. A track synthesized from the
@@ -147,6 +183,8 @@ impl Viewer {
 
         let rectangle_renderer = RectangleRenderer::new(&device, surface_config.format);
         let alignment_gpu_renderer = AlignmentGpuRenderer::new(&device, surface_config.format);
+        let alignment_summary_gpu_renderer =
+            AlignmentSummaryGpuRenderer::new(&device, surface_config.format);
         let navigation_preview_renderer =
             NavigationPreviewRenderer::new(&device, surface_config.format);
         let egui_context = egui::Context::default();
@@ -209,6 +247,7 @@ impl Viewer {
             total_cache_bytes,
             total_cache_bytes,
         );
+        let alignment_ledger_progress = alignment_scene_ledger.subscribe_progress();
         // The desktop coordinates these as borrowing ceilings, not fixed
         // partitions. Empty derived tiers must not strand most of the user's
         // selected budget before the first alignment query even starts.
@@ -558,26 +597,6 @@ impl Viewer {
         } else {
             None
         };
-        let alignment_row_layout_scheduler_clock = GenerationClock::default();
-        let alignment_row_layout_worker_count = std::thread::available_parallelism()
-            .map_or(2, NonZeroUsize::get)
-            .clamp(1, 4);
-        let alignment_row_layout_scheduler = Scheduler::new(
-            NonZeroUsize::new(alignment_row_layout_worker_count)
-                .expect("read-layout worker count is nonzero"),
-            NonZeroUsize::new(32).expect("read-layout queue capacity is nonzero"),
-            &alignment_row_layout_scheduler_clock,
-            process_alignment_row_layout_work,
-        );
-        let alignment_row_scene_scheduler_clock = GenerationClock::default();
-        let alignment_row_scene_scheduler = Scheduler::new(
-            NonZeroUsize::new(alignment_row_layout_worker_count.min(2))
-                .expect("row-scene worker count is nonzero"),
-            NonZeroUsize::new(16).expect("row-scene queue capacity is nonzero"),
-            &alignment_row_scene_scheduler_clock,
-            process_alignment_row_scene_work,
-        );
-
         Ok(Self {
             application_instance_id,
             workspace_revision: 1,
@@ -591,20 +610,22 @@ impl Viewer {
             surface_config,
             rectangle_renderer,
             alignment_scene_ledger,
+            alignment_ledger_progress,
             alignment_gpu_renderer,
-            alignment_gpu_frame: None,
-            alignment_gpu_residency: None,
-            alignment_gpu_prefetch_pending: false,
+            alignment_summary_gpu_renderer,
+            alignment_presented_epoch: None,
+            alignment_gpu_residency_bundle: None,
+            alignment_gpu_prefetch: AlignmentGpuPrefetchState::default(),
+            alignment_gpu_publication_retry: None,
+            alignment_gpu_speculation_gate: AlignmentGpuSpeculationGate::default(),
             alignment_panel_scene_stores,
-            alignment_panel_frames: HashMap::new(),
             alignment_scene_owner_clock: 0,
             alignment_scene_request_clock: 0,
-            alignment_scene_camera_revision: 0,
+            alignment_scene_publication_authority: AlignmentScenePublicationAuthority::default(),
             navigation_preview_renderer,
             navigation_texture_revisions: HashMap::new(),
             navigation_horizon_preview_stats: NavigationHorizonPreviewStats::default(),
             navigation_stale_result_rejections: 0,
-            alignment_row_layout_cancellations: 0,
             egui_context,
             egui_state,
             egui_renderer,
@@ -625,12 +646,6 @@ impl Viewer {
                 maximum_alignments: workspace_alignment_limit,
             },
             alignment_retirement_tasks: Vec::new(),
-            alignment_row_layout_tasks: Vec::new(),
-            alignment_row_layout_scheduler_clock,
-            alignment_row_layout_scheduler,
-            alignment_row_scene_tasks: Vec::new(),
-            alignment_row_scene_scheduler_clock,
-            alignment_row_scene_scheduler,
             reference_engine,
             reference_revision: None,
             reference_open_error: None,
@@ -855,10 +870,28 @@ impl Viewer {
                     }
                 }
             }
-            if let Some(frame) = &self.alignment_gpu_frame
-                && let Err(error) = self.alignment_gpu_renderer.render(&mut pass, frame)
+            if let Some(bundle) = self
+                .alignment_presented_epoch
+                .as_ref()
+                .and_then(|epoch| epoch.gpu_bundle.as_ref())
+                && alignment_gpu_bundle_is_current(
+                    bundle,
+                    &self.alignment_scene_publication_authority,
+                )
             {
-                tracing::error!(%error, "could not render unified alignment scene frame");
+                if let Some(frame) = &bundle.summaries
+                    && let Err(error) = self.alignment_summary_gpu_renderer.render(&mut pass, frame)
+                {
+                    tracing::error!(
+                        %error,
+                        "could not render unified alignment summary frame"
+                    );
+                }
+                if let Some(frame) = &bundle.reads
+                    && let Err(error) = self.alignment_gpu_renderer.render(&mut pass, frame)
+                {
+                    tracing::error!(%error, "could not render unified alignment scene frame");
+                }
             }
         }
         {
@@ -1084,26 +1117,40 @@ impl Viewer {
         let mut live_regions = Vec::new();
         let mut preview_instances = Vec::new();
         let mut preview_frame_records = Vec::new();
-        let alignment_live_regions = self
-            .alignment_panel_frames
-            .iter()
-            .map(|(panel_id, frame)| {
-                let regions = frame
-                    .lanes
-                    .iter()
-                    .filter_map(|lane| {
-                        workspace::alignment_management::alignment_scene_gpu_scissor(
-                            lane.camera,
-                            scale_factor,
-                            self.surface_config.width,
-                            self.surface_config.height,
-                        )
-                    })
-                    .map(|scissor| [scissor.x, scissor.y, scissor.width, scissor.height])
-                    .collect::<Vec<_>>();
-                (*panel_id, regions)
+        let current_alignment_target_revision = self
+            .alignment_scene_publication_authority
+            .desired_target_revision();
+        let alignment_camera_revisions = self
+            .alignment_presented_epoch
+            .as_ref()
+            .into_iter()
+            .flat_map(|epoch| epoch.panel_frames.iter())
+            .filter(|(_, frame)| {
+                frame.camera_revision == current_alignment_target_revision
+                    && self
+                        .alignment_presented_epoch
+                        .as_ref()
+                        .and_then(|epoch| epoch.gpu_bundle.as_ref())
+                        .is_some_and(|bundle| {
+                            bundle.target_revision == frame.camera_revision
+                                && alignment_gpu_bundle_is_current(
+                                    bundle,
+                                    &self.alignment_scene_publication_authority,
+                                )
+                        })
             })
+            .map(|(panel_id, frame)| (*panel_id, frame.camera_revision))
             .collect::<HashMap<_, _>>();
+        let alignment_live_regions = alignment_native_live_regions(
+            self.alignment_presented_epoch
+                .iter()
+                .flat_map(|epoch| epoch.gpu_bundle.iter())
+                .flat_map(|bundle| bundle.live_regions.iter()),
+            &alignment_camera_revisions,
+            scale_factor,
+            self.surface_config.width,
+            self.surface_config.height,
+        );
         for layout in &self.workspace_layout.panels {
             let Some(panel) = self.panels.get(layout.panel_id) else {
                 continue;
@@ -1550,7 +1597,14 @@ mod launch_tests {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::{decoded_capture_pixels, frame_target_plan, subtract_physical_regions};
+    use std::collections::HashMap;
+
+    use rgv_core::PanelId;
+
+    use super::{
+        AlignmentNativeLiveRegion, CpuClipRect, alignment_native_live_regions,
+        decoded_capture_pixels, frame_target_plan, subtract_physical_regions,
+    };
 
     #[test]
     fn native_capture_adds_a_target_without_replacing_the_presented_surface() {
@@ -1600,6 +1654,104 @@ mod capture_tests {
                 [0, 25, 25, 50],
                 [75, 25, 25, 50],
             ]
+        );
+    }
+
+    #[test]
+    fn alignment_live_regions_require_explicit_current_camera_render_authority() {
+        let panel = PanelId::new(1);
+        let other_panel = PanelId::new(2);
+        let regions = [
+            AlignmentNativeLiveRegion {
+                panel_id: panel,
+                target_revision: 7,
+                clip: CpuClipRect {
+                    x: 25.0,
+                    y: 20.25,
+                    width: 50.0,
+                    height: 9.5,
+                },
+            },
+            AlignmentNativeLiveRegion {
+                panel_id: panel,
+                target_revision: 6,
+                clip: CpuClipRect {
+                    x: 0.0,
+                    y: 40.0,
+                    width: 100.0,
+                    height: 10.0,
+                },
+            },
+            AlignmentNativeLiveRegion {
+                panel_id: other_panel,
+                target_revision: 3,
+                clip: CpuClipRect {
+                    x: 10.0,
+                    y: 50.0,
+                    width: 20.0,
+                    height: 5.0,
+                },
+            },
+        ];
+        let current = HashMap::from([(panel, 7), (other_panel, 3)]);
+        let live = alignment_native_live_regions(&regions, &current, 2.0, 300, 200);
+
+        assert_eq!(live.get(&panel), Some(&vec![[50, 41, 100, 19]]));
+        assert_eq!(live.get(&other_panel), Some(&vec![[20, 100, 40, 10]]));
+
+        // Only the explicitly covered middle remains native; both uncovered edges retain preview.
+        assert_eq!(
+            subtract_physical_regions([0, 41, 200, 19], live[&panel].iter().copied()),
+            vec![[0, 41, 50, 19], [150, 41, 50, 19]]
+        );
+    }
+
+    #[test]
+    fn unavailable_alignment_lane_does_not_withdraw_ready_sibling_regions() {
+        let panel = PanelId::new(1);
+        let regions = [
+            AlignmentNativeLiveRegion {
+                panel_id: panel,
+                target_revision: 9,
+                clip: CpuClipRect {
+                    x: 0.0,
+                    y: 10.0,
+                    width: 100.0,
+                    height: 10.0,
+                },
+            },
+            // This models a retained/stale lane after its current preparation failed. It must
+            // leave preview authority in place without affecting the ready lanes around it.
+            AlignmentNativeLiveRegion {
+                panel_id: panel,
+                target_revision: 8,
+                clip: CpuClipRect {
+                    x: 0.0,
+                    y: 20.0,
+                    width: 100.0,
+                    height: 10.0,
+                },
+            },
+            AlignmentNativeLiveRegion {
+                panel_id: panel,
+                target_revision: 9,
+                clip: CpuClipRect {
+                    x: 0.0,
+                    y: 30.0,
+                    width: 100.0,
+                    height: 10.0,
+                },
+            },
+        ];
+        let current = HashMap::from([(panel, 9)]);
+        let live = alignment_native_live_regions(&regions, &current, 1.0, 100, 50);
+
+        assert_eq!(live[&panel], vec![[0, 10, 100, 10], [0, 30, 100, 10]]);
+        let mut preview = subtract_physical_regions([0, 0, 100, 50], live[&panel].iter().copied());
+        preview.sort_unstable();
+        assert_eq!(
+            preview,
+            vec![[0, 0, 100, 10], [0, 20, 100, 10], [0, 40, 100, 10]]
         );
     }
 }

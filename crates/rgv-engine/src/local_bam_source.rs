@@ -249,7 +249,8 @@ impl CanonicalAlignmentSourceBackend for LocalBamCanonicalBackend {
         match error {
             LocalBamCanonicalBackendError::Ledger(
                 pressure @ (LedgerError::BudgetExceeded { .. }
-                | LedgerError::TransientBudgetExceeded { .. }),
+                | LedgerError::TransientBudgetExceeded { .. }
+                | LedgerError::ReplacementTransitionActive { .. }),
             ) => Some(*pressure),
             _ => None,
         }

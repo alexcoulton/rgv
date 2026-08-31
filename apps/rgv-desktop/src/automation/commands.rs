@@ -308,8 +308,6 @@ impl Viewer {
             || !self.session_save_tasks.is_empty()
             || !self.session_load_tasks.is_empty()
             || !self.workspace_list_import_tasks.is_empty()
-            || !self.alignment_row_layout_tasks.is_empty()
-            || !self.alignment_row_scene_tasks.is_empty()
         {
             return false;
         }
@@ -322,10 +320,7 @@ impl Viewer {
             {
                 return false;
             }
-            if panel.pending_queries.alignment
-                || panel.pending_queries.reference
-                || panel.pending_queries.tracks
-            {
+            if panel.pending_queries.reference || panel.pending_queries.tracks {
                 return false;
             }
             if self.track_engine.is_some()
@@ -355,6 +350,15 @@ impl Viewer {
                         let Some(projection) = track.projection(panel.id) else {
                             return false;
                         };
+                        if track.scene_engine.is_some() {
+                            if !projection
+                                .navigation
+                                .is_current_settled(projection.clock.current().get())
+                            {
+                                return false;
+                            }
+                            continue;
+                        }
                         if projection.pending_query
                             || projection.query_phase != AlignmentQueryPhase::Ready
                             || projection.settled_generation
@@ -386,8 +390,6 @@ impl Viewer {
             ("session_saves", self.session_save_tasks.len()),
             ("session_loads", self.session_load_tasks.len()),
             ("list_imports", self.workspace_list_import_tasks.len()),
-            ("row_layouts", self.alignment_row_layout_tasks.len()),
-            ("row_scenes", self.alignment_row_scene_tasks.len()),
         ] {
             if count > 0 {
                 reasons.push(format!("{label}={count}"));
@@ -431,6 +433,22 @@ impl Viewer {
                     ));
                     continue;
                 };
+                if track.scene_engine.is_some() {
+                    if !projection
+                        .navigation
+                        .is_current_settled(projection.clock.current().get())
+                    {
+                        let diagnostic = projection.navigation.diagnostic();
+                        reasons.push(format!(
+                            "panel{}_track{}_scene_phase={:?}_owner={:?}",
+                            panel.id.get(),
+                            track.config.id.get(),
+                            diagnostic.phase,
+                            diagnostic.owner
+                        ));
+                    }
+                    continue;
+                }
                 if projection.pending_query {
                     reasons.push(format!(
                         "panel{}_track{}_query",
@@ -2073,12 +2091,7 @@ impl Viewer {
                                 })
                             })
                         }),
-                        row_scene_preparation_pending: self.alignment_row_scene_tasks.iter().any(
-                            |task| {
-                                task.track_id == track.config.id
-                                    && task.panel_id == self.panels.active().id
-                            },
-                        ),
+                        row_scene_preparation_pending: false,
                         row_layout_compatibility_probes: reconciliation.compatibility_probes,
                         row_layout_rows_reused: reconciliation.rows_reused,
                         row_layout_rows_appended: reconciliation.rows_appended,

@@ -162,6 +162,122 @@ pub(crate) fn apply_alignment_annotation_height(
     frame_top + target_height
 }
 
+/// Query-independent annotation-lane layout for the unified scene.
+///
+/// Visibility and geometry are presentation contracts, so Coverage, Sashimi and modification
+/// rows must exist before (and independently from) any source publication. Their eventual pixels
+/// are projected from the captured scene snapshot; this function deliberately reads no
+/// `AlignmentQuery` and invents no data-availability decision from an empty summary.
+pub(crate) fn alignment_scene_annotation_frame(
+    config: &SessionAlignmentTrack,
+    viewport: Viewport,
+    frame_top: f32,
+    requested_height: Option<f32>,
+) -> TrackFrame {
+    let filters = &config.filters;
+    let heights = alignment_annotation_lane_heights(filters);
+    let content_top = frame_top + 22.0;
+    let mut lane_top = content_top;
+    let mut options = AlignmentLayoutOptions {
+        coverage_top: lane_top,
+        coverage_height: heights.coverage,
+        ..AlignmentLayoutOptions::default()
+    };
+    lane_top += if filters.show_coverage {
+        heights.coverage + 6.0
+    } else {
+        COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT
+    };
+    options.junction_top = lane_top;
+    options.junction_height = heights.junction;
+    lane_top += if filters.show_junctions {
+        heights.junction + 6.0
+    } else {
+        COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT
+    };
+    options.modification_top = lane_top;
+    options.modification_height = heights.modification;
+    let modifications_supported = viewport.detail_level() != DetailLevel::Overview;
+    lane_top += if filters.show_modification_frequency && modifications_supported {
+        heights.modification + 8.0
+    } else if modifications_supported {
+        COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT
+    } else {
+        0.0
+    };
+    let frame_bottom = apply_alignment_annotation_height(
+        &mut options,
+        frame_top,
+        lane_top.max(content_top),
+        requested_height,
+    );
+
+    let mut subtracks = Vec::with_capacity(3);
+    if filters.show_coverage {
+        subtracks.push(TrackSubtrack {
+            alignment_subtrack: Some(AlignmentSubtrack::Coverage),
+            label: "Coverage".to_owned(),
+            detail: None,
+            top: options.coverage_top,
+            bottom: options.coverage_top + options.coverage_height,
+            collapsed: false,
+            composite_member: None,
+        });
+    } else {
+        subtracks.push(collapsed_alignment_subtrack(
+            AlignmentSubtrack::Coverage,
+            options.coverage_top,
+        ));
+    }
+    if filters.show_junctions {
+        subtracks.push(TrackSubtrack {
+            alignment_subtrack: Some(AlignmentSubtrack::Sashimi),
+            label: "Sashimi".to_owned(),
+            detail: None,
+            top: options.junction_top,
+            bottom: options.junction_top + options.junction_height,
+            collapsed: false,
+            composite_member: None,
+        });
+    } else {
+        subtracks.push(collapsed_alignment_subtrack(
+            AlignmentSubtrack::Sashimi,
+            options.junction_top,
+        ));
+    }
+    if modifications_supported {
+        if filters.show_modification_frequency {
+            subtracks.push(TrackSubtrack {
+                alignment_subtrack: Some(AlignmentSubtrack::Modifications),
+                label: "Modifications".to_owned(),
+                detail: None,
+                top: options.modification_top,
+                bottom: options.modification_top + options.modification_height,
+                collapsed: false,
+                composite_member: None,
+            });
+        } else {
+            subtracks.push(collapsed_alignment_subtrack(
+                AlignmentSubtrack::Modifications,
+                options.modification_top,
+            ));
+        }
+    }
+    TrackFrame {
+        key: TrackFrameKey::Alignment(config.id),
+        channel: ui::TrackPane::Annotation,
+        name: config.name.clone(),
+        kind: TrackKind::Alignment,
+        source_label: Some(config.source.redacted_label()),
+        top: frame_top,
+        bottom: frame_bottom.max(frame_top + 22.0),
+        visible: true,
+        collapsed: false,
+        frozen_bottom: None,
+        subtracks,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadPanelKey {
     Track(TrackId),
@@ -428,6 +544,7 @@ pub(crate) fn secondary_alignment_track_layout(
     let active_filters = track.active_filters.clone();
     let mut frame_bottom = frame_top + 26.0;
     let source_label = Some(config.source.redacted_label());
+    let scene_backed = track.scene_engine.is_some();
     // Pane visibility is presentation state, not a source/configuration
     // property. The caller decides independently whether annotation and read
     // content paint; this projection remains available when either channel is
@@ -437,14 +554,29 @@ pub(crate) fn secondary_alignment_track_layout(
         .as_ref()
         .and_then(|dictionary| interval_for_track(dictionary, contig_name, viewport.interval()));
     let projection = track.projection_mut(panel_id);
-    projection
-        .row_history
-        .pin_navigation_intervals(navigation_intervals);
     // Select overview presentation from the current viewport immediately.
     // A regional query may remain retained until query dispatch settles, but
     // rendering it here would expose a stale count for the previous interval.
     let index_only_overview =
         projection.index_only_overview || viewport.detail_level() == DetailLevel::Overview;
+    if !index_only_overview && scene_backed {
+        // Scene lane geometry is a UI contract, not a side effect of a legacy query. It is
+        // therefore available while the first immutable publication is still being prepared and
+        // remains available when Reads is collapsed.
+        return (
+            None,
+            alignment_scene_annotation_frame(
+                &config,
+                viewport,
+                frame_top,
+                annotation_preferred_height,
+            ),
+            None,
+        );
+    }
+    projection
+        .row_history
+        .pin_navigation_intervals(navigation_intervals);
     let Some(query) = projection.current_query.clone().filter(|query| {
         projection.query_is_current()
             && !index_only_overview
@@ -486,6 +618,7 @@ pub(crate) fn secondary_alignment_track_layout(
                 collapsed: false,
                 frozen_bottom: None,
                 subtracks: vec![TrackSubtrack {
+                    alignment_subtrack: None,
                     label: status,
                     detail: None,
                     top: frame_top + 22.0,
@@ -645,6 +778,7 @@ pub(crate) fn secondary_alignment_track_layout(
                 collapsed: false,
                 frozen_bottom: None,
                 subtracks: vec![TrackSubtrack {
+                    alignment_subtrack: None,
                     label: "Laying out complete reads…".to_owned(),
                     detail: None,
                     top: frame_top + 22.0,
@@ -732,6 +866,7 @@ pub(crate) fn secondary_alignment_track_layout(
     let mut subtracks = Vec::with_capacity(3);
     if options.show_coverage {
         subtracks.push(TrackSubtrack {
+            alignment_subtrack: Some(AlignmentSubtrack::Coverage),
             label: "Coverage".to_owned(),
             detail: Some(coverage_scale_detail(
                 layout.stats.maximum_coverage,
@@ -746,12 +881,13 @@ pub(crate) fn secondary_alignment_track_layout(
         });
     } else {
         subtracks.push(collapsed_alignment_subtrack(
-            "Coverage",
+            AlignmentSubtrack::Coverage,
             options.coverage_top,
         ));
     }
     if show_junctions {
         subtracks.push(TrackSubtrack {
+            alignment_subtrack: Some(AlignmentSubtrack::Sashimi),
             label: "Sashimi".to_owned(),
             detail: Some(sashimi_track_detail(
                 &layout.stats,
@@ -767,12 +903,13 @@ pub(crate) fn secondary_alignment_track_layout(
         });
     } else if junctions_available {
         subtracks.push(collapsed_alignment_subtrack(
-            "Sashimi",
+            AlignmentSubtrack::Sashimi,
             options.junction_top,
         ));
     }
     if show_modification_frequency {
         subtracks.push(TrackSubtrack {
+            alignment_subtrack: Some(AlignmentSubtrack::Modifications),
             label: "Modifications".to_owned(),
             detail: Some(format!("{} types", query.pileup.modifications.series.len())),
             top: options.modification_top,
@@ -782,7 +919,7 @@ pub(crate) fn secondary_alignment_track_layout(
         });
     } else if modification_frequency_supported {
         subtracks.push(collapsed_alignment_subtrack(
-            "Modifications",
+            AlignmentSubtrack::Modifications,
             options.modification_top,
         ));
     }
@@ -901,6 +1038,7 @@ pub(crate) fn secondary_alignment_track_layout(
             .fold(options.reads_top + options.row_height, f32::max)
             + 6.0;
         let reads = TrackSubtrack {
+            alignment_subtrack: Some(AlignmentSubtrack::Reads),
             label: "Reads".to_owned(),
             detail: (!read_details.is_empty()).then(|| read_details.join(" · ")),
             top: options.reads_top,
@@ -962,7 +1100,10 @@ pub(crate) fn secondary_alignment_track_layout(
             visible: true,
             collapsed: true,
             frozen_bottom: Some(read_bottom),
-            subtracks: vec![collapsed_alignment_subtrack("Reads", read_frame_top)],
+            subtracks: vec![collapsed_alignment_subtrack(
+                AlignmentSubtrack::Reads,
+                read_frame_top,
+            )],
         };
         return (Some(layout), annotation_frame, Some(read_frame));
     }

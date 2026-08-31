@@ -49,6 +49,7 @@ pub(crate) struct WorkspaceListImportTask {
     pub(crate) worker: JoinHandle<std::result::Result<WorkspaceListImport, String>>,
 }
 
+#[cfg(any())]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AlignmentRowLayoutTaskKey {
     pub(crate) query_identity: usize,
@@ -67,6 +68,7 @@ pub(crate) struct AlignmentRowLayoutTaskKey {
     pub(crate) repack: bool,
 }
 
+#[cfg(any())]
 pub(crate) struct AlignmentRowLayoutTask {
     pub(crate) panel_id: PanelId,
     pub(crate) track_id: TrackId,
@@ -74,12 +76,14 @@ pub(crate) struct AlignmentRowLayoutTask {
     pub(crate) key: AlignmentRowLayoutTaskKey,
 }
 
+#[cfg(any())]
 pub(crate) struct AlignmentRowLayoutTaskResult {
     pub(crate) rows: CachedAlignmentRows,
     pub(crate) history: AlignmentRowHistory,
     pub(crate) scene: Option<Arc<AlignmentRowScene>>,
 }
 
+#[cfg(any())]
 pub(crate) struct AlignmentRowLayoutWork {
     panel_id: PanelId,
     track_id: TrackId,
@@ -96,6 +100,7 @@ pub(crate) struct AlignmentRowLayoutWork {
     cancellation_generation: ViewportGeneration,
 }
 
+#[cfg(any())]
 pub(crate) struct CompletedAlignmentRowLayoutWork {
     panel_id: PanelId,
     track_id: TrackId,
@@ -104,6 +109,7 @@ pub(crate) struct CompletedAlignmentRowLayoutWork {
     result: Option<AlignmentRowLayoutTaskResult>,
 }
 
+#[cfg(any())]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AlignmentRowSceneTask {
     pub(crate) panel_id: PanelId,
@@ -112,6 +118,7 @@ pub(crate) struct AlignmentRowSceneTask {
     pub(crate) resident_query_identity: usize,
 }
 
+#[cfg(any())]
 pub(crate) struct AlignmentRowSceneWork {
     panel_id: PanelId,
     track_id: TrackId,
@@ -121,6 +128,7 @@ pub(crate) struct AlignmentRowSceneWork {
     cancellation_generation: ViewportGeneration,
 }
 
+#[cfg(any())]
 pub(crate) struct CompletedAlignmentRowSceneWork {
     panel_id: PanelId,
     track_id: TrackId,
@@ -129,6 +137,7 @@ pub(crate) struct CompletedAlignmentRowSceneWork {
     scene: Option<Arc<AlignmentRowScene>>,
 }
 
+#[cfg(any())]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AlignmentRowLayoutSubmit {
     Submitted,
@@ -136,6 +145,7 @@ pub(crate) enum AlignmentRowLayoutSubmit {
     Disconnected,
 }
 
+#[cfg(any())]
 pub(crate) fn process_alignment_row_layout_work(
     work: AlignmentRowLayoutWork,
     _scheduler_clock: &GenerationClock,
@@ -217,6 +227,7 @@ pub(crate) fn process_alignment_row_layout_work(
     })
 }
 
+#[cfg(any())]
 pub(crate) fn process_alignment_row_scene_work(
     work: AlignmentRowSceneWork,
     _scheduler_clock: &GenerationClock,
@@ -248,6 +259,7 @@ pub(crate) fn process_alignment_row_scene_work(
 }
 
 impl Viewer {
+    #[cfg(any())]
     pub(crate) fn schedule_alignment_row_scene_preparations(&mut self) {
         let candidates = self
             .alignment_tracks
@@ -318,6 +330,7 @@ impl Viewer {
         }
     }
 
+    #[cfg(any())]
     pub(crate) fn poll_alignment_row_scene_tasks(&mut self) {
         let mut committed = false;
         loop {
@@ -372,12 +385,14 @@ impl Viewer {
         }
     }
 
+    #[cfg(any())]
     pub(crate) fn finish_alignment_row_scene_tasks(&mut self) {
         self.alignment_row_scene_scheduler_clock.advance();
         self.alignment_row_scene_tasks.clear();
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any())]
     pub(crate) fn start_alignment_row_layout_task(
         &mut self,
         panel_id: PanelId,
@@ -435,6 +450,7 @@ impl Viewer {
         }
     }
 
+    #[cfg(any())]
     pub(crate) fn poll_alignment_row_layout_tasks(&mut self) {
         let mut committed = false;
         let mut processed = false;
@@ -515,6 +531,7 @@ impl Viewer {
         }
     }
 
+    #[cfg(any())]
     pub(crate) fn finish_alignment_row_layout_tasks(&mut self) {
         for track in &self.alignment_tracks {
             for projection in track.projections.values() {

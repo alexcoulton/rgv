@@ -61,6 +61,7 @@ struct ReadPanelScrollbarDraft {
     offset: f32,
     density: f32,
     preview_fraction: Option<f32>,
+    provisional: bool,
     overview: ui::ScrollbarOverview,
     interaction: ui::ScrollbarInteraction,
 }
@@ -115,12 +116,22 @@ fn read_panel_scrollbar_draft(
     density: f32,
     density_drag_fraction: Option<f32>,
     cached: Option<&ReadPanelDisplayCache>,
+    current_alignment_target_revision: u64,
+    committed_row_target_still_exact: bool,
 ) -> ReadPanelScrollbarDraft {
-    let maximum = cached.map_or(0.0, |read_panel| {
+    let presented_authority = cached.map_or(ReadRowCoordinateAuthority::Absent, |read_panel| {
+        current_read_row_authority(
+            read_panel.presentation_target_revision,
+            current_alignment_target_revision,
+            committed_row_target_still_exact,
+            read_panel.row_coordinate_authority,
+        )
+    });
+    let maximum = cached.map_or(0.0, |_read_panel| {
         crate::display::read_panel_scrollbar_maximum(
             state,
             allocation.bottom(),
-            read_panel.row_coordinate_authority,
+            presented_authority,
         )
     });
     let preview_fraction = density_drag_fraction.or_else(|| {
@@ -128,6 +139,7 @@ fn read_panel_scrollbar_draft(
             .then_some(state.latent_scroll_fraction)
             .flatten()
     });
+    let provisional = presented_authority.is_pending();
     ReadPanelScrollbarDraft {
         track_id,
         allocation,
@@ -135,6 +147,7 @@ fn read_panel_scrollbar_draft(
         offset: state.scroll_points.clamp(0.0, maximum),
         density,
         preview_fraction,
+        provisional,
         overview: cached
             .map(|read_panel| read_panel.overview.clone())
             .unwrap_or_default(),
@@ -191,9 +204,23 @@ impl Viewer {
         let detail = self.panels.active().viewport.detail_level();
         let contig_name = self.panels.active().contig_name.clone();
         let navigation = &self.panels.active().navigation_presentation;
+        let alignment_navigation_status = self.alignment_tracks.iter().find_map(|track| {
+            let projection = track.projection(self.panels.active().id)?;
+            (!projection
+                .navigation
+                .is_current_settled(projection.clock.current().get()))
+            .then(|| {
+                let diagnostic = projection.navigation.diagnostic();
+                diagnostic.invariant_failure.as_deref().map_or_else(
+                    || diagnostic.phase.status().to_owned(),
+                    |failure| format!("Alignment navigation stopped: {failure}"),
+                )
+            })
+        });
         let data_status = if navigation.is_unsettled() {
             if navigation.notice_visible {
-                "Updating view…".to_owned()
+                alignment_navigation_status
+                    .unwrap_or_else(|| "Updating contextual tracks…".to_owned())
             } else if navigation.source_status.is_empty() {
                 self.data_status.clone()
             } else {
@@ -657,6 +684,9 @@ impl Viewer {
                     .iter()
                     .all(|id| group.members.contains(id))
         });
+        let current_alignment_target_revision = self
+            .alignment_scene_publication_authority
+            .desired_target_revision();
         let mut workspace_scrollbars = self
             .panels
             .iter()
@@ -700,6 +730,9 @@ impl Viewer {
                             self.alignment_density_for_panel_track(panel.id, track_id),
                             density_drag_fraction,
                             cached,
+                            current_alignment_target_revision,
+                            self.alignment_scene_publication_authority
+                                .committed_row_target_matches_desired(panel.id, track_id),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -1965,6 +1998,7 @@ impl Viewer {
                             rect.height().max(1.0),
                             scrollbar.preview_fraction,
                             Some(&scrollbar.overview),
+                            scrollbar.provisional,
                         );
                         ui.painter().line_segment(
                             [
@@ -3875,27 +3909,38 @@ impl Viewer {
             }
         }
         if clear_cache_requested {
-            self.alignment_gpu_frame = None;
-            self.alignment_gpu_residency = None;
-            self.alignment_gpu_prefetch_pending = false;
+            self.alignment_presented_epoch = None;
+            self.alignment_gpu_residency_bundle = None;
+            self.alignment_gpu_prefetch.clear();
+            self.alignment_gpu_publication_retry = None;
             self.alignment_gpu_renderer.discard_device_resources();
+            self.alignment_summary_gpu_renderer
+                .discard_device_resources();
+            self.alignment_gpu_speculation_gate.reset();
             let budget = self
                 .settings
                 .cache_budget_mib
                 .saturating_mul(1024 * 1024)
                 .max(1);
-            for track in &self.alignment_tracks {
+            for track in &mut self.alignment_tracks {
                 if let Some(engine) = &track.scene_engine {
-                    if let Err(error) = engine.try_reduce_budget(0) {
+                    if let Err(error) = engine.try_clear_cache_budget(budget) {
                         self.data_status = error.to_string();
-                    } else if let Err(error) = engine.try_reduce_budget(budget) {
-                        self.data_status = error.to_string();
+                    } else {
+                        track.scene_budget_retry = None;
                     }
                 }
             }
         }
         if clear_cache_requested {
             self.layout_cache.clear();
+            // Dropping the native derivative is not itself a navigation transaction. Reissue
+            // every current alignment target with a fresh request token so cache clearing cannot
+            // leave a formerly committed projection beside an empty presented epoch. The source
+            // actor may reuse the exact still-pinned current scene, but all speculative/cache
+            // residency is rebuilt under the post-clear budget policy.
+            self.request_all_alignment_queries();
+            self.display_dirty = true;
         }
         truncate_string_to_bytes(&mut read_name_editor, 1_024);
         self.read_name_editor.clone_from(&read_name_editor);
@@ -4615,7 +4660,8 @@ mod tests {
             ..ReadPanelScrollState::default()
         };
 
-        let draft = read_panel_scrollbar_draft(track_id, allocation, state, 1.0, None, None);
+        let draft =
+            read_panel_scrollbar_draft(track_id, allocation, state, 1.0, None, None, 0, false);
 
         assert_eq!(draft.track_id, track_id);
         assert_eq!(draft.allocation, allocation);

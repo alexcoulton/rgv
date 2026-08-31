@@ -439,10 +439,15 @@ impl Viewer {
         {
             return None;
         }
-        self.alignment_tracks
+        let track = self
+            .alignment_tracks
             .iter()
-            .find(|track| track.config.id == id)
-            .and_then(|track| track.projection(self.panels.active().id))
+            .find(|track| track.config.id == id)?;
+        if track.scene_engine.is_some() {
+            return None;
+        }
+        track
+            .projection(self.panels.active().id)
             .filter(|projection| projection.query_is_current())
             .and_then(|projection| projection.current_query.as_ref())
     }
@@ -464,6 +469,9 @@ impl Viewer {
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == id)?;
+        if track.scene_engine.is_some() {
+            return None;
+        }
         let projection = track
             .projection(panel_id)
             .filter(|projection| projection.query_is_current())?;
@@ -835,8 +843,7 @@ impl Viewer {
             self.activate_first_alignment_track()?;
         }
         if query_requested {
-            self.panels.active_mut().pending_queries.alignment = true;
-            self.dispatch_alignment_query();
+            self.request_all_alignment_queries();
         }
         self.rebuild_genomic_display();
         self.display_dirty = true;
@@ -1170,7 +1177,7 @@ impl Viewer {
             self.display_dirty = true;
         }
         if outcome.query_changed {
-            self.dispatch_alignment_query();
+            self.request_all_alignment_queries();
         }
     }
 }

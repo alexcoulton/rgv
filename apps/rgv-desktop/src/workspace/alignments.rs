@@ -1,13 +1,44 @@
 use super::super::*;
 use crate::display::alignment;
 
-const MAXIMUM_ALIGNMENT_ROW_SCENES: usize = 4;
 /// Canonical presentation partition used by the first desktop qualification slice. This is a
 /// cache/page granularity, never an evidence or display cap. It deliberately matches the proven
 /// legacy layout tile scale so comparative traces have one fewer independent variable; Phase 6
 /// measurements may replace it without changing scene identity or completeness semantics.
 const DESKTOP_ALIGNMENT_SCENE_TILE_BASES: u64 = 32_768;
 const DESKTOP_ALIGNMENT_SCENE_ROW_BLOCK_ROWS: u32 = 256;
+
+/// Panel-local coherence identities. Raw and CPM scales are deliberately different groups: a
+/// numerical maximum in one unit can never be applied to the other.
+pub(crate) const ALIGNMENT_SASHIMI_RAW_GROUP: AlignmentCoherenceGroupId =
+    AlignmentCoherenceGroupId::new(1);
+pub(crate) const ALIGNMENT_SASHIMI_CPM_GROUP: AlignmentCoherenceGroupId =
+    AlignmentCoherenceGroupId::new(2);
+
+pub(crate) const fn alignment_scene_sashimi_group(
+    filters: &SessionFilters,
+) -> Option<AlignmentCoherenceGroupId> {
+    if !matches!(filters.sashimi_scale_mode, SashimiScaleMode::Shared) {
+        return None;
+    }
+    Some(match filters.sashimi_count_mode {
+        SashimiCountMode::Raw => ALIGNMENT_SASHIMI_RAW_GROUP,
+        SashimiCountMode::CountsPerMillion => ALIGNMENT_SASHIMI_CPM_GROUP,
+    })
+}
+
+/// Captures a panel selection only into the lane that owns it. Coverage and modification lanes
+/// deliberately share this gate so neither can leak another track's mutable selection into an
+/// immutable panel epoch.
+pub(crate) fn alignment_scene_selected_position(
+    selected_track: Option<TrackId>,
+    track_id: TrackId,
+    position: Option<u64>,
+) -> Option<u64> {
+    (selected_track == Some(track_id))
+        .then_some(position)
+        .flatten()
+}
 
 pub(crate) fn expanded_workspace_alignment_limit(
     current_workspace_limit: usize,
@@ -19,6 +50,195 @@ pub(crate) fn expanded_workspace_alignment_limit(
         current_workspace_limit.max(requested_track_limit),
         requested_track_limit,
     )
+}
+
+/// Translates mutable session settings into the immutable coverage contract captured by one panel
+/// epoch. Allele painting is present only when the snapshot has an exact reference-backed allele
+/// authority; coverage depth itself remains reference independent.
+pub(crate) fn alignment_scene_coverage_lane_options(
+    filters: &SessionFilters,
+    reference_backed_alleles: bool,
+    selected_position: Option<u64>,
+) -> AlignmentCoverageLaneOptions {
+    let scale_maximum = filters.coverage_scale_maximum;
+    let transform = filters.coverage_scale_transform;
+    AlignmentCoverageLaneOptions {
+        depth: CpuDepthProjectionOptions {
+            scale_maximum,
+            transform,
+            show_center_line: filters.show_coverage_center_line,
+            selected_position,
+        },
+        alleles: reference_backed_alleles.then_some(CpuAlleleProjectionOptions {
+            minimum_fraction: f64::from(filters.minimum_allele_fraction),
+            quality_weighted: filters.quality_weighted_alleles,
+            scale_maximum,
+            transform,
+            interpretation: match filters.alignment_color_mode {
+                AlignmentColorMode::Bisulfite(context) => {
+                    CoverageAlleleInterpretation::Bisulfite(context)
+                }
+                _ => CoverageAlleleInterpretation::GenericReferenceAware,
+            },
+        }),
+    }
+}
+
+/// Captures Sashimi scale policy rather than prematurely resolving a shared maximum from a
+/// different frame. Shared values are resolved only after the complete coherence group has
+/// entered the same panel epoch.
+pub(crate) fn alignment_scene_sashimi_lane_options(
+    filters: &SessionFilters,
+    shared_group: Option<AlignmentCoherenceGroupId>,
+) -> Option<AlignmentSashimiLaneOptions> {
+    let scale = match filters.sashimi_scale_mode {
+        SashimiScaleMode::Automatic => AlignmentSashimiScalePolicy::Automatic,
+        SashimiScaleMode::Fixed => AlignmentSashimiScalePolicy::Fixed(f64::from(
+            filters.sashimi_fixed_scale_maximum.max(1),
+        )),
+        SashimiScaleMode::Shared => AlignmentSashimiScalePolicy::Shared(shared_group?),
+    };
+    let scale_maximum = match scale {
+        AlignmentSashimiScalePolicy::Fixed(maximum) => Some(maximum),
+        AlignmentSashimiScalePolicy::Automatic | AlignmentSashimiScalePolicy::Shared(_) => None,
+    };
+    Some(AlignmentSashimiLaneOptions {
+        projection: CpuJunctionProjectionOptions {
+            minimum_depth: filters.minimum_junction_depth,
+            minimum_flank: filters.minimum_junction_flank,
+            display_mode: filters.junction_display_mode,
+            scale_maximum,
+            count_mode: filters.sashimi_count_mode,
+            show_labels: filters.show_junction_labels,
+        },
+        scale,
+    })
+}
+
+pub(crate) fn alignment_scene_modification_lane_options(
+    filters: &SessionFilters,
+    selected_position: Option<u64>,
+) -> AlignmentModificationLaneOptions {
+    let mut hidden_codes = filters
+        .hidden_modification_codes
+        .iter()
+        .filter_map(|value| crate::ui::alignment_settings::parse_modification_code(value))
+        .collect::<Vec<_>>();
+    hidden_codes.sort_unstable();
+    hidden_codes.dedup();
+    AlignmentModificationLaneOptions {
+        projection: CpuModificationProjectionOptions {
+            probability_weighted: true,
+            hidden_codes,
+        },
+        color_mode: filters.modified_base_color_mode,
+        selected_position,
+    }
+}
+
+/// Resolves scene-owned derived lanes from the already-final pane layout. The lane's stable
+/// `AlignmentSubtrack` identity—not its user-facing label—selects semantics, and the returned clip
+/// is intersected with the final scrolled item clip used by gutter hit testing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn alignment_scene_derived_lane_captures(
+    layout: &ui::PaneLayoutSnapshot,
+    track_id: TrackId,
+    horizontal_x: f64,
+    horizontal_width: f64,
+    filters: &SessionFilters,
+    reference_backed_alleles: bool,
+    sashimi_group: Option<AlignmentCoherenceGroupId>,
+    selected_pileup_position: Option<u64>,
+    selected_modification_position: Option<u64>,
+) -> Result<Vec<AlignmentDerivedLaneCapture>, AlignmentPanelSceneError> {
+    let Some(item) = layout.items.iter().find(|item| {
+        item.frame.key == ui::TrackFrameKey::Alignment(track_id)
+            && item.frame.channel == ui::TrackPane::Annotation
+    }) else {
+        return Ok(Vec::new());
+    };
+    if !item.effective_content_visible || item.clip_rect.height() <= 0.0 {
+        return Ok(Vec::new());
+    }
+    let mut captures = Vec::new();
+    for subtrack in &item.frame.subtracks {
+        if subtrack.collapsed {
+            continue;
+        }
+        let Some(kind) = subtrack.alignment_subtrack else {
+            continue;
+        };
+        let top = (subtrack.top - layout.scroll_points).max(item.clip_rect.top());
+        let bottom = (subtrack.bottom - layout.scroll_points).min(item.clip_rect.bottom());
+        if bottom <= top {
+            continue;
+        }
+        let options = match kind {
+            ui::AlignmentSubtrack::Coverage if filters.show_coverage => {
+                AlignmentDerivedLaneOptions::Coverage(alignment_scene_coverage_lane_options(
+                    filters,
+                    reference_backed_alleles,
+                    selected_pileup_position,
+                ))
+            }
+            ui::AlignmentSubtrack::Sashimi if filters.show_junctions => {
+                let Some(options) = alignment_scene_sashimi_lane_options(filters, sashimi_group)
+                else {
+                    // A Shared lane cannot truthfully enter an epoch without its explicit group.
+                    continue;
+                };
+                AlignmentDerivedLaneOptions::Sashimi(options)
+            }
+            ui::AlignmentSubtrack::Modifications if filters.show_modification_frequency => {
+                AlignmentDerivedLaneOptions::Modifications(
+                    alignment_scene_modification_lane_options(
+                        filters,
+                        selected_modification_position,
+                    ),
+                )
+            }
+            ui::AlignmentSubtrack::Reference
+            | ui::AlignmentSubtrack::Reads
+            | ui::AlignmentSubtrack::Coverage
+            | ui::AlignmentSubtrack::Sashimi
+            | ui::AlignmentSubtrack::Modifications => continue,
+        };
+        captures.push(AlignmentDerivedLaneCapture::new(
+            CpuClipRect {
+                x: horizontal_x,
+                y: f64::from(top),
+                width: horizontal_width,
+                height: f64::from(bottom - top),
+            },
+            options,
+        )?);
+    }
+    Ok(captures)
+}
+
+/// Actual read-pixel clip from the canonical Reads pane. A hidden lane returns `None`; callers
+/// must not manufacture a read render camera merely to keep summary acquisition alive.
+pub(crate) fn alignment_scene_read_clip(
+    layout: &ui::PaneLayoutSnapshot,
+    track_id: TrackId,
+    horizontal_x: f64,
+    horizontal_width: f64,
+) -> Option<CpuClipRect> {
+    let item = layout.items.iter().find(|item| {
+        item.frame.key == ui::TrackFrameKey::Alignment(track_id)
+            && item.frame.channel == ui::TrackPane::Reads
+    })?;
+    let reads_visible = item.effective_content_visible
+        && item.frame.subtracks.iter().any(|subtrack| {
+            subtrack.alignment_subtrack == Some(ui::AlignmentSubtrack::Reads) && !subtrack.collapsed
+        });
+    let content = reads_visible.then_some(item.content_rect).flatten()?;
+    (content.height() > 0.0).then_some(CpuClipRect {
+        x: horizontal_x,
+        y: f64::from(content.top()),
+        width: horizontal_width,
+        height: f64::from(content.height()),
+    })
 }
 
 #[derive(Clone)]
@@ -75,6 +295,598 @@ pub(crate) enum AlignmentTrackLifecycle {
     Failed(String),
 }
 
+/// Whether the exact retained/transient obstruction reported by a ledger error is still present.
+/// The progress epoch is deliberately not sufficient: unrelated pins, allocations, or another
+/// policy lane can change that epoch without making this request admissible.
+pub(crate) trait AlignmentLedgerProgressView {
+    fn alignment_ledger_progress(&self) -> LedgerProgress;
+}
+
+impl AlignmentLedgerProgressView for LedgerProgress {
+    fn alignment_ledger_progress(&self) -> LedgerProgress {
+        *self
+    }
+}
+
+impl AlignmentLedgerProgressView for LedgerSnapshot {
+    fn alignment_ledger_progress(&self) -> LedgerProgress {
+        self.capacity_progress()
+    }
+}
+
+pub(crate) fn alignment_ledger_pressure_blocker_remains(
+    pressure: LedgerError,
+    snapshot: &impl AlignmentLedgerProgressView,
+) -> bool {
+    let snapshot = snapshot.alignment_ledger_progress();
+    match pressure {
+        LedgerError::ReplacementTransitionActive { bundle_id } => {
+            snapshot.active_replacement_bundle == Some(bundle_id)
+        }
+        LedgerError::BudgetExceeded {
+            requested, limit, ..
+        } => {
+            let same_policy_lane = limit == snapshot.budget
+                || limit == snapshot.budget.saturating_add(snapshot.transition_reserve);
+            same_policy_lane
+                && snapshot
+                    .charged
+                    .saturating_add(snapshot.reserved)
+                    .saturating_add(requested)
+                    > limit
+        }
+        LedgerError::TransientBudgetExceeded {
+            requested, limit, ..
+        } => {
+            let same_policy_lane = limit == snapshot.transient_budget
+                || limit
+                    == snapshot
+                        .transient_budget
+                        .saturating_add(snapshot.transition_reserve);
+            same_policy_lane && snapshot.transient.saturating_add(requested) > limit
+        }
+        LedgerError::ReservationExceeded { .. }
+        | LedgerError::UnknownAllocation(_)
+        | LedgerError::IdOverflow
+        | LedgerError::Poisoned => false,
+    }
+}
+
+/// One attempted resume of an exact pressure-paused source request. The epoch is only a cheap
+/// change detector; after it changes the exact typed obstruction must also be revalidated before
+/// another request is allowed into the engine mailbox.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AlignmentScenePressureRetry {
+    pub(crate) request_token: AlignmentSceneRequestToken,
+    pub(crate) target: GenomicInterval,
+    pub(crate) pressure: LedgerError,
+    pub(crate) ledger_epoch: LedgerProgressEpoch,
+    /// True after the exact resume entered the engine mailbox and until either a current frame or
+    /// another typed pressure event answers it.
+    pub(crate) in_flight: bool,
+}
+
+impl AlignmentScenePressureRetry {
+    pub(crate) fn same_request(
+        self,
+        request_token: AlignmentSceneRequestToken,
+        target: GenomicInterval,
+    ) -> bool {
+        self.request_token == request_token && self.target == target
+    }
+
+    pub(crate) fn poll(
+        mut self,
+        snapshot: &impl AlignmentLedgerProgressView,
+    ) -> AlignmentScenePressureRetryPoll {
+        let snapshot = snapshot.alignment_ledger_progress();
+        if self.in_flight || self.ledger_epoch == snapshot.progress_epoch() {
+            return AlignmentScenePressureRetryPoll::Waiting(self);
+        }
+        if alignment_ledger_pressure_blocker_remains(self.pressure, &snapshot) {
+            // Consume unrelated epoch churn once, without reopening the exact source request on
+            // every subsequent desktop poll.
+            self.ledger_epoch = snapshot.progress_epoch();
+            AlignmentScenePressureRetryPoll::Waiting(self)
+        } else {
+            AlignmentScenePressureRetryPoll::Ready
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AlignmentScenePressureRetryPoll {
+    Waiting(AlignmentScenePressureRetry),
+    Ready,
+}
+
+/// Classifies the first post-relief snapshot without manufacturing an engine retry. Callers store
+/// the returned waiting authority verbatim; `Ready` alone permits one mailbox submission.
+pub(crate) fn alignment_scene_pressure_after_relief(
+    request_token: AlignmentSceneRequestToken,
+    target: GenomicInterval,
+    pressure: LedgerError,
+    snapshot: &impl AlignmentLedgerProgressView,
+) -> AlignmentScenePressureRetryPoll {
+    let snapshot = snapshot.alignment_ledger_progress();
+    if alignment_ledger_pressure_blocker_remains(pressure, &snapshot) {
+        AlignmentScenePressureRetryPoll::Waiting(AlignmentScenePressureRetry {
+            request_token,
+            target,
+            pressure,
+            ledger_epoch: snapshot.progress_epoch(),
+            in_flight: false,
+        })
+    } else {
+        AlignmentScenePressureRetryPoll::Ready
+    }
+}
+
+/// Independent retry authority for one source coordinator's application-wide budget edit. The
+/// controller records the requested value as soon as it queues the original command, so this
+/// state—not `cache_budget_bytes`—tracks whether that command actually reached the ledger and
+/// completed the coordinator-local eviction pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AlignmentSceneBudgetRetry {
+    pub(crate) requested_budget: usize,
+    pub(crate) clear_before_apply: bool,
+    pub(crate) observed_policy_revision: u64,
+    pub(crate) observed_budget: usize,
+    pub(crate) pressure: LedgerError,
+    pub(crate) ledger_epoch: LedgerProgressEpoch,
+    /// The first UI-side snapshot proved that the exact worker-reported blocker had already
+    /// cleared. This closes the settle-between-event-and-consumption wakeup race without opening
+    /// a frame-rate retry loop.
+    pub(crate) ready_after_observed_progress: bool,
+    pub(crate) in_flight: bool,
+}
+
+impl AlignmentSceneBudgetRetry {
+    pub(crate) fn after_pressure_event(
+        requested_budget: usize,
+        clear_before_apply: bool,
+        observed_policy_revision: u64,
+        observed_budget: usize,
+        pressure: LedgerError,
+        snapshot: &impl AlignmentLedgerProgressView,
+    ) -> Self {
+        let snapshot = snapshot.alignment_ledger_progress();
+        let policy_already_applied = !clear_before_apply && snapshot.budget == requested_budget;
+        Self {
+            requested_budget,
+            clear_before_apply,
+            observed_policy_revision,
+            observed_budget,
+            pressure,
+            ledger_epoch: snapshot.progress_epoch(),
+            ready_after_observed_progress: policy_already_applied
+                || !alignment_ledger_pressure_blocker_remains(pressure, &snapshot),
+            in_flight: false,
+        }
+    }
+
+    pub(crate) fn poll(
+        mut self,
+        snapshot: &impl AlignmentLedgerProgressView,
+    ) -> AlignmentSceneBudgetRetryPoll {
+        let snapshot = snapshot.alignment_ledger_progress();
+        if self.in_flight {
+            return AlignmentSceneBudgetRetryPoll::Waiting(self);
+        }
+        if self.ready_after_observed_progress {
+            return AlignmentSceneBudgetRetryPoll::Ready;
+        }
+
+        // Another coordinator sharing this ledger may already have installed the requested base
+        // policy. `set_budget` is then a no-op even during a newer prepared GPU transition, but
+        // this coordinator must still run its own cache-eviction pass.
+        if !self.clear_before_apply && snapshot.budget == self.requested_budget {
+            return AlignmentSceneBudgetRetryPoll::Ready;
+        }
+        if self.ledger_epoch == snapshot.progress_epoch() {
+            return AlignmentSceneBudgetRetryPoll::Waiting(self);
+        }
+        if alignment_ledger_pressure_blocker_remains(self.pressure, &snapshot) {
+            self.ledger_epoch = snapshot.progress_epoch();
+            AlignmentSceneBudgetRetryPoll::Waiting(self)
+        } else {
+            AlignmentSceneBudgetRetryPoll::Ready
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AlignmentSceneBudgetRetryPoll {
+    Waiting(AlignmentSceneBudgetRetry),
+    Ready,
+}
+
+#[cfg(test)]
+mod alignment_scene_pressure_retry_tests {
+    use super::*;
+
+    fn request() -> (AlignmentSceneRequestToken, GenomicInterval) {
+        (
+            AlignmentSceneRequestToken::new(17),
+            GenomicInterval::new(ContigId::new(2), 100, 200).unwrap(),
+        )
+    }
+
+    fn retry(ledger: &AllocationLedger, pressure: LedgerError) -> AlignmentScenePressureRetry {
+        let (request_token, target) = request();
+        AlignmentScenePressureRetry {
+            request_token,
+            target,
+            pressure,
+            ledger_epoch: ledger.snapshot().unwrap().progress_epoch(),
+            in_flight: false,
+        }
+    }
+
+    fn retained(ledger: &AllocationLedger, bytes: usize) -> rgv_alignment_scene::AllocationLease {
+        let mut reservation = ledger
+            .reserve(
+                rgv_alignment_scene::AllocationClass::CoreChunk,
+                bytes,
+                rgv_alignment_scene::ReservationKind::Normal,
+            )
+            .unwrap();
+        reservation.register(bytes, 1).unwrap()
+    }
+
+    fn assert_waiting(poll: AlignmentScenePressureRetryPoll) -> AlignmentScenePressureRetry {
+        match poll {
+            AlignmentScenePressureRetryPoll::Waiting(retry) => retry,
+            AlignmentScenePressureRetryPoll::Ready => panic!("expected pressure to keep waiting"),
+        }
+    }
+
+    #[test]
+    fn unchanged_exact_pressure_remains_waiting() {
+        let ledger = AllocationLedger::new(100, 0);
+        let _occupied = retained(&ledger, 80);
+        let pressure = ledger
+            .reserve(
+                rgv_alignment_scene::AllocationClass::CoreChunk,
+                40,
+                rgv_alignment_scene::ReservationKind::Normal,
+            )
+            .unwrap_err();
+        let retry = retry(&ledger, pressure);
+
+        assert_eq!(
+            assert_waiting(retry.poll(&ledger.snapshot().unwrap())),
+            retry
+        );
+    }
+
+    #[test]
+    fn first_pressure_waits_without_queueing_when_post_relief_blocker_remains() {
+        let ledger = AllocationLedger::new(1_024, 128);
+        let before_bundle = ledger.snapshot().unwrap();
+        let bundle = ledger
+            .reserve_replacement_bundle(AllocationBundleSpec::new(
+                before_bundle.policy_revision,
+                Vec::new(),
+                ledger.empty_retirement_claim_set(),
+            ))
+            .unwrap();
+        let blocked = ledger.snapshot().unwrap();
+        let pressure = LedgerError::ReplacementTransitionActive {
+            bundle_id: blocked.active_replacement_bundle.unwrap(),
+        };
+        let (request_token, target) = request();
+
+        let waiting = assert_waiting(alignment_scene_pressure_after_relief(
+            request_token,
+            target,
+            pressure,
+            &blocked,
+        ));
+        assert!(!waiting.in_flight);
+        assert_eq!(waiting.ledger_epoch, blocked.progress_epoch());
+        assert_eq!(assert_waiting(waiting.poll(&blocked)), waiting);
+
+        drop(bundle);
+        assert_eq!(
+            waiting.poll(&ledger.snapshot().unwrap()),
+            AlignmentScenePressureRetryPoll::Ready
+        );
+    }
+
+    #[test]
+    fn unrelated_pin_and_allocation_churn_cannot_wake_the_same_active_bundle() {
+        let ledger = AllocationLedger::new(1_024, 128);
+        let retained_for_pin = retained(&ledger, 64);
+        let unrelated_allocation = retained(&ledger, 32);
+        let before_bundle = ledger.snapshot().unwrap();
+        let bundle = ledger
+            .reserve_replacement_bundle(AllocationBundleSpec::new(
+                before_bundle.policy_revision,
+                Vec::new(),
+                ledger.empty_retirement_claim_set(),
+            ))
+            .unwrap();
+        let bundle_id = ledger
+            .snapshot()
+            .unwrap()
+            .active_replacement_bundle
+            .unwrap();
+        let retry = retry(
+            &ledger,
+            LedgerError::ReplacementTransitionActive { bundle_id },
+        );
+
+        let pin = retained_for_pin.pin().unwrap();
+        let after_pin = ledger.snapshot().unwrap();
+        assert_ne!(retry.ledger_epoch, after_pin.progress_epoch());
+        let after_pin_retry = assert_waiting(retry.poll(&after_pin));
+        assert_eq!(after_pin_retry.ledger_epoch, after_pin.progress_epoch());
+
+        drop(unrelated_allocation);
+        let after_release = ledger.snapshot().unwrap();
+        let after_release_retry = assert_waiting(after_pin_retry.poll(&after_release));
+        assert_eq!(
+            after_release_retry.ledger_epoch,
+            after_release.progress_epoch()
+        );
+
+        drop(bundle);
+        assert_eq!(
+            after_release_retry.poll(&ledger.snapshot().unwrap()),
+            AlignmentScenePressureRetryPoll::Ready
+        );
+        drop(pin);
+    }
+
+    #[test]
+    fn retained_pressure_waits_through_insufficient_churn_then_wakes_when_it_fits() {
+        let ledger = AllocationLedger::new(100, 0);
+        let occupied = retained(&ledger, 70);
+        let unrelated = retained(&ledger, 10);
+        let pressure = ledger
+            .reserve(
+                rgv_alignment_scene::AllocationClass::CoreChunk,
+                40,
+                rgv_alignment_scene::ReservationKind::Normal,
+            )
+            .unwrap_err();
+        let retry = retry(&ledger, pressure);
+
+        drop(unrelated);
+        let still_blocked = ledger.snapshot().unwrap();
+        let waiting = assert_waiting(retry.poll(&still_blocked));
+        assert_eq!(waiting.ledger_epoch, still_blocked.progress_epoch());
+
+        drop(occupied);
+        assert_eq!(
+            waiting.poll(&ledger.snapshot().unwrap()),
+            AlignmentScenePressureRetryPoll::Ready
+        );
+    }
+
+    #[test]
+    fn retained_policy_change_makes_one_retry_eligible() {
+        let ledger = AllocationLedger::new(100, 0);
+        let _occupied = retained(&ledger, 80);
+        let pressure = ledger
+            .reserve(
+                rgv_alignment_scene::AllocationClass::CoreChunk,
+                40,
+                rgv_alignment_scene::ReservationKind::Normal,
+            )
+            .unwrap_err();
+        let retry = retry(&ledger, pressure);
+
+        ledger.set_budget(200).unwrap();
+        assert_eq!(
+            retry.poll(&ledger.snapshot().unwrap()),
+            AlignmentScenePressureRetryPoll::Ready
+        );
+    }
+
+    #[test]
+    fn transient_pressure_uses_current_occupancy_and_captured_policy_lane() {
+        let ledger = AllocationLedger::new_with_transient_budget(1_024, 0, 100);
+        let mut occupied = ledger
+            .reserve_transient(
+                rgv_alignment_scene::TransientResourceClass::DecoderScratch,
+                70,
+                rgv_alignment_scene::ReservationKind::Normal,
+            )
+            .unwrap();
+        let unrelated = ledger
+            .reserve_transient(
+                rgv_alignment_scene::TransientResourceClass::DecoderScratch,
+                10,
+                rgv_alignment_scene::ReservationKind::Normal,
+            )
+            .unwrap();
+        let pressure = ledger
+            .reserve_transient(
+                rgv_alignment_scene::TransientResourceClass::DecoderScratch,
+                40,
+                rgv_alignment_scene::ReservationKind::Normal,
+            )
+            .unwrap_err();
+        let retry = retry(&ledger, pressure);
+
+        drop(unrelated);
+        let still_blocked = ledger.snapshot().unwrap();
+        let waiting = assert_waiting(retry.poll(&still_blocked));
+
+        occupied.shrink_to(50).unwrap();
+        assert_eq!(
+            waiting.poll(&ledger.snapshot().unwrap()),
+            AlignmentScenePressureRetryPoll::Ready
+        );
+    }
+}
+
+#[cfg(test)]
+mod alignment_scene_budget_retry_tests {
+    use super::*;
+
+    fn active_bundle(
+        ledger: &AllocationLedger,
+    ) -> (rgv_alignment_scene::AllocationBundleReservation, u64) {
+        let snapshot = ledger.snapshot().unwrap();
+        let bundle = ledger
+            .reserve_replacement_bundle(AllocationBundleSpec::new(
+                snapshot.policy_revision,
+                Vec::new(),
+                ledger.empty_retirement_claim_set(),
+            ))
+            .unwrap();
+        let bundle_id = ledger
+            .snapshot()
+            .unwrap()
+            .active_replacement_bundle
+            .unwrap();
+        (bundle, bundle_id)
+    }
+
+    fn retry(
+        ledger: &AllocationLedger,
+        requested_budget: usize,
+        clear_before_apply: bool,
+        bundle_id: u64,
+    ) -> AlignmentSceneBudgetRetry {
+        let snapshot = ledger.snapshot().unwrap();
+        AlignmentSceneBudgetRetry {
+            requested_budget,
+            clear_before_apply,
+            observed_policy_revision: snapshot.policy_revision,
+            observed_budget: snapshot.budget,
+            pressure: LedgerError::ReplacementTransitionActive { bundle_id },
+            ledger_epoch: snapshot.progress_epoch(),
+            ready_after_observed_progress: false,
+            in_flight: false,
+        }
+    }
+
+    fn assert_waiting(poll: AlignmentSceneBudgetRetryPoll) -> AlignmentSceneBudgetRetry {
+        match poll {
+            AlignmentSceneBudgetRetryPoll::Waiting(retry) => retry,
+            AlignmentSceneBudgetRetryPoll::Ready => panic!("expected budget retry to wait"),
+        }
+    }
+
+    #[test]
+    fn active_replacement_waits_without_polling_then_wakes_once_after_settlement() {
+        let ledger = AllocationLedger::new(1_024, 128);
+        let (bundle, bundle_id) = active_bundle(&ledger);
+        let retry = retry(&ledger, 512, false, bundle_id);
+        assert_eq!(
+            assert_waiting(retry.poll(&ledger.snapshot().unwrap())),
+            retry
+        );
+
+        drop(bundle);
+        assert_eq!(
+            retry.poll(&ledger.snapshot().unwrap()),
+            AlignmentSceneBudgetRetryPoll::Ready
+        );
+    }
+
+    #[test]
+    fn shared_policy_application_still_runs_this_coordinators_eviction_pass() {
+        let ledger = AllocationLedger::new(1_024, 128);
+        let (old_bundle, old_bundle_id) = active_bundle(&ledger);
+        let retry = retry(&ledger, 512, false, old_bundle_id);
+        drop(old_bundle);
+        ledger.set_budget(512).unwrap();
+        let (_new_bundle, _) = active_bundle(&ledger);
+
+        assert_eq!(
+            retry.poll(&ledger.snapshot().unwrap()),
+            AlignmentSceneBudgetRetryPoll::Ready,
+            "a shared ledger policy success must not skip this source's local eviction pass"
+        );
+    }
+
+    #[test]
+    fn clear_transaction_cannot_skip_zero_pass_when_restore_budget_is_already_current() {
+        let ledger = AllocationLedger::new(1_024, 128);
+        let (_bundle, bundle_id) = active_bundle(&ledger);
+        let retry = retry(&ledger, 1_024, true, bundle_id);
+
+        assert_eq!(
+            assert_waiting(retry.poll(&ledger.snapshot().unwrap())),
+            retry,
+            "the final restored policy does not prove that the clear pass ran"
+        );
+    }
+
+    #[test]
+    fn queued_retry_stays_single_flight_even_after_unrelated_progress() {
+        let ledger = AllocationLedger::new(1_024, 128);
+        let (bundle, bundle_id) = active_bundle(&ledger);
+        let mut retry = retry(&ledger, 512, false, bundle_id);
+        retry.in_flight = true;
+        drop(bundle);
+
+        assert_eq!(
+            assert_waiting(retry.poll(&ledger.snapshot().unwrap())),
+            retry
+        );
+    }
+
+    #[test]
+    fn settlement_between_worker_event_and_ui_consumption_is_immediately_retryable() {
+        let ledger = AllocationLedger::new(1_024, 128);
+        let (bundle, bundle_id) = active_bundle(&ledger);
+        let observed = ledger.snapshot().unwrap();
+        drop(bundle);
+        let consumed = AlignmentSceneBudgetRetry::after_pressure_event(
+            512,
+            false,
+            observed.policy_revision,
+            observed.budget,
+            LedgerError::ReplacementTransitionActive { bundle_id },
+            &ledger.snapshot().unwrap(),
+        );
+
+        assert!(consumed.ready_after_observed_progress);
+        assert_eq!(
+            consumed.poll(&ledger.snapshot().unwrap()),
+            AlignmentSceneBudgetRetryPoll::Ready,
+            "a settled blocker must not wait for a second ledger epoch change"
+        );
+    }
+
+    #[test]
+    fn current_retry_response_refreshes_blocker_epoch_and_clears_single_flight() {
+        let ledger = AllocationLedger::new(1_024, 128);
+        let (old_bundle, old_bundle_id) = active_bundle(&ledger);
+        let mut in_flight = retry(&ledger, 512, false, old_bundle_id);
+        in_flight.in_flight = true;
+        drop(old_bundle);
+        let (_current_bundle, current_bundle_id) = active_bundle(&ledger);
+        let current = ledger.snapshot().unwrap();
+        let refreshed = AlignmentSceneBudgetRetry::after_pressure_event(
+            512,
+            false,
+            current.policy_revision,
+            current.budget,
+            LedgerError::ReplacementTransitionActive {
+                bundle_id: current_bundle_id,
+            },
+            &current,
+        );
+
+        assert_ne!(in_flight.pressure, refreshed.pressure);
+        assert_eq!(refreshed.ledger_epoch, current.progress_epoch());
+        assert!(!refreshed.in_flight);
+        assert!(!refreshed.ready_after_observed_progress);
+        assert_eq!(
+            assert_waiting(refreshed.poll(&current)),
+            refreshed,
+            "the refreshed exact blocker must wait rather than reusing prior relief"
+        );
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct AlignmentPanelProjection {
     pub(crate) clock: GenerationClock,
@@ -105,13 +917,6 @@ pub(crate) struct AlignmentPanelProjection {
     pub(crate) working_set: AlignmentWorkingSetStats,
     pub(crate) query_stats: Option<QueryStats>,
     pub(crate) alignment_rows: Option<CachedAlignmentRows>,
-    /// Bounded exact-camera row projections. These retain only compact index
-    /// arrays and shared scene/query Arcs, allowing an exact return to bypass
-    /// even the linear physical projection over a dense target.
-    pub(crate) row_layout_cache: Vec<CachedAlignmentRows>,
-    /// Monotonic identity for transactional off-thread row-layout requests.
-    /// A completed worker may commit only when this value still matches.
-    pub(crate) row_layout_request_revision: u64,
     /// Dedicated cancellation generation for row sweeps. Query generations
     /// and layout generations advance independently, so this clock changes
     /// only when a distinct row-layout request supersedes existing work.
@@ -135,17 +940,40 @@ pub(crate) struct AlignmentPanelProjection {
     pub(crate) scene_contig: Option<ContigId>,
     pub(crate) scene_contract: Option<AlignmentSceneBuildContract>,
     pub(crate) scene_policy: Option<AlignmentScenePreparationPolicy>,
-    pub(crate) desired_scene_camera: Option<AlignmentCamera>,
-    pub(crate) desired_scene_request_token: Option<AlignmentSceneRequestToken>,
+    /// Sole liveness authority for the latest unified-scene target. Legacy query fields below are
+    /// retained temporarily for unsupported-source diagnostics, but cannot settle this record.
+    pub(crate) navigation: AlignmentNavigationTransaction,
+    /// Last exact pressure resume admitted for this request at a specific shared-ledger epoch.
+    /// It is scheduling state only and never authorizes scene publication.
+    pub(crate) scene_pressure_retry: Option<AlignmentScenePressureRetry>,
     pub(crate) scene_frame: Option<AlignmentCoordinatorFrame>,
     pub(crate) scene_frame_request_token: Option<AlignmentSceneRequestToken>,
     pub(crate) scene_interaction: AlignmentInteractionState,
 }
 
 impl AlignmentPanelProjection {
-    pub(crate) fn settle_unavailable(&mut self, message: String) {
+    pub(crate) fn settle_failed(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.navigation.transition(
+            AlignmentNavigationPhase::Failed,
+            Arc::<str>::from(message.clone()),
+        );
         self.finish_checking();
         self.pending_query = false;
+        self.scene_pressure_retry = None;
+        self.unavailable = Some(message);
+        self.index_only_overview = false;
+        self.settled_generation = Some(self.clock.current().get());
+    }
+
+    pub(crate) fn settle_unavailable(&mut self, message: String) {
+        self.navigation.transition(
+            AlignmentNavigationPhase::Unavailable,
+            Arc::<str>::from(message.clone()),
+        );
+        self.finish_checking();
+        self.pending_query = false;
+        self.scene_pressure_retry = None;
         self.current_query = None;
         self.layout_query = None;
         self.resident_query = None;
@@ -155,43 +983,6 @@ impl AlignmentPanelProjection {
         self.unavailable = Some(message);
         self.index_only_overview = false;
         self.settled_generation = Some(self.clock.current().get());
-    }
-
-    pub(crate) fn commit_alignment_rows(&mut self, rows: CachedAlignmentRows) {
-        self.row_layout_cache.retain(|cached| {
-            !Arc::ptr_eq(&cached.query, &rows.query)
-                || cached.group_mode != rows.group_mode
-                || cached.group_order != rows.group_order
-                || cached.sort_mode != rows.sort_mode
-                || cached.sort_order != rows.sort_order
-                || cached.sort_position != rows.sort_position
-                || cached.promoted_read_name_hash != rows.promoted_read_name_hash
-                || cached.max_rows != rows.max_rows
-                || cached.row_scale_class != rows.row_scale_class
-                || cached.view_as_pairs != rows.view_as_pairs
-                || cached.pair_length_bounds != rows.pair_length_bounds
-                || cached.stacking_mode != rows.stacking_mode
-        });
-        self.row_layout_cache.push(rows.clone());
-        if self.row_layout_cache.len() > MAXIMUM_ALIGNMENT_ROW_SCENES {
-            let excess = self
-                .row_layout_cache
-                .len()
-                .saturating_sub(MAXIMUM_ALIGNMENT_ROW_SCENES);
-            self.row_layout_cache.drain(..excess);
-        }
-        self.alignment_rows = Some(rows);
-    }
-
-    pub(crate) fn admit_row_scene(&mut self, scene: Arc<AlignmentRowScene>) {
-        self.row_scenes.push(scene);
-        if self.row_scenes.len() > MAXIMUM_ALIGNMENT_ROW_SCENES {
-            let excess = self
-                .row_scenes
-                .len()
-                .saturating_sub(MAXIMUM_ALIGNMENT_ROW_SCENES);
-            self.row_scenes.drain(..excess);
-        }
     }
 
     /// Starts a new query generation and immediately invalidates any row
@@ -207,7 +998,8 @@ impl AlignmentPanelProjection {
     /// running. A previous query must not be reprojected or exposed through
     /// interaction while either condition is true.
     pub(crate) fn query_is_current(&self) -> bool {
-        !self.pending_query && self.settled_generation == Some(self.clock.current().get())
+        self.navigation
+            .is_current_settled(self.clock.current().get())
     }
 
     pub(crate) fn query_is_checking(&self) -> bool {
@@ -270,6 +1062,10 @@ impl AlignmentPanelProjection {
 
     pub(crate) fn settle_index_only_overview(&mut self, resolution: AlignmentQueryResolution) {
         debug_assert!(!resolution.requires_alignment_records());
+        self.navigation.transition(
+            AlignmentNavigationPhase::IndexOverview,
+            "viewport uses exact index-only alignment overview",
+        );
         self.finish_checking();
         self.pending_query = false;
         self.current_query = None;
@@ -345,6 +1141,10 @@ pub(crate) struct AlignmentTrackController {
     /// applied value here prevents a frame-by-frame rebalance from flooding
     /// the bounded actor queue while its statistics event is in flight.
     pub(crate) cache_budget_bytes: NonZeroUsize,
+    /// Typed, progress-gated authority proving that the latest queued budget edit still needs a
+    /// coordinator-local retry. This is deliberately separate from `cache_budget_bytes`, which
+    /// records submission and cannot prove worker completion.
+    pub(crate) scene_budget_retry: Option<AlignmentSceneBudgetRetry>,
     pub(crate) remote_io_stats: Option<RemoteIoStats>,
 }
 
@@ -362,54 +1162,6 @@ pub(crate) struct AlignmentSettingsOutcome {
 }
 
 impl AlignmentTrackController {
-    pub(crate) fn prepare_query_interval(
-        &mut self,
-        panel_id: PanelId,
-        record_allocation: usize,
-        contig_name: &str,
-        viewport_interval: GenomicInterval,
-    ) -> Option<GenomicInterval> {
-        let projection = self.projections.entry(panel_id).or_default();
-        if !projection.pending_query {
-            return None;
-        }
-        match &self.lifecycle {
-            AlignmentTrackLifecycle::Opening => return None,
-            AlignmentTrackLifecycle::Failed(_) => {
-                projection.pending_query = false;
-                return None;
-            }
-            AlignmentTrackLifecycle::Ready => {}
-        }
-        if record_allocation == 0 {
-            self.mark_unavailable(
-                panel_id,
-                "workspace record budget is exhausted by earlier visible tracks".to_owned(),
-            );
-            return None;
-        }
-        let Some(interval) = self
-            .dictionary
-            .as_ref()
-            .and_then(|dictionary| interval_for_track(dictionary, contig_name, viewport_interval))
-        else {
-            self.mark_unavailable(
-                panel_id,
-                format!(
-                    "{contig_name}:{}-{} is not available in this alignment",
-                    viewport_interval.start().saturating_add(1),
-                    viewport_interval.end()
-                ),
-            );
-            return None;
-        };
-        if let Some(projection) = self.projections.get_mut(&panel_id) {
-            projection.unavailable = None;
-            projection.index_only_overview = false;
-        }
-        Some(interval)
-    }
-
     pub(crate) fn mark_unavailable(&mut self, panel_id: PanelId, message: String) {
         let projection = self.projections.entry(panel_id).or_default();
         projection.settle_unavailable(message);
@@ -641,6 +1393,7 @@ pub(crate) struct LiveCacheCoordinatorSnapshot {
 /// Existing residency is preserved when it fits; remaining capacity follows
 /// observed per-track demand. Under pressure, every track receives a
 /// proportional non-zero allowance and its engine evicts speculation first.
+#[cfg(test)]
 pub(crate) fn adaptive_alignment_cache_shares(
     total_bytes: usize,
     resident_bytes: &[usize],
@@ -683,6 +1436,7 @@ pub(crate) fn adaptive_alignment_cache_shares(
         .collect()
 }
 
+#[cfg(test)]
 fn distribute_cache_bytes(shares: &mut [usize], bytes: usize, weights: &[usize]) {
     if bytes == 0 || shares.is_empty() {
         return;
@@ -744,44 +1498,6 @@ pub(crate) fn alignment_coverage_query_plan(
     (bins, collect_alleles)
 }
 
-pub(crate) fn alignment_query_options(
-    track: &AlignmentTrackController,
-    detail_level: DetailLevel,
-    bases_per_pixel: f64,
-    record_allocation: usize,
-    coverage_bins: usize,
-    collect_alleles: bool,
-) -> QueryOptions {
-    let filters = &track.config.filters;
-    QueryOptions {
-        detail: if matches!(detail_level, DetailLevel::Reads | DetailLevel::Bases) {
-            QueryDetail::Full
-        } else {
-            QueryDetail::Layout
-        },
-        retained_auxiliary_tags: alignment_row_policy_auxiliary_tags(filters),
-        layout_requires_sequence: filters.alignment_sort_mode == AlignmentSortMode::Base,
-        max_records: NonZeroUsize::new(record_allocation).unwrap(),
-        coverage_bins: NonZeroUsize::new(coverage_bins).unwrap(),
-        collect_alleles,
-        collect_modifications: filters.show_modification_frequency
-            && detail_level != DetailLevel::Overview,
-        overlapping_mate_policy: filters.overlapping_mate_policy,
-        minimum_base_quality: filters.minimum_base_quality,
-        minimum_junction_flank: filters.minimum_junction_flank,
-        include_secondary: track.active_filters.include_secondary,
-        include_supplementary: track.active_filters.include_supplementary,
-        include_reference: collect_alleles
-            || alignment_query_needs_reference(
-                filters.alignment_color_mode,
-                detail_level,
-                bases_per_pixel,
-            ),
-        filter: track.active_filters.alignment.clone(),
-        ..QueryOptions::default()
-    }
-}
-
 /// Source-level options for the unified scene. Presentation and summary contracts remain typed
 /// and independent; these options contain only source eligibility, resumable decode policy, and
 /// the richest payload currently required by desktop alignment consumers.
@@ -827,7 +1543,12 @@ pub(crate) fn alignment_scene_build_contract(
 ) -> AlignmentSceneBuildContract {
     let filters = &config.filters;
     let detail = viewport.detail_level();
-    let allele_detail = if viewport.bases_per_pixel() <= MAXIMUM_ALLELE_COVERAGE_BASES_PER_PIXEL
+    // A coverage allele becomes a substitution only relative to a versioned FASTA base. Keep
+    // exact depth reference-independent, but do not publish an allele presentation contract that
+    // could cause every observed base to be labelled as an alternate when no reference authority
+    // is available.
+    let allele_detail = if reference_revision.is_some()
+        && viewport.bases_per_pixel() <= MAXIMUM_ALLELE_COVERAGE_BASES_PER_PIXEL
         && viewport.interval().len() <= MAXIMUM_COVERAGE_BINS as u64
     {
         if filters.quality_weighted_alleles {
@@ -853,8 +1574,11 @@ pub(crate) fn alignment_scene_build_contract(
         DetailLevel::Reads => GeometryLod::Read,
         DetailLevel::Bases => GeometryLod::Base,
     };
-    let scene_reference_revision =
-        alignment_scene_reference_revision(geometry_lod, reference_revision);
+    let scene_reference_revision = if allele_detail != AlleleSummaryDetail::None {
+        reference_revision
+    } else {
+        alignment_scene_reference_revision(geometry_lod, reference_revision)
+    };
     AlignmentSceneBuildContract {
         source_revision: metadata.source_revision,
         record_contract: metadata.record_contract,
@@ -941,10 +1665,12 @@ pub(crate) const fn alignment_scene_reference_revision(
 
 pub(crate) fn alignment_scene_preparation_policy(
     buffer_percent: u16,
-    camera: AlignmentCamera,
+    camera: impl Into<AlignmentSceneCamera>,
 ) -> AlignmentScenePreparationPolicy {
+    let camera = camera.into();
     let side_viewports = f64::from(buffer_percent) / 100.0;
-    let visible_rows = camera.visible_rows().len().max(1);
+    let has_visible_rows = camera.has_visible_rows();
+    let visible_rows = camera.visible_rows().len();
     let visible_rows = u32::try_from(visible_rows).unwrap_or(u32::MAX);
     let scaled_rows = |denominator: u64| {
         u64::from(visible_rows)
@@ -959,10 +1685,14 @@ pub(crate) fn alignment_scene_preparation_policy(
         side_viewports,
         side_viewports * 0.25,
         scaled_rows(100),
-        scaled_rows(400).max(1),
+        if has_visible_rows {
+            scaled_rows(400).max(1)
+        } else {
+            0
+        },
     )
     .expect("desktop scene preparation policy is finite and non-negative")
-    .with_full_vertical_residency(true)
+    .with_full_vertical_residency(has_visible_rows)
 }
 
 pub(crate) fn alignment_scene_contract_equivalent(
@@ -1019,6 +1749,7 @@ fn alignment_row_policy_auxiliary_tags(filters: &SessionFilters) -> Vec<[u8; 2]>
     tags
 }
 
+#[cfg(test)]
 pub(crate) fn alignment_query_needs_reference(
     color_mode: AlignmentColorMode,
     detail_level: DetailLevel,
@@ -1313,6 +2044,7 @@ pub(crate) fn spawn_alignment_track_controller(
         projections: alignment_panel_projections(panel_ids),
         cache_stats: None,
         cache_budget_bytes: cache_bytes,
+        scene_budget_retry: None,
         remote_io_stats: None,
     })
 }

@@ -7,16 +7,16 @@ use std::{
 };
 
 use rgv_alignment_scene::{
-    AlignmentCamera, AlignmentPresentationOwner, AlignmentPresentationSceneError,
-    AlignmentPresentationStore, AlignmentPresentationStoreError, AlignmentRowActivityProfile,
-    AlignmentRowAtlasError, AlignmentSceneSnapshot, AlignmentSceneSnapshotError,
-    AlignmentSourceRevision, CanonicalGenomicTile, ContractFingerprint, EvidenceBuildError,
-    EvidenceSelectionError, EvidenceStoreError, ExactAlleleSummaryError, ExactDepthSummaryError,
-    ExactFilterSummaryError, ExactJunctionSummaryError, ExactModificationSummaryError,
-    ExactPairSummaryError, ExactSummaryRootError, GeometryLod, JunctionAnnotationIndex,
-    LayoutContract, LedgerError, PayloadContract, PresentationContract, PresentationStorePressure,
-    ReferenceRevision, ReservationKind, RowAtlasRevision, SceneRevision, SemanticPageError,
-    StorePressure, SummaryContract, SummarySemanticPageError,
+    AlignmentPresentationOwner, AlignmentPresentationSceneError, AlignmentPresentationStore,
+    AlignmentPresentationStoreError, AlignmentRowActivityProfile, AlignmentRowAtlasError,
+    AlignmentSceneCamera, AlignmentSceneSnapshot, AlignmentSceneSnapshotError,
+    AlignmentSourceRevision, AlleleSummaryDetail, CanonicalGenomicTile, ContractFingerprint,
+    EvidenceBuildError, EvidenceSelectionError, EvidenceStoreError, ExactAlleleSummaryError,
+    ExactDepthSummaryError, ExactFilterSummaryError, ExactJunctionSummaryError,
+    ExactModificationSummaryError, ExactPairSummaryError, ExactSummaryRootError, GeometryLod,
+    JunctionAnnotationIndex, LayoutContract, LedgerError, PayloadContract, PresentationContract,
+    PresentationStorePressure, ReferenceRevision, ReservationKind, RowAtlasRevision, SceneRevision,
+    SemanticPageError, StorePressure, SummaryContract, SummarySemanticPageError,
 };
 use rgv_core::{ContigId, GenomicInterval};
 use rgv_hts::ReferenceSlice;
@@ -27,6 +27,8 @@ use crate::{
     AlignmentSourceIntentSpec, CanonicalAlignmentSourceBackend, SourceIntentKind,
     SourceIntentSequence, SourceOwnerId, SourceScheduleError,
 };
+
+const ALLELE_REFERENCE_CONTEXT_RADIUS: u64 = 2;
 
 /// A presentation reference carries its immutable identity beside the actual bases. Keeping the
 /// revision separate from `ReferenceSlice` prevents a caller from pairing current bases with a
@@ -130,6 +132,44 @@ impl AlignmentSceneBuildContract {
     }
 }
 
+/// Proves that a camera-local row profile still describes the exact genomic row coordinate
+/// space owned by `scene` under `contract`.
+///
+/// Visible-row coverage is deliberately absent from this predicate. Scrolling changes which
+/// geometry pages are ready to draw, but it does not change the number, identity, or activity of
+/// canonical rows at the same genomic interval.
+#[must_use]
+pub fn alignment_row_activity_satisfies_contract(
+    profile: &AlignmentRowActivityProfile,
+    scene: &AlignmentSceneSnapshot,
+    interval: GenomicInterval,
+    contract: &AlignmentSceneBuildContract,
+) -> bool {
+    let atlas = scene.reads().atlas();
+    alignment_row_atlas_satisfies_contract(scene, interval, contract)
+        && profile.interval() == interval
+        && profile.atlas_revision() == atlas.revision()
+        && profile.row_coordinate_space() == atlas.row_coordinate_space()
+        && profile.stable_row_count() == atlas.row_count()
+}
+
+fn alignment_row_atlas_satisfies_contract(
+    scene: &AlignmentSceneSnapshot,
+    interval: GenomicInterval,
+    contract: &AlignmentSceneBuildContract,
+) -> bool {
+    let reads = scene.reads();
+    let evidence = reads.evidence();
+    let atlas = reads.atlas();
+    scene.prepared_interval().contains_interval(interval)
+        && evidence.coverage().covers(interval)
+        && atlas.interval().contains_interval(interval)
+        && atlas.derived_from_evidence() == evidence.revision()
+        && atlas.source_revision() == contract.source_revision
+        && atlas.record_contract() == contract.record_contract
+        && atlas.layout_contract() == contract.layout
+}
+
 /// User-adjustable preparation distances. The coordinator contains no hidden hard clamp; callers
 /// choose these values within the shared allocation budget and measurements can later supply the
 /// product defaults.
@@ -216,7 +256,7 @@ enum CameraDirection {
 
 #[derive(Clone, Debug)]
 struct DesiredScene {
-    camera: AlignmentCamera,
+    camera: AlignmentSceneCamera,
     camera_sequence: u64,
     prepared_interval: GenomicInterval,
     source_horizon: GenomicInterval,
@@ -229,7 +269,7 @@ struct DesiredScene {
 /// whole-lane sentinel.
 #[derive(Clone, Debug)]
 pub struct AlignmentCoordinatorFrame {
-    pub camera: AlignmentCamera,
+    pub camera: AlignmentSceneCamera,
     pub camera_sequence: u64,
     pub snapshot: Option<Arc<AlignmentSceneSnapshot>>,
     pub covered_interval: Option<GenomicInterval>,
@@ -241,11 +281,24 @@ pub struct AlignmentCoordinatorFrame {
     /// rows for immediate horizontal navigation.
     pub row_activity: Option<Arc<AlignmentRowActivityProfile>>,
     pub reference_requirement: AlignmentReferenceRequirement,
-    /// Whether the retained snapshot was built from the lane's currently desired presentation,
-    /// summary, and layout contracts. Geometric overlap alone cannot make stale semantics ready.
+    /// Whether the retained snapshot was built from the lane's currently desired
+    /// reference-independent presentation, summary, and layout contracts. Reference-backed
+    /// interpretation has its own readiness bit below: a pending FASTA slice must not make
+    /// truthful read geometry or exact depth stale.
     pub scene_contracts_current: bool,
+    /// Whether every reference-dependent presentation product in the desired contract is also
+    /// current. `false` is an optional-product state, not a reason to withhold the core scene.
+    pub reference_products_current: bool,
     pub individual_reads: AlignmentIndividualReadCapability,
     pub vertical_residency: AlignmentVerticalResidency,
+}
+
+/// Constant-size proof of which worker queue can still advance one owner. A frame which is not
+/// terminal and reports both fields false is ownerless rather than merely "still updating".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentSceneOwnerWorkState {
+    pub source_pending: bool,
+    pub presentation_pending: bool,
 }
 
 impl AlignmentCoordinatorFrame {
@@ -373,7 +426,7 @@ where
 
     pub fn update_camera(
         &mut self,
-        camera: AlignmentCamera,
+        camera: impl Into<AlignmentSceneCamera>,
     ) -> Result<AlignmentCoordinatorUpdate, AlignmentSceneCoordinatorError<B::Error>> {
         self.source.update_camera(self.owner, camera)
     }
@@ -532,6 +585,10 @@ pub struct AlignmentPresentationPump {
     pub owner: SourceOwnerId,
     pub published_scene: Option<SceneRevision>,
     pub budget_limited: bool,
+    /// Allocation pressure which paused this optional vertical-residency checkpoint. The current
+    /// immutable scene remains authoritative; callers may resume the lane after shared-ledger
+    /// progress instead of treating the source as unavailable.
+    pub pressure: Option<LedgerError>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -665,8 +722,9 @@ where
     pub fn update_camera(
         &mut self,
         owner: SourceOwnerId,
-        camera: AlignmentCamera,
+        camera: impl Into<AlignmentSceneCamera>,
     ) -> Result<AlignmentCoordinatorUpdate, AlignmentSceneCoordinatorError<B::Error>> {
+        let camera = camera.into();
         let lane = self
             .lanes
             .get_mut(&owner)
@@ -952,6 +1010,21 @@ where
         self.actor.schedule().pending_slots() > 0
     }
 
+    #[must_use]
+    pub fn owner_work_state(
+        &self,
+        owner: SourceOwnerId,
+    ) -> Result<AlignmentSceneOwnerWorkState, AlignmentSceneCoordinatorConfigError> {
+        let lane = self
+            .lanes
+            .get(&owner)
+            .ok_or(AlignmentSceneCoordinatorConfigError::UnknownOwner(owner))?;
+        Ok(AlignmentSceneOwnerWorkState {
+            source_pending: self.actor.schedule().foreground_pending_for(owner),
+            presentation_pending: lane.needs_vertical_residency(owner, &self.presentation),
+        })
+    }
+
     /// Whether a visible-complete lane has optional vertical presentation work. This never makes
     /// an incomplete source look ready: a lane becomes eligible only after its immutable current
     /// scene truthfully covers the live camera.
@@ -1038,6 +1111,63 @@ where
         Ok(retries)
     }
 
+    /// Reconciles and resumes the still-current lane after a caller has made shared-ledger
+    /// progress. This is intentionally not another camera update: it preserves the exact camera
+    /// sequence and retries only when the failed source target still belongs to that lane's live
+    /// preparation horizon. A stale pressure notification is therefore a harmless no-op.
+    pub fn retry_resource_pressure(
+        &mut self,
+        owner: SourceOwnerId,
+        failed_target: GenomicInterval,
+    ) -> Result<Option<AlignmentCoordinatorUpdate>, AlignmentSceneCoordinatorError<B::Error>> {
+        let lane = self
+            .lanes
+            .get_mut(&owner)
+            .ok_or(AlignmentSceneCoordinatorError::UnknownOwner(owner))?;
+        let Some(desired) = lane.desired.as_ref() else {
+            return Ok(None);
+        };
+        if !desired.source_horizon.contains_interval(failed_target) {
+            return Ok(None);
+        }
+
+        // Vertical residency is optional and is paused after any capacity refusal so the worker
+        // cannot spin at frame rate. An explicit, current-token resume makes exactly one new
+        // checkpoint eligible alongside the foreground reconciliation below.
+        lane.vertical_residency_budget_limited = false;
+
+        let camera_sequence = desired.camera_sequence;
+        let before = self
+            .presentation
+            .current_for(presentation_owner(owner))
+            .map(|scene| scene.revision());
+        let published =
+            lane.reconcile_from_resident_or_cache(owner, &mut self.actor, &mut self.presentation)?;
+        let frame = lane
+            .frame(owner, &self.presentation)
+            .expect("a pressure retry retains desired camera state");
+        let mut update = AlignmentCoordinatorUpdate {
+            camera_sequence,
+            published_scene: published,
+            visible_complete: frame.visible_complete(),
+            reused_current_scene: published.is_none()
+                && before == frame.snapshot.as_ref().map(|scene| scene.revision()),
+            ..AlignmentCoordinatorUpdate::default()
+        };
+
+        if lane.current_covers_desired(owner, &self.presentation) {
+            self.actor.cancel_foreground_for(owner);
+            self.actor.cancel_speculation_for(owner);
+        } else if update.visible_complete {
+            self.actor.cancel_foreground_for(owner);
+            update.speculation_submitted = lane.ensure_speculation(owner, &mut self.actor)?;
+        } else {
+            self.actor.cancel_speculation_for(owner);
+            update.foreground_submitted = lane.ensure_foreground(owner, &mut self.actor)?;
+        }
+        Ok(Some(update))
+    }
+
     pub fn reduce_budget(
         &mut self,
         budget: usize,
@@ -1064,11 +1194,11 @@ where
         }
         let presentation = self.presentation.reduce_budget(budget)?;
         let evidence = self.actor.store_mut().reduce_budget(budget)?;
-        let snapshot = self
+        let progress = self
             .actor
             .store()
             .ledger()
-            .snapshot()
+            .progress()
             .map_err(EvidenceStoreError::from)?;
         Ok(AlignmentCoordinatorPressure {
             budget,
@@ -1076,10 +1206,10 @@ where
             active_speculation_aborted: aborted.is_some(),
             presentation,
             evidence,
-            charged: snapshot.charged,
-            pinned: snapshot.pinned,
-            pinned_overage: snapshot.pinned_overage,
-            remaining_overage: snapshot.charged.saturating_sub(budget),
+            charged: progress.charged,
+            pinned: progress.pinned,
+            pinned_overage: progress.pinned_overage,
+            remaining_overage: progress.charged.saturating_sub(budget),
         })
     }
 }
@@ -1107,7 +1237,7 @@ impl AlignmentSceneSourceLane {
         owner: SourceOwnerId,
         actor: &mut AlignmentSourceActor<B>,
         presentation: &mut AlignmentPresentationStore,
-        camera: AlignmentCamera,
+        camera: AlignmentSceneCamera,
         retain_prepared_scene: bool,
     ) -> Result<AlignmentCoordinatorUpdate, AlignmentSceneCoordinatorError<B::Error>>
     where
@@ -1236,12 +1366,13 @@ impl AlignmentSceneSourceLane {
         let Some(desired) = self.desired.clone() else {
             return Ok(AlignmentReferenceInstallOutcome::default());
         };
+        let required_reference = required_reference_horizon(&self.contract, desired.source_horizon);
         if self.contract.presentation.reference != Some(authority.revision)
             || authority.slice.interval.contig() != self.contract.contig
             || !authority
                 .slice
                 .interval
-                .contains_interval(desired.source_horizon)
+                .contains_interval(required_reference)
         {
             return Ok(AlignmentReferenceInstallOutcome::default());
         }
@@ -1365,16 +1496,25 @@ impl AlignmentSceneSourceLane {
             )
         });
         let scene_contracts_current = snapshot.as_ref().is_some_and(|scene| {
-            scene.reads().presentation() == self.contract.presentation
+            presentation_core_matches(scene.reads().presentation(), self.contract.presentation)
                 && scene.summaries().contract() == self.contract.summaries
                 && scene.reads().atlas().layout_contract() == self.contract.layout
+        });
+        let reference_requirement = self.reference_requirement(desired);
+        let reference_products_current = snapshot.as_ref().is_some_and(|scene| {
+            reference_requirement.is_ready()
+                && scene.reads().presentation() == self.contract.presentation
         });
         let visible_complete = scene_contracts_current
             && covered_interval
                 .is_some_and(|covered| covered.contains_interval(desired.camera.interval()))
             && covered_rows.start <= requested_rows.start
             && covered_rows.end >= requested_rows.end;
-        let individual_reads = if visible_complete {
+        let individual_reads = if !desired.camera.has_visible_rows() {
+            // This camera requested genomic summary authority only. Do not report an
+            // individual-read capability for work the caller deliberately omitted.
+            AlignmentIndividualReadCapability::Pending
+        } else if visible_complete {
             AlignmentIndividualReadCapability::Complete {
                 scene_revision: snapshot
                     .as_ref()
@@ -1393,14 +1533,24 @@ impl AlignmentSceneSourceLane {
         } else {
             AlignmentIndividualReadCapability::Pending
         };
-        let vertical_residency = snapshot
-            .as_ref()
-            .map_or(AlignmentVerticalResidency::ViewportBounded, |scene| {
-                self.vertical_residency_state(scene)
-            });
-        let row_activity = snapshot
-            .as_ref()
-            .and_then(|scene| self.row_activity_for_frame(scene, desired.camera.interval()));
+        let vertical_residency = if !desired.camera.has_visible_rows() {
+            AlignmentVerticalResidency::ViewportBounded
+        } else {
+            snapshot
+                .as_ref()
+                .map_or(AlignmentVerticalResidency::ViewportBounded, |scene| {
+                    self.vertical_residency_state(scene)
+                })
+        };
+        let row_activity = desired
+            .camera
+            .has_visible_rows()
+            .then(|| {
+                snapshot
+                    .as_ref()
+                    .and_then(|scene| self.row_activity_for_frame(scene, desired.camera.interval()))
+            })
+            .flatten();
         Some(AlignmentCoordinatorFrame {
             camera: desired.camera,
             camera_sequence: desired.camera_sequence,
@@ -1409,8 +1559,9 @@ impl AlignmentSceneSourceLane {
             requested_rows,
             covered_rows,
             row_activity,
-            reference_requirement: self.reference_requirement(desired),
+            reference_requirement,
             scene_contracts_current,
+            reference_products_current,
             individual_reads,
             vertical_residency,
         })
@@ -1420,17 +1571,28 @@ impl AlignmentSceneSourceLane {
         let Some(revision) = self.contract.presentation.reference else {
             return AlignmentReferenceRequirement::NotRequired;
         };
+        let horizon = required_reference_horizon(&self.contract, desired.source_horizon);
         if matching_reference_slice(&self.contract, desired.source_horizon).is_some() {
-            AlignmentReferenceRequirement::Ready {
-                revision,
-                horizon: desired.source_horizon,
-            }
+            AlignmentReferenceRequirement::Ready { revision, horizon }
         } else {
-            AlignmentReferenceRequirement::Pending {
-                revision,
-                horizon: desired.source_horizon,
-            }
+            AlignmentReferenceRequirement::Pending { revision, horizon }
         }
+    }
+
+    /// Resolves the presentation contract that can be built truthfully from authority currently
+    /// resident in the lane. Only the reference revision is optional: evidence, exact summaries,
+    /// row layout, annotation, and every reference-independent style choice remain unchanged.
+    /// A later FASTA publication upgrades this scene through the same immutable candidate path.
+    fn available_presentation_contract(
+        &self,
+        source_horizon: GenomicInterval,
+    ) -> (PresentationContract, Option<&ReferenceSlice>) {
+        let reference = matching_reference_slice(&self.contract, source_horizon);
+        let mut presentation = self.contract.presentation;
+        if reference.is_none() {
+            presentation.reference = None;
+        }
+        (presentation, reference)
     }
 
     fn row_activity_for_frame(
@@ -1438,21 +1600,12 @@ impl AlignmentSceneSourceLane {
         scene: &AlignmentSceneSnapshot,
         camera_interval: GenomicInterval,
     ) -> Option<Arc<AlignmentRowActivityProfile>> {
-        let reads = scene.reads();
-        let evidence = reads.evidence();
-        let atlas = reads.atlas();
-        let exact_row_authority = scene.prepared_interval().contains_interval(camera_interval)
-            && evidence.coverage().covers(camera_interval)
-            && atlas.interval().contains_interval(camera_interval)
-            && atlas.derived_from_evidence() == evidence.revision()
-            && atlas.source_revision() == self.contract.source_revision
-            && atlas.record_contract() == self.contract.record_contract
-            && atlas.layout_contract() == self.contract.layout;
-        if !exact_row_authority {
+        if !alignment_row_atlas_satisfies_contract(scene, camera_interval, &self.contract) {
             *self.row_activity_cache.borrow_mut() = None;
             return None;
         }
 
+        let atlas = scene.reads().atlas();
         let atlas_revision = atlas.revision();
         if let Some(cached) = self.row_activity_cache.borrow().as_ref()
             && cached.atlas_revision == atlas_revision
@@ -1468,8 +1621,12 @@ impl AlignmentSceneSourceLane {
                     .expect("the fixed row-activity bin bound is non-zero"),
             )?,
         );
-        debug_assert_eq!(profile.atlas_revision(), atlas_revision);
-        debug_assert_eq!(profile.interval(), camera_interval);
+        debug_assert!(alignment_row_activity_satisfies_contract(
+            &profile,
+            scene,
+            camera_interval,
+            &self.contract,
+        ));
         *self.row_activity_cache.borrow_mut() = Some(AlignmentRowActivityCache {
             atlas_revision,
             interval: camera_interval,
@@ -1516,19 +1673,14 @@ impl AlignmentSceneSourceLane {
         let Some(desired) = self.desired.clone() else {
             return Ok(None);
         };
-        let reference_ready = self.reference_requirement(&desired).is_ready();
-        if reference_ready {
-            if self.current_covers_desired(owner, presentation) {
-                return Ok(None);
-            }
-            if let Some(scene) = self.prepare_from_current_roots(owner, presentation, &desired)? {
-                return Ok(Some(scene.revision()));
-            }
-            if let Some(scene) =
-                self.prepare_from_source_roots(owner, actor, presentation, &desired)?
-            {
-                return Ok(Some(scene.revision()));
-            }
+        if self.current_covers_desired(owner, presentation) {
+            return Ok(None);
+        }
+        if let Some(scene) = self.prepare_from_current_roots(owner, presentation, &desired)? {
+            return Ok(Some(scene.revision()));
+        }
+        if let Some(scene) = self.prepare_from_source_roots(owner, actor, presentation, &desired)? {
+            return Ok(Some(scene.revision()));
         }
         if !actor
             .store()
@@ -1538,9 +1690,6 @@ impl AlignmentSceneSourceLane {
         }
         if !self.source_roots_cover(actor, &desired) {
             self.publish_source_roots_from_cache(actor, &desired)?;
-        }
-        if !reference_ready {
-            return Ok(None);
         }
         let scene = self
             .prepare_from_source_roots(owner, actor, presentation, &desired)?
@@ -1562,7 +1711,8 @@ impl AlignmentSceneSourceLane {
         let reads = current.reads();
         let evidence = reads.evidence();
         let atlas = reads.atlas();
-        if current.summaries().contract() != self.contract.summaries
+        if !evidence.payload().satisfies(&self.contract.payload)
+            || current.summaries().contract() != self.contract.summaries
             || atlas.layout_contract() != self.contract.layout
             || !evidence.coverage().covers(desired.source_horizon)
             || !current
@@ -1574,12 +1724,13 @@ impl AlignmentSceneSourceLane {
             return Ok(None);
         }
         let rows = desired_rows(desired, atlas.row_count(), self.policy.vertical_margin_rows)?;
-        let reference = matching_reference_slice(&self.contract, desired.source_horizon);
+        let (presentation_contract, reference) =
+            self.available_presentation_contract(desired.source_horizon);
         let candidate = presentation.prepare_with_annotation(
             evidence,
             current.summaries(),
             atlas,
-            self.contract.presentation,
+            presentation_contract,
             desired.prepared_interval,
             rows,
             self.contract.contig_length,
@@ -1629,12 +1780,13 @@ impl AlignmentSceneSourceLane {
             return Ok(None);
         }
         let rows = desired_rows(desired, atlas.row_count(), self.policy.vertical_margin_rows)?;
-        let reference = matching_reference_slice(&self.contract, desired.source_horizon);
+        let (presentation_contract, reference) =
+            self.available_presentation_contract(desired.source_horizon);
         let candidate = presentation.prepare_with_annotation(
             &evidence,
             &summaries,
             &atlas,
-            self.contract.presentation,
+            presentation_contract,
             desired.prepared_interval,
             rows,
             self.contract.contig_length,
@@ -1732,13 +1884,12 @@ impl AlignmentSceneSourceLane {
         let Some(desired) = &self.desired else {
             return false;
         };
-        if !self.reference_requirement(desired).is_ready() {
-            return false;
-        }
         let Some(scene) = presentation.current_for(presentation_owner(owner)) else {
             return false;
         };
-        if scene.reads().presentation() != self.contract.presentation
+        let (available_presentation, _) =
+            self.available_presentation_contract(desired.source_horizon);
+        if scene.reads().presentation() != available_presentation
             || scene.summaries().contract() != self.contract.summaries
             || scene.reads().atlas().layout_contract() != self.contract.layout
             || !scene
@@ -1764,11 +1915,11 @@ impl AlignmentSceneSourceLane {
         &self,
         owner: SourceOwnerId,
         presentation: &AlignmentPresentationStore,
-        camera: AlignmentCamera,
+        camera: AlignmentSceneCamera,
         direction: CameraDirection,
     ) -> Option<(GenomicInterval, Option<Range<u32>>)> {
         let scene = presentation.current_for(presentation_owner(owner))?;
-        if scene.reads().presentation() != self.contract.presentation
+        if !presentation_core_matches(scene.reads().presentation(), self.contract.presentation)
             || scene.summaries().contract() != self.contract.summaries
             || scene.reads().atlas().layout_contract() != self.contract.layout
             || !scene
@@ -1796,6 +1947,9 @@ impl AlignmentSceneSourceLane {
         }
 
         let visible = camera.visible_rows();
+        if visible.is_empty() {
+            return Some((prepared, None));
+        }
         let prepared_rows = scene.reads().prepared_rows();
         let total_rows = u32::try_from(scene.reads().atlas().row_count()).ok()?;
         let before_safe = visible.start.saturating_sub(prepared_rows.start)
@@ -1821,16 +1975,18 @@ impl AlignmentSceneSourceLane {
         let Some(desired) = &self.desired else {
             return false;
         };
-        if !self.reference_requirement(desired).is_ready() {
+        if !desired.camera.has_visible_rows() {
             return false;
         }
         let Some(scene) = presentation.current_for(presentation_owner(owner)) else {
             return false;
         };
+        let (available_presentation, _) =
+            self.available_presentation_contract(desired.source_horizon);
         if !self
             .frame(owner, presentation)
             .is_some_and(|frame| frame.visible_complete())
-            || scene.reads().presentation() != self.contract.presentation
+            || scene.reads().presentation() != available_presentation
             || scene.summaries().contract() != self.contract.summaries
             || scene.reads().atlas().layout_contract() != self.contract.layout
             || !scene
@@ -1874,12 +2030,13 @@ impl AlignmentSceneSourceLane {
             .telemetry
             .vertical_residency_checkpoints
             .saturating_add(1);
-        let reference = matching_reference_slice(&self.contract, desired.source_horizon);
+        let (presentation_contract, reference) =
+            self.available_presentation_contract(desired.source_horizon);
         let candidate = match presentation.prepare_with_annotation(
             current.reads().evidence(),
             current.summaries(),
             current.reads().atlas(),
-            self.contract.presentation,
+            presentation_contract,
             current.prepared_interval(),
             target_rows.clone(),
             self.contract.contig_length,
@@ -1890,7 +2047,9 @@ impl AlignmentSceneSourceLane {
             ReservationKind::Normal,
         ) {
             Ok(candidate) => candidate,
-            Err(error) if presentation_budget_limited(&error) => {
+            Err(error) if presentation_budget_pressure(&error).is_some() => {
+                let pressure = presentation_budget_pressure(&error)
+                    .expect("the guarded presentation error has allocation pressure");
                 self.vertical_residency_budget_limited = true;
                 self.telemetry.vertical_residency_budget_limits = self
                     .telemetry
@@ -1900,6 +2059,7 @@ impl AlignmentSceneSourceLane {
                     owner,
                     published_scene: None,
                     budget_limited: true,
+                    pressure: Some(pressure),
                 });
             }
             Err(error) => return Err(error.into()),
@@ -1922,6 +2082,7 @@ impl AlignmentSceneSourceLane {
             owner,
             published_scene: Some(scene.revision()),
             budget_limited: false,
+            pressure: None,
         })
     }
 
@@ -2044,10 +2205,43 @@ fn matching_reference_slice(
 ) -> Option<&ReferenceSlice> {
     let revision = contract.presentation.reference?;
     let reference = contract.reference.as_ref()?;
+    let required = required_reference_horizon(contract, horizon);
     (reference.revision == revision
         && reference.slice.interval.contig() == contract.contig
-        && reference.slice.interval.contains_interval(horizon))
+        && reference.slice.interval.contains_interval(required))
     .then_some(reference.slice.as_ref())
+}
+
+/// Reference revisions invalidate only reference-interpreted page products. Comparing contracts
+/// with that optional dependency erased lets the immutable core scene remain current while FASTA
+/// work is pending, unavailable, or being upgraded.
+fn presentation_core_matches(
+    mut actual: PresentationContract,
+    mut desired: PresentationContract,
+) -> bool {
+    actual.reference = None;
+    desired.reference = None;
+    actual == desired
+}
+
+fn required_reference_horizon(
+    contract: &AlignmentSceneBuildContract,
+    source_horizon: GenomicInterval,
+) -> GenomicInterval {
+    let radius = if contract.summaries.allele_detail != AlleleSummaryDetail::None {
+        ALLELE_REFERENCE_CONTEXT_RADIUS
+    } else {
+        0
+    };
+    GenomicInterval::new(
+        source_horizon.contig(),
+        source_horizon.start().saturating_sub(radius),
+        source_horizon
+            .end()
+            .saturating_add(radius)
+            .min(contract.contig_length),
+    )
+    .expect("validated source horizon remains non-empty within its reference contig")
 }
 
 fn source_intent_covers(
@@ -2074,7 +2268,7 @@ fn camera_direction(previous: Option<f64>, current: f64) -> CameraDirection {
 }
 
 fn prepared_interval(
-    camera: AlignmentCamera,
+    camera: AlignmentSceneCamera,
     direction: CameraDirection,
     policy: AlignmentScenePreparationPolicy,
     contract: &AlignmentSceneBuildContract,
@@ -2122,7 +2316,7 @@ fn source_horizon(
 
 fn prepared_rows(
     row_count: usize,
-    camera: AlignmentCamera,
+    camera: AlignmentSceneCamera,
     margin: u32,
 ) -> Result<Range<u32>, AlignmentSceneCoordinatorConfigError> {
     let row_count = u32::try_from(row_count)
@@ -2131,6 +2325,9 @@ fn prepared_rows(
         return Ok(0..0);
     }
     let visible = camera.visible_rows();
+    if visible.is_empty() {
+        return Ok(0..0);
+    }
     Ok(visible.start.saturating_sub(margin).min(row_count)
         ..visible.end.saturating_add(margin).min(row_count))
 }
@@ -2192,9 +2389,9 @@ fn expanded_vertical_rows(
 
 const fn budget_pressure(error: &LedgerError) -> Option<LedgerError> {
     match error {
-        LedgerError::BudgetExceeded { .. } | LedgerError::TransientBudgetExceeded { .. } => {
-            Some(*error)
-        }
+        LedgerError::BudgetExceeded { .. }
+        | LedgerError::TransientBudgetExceeded { .. }
+        | LedgerError::ReplacementTransitionActive { .. } => Some(*error),
         LedgerError::ReservationExceeded { .. }
         | LedgerError::UnknownAllocation(_)
         | LedgerError::IdOverflow
@@ -2284,7 +2481,10 @@ fn presentation_budget_pressure(error: &AlignmentPresentationStoreError) -> Opti
     }
 }
 
-fn coordinator_budget_pressure<E>(
+/// Extracts only shared-ledger admission pressure from a coordinator failure. Keeping this typed
+/// at the coordinator boundary avoids relying on `Error::source` traversal across generic nested
+/// allocation wrappers in the threaded engine.
+pub(crate) fn coordinator_budget_pressure<E>(
     error: &AlignmentSceneCoordinatorError<E>,
 ) -> Option<LedgerError> {
     match error {
@@ -2300,10 +2500,6 @@ fn coordinator_budget_pressure<E>(
         | AlignmentSceneCoordinatorError::MissingCamera
         | AlignmentSceneCoordinatorError::IncompleteCachedHorizon(_) => None,
     }
-}
-
-fn presentation_budget_limited(error: &AlignmentPresentationStoreError) -> bool {
-    presentation_budget_pressure(error).is_some()
 }
 
 fn intersect_intervals(left: GenomicInterval, right: GenomicInterval) -> Option<GenomicInterval> {
@@ -2388,7 +2584,8 @@ mod tests {
     use std::{num::NonZeroUsize, path::Path, sync::Arc};
 
     use rgv_alignment_scene::{
-        AlignmentComponent, AlignmentPanelSceneAdmission, AlignmentPanelSceneStore,
+        AlignmentCamera, AlignmentComponent, AlignmentPanelLaneCapture,
+        AlignmentPanelLanePublication, AlignmentPanelSceneAdmission, AlignmentPanelSceneStore,
         AlignmentStyleContract, AlleleSummaryDetail, AllocationLedger, CapabilityRequirement,
         EvidenceStore, GeometryLod, RevisionFingerprint,
     };
@@ -2575,6 +2772,22 @@ mod tests {
         })
     }
 
+    fn allele_reference_coordinator(
+        revision: ReferenceRevision,
+    ) -> (TestCoordinator, AlignmentCamera) {
+        test_coordinator_with_contract(|contract| {
+            contract.payload = PayloadContract::new(
+                CapabilityRequirement::Required,
+                CapabilityRequirement::Required,
+                [*b"XS"],
+                None,
+            );
+            contract.summaries.allele_detail = AlleleSummaryDetail::Counts;
+            contract.presentation.reference = Some(revision);
+            contract.reference = None;
+        })
+    }
+
     fn reference_authority(
         revision: ReferenceRevision,
         interval: GenomicInterval,
@@ -2583,17 +2796,27 @@ mod tests {
         AlignmentReferenceAuthority::new(revision, Arc::new(ReferenceSlice { interval, bases }))
     }
 
-    fn pump_until_source_complete_without_publication(coordinator: &mut TestCoordinator) {
+    fn pump_until_source_complete_with_core_publication(coordinator: &mut TestCoordinator) {
         for _ in 0..256 {
             let event = coordinator.pump_once().unwrap();
-            assert!(
-                event.published_scene.is_none(),
-                "reference-dependent semantics published while reference was pending"
-            );
             if matches!(
                 event.source_event,
                 Some(AlignmentSourceActorEvent::AcquisitionCompleted { .. })
             ) {
+                let frame = coordinator.frame().unwrap();
+                assert!(frame.visible_complete());
+                assert!(frame.scene_contracts_current);
+                assert!(!frame.reference_products_current);
+                assert_eq!(
+                    frame
+                        .snapshot
+                        .as_ref()
+                        .unwrap()
+                        .reads()
+                        .presentation()
+                        .reference,
+                    None
+                );
                 return;
             }
         }
@@ -2680,6 +2903,55 @@ mod tests {
             usize::try_from(atlas_wide_total).unwrap(),
             atlas.row_count()
         );
+    }
+
+    #[test]
+    fn row_activity_authority_ignores_visible_rows_but_rejects_genomic_or_layout_change() {
+        let (mut coordinator, camera) = test_coordinator();
+        coordinator.update_camera(camera).unwrap();
+        pump_until_publication(&mut coordinator);
+
+        let frame = coordinator.frame().unwrap();
+        let snapshot = frame.snapshot.as_ref().unwrap();
+        let profile = frame.row_activity.as_ref().unwrap();
+        let vertically_scrolled = AlignmentCamera::from_viewport(
+            camera.viewport(),
+            camera.row_scroll() + 1_000.0,
+            camera.row_height(),
+            camera.read_height(),
+            camera.clip(),
+        )
+        .unwrap();
+        assert_ne!(camera.visible_rows(), vertically_scrolled.visible_rows());
+        assert!(alignment_row_activity_satisfies_contract(
+            profile,
+            snapshot,
+            vertically_scrolled.interval(),
+            coordinator.contract(),
+        ));
+
+        let shifted = GenomicInterval::new(
+            camera.interval().contig(),
+            camera.interval().start() + 1,
+            camera.interval().end() + 1,
+        )
+        .unwrap();
+        assert!(!alignment_row_activity_satisfies_contract(
+            profile,
+            snapshot,
+            shifted,
+            coordinator.contract(),
+        ));
+
+        let mut changed_layout = coordinator.contract().clone();
+        changed_layout.layout.row_scale_class =
+            changed_layout.layout.row_scale_class.saturating_add(1);
+        assert!(!alignment_row_activity_satisfies_contract(
+            profile,
+            snapshot,
+            camera.interval(),
+            &changed_layout,
+        ));
     }
 
     #[test]
@@ -2776,7 +3048,78 @@ mod tests {
     }
 
     #[test]
-    fn source_completes_while_reference_is_pending_and_install_reuses_it_without_acquisition() {
+    fn allele_reference_requirement_adds_an_exact_bounded_context_halo() {
+        let revision = test_reference_revision(101);
+        let (mut coordinator, camera) = allele_reference_coordinator(revision);
+        coordinator.update_camera(camera).unwrap();
+        let source_horizon =
+            GenomicInterval::new(camera.interval().contig(), 9_997, 10_003).unwrap();
+        let reference_horizon =
+            GenomicInterval::new(camera.interval().contig(), 9_995, 10_005).unwrap();
+        assert_eq!(
+            coordinator.frame().unwrap().reference_requirement,
+            AlignmentReferenceRequirement::Pending {
+                revision,
+                horizon: reference_horizon,
+            }
+        );
+
+        pump_until_source_complete_with_core_publication(&mut coordinator);
+        let before = coordinator.telemetry();
+        assert_eq!(
+            coordinator
+                .install_reference_authority(reference_authority(revision, source_horizon))
+                .unwrap(),
+            AlignmentReferenceInstallOutcome::default(),
+            "a source-only horizon must not masquerade as bisulfite context authority"
+        );
+        let installed = coordinator
+            .install_reference_authority(reference_authority(revision, reference_horizon))
+            .unwrap();
+        assert!(installed.installed);
+        assert!(installed.published_scene.is_some());
+        assert_eq!(
+            coordinator.frame().unwrap().reference_requirement,
+            AlignmentReferenceRequirement::Ready {
+                revision,
+                horizon: reference_horizon,
+            }
+        );
+        assert_eq!(
+            coordinator.telemetry().source_acquisitions,
+            before.source_acquisitions,
+            "installing the FASTA halo must reuse completed source roots"
+        );
+
+        let contract = coordinator.contract();
+        assert_eq!(
+            required_reference_horizon(
+                contract,
+                GenomicInterval::new(contract.contig, 0, 3).unwrap()
+            ),
+            GenomicInterval::new(contract.contig, 0, 5).unwrap()
+        );
+        assert_eq!(
+            required_reference_horizon(
+                contract,
+                GenomicInterval::new(
+                    contract.contig,
+                    contract.contig_length - 3,
+                    contract.contig_length,
+                )
+                .unwrap()
+            ),
+            GenomicInterval::new(
+                contract.contig,
+                contract.contig_length - 5,
+                contract.contig_length,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn core_scene_completes_while_reference_is_pending_and_upgrade_reuses_source_roots() {
         let revision = test_reference_revision(2);
         let (mut coordinator, camera) = base_reference_coordinator(revision);
         coordinator.update_camera(camera).unwrap();
@@ -2785,19 +3128,22 @@ mod tests {
             other => panic!("expected pending reference requirement, got {other:?}"),
         };
 
-        pump_until_source_complete_without_publication(&mut coordinator);
+        pump_until_source_complete_with_core_publication(&mut coordinator);
         assert!(coordinator.actor().store().current().is_some());
         assert!(coordinator.actor().store().current_summaries().is_some());
         assert!(coordinator.actor().store().current_row_atlas().is_some());
         let pending = coordinator.frame().unwrap();
-        assert!(pending.snapshot.is_none());
+        assert!(pending.snapshot.is_some());
+        assert!(pending.scene_contracts_current);
+        assert!(pending.visible_complete());
+        assert!(!pending.reference_products_current);
         assert_eq!(
             pending.reference_requirement,
             AlignmentReferenceRequirement::Pending { revision, horizon }
         );
         let before = coordinator.telemetry();
         assert_eq!(before.source_acquisitions, 1);
-        assert_eq!(before.presentation_candidates, 0);
+        assert_eq!(before.presentation_candidates, 1);
 
         let installed = coordinator
             .install_reference_authority(reference_authority(revision, horizon))
@@ -2824,6 +3170,7 @@ mod tests {
             AlignmentReferenceRequirement::Ready { revision, horizon }
         );
         assert!(ready.scene_contracts_current);
+        assert!(ready.reference_products_current);
         assert!(ready.visible_complete());
         assert_eq!(
             ready
@@ -2866,7 +3213,7 @@ mod tests {
             AlignmentReferenceRequirement::Pending { horizon, .. } => horizon,
             other => panic!("expected pending reference requirement, got {other:?}"),
         };
-        pump_until_source_complete_without_publication(&mut coordinator);
+        pump_until_source_complete_with_core_publication(&mut coordinator);
         let before = coordinator.telemetry();
 
         let stale = coordinator
@@ -2913,7 +3260,6 @@ mod tests {
         source.update_camera(first, camera).unwrap();
         for _ in 0..256 {
             let pump = source.pump_once().unwrap();
-            assert!(pump.publications.is_empty());
             if matches!(
                 pump.source_event,
                 Some(AlignmentSourceActorEvent::AcquisitionCompleted { .. })
@@ -2941,8 +3287,19 @@ mod tests {
             second_frame.reference_requirement,
             AlignmentReferenceRequirement::Pending { revision, horizon }
         );
-        assert!(second_frame.snapshot.is_none());
-        assert!(!second_frame.visible_complete());
+        assert!(second_frame.snapshot.is_some());
+        assert!(second_frame.visible_complete());
+        assert!(!second_frame.reference_products_current);
+        assert_eq!(
+            second_frame
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .reads()
+                .presentation()
+                .reference,
+            None
+        );
         assert!(source.contract(second).unwrap().reference.is_none());
     }
 
@@ -3015,6 +3372,52 @@ mod tests {
             frame.individual_reads,
             AlignmentIndividualReadCapability::Pending
         );
+    }
+
+    #[test]
+    fn genomic_only_camera_acquires_exact_summaries_without_read_row_demand() {
+        let (mut coordinator, render_camera) = test_coordinator();
+        let policy = coordinator
+            .preparation_policy()
+            .with_full_vertical_residency(true);
+        assert!(
+            coordinator
+                .set_preparation_policy(policy)
+                .unwrap()
+                .is_none()
+        );
+        let camera = AlignmentSceneCamera::without_visible_rows(render_camera.viewport());
+        let initial = coordinator.update_camera(camera).unwrap();
+        assert!(initial.foreground_submitted.is_some());
+        assert!(!initial.visible_complete);
+
+        pump_until_publication(&mut coordinator);
+        let frame = coordinator.frame().unwrap();
+        assert_eq!(frame.camera, camera);
+        assert_eq!(frame.requested_rows, 0..0);
+        assert_eq!(frame.covered_rows, 0..0);
+        assert!(frame.visible_complete(), "{frame:#?}");
+        assert!(frame.row_activity.is_none());
+        assert_eq!(
+            frame.vertical_residency,
+            AlignmentVerticalResidency::ViewportBounded
+        );
+        assert_eq!(
+            frame.individual_reads,
+            AlignmentIndividualReadCapability::Pending
+        );
+        let snapshot = frame
+            .snapshot
+            .expect("summary acquisition publishes a scene");
+        assert!(
+            snapshot
+                .summaries()
+                .prepared_interval()
+                .contains_interval(camera.interval())
+        );
+        assert!(!snapshot.summary_pages().is_empty());
+        assert_eq!(snapshot.reads().prepared_rows(), 0..0);
+        assert!(!coordinator.has_pending_presentation_work());
     }
 
     #[test]
@@ -3114,6 +3517,12 @@ mod tests {
         )
         .unwrap();
         let trace = [zoomed, panned, zoomed, scrolled, zoomed, camera];
+        let operations_before = coordinator
+            .actor()
+            .store()
+            .ledger()
+            .operation_counters()
+            .unwrap();
 
         for next in trace {
             let update = coordinator.update_camera(next).unwrap();
@@ -3124,7 +3533,7 @@ mod tests {
             assert!(update.speculation_submitted.is_none());
         }
         let warmed_telemetry = coordinator.telemetry();
-        let warmed_ledger = coordinator.actor().store().ledger().snapshot().unwrap();
+        let warmed_ledger = coordinator.actor().store().ledger().progress().unwrap();
 
         for _ in 0..32 {
             for next in trace {
@@ -3134,7 +3543,13 @@ mod tests {
             }
         }
         let final_telemetry = coordinator.telemetry();
-        let final_ledger = coordinator.actor().store().ledger().snapshot().unwrap();
+        let final_ledger = coordinator.actor().store().ledger().progress().unwrap();
+        let operations_after = coordinator
+            .actor()
+            .store()
+            .ledger()
+            .operation_counters()
+            .unwrap();
         assert_eq!(
             final_telemetry.source_work_started,
             warmed_telemetry.source_work_started
@@ -3160,7 +3575,15 @@ mod tests {
             warmed_telemetry.scene_publications
         );
         assert_eq!(final_ledger.charged, warmed_ledger.charged);
-        assert_eq!(final_ledger.records.len(), warmed_ledger.records.len());
+        assert_eq!(final_ledger.retained, warmed_ledger.retained);
+        assert_eq!(
+            operations_after.full_inventory_snapshots, operations_before.full_inventory_snapshots,
+            "camera-only recovery traces must not enumerate the allocation inventory"
+        );
+        assert_eq!(
+            operations_after.allocation_records_enumerated,
+            operations_before.allocation_records_enumerated
+        );
         assert_eq!(
             coordinator.frame().unwrap().snapshot.unwrap().revision(),
             revision
@@ -3297,12 +3720,21 @@ mod tests {
         let mut panel = AlignmentPanelSceneStore::new([track]);
         assert_eq!(
             panel
-                .admit(track, source_frame.camera_sequence, Some(snapshot.clone()))
+                .admit(
+                    track,
+                    AlignmentPanelLanePublication::new(
+                        source_frame.camera_sequence,
+                        Some(snapshot.clone()),
+                        source_frame.scene_contracts_current,
+                    ),
+                )
                 .unwrap(),
             AlignmentPanelSceneAdmission::SceneReplaced
         );
+        let initial_capture =
+            AlignmentPanelLaneCapture::new(track, camera, Some(camera), []).unwrap();
         let initial = panel
-            .capture(PanelId::new(3), 1, [(track, camera)])
+            .capture(PanelId::new(3), 1, camera.viewport(), [initial_capture])
             .unwrap();
         assert!(initial.lanes[0].visible_complete());
 
@@ -3318,8 +3750,10 @@ mod tests {
             camera.clip(),
         )
         .unwrap();
+        let live_capture =
+            AlignmentPanelLaneCapture::new(track, live_camera, Some(live_camera), []).unwrap();
         let panned = panel
-            .capture(PanelId::new(3), 2, [(track, live_camera)])
+            .capture(PanelId::new(3), 2, live_camera.viewport(), [live_capture])
             .unwrap();
         assert_eq!(panned.camera_revision, 2);
         assert_eq!(panned.authority_revision, initial.authority_revision);
@@ -3330,6 +3764,65 @@ mod tests {
         assert!(panned.lanes[0].covered_interval.is_some());
         assert!(!panned.lanes[0].visible_complete());
         assert_eq!(coordinator.telemetry(), before);
+    }
+
+    #[test]
+    fn panel_capture_keeps_exact_row_authority_while_vertical_pages_are_pending() {
+        let (mut coordinator, camera) = test_coordinator();
+        let policy = AlignmentScenePreparationPolicy::new(0.0, 0.0, 0.0, 0, 1)
+            .unwrap()
+            .with_full_vertical_residency(true);
+        assert!(
+            coordinator
+                .set_preparation_policy(policy)
+                .unwrap()
+                .is_none()
+        );
+        coordinator.update_camera(camera).unwrap();
+        pump_until_publication(&mut coordinator);
+
+        let source_frame = coordinator.frame().unwrap();
+        let snapshot = Arc::clone(source_frame.snapshot.as_ref().unwrap());
+        let profile = Arc::clone(source_frame.row_activity.as_ref().unwrap());
+        let prepared_rows = snapshot.reads().prepared_rows();
+        let total_rows = u32::try_from(snapshot.reads().atlas().row_count()).unwrap();
+        assert!(prepared_rows.end < total_rows);
+
+        let track = TrackId::new(18);
+        let mut panel = AlignmentPanelSceneStore::new([track]);
+        panel
+            .admit(
+                track,
+                AlignmentPanelLanePublication::new(
+                    source_frame.camera_sequence,
+                    Some(snapshot),
+                    source_frame.scene_contracts_current,
+                ),
+            )
+            .unwrap();
+        let scrolled = AlignmentCamera::from_viewport(
+            camera.viewport(),
+            f64::from(prepared_rows.end),
+            camera.row_height(),
+            camera.read_height(),
+            camera.clip(),
+        )
+        .unwrap();
+        let capture = AlignmentPanelLaneCapture::new(track, scrolled, Some(scrolled), [])
+            .unwrap()
+            .with_row_activity(Some(Arc::clone(&profile)));
+        let captured = panel
+            .capture(PanelId::new(3), 2, scrolled.viewport(), [capture])
+            .unwrap();
+        let lane = &captured.lanes[0];
+
+        assert!(!lane.reads_complete());
+        assert!(lane.covered_rows.is_empty());
+        assert!(Arc::ptr_eq(lane.row_activity.as_ref().unwrap(), &profile));
+        assert_eq!(
+            lane.row_activity.as_ref().unwrap().interval(),
+            scrolled.interval()
+        );
     }
 
     #[test]
@@ -3721,6 +4214,12 @@ mod tests {
         assert!(supports_full_vertical_residency(GeometryLod::Span));
         assert!(supports_full_vertical_residency(GeometryLod::Read));
         assert!(!supports_full_vertical_residency(GeometryLod::Base));
+    }
+
+    #[test]
+    fn an_active_gpu_replacement_is_retryable_pressure_not_a_terminal_scene_error() {
+        let pressure = LedgerError::ReplacementTransitionActive { bundle_id: 17 };
+        assert_eq!(budget_pressure(&pressure), Some(pressure));
     }
 
     #[test]
@@ -4282,7 +4781,9 @@ mod tests {
         assert_eq!(pressure.intent, SourceIntentKind::Foreground);
         assert!(matches!(
             pressure.pressure,
-            LedgerError::BudgetExceeded { .. } | LedgerError::TransientBudgetExceeded { .. }
+            LedgerError::BudgetExceeded { .. }
+                | LedgerError::TransientBudgetExceeded { .. }
+                | LedgerError::ReplacementTransitionActive { .. }
         ));
         assert_eq!(pressure.target.contig(), dense_camera.interval().contig());
         assert!(pressure.target.contains_interval(dense_camera.interval()));

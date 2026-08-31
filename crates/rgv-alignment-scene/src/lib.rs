@@ -21,6 +21,7 @@ mod junction_summary;
 mod modification_summary;
 mod pair_summary;
 mod panel_scene;
+mod panel_summary;
 mod payload;
 mod presentation_scene;
 mod presentation_store;
@@ -28,6 +29,7 @@ mod resource;
 mod revision;
 mod row_atlas;
 mod row_oracle;
+mod scene_camera;
 mod scene_snapshot;
 mod semantic_page;
 mod store;
@@ -55,8 +57,9 @@ pub use cpu_projector::{
     CpuProjectedPrimitive, CpuProjectionError,
 };
 pub use cpu_summary_projector::{
-    CpuAlleleProjectionOptions, CpuAlleleToken, CpuDepthProjectionOptions,
-    CpuJunctionProjectionOptions, CpuJunctionStrandToken, CpuModificationProjectionOptions,
+    CoverageAlleleInterpretation, CpuAlleleProjectionOptions, CpuAlleleToken,
+    CpuBisulfiteStrandToken, CpuDepthProjectionOptions, CpuJunctionProjectionOptions,
+    CpuJunctionScaleMeasurement, CpuJunctionStrandToken, CpuModificationProjectionOptions,
     CpuSummaryCamera, CpuSummaryFrame, CpuSummaryPrimitiveShape, CpuSummaryProjectedComponent,
     CpuSummaryProjectedPrimitive, CpuSummaryProjectionError, CpuSummaryProjectionOptions,
     CpuSummaryProjector,
@@ -86,8 +89,16 @@ pub use pair_summary::{
 };
 pub use panel_scene::{
     AlignmentCoherenceGroupFrame, AlignmentCoherenceGroupId, AlignmentCoherenceGroupKind,
-    AlignmentCoherenceGroupSpec, AlignmentPanelLaneFrame, AlignmentPanelSceneAdmission,
-    AlignmentPanelSceneError, AlignmentPanelSceneFrame, AlignmentPanelSceneStore,
+    AlignmentCoherenceGroupSpec, AlignmentCoverageLaneOptions, AlignmentDerivedLaneCapture,
+    AlignmentDerivedLaneKind, AlignmentDerivedLaneOptions, AlignmentModificationLaneOptions,
+    AlignmentPanelLaneCapture, AlignmentPanelLaneFrame, AlignmentPanelLanePublication,
+    AlignmentPanelSceneAdmission, AlignmentPanelSceneError, AlignmentPanelSceneFrame,
+    AlignmentPanelSceneStore, AlignmentSashimiLaneOptions, AlignmentSashimiScalePolicy,
+};
+pub use panel_summary::{
+    AlignmentPanelDerivedLaneFrame, AlignmentPanelDerivedLaneReadiness,
+    AlignmentPanelDerivedLaneSummary, AlignmentPanelDerivedLaneUnavailable,
+    AlignmentPanelSummaryFrame, AlignmentPanelSummaryProjector,
 };
 pub use payload::{PayloadSidecar, PayloadSidecarError};
 pub use presentation_scene::{
@@ -99,9 +110,16 @@ pub use presentation_store::{
     AlignmentSceneCandidate, PresentationCacheDiscard, PresentationStorePressure,
 };
 pub use resource::{
-    AllocationClass, AllocationId, AllocationLease, AllocationLedger, AllocationRecordSnapshot,
-    AllocationReservation, LedgerError, LedgerSnapshot, PinnedAllocationLease, ReservationKind,
-    TransientResourceClass, TransientResourceReservation, TransientResourceSnapshot,
+    AllocationBundleAccountingOperation, AllocationBundleActual, AllocationBundleCommit,
+    AllocationBundleDemand, AllocationBundleError, AllocationBundleLease,
+    AllocationBundleReservation, AllocationBundleSlot, AllocationBundleSpec, AllocationClass,
+    AllocationId, AllocationLease, AllocationLedger, AllocationRecordSnapshot,
+    AllocationReservation, AllocationRetirementClaim, AllocationRetirementClaimBuilder,
+    AllocationRetirementClaimSet, AllocationRetirementToken, LedgerError, LedgerInventory,
+    LedgerOperationCounters, LedgerProgress, LedgerProgressEpoch, LedgerProgressSubscription,
+    LedgerRetainedBreakdown, LedgerSnapshot, PinnedAllocationLease,
+    PreparedAllocationBundleSettlement, ReservationKind, TransientResourceClass,
+    TransientResourceReservation, TransientResourceSnapshot,
 };
 pub use revision::{
     AlignmentSourceRevision, AnnotationRevision, EvidenceRevision, ReferenceRevision,
@@ -114,6 +132,7 @@ pub use row_atlas::{
     RowAtlasRecordHit, RowExtent,
 };
 pub use row_oracle::{AlignmentRowGroup, AlignmentRowGroupKey, RowOracleError};
+pub use scene_camera::{AlignmentSceneCamera, AlignmentSceneCameraError, AlignmentSceneRowDemand};
 pub use scene_snapshot::{AlignmentSceneSnapshot, AlignmentSceneSnapshotError};
 pub use semantic_page::{
     AlignmentBodyColorToken, AlignmentComponent, AlignmentGeometryToken, AlignmentLabelKind,
@@ -129,8 +148,9 @@ pub use store::{
 };
 pub use summary::{ExactDepthSummaryError, ExactDepthSummaryKey, ExactDepthSummaryTile};
 pub use summary_page::{
-    AnnotatedJunctionSemantic, SummaryPageFamily, SummaryPageKey, SummarySemanticComponent,
-    SummarySemanticPage, SummarySemanticPageError, SummarySemanticPrimitive,
+    AnnotatedJunctionSemantic, SummaryAlleleReferenceContext, SummaryPageFamily, SummaryPageKey,
+    SummarySemanticComponent, SummarySemanticPage, SummarySemanticPageError,
+    SummarySemanticPrimitive,
 };
 pub use summary_root::{
     ExactSummaryPins, ExactSummaryQueryError, ExactSummaryRoot, ExactSummaryRootError,

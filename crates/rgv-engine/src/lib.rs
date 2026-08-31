@@ -22,12 +22,14 @@ pub use alignment_scene_coordinator::{
     AlignmentSceneBuildContract, AlignmentSceneCoordinator, AlignmentSceneCoordinatorConfigError,
     AlignmentSceneCoordinatorError, AlignmentSceneCoordinatorTelemetry,
     AlignmentSceneOwnerPressure, AlignmentSceneOwnerPublication, AlignmentSceneOwnerRefusal,
-    AlignmentSceneOwnerRetry, AlignmentScenePreparationPolicy, AlignmentSceneSourceCoordinator,
-    AlignmentSceneSourcePump, AlignmentVerticalResidency,
+    AlignmentSceneOwnerRetry, AlignmentSceneOwnerWorkState, AlignmentScenePreparationPolicy,
+    AlignmentSceneSourceCoordinator, AlignmentSceneSourcePump, AlignmentVerticalResidency,
+    alignment_row_activity_satisfies_contract,
 };
 pub use alignment_scene_engine::{
     AlignmentSceneEngine, AlignmentSceneEngineEvent, AlignmentSceneEngineOperation,
-    AlignmentSceneFrameCause, AlignmentSceneRequestToken, AlignmentSceneSourceMetadata,
+    AlignmentSceneFrameCause, AlignmentSceneRequestToken,
+    AlignmentSceneResourcePressureDisposition, AlignmentSceneSourceMetadata,
     LocalAlignmentSceneEngineConfig,
 };
 pub use cache::{

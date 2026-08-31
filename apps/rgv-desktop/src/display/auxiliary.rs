@@ -89,6 +89,7 @@ pub(crate) fn quantitative_overlay_subtracks(
         .take(member_rows)
         .enumerate()
         .map(|(index, member)| TrackSubtrack {
+            alignment_subtrack: None,
             label: member.name.clone(),
             detail: member
                 .quantitative
@@ -104,6 +105,7 @@ pub(crate) fn quantitative_overlay_subtracks(
         let omitted = members.len().saturating_sub(member_rows);
         let index = subtracks.len();
         subtracks.push(TrackSubtrack {
+            alignment_subtrack: None,
             label: format!("+{omitted} more tracks"),
             detail: Some("Open the Tracks menu to inspect every overlay member".to_owned()),
             top: top + 22.0 + index as f32 * 14.0,

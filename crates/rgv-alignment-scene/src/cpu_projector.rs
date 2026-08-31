@@ -579,10 +579,13 @@ impl CpuAlignmentProjector {
         let Some(snapshot) = &lane.snapshot else {
             return Ok(None);
         };
+        let Some(camera) = lane.read_camera else {
+            return Ok(None);
+        };
         Ok(pick_captured_scene(
             snapshot.reads(),
             lane.track_id,
-            lane.camera,
+            camera,
             lane.covered_interval,
             lane.covered_rows.clone(),
             x,

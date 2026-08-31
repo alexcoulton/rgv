@@ -67,8 +67,8 @@ pub(crate) fn alignment_scene_event_token_is_current(
 pub(crate) fn alignment_scene_frame_is_current(
     desired_token: Option<AlignmentSceneRequestToken>,
     event_token: AlignmentSceneRequestToken,
-    desired_camera: Option<AlignmentCamera>,
-    frame_camera: AlignmentCamera,
+    desired_camera: Option<AlignmentSceneCamera>,
+    frame_camera: AlignmentSceneCamera,
 ) -> bool {
     alignment_scene_event_token_is_current(desired_token, Some(event_token))
         && desired_camera == Some(frame_camera)
@@ -80,22 +80,73 @@ pub(crate) fn alignment_scene_frame_is_current(
 pub(crate) fn alignment_scene_refusal_is_current(
     desired_token: Option<AlignmentSceneRequestToken>,
     event_token: AlignmentSceneRequestToken,
-    desired_camera: Option<AlignmentCamera>,
-    frame_camera: AlignmentCamera,
+    desired_camera: Option<AlignmentSceneCamera>,
+    frame_camera: AlignmentSceneCamera,
     refused_horizon: GenomicInterval,
 ) -> bool {
     alignment_scene_frame_is_current(desired_token, event_token, desired_camera, frame_camera)
         && refused_horizon.contains_interval(frame_camera.interval())
 }
 
+/// A resource-pressure edge belongs to the current desktop transaction only when both its token
+/// and failed source target still describe the live camera. This rejects an unread old pressure
+/// notification after a latest-wins pan without requiring the UI to know the actor's sequence.
+pub(crate) fn alignment_scene_pressure_is_current(
+    desired_token: Option<AlignmentSceneRequestToken>,
+    event_token: AlignmentSceneRequestToken,
+    desired_camera: Option<AlignmentSceneCamera>,
+    failed_target: GenomicInterval,
+) -> bool {
+    alignment_scene_event_token_is_current(desired_token, Some(event_token))
+        && desired_camera.is_some_and(|camera| failed_target.contains_interval(camera.interval()))
+}
+
+/// A source-wide budget response is current only for the value both the workspace and this
+/// source controller most recently submitted. This independent comparison is required because
+/// `cache_budget_bytes` advances when a command is queued, before the worker proves completion.
+pub(crate) fn alignment_scene_budget_event_is_current(
+    workspace_budget: usize,
+    submitted_source_budget: usize,
+    event_budget: usize,
+) -> bool {
+    event_budget == workspace_budget && event_budget == submitted_source_budget
+}
+
+/// Whether a typed pressure edge must be resumed after shared-ledger progress. Optional source
+/// read-ahead and explicit presentation prewarming can simply yield. Vertical presentation
+/// pumping is different: the coordinator latches that lane as budget-limited until an exact
+/// retry clears it, so dropping its speculative notification would permanently stop ACTB-style
+/// vertical residency work.
+pub(crate) fn alignment_scene_pressure_requires_resume(
+    operation: AlignmentSceneEngineOperation,
+    intent: SourceIntentKind,
+) -> bool {
+    intent != SourceIntentKind::Speculative
+        || matches!(operation, AlignmentSceneEngineOperation::PumpPresentation)
+}
+
+/// An intrinsically oversized optional row-residency page limits instant deep scrolling; it does
+/// not invalidate the already complete visible scene. Keep this operation check deliberately
+/// narrow: speculative source acquisition has different lifecycle semantics and continues to use
+/// its existing yield/terminal handling.
+pub(crate) fn alignment_scene_pressure_preserves_visible_epoch(
+    operation: AlignmentSceneEngineOperation,
+    intent: SourceIntentKind,
+    disposition: AlignmentSceneResourcePressureDisposition,
+) -> bool {
+    operation == AlignmentSceneEngineOperation::PumpPresentation
+        && intent == SourceIntentKind::Speculative
+        && disposition == AlignmentSceneResourcePressureDisposition::Infeasible
+}
+
 /// How a current, token-matched frame affects the desktop navigation transaction. A source
 /// refusal is already a terminal answer for individual reads, so it outranks a pending FASTA
-/// dependency which can no longer make those reads displayable. Complete scene frames still wait
-/// for their exact reference authority when the presentation contract requires one.
+/// dependency which can no longer make those reads displayable. A complete core scene settles
+/// navigation even when its optional reference-backed interpretation remains pending.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AlignmentSceneFrameSettlement {
     Settled,
-    WaitingForReference,
+    SettledWithReferencePending,
     WaitingForScene,
 }
 
@@ -104,11 +155,18 @@ pub(crate) fn alignment_scene_frame_settlement(
 ) -> AlignmentSceneFrameSettlement {
     if frame.individual_reads_refused_for_camera() {
         AlignmentSceneFrameSettlement::Settled
+    } else if frame.visible_complete()
+        && matches!(
+            frame.reference_requirement,
+            AlignmentReferenceRequirement::Pending { .. }
+        )
+    {
+        AlignmentSceneFrameSettlement::SettledWithReferencePending
     } else if matches!(
         frame.reference_requirement,
         AlignmentReferenceRequirement::Pending { .. }
     ) {
-        AlignmentSceneFrameSettlement::WaitingForReference
+        AlignmentSceneFrameSettlement::WaitingForScene
     } else if frame.visible_complete() {
         AlignmentSceneFrameSettlement::Settled
     } else {
@@ -184,14 +242,18 @@ pub(crate) fn plan_alignment_reference_lanes(
 impl Viewer {
     fn mark_active_panel_navigation_queries_pending(&mut self) {
         let panel_id = self.panels.active().id;
-        for track in &mut self.alignment_tracks {
-            track.projection_mut(panel_id).pending_query =
-                !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_));
+        for track_index in 0..self.alignment_tracks.len() {
+            self.queue_alignment_navigation_for_track(
+                track_index,
+                panel_id,
+                false,
+                "viewport navigation requested",
+            );
         }
         let alignment_pending = self.alignment_tracks.iter().any(|track| {
             track
                 .projection(panel_id)
-                .is_some_and(|projection| projection.pending_query)
+                .is_some_and(|projection| projection.navigation.is_queued())
         });
         let base_marks_visible =
             self.panels.active().viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL;
@@ -351,15 +413,16 @@ impl Viewer {
         let Some(panel) = self.panels.get(panel_id) else {
             return false;
         };
-        if panel.navigation_query_schedule.pending.is_some()
-            || panel.pending_queries.alignment
-            || panel.pending_queries.reference
-            || panel.pending_queries.tracks
-        {
+        if panel.navigation_query_schedule.pending.is_some() {
             return false;
         }
+        // Alignment pixels own their own atomic scene epoch. Reference interpretation and generic
+        // contextual tracks publish independently and cannot silently hold a complete alignment
+        // target behind the panel-wide preview transaction.
+        if !self.alignment_tracks.is_empty() {
+            return self.panel_alignment_queries_are_settled(panel_id);
+        }
         let panel_generation = panel.generation_clock.current().get();
-        let alignments_settled = self.panel_alignment_queries_are_settled(panel_id);
         let reference_settled = reference_dependency_is_settled(
             self.reference_engine.is_some()
                 && panel.viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL,
@@ -375,7 +438,7 @@ impl Viewer {
             || panel.track_query_error_generation == Some(panel_generation)
             || (panel.track_settled_generation == Some(panel_generation)
                 && panel.track_snapshot_interval == Some(panel.viewport.interval()));
-        alignments_settled && reference_settled && tracks_settled
+        reference_settled && tracks_settled
     }
 
     fn panel_alignment_queries_are_settled(&self, panel_id: PanelId) -> bool {
@@ -383,9 +446,13 @@ impl Viewer {
             .iter()
             .all(|track| match track.lifecycle {
                 AlignmentTrackLifecycle::Opening => false,
-                AlignmentTrackLifecycle::Ready => track
-                    .projection(panel_id)
-                    .is_some_and(AlignmentPanelProjection::query_is_current),
+                AlignmentTrackLifecycle::Ready => {
+                    track.projection(panel_id).is_some_and(|projection| {
+                        projection
+                            .navigation
+                            .is_current_settled(projection.clock.current().get())
+                    })
+                }
                 AlignmentTrackLifecycle::Failed(_) => true,
             })
     }
@@ -406,9 +473,7 @@ impl Viewer {
         let active_id = self.panels.active().id;
         let mut ready = Vec::new();
         for panel_id in candidate_ids {
-            let alignment_queries_settled = self.panel_alignment_queries_are_settled(panel_id);
             self.panels.activate(panel_id);
-            let row_layouts_settled = alignment_queries_settled && self.ensure_alignment_rows();
             let data_settled = self.panel_navigation_data_is_settled(panel_id);
             let panel = self
                 .panels
@@ -418,7 +483,7 @@ impl Viewer {
                 panel.navigation_presentation.phase,
                 panel.navigation_query_schedule.hold_commit_until_end,
                 data_settled,
-                row_layouts_settled,
+                true,
             ) {
                 ready.push(panel_id);
             }
@@ -576,6 +641,11 @@ impl Viewer {
         panel_id: PanelId,
         revision: ReferenceRevision,
     ) -> Vec<AlignmentReferenceLaneRequirement> {
+        if self.panels.get(panel_id).is_some_and(|panel| {
+            panel.reference_query_error_generation == Some(panel.generation_clock.current().get())
+        }) {
+            return Vec::new();
+        }
         self.alignment_tracks
             .iter()
             .filter(|track| {
@@ -584,14 +654,11 @@ impl Viewer {
             })
             .filter_map(|track| {
                 let projection = track.projection(panel_id)?;
-                if projection.query_is_current() {
-                    return None;
-                }
                 let owner = projection.scene_owner?;
                 let frame = projection.scene_frame.as_ref()?;
-                if projection.desired_scene_camera != Some(frame.camera)
+                if projection.navigation.desired_camera() != Some(frame.camera)
                     || !alignment_scene_event_token_is_current(
-                        projection.desired_scene_request_token,
+                        projection.navigation.request_token(),
                         projection.scene_frame_request_token,
                     )
                 {
@@ -882,7 +949,7 @@ impl Viewer {
             let alignment_pending = self.alignment_tracks.iter().any(|track| {
                 track
                     .projection(id)
-                    .is_some_and(|projection| projection.pending_query)
+                    .is_some_and(|projection| projection.navigation.is_queued())
             });
             self.panels.activate(id);
             if self
@@ -894,12 +961,193 @@ impl Viewer {
             {
                 continue;
             }
-            self.panels.active_mut().pending_queries.alignment |= alignment_pending;
+            self.panels.active_mut().pending_queries.alignment = alignment_pending;
             self.dispatch_alignment_query();
             self.dispatch_reference_query();
             self.dispatch_track_query();
         }
         self.panels.activate(active_id);
+    }
+
+    /// Resumes paused, exact source intents only after their typed ledger obstruction has cleared.
+    /// The epoch is a cheap change detector, not proof of capacity: unrelated ledger churn is
+    /// consumed without reopening the same request.
+    fn retry_deferred_alignment_source_pressures(&mut self) {
+        if !self.alignment_tracks.iter().any(|track| {
+            track
+                .projections
+                .values()
+                .any(|projection| projection.scene_pressure_retry.is_some())
+        }) {
+            return;
+        }
+        let Ok(snapshot) = self.alignment_scene_ledger.progress() else {
+            return;
+        };
+        let epoch = snapshot.progress_epoch();
+        let mut waiting_updates = Vec::new();
+        let mut retries = Vec::new();
+        for (track_index, track) in self.alignment_tracks.iter().enumerate() {
+            if !matches!(track.lifecycle, AlignmentTrackLifecycle::Ready) {
+                continue;
+            }
+            for (panel_id, projection) in &track.projections {
+                let Some(retry) = projection.scene_pressure_retry else {
+                    continue;
+                };
+                let Some(owner) = projection.scene_owner else {
+                    continue;
+                };
+                if !alignment_scene_pressure_is_current(
+                    projection.navigation.request_token(),
+                    retry.request_token,
+                    projection.navigation.desired_camera(),
+                    retry.target,
+                ) {
+                    continue;
+                }
+                match retry.poll(&snapshot) {
+                    AlignmentScenePressureRetryPoll::Waiting(updated) => {
+                        if updated != retry {
+                            waiting_updates.push((track_index, *panel_id, retry, updated));
+                        }
+                    }
+                    AlignmentScenePressureRetryPoll::Ready => retries.push((
+                        track_index,
+                        *panel_id,
+                        owner,
+                        retry.request_token,
+                        retry.target,
+                    )),
+                }
+            }
+        }
+
+        for (track_index, panel_id, observed, updated) in waiting_updates {
+            if let Some(retry) = self.alignment_tracks[track_index]
+                .projection_mut(panel_id)
+                .scene_pressure_retry
+                .as_mut()
+            {
+                // Preserve a newer engine response if one was consumed between collection and
+                // mutation (the desktop currently drains serially, but this keeps the authority
+                // local and explicit).
+                if *retry == observed {
+                    *retry = updated;
+                }
+            }
+        }
+
+        for (track_index, panel_id, owner, request_token, target) in retries {
+            let result = self.alignment_tracks[track_index]
+                .scene_engine
+                .as_ref()
+                .map(|engine| engine.try_retry_resource_pressure(owner, request_token, target));
+            if let Some(retry) = self.alignment_tracks[track_index]
+                .projection_mut(panel_id)
+                .scene_pressure_retry
+                .as_mut()
+            {
+                retry.ledger_epoch = epoch;
+                retry.in_flight = matches!(result, Some(Ok(())));
+            }
+            if matches!(result, Some(Ok(()))) {
+                self.alignment_tracks[track_index]
+                    .projection_mut(panel_id)
+                    .navigation
+                    .transition(
+                        AlignmentNavigationPhase::Running,
+                        "ledger progress resumed the exact source target",
+                    );
+            }
+            if matches!(result, Some(Err(EngineQueueError::Disconnected)) | None) {
+                self.alignment_tracks[track_index]
+                    .projection_mut(panel_id)
+                    .settle_failed("alignment source mailbox disconnected during pressure retry");
+                self.alignment_tracks[track_index].lifecycle =
+                    AlignmentTrackLifecycle::Failed(EngineQueueError::Disconnected.to_string());
+                self.alignment_tracks[track_index].scene_budget_retry = None;
+            }
+        }
+    }
+
+    /// Replays a source coordinator's latest refused budget edit exactly once after its prepared
+    /// replacement obstruction clears. Every source still runs its own eviction pass even though
+    /// all sources and renderers share one enforcing ledger.
+    fn retry_deferred_alignment_budget_pressures(&mut self) {
+        if !self
+            .alignment_tracks
+            .iter()
+            .any(|track| track.scene_budget_retry.is_some())
+        {
+            return;
+        }
+        let Ok(snapshot) = self.alignment_scene_ledger.progress() else {
+            return;
+        };
+        let desired_budget = self.cache_coordinator.total_budget_bytes;
+        let mut stale = Vec::new();
+        let mut waiting_updates = Vec::new();
+        let mut retries = Vec::new();
+        for (track_index, track) in self.alignment_tracks.iter().enumerate() {
+            let Some(retry) = track.scene_budget_retry else {
+                continue;
+            };
+            if !alignment_scene_budget_event_is_current(
+                desired_budget,
+                track.cache_budget_bytes.get(),
+                retry.requested_budget,
+            ) {
+                stale.push(track_index);
+                continue;
+            }
+            match retry.poll(&snapshot) {
+                AlignmentSceneBudgetRetryPoll::Waiting(updated) => {
+                    if updated != retry {
+                        waiting_updates.push((track_index, updated));
+                    }
+                }
+                AlignmentSceneBudgetRetryPoll::Ready => {
+                    retries.push((
+                        track_index,
+                        retry.requested_budget,
+                        retry.clear_before_apply,
+                    ));
+                }
+            }
+        }
+
+        for track_index in stale {
+            self.alignment_tracks[track_index].scene_budget_retry = None;
+        }
+        for (track_index, updated) in waiting_updates {
+            if self.alignment_tracks[track_index]
+                .scene_budget_retry
+                .is_some_and(|retry| retry.requested_budget == updated.requested_budget)
+            {
+                self.alignment_tracks[track_index].scene_budget_retry = Some(updated);
+            }
+        }
+        for (track_index, requested_budget, clear_before_apply) in retries {
+            let result = self.alignment_tracks[track_index]
+                .scene_engine
+                .as_ref()
+                .map(|engine| {
+                    engine.try_retry_budget_pressure(requested_budget, clear_before_apply)
+                });
+            if let Some(retry) = self.alignment_tracks[track_index]
+                .scene_budget_retry
+                .as_mut()
+                && retry.requested_budget == requested_budget
+            {
+                retry.ledger_epoch = snapshot.progress_epoch();
+                retry.in_flight = matches!(result, Some(Ok(())));
+            }
+            if matches!(result, Some(Err(EngineQueueError::Disconnected)) | None) {
+                self.alignment_tracks[track_index].lifecycle =
+                    AlignmentTrackLifecycle::Failed(EngineQueueError::Disconnected.to_string());
+            }
+        }
     }
 
     pub(crate) fn poll_background_work(&mut self) {
@@ -908,9 +1156,27 @@ impl Viewer {
         self.dispatch_due_resolution_query_refresh(now);
         self.poll_reference_events();
         self.poll_alignment_events();
-        self.poll_alignment_row_layout_tasks();
-        self.poll_alignment_row_scene_tasks();
+        let ledger_progressed = self.alignment_ledger_progress.take_pending();
+        let immediate_budget_retry = self.alignment_tracks.iter().any(|track| {
+            track
+                .scene_budget_retry
+                .is_some_and(|retry| retry.ready_after_observed_progress)
+        });
+        let immediate_gpu_retry = self.alignment_gpu_publication_retry.is_some_and(|retry| {
+            matches!(
+                retry.gate,
+                AlignmentGpuPublicationRetryGate::ReadyAfterObservedProgress
+            )
+        });
+        if ledger_progressed || immediate_budget_retry {
+            self.retry_deferred_alignment_budget_pressures();
+            self.retry_deferred_alignment_source_pressures();
+        }
+        if ledger_progressed || immediate_gpu_retry {
+            self.retry_deferred_alignment_gpu_publication();
+        }
         self.poll_track_events();
+        self.synchronize_alignment_contextual_product_states();
         self.poll_alignment_retirement_tasks();
         self.poll_session_load_tasks();
         self.poll_session_save_tasks();
@@ -925,6 +1191,53 @@ impl Viewer {
         }
         if self.display_dirty {
             self.window.request_redraw();
+        }
+    }
+
+    fn synchronize_alignment_contextual_product_states(&mut self) {
+        let has_contextual_lanes = !self.tracks.tracks().is_empty();
+        let states = self
+            .panels
+            .iter()
+            .map(|panel| {
+                let generation = panel.generation_clock.current().get();
+                let state = if !has_contextual_lanes {
+                    AlignmentNavigationProductState::Independent
+                } else if panel.track_query_error_generation == Some(generation) {
+                    AlignmentNavigationProductState::IndependentFailed
+                } else if panel.pending_queries.tracks
+                    || panel.track_settled_generation != Some(generation)
+                    || panel.track_snapshot_interval != Some(panel.viewport.interval())
+                {
+                    AlignmentNavigationProductState::IndependentPending
+                } else {
+                    AlignmentNavigationProductState::IndependentReady
+                };
+                (panel.id, state)
+            })
+            .collect::<Vec<_>>();
+        for track in &mut self.alignment_tracks {
+            for (panel_id, state) in &states {
+                let reason = match state {
+                    AlignmentNavigationProductState::Independent => {
+                        "no contextual annotation lanes are required"
+                    }
+                    AlignmentNavigationProductState::IndependentPending => {
+                        "contextual annotation lanes remain independently pending"
+                    }
+                    AlignmentNavigationProductState::IndependentReady => {
+                        "contextual annotation lanes are independently ready"
+                    }
+                    AlignmentNavigationProductState::IndependentFailed => {
+                        "contextual annotation lanes failed independently"
+                    }
+                    _ => unreachable!("contextual product synchronization uses independent states"),
+                };
+                track
+                    .projection_mut(*panel_id)
+                    .navigation
+                    .observe_contextual_lanes(*state, reason);
+            }
         }
     }
 
@@ -1148,6 +1461,15 @@ impl Viewer {
                         for panel in self.panels.iter_mut() {
                             panel.settle_reference_open_failure();
                         }
+                        for projection in self
+                            .alignment_tracks
+                            .iter_mut()
+                            .flat_map(|track| track.projections.values_mut())
+                        {
+                            projection.navigation.observe_reference_failure(
+                                "reference source failed; core alignment navigation remains independent",
+                            );
+                        }
                     }
                     let current = query.is_none_or(|query| {
                         let request = query.request();
@@ -1187,9 +1509,9 @@ impl Viewer {
                                 let projection = track.projection_mut(panel_id);
                                 let matching_current_requirement =
                                     projection.scene_frame.as_ref().is_some_and(|frame| {
-                                        projection.desired_scene_camera == Some(frame.camera)
+                                        projection.navigation.desired_camera() == Some(frame.camera)
                                             && alignment_scene_event_token_is_current(
-                                                projection.desired_scene_request_token,
+                                                projection.navigation.request_token(),
                                                 projection.scene_frame_request_token,
                                             )
                                             && reference_failure_matches_requirement(
@@ -1200,13 +1522,14 @@ impl Viewer {
                                     });
                                 if matching_current_requirement {
                                     // A terminal FASTA dependency failure is not an alignment
-                                    // source failure. Keep the immutable scene and its reads, but
-                                    // let this transaction settle with the explicit reference
-                                    // error already recorded on the panel.
+                                    // navigation transition. Keep the core scene transaction in
+                                    // its existing candidate/committed phase and record the
+                                    // optional-product failure on the panel only.
                                     projection.finish_checking();
                                     projection.pending_query = false;
-                                    projection.settled_generation =
-                                        Some(projection.clock.current().get());
+                                    projection.navigation.observe_reference_failure(
+                                        "reference query failed; core alignment navigation remains independent",
+                                    );
                                     if let Some(owner) = projection.scene_owner {
                                         failed_owners.push(owner);
                                     }
@@ -1275,6 +1598,9 @@ impl Viewer {
                     Ok(None) => break,
                     Err(error) => {
                         track.lifecycle = AlignmentTrackLifecycle::Failed(error.to_string());
+                        for projection in track.projections.values_mut() {
+                            projection.settle_failed(error.to_string());
+                        }
                         if Some(id) == primary_id {
                             self.data_status = error.to_string();
                         }
@@ -1625,7 +1951,18 @@ impl Viewer {
                     track.dictionary = Some(dictionary.clone());
                     track.index_overview = metadata.index_overview.clone();
                     track.scene_metadata = Some(metadata);
-                    for projection in track.projections.values_mut() {
+                    let panel_ids = track.projections.keys().copied().collect::<Vec<_>>();
+                    let track_id = track.config.id;
+                    for panel_id in panel_ids {
+                        let token = self.take_alignment_scene_request_token();
+                        let projection =
+                            self.alignment_tracks[track_index].projection_mut(panel_id);
+                        projection.navigation.bind_identity(panel_id, track_id);
+                        projection.navigation.begin(
+                            projection.clock.current().get(),
+                            token,
+                            "alignment source opened",
+                        );
                         projection.pending_query = true;
                     }
                     source_opened = true;
@@ -1640,6 +1977,7 @@ impl Viewer {
                     cause,
                     published_scene,
                     frame,
+                    work,
                     ..
                 } => {
                     let frame = alignment_scene_frame_for_ui(frame);
@@ -1664,12 +2002,10 @@ impl Viewer {
                     }
                     let track = &mut self.alignment_tracks[track_index];
                     let projection = track.projection_mut(panel_id);
-                    if !alignment_scene_frame_is_current(
-                        projection.desired_scene_request_token,
-                        request_token,
-                        projection.desired_scene_camera,
-                        frame.camera,
-                    ) {
+                    if !projection
+                        .navigation
+                        .event_is_current(request_token, frame.camera)
+                    {
                         self.navigation_stale_result_rejections =
                             self.navigation_stale_result_rejections.saturating_add(1);
                         continue;
@@ -1691,27 +2027,70 @@ impl Viewer {
                     let camera_refusal_is_terminal = frame.individual_reads_refused_for_camera();
                     projection.scene_frame = Some(frame.clone());
                     projection.scene_frame_request_token = Some(request_token);
-                    let current_target = projection.desired_scene_camera == Some(frame.camera);
+                    let current_target =
+                        projection.navigation.desired_camera() == Some(frame.camera);
                     if current_target {
                         projection.pending_query = false;
                         projection.unavailable = None;
                         projection.index_only_overview = false;
-                        match alignment_scene_frame_settlement(&frame) {
+                        projection.navigation.observe_frame_products(&frame);
+                        let settlement = alignment_scene_frame_settlement(&frame);
+                        if settlement != AlignmentSceneFrameSettlement::WaitingForScene {
+                            projection.scene_pressure_retry = None;
+                        }
+                        match settlement {
                             AlignmentSceneFrameSettlement::Settled => {
                                 // A later terminal frame in this same mailbox drain supersedes an
                                 // earlier progress frame which may have queued a FASTA request.
                                 reference_panels_to_request.remove(&panel_id);
                                 projection.finish_checking();
-                                projection.settled_generation =
-                                    Some(projection.clock.current().get());
+                                if projection.navigation.phase()
+                                    != AlignmentNavigationPhase::Committed
+                                {
+                                    projection.navigation.transition(
+                                        AlignmentNavigationPhase::CandidateReady,
+                                        "complete semantic scene is ready for atomic GPU publication",
+                                    );
+                                }
                             }
-                            AlignmentSceneFrameSettlement::WaitingForReference => {
-                                // Source/layout work is complete, but Base pages cannot become the
-                                // current generation until the exact versioned FASTA horizon is
-                                // installed and a reference-backed frame is published.
+                            AlignmentSceneFrameSettlement::SettledWithReferencePending => {
+                                // The core scene is complete and can commit now. FASTA-backed
+                                // substitutions continue as an optional product upgrade under the
+                                // same request token; they do not own alignment navigation.
                                 reference_panels_to_request.insert(panel_id);
+                                projection.finish_checking();
+                                if projection.navigation.phase()
+                                    != AlignmentNavigationPhase::Committed
+                                {
+                                    projection.navigation.transition(
+                                        AlignmentNavigationPhase::CandidateReady,
+                                        "reference-independent scene is ready; substitution interpretation remains pending",
+                                    );
+                                }
                             }
-                            AlignmentSceneFrameSettlement::WaitingForScene => {}
+                            AlignmentSceneFrameSettlement::WaitingForScene => {
+                                if projection.navigation.phase()
+                                    != AlignmentNavigationPhase::Running
+                                {
+                                    projection.navigation.transition(
+                                        AlignmentNavigationPhase::Running,
+                                        "source or row-presentation work is active",
+                                    );
+                                }
+                                if projection.navigation.fail_if_source_owner_is_idle(
+                                    work.source_pending,
+                                    work.presentation_pending,
+                                ) {
+                                    projection.finish_checking();
+                                    projection.settled_generation =
+                                        Some(projection.clock.current().get());
+                                    projection.unavailable = Some(
+                                        "Internal liveness failure: the alignment worker became idle before completing this target"
+                                            .to_owned(),
+                                    );
+                                    rebuild_display = true;
+                                }
+                            }
                         }
                     }
                     if Some(track_id) == primary_id && panel_id == active_panel_id && current_target
@@ -1797,9 +2176,9 @@ impl Viewer {
                     let track = &mut self.alignment_tracks[track_index];
                     let projection = track.projection_mut(panel_id);
                     if !alignment_scene_refusal_is_current(
-                        projection.desired_scene_request_token,
+                        projection.navigation.request_token(),
                         request_token,
-                        projection.desired_scene_camera,
+                        projection.navigation.desired_camera(),
                         frame.camera,
                         target,
                     ) {
@@ -1818,11 +2197,15 @@ impl Viewer {
                     }
                     projection.scene_frame = Some(frame.clone());
                     projection.scene_frame_request_token = Some(request_token);
-                    if projection.desired_scene_camera == Some(frame.camera) {
+                    projection.scene_pressure_retry = None;
+                    if projection.navigation.desired_camera() == Some(frame.camera) {
                         reference_panels_to_request.remove(&panel_id);
                         projection.finish_checking();
                         projection.pending_query = false;
-                        projection.settled_generation = Some(projection.clock.current().get());
+                        projection.navigation.transition(
+                            AlignmentNavigationPhase::CandidateReady,
+                            "complete source count produced a terminal individual-read refusal",
+                        );
                     }
                     if Some(track_id) == primary_id && panel_id == active_panel_id {
                         self.data_status = format!(
@@ -1831,6 +2214,259 @@ impl Viewer {
                     }
                     rebuild_display = true;
                     prepare_frame = true;
+                }
+                AlignmentSceneEngineEvent::ResourcePressure {
+                    owner,
+                    request_token,
+                    target,
+                    operation,
+                    intent,
+                    pressure,
+                    disposition,
+                } => {
+                    let panel_id = self.alignment_tracks[track_index]
+                        .projections
+                        .iter()
+                        .find_map(|(panel_id, projection)| {
+                            (projection.scene_owner == Some(owner)).then_some(*panel_id)
+                        });
+                    let Some(panel_id) = panel_id else {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    };
+                    let current = self.alignment_tracks[track_index]
+                        .projection(panel_id)
+                        .is_some_and(|projection| {
+                            !projection.index_only_overview
+                                && alignment_scene_pressure_is_current(
+                                    projection.navigation.request_token(),
+                                    request_token,
+                                    projection.navigation.desired_camera(),
+                                    target,
+                                )
+                        });
+                    if !current {
+                        self.navigation_stale_result_rejections =
+                            self.navigation_stale_result_rejections.saturating_add(1);
+                        continue;
+                    }
+
+                    // Source read-ahead is optional once the current frame is complete. It yields
+                    // at its own checkpoint and must not displace a useful GPU scene or reopen the
+                    // foreground navigation transaction.
+                    if !alignment_scene_pressure_requires_resume(operation, intent) {
+                        continue;
+                    }
+
+                    if alignment_scene_pressure_preserves_visible_epoch(
+                        operation,
+                        intent,
+                        disposition,
+                    ) {
+                        let projection =
+                            self.alignment_tracks[track_index].projection_mut(panel_id);
+                        projection.scene_pressure_retry = None;
+                        if Some(track_id) == primary_id && panel_id == active_panel_id {
+                            let records = projection
+                                .scene_frame
+                                .as_ref()
+                                .and_then(|frame| frame.snapshot.as_ref())
+                                .map_or(0, |snapshot| snapshot.reads().evidence().record_count());
+                            self.data_status = projection.scene_frame.as_ref().map_or_else(
+                                || {
+                                    "Complete alignments remain available · instant deep scrolling is limited by the cache budget"
+                                        .to_owned()
+                                },
+                                |frame| match frame.vertical_residency {
+                                    AlignmentVerticalResidency::Preparing {
+                                        prepared_rows,
+                                        total_rows,
+                                    }
+                                    | AlignmentVerticalResidency::BudgetLimited {
+                                        prepared_rows,
+                                        total_rows,
+                                    } => format!(
+                                        "{records} complete alignments · {prepared_rows}/{total_rows} rows resident (cache budget reached)"
+                                    ),
+                                    AlignmentVerticalResidency::Complete { total_rows } => format!(
+                                        "{records} complete alignments · all {total_rows} rows prepared"
+                                    ),
+                                    AlignmentVerticalResidency::ViewportBounded => format!(
+                                        "{records} complete alignments · instant deep scrolling is limited by the cache budget"
+                                    ),
+                                },
+                            );
+                        }
+                        continue;
+                    }
+
+                    if disposition == AlignmentSceneResourcePressureDisposition::Infeasible {
+                        let message = format!(
+                            "Alignment scene requires more cache capacity than the configured limit: {pressure}"
+                        );
+                        let projection =
+                            self.alignment_tracks[track_index].projection_mut(panel_id);
+                        projection.scene_pressure_retry = None;
+                        projection.settle_unavailable(message.clone());
+                        if Some(track_id) == primary_id && panel_id == active_panel_id {
+                            self.data_status = message;
+                        }
+                        rebuild_display = true;
+                        continue;
+                    }
+
+                    let snapshot_before = match self.alignment_scene_ledger.progress() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            self.data_status =
+                                format!("Could not inspect alignment cache capacity: {error}");
+                            continue;
+                        }
+                    };
+                    let answers_existing_retry = self.alignment_tracks[track_index]
+                        .projection(panel_id)
+                        .and_then(|projection| projection.scene_pressure_retry)
+                        .is_some_and(|retry| retry.same_request(request_token, target));
+                    let post_relief = if answers_existing_retry {
+                        // This is the typed answer to the queued retry. Revalidate its newest exact
+                        // obstruction even if occupancy changed while the request was in flight.
+                        snapshot_before
+                    } else {
+                        match self.yield_alignment_gpu_speculation_for_source_pressure(pressure) {
+                            Ok(_) => {}
+                            Err(error) => {
+                                self.data_status =
+                                    format!("Could not yield optional GPU residency: {error}");
+                                continue;
+                            }
+                        };
+                        match self.alignment_scene_ledger.progress() {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => {
+                                self.data_status =
+                                    format!("Could not inspect alignment cache capacity: {error}");
+                                continue;
+                            }
+                        }
+                    };
+                    let retry_epoch = post_relief.progress_epoch();
+                    if let AlignmentScenePressureRetryPoll::Waiting(waiting) =
+                        alignment_scene_pressure_after_relief(
+                            request_token,
+                            target,
+                            pressure,
+                            &post_relief,
+                        )
+                    {
+                        // A first pressure edge is not itself permission for a guaranteed-failing
+                        // retry. Record the exact post-yield blocker and wait for relevant ledger
+                        // progress; a later pressure answer replaces it through the same path.
+                        self.alignment_tracks[track_index]
+                            .projection_mut(panel_id)
+                            .scene_pressure_retry = Some(waiting);
+                        self.alignment_tracks[track_index]
+                            .projection_mut(panel_id)
+                            .navigation
+                            .transition(
+                                AlignmentNavigationPhase::WaitingForSourcePressure,
+                                "source allocation is paused on an exact ledger blocker",
+                            );
+                        if Some(track_id) == primary_id && panel_id == active_panel_id {
+                            "Waiting for shared alignment cache capacity…"
+                                .clone_into(&mut self.data_status);
+                        }
+                        continue;
+                    }
+                    let retry_result = self.alignment_tracks[track_index]
+                        .scene_engine
+                        .as_ref()
+                        .map(|engine| {
+                            engine.try_retry_resource_pressure(owner, request_token, target)
+                        });
+                    let retry_queued = matches!(retry_result, Some(Ok(())));
+                    self.alignment_tracks[track_index]
+                        .projection_mut(panel_id)
+                        .scene_pressure_retry = Some(AlignmentScenePressureRetry {
+                        request_token,
+                        target,
+                        pressure,
+                        ledger_epoch: retry_epoch,
+                        in_flight: retry_queued,
+                    });
+                    match retry_result {
+                        Some(Ok(())) => {
+                            self.alignment_tracks[track_index]
+                                .projection_mut(panel_id)
+                                .navigation
+                                .transition(
+                                    AlignmentNavigationPhase::Running,
+                                    "source pressure retry was accepted",
+                                );
+                            if Some(track_id) == primary_id && panel_id == active_panel_id {
+                                "Updating alignment scene…".clone_into(&mut self.data_status);
+                            }
+                        }
+                        Some(Err(EngineQueueError::Disconnected)) | None => {
+                            self.alignment_tracks[track_index]
+                                .projection_mut(panel_id)
+                                .settle_failed("alignment source mailbox disconnected");
+                            self.alignment_tracks[track_index].lifecycle =
+                                AlignmentTrackLifecycle::Failed(
+                                    EngineQueueError::Disconnected.to_string(),
+                                );
+                        }
+                        Some(Err(EngineQueueError::Full)) => {
+                            // The retry API is replaceable and currently cannot report Full, but
+                            // keep the state paused if that mailbox contract ever changes.
+                        }
+                    }
+                }
+                AlignmentSceneEngineEvent::BudgetPressure {
+                    requested_budget,
+                    clear_before_apply,
+                    current_policy_revision,
+                    current_budget,
+                    pressure,
+                } => {
+                    let desired_budget = self.cache_coordinator.total_budget_bytes;
+                    let submitted_budget =
+                        self.alignment_tracks[track_index].cache_budget_bytes.get();
+                    if !alignment_scene_budget_event_is_current(
+                        desired_budget,
+                        submitted_budget,
+                        requested_budget,
+                    ) {
+                        // A later settings/rebalance command is already ordered behind this
+                        // response. Never revive the stale value when the old GPU transition
+                        // eventually settles.
+                        continue;
+                    }
+                    let snapshot = match self.alignment_scene_ledger.progress() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            self.data_status =
+                                format!("Could not inspect alignment cache capacity: {error}");
+                            continue;
+                        }
+                    };
+                    self.alignment_tracks[track_index].scene_budget_retry =
+                        Some(AlignmentSceneBudgetRetry::after_pressure_event(
+                            requested_budget,
+                            clear_before_apply,
+                            current_policy_revision,
+                            current_budget,
+                            pressure,
+                            &snapshot,
+                        ));
+                }
+                AlignmentSceneEngineEvent::BudgetReduced { pressure } => {
+                    if self.alignment_tracks[track_index]
+                        .scene_budget_retry
+                        .is_some_and(|retry| retry.requested_budget == pressure.budget)
+                    {
+                        self.alignment_tracks[track_index].scene_budget_retry = None;
+                    }
                 }
                 AlignmentSceneEngineEvent::Error {
                     owner,
@@ -1850,14 +2486,14 @@ impl Viewer {
                         let projection =
                             self.alignment_tracks[track_index].projection_mut(panel_id);
                         if !alignment_scene_event_token_is_current(
-                            projection.desired_scene_request_token,
+                            projection.navigation.request_token(),
                             request_token,
                         ) {
                             self.navigation_stale_result_rejections =
                                 self.navigation_stale_result_rejections.saturating_add(1);
                             continue;
                         }
-                        projection.settle_unavailable(message.to_string());
+                        projection.settle_failed(message.to_string());
                     } else if owner.is_some() {
                         self.navigation_stale_result_rejections =
                             self.navigation_stale_result_rejections.saturating_add(1);
@@ -1871,7 +2507,7 @@ impl Viewer {
                         for projection in
                             self.alignment_tracks[track_index].projections.values_mut()
                         {
-                            projection.pending_query = false;
+                            projection.settle_failed(message.to_string());
                         }
                     } else {
                         // Source pumping is shared by every lane and therefore has no owner in its
@@ -1882,7 +2518,7 @@ impl Viewer {
                         for projection in
                             self.alignment_tracks[track_index].projections.values_mut()
                         {
-                            projection.settle_unavailable(message.to_string());
+                            projection.settle_failed(message.to_string());
                         }
                     }
                     if Some(track_id) == primary_id
@@ -1895,8 +2531,7 @@ impl Viewer {
                 AlignmentSceneEngineEvent::LaneInserted { .. }
                 | AlignmentSceneEngineEvent::LaneRemoved { .. }
                 | AlignmentSceneEngineEvent::PresentationPrewarmed { .. }
-                | AlignmentSceneEngineEvent::SourceControlQueued
-                | AlignmentSceneEngineEvent::BudgetReduced { .. } => {}
+                | AlignmentSceneEngineEvent::SourceControlQueued => {}
             }
         }
 
@@ -1914,9 +2549,11 @@ impl Viewer {
         for panel_id in panel_ids {
             let pending = self.alignment_tracks.iter().any(|track| {
                 !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_))
-                    && track
-                        .projection(panel_id)
-                        .is_some_and(|projection| projection.pending_query)
+                    && track.projection(panel_id).is_some_and(|projection| {
+                        !projection
+                            .navigation
+                            .is_current_settled(projection.clock.current().get())
+                    })
             });
             if let Some(panel) = self.panels.get_mut(panel_id) {
                 panel.pending_queries.alignment = pending;

@@ -1,18 +1,202 @@
 # Unified alignment-scene implementation and legacy-removal plan
 
-Status: implementation in progress on `feature/unified-alignment-scene`, updated 30 August 2026.
+Status: recovery R0–R6 complete on `feature/unified-alignment-scene`. R0–R5 pass their automated
+gates and the user accepted the R6 native checkpoint on 31 August 2026. Broader Phase 7 feature
+expansion is unblocked; its remaining product-family gates and Phase 8 deletion are still open.
 
-Current evidence: the headless scene crate, source-position BAM identity, exact immutable evidence
-and summaries, enforcing allocation ledger, immutable row atlas, semantic read and summary pages,
-CPU projection/picking/export, persistent read GPU pages, one source-level multi-panel
-coordinator, latest-wins source scheduling, and a bounded background local-BAM runtime are present
-and covered by their crate tests. The desktop has not yet cut over and therefore still uses the
-legacy presentation path; Phase 8 deletion has not begun. This status paragraph records progress
-only—the gates and definition of done below remain unchanged.
+Current execution authority: `UNIFIED_ALIGNMENT_SCENE_RECOVERY_PLAN.md`. Its automated R0–R5
+frontier now proves the bounded control plane, owned navigation liveness, and single scene-backed
+local-BAM authority. Its user-reviewed R6 record accepts the minimum native navigation and
+interaction behaviour. Phase 7 feature expansion may proceed, while Phase 8 deletion remains
+gated on migration and qualification of the remaining consumers.
+
+The branch is no longer headless-only. Commit `1a923fa` implemented the headless scene
+architecture and also cut the local-BAM read lane over to immutable scene frames, persistent GPU
+pages, stable-handle picking, and scene-backed inspection. Commit `91d36f5` then repaired
+integration contracts exposed by the first ACTB/BAP1 manual qualification: camera-exact row
+activity, stable row-coordinate lineage, exact/pending/absent vertical authority, live scrollbar
+geometry, terminal Complete-read refusal settlement, and command-line Complete-read-limit
+propagation.
+
+That desktop slice entered before the complete Phase 6 gate had passed. This was a sequencing
+deviation, not a change of architecture. It does not waive any gate below: local-BAM read pixels
+are only the first Phase 7 slice, the all-consumer cutover is incomplete, and Phase 8 destructive
+deletion cannot complete until the remaining consumers have migrated and qualification has
+passed.
+
+The native test that initiated recovery invalidated the previous execution frontier. Under rapid
+pan, zoom, and contig changes, that build could remain permanently on `Updating view...` while its
+BAM scene-source actor was idle. Sampling also showed repeated full allocation-ledger inventories
+on UI background polls while the process held approximately 9 GiB. Recovery replaced those
+control-plane and mixed-authority paths; the automated R0–R5 evidence and accepted R6 checkpoint
+are recorded in the recovery plan.
 
 This plan supersedes the alignment-presentation direction in the earlier resident-window and
 transactional-preview plans. Those documents remain useful evidence, but they are not the delivery
 authority for the replacement described here.
+
+## Progress ledger
+
+The ledger distinguishes four different claims that were previously easy to conflate:
+
+- **implemented**: the required code and focused tests exist;
+- **integrated**: the desktop production path consumes it;
+- **qualified**: the complete phase gate has passed across its required workload/mode matrix; and
+- **accepted**: the user has manually verified the native visual behaviour where required.
+
+Passing crate tests is implementation evidence; it is not by itself a qualified or manually
+accepted phase.
+
+| Phase | Current status | Evidence and remaining gate work |
+| --- | --- | --- |
+| 0 — authority, baselines, deletion map | Partial | The accepted ADR, feature/mode inventory, source inventory, telemetry, and BAM/CRAM source-position feasibility exist. A reproducible, user-reviewed ACTB/BAP1/WGS/exome/long-read fixture and screenshot bundle plus a complete baseline measurement report remain open. |
+| 1 — contracts, identities, scene crate | Implemented in the scene model/local-BAM path; end-to-end source-backend gate open | Typed factorised contracts, immutable chunks, coverage certificates, source revisions, stable source-position handles, true-duplicate preservation, payload sidecars, and zero-copy selections exist. Supporting CRAM/remote identity evidence is currently at the HTS layer; it is not yet an end-to-end unified-scene backend qualification. |
+| 2 — scene store and resource ledger | Implemented headlessly; gate evidence present | Immutable current/candidate publication, allocation-level charging, leases, pins, reservations, independent summary roots, pressure policy, and high-water tests exist. Production-wide pressure/soak evidence remains part of later qualification. |
+| 3 — source actor and row atlas | Implemented for the local-BAM backend | Latest-wins/fair scheduling, resumable canonical decode, cancellation salvage, immutable row-atlas publication, stable-handle indexes, and clean-vs-incremental fingerprints exist. Other production source backends remain outside this scope. |
+| 4 — semantic pages and CPU reference path | Broadly implemented; qualification open | Read primitives, specialist modes, exact summary pages, CPU projection, stable picking, inspection, and export APIs exist. One captured panel epoch now projects typed Coverage, Sashimi, and Modifications results with explicit Pending/Unavailable/Ready states; shared Raw and CPM Sashimi scales are resolved atomically from the complete coherence group. The feature-matrix test currently proves inventory integrity, not exhaustive independent-oracle parity for every product mode. |
+| 5 — persistent GPU pages | Read and coverage/allele renderers integrated; shared reclaim and camera-only capture implemented; remaining product families open | Read world-coordinate pages, admission/pinning, prefetch, camera uniforms, overlays, unchanged-page reuse, device-resource discard, and CPU/GPU geometry tests exist. Summary-page identity is based on compatible tile content and family dependencies rather than whole-root publication revisions, so widening a prepared horizon does not inherently rekey unchanged coverage tiles. A sibling persistent renderer draws exact coverage and generic reference-aware substitutions. Shared-ledger reclaim now composes one exact goal across both renderers, protects both foreground candidates, retires speculative full-scene pins, batches deterministic LRU eviction, and suppresses rewarming until authority or budget genuinely changes. The ledger has a tested single-flight replacement-bundle primitive which separately proves steady-state base fit and bounded old/new overlap. Read and summary renderers each precharge a two-slot camera ring and expose a content-authority-checked camera-only capture path with no retained allocation, page-table replacement, or unchanged-geometry upload; transient scratch remains ledger-accounted. The desktop atomically captures and privately stages the supported read-plus-summary candidate with renderer-owned retirement tokens. Full manual visual acceptance, bisulfite GPU interpretation, junction/modification GPU families, exhaustive framebuffer equivalence, and a same-scene desktop software presenter remain open. |
+| 6 — camera navigation | **Recovery R0–R6 complete and accepted** | The control plane is constant-cost/event-driven, navigation has one owned transaction, camera-only capture and bounded prefetch/reclaim are implemented, deterministic rapid-navigation/resource traces pass, and the user accepted the minimum native continuity, flicker, scroll, and interaction checkpoint on 31 August 2026. |
+| 7 — desktop semantic cutover | **Unified local-BAM recovery cutover implemented; broader Phase 7 unblocked** | The supported local-BAM path consumes the committed scene epoch for rows, pixels, coverage/substitutions, picking, stable-handle selection, and status. Legacy query/row/display code is disconnected or compile-disabled for that path and remains only at the unsupported-source boundary pending later Phase 8 deletion. Remaining product-family integration and qualification may now proceed. |
+| 8 — exclusive renderer and deletion | **Blocked behind remaining Phase 7 migration** | Legacy authority must be removed deliberately after every required scene-backed replacement is integrated and qualified, not retained as a fallback or deleted prematurely. |
+| 9 — contextual lanes | Not started | Genes, reference, annotations, and other contextual lanes still use the generic display/retained panel presentation path. |
+| 10 — remote qualification and soak | Not started for the unified scene | HTS-layer remote and CRAM infrastructure is useful foundation work, but the production scene backend intentionally supports local BAM only. Local CRAM, remote BAM/CRAM, pressure soak, and memory reconciliation remain open. |
+
+### Post-MVP stabilization incorporated into this plan
+
+The work in `91d36f5` advances the existing architecture rather than introducing another one:
+
+1. `AlignmentRowAtlas` now derives a camera-exact activity profile and stable coordinate-space
+   lineage, separating atlas-wide retained rows from rows active at the current locus.
+2. Coordinator frames carry that exact row authority to the desktop; stale or disjoint authority
+   is rejected.
+3. Desktop vertical state distinguishes exact, pending, and absent authority and preserves a latent
+   camera only when its lineage remains compatible.
+4. The live panel allocation owns the scrollbar rail and hit geometry; scene data controls only
+   the semantic extent, thumb, and density overview.
+5. Complete-read refusal is a non-discardable terminal control result, and a later compatible frame
+   can settle it. This closes the permanent `Updating view...` failure mode.
+6. The command-line Complete-read limit now reaches the created alignment track rather than
+   silently reverting to the old default.
+
+These changes directly advance Phases 3, 6, and 7 and strengthen Phase 2/3 publication semantics.
+They do not complete derived-lane migration, all-consumer cutover, legacy deletion, contextual-lane
+migration, or remote qualification.
+
+### Camera-publication incident correction awaiting native acceptance
+
+The current native build is **not visually accepted**. The preceding build repeatedly produced
+the following behaviour during zoom in/out at ACTB:
+`replacement GPU transition bundle <id> is already active`, and a pending zoom could display a
+full-height vertical thumb even though the locus contained many scrollable rows. The changing
+bundle IDs show repeated short-lived ownership collisions, not one leaked bundle and not evidence
+that the Complete-read requirement inherently exceeds memory.
+
+The collision occurred because a camera-only desktop update could enter the same single-flight GPU
+replacement transaction that source/presentation reconciliation was already using. Expected
+temporary ledger occupancy was then flattened into a terminal engine/desktop error, so a
+recoverable scheduling edge became `Complete reads unavailable`. At the same time, desired-camera
+panel state, previously committed GPU pixels, row activity, scrollbar extent, and status could be
+published from different attempts. In particular, pending row authority was interpreted as a
+zero-extent exact result, producing the misleading full-height thumb.
+
+The correction is an authority-boundary change, not another renderer fallback:
+
+1. **Two navigation authorities.** `DesiredNavigationTarget` changes immediately with input and
+   owns cancellable acquisition intent. `CommittedPresentationTarget` changes only through one
+   successful presentation commit. Tokens and target revisions reject every stale completion or
+   retry; a retry for an older target can never overwrite the latest camera.
+2. **One committed presentation object.** `PresentedAlignmentEpoch` owns the camera-exact panel
+   scene frames and the matching read-plus-summary GPU bundle. Render, hit testing, selection,
+   status, row metrics, and scrollbar projection read that object rather than independently
+   assignable staging fields. A failed or deferred candidate leaves the preceding committed epoch
+   intact; no read or summary half may publish alone.
+3. **Camera-exact row and scrollbar authority.** Every publishable lane carries row activity for
+   the candidate camera. Scroll extent, density overview, thumb, and hit geometry are projected
+   synchronously from that same candidate before its atomic commit. Full pixel-target identity and
+   row-semantic identity are distinct: vertical camera, clip, density, or surface-only movement
+   keeps the same genomic row profile exact and the scrollbar interactive while row blocks catch
+   up. A genomic interval or row-lineage change revokes it. While such a desired target lacks exact
+   row authority, the previous exact thumb may remain visible only as explicitly provisional and
+   noninteractive; `Pending` must never be converted to `maximum = 0` or a full-height exact thumb.
+4. **Precharged camera capture.** Read and summary renderers each own a two-slot camera-frame ring
+   admitted with the content replacement. Movement over unchanged resident content captures both
+   new camera frames from immutable content authorities, then publishes both or neither. This path
+   opens no replacement bundle, admits no retained allocation, rebuilds no page table, and uploads
+   no unchanged geometry. CPU packing/encoder scratch and any other transient memory remain
+   explicitly charged and bounded.
+5. **Bounded interaction envelope.** Immediate camera capture is valid only while the requested
+   horizontal interval, row blocks, LOD, device generation, scene revisions, and complete prepared
+   page manifests remain covered by the committed content authority. Preparation extends that
+   envelope predictively within the user budget. Leaving it schedules a content replacement; it
+   does not pretend missing pages exist, partially commit one renderer, or clear a truthfully
+   covered lane. Numerical envelope sizes remain measurement-led.
+6. **Typed pressure for every owner-local operation.** Allocation pressure from `UpdateCamera`,
+   `ReplaceContract`, `InstallReferenceAuthority`, `SetPreparationPolicy`,
+   `PrewarmPresentation`, `PumpSource`, and `PumpPresentation` is a nonterminal typed event with
+   owner, request token, target, operation, intent, pressure, and retryable/infeasible disposition.
+   Focused engine tests cover this contract and active-bundle contention. Intrinsically oversized
+   work may become a truthful terminal capacity result; ordinary occupancy must retain the
+   committed epoch and remain pending.
+7. **Progress-authoritative retry.** Desktop integration now schedules at most one
+   token/target/attempt-matched retry and rechecks the exact typed blocker after ledger progress;
+   unrelated allocation or pin churn cannot wake it. Settlement racing error delivery is detected
+   immediately, stale retries are rejected, and same-target hover/selection refresh cannot bypass
+   the waiting authority. Optional source read-ahead and explicit prewarm may yield.
+8. **Typed application-budget collision.** `ReduceBudget` and Clear Cache no longer flatten an
+   active replacement into source failure. Each source retains the latest applicable budget edit,
+   waits for its exact blocker, and reruns its local eviction pass. Clear Cache remains one ordered
+   `0 -> configured budget` transaction, so mailbox coalescing cannot omit the zero pass.
+9. **Operation-aware vertical limit.** An intrinsically oversized speculative
+   `PumpPresentation` block preserves the current visible-complete frame and publishes truthful
+   `BudgetLimited` residency. It limits instant deep scrolling; it does not make complete reads
+   unavailable. Ordinary occupancy pressure remains retryable. Optional `PumpSource` semantics are
+   unchanged.
+
+A later ACTB checkpoint exposed one narrower violation of item 3: dragging rapidly down the read
+stack changed the cursor to the application's blue wait indicator and then locked the scrollbar.
+Temporary tracing proved that the cached and desired target revisions were already equal and the
+committed/desired genomic row targets were compatible, but the cached authority had nevertheless
+become `Pending` with no atlas revision. This was not event-loop starvation or a RAM limit. The
+desktop capture path had coupled the genomic row profile to exact worker-camera and visible-row
+page coverage; the display rebuild then discarded the retained profile a second time.
+
+The integrated correction now uses one shared row-authority predicate based on genomic interval,
+evidence/atlas lineage, and row-layout contract only. Visible-row page coverage is explicitly not
+part of that identity. A contract-compatible progressive snapshot remains admitted even when the
+new row block is still pending, panel capture records the truthful covered-row intersection, and
+display reconstruction may read the compatible committed row profile without claiming stale GPU
+pixels. Genomic movement or row-layout lineage change still revokes authority. Focused tests prove
+both sides: a vertical camera change with missing row pages retains exact row authority, while a
+genomic interval or layout-contract change is rejected.
+
+Implementation and desktop-integration evidence now exists for both renderer camera-capture
+paths, typed all-operation engine pressure, `PresentedAlignmentEpoch`, atomic read-plus-summary
+capture, camera-exact scrollbar publication, exact GPU/source/budget retry, and the optional
+vertical-residency distinction. Recovery subsequently added the owned navigation journal,
+constant-size event-driven ledger control, exact contextual-product states, prepared-page spatial
+indexes, incremental row-first prefetch, precharged camera envelopes, and online bounded GPU
+reclaim indexes. On 31 August 2026 the independent affected suites passed: engine 120/120,
+alignment scene 153/153, renderer 78/78 plus its integration test, and desktop 435 passed with one
+intentional ignore; workspace all-target compilation, formatting, and diff validation also passed.
+These results complete automated recovery R0–R5. The user subsequently accepted the native R6
+checkpoint on 31 August 2026 after assessing the corrected RNA/GRCh38/GENCODE build.
+
+### Current execution frontier
+
+1. Qualify the integrated coverage/generic-substitution GPU slice under partial evidence, pressure,
+   collapsed-Reads, multi-track failure, selection, and manual visual tests; then connect the same
+   exact, same-epoch model to persistent bisulfite, junction/Sashimi, and modification GPU pages,
+   including selection and picking.
+2. Finish whole-candidate GPU admission for genuine content changes: read and derived renderers
+   must privately plan and stage every missing page, page-table replacement, precharged camera
+   ring, and frame allocation under one shared replacement bundle. Opaque renderer-owned
+   retirement tokens must prove the exact old allocations credited to steady-state fit; remove
+   the transitional multi-phase retry loops. Camera-only movement inside the bounded interaction
+   envelope must never enter this transaction.
+3. Complete Phase 7C by moving every remaining product consumer to scene handles and one panel
+   scene epoch: export, automation, MCP, keyboard/mate navigation, properties, and diagnostics.
+4. Pass the Phase 7 atomic gate before deleting legacy authorities under Phase 8.
+5. Continue with contextual-lane migration and remote/CRAM qualification only after those gates.
 
 ## Decision
 
@@ -462,11 +646,23 @@ redraws. It does not advance evidence/layout revisions. Directional extension be
 prepared edge and retargets at chunk boundaries. If the user outruns acquisition, only the
 truthfully uncovered edge reports loading.
 
+The desktop keeps the desired navigation target separate from the committed presentation target.
+Inside the committed content authority's bounded interaction envelope, a camera move captures the
+precharged read and summary camera rings and commits one `PresentedAlignmentEpoch`; it does not
+open a GPU replacement bundle. Outside that envelope, source/content preparation is cancellable
+candidate work while the last coherent epoch remains the publication authority.
+
 ### Vertical scroll
 
 Vertical scroll changes the row-camera uniform and visible row-block set. Foreground blocks and a
 measured bounded look-ahead are pinned. It never changes the layout key, repacks rows, crops a
 cached `DisplayList`, or blanks the whole read pane while admitting a page.
+
+The row-activity profile and scrollbar projection are camera-exact members of the same publication
+attempt as the pixels. A pending desired target cannot synthesize an exact zero-row result. If its
+row blocks are resident, vertical movement uses the precharged camera rings; otherwise
+`PumpPresentation` remains retryable after real ledger progress until the requested blocks become
+publishable or are proven intrinsically infeasible.
 
 ### Zoom and LOD
 
@@ -755,6 +951,10 @@ Gate:
    selection overlays.
 3. Establish CPU/GPU geometry and picking equivalence.
 4. Test device loss and software presentation from the same scene.
+5. Precharge exactly two bounded camera-frame slots for each read and summary renderer as part of
+   content admission. Capture camera/scroll/overlay changes from an immutable content authority
+   without retained allocation, page-table replacement, unchanged-geometry upload, or a
+   replacement bundle; retain explicit transient accounting.
 
 Gate:
 
@@ -763,6 +963,8 @@ Gate:
 - interaction never rekeys immutable base pages;
 - active leases survive cache pressure;
 - prepared constant-scale movement uploads no unchanged geometry; and
+- repeated read-plus-summary camera capture keeps both rings bounded at two slots, performs no
+  retained allocation, and publishes neither renderer when either authority check fails; and
 - GPU and CPU paths agree for the exhaustive scene fixture set.
 
 ### Phase 6 — camera navigation in the headless/native harness
@@ -771,6 +973,11 @@ Gate:
 2. Add predictive horizontal, vertical, and adjacent-LOD preparation within the user budget.
 3. Add cancellation, retargeting, and resource-pressure traces.
 4. Qualify ACTB and BAP1 before broader workloads.
+5. Keep desired acquisition targets separate from the committed presentation target, and define
+   the measured horizontal/vertical/LOD interaction envelope in which camera-only capture is
+   truthful.
+6. Treat owner-local allocation pressure as a typed scheduling edge for every engine operation.
+   Retry only after ledger progress and preserve operation-aware `PumpPresentation` liveness.
 
 Gate:
 
@@ -779,6 +986,10 @@ Gate:
 - vertical scroll has zero row assignment and horizontal-geometry rebuild;
 - zoom returns to resident compatible scenes without source I/O;
 - no held interaction exposes a full white lane or release replacement flash;
+- camera-only interaction cannot open or collide with a replacement bundle, allocate retained GPU
+  state, partially publish read/summary frames, or turn retryable pressure into source failure;
+- pending row authority cannot produce a full-height exact thumb, and exact pixels, row activity,
+  scroll extent, density overview, thumb, hit testing, and status share one committed epoch;
 - the final target equals a clean independent load; and
 - measured results establish realistic performance thresholds rather than relying on arbitrary
   numbers chosen in advance.
@@ -787,6 +998,9 @@ Gate:
 
 1. Publish one immutable alignment scene set/epoch per panel, containing every visible alignment
    track and explicit coherence groups.
+   The desktop presentation commit is one `PresentedAlignmentEpoch` containing the camera-exact
+   panel frames and matching read-plus-summary GPU bundle; independently assignable staging fields
+   are not product authorities.
 2. Move all alignment product consumers to scene handles: coverage/junction/modification/read
    picking, selection, inspector, navigation, keyboard traversal, sashimi, export, automation,
    MCP, properties, and diagnostics.
@@ -795,12 +1009,48 @@ Gate:
    for deletion in the next phase.
 4. Do not add a normal application backend preference or per-frame fallback.
 
+Delivery milestones used for progress tracking do not weaken the atomic gate:
+
+- **7A — read lane:** publish local-BAM scene frames and use scene read pages, stable-handle
+  hover/picking/selection, and inspection. Substantially implemented; final Phase 6/manual
+  qualification remains open.
+- **7B — derived lanes:** render coverage, alleles, junctions/Sashimi, modifications, and required
+  reference interpretation from the same snapshot and epoch. Typed lane capture and atomic
+  headless projection exist, including shared Raw/CPM Sashimi scales. Exact coverage and generic
+  reference-aware substitutions now have persistent scene-native GPU pixels in the desktop, with
+  partial-authority/pressure/failure-isolation qualification in progress. Bisulfite interpretation,
+  junction/Sashimi and modification GPU pixels, and derived-lane interaction remain open; no
+  missing family is silently supplied by a legacy semantic fallback.
+- **7C — remaining consumers:** migrate keyboard and mate navigation, export, automation, MCP,
+  properties, diagnostics, multi-track, and multi-panel coherence. Remains open.
+
+These milestones describe delivery order only. Until 7A–7C all pass together, Phase 7 remains
+partial and Phase 8 cannot delete the corresponding oracle or legacy code.
+
+#### Phase 7B semantic wiring checklist
+
+| Product behaviour | Semantic authority | Native pixels | Remaining acceptance work |
+| --- | --- | --- | --- |
+| Exact coverage depth | Same-epoch depth summary pages and CPU oracle implemented | Persistent GPU pages integrated | Partial-edge, collapsed-Reads, multi-track isolation, and transition-pressure control paths have focused tests; framebuffer, cross-renderer pressure, and manual visual qualification remain |
+| Generic base substitutions | Reference-revision-keyed allele pages and reference-aware CPU oracle implemented | Persistent GPU allele pages integrated on the coverage scale | Manual zoom/threshold/quality-weight/selection checks and exhaustive CPU/GPU equivalence |
+| Bisulfite protected/converted calls | Strand/context-aware CPU oracle implemented with exact ±2 reference context | Deliberately unavailable in the GPU presenter | Add a semantically exact native presenter; never reinterpret these calls as generic substitutions |
+| Coverage selection marker | Typed same-epoch selected-position overlay implemented | Native overlay integrated | CPU/GPU geometry parity is tested; manual interaction qualification remains |
+| Junctions and Sashimi | Exact junction pages, CPU projection, Raw/CPM normalization, and atomic shared-scale groups implemented | Not yet integrated | Define non-duplicating cross-tile GPU ownership, render persistent arcs, then add picking/labels and manual qualification |
+| Modification frequency | Exact modification pages and typed CPU projection implemented | Not yet integrated | Add persistent native pages/pixels, selection, picking, labels, and manual qualification |
+| Derived-lane inspection/export/automation | Stable semantic components exist in the scene model | Not applicable | Route each consumer through the captured panel epoch and stable handles under 7C |
+
+“Integrated” in this table means the production desktop invokes the new path. It does not mean the
+behaviour is qualified or manually accepted; those claims require the remaining gates in the last
+column.
+
 Gate:
 
 - no product consumer reads `current_query`, `layout_query`, `resident_query`, `cached_layout`, or
   query-local selection indices;
 - primary/secondary tracks and multi-panel state use one path;
 - every alignment-derived lane reports the same panel scene epoch;
+- desired/pending state cannot replace or mutate committed pixels, scrollbar authority, picking,
+  selection, or status, and a read/summary capture commits atomically or not at all;
 - user manually verifies static interaction before live navigation is connected; and
 - unsupported modes block cutover rather than silently falling back.
 
@@ -814,6 +1064,12 @@ Gate:
    caches.
 6. Remove the temporary scene-to-legacy pixel adapter.
 7. Keep generic `DisplayList`/`RectangleRenderer` only for non-migrated, non-overlapping lanes.
+
+Current implementation note: for a supported local BAM, the scene renderer owns read pixels at
+runtime and the old alignment event loop cannot run as a fallback. This is runtime pixel authority,
+not renderer-code exclusivity or Phase 8 completion. Query-era projection fields, display-list
+construction, query-local interaction, `CompleteHorizon`, retained navigation textures, and the
+legacy engine remain present until their Phase 7 replacements pass.
 
 Gate:
 
@@ -831,6 +1087,10 @@ Gate:
 3. Keep cross-track coherence groups explicit where scales/comparisons are shared.
 4. Remove the whole-panel navigation texture after its last consumer migrates.
 
+Current implementation note: this phase has not started. Alignment read regions can already be
+excluded from the retained preview, but genes, reference, annotation, and other contextual regions
+still require the existing presentation path.
+
 Gate:
 
 - a slow or unprepared lane cannot cover a ready lane;
@@ -846,6 +1106,10 @@ Gate:
    tests.
 3. Reconcile allocation-ledger totals with process/GPU measurements and document unavoidable
    overhead.
+
+Current implementation note: this phase has not started for the unified scene production path.
+Source-position and remote-HTS foundations exist, but local CRAM and all remote alignment sources
+currently fail explicitly with no legacy fallback rather than claiming qualification.
 
 Gate:
 
@@ -905,6 +1169,11 @@ their own migration; deleting them globally is outside the alignment cutover.
 - selection preservation across pan, zoom, page eviction, and extension;
 - mate/supplementary navigation and promoted row;
 - primary/secondary and multi-panel equivalence; and
+- a high-row committed epoch plus a newer pending target retains a provisional noninteractive
+  thumb rather than publishing `maximum = 0`; the exact newer epoch swaps pixels, row activity,
+  extent, density, thumb, status, and hit authority together;
+- a failed or deferred camera candidate preserves the preceding `PresentedAlignmentEpoch`, and a
+  partial read/summary capture cannot become visible; and
 - stale frame/scene mismatch refuses interaction rather than selecting the wrong read.
 
 ### Resource tests
@@ -914,6 +1183,12 @@ their own migration; deleting them globally is outside the alignment cutover.
 - no uncharged Arc after cache-key eviction;
 - reservation failure leaves current untouched;
 - pressure follows declared eviction order;
+- camera-only read and summary captures reuse their precharged two-slot rings, report zero retained
+  allocation and unchanged-geometry upload, and charge/release all transient scratch;
+- active replacement occupancy yields typed nonterminal pressure for every owner-local operation;
+  stale token/target retries cannot publish and retries do not repeat without ledger progress;
+- speculative `PumpPresentation` resumes after progress while optional source read-ahead/prewarm
+  may yield, proving deep vertical-scroll liveness without a retry loop;
 - budget decrease reports pinned overage;
 - device-loss GPU resources release/rebuild without semantic loss; and
 - bounded loops/cancellation storms reach steady state.
@@ -931,6 +1206,18 @@ their own migration; deleting them globally is outside the alignment cutover.
 
 Automated tests establish semantics, accounting, and frame behaviour. The user performs visual
 acceptance when prompted.
+
+The immediate native visual checkpoint is deliberately specific and remains open:
+
+- at ACTB, repeatedly zoom in/out/return, hold-pan in both directions, reverse direction, and drag
+  rapidly through the deep vertical stack; there must be no active-replacement error overlay,
+  terminal Complete-read failure, stuck `Updating view...`, full-lane white replacement, stale or
+  full-height thumb, missing resident reads, or lost hover/selection;
+- at BAP1, pan and release, zoom through the individual-read boundary, then navigate to and from
+  ACTB; there must be no release flash, retained old-locus reads, inherited ACTB scroll extent, or
+  missing density overview; and
+- only the user records this visual gate as accepted. Automated UI driving or a successful build
+  cannot substitute for that decision.
 
 ## Measurement-led acceptance
 

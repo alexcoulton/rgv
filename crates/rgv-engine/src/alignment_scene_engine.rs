@@ -9,8 +9,8 @@ use std::{
 };
 
 use rgv_alignment_scene::{
-    AlignmentCamera, AlignmentSourceRevision, AllocationLedger, ContractFingerprint, EvidenceStore,
-    LedgerError, PresentationContract, SceneRevision,
+    AlignmentSceneCamera, AlignmentSourceRevision, AllocationLedger, ContractFingerprint,
+    EvidenceStore, LedgerError, PresentationContract, SceneRevision,
 };
 use rgv_core::ReferenceDictionary;
 use rgv_hts::{
@@ -18,6 +18,7 @@ use rgv_hts::{
     QueryOptions,
 };
 
+use crate::alignment_scene_coordinator::coordinator_budget_pressure;
 use crate::{
     AlignmentCoordinatorFrame, AlignmentCoordinatorPressure, AlignmentCoordinatorUpdate,
     AlignmentReferenceAuthority, AlignmentSceneBuildContract, AlignmentSceneCoordinatorConfigError,
@@ -64,6 +65,28 @@ pub enum AlignmentSceneEngineOperation {
     ReduceBudget,
     PumpSource,
     PumpPresentation,
+    RetryResourcePressure,
+}
+
+/// Whether the failed allocation can become admissible without changing the scene contract.
+/// Retryable pressure is a nonterminal scheduling edge; an infeasible request is still reported
+/// through the typed event so callers can explain the exact budget mismatch rather than treating
+/// the source backend as unavailable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlignmentSceneResourcePressureDisposition {
+    Retryable,
+    Infeasible,
+}
+
+impl AlignmentSceneResourcePressureDisposition {
+    #[must_use]
+    pub const fn for_pressure(pressure: LedgerError) -> Self {
+        if pressure.intrinsically_exceeds_limit() {
+            Self::Infeasible
+        } else {
+            Self::Retryable
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +120,7 @@ pub enum AlignmentSceneFrameCause {
     ReferenceAuthority,
     PreparationPolicy,
     SourceControlRetry,
+    ResourcePressureRetry,
     SourcePublication,
     VerticalResidency,
 }
@@ -122,6 +146,8 @@ pub enum AlignmentSceneEngineEvent {
         update: Option<AlignmentCoordinatorUpdate>,
         published_scene: Option<SceneRevision>,
         frame: AlignmentCoordinatorFrame,
+        /// Exact bounded liveness ownership after producing this frame.
+        work: crate::AlignmentSceneOwnerWorkState,
         telemetry: AlignmentSceneCoordinatorTelemetry,
     },
     /// The current exact foreground target was counted completely, but individual-read evidence
@@ -144,6 +170,35 @@ pub enum AlignmentSceneEngineEvent {
     BudgetReduced {
         pressure: AlignmentCoordinatorPressure,
     },
+    /// A source-local budget reduction was temporarily blocked by the workspace-shared ledger's
+    /// prepared GPU replacement. No budget was reported as applied and no lane/source is failed.
+    /// The requested value plus the observed policy identity let the desktop discard stale edits
+    /// and retry the latest value only after the obstruction or shared policy changes.
+    BudgetPressure {
+        /// Final configured base budget. For a clear transaction this remains the restore value,
+        /// so stale-event matching does not confuse its temporary zero pass with a settings edit.
+        requested_budget: usize,
+        /// Whether retry must still execute the ordered `0 -> requested_budget` cache-clear pass.
+        clear_before_apply: bool,
+        current_policy_revision: u64,
+        current_budget: usize,
+        pressure: LedgerError,
+    },
+    /// An owner-local source or scene-root allocation could not proceed under the shared ledger.
+    /// This is never a source-availability error. For `Retryable`, the failed intent is paused and
+    /// resumes only through `try_retry_resource_pressure`, after the caller observes capacity
+    /// progress. The request token and target make stale retry notifications rejectable.
+    ResourcePressure {
+        owner: SourceOwnerId,
+        request_token: AlignmentSceneRequestToken,
+        target: rgv_core::GenomicInterval,
+        /// Coordinator boundary which encountered the pressure. Source intent alone cannot
+        /// distinguish camera/contract/reference/presentation retries.
+        operation: AlignmentSceneEngineOperation,
+        intent: SourceIntentKind,
+        pressure: LedgerError,
+        disposition: AlignmentSceneResourcePressureDisposition,
+    },
     Error {
         owner: Option<SourceOwnerId>,
         request_token: Option<AlignmentSceneRequestToken>,
@@ -165,7 +220,7 @@ enum AlignmentSceneEngineRequest<C> {
     UpdateCamera {
         owner: SourceOwnerId,
         request_token: AlignmentSceneRequestToken,
-        camera: AlignmentCamera,
+        camera: AlignmentSceneCamera,
     },
     ReplaceContract {
         owner: SourceOwnerId,
@@ -188,6 +243,14 @@ enum AlignmentSceneEngineRequest<C> {
     SetSourceControl(C),
     ReduceBudget {
         budget: usize,
+    },
+    ClearCacheBudget {
+        restore_budget: usize,
+    },
+    RetryResourcePressure {
+        owner: SourceOwnerId,
+        request_token: AlignmentSceneRequestToken,
+        target: rgv_core::GenomicInterval,
     },
 }
 
@@ -265,7 +328,7 @@ where
     pub fn try_update_camera(
         &self,
         owner: SourceOwnerId,
-        camera: AlignmentCamera,
+        camera: impl Into<AlignmentSceneCamera>,
     ) -> Result<(), EngineQueueError> {
         self.try_update_camera_for_request(owner, AlignmentSceneRequestToken::default(), camera)
     }
@@ -276,8 +339,9 @@ where
         &self,
         owner: SourceOwnerId,
         request_token: AlignmentSceneRequestToken,
-        camera: AlignmentCamera,
+        camera: impl Into<AlignmentSceneCamera>,
     ) -> Result<(), EngineQueueError> {
+        let camera = camera.into();
         let Some(input) = &self.input else {
             return Err(EngineQueueError::Disconnected);
         };
@@ -374,6 +438,64 @@ where
 
     pub fn try_reduce_budget(&self, budget: usize) -> Result<(), EngineQueueError> {
         self.try_control(AlignmentSceneEngineRequest::ReduceBudget { budget })
+    }
+
+    /// Runs the cache-clear budget pulse as one ordered worker transaction. It must not be
+    /// represented as two latest-wins edits: coalescing `0 -> configured` would silently omit the
+    /// eviction pass which the user explicitly requested.
+    pub fn try_clear_cache_budget(&self, restore_budget: usize) -> Result<(), EngineQueueError> {
+        self.try_control(AlignmentSceneEngineRequest::ClearCacheBudget { restore_budget })
+    }
+
+    /// Retries a previously refused policy edit through a source-wide latest-wins slot. Ordinary
+    /// budget controls remain ordered so the Clear Cache `0 -> configured budget` transaction is
+    /// never collapsed; only retries are replaceable, and therefore cannot fill the control FIFO.
+    pub fn try_retry_budget_pressure(
+        &self,
+        budget: usize,
+        clear_before_apply: bool,
+    ) -> Result<(), EngineQueueError> {
+        let Some(input) = &self.input else {
+            return Err(EngineQueueError::Disconnected);
+        };
+        let request = if clear_before_apply {
+            AlignmentSceneEngineRequest::ClearCacheBudget {
+                restore_budget: budget,
+            }
+        } else {
+            AlignmentSceneEngineRequest::ReduceBudget { budget }
+        };
+        input
+            .send_latest_system(0, request)
+            .map_err(|_| EngineQueueError::Disconnected)
+    }
+
+    /// Resumes a pressure-paused source intent without reconstructing or advancing its camera.
+    /// The replaceable mailbox and worker-side token/target checks make a retry for a superseded
+    /// desktop transaction a harmless no-op.
+    pub fn try_retry_resource_pressure(
+        &self,
+        owner: SourceOwnerId,
+        request_token: AlignmentSceneRequestToken,
+        target: rgv_core::GenomicInterval,
+    ) -> Result<(), EngineQueueError> {
+        let Some(input) = &self.input else {
+            return Err(EngineQueueError::Disconnected);
+        };
+        // A retry must never replace an unread newer camera and must not strand behind a full
+        // control FIFO. Its dedicated owner/system slot is bounded, latest-wins, and token-checked
+        // by the worker after dequeue.
+        input
+            .send_latest_system_for(
+                1,
+                owner.get(),
+                AlignmentSceneEngineRequest::RetryResourcePressure {
+                    owner,
+                    request_token,
+                    target,
+                },
+            )
+            .map_err(|_| EngineQueueError::Disconnected)
     }
 
     pub fn try_receive(&self) -> Result<Option<AlignmentSceneEngineEvent>, EngineQueueError> {
@@ -582,6 +704,9 @@ fn scene_worker_loop<B>(
                         let Ok(telemetry) = coordinator.telemetry(publication.owner) else {
                             continue;
                         };
+                        let Ok(work) = coordinator.owner_work_state(publication.owner) else {
+                            continue;
+                        };
                         if output
                             .send_latest_for(
                                 publication.owner.get(),
@@ -595,6 +720,7 @@ fn scene_worker_loop<B>(
                                     update: None,
                                     published_scene: Some(publication.revision),
                                     frame,
+                                    work,
                                     telemetry,
                                 },
                             )
@@ -632,27 +758,15 @@ fn scene_worker_loop<B>(
                         }
                     }
                     for pressure in pump.pressures {
-                        if pressure.intent == SourceIntentKind::Speculative {
-                            // Optional scene-root read-ahead stops at resource pressure. The
-                            // current immutable frame remains the owner's visible authority.
-                            continue;
-                        }
-                        let message: Arc<str> = Arc::from(format!(
-                            "alignment memory budget could not admit the requested scene roots: {}",
-                            pressure.pressure
-                        ));
-                        if output
-                            .send_control(AlignmentSceneEngineEvent::Error {
-                                owner: Some(pressure.owner),
-                                request_token: Some(current_request_token(
-                                    &request_tokens,
-                                    pressure.owner,
-                                )),
-                                operation: AlignmentSceneEngineOperation::PumpSource,
-                                message,
-                            })
-                            .is_err()
-                        {
+                        if !send_resource_pressure(
+                            output,
+                            pressure.owner,
+                            current_request_token(&request_tokens, pressure.owner),
+                            pressure.target,
+                            AlignmentSceneEngineOperation::PumpSource,
+                            pressure.intent,
+                            pressure.pressure,
+                        ) {
                             return;
                         }
                     }
@@ -666,7 +780,52 @@ fn scene_worker_loop<B>(
         } else if coordinator.has_pending_presentation_work() {
             match coordinator.pump_presentation_once() {
                 Ok(Some(pump)) => {
-                    if !send_frame(
+                    if let Some(pressure) = pump.pressure {
+                        let target = coordinator
+                            .frame(pump.owner)
+                            .ok()
+                            .flatten()
+                            .map(|frame| frame.camera.interval());
+                        let Some(target) = target else {
+                            if !send_error(
+                                output,
+                                Some(pump.owner),
+                                Some(current_request_token(&request_tokens, pump.owner)),
+                                AlignmentSceneEngineOperation::PumpPresentation,
+                                AlignmentSceneCoordinatorConfigError::UnknownOwner(pump.owner),
+                            ) {
+                                return;
+                            }
+                            continue;
+                        };
+                        if pressure.intrinsically_exceeds_limit() {
+                            // Full-height residency is optional. The coordinator has already
+                            // latched this lane as BudgetLimited while preserving its current
+                            // visible-complete snapshot, so publish that truthful state instead of
+                            // turning an oversized background row block into a read-data failure.
+                            if !send_frame(
+                                &coordinator,
+                                output,
+                                pump.owner,
+                                current_request_token(&request_tokens, pump.owner),
+                                AlignmentSceneFrameCause::VerticalResidency,
+                                None,
+                                None,
+                            ) {
+                                return;
+                            }
+                        } else if !send_resource_pressure(
+                            output,
+                            pump.owner,
+                            current_request_token(&request_tokens, pump.owner),
+                            target,
+                            AlignmentSceneEngineOperation::PumpPresentation,
+                            SourceIntentKind::Speculative,
+                            pressure,
+                        ) {
+                            return;
+                        }
+                    } else if !send_frame(
                         &coordinator,
                         output,
                         pump.owner,
@@ -721,22 +880,15 @@ where
         if !coordinator.actor_mut().cancel_failed_work_if_current(&work) {
             return true;
         }
-        if work.kind() == SourceIntentKind::Speculative {
-            // Optional read-ahead stops at resource pressure. The last immutable visible scene
-            // remains authoritative, and a later camera intent may request the region normally.
-            return true;
-        }
-        let message: Arc<str> = Arc::from(format!(
-            "alignment memory budget could not admit the requested reads: {pressure}"
-        ));
-        return output
-            .send_control(AlignmentSceneEngineEvent::Error {
-                owner: Some(work.intent().owner()),
-                request_token: Some(current_request_token(request_tokens, work.intent().owner())),
-                operation: AlignmentSceneEngineOperation::PumpSource,
-                message,
-            })
-            .is_ok();
+        return send_resource_pressure(
+            output,
+            work.intent().owner(),
+            current_request_token(request_tokens, work.intent().owner()),
+            work.intent().spec().target(),
+            AlignmentSceneEngineOperation::PumpSource,
+            work.kind(),
+            pressure,
+        );
     }
 
     // Failures without a ledger-pressure cause can indicate a corrupt or unavailable shared
@@ -752,13 +904,38 @@ where
         .is_ok()
 }
 
+fn send_resource_pressure(
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+    owner: SourceOwnerId,
+    request_token: AlignmentSceneRequestToken,
+    target: rgv_core::GenomicInterval,
+    operation: AlignmentSceneEngineOperation,
+    intent: SourceIntentKind,
+    pressure: LedgerError,
+) -> bool {
+    send_control(
+        output,
+        AlignmentSceneEngineEvent::ResourcePressure {
+            owner,
+            request_token,
+            target,
+            operation,
+            intent,
+            pressure,
+            disposition: AlignmentSceneResourcePressureDisposition::for_pressure(pressure),
+        },
+    )
+}
+
 fn allocation_pressure(error: &(dyn Error + 'static)) -> Option<LedgerError> {
     let mut current = Some(error);
     while let Some(candidate) = current {
         if let Some(pressure) = candidate.downcast_ref::<LedgerError>()
             && matches!(
                 pressure,
-                LedgerError::BudgetExceeded { .. } | LedgerError::TransientBudgetExceeded { .. }
+                LedgerError::BudgetExceeded { .. }
+                    | LedgerError::TransientBudgetExceeded { .. }
+                    | LedgerError::ReplacementTransitionActive { .. }
             )
         {
             return Some(*pressure);
@@ -779,8 +956,130 @@ where
         crate::AlignmentSceneCoordinatorError::Source(source) => source
             .backend_error()
             .and_then(B::allocation_pressure)
+            .or_else(|| coordinator_budget_pressure(error))
             .or_else(|| allocation_pressure(error)),
-        _ => allocation_pressure(error),
+        _ => coordinator_budget_pressure(error).or_else(|| allocation_pressure(error)),
+    }
+}
+
+fn owner_pressure_target<B>(
+    coordinator: &AlignmentSceneSourceCoordinator<B>,
+    owner: SourceOwnerId,
+) -> Option<rgv_core::GenomicInterval>
+where
+    B: CanonicalAlignmentSourceBackend,
+{
+    coordinator
+        .frame(owner)
+        .ok()
+        .flatten()
+        .map(|frame| frame.camera.interval())
+}
+
+/// Converts owner-local shared-ledger contention into a typed scheduling edge. Configuration,
+/// identity, and backend failures remain ordinary terminal errors for the exact operation.
+fn send_owner_operation_error<B>(
+    coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+    owner: SourceOwnerId,
+    request_token: AlignmentSceneRequestToken,
+    operation: AlignmentSceneEngineOperation,
+    intent: SourceIntentKind,
+    error: crate::AlignmentSceneCoordinatorError<B::Error>,
+) -> bool
+where
+    B: CanonicalAlignmentSourceBackend,
+    B::Error: Error + 'static,
+{
+    if let (Some(pressure), Some(target)) = (
+        source_allocation_pressure::<B>(&error),
+        owner_pressure_target(coordinator, owner),
+    ) {
+        // The desired lane state is already durable. Stop any older source authority from being
+        // pumped under that newer token while capacity is unavailable; the explicit retry will
+        // reconcile and resume only the still-current desired target.
+        match intent {
+            SourceIntentKind::Foreground => {
+                coordinator.actor_mut().cancel_foreground_for(owner);
+                coordinator.actor_mut().cancel_speculation_for(owner);
+            }
+            SourceIntentKind::Speculative => {
+                coordinator.actor_mut().cancel_speculation_for(owner);
+            }
+        }
+        return send_resource_pressure(
+            output,
+            owner,
+            request_token,
+            target,
+            operation,
+            intent,
+            pressure,
+        );
+    }
+    send_error(output, Some(owner), Some(request_token), operation, error)
+}
+
+/// Budget policy edits have one ordinary transient failure mode: `set_budget` cannot change the
+/// policy while a prepared replacement is between commit and retirement settlement. Keep that
+/// collision typed and nonterminal. Every other coordinator/ledger failure remains an ordinary
+/// error; in particular, this must not turn bookkeeping corruption into a retry loop.
+fn budget_reduction_pressure<E>(
+    error: &crate::AlignmentSceneCoordinatorError<E>,
+) -> Option<LedgerError> {
+    match coordinator_budget_pressure(error) {
+        Some(pressure @ LedgerError::ReplacementTransitionActive { .. }) => Some(pressure),
+        Some(
+            LedgerError::BudgetExceeded { .. }
+            | LedgerError::TransientBudgetExceeded { .. }
+            | LedgerError::ReservationExceeded { .. }
+            | LedgerError::UnknownAllocation(_)
+            | LedgerError::IdOverflow
+            | LedgerError::Poisoned,
+        )
+        | None => None,
+    }
+}
+
+fn send_budget_reduction_pressure_or_error<B>(
+    coordinator: &AlignmentSceneSourceCoordinator<B>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+    requested_budget: usize,
+    clear_before_apply: bool,
+    error: crate::AlignmentSceneCoordinatorError<B::Error>,
+) -> bool
+where
+    B: CanonicalAlignmentSourceBackend,
+    B::Error: Error + 'static,
+{
+    if let Some(pressure) = budget_reduction_pressure(&error) {
+        match coordinator.actor().store().ledger().progress() {
+            Ok(progress) => send_control(
+                output,
+                AlignmentSceneEngineEvent::BudgetPressure {
+                    requested_budget,
+                    clear_before_apply,
+                    current_policy_revision: progress.policy_revision,
+                    current_budget: progress.budget,
+                    pressure,
+                },
+            ),
+            Err(progress_error) => send_error(
+                output,
+                None,
+                None,
+                AlignmentSceneEngineOperation::ReduceBudget,
+                progress_error,
+            ),
+        }
+    } else {
+        send_error(
+            output,
+            None,
+            None,
+            AlignmentSceneEngineOperation::ReduceBudget,
+            error,
+        )
     }
 }
 
@@ -837,11 +1136,13 @@ where
                     Some(update),
                     update.published_scene,
                 ),
-                Err(error) => send_error(
+                Err(error) => send_owner_operation_error(
+                    coordinator,
                     output,
-                    Some(owner),
-                    Some(request_token),
+                    owner,
+                    request_token,
                     AlignmentSceneEngineOperation::UpdateCamera,
+                    SourceIntentKind::Foreground,
                     error,
                 ),
             }
@@ -862,11 +1163,13 @@ where
                     Some(update),
                     update.published_scene,
                 ),
-                Err(error) => send_error(
+                Err(error) => send_owner_operation_error(
+                    coordinator,
                     output,
-                    Some(owner),
-                    Some(request_token),
+                    owner,
+                    request_token,
                     AlignmentSceneEngineOperation::ReplaceContract,
+                    SourceIntentKind::Foreground,
                     error,
                 ),
             }
@@ -884,11 +1187,13 @@ where
                     outcome.published_scene,
                 ),
                 Ok(_) => true,
-                Err(error) => send_error(
+                Err(error) => send_owner_operation_error(
+                    coordinator,
                     output,
-                    Some(owner),
-                    Some(request_token),
+                    owner,
+                    request_token,
                     AlignmentSceneEngineOperation::InstallReferenceAuthority,
+                    SourceIntentKind::Foreground,
                     error,
                 ),
             }
@@ -910,11 +1215,13 @@ where
                     update.published_scene,
                 ),
                 Ok(None) => true,
-                Err(error) => send_error(
+                Err(error) => send_owner_operation_error(
+                    coordinator,
                     output,
-                    Some(owner),
-                    Some(request_token),
+                    owner,
+                    request_token,
                     AlignmentSceneEngineOperation::SetPreparationPolicy,
+                    SourceIntentKind::Foreground,
                     error,
                 ),
             }
@@ -927,11 +1234,13 @@ where
                 output,
                 AlignmentSceneEngineEvent::PresentationPrewarmed { owner, prepared },
             ),
-            Err(error) => send_error(
+            Err(error) => send_owner_operation_error(
+                coordinator,
                 output,
-                Some(owner),
-                Some(current_request_token(request_tokens, owner)),
+                owner,
+                current_request_token(request_tokens, owner),
                 AlignmentSceneEngineOperation::PrewarmPresentation,
+                SourceIntentKind::Speculative,
                 error,
             ),
         },
@@ -981,13 +1290,81 @@ where
                     output,
                     AlignmentSceneEngineEvent::BudgetReduced { pressure },
                 ),
-                Err(error) => send_error(
+                Err(error) => send_budget_reduction_pressure_or_error(
+                    coordinator,
                     output,
-                    None,
-                    None,
-                    AlignmentSceneEngineOperation::ReduceBudget,
+                    budget,
+                    false,
                     error,
                 ),
+            }
+        }
+        AlignmentSceneEngineRequest::ClearCacheBudget { restore_budget } => {
+            match coordinator.reduce_budget(0) {
+                Ok(_) => match coordinator.reduce_budget(restore_budget) {
+                    Ok(pressure) => send_control(
+                        output,
+                        AlignmentSceneEngineEvent::BudgetReduced { pressure },
+                    ),
+                    Err(error) => send_budget_reduction_pressure_or_error(
+                        coordinator,
+                        output,
+                        restore_budget,
+                        false,
+                        error,
+                    ),
+                },
+                Err(error) => send_budget_reduction_pressure_or_error(
+                    coordinator,
+                    output,
+                    restore_budget,
+                    true,
+                    error,
+                ),
+            }
+        }
+        AlignmentSceneEngineRequest::RetryResourcePressure {
+            owner,
+            request_token,
+            target,
+        } => {
+            // The UI can consume a pressure event after a newer camera has already entered the
+            // mailbox. Never let that stale relief signal reconstruct or publish old work.
+            if request_tokens.get(&owner).copied() != Some(request_token) {
+                return true;
+            }
+            match coordinator.retry_resource_pressure(owner, target) {
+                Ok(Some(update)) => send_frame(
+                    coordinator,
+                    output,
+                    owner,
+                    request_token,
+                    AlignmentSceneFrameCause::ResourcePressureRetry,
+                    Some(update),
+                    update.published_scene,
+                ),
+                Ok(None) => true,
+                Err(error) => {
+                    if let Some(pressure) = source_allocation_pressure::<B>(&error) {
+                        send_resource_pressure(
+                            output,
+                            owner,
+                            request_token,
+                            target,
+                            AlignmentSceneEngineOperation::RetryResourcePressure,
+                            SourceIntentKind::Foreground,
+                            pressure,
+                        )
+                    } else {
+                        send_error(
+                            output,
+                            Some(owner),
+                            Some(request_token),
+                            AlignmentSceneEngineOperation::RetryResourcePressure,
+                            error,
+                        )
+                    }
+                }
             }
         }
     }
@@ -1023,6 +1400,15 @@ where
             AlignmentSceneCoordinatorConfigError::UnknownOwner(owner),
         );
     };
+    let Ok(work) = coordinator.owner_work_state(owner) else {
+        return send_error(
+            output,
+            Some(owner),
+            Some(request_token),
+            AlignmentSceneEngineOperation::UpdateCamera,
+            AlignmentSceneCoordinatorConfigError::UnknownOwner(owner),
+        );
+    };
     output
         .send_latest_for(
             owner.get(),
@@ -1033,6 +1419,7 @@ where
                 update,
                 published_scene,
                 frame,
+                work,
                 telemetry,
             },
         )
@@ -1085,9 +1472,11 @@ mod tests {
     };
 
     use rgv_alignment_scene::{
-        AlignmentStyleContract, AlleleSummaryDetail, AllocationLedger, CapabilityRequirement,
-        EvidenceStore, GeometryLod, LayoutContract, PayloadContract, PresentationContract,
-        RevisionFingerprint, SourceFingerprint, SummaryContract,
+        AlignmentCamera, AlignmentStyleContract, AlleleSummaryDetail, AllocationBundleActual,
+        AllocationBundleDemand, AllocationBundleSlot, AllocationBundleSpec, AllocationClass,
+        AllocationLedger, AllocationRetirementClaimSet, AllocationRetirementToken,
+        CapabilityRequirement, EvidenceStore, GeometryLod, LayoutContract, PayloadContract,
+        PresentationContract, RevisionFingerprint, SourceFingerprint, SummaryContract,
     };
     use rgv_core::{
         AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigId, GenomicInterval,
@@ -1121,6 +1510,14 @@ mod tests {
 
     struct LedgerPressureBackend {
         checkpoints: Arc<AtomicUsize>,
+    }
+
+    struct EmptyRetirementToken(AllocationRetirementClaimSet);
+
+    impl AllocationRetirementToken for EmptyRetirementToken {
+        fn retirement_claim_set(&self) -> &AllocationRetirementClaimSet {
+            &self.0
+        }
     }
 
     impl CanonicalAlignmentSourceBackend for LedgerPressureBackend {
@@ -1216,25 +1613,44 @@ mod tests {
     }
 
     #[test]
-    fn foreground_allocation_pressure_is_owner_scoped_and_concrete() {
+    fn foreground_allocation_pressure_is_typed_owner_scoped_and_nonterminal() {
         let owner = SourceOwnerId::new(301);
         let (engine, checkpoints) = pressure_engine(owner, SourceIntentKind::Foreground);
         let event = receive_matching(&engine, |event| {
-            matches!(event, AlignmentSceneEngineEvent::Error { .. })
+            matches!(event, AlignmentSceneEngineEvent::ResourcePressure { .. })
         });
-        let AlignmentSceneEngineEvent::Error {
+        let AlignmentSceneEngineEvent::ResourcePressure {
             owner: seen,
+            target,
             operation,
-            message,
+            intent,
+            pressure,
+            disposition,
             ..
         } = event
         else {
-            unreachable!("the matching event is an error")
+            unreachable!("the matching event is typed resource pressure")
         };
-        assert_eq!(seen, Some(owner), "unexpected source error: {message}");
+        assert_eq!(seen, owner);
         assert_eq!(operation, AlignmentSceneEngineOperation::PumpSource);
-        assert!(message.contains("alignment memory budget"));
-        assert!(message.contains("requested 64"));
+        assert_eq!(
+            target,
+            GenomicInterval::new(ContigId::new(0), 100, 200).unwrap()
+        );
+        assert_eq!(intent, SourceIntentKind::Foreground);
+        assert_eq!(
+            pressure,
+            LedgerError::BudgetExceeded {
+                requested: 64,
+                charged: 960,
+                reserved: 0,
+                limit: 1_000,
+            }
+        );
+        assert_eq!(
+            disposition,
+            AlignmentSceneResourcePressureDisposition::Retryable
+        );
         assert_eq!(checkpoints.load(Ordering::SeqCst), 1);
         assert!(
             engine
@@ -1246,20 +1662,96 @@ mod tests {
     }
 
     #[test]
-    fn speculative_allocation_pressure_pauses_without_an_unavailable_error() {
+    fn speculative_allocation_pressure_is_typed_and_pauses_without_busy_loop() {
         let owner = SourceOwnerId::new(302);
         let (engine, checkpoints) = pressure_engine(owner, SourceIntentKind::Speculative);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while checkpoints.load(Ordering::SeqCst) == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "source pressure was never reached"
-            );
-            thread::yield_now();
-        }
-        thread::sleep(Duration::from_millis(50));
+        let event = receive_matching(&engine, |event| {
+            matches!(event, AlignmentSceneEngineEvent::ResourcePressure { .. })
+        });
+        let AlignmentSceneEngineEvent::ResourcePressure {
+            owner: seen,
+            operation,
+            intent,
+            disposition,
+            ..
+        } = event
+        else {
+            unreachable!("the matching event is typed resource pressure")
+        };
+        assert_eq!(seen, owner);
+        assert_eq!(operation, AlignmentSceneEngineOperation::PumpSource);
+        assert_eq!(intent, SourceIntentKind::Speculative);
+        assert_eq!(
+            disposition,
+            AlignmentSceneResourcePressureDisposition::Retryable
+        );
         assert_eq!(checkpoints.load(Ordering::SeqCst), 1);
-        assert!(engine.try_receive().unwrap().is_none());
+        assert!(
+            engine
+                .receive_timeout(Duration::from_millis(50))
+                .unwrap()
+                .is_none(),
+            "speculative pressure must pause rather than restart in a busy loop"
+        );
+    }
+
+    #[test]
+    fn pressure_disposition_distinguishes_occupancy_from_intrinsically_oversized_work() {
+        assert_eq!(
+            AlignmentSceneResourcePressureDisposition::for_pressure(
+                LedgerError::ReplacementTransitionActive { bundle_id: 7 }
+            ),
+            AlignmentSceneResourcePressureDisposition::Retryable
+        );
+        assert_eq!(
+            AlignmentSceneResourcePressureDisposition::for_pressure(LedgerError::BudgetExceeded {
+                requested: 100,
+                charged: 950,
+                reserved: 0,
+                limit: 1_000,
+            }),
+            AlignmentSceneResourcePressureDisposition::Retryable
+        );
+        assert_eq!(
+            AlignmentSceneResourcePressureDisposition::for_pressure(LedgerError::BudgetExceeded {
+                requested: 1_001,
+                charged: 0,
+                reserved: 0,
+                limit: 1_000,
+            }),
+            AlignmentSceneResourcePressureDisposition::Infeasible
+        );
+    }
+
+    #[test]
+    fn budget_reduction_only_defers_the_prepared_replacement_collision() {
+        let replacement =
+            crate::AlignmentSceneCoordinatorError::<LocalBamCanonicalBackendError>::Store(
+                rgv_alignment_scene::EvidenceStoreError::Ledger(
+                    LedgerError::ReplacementTransitionActive { bundle_id: 17 },
+                ),
+            );
+        assert_eq!(
+            budget_reduction_pressure(&replacement),
+            Some(LedgerError::ReplacementTransitionActive { bundle_id: 17 })
+        );
+
+        let accounting =
+            crate::AlignmentSceneCoordinatorError::<LocalBamCanonicalBackendError>::Store(
+                rgv_alignment_scene::EvidenceStoreError::Ledger(LedgerError::BudgetExceeded {
+                    requested: 8,
+                    charged: 64,
+                    reserved: 0,
+                    limit: 64,
+                }),
+            );
+        assert_eq!(budget_reduction_pressure(&accounting), None);
+
+        let configuration =
+            crate::AlignmentSceneCoordinatorError::<LocalBamCanonicalBackendError>::Config(
+                AlignmentSceneCoordinatorConfigError::EmptyContig,
+            );
+        assert_eq!(budget_reduction_pressure(&configuration), None);
     }
 
     struct ThreadRecordingBackend {
@@ -1467,6 +1959,614 @@ mod tests {
     }
 
     #[test]
+    fn active_gpu_settlement_pressure_preserves_latest_camera_and_rejects_a_stale_retry() {
+        let (engine, mut contract, policy, camera, _) = test_engine();
+        let owner = SourceOwnerId::new(43);
+        let initial_request = AlignmentSceneRequestToken::new(70);
+        let pressured_request = AlignmentSceneRequestToken::new(71);
+        let latest_request = AlignmentSceneRequestToken::new(72);
+        engine
+            .try_insert_lane(owner, contract.clone(), policy)
+            .unwrap();
+        let _ = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::LaneInserted { owner: seen } if *seen == owner
+            )
+        });
+        engine
+            .try_update_camera_for_request(owner, initial_request, camera)
+            .unwrap();
+        let _ = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    request_token: seen_token,
+                    frame,
+                    ..
+                } if *seen == owner
+                    && *seen_token == initial_request
+                    && frame.visible_complete()
+            )
+        });
+        // Hold the ledger at the narrow prepared-settlement boundary which the user's
+        // zoom-in/zoom-out race reached. The source roots are already resident. First leave a
+        // changed presentation contract durably desired under pressure, then advance the camera:
+        // that second collision is owned by UpdateCamera itself rather than BAM I/O.
+        let ledger = engine.ledger().clone();
+        let snapshot = ledger.snapshot().unwrap();
+        let slot = AllocationBundleSlot::new(0);
+        let claims = ledger.empty_retirement_claim_set();
+        let bundle = ledger
+            .reserve_replacement_bundle(AllocationBundleSpec::new(
+                snapshot.policy_revision,
+                vec![AllocationBundleDemand::new(
+                    slot,
+                    AllocationClass::TransitionFrame,
+                    1,
+                )],
+                claims.clone(),
+            ))
+            .unwrap();
+        let commit = bundle
+            .commit(vec![AllocationBundleActual::new(slot, 1, 1)])
+            .unwrap();
+        let mut retirement = Some(EmptyRetirementToken(claims));
+        let prepared = commit
+            .prepare_retirement_settlement(&mut retirement)
+            .unwrap();
+
+        contract.presentation.style.show_direction_terminals = false;
+        engine
+            .try_replace_contract_for_request(owner, pressured_request, contract)
+            .unwrap();
+        let pressure_event = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::ResourcePressure {
+                    owner: seen,
+                    request_token: seen_token,
+                    operation: AlignmentSceneEngineOperation::ReplaceContract,
+                    pressure: LedgerError::ReplacementTransitionActive { .. },
+                    ..
+                } if *seen == owner && *seen_token == pressured_request
+            ) || matches!(
+                event,
+                AlignmentSceneEngineEvent::Error {
+                    owner: Some(seen),
+                    request_token: Some(seen_token),
+                    ..
+                } if *seen == owner && *seen_token == pressured_request
+            )
+        });
+        let AlignmentSceneEngineEvent::ResourcePressure {
+            target,
+            operation,
+            disposition,
+            ..
+        } = pressure_event
+        else {
+            panic!("contract setup pressure became a terminal error: {pressure_event:?}")
+        };
+        assert_eq!(operation, AlignmentSceneEngineOperation::ReplaceContract);
+        assert_eq!(
+            disposition,
+            AlignmentSceneResourcePressureDisposition::Retryable
+        );
+
+        // A newer camera and its token must win even if a relief signal for the older pressure is
+        // queued immediately behind it. The retry uses the ordered control lane specifically so it
+        // cannot overwrite the unread latest-wins camera slot.
+        let latest_camera = camera;
+        engine
+            .try_update_camera_for_request(owner, latest_request, latest_camera)
+            .unwrap();
+        engine
+            .try_retry_resource_pressure(owner, pressured_request, target)
+            .unwrap();
+        let latest_pressure = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::ResourcePressure {
+                    owner: seen,
+                    request_token: seen_token,
+                    operation: AlignmentSceneEngineOperation::UpdateCamera,
+                    pressure: LedgerError::ReplacementTransitionActive { .. },
+                    ..
+                } if *seen == owner && *seen_token == latest_request
+            ) || matches!(
+                event,
+                AlignmentSceneEngineEvent::Error {
+                    owner: Some(seen),
+                    request_token: Some(seen_token),
+                    ..
+                } if *seen == owner && *seen_token == latest_request
+            )
+        });
+        let AlignmentSceneEngineEvent::ResourcePressure {
+            target: latest_target,
+            ..
+        } = latest_pressure
+        else {
+            panic!("the newer UpdateCamera pressure became terminal: {latest_pressure:?}")
+        };
+
+        let settled = prepared.retire_and_settle();
+        assert_eq!(settled.len(), 1);
+        engine
+            .try_retry_resource_pressure(owner, latest_request, latest_target)
+            .unwrap();
+        let resumed = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    request_token: seen_token,
+                    cause: AlignmentSceneFrameCause::ResourcePressureRetry,
+                    published_scene: Some(_),
+                    frame,
+                    ..
+                } if *seen == owner
+                    && *seen_token == latest_request
+                    && frame.camera == latest_camera
+                    && frame.visible_complete()
+                    && frame.snapshot.as_ref().is_some_and(|scene| {
+                        !scene.reads().presentation().style.show_direction_terminals
+                    })
+            ) || matches!(
+                event,
+                AlignmentSceneEngineEvent::Error {
+                    owner: Some(seen),
+                    request_token: Some(seen_token),
+                    ..
+                } if *seen == owner && *seen_token == latest_request
+            )
+        });
+        assert!(
+            matches!(resumed, AlignmentSceneEngineEvent::FrameUpdated { .. }),
+            "the exact latest request must resume to a frame rather than becoming unavailable: {resumed:?}"
+        );
+        assert!(
+            engine
+                .receive_timeout(Duration::from_millis(50))
+                .unwrap()
+                .is_none(),
+            "a stale retry or resumed exact request published more than once"
+        );
+    }
+
+    #[test]
+    fn active_gpu_settlement_reports_budget_pressure_without_faking_budget_reduction() {
+        let (engine, _, _, _, _) = test_engine();
+        let ledger = engine.ledger().clone();
+        let before = ledger.snapshot().unwrap();
+        let slot = AllocationBundleSlot::new(0);
+        let claims = ledger.empty_retirement_claim_set();
+        let bundle = ledger
+            .reserve_replacement_bundle(AllocationBundleSpec::new(
+                before.policy_revision,
+                vec![AllocationBundleDemand::new(
+                    slot,
+                    AllocationClass::TransitionFrame,
+                    1,
+                )],
+                claims.clone(),
+            ))
+            .unwrap();
+        let bundle_id = ledger
+            .snapshot()
+            .unwrap()
+            .active_replacement_bundle
+            .expect("the reserved replacement owns the ledger transition");
+        let commit = bundle
+            .commit(vec![AllocationBundleActual::new(slot, 1, 1)])
+            .unwrap();
+        let mut retirement = Some(EmptyRetirementToken(claims));
+        let prepared = commit
+            .prepare_retirement_settlement(&mut retirement)
+            .unwrap();
+        let requested = before.budget / 2;
+
+        engine.try_reduce_budget(requested).unwrap();
+        let event = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::BudgetPressure {
+                    requested_budget,
+                    ..
+                } if *requested_budget == requested
+            ) || matches!(
+                event,
+                AlignmentSceneEngineEvent::Error {
+                    operation: AlignmentSceneEngineOperation::ReduceBudget,
+                    ..
+                }
+            )
+        });
+        let AlignmentSceneEngineEvent::BudgetPressure {
+            requested_budget,
+            clear_before_apply,
+            current_policy_revision,
+            current_budget,
+            pressure,
+        } = event
+        else {
+            panic!("prepared replacement budget collision became terminal: {event:?}")
+        };
+        assert_eq!(requested_budget, requested);
+        assert!(!clear_before_apply);
+        assert_eq!(current_policy_revision, before.policy_revision);
+        assert_eq!(current_budget, before.budget);
+        assert_eq!(
+            pressure,
+            LedgerError::ReplacementTransitionActive { bundle_id }
+        );
+        assert_eq!(ledger.snapshot().unwrap().budget, before.budget);
+        assert!(
+            engine
+                .receive_timeout(Duration::from_millis(50))
+                .unwrap()
+                .is_none(),
+            "a budget collision must wait for an explicit progress-gated retry"
+        );
+
+        let settled = prepared.retire_and_settle();
+        assert_eq!(settled.len(), 1);
+        engine.try_reduce_budget(requested).unwrap();
+        let reduced = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::BudgetReduced { pressure }
+                    if pressure.budget == requested
+            )
+        });
+        assert!(matches!(
+            reduced,
+            AlignmentSceneEngineEvent::BudgetReduced { .. }
+        ));
+        assert_eq!(ledger.snapshot().unwrap().budget, requested);
+
+        let clear_snapshot = ledger.snapshot().unwrap();
+        let clear_slot = AllocationBundleSlot::new(1);
+        let clear_claims = ledger.empty_retirement_claim_set();
+        let clear_bundle = ledger
+            .reserve_replacement_bundle(AllocationBundleSpec::new(
+                clear_snapshot.policy_revision,
+                vec![AllocationBundleDemand::new(
+                    clear_slot,
+                    AllocationClass::TransitionFrame,
+                    1,
+                )],
+                clear_claims.clone(),
+            ))
+            .unwrap();
+        let clear_bundle_id = ledger
+            .snapshot()
+            .unwrap()
+            .active_replacement_bundle
+            .unwrap();
+        let clear_commit = clear_bundle
+            .commit(vec![AllocationBundleActual::new(clear_slot, 1, 1)])
+            .unwrap();
+        let mut clear_retirement = Some(EmptyRetirementToken(clear_claims));
+        let clear_prepared = clear_commit
+            .prepare_retirement_settlement(&mut clear_retirement)
+            .unwrap();
+
+        engine.try_clear_cache_budget(requested).unwrap();
+        let clear_pressure = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::BudgetPressure {
+                    requested_budget,
+                    clear_before_apply: true,
+                    ..
+                } if *requested_budget == requested
+            )
+        });
+        assert!(matches!(
+            clear_pressure,
+            AlignmentSceneEngineEvent::BudgetPressure {
+                requested_budget,
+                clear_before_apply: true,
+                pressure: LedgerError::ReplacementTransitionActive { bundle_id },
+                ..
+            } if requested_budget == requested && bundle_id == clear_bundle_id
+        ));
+        let clear_settled = clear_prepared.retire_and_settle();
+        assert_eq!(clear_settled.len(), 1);
+        engine.try_retry_budget_pressure(requested, true).unwrap();
+        assert!(matches!(
+            receive_matching(&engine, |event| matches!(
+                event,
+                AlignmentSceneEngineEvent::BudgetReduced { pressure }
+                    if pressure.budget == requested
+            )),
+            AlignmentSceneEngineEvent::BudgetReduced { .. }
+        ));
+        assert_eq!(ledger.snapshot().unwrap().budget, requested);
+    }
+
+    #[test]
+    fn active_gpu_settlement_defers_contract_replacement_then_publishes_once_on_exact_retry() {
+        let (engine, mut contract, policy, camera, _) = test_engine();
+        let owner = SourceOwnerId::new(44);
+        let initial_request = AlignmentSceneRequestToken::new(80);
+        let contract_request = AlignmentSceneRequestToken::new(81);
+        engine
+            .try_insert_lane_for_request(owner, initial_request, contract.clone(), policy)
+            .unwrap();
+        let _ = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::LaneInserted { owner: seen } if *seen == owner
+            )
+        });
+        engine
+            .try_update_camera_for_request(owner, initial_request, camera)
+            .unwrap();
+        let _ = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    request_token: seen_token,
+                    frame,
+                    ..
+                } if *seen == owner
+                    && *seen_token == initial_request
+                    && frame.visible_complete()
+            )
+        });
+
+        let ledger = engine.ledger().clone();
+        let snapshot = ledger.snapshot().unwrap();
+        let slot = AllocationBundleSlot::new(0);
+        let claims = ledger.empty_retirement_claim_set();
+        let bundle = ledger
+            .reserve_replacement_bundle(AllocationBundleSpec::new(
+                snapshot.policy_revision,
+                vec![AllocationBundleDemand::new(
+                    slot,
+                    AllocationClass::TransitionFrame,
+                    1,
+                )],
+                claims.clone(),
+            ))
+            .unwrap();
+        let commit = bundle
+            .commit(vec![AllocationBundleActual::new(slot, 1, 1)])
+            .unwrap();
+        let mut retirement = Some(EmptyRetirementToken(claims));
+        let prepared = commit
+            .prepare_retirement_settlement(&mut retirement)
+            .unwrap();
+
+        contract.presentation.style.show_direction_terminals = false;
+        engine
+            .try_replace_contract_for_request(owner, contract_request, contract)
+            .unwrap();
+        let pressure_event = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::ResourcePressure {
+                    owner: seen,
+                    request_token: seen_token,
+                    operation: AlignmentSceneEngineOperation::ReplaceContract,
+                    pressure: LedgerError::ReplacementTransitionActive { .. },
+                    ..
+                } if *seen == owner && *seen_token == contract_request
+            ) || matches!(
+                event,
+                AlignmentSceneEngineEvent::Error {
+                    owner: Some(seen),
+                    request_token: Some(seen_token),
+                    ..
+                } if *seen == owner && *seen_token == contract_request
+            )
+        });
+        let AlignmentSceneEngineEvent::ResourcePressure {
+            target,
+            intent,
+            disposition,
+            ..
+        } = pressure_event
+        else {
+            panic!("ReplaceContract pressure became a terminal error: {pressure_event:?}")
+        };
+        assert_eq!(intent, SourceIntentKind::Foreground);
+        assert_eq!(
+            disposition,
+            AlignmentSceneResourcePressureDisposition::Retryable
+        );
+
+        let settled = prepared.retire_and_settle();
+        assert_eq!(settled.len(), 1);
+        engine
+            .try_retry_resource_pressure(owner, contract_request, target)
+            .unwrap();
+        let resumed = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    request_token: seen_token,
+                    cause: AlignmentSceneFrameCause::ResourcePressureRetry,
+                    published_scene: Some(_),
+                    frame,
+                    ..
+                } if *seen == owner
+                    && *seen_token == contract_request
+                    && frame.visible_complete()
+                    && frame.snapshot.as_ref().is_some_and(|scene| {
+                        !scene.reads().presentation().style.show_direction_terminals
+                    })
+            ) || matches!(
+                event,
+                AlignmentSceneEngineEvent::Error {
+                    owner: Some(seen),
+                    request_token: Some(seen_token),
+                    ..
+                } if *seen == owner && *seen_token == contract_request
+            )
+        });
+        assert!(
+            matches!(resumed, AlignmentSceneEngineEvent::FrameUpdated { .. }),
+            "the exact contract request must resume to one publication: {resumed:?}"
+        );
+        assert!(
+            engine
+                .receive_timeout(Duration::from_millis(50))
+                .unwrap()
+                .is_none(),
+            "the resumed contract request published more than once"
+        );
+    }
+
+    #[test]
+    fn active_gpu_settlement_defers_optional_prewarm_without_error_or_busy_loop() {
+        let (engine, contract, policy, camera, _) = test_engine();
+        let owner = SourceOwnerId::new(45);
+        let request_token = AlignmentSceneRequestToken::new(90);
+        engine
+            .try_insert_lane_for_request(owner, request_token, contract.clone(), policy)
+            .unwrap();
+        let _ = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::LaneInserted { owner: seen } if *seen == owner
+            )
+        });
+        engine
+            .try_update_camera_for_request(owner, request_token, camera)
+            .unwrap();
+        let _ = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    request_token: seen_token,
+                    frame,
+                    ..
+                } if *seen == owner
+                    && *seen_token == request_token
+                    && frame.visible_complete()
+            )
+        });
+
+        let ledger = engine.ledger().clone();
+        let snapshot = ledger.snapshot().unwrap();
+        let slot = AllocationBundleSlot::new(0);
+        let claims = ledger.empty_retirement_claim_set();
+        let bundle = ledger
+            .reserve_replacement_bundle(AllocationBundleSpec::new(
+                snapshot.policy_revision,
+                vec![AllocationBundleDemand::new(
+                    slot,
+                    AllocationClass::TransitionFrame,
+                    1,
+                )],
+                claims.clone(),
+            ))
+            .unwrap();
+        let commit = bundle
+            .commit(vec![AllocationBundleActual::new(slot, 1, 1)])
+            .unwrap();
+        let mut retirement = Some(EmptyRetirementToken(claims));
+        let prepared = commit
+            .prepare_retirement_settlement(&mut retirement)
+            .unwrap();
+
+        let mut prewarm = contract.presentation;
+        prewarm.style.show_direction_terminals = false;
+        engine.try_prewarm_presentation(owner, prewarm).unwrap();
+        let deferred = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::ResourcePressure {
+                    owner: seen,
+                    request_token: seen_token,
+                    operation: AlignmentSceneEngineOperation::PrewarmPresentation,
+                    pressure: LedgerError::ReplacementTransitionActive { .. },
+                    ..
+                } if *seen == owner && *seen_token == request_token
+            ) || matches!(
+                event,
+                AlignmentSceneEngineEvent::Error {
+                    owner: Some(seen),
+                    request_token: Some(seen_token),
+                    ..
+                } if *seen == owner && *seen_token == request_token
+            )
+        });
+        let AlignmentSceneEngineEvent::ResourcePressure {
+            intent,
+            disposition,
+            ..
+        } = deferred
+        else {
+            panic!("PrewarmPresentation pressure became a terminal error: {deferred:?}")
+        };
+        assert_eq!(intent, SourceIntentKind::Speculative);
+        assert_eq!(
+            disposition,
+            AlignmentSceneResourcePressureDisposition::Retryable
+        );
+        assert!(
+            engine
+                .receive_timeout(Duration::from_millis(50))
+                .unwrap()
+                .is_none(),
+            "a deferred optional prewarm must not busy-poll"
+        );
+
+        let settled = prepared.retire_and_settle();
+        assert_eq!(settled.len(), 1);
+        engine.try_prewarm_presentation(owner, prewarm).unwrap();
+        assert!(matches!(
+            receive_matching(&engine, |event| matches!(
+                event,
+                AlignmentSceneEngineEvent::PresentationPrewarmed {
+                    owner: seen,
+                    prepared: true,
+                } if *seen == owner
+            )),
+            AlignmentSceneEngineEvent::PresentationPrewarmed { prepared: true, .. }
+        ));
+    }
+
+    #[test]
+    fn worker_accepts_a_genomic_only_camera_without_synthetic_read_geometry() {
+        let (engine, contract, policy, render_camera, _) = test_engine();
+        let owner = SourceOwnerId::new(420);
+        engine.try_insert_lane(owner, contract, policy).unwrap();
+        receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::LaneInserted { owner: seen } if *seen == owner
+            )
+        });
+
+        let camera = AlignmentSceneCamera::without_visible_rows(render_camera.viewport());
+        engine.try_update_camera(owner, camera).unwrap();
+        let complete = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated { owner: seen, frame, .. }
+                    if *seen == owner && frame.visible_complete()
+            )
+        });
+        let AlignmentSceneEngineEvent::FrameUpdated { frame, .. } = complete else {
+            unreachable!("matching event has the asserted frame shape")
+        };
+        assert_eq!(frame.camera, camera);
+        assert_eq!(frame.requested_rows, 0..0);
+        assert_eq!(frame.covered_rows, 0..0);
+        assert!(frame.snapshot.is_some());
+    }
+
+    #[test]
     fn owner_results_echo_the_exact_latest_request_token() {
         let (engine, contract, policy, camera, _) = test_engine();
         let owner = SourceOwnerId::new(421);
@@ -1570,6 +2670,100 @@ mod tests {
         assert_eq!(frame.snapshot.unwrap().reads().prepared_rows(), 0..13);
         assert!(telemetry.vertical_residency_checkpoints > 0);
         assert_eq!(telemetry.vertical_residency_completions, 1);
+    }
+
+    #[test]
+    fn oversized_optional_vertical_page_publishes_budget_limited_frame_not_pressure() {
+        let (engine, contract, _, camera, _) = test_engine();
+        let owner = SourceOwnerId::new(44);
+        let request = AlignmentSceneRequestToken::new(91);
+        let viewport_only = AlignmentScenePreparationPolicy::new(0.0, 0.0, 0.0, 0, 1)
+            .unwrap()
+            .with_full_vertical_residency(false);
+        engine
+            .try_insert_lane(owner, contract, viewport_only)
+            .unwrap();
+        receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::LaneInserted { owner: seen } if *seen == owner
+            )
+        });
+        engine
+            .try_update_camera_for_request(owner, request, camera)
+            .unwrap();
+        let visible = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    request_token: seen_request,
+                    frame,
+                    ..
+                } if *seen == owner && *seen_request == request && frame.visible_complete()
+            )
+        });
+        let AlignmentSceneEngineEvent::FrameUpdated { frame, .. } = visible else {
+            unreachable!("the predicate accepts only a visible frame")
+        };
+        let visible_revision = frame.snapshot.unwrap().revision();
+
+        engine.try_reduce_budget(1).unwrap();
+        receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::BudgetReduced { pressure } if pressure.budget == 1
+            )
+        });
+        let full_vertical = viewport_only.with_full_vertical_residency(true);
+        engine
+            .try_set_preparation_policy_for_request(owner, request, full_vertical)
+            .unwrap();
+
+        let outcome = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    request_token: seen_request,
+                    cause: AlignmentSceneFrameCause::VerticalResidency,
+                    frame,
+                    ..
+                } if *seen == owner
+                    && *seen_request == request
+                    && matches!(
+                        frame.vertical_residency,
+                        crate::AlignmentVerticalResidency::BudgetLimited { .. }
+                    )
+            ) || matches!(
+                event,
+                AlignmentSceneEngineEvent::ResourcePressure {
+                    owner: seen,
+                    operation: AlignmentSceneEngineOperation::PumpPresentation,
+                    ..
+                } if *seen == owner
+            ) || matches!(
+                event,
+                AlignmentSceneEngineEvent::Error {
+                    owner: Some(seen),
+                    operation: AlignmentSceneEngineOperation::SetPreparationPolicy,
+                    ..
+                } if *seen == owner
+            )
+        });
+        let AlignmentSceneEngineEvent::FrameUpdated {
+            frame,
+            published_scene,
+            ..
+        } = outcome
+        else {
+            panic!(
+                "optional vertical residency became pressure/error instead of a BudgetLimited frame: {outcome:?}"
+            )
+        };
+        assert!(frame.visible_complete());
+        assert_eq!(frame.snapshot.unwrap().revision(), visible_revision);
+        assert!(published_scene.is_none());
     }
 
     #[test]

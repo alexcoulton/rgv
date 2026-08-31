@@ -1,14 +1,17 @@
 use std::{mem::size_of, sync::Arc};
 
-use rgv_core::GenomicInterval;
-use rgv_hts::{JunctionEvidence, ModificationBin, ModificationSeriesKey, PairSummary, PileupBin};
+use rgv_core::{BisulfiteContext, ContigId, GenomicInterval};
+use rgv_hts::{
+    JunctionEvidence, ModificationBin, ModificationSeriesKey, PairSummary, PileupBin,
+    ReferenceSlice, bisulfite_context_matches,
+};
 use thiserror::Error;
 
 use crate::{
     AlignmentSourceRevision, AllocationClass, AllocationLease, AllocationLedger,
-    AnnotationRevision, CanonicalGenomicTile, ContractFingerprint, EvidenceRevision,
-    ExactSummaryQueryError, ExactSummaryRoot, JunctionAnnotationIndex, JunctionAnnotationStatus,
-    LedgerError, ReservationKind, SummaryRevision, TransientResourceClass,
+    AnnotationRevision, CanonicalGenomicTile, ContractFingerprint, ExactSummaryQueryError,
+    ExactSummaryRoot, JunctionAnnotationIndex, JunctionAnnotationStatus, LedgerError,
+    ModificationSummaryContract, ReferenceRevision, ReservationKind, TransientResourceClass,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -21,13 +24,43 @@ pub enum SummaryPageFamily {
     FilterProvenance,
 }
 
-/// Camera-independent identity for one exact derived-lane semantic page.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct FilterPageScope {
+    contig: ContigId,
+    start: u64,
+    end: u64,
+}
+
+impl From<GenomicInterval> for FilterPageScope {
+    fn from(interval: GenomicInterval) -> Self {
+        Self {
+            contig: interval.contig(),
+            start: interval.start(),
+            end: interval.end(),
+        }
+    }
+}
+
+/// Camera-independent content identity for one exact derived-lane semantic page.
+///
+/// Evidence-root and summary-root publication revisions are deliberately absent. An immutable
+/// exact tile for the same source, record contract, family contract, and dependencies has the
+/// same biological contents when a wider compatible root is published. Keeping publication
+/// revisions here would force the presentation cache and GPU page table to rebuild unchanged
+/// tiles on every prepared-horizon extension.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SummaryPageKey {
     source_revision: AlignmentSourceRevision,
-    evidence_revision: EvidenceRevision,
-    summary_revision: SummaryRevision,
-    summary_contract: ContractFingerprint,
+    record_contract: ContractFingerprint,
+    family_contract: ContractFingerprint,
+    /// Pair statistics can contain a fact canonically owned by an earlier tile. This stable
+    /// dependency span changes only when the contributing exact-tile set changes.
+    dependency_first_tile: u64,
+    dependency_last_tile: u64,
+    junction_normalization_mapped_records: Option<u64>,
+    filter_coverage: Option<ContractFingerprint>,
+    filter_scope: Option<FilterPageScope>,
+    reference_revision: Option<ReferenceRevision>,
     annotation_revision: Option<AnnotationRevision>,
     tile: CanonicalGenomicTile,
     family: SummaryPageFamily,
@@ -50,11 +83,46 @@ impl SummaryPageKey {
         family: SummaryPageFamily,
         annotation: Option<&JunctionAnnotationIndex>,
     ) -> Self {
+        Self::new_with_dependencies(root, tile, family, None, annotation)
+    }
+
+    #[must_use]
+    pub fn new_with_dependencies(
+        root: &ExactSummaryRoot,
+        tile: CanonicalGenomicTile,
+        family: SummaryPageFamily,
+        reference_revision: Option<ReferenceRevision>,
+        annotation: Option<&JunctionAnnotationIndex>,
+    ) -> Self {
+        let (dependency_first_tile, dependency_last_tile) =
+            summary_page_dependency_span(root, tile, family);
+        let junction_normalization_mapped_records = (family == SummaryPageFamily::Junctions)
+            .then(|| {
+                root.junction_tiles()
+                    .iter()
+                    .find(|summary| summary.tile() == tile)
+                    .and_then(|summary| summary.summary().provenance.normalization_mapped_records)
+            })
+            .flatten();
+        let filter = (family == SummaryPageFamily::FilterProvenance)
+            .then(|| {
+                root.filter_tiles()
+                    .iter()
+                    .find(|summary| summary.tile() == tile)
+            })
+            .flatten();
         Self {
             source_revision: root.source_revision(),
-            evidence_revision: root.evidence_revision(),
-            summary_revision: root.revision(),
-            summary_contract: root.contract().fingerprint(),
+            record_contract: root.record_contract(),
+            family_contract: summary_family_contract(root, family),
+            dependency_first_tile,
+            dependency_last_tile,
+            junction_normalization_mapped_records,
+            filter_coverage: filter.map(|summary| summary.coverage_fingerprint()),
+            filter_scope: filter.map(|summary| summary.provenance_scope().into()),
+            reference_revision: (family == SummaryPageFamily::Alleles)
+                .then_some(reference_revision)
+                .flatten(),
             annotation_revision: (family == SummaryPageFamily::Junctions)
                 .then(|| annotation.map(JunctionAnnotationIndex::revision))
                 .flatten(),
@@ -69,13 +137,8 @@ impl SummaryPageKey {
     }
 
     #[must_use]
-    pub const fn evidence_revision(self) -> EvidenceRevision {
-        self.evidence_revision
-    }
-
-    #[must_use]
-    pub const fn summary_revision(self) -> SummaryRevision {
-        self.summary_revision
+    pub const fn reference_revision(self) -> Option<ReferenceRevision> {
+        self.reference_revision
     }
 
     #[must_use]
@@ -94,6 +157,66 @@ impl SummaryPageKey {
     }
 }
 
+fn summary_family_contract(
+    root: &ExactSummaryRoot,
+    family: SummaryPageFamily,
+) -> ContractFingerprint {
+    match family {
+        SummaryPageFamily::Depth => root.contract().depth().fingerprint(),
+        SummaryPageFamily::Alleles => root.contract().alleles().fingerprint(),
+        SummaryPageFamily::Junctions => root.contract().junctions().fingerprint(),
+        SummaryPageFamily::Modifications => root
+            .contract()
+            .modifications()
+            .unwrap_or(ModificationSummaryContract)
+            .fingerprint(),
+        SummaryPageFamily::Pairs => root.contract().pairs().fingerprint(),
+        SummaryPageFamily::FilterProvenance => root.contract().filters().fingerprint(),
+    }
+}
+
+fn summary_page_dependency_span(
+    root: &ExactSummaryRoot,
+    tile: CanonicalGenomicTile,
+    family: SummaryPageFamily,
+) -> (u64, u64) {
+    let Some(interval) = root
+        .depth_tiles()
+        .iter()
+        .find(|summary| summary.tile() == tile)
+        .map(|summary| summary.depth().interval())
+    else {
+        return (tile.coordinate(), tile.coordinate());
+    };
+    let contributor_coordinates = match family {
+        SummaryPageFamily::Pairs => root
+            .pair_tiles()
+            .iter()
+            .filter(|summary| summary.tile().contig() == interval.contig())
+            .filter(|summary| {
+                summary
+                    .tile()
+                    .coordinate()
+                    .checked_mul(summary.tile().bases().get())
+                    .is_some_and(|start| start < interval.end())
+                    && summary
+                        .maximum_record_end()
+                        .is_some_and(|end| end > interval.start())
+            })
+            .map(|summary| summary.tile().coordinate())
+            .collect::<Vec<_>>(),
+        SummaryPageFamily::Depth
+        | SummaryPageFamily::Alleles
+        | SummaryPageFamily::Junctions
+        | SummaryPageFamily::Modifications
+        | SummaryPageFamily::FilterProvenance => Vec::new(),
+    };
+    contributor_coordinates.into_iter().fold(
+        (tile.coordinate(), tile.coordinate()),
+        |(first, last), coordinate| (first.min(coordinate), last.max(coordinate)),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SummarySemanticComponent {
     Depth {
@@ -103,7 +226,13 @@ pub enum SummarySemanticComponent {
         mapping_quality_sum: u64,
         mapping_quality_observations: u32,
     },
-    Alleles(PileupBin),
+    Alleles {
+        bin: PileupBin,
+        /// The immutable FASTA base whose revision is part of this allele page's key. `None`
+        /// means the scene deliberately requested reference-independent allele facts; consumers
+        /// must not label those observations as substitutions.
+        reference_base: Option<u8>,
+    },
     Junction(AnnotatedJunctionSemantic),
     Modification {
         series: ModificationSeriesKey,
@@ -118,6 +247,74 @@ pub enum SummarySemanticComponent {
     FilterProvenance(crate::CompleteCoverage),
 }
 
+/// Exact, reference-revision-backed bisulfite context at one allele site.
+///
+/// The masks are computed while the immutable FASTA authority is present, using the same matcher
+/// as the legacy layout. Semantic pages therefore retain enough context for any captured
+/// bisulfite policy without retaining a mutable or oversized reference slice.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SummaryAlleleReferenceContext {
+    genomic_bases: [Option<u8>; 5],
+    forward: u8,
+    reverse: u8,
+}
+
+impl SummaryAlleleReferenceContext {
+    #[must_use]
+    pub fn matches(self, reverse: bool, context: BisulfiteContext) -> bool {
+        let mask = if reverse { self.reverse } else { self.forward };
+        mask & bisulfite_context_bit(context) != 0
+    }
+
+    /// Exact uppercase FASTA base at a genomic offset in `-2..=2`; `None` is possible only past
+    /// a true contig boundary because page construction validates the complete bounded halo.
+    #[must_use]
+    pub fn genomic_base(self, offset: i8) -> Option<u8> {
+        let index = usize::try_from(i16::from(offset) + 2).ok()?;
+        self.genomic_bases.get(index).copied().flatten()
+    }
+
+    pub(crate) fn capture(reference: &ReferenceSlice, position: u64) -> Self {
+        let mut captured = Self {
+            genomic_bases: [-2_i64, -1, 0, 1, 2].map(|offset| {
+                position
+                    .checked_add_signed(offset)
+                    .and_then(|position| reference.base_at(position))
+                    .map(|base| base.to_ascii_uppercase())
+            }),
+            ..Self::default()
+        };
+        for context in [
+            BisulfiteContext::Cg,
+            BisulfiteContext::Chg,
+            BisulfiteContext::Chh,
+            BisulfiteContext::Hcg,
+            BisulfiteContext::Gch,
+            BisulfiteContext::Wcg,
+        ] {
+            let bit = bisulfite_context_bit(context);
+            if bisulfite_context_matches(reference, position, false, context) {
+                captured.forward |= bit;
+            }
+            if bisulfite_context_matches(reference, position, true, context) {
+                captured.reverse |= bit;
+            }
+        }
+        captured
+    }
+}
+
+const fn bisulfite_context_bit(context: BisulfiteContext) -> u8 {
+    1 << match context {
+        BisulfiteContext::Cg => 0,
+        BisulfiteContext::Chg => 1,
+        BisulfiteContext::Chh => 2,
+        BisulfiteContext::Hcg => 3,
+        BisulfiteContext::Gch => 4,
+        BisulfiteContext::Wcg => 5,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AnnotatedJunctionSemantic {
     pub evidence: JunctionEvidence,
@@ -126,8 +323,9 @@ pub struct AnnotatedJunctionSemantic {
     pub annotation: Option<JunctionAnnotationStatus>,
 }
 
-/// Tile-local raw summary fact. Display transforms, thresholds, scale maxima, labels, and camera
-/// pixels are projection state and never alter this exact semantic authority.
+/// Canonically tile-owned raw summary fact. Offsets are relative to the owner interval; a
+/// junction's end offset can extend beyond that tile. Display transforms, thresholds, scale
+/// maxima, labels, and camera pixels are projection state and never alter this exact authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SummarySemanticPrimitive {
     pub start_offset: u64,
@@ -138,8 +336,13 @@ pub struct SummarySemanticPrimitive {
 #[derive(Debug)]
 pub struct SummarySemanticPage {
     key: SummaryPageKey,
+    /// Canonical ownership interval used to decode tile-local primitive offsets.
     interval: GenomicInterval,
+    /// Coarse page index covering the owner tile and every primitive's complete genomic span.
+    /// A junction may extend beyond `interval`, but it remains stored only in its start tile.
+    indexed_interval: GenomicInterval,
     primitives: Arc<[SummarySemanticPrimitive]>,
+    allele_reference_contexts: Option<Arc<[SummaryAlleleReferenceContext]>>,
     allocation: AllocationLease,
 }
 
@@ -152,15 +355,61 @@ impl SummarySemanticPage {
         reservation_kind: ReservationKind,
         publication_revision: u64,
     ) -> Result<Arc<Self>, SummarySemanticPageError> {
-        validate_key(key, root, annotation)?;
+        Self::build_with_dependencies(
+            key,
+            root,
+            None,
+            annotation,
+            ledger,
+            reservation_kind,
+            publication_revision,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_dependencies(
+        key: SummaryPageKey,
+        root: &Arc<ExactSummaryRoot>,
+        reference: Option<(ReferenceRevision, &ReferenceSlice, u64)>,
+        annotation: Option<&JunctionAnnotationIndex>,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, SummarySemanticPageError> {
+        validate_key(key, root, reference, annotation)?;
         let interval = root
             .depth_tiles()
             .iter()
             .find(|tile| tile.tile() == key.tile)
             .map(|tile| tile.depth().interval())
             .ok_or(SummarySemanticPageError::MissingCanonicalTile)?;
+        if let Some((_, reference, contig_length)) = reference
+            && key.family == SummaryPageFamily::Alleles
+        {
+            let required = allele_reference_context_interval(interval, contig_length)?;
+            if !reference.interval.contains_interval(required) {
+                return Err(SummarySemanticPageError::ReferenceCoverageMismatch {
+                    required,
+                    available: reference.interval,
+                });
+            }
+            if reference.base_at(required.start()).is_none()
+                || reference
+                    .base_at(required.end().saturating_sub(1))
+                    .is_none()
+            {
+                return Err(SummarySemanticPageError::ReferenceBaseCoverageMismatch {
+                    required,
+                    available: reference.interval,
+                    available_bases: reference.bases.len(),
+                });
+            }
+        }
         let maximum_primitives = maximum_primitives(root, key, interval)?;
-        let maximum_bytes = page_bytes(maximum_primitives);
+        let maximum_reference_contexts =
+            usize::from(key.family == SummaryPageFamily::Alleles && reference.is_some())
+                .saturating_mul(maximum_primitives);
+        let maximum_bytes = page_bytes(maximum_primitives, maximum_reference_contexts);
         let _scratch = ledger.reserve_transient(
             TransientResourceClass::SummaryPageBuilder,
             maximum_bytes,
@@ -174,9 +423,15 @@ impl SummarySemanticPage {
         let mut primitives = Vec::with_capacity(maximum_primitives);
         match key.family {
             SummaryPageFamily::Depth => emit_depth(root, key.tile, interval, &mut primitives),
-            SummaryPageFamily::Alleles => emit_alleles(root, key.tile, interval, &mut primitives),
+            SummaryPageFamily::Alleles => emit_alleles(
+                root,
+                key.tile,
+                interval,
+                reference.map(|(_, reference, _)| reference),
+                &mut primitives,
+            ),
             SummaryPageFamily::Junctions => {
-                emit_junctions(root, interval, annotation, &mut primitives)?;
+                emit_junctions(root, key.tile, interval, annotation, &mut primitives)?;
             }
             SummaryPageFamily::Modifications => {
                 emit_modifications(root, key.tile, interval, &mut primitives);
@@ -187,13 +442,45 @@ impl SummarySemanticPage {
             }
         }
         primitives.sort_by_key(|primitive| (primitive.start_offset, primitive.end_offset));
+        let allele_reference_contexts = (key.family == SummaryPageFamily::Alleles)
+            .then(|| {
+                reference.map(|(_, reference, _)| {
+                    primitives
+                        .iter()
+                        .map(|primitive| {
+                            SummaryAlleleReferenceContext::capture(
+                                reference,
+                                interval.start().saturating_add(primitive.start_offset),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .flatten();
+        let indexed_end = primitives.iter().fold(interval.end(), |end, primitive| {
+            end.max(interval.start().saturating_add(primitive.end_offset))
+        });
+        let indexed_interval =
+            GenomicInterval::new(interval.contig(), interval.start(), indexed_end)
+                .expect("a page index always contains its non-empty canonical owner tile");
         primitives.shrink_to_fit();
-        let retained_bytes = page_bytes(primitives.len());
+        let allele_reference_contexts = allele_reference_contexts.map(|mut contexts| {
+            contexts.shrink_to_fit();
+            Arc::<[SummaryAlleleReferenceContext]>::from(contexts)
+        });
+        let retained_bytes = page_bytes(
+            primitives.len(),
+            allele_reference_contexts
+                .as_ref()
+                .map_or(0, |contexts| contexts.len()),
+        );
         let allocation = reservation.register(retained_bytes, publication_revision)?;
         Ok(Arc::new(Self {
             key,
             interval,
+            indexed_interval,
             primitives: primitives.into(),
+            allele_reference_contexts,
             allocation,
         }))
     }
@@ -208,9 +495,22 @@ impl SummarySemanticPage {
         self.interval
     }
 
+    /// Returns the page-table query extent. For junction pages this can be wider than the
+    /// canonical owner interval so a partial camera can find a junction through its sole page.
+    #[must_use]
+    pub const fn indexed_interval(&self) -> GenomicInterval {
+        self.indexed_interval
+    }
+
     #[must_use]
     pub fn primitives(&self) -> &[SummarySemanticPrimitive] {
         &self.primitives
+    }
+
+    /// Contexts are parallel to `primitives()` and exist only for a reference-backed allele page.
+    #[must_use]
+    pub fn allele_reference_contexts(&self) -> Option<&[SummaryAlleleReferenceContext]> {
+        self.allele_reference_contexts.as_deref()
     }
 
     #[must_use]
@@ -222,20 +522,44 @@ impl SummarySemanticPage {
 fn validate_key(
     key: SummaryPageKey,
     root: &ExactSummaryRoot,
+    reference: Option<(ReferenceRevision, &ReferenceSlice, u64)>,
     annotation: Option<&JunctionAnnotationIndex>,
 ) -> Result<(), SummarySemanticPageError> {
-    if key.source_revision != root.source_revision()
-        || key.evidence_revision != root.evidence_revision()
-        || key.summary_revision != root.revision()
-        || key.summary_contract != root.contract().fingerprint()
-        || key.annotation_revision
-            != (key.family == SummaryPageFamily::Junctions)
-                .then(|| annotation.map(JunctionAnnotationIndex::revision))
-                .flatten()
+    if key
+        != SummaryPageKey::new_with_dependencies(
+            root,
+            key.tile,
+            key.family,
+            reference.map(|(revision, _, _)| revision),
+            annotation,
+        )
     {
         return Err(SummarySemanticPageError::AuthorityMismatch);
     }
     Ok(())
+}
+
+fn allele_reference_context_interval(
+    interval: GenomicInterval,
+    contig_length: u64,
+) -> Result<GenomicInterval, SummarySemanticPageError> {
+    if interval.end() > contig_length {
+        return Err(SummarySemanticPageError::ReferenceContigLengthMismatch {
+            interval,
+            contig_length,
+        });
+    }
+    GenomicInterval::new(
+        interval.contig(),
+        interval.start().saturating_sub(2),
+        interval.end().saturating_add(2).min(contig_length),
+    )
+    .map_err(
+        |_| SummarySemanticPageError::ReferenceContigLengthMismatch {
+            interval,
+            contig_length,
+        },
+    )
 }
 
 fn maximum_primitives(
@@ -252,7 +576,11 @@ fn maximum_primitives(
         SummaryPageFamily::Alleles => {
             usize::try_from(interval.len()).map_err(|_| SummarySemanticPageError::TileTooWide)?
         }
-        SummaryPageFamily::Junctions => root.junction_count(interval)?,
+        SummaryPageFamily::Junctions => root
+            .junction_tiles()
+            .iter()
+            .find(|summary| summary.tile() == key.tile)
+            .map_or(0, |summary| summary.summary().junctions.len()),
         SummaryPageFamily::Modifications => root
             .modification_tiles()
             .iter()
@@ -312,6 +640,7 @@ fn emit_alleles(
     root: &ExactSummaryRoot,
     tile: CanonicalGenomicTile,
     interval: GenomicInterval,
+    reference: Option<&ReferenceSlice>,
     output: &mut Vec<SummarySemanticPrimitive>,
 ) {
     let Some(summary) = root
@@ -335,7 +664,14 @@ fn emit_alleles(
                 (observations > 0).then(|| SummarySemanticPrimitive {
                     start_offset: index as u64,
                     end_offset: (index as u64).saturating_add(1).min(interval.len()),
-                    component: SummarySemanticComponent::Alleles(bin),
+                    component: SummarySemanticComponent::Alleles {
+                        bin,
+                        reference_base: reference
+                            .and_then(|reference| {
+                                reference.base_at(interval.start().saturating_add(index as u64))
+                            })
+                            .map(|base| base.to_ascii_uppercase()),
+                    },
                 })
             }),
     );
@@ -343,25 +679,30 @@ fn emit_alleles(
 
 fn emit_junctions(
     root: &ExactSummaryRoot,
+    tile: CanonicalGenomicTile,
     interval: GenomicInterval,
     annotation: Option<&JunctionAnnotationIndex>,
     output: &mut Vec<SummarySemanticPrimitive>,
 ) -> Result<(), SummarySemanticPageError> {
-    root.for_each_junction(interval, |junction| {
-        let start = junction.start.max(interval.start());
-        let end = junction.end.min(interval.end());
-        if start < end {
-            output.push(SummarySemanticPrimitive {
-                start_offset: start - interval.start(),
-                end_offset: end - interval.start(),
-                component: SummarySemanticComponent::Junction(AnnotatedJunctionSemantic {
-                    evidence: junction,
-                    annotation: annotation
-                        .map(|index| index.status(interval.contig(), junction.start, junction.end)),
-                }),
-            });
+    let summary = root
+        .junction_tiles()
+        .iter()
+        .find(|summary| summary.tile() == tile)
+        .ok_or(SummarySemanticPageError::MissingCanonicalTile)?;
+    output.extend(summary.summary().junctions.iter().copied().map(|junction| {
+        debug_assert!(interval.contains(junction.start));
+        SummarySemanticPrimitive {
+            start_offset: junction.start.saturating_sub(interval.start()),
+            // Preserve the complete biological extent. Later tiles index this owner page rather
+            // than storing clipped copies of the same junction.
+            end_offset: junction.end.saturating_sub(interval.start()),
+            component: SummarySemanticComponent::Junction(AnnotatedJunctionSemantic {
+                evidence: junction,
+                annotation: annotation
+                    .map(|index| index.status(interval.contig(), junction.start, junction.end)),
+            }),
         }
-    })?;
+    }));
     Ok(())
 }
 
@@ -452,9 +793,74 @@ fn emit_filter_provenance(
     Ok(())
 }
 
-const fn page_bytes(primitives: usize) -> usize {
+/// Exact page keys required to project an interval. Ordinary families are owned by overlapping
+/// canonical tiles. Junction pages are additionally indexed by complete junction extent, so an
+/// owner tile immediately before a partial prepared interval is retained exactly once.
+pub(crate) fn required_summary_page_keys(
+    root: &ExactSummaryRoot,
+    interval: GenomicInterval,
+    reference_revision: Option<ReferenceRevision>,
+    annotation: Option<&JunctionAnnotationIndex>,
+) -> Vec<SummaryPageKey> {
+    let families = required_summary_families(root);
+    let mut keys = Vec::new();
+    for tile in root
+        .depth_tiles()
+        .iter()
+        .filter(|tile| tile.depth().interval().overlaps(interval))
+        .map(|tile| tile.tile())
+    {
+        for family in families.iter().copied() {
+            keys.push(SummaryPageKey::new_with_dependencies(
+                root,
+                tile,
+                family,
+                reference_revision,
+                annotation,
+            ));
+        }
+    }
+    for tile in root.junction_tiles().iter().filter(|tile| {
+        tile.summary()
+            .junctions
+            .iter()
+            .any(|junction| junction.start < interval.end() && junction.end > interval.start())
+    }) {
+        keys.push(SummaryPageKey::new_with_dependencies(
+            root,
+            tile.tile(),
+            SummaryPageFamily::Junctions,
+            reference_revision,
+            annotation,
+        ));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+fn required_summary_families(root: &ExactSummaryRoot) -> Vec<SummaryPageFamily> {
+    let mut families = vec![
+        SummaryPageFamily::Depth,
+        SummaryPageFamily::Junctions,
+        SummaryPageFamily::Pairs,
+        SummaryPageFamily::FilterProvenance,
+    ];
+    if root.contract().allele_detail != crate::AlleleSummaryDetail::None {
+        families.push(SummaryPageFamily::Alleles);
+    }
+    if root.contract().collect_modifications {
+        families.push(SummaryPageFamily::Modifications);
+    }
+    families
+}
+
+const fn page_bytes(primitives: usize, allele_reference_contexts: usize) -> usize {
     size_of::<SummarySemanticPage>()
         .saturating_add(primitives.saturating_mul(size_of::<SummarySemanticPrimitive>()))
+        .saturating_add(
+            allele_reference_contexts.saturating_mul(size_of::<SummaryAlleleReferenceContext>()),
+        )
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -467,6 +873,28 @@ pub enum SummarySemanticPageError {
     AuthorityMismatch,
     #[error("summary page canonical tile is absent from the exact summary root")]
     MissingCanonicalTile,
+    #[error(
+        "summary allele page requires reference coverage {required:?}, but only {available:?} is available"
+    )]
+    ReferenceCoverageMismatch {
+        required: GenomicInterval,
+        available: GenomicInterval,
+    },
+    #[error(
+        "summary allele page requires reference bases for {required:?}, but slice {available:?} contains only {available_bases} bases"
+    )]
+    ReferenceBaseCoverageMismatch {
+        required: GenomicInterval,
+        available: GenomicInterval,
+        available_bases: usize,
+    },
+    #[error(
+        "summary allele page interval {interval:?} is outside reference contig length {contig_length}"
+    )]
+    ReferenceContigLengthMismatch {
+        interval: GenomicInterval,
+        contig_length: u64,
+    },
     #[error("summary page canonical tile is too wide for this platform")]
     TileTooWide,
 }
@@ -491,11 +919,12 @@ mod tests {
         AlignmentRowAtlas, AlignmentSceneSnapshot, AlignmentSceneSnapshotError,
         AlignmentSemanticPage, AlignmentSourceRevision, AlleleSummaryDetail, AllocationClass,
         CanonicalRowBlock, CapabilityRequirement, CompleteCoverage, EvidenceAcquisition,
-        EvidenceChunk, EvidenceRoot, EvidenceRootBuilder, ExactAlleleSummaryTile,
+        EvidenceChunk, EvidenceRevision, EvidenceRoot, EvidenceRootBuilder, ExactAlleleSummaryTile,
         ExactDepthSummaryTile, ExactFilterSummaryTile, ExactJunctionSummaryTile,
         ExactModificationSummaryTile, ExactPairSummaryTile, FilteredRecordProvenance, GeometryLod,
         LayoutContract, PayloadContract, PayloadSidecar, PresentationContract, RevisionFingerprint,
         RowAtlasRevision, SceneRevision, SourceChunkId, SourceFingerprint, SummaryContract,
+        SummaryRevision,
     };
 
     const RECORD_CONTRACT: ContractFingerprint = ContractFingerprint::new(77);
@@ -736,6 +1165,742 @@ mod tests {
         exact_authority(ledger).1
     }
 
+    const CROSS_TILE_CONTIG_LENGTH: u64 = 300;
+    const CROSS_TILE_NORMALIZATION: u64 = 1_000;
+
+    fn cross_tile_interval(tile_count: u64) -> GenomicInterval {
+        GenomicInterval::new(ContigId::new(0), 0, tile_count.saturating_mul(100)).unwrap()
+    }
+
+    fn cross_tile_tile(coordinate: u64) -> CanonicalGenomicTile {
+        CanonicalGenomicTile::new(ContigId::new(0), coordinate, NonZeroU64::new(100).unwrap())
+    }
+
+    fn cross_tile_contract() -> SummaryContract {
+        SummaryContract {
+            overlapping_mate_policy: OverlappingMatePolicy::CountBoth,
+            minimum_base_quality: 0,
+            minimum_junction_flank: 0,
+            allele_detail: AlleleSummaryDetail::None,
+            collect_modifications: false,
+        }
+    }
+
+    fn cross_tile_evidence(ledger: &AllocationLedger) -> Arc<EvidenceRoot> {
+        let interval = cross_tile_interval(3);
+        let record = AlignmentRecord {
+            contig: interval.contig(),
+            start: 80,
+            end: 230,
+            flags: AlignmentFlags::from_bits(0x10),
+            mapping_quality: Some(60),
+            mate_contig: None,
+            mate_start: None,
+            template_length: 0,
+            read_name: b"cross-tile-splice".to_vec(),
+            cigar: vec![
+                CigarOp {
+                    kind: CigarOpKind::Match,
+                    len: 10,
+                },
+                CigarOp {
+                    kind: CigarOpKind::ReferenceSkip,
+                    len: 120,
+                },
+                CigarOp {
+                    kind: CigarOpKind::Match,
+                    len: 20,
+                },
+            ],
+            sequence: SequenceData::NotLoaded,
+            auxiliary_fields: vec![AuxField {
+                tag: *b"XS",
+                value: AuxValue::Character(b'+'),
+            }],
+        };
+        let mut decoded = AlignmentBatch::default();
+        decoded
+            .push_with_source_position(
+                &record,
+                AlignmentSourcePosition::bam_virtual_offset((71 << 16) | 1),
+            )
+            .unwrap();
+        let retained_tags = [*b"XS"];
+        let payload_contract = PayloadContract::new(
+            CapabilityRequirement::NotRequired,
+            CapabilityRequirement::NotRequired,
+            retained_tags,
+            None,
+        );
+        let payload = Arc::new(
+            AlignmentPayloadBatch::from_batch(&decoded, false, false, Some(&retained_tags))
+                .unwrap(),
+        );
+        let core = crate::CanonicalRecordChunk::new(
+            source_revision(),
+            SourceChunkId::BamBlock {
+                compressed_offset: 71,
+            },
+            Arc::new(decoded.copy_core().unwrap()),
+            RECORD_CONTRACT,
+        )
+        .unwrap();
+        let payload_bytes = payload.estimated_bytes();
+        let payload_allocation = ledger
+            .reserve(
+                AllocationClass::PayloadSidecar,
+                payload_bytes,
+                ReservationKind::Normal,
+            )
+            .unwrap()
+            .register(payload_bytes, 70)
+            .unwrap();
+        let payload = Arc::new(
+            PayloadSidecar::new(&core, payload_contract.clone(), payload, payload_allocation)
+                .unwrap(),
+        );
+        let footprint = EvidenceChunk::footprint(&core);
+        let core_allocation = ledger
+            .reserve(
+                AllocationClass::CoreChunk,
+                footprint.core_bytes,
+                ReservationKind::Normal,
+            )
+            .unwrap()
+            .register(footprint.core_bytes, 70)
+            .unwrap();
+        let overlap_allocation = ledger
+            .reserve(
+                AllocationClass::OverlapIndex,
+                footprint.overlap_index_bytes,
+                ReservationKind::Normal,
+            )
+            .unwrap()
+            .register(footprint.overlap_index_bytes, 70)
+            .unwrap();
+        let chunk = Arc::new(
+            EvidenceChunk::new_with_payload(core, core_allocation, overlap_allocation, payload)
+                .unwrap(),
+        );
+        let acquisition = EvidenceAcquisition::new(
+            CompleteCoverage::new(
+                source_revision(),
+                RECORD_CONTRACT,
+                interval,
+                FilteredRecordProvenance {
+                    records_seen: 1,
+                    eligible_records: 1,
+                    ..FilteredRecordProvenance::default()
+                },
+            )
+            .unwrap(),
+            [chunk],
+        )
+        .unwrap();
+        let mut builder = EvidenceRootBuilder::new(
+            EvidenceRevision::new(RevisionFingerprint::new(70, 71)),
+            source_revision(),
+            RECORD_CONTRACT,
+            payload_contract,
+            1,
+            1,
+            ledger,
+            ReservationKind::Normal,
+        )
+        .unwrap();
+        builder.insert_acquisition(&acquisition).unwrap();
+        builder.build(72).unwrap()
+    }
+
+    fn cross_tile_root_reusing(
+        evidence: &Arc<EvidenceRoot>,
+        tile_count: u64,
+        revision_seed: u64,
+        reused: Option<&ExactSummaryRoot>,
+        ledger: &AllocationLedger,
+    ) -> Arc<ExactSummaryRoot> {
+        let contract = cross_tile_contract();
+        assert!(reused.is_none_or(|root| root.contract() == contract));
+        let prepared = cross_tile_interval(tile_count);
+        let mut depth = Vec::new();
+        let mut junctions = Vec::new();
+        let mut pairs = Vec::new();
+        let mut filters = Vec::new();
+        for coordinate in 0..tile_count {
+            let tile = cross_tile_tile(coordinate);
+            let publication_revision = revision_seed.saturating_add(coordinate);
+            depth.push(
+                reused
+                    .and_then(|root| {
+                        root.depth_tiles()
+                            .iter()
+                            .find(|summary| summary.tile() == tile)
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| {
+                        ExactDepthSummaryTile::build(
+                            evidence,
+                            tile,
+                            CROSS_TILE_CONTIG_LENGTH,
+                            contract.depth(),
+                            ledger,
+                            ReservationKind::Normal,
+                            publication_revision,
+                        )
+                        .unwrap()
+                    }),
+            );
+            junctions.push(
+                reused
+                    .and_then(|root| {
+                        root.junction_tiles()
+                            .iter()
+                            .find(|summary| summary.tile() == tile)
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| {
+                        ExactJunctionSummaryTile::build(
+                            evidence,
+                            tile,
+                            CROSS_TILE_CONTIG_LENGTH,
+                            contract.junctions(),
+                            Some(CROSS_TILE_NORMALIZATION),
+                            ledger,
+                            ReservationKind::Normal,
+                            publication_revision,
+                        )
+                        .unwrap()
+                    }),
+            );
+            pairs.push(
+                reused
+                    .and_then(|root| {
+                        root.pair_tiles()
+                            .iter()
+                            .find(|summary| summary.tile() == tile)
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| {
+                        ExactPairSummaryTile::build(
+                            evidence,
+                            tile,
+                            CROSS_TILE_CONTIG_LENGTH,
+                            contract.pairs(),
+                            ledger,
+                            ReservationKind::Normal,
+                            publication_revision,
+                        )
+                        .unwrap()
+                    }),
+            );
+            // Filter certificates name the complete prepared scope, so extension deliberately
+            // rebuilds this family while reusing the tile-owned biological summaries above.
+            filters.push(
+                ExactFilterSummaryTile::build(
+                    evidence,
+                    tile,
+                    CROSS_TILE_CONTIG_LENGTH,
+                    prepared,
+                    contract.filters(),
+                    ledger,
+                    ReservationKind::Normal,
+                    publication_revision,
+                )
+                .unwrap(),
+            );
+        }
+        ExactSummaryRoot::build(
+            SummaryRevision::new(RevisionFingerprint::new(revision_seed, revision_seed + 1)),
+            evidence.revision(),
+            evidence.source_revision(),
+            evidence.record_contract(),
+            contract,
+            prepared,
+            depth,
+            Vec::new(),
+            junctions,
+            pairs,
+            filters,
+            Vec::new(),
+            ledger,
+            ReservationKind::Normal,
+            revision_seed + 10,
+        )
+        .unwrap()
+    }
+
+    fn cross_tile_root(
+        evidence: &Arc<EvidenceRoot>,
+        tile_count: u64,
+        revision_seed: u64,
+        ledger: &AllocationLedger,
+    ) -> Arc<ExactSummaryRoot> {
+        cross_tile_root_reusing(evidence, tile_count, revision_seed, None, ledger)
+    }
+
+    fn extend_cross_tile_root(
+        evidence: &Arc<EvidenceRoot>,
+        partial: &Arc<ExactSummaryRoot>,
+        ledger: &AllocationLedger,
+    ) -> Arc<ExactSummaryRoot> {
+        cross_tile_root_reusing(evidence, 3, 92, Some(partial), ledger)
+    }
+
+    fn cross_tile_atlas(
+        evidence: &Arc<EvidenceRoot>,
+        ledger: &AllocationLedger,
+    ) -> Arc<AlignmentRowAtlas> {
+        let layout = LayoutContract {
+            row_scale_class: 0,
+            stacking: ReadStackingMode::Compact,
+            grouping: AlignmentGroupMode::None,
+            group_order: AlignmentOrderDirection::Natural,
+            sorting: AlignmentSortMode::Start,
+            sort_order: AlignmentOrderDirection::Natural,
+            sort_anchor: None,
+            view_as_pairs: false,
+            pair_length_bounds: TemplateLengthBounds::default(),
+            promoted_template: None,
+        };
+        AlignmentRowAtlas::build(
+            RowAtlasRevision::new(RevisionFingerprint::new(97, 98)),
+            evidence,
+            cross_tile_interval(3),
+            layout,
+            ledger,
+            ReservationKind::Normal,
+            97,
+        )
+        .unwrap()
+    }
+
+    fn cross_tile_snapshot(
+        evidence: &Arc<EvidenceRoot>,
+        summaries: &Arc<ExactSummaryRoot>,
+        atlas: &Arc<AlignmentRowAtlas>,
+        prepared_interval: GenomicInterval,
+        ledger: &AllocationLedger,
+    ) -> Arc<AlignmentSceneSnapshot> {
+        let presentation = PresentationContract {
+            geometry_lod: GeometryLod::Span,
+            style: crate::AlignmentStyleContract {
+                show_modified_bases: false,
+                ..crate::AlignmentStyleContract::default()
+            },
+            reference: None,
+            annotation: None,
+        };
+        let mut store = AlignmentPresentationStore::new(ledger.clone());
+        let candidate = store
+            .prepare(
+                evidence,
+                summaries,
+                atlas,
+                presentation,
+                prepared_interval,
+                0..u32::try_from(atlas.row_count()).unwrap(),
+                CROSS_TILE_CONTIG_LENGTH,
+                NonZeroU64::new(100).unwrap(),
+                NonZeroU32::new(16).unwrap(),
+                None,
+                ReservationKind::Normal,
+            )
+            .unwrap();
+        Arc::clone(candidate.snapshot())
+    }
+
+    fn cross_tile_junction_frame(
+        snapshot: &Arc<AlignmentSceneSnapshot>,
+        interval: GenomicInterval,
+        count_mode: rgv_core::SashimiCountMode,
+        show_labels: bool,
+    ) -> crate::CpuSummaryFrame {
+        let camera = crate::CpuSummaryCamera::new(
+            interval,
+            crate::CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 600.0,
+                height: 80.0,
+            },
+        )
+        .unwrap();
+        crate::CpuSummaryProjector::project(
+            snapshot,
+            7,
+            camera,
+            &crate::CpuSummaryProjectionOptions::Junctions(crate::CpuJunctionProjectionOptions {
+                count_mode,
+                show_labels,
+                ..Default::default()
+            }),
+        )
+        .unwrap()
+    }
+
+    fn cross_tile_junction_arcs(
+        frame: &crate::CpuSummaryFrame,
+    ) -> Vec<&crate::CpuSummaryProjectedPrimitive> {
+        frame
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(
+                    primitive.component,
+                    crate::CpuSummaryProjectedComponent::Junction { evidence, .. }
+                        if (evidence.start, evidence.end) == (90, 210)
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spanning_junction_has_one_semantic_owner_and_one_whole_interval_arc() {
+        let ledger = AllocationLedger::new(64 << 20, 0);
+        let evidence = cross_tile_evidence(&ledger);
+        let summaries = cross_tile_root(&evidence, 3, 100, &ledger);
+        let atlas = cross_tile_atlas(&evidence, &ledger);
+        let snapshot = cross_tile_snapshot(
+            &evidence,
+            &summaries,
+            &atlas,
+            cross_tile_interval(3),
+            &ledger,
+        );
+        let junction_pages = snapshot
+            .summary_pages()
+            .iter()
+            .filter(|page| page.key().family() == SummaryPageFamily::Junctions)
+            .collect::<Vec<_>>();
+        assert_eq!(junction_pages.len(), 3);
+        assert_eq!(
+            junction_pages
+                .iter()
+                .map(|page| page.primitives().len())
+                .sum::<usize>(),
+            1
+        );
+        let owner = junction_pages
+            .iter()
+            .find(|page| !page.primitives().is_empty())
+            .unwrap();
+        assert_eq!(owner.key().tile(), cross_tile_tile(0));
+        assert_eq!(owner.interval(), cross_tile_interval(1));
+        assert_eq!(
+            owner.indexed_interval(),
+            GenomicInterval::new(ContigId::new(0), 0, 210).unwrap()
+        );
+        assert_eq!(
+            (
+                owner.primitives()[0].start_offset,
+                owner.primitives()[0].end_offset
+            ),
+            (90, 210)
+        );
+
+        let frame = cross_tile_junction_frame(
+            &snapshot,
+            cross_tile_interval(3),
+            rgv_core::SashimiCountMode::Raw,
+            false,
+        );
+        assert_eq!(cross_tile_junction_arcs(&frame).len(), 1);
+    }
+
+    #[test]
+    fn partial_camera_discovers_spanning_junction_through_owner_page_index() {
+        let ledger = AllocationLedger::new(64 << 20, 0);
+        let evidence = cross_tile_evidence(&ledger);
+        let summaries = cross_tile_root(&evidence, 3, 120, &ledger);
+        let atlas = cross_tile_atlas(&evidence, &ledger);
+        let partial = GenomicInterval::new(ContigId::new(0), 150, 160).unwrap();
+        let snapshot = cross_tile_snapshot(&evidence, &summaries, &atlas, partial, &ledger);
+        let owner = snapshot
+            .summary_pages()
+            .iter()
+            .find(|page| {
+                page.key().family() == SummaryPageFamily::Junctions
+                    && page.key().tile() == cross_tile_tile(0)
+            })
+            .expect("the page table retains a non-local junction owner");
+        assert!(!owner.interval().overlaps(partial));
+        assert!(owner.indexed_interval().overlaps(partial));
+        assert!(
+            snapshot
+                .summary_pages_for(SummaryPageFamily::Junctions, partial)
+                .iter()
+                .any(|page| page.key().tile() == cross_tile_tile(0))
+        );
+
+        let frame =
+            cross_tile_junction_frame(&snapshot, partial, rgv_core::SashimiCountMode::Raw, false);
+        assert_eq!(frame.covered_interval, Some(partial));
+        assert_eq!(cross_tile_junction_arcs(&frame).len(), 1);
+    }
+
+    #[test]
+    fn incrementally_extended_and_clean_roots_have_identical_junction_pages_and_projection() {
+        let ledger = AllocationLedger::new(128 << 20, 0);
+        let evidence = cross_tile_evidence(&ledger);
+        let partial = cross_tile_root(&evidence, 2, 140, &ledger);
+        let incremental = extend_cross_tile_root(&evidence, &partial, &ledger);
+        let clean = cross_tile_root(&evidence, 3, 160, &ledger);
+        for index in 0..2 {
+            assert!(Arc::ptr_eq(
+                &partial.junction_tiles()[index],
+                &incremental.junction_tiles()[index]
+            ));
+        }
+        assert_eq!(
+            incremental.junctions(cross_tile_interval(3)).unwrap(),
+            clean.junctions(cross_tile_interval(3)).unwrap()
+        );
+
+        let atlas = cross_tile_atlas(&evidence, &ledger);
+        let incremental_snapshot = cross_tile_snapshot(
+            &evidence,
+            &incremental,
+            &atlas,
+            cross_tile_interval(3),
+            &ledger,
+        );
+        let clean_snapshot =
+            cross_tile_snapshot(&evidence, &clean, &atlas, cross_tile_interval(3), &ledger);
+        let page_signature = |snapshot: &AlignmentSceneSnapshot| {
+            snapshot
+                .summary_pages()
+                .iter()
+                .filter(|page| page.key().family() == SummaryPageFamily::Junctions)
+                .map(|page| {
+                    (
+                        page.key(),
+                        page.interval(),
+                        page.indexed_interval(),
+                        page.primitives().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            page_signature(&incremental_snapshot),
+            page_signature(&clean_snapshot)
+        );
+
+        let incremental_frame = cross_tile_junction_frame(
+            &incremental_snapshot,
+            cross_tile_interval(3),
+            rgv_core::SashimiCountMode::Raw,
+            false,
+        );
+        let clean_frame = cross_tile_junction_frame(
+            &clean_snapshot,
+            cross_tile_interval(3),
+            rgv_core::SashimiCountMode::Raw,
+            false,
+        );
+        assert_eq!(incremental_frame.scale_maximum, clean_frame.scale_maximum);
+        assert_eq!(
+            incremental_frame.normalization_available,
+            clean_frame.normalization_available
+        );
+        assert_eq!(incremental_frame.primitives, clean_frame.primitives);
+    }
+
+    #[test]
+    fn single_owner_preserves_raw_and_cpm_values_scales_and_labels() {
+        let ledger = AllocationLedger::new(64 << 20, 0);
+        let evidence = cross_tile_evidence(&ledger);
+        let summaries = cross_tile_root(&evidence, 3, 180, &ledger);
+        let atlas = cross_tile_atlas(&evidence, &ledger);
+        let snapshot = cross_tile_snapshot(
+            &evidence,
+            &summaries,
+            &atlas,
+            cross_tile_interval(3),
+            &ledger,
+        );
+        let raw = cross_tile_junction_frame(
+            &snapshot,
+            cross_tile_interval(3),
+            rgv_core::SashimiCountMode::Raw,
+            true,
+        );
+        let cpm = cross_tile_junction_frame(
+            &snapshot,
+            cross_tile_interval(3),
+            rgv_core::SashimiCountMode::CountsPerMillion,
+            true,
+        );
+        let raw_arcs = cross_tile_junction_arcs(&raw);
+        let cpm_arcs = cross_tile_junction_arcs(&cpm);
+        assert_eq!((raw_arcs.len(), cpm_arcs.len()), (1, 1));
+        let value = |primitive: &crate::CpuSummaryProjectedPrimitive| {
+            let crate::CpuSummaryProjectedComponent::Junction { value_bits, .. } =
+                primitive.component
+            else {
+                unreachable!()
+            };
+            f64::from_bits(value_bits)
+        };
+        assert_eq!(value(raw_arcs[0]), 1.0);
+        assert_eq!(value(cpm_arcs[0]), 1_000.0);
+        assert_eq!(raw.scale_maximum, Some(1.0));
+        assert_eq!(cpm.scale_maximum, Some(1_000.0));
+        assert!(raw.normalization_available);
+        assert!(cpm.normalization_available);
+        let label = |frame: &crate::CpuSummaryFrame| {
+            frame.primitives.iter().find_map(|primitive| {
+                matches!(
+                    primitive.component,
+                    crate::CpuSummaryProjectedComponent::JunctionLabel { .. }
+                )
+                .then(|| primitive.text.clone())
+                .flatten()
+            })
+        };
+        assert_eq!(label(&raw).as_deref(), Some("1"));
+        assert_eq!(label(&cpm).as_deref(), Some("1000 CPM"));
+    }
+
+    fn republished_exact_root(
+        root: &ExactSummaryRoot,
+        revision: SummaryRevision,
+        ledger: &AllocationLedger,
+    ) -> Arc<ExactSummaryRoot> {
+        ExactSummaryRoot::build(
+            revision,
+            root.evidence_revision(),
+            root.source_revision(),
+            root.record_contract(),
+            root.contract(),
+            root.prepared_interval(),
+            root.depth_tiles().to_vec(),
+            root.allele_tiles().to_vec(),
+            root.junction_tiles().to_vec(),
+            root.pair_tiles().to_vec(),
+            root.filter_tiles().to_vec(),
+            root.modification_tiles().to_vec(),
+            ledger,
+            ReservationKind::Normal,
+            5,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn semantic_page_identity_survives_a_compatible_root_republication() {
+        let ledger = AllocationLedger::new(64 << 20, 0);
+        let root = exact_root(&ledger);
+        let republished = republished_exact_root(
+            &root,
+            SummaryRevision::new(RevisionFingerprint::new(80, 81)),
+            &ledger,
+        );
+        let tile = root.depth_tiles()[0].tile();
+        for family in [
+            SummaryPageFamily::Depth,
+            SummaryPageFamily::Alleles,
+            SummaryPageFamily::Junctions,
+            SummaryPageFamily::Modifications,
+            SummaryPageFamily::Pairs,
+            SummaryPageFamily::FilterProvenance,
+        ] {
+            assert_eq!(
+                SummaryPageKey::new(&root, tile, family),
+                SummaryPageKey::new(&republished, tile, family),
+                "{family:?} was incorrectly keyed by root publication"
+            );
+        }
+
+        let original_page = SummarySemanticPage::build(
+            SummaryPageKey::new(&root, tile, SummaryPageFamily::Depth),
+            &root,
+            None,
+            &ledger,
+            ReservationKind::Normal,
+            6,
+        )
+        .unwrap();
+        assert!(validate_key(original_page.key(), &republished, None, None).is_ok());
+    }
+
+    #[test]
+    fn unrelated_summary_settings_do_not_rekey_depth_pages() {
+        let ledger = AllocationLedger::new(64 << 20, 0);
+        let (evidence, root) = exact_authority(&ledger);
+        let tile = root.depth_tiles()[0].tile();
+        let contract = SummaryContract {
+            minimum_junction_flank: 2,
+            ..root.contract()
+        };
+        let junction = ExactJunctionSummaryTile::build(
+            &evidence,
+            tile,
+            100,
+            contract.junctions(),
+            Some(1_000),
+            &ledger,
+            ReservationKind::Normal,
+            8,
+        )
+        .unwrap();
+        let changed = ExactSummaryRoot::build(
+            SummaryRevision::new(RevisionFingerprint::new(82, 83)),
+            root.evidence_revision(),
+            root.source_revision(),
+            root.record_contract(),
+            contract,
+            root.prepared_interval(),
+            root.depth_tiles().to_vec(),
+            root.allele_tiles().to_vec(),
+            vec![junction],
+            root.pair_tiles().to_vec(),
+            root.filter_tiles().to_vec(),
+            root.modification_tiles().to_vec(),
+            &ledger,
+            ReservationKind::Normal,
+            9,
+        )
+        .unwrap();
+
+        assert_eq!(
+            SummaryPageKey::new(&root, tile, SummaryPageFamily::Depth),
+            SummaryPageKey::new(&changed, tile, SummaryPageFamily::Depth)
+        );
+        assert_ne!(
+            SummaryPageKey::new(&root, tile, SummaryPageFamily::Junctions),
+            SummaryPageKey::new(&changed, tile, SummaryPageFamily::Junctions)
+        );
+    }
+
+    #[test]
+    fn reference_revision_is_an_allele_only_page_dependency() {
+        let ledger = AllocationLedger::new(32 << 20, 0);
+        let root = exact_root(&ledger);
+        let tile = root.depth_tiles()[0].tile();
+        let first = ReferenceRevision::new(RevisionFingerprint::new(88, 89));
+        let second = ReferenceRevision::new(RevisionFingerprint::new(90, 91));
+
+        for family in [
+            SummaryPageFamily::Depth,
+            SummaryPageFamily::Alleles,
+            SummaryPageFamily::Junctions,
+            SummaryPageFamily::Modifications,
+            SummaryPageFamily::Pairs,
+            SummaryPageFamily::FilterProvenance,
+        ] {
+            let first =
+                SummaryPageKey::new_with_dependencies(&root, tile, family, Some(first), None);
+            let second =
+                SummaryPageKey::new_with_dependencies(&root, tile, family, Some(second), None);
+            assert_eq!(
+                first == second,
+                family != SummaryPageFamily::Alleles,
+                "unexpected reference dependency for {family:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_derived_lane_is_a_raw_camera_independent_semantic_page() {
         let ledger = AllocationLedger::new(32 << 20, 0);
@@ -793,6 +1958,142 @@ mod tests {
     }
 
     #[test]
+    fn allele_page_captures_exact_reference_authority_without_retaining_the_fasta_slice() {
+        let ledger = AllocationLedger::new(32 << 20, 0);
+        let root = exact_root(&ledger);
+        let tile = root.depth_tiles()[0].tile();
+        let interval = root.depth_tiles()[0].depth().interval();
+        let contig_length = interval.end().saturating_add(2);
+        let revision = ReferenceRevision::new(RevisionFingerprint::new(90, 91));
+        let reference_interval = GenomicInterval::new(interval.contig(), 0, contig_length).unwrap();
+        let mut bases = vec![b'A'; reference_interval.len() as usize];
+        bases[10] = b'c';
+        let reference = ReferenceSlice {
+            interval: reference_interval,
+            bases,
+        };
+        let key = SummaryPageKey::new_with_dependencies(
+            &root,
+            tile,
+            SummaryPageFamily::Alleles,
+            Some(revision),
+            None,
+        );
+        let page = SummarySemanticPage::build_with_dependencies(
+            key,
+            &root,
+            Some((revision, &reference, contig_length)),
+            None,
+            &ledger,
+            ReservationKind::Normal,
+            19,
+        )
+        .unwrap();
+
+        assert_eq!(page.key().reference_revision(), Some(revision));
+        assert!(page.primitives().iter().any(|primitive| matches!(
+            primitive.component,
+            SummarySemanticComponent::Alleles {
+                reference_base: Some(b'C'),
+                ..
+            }
+        )));
+
+        let mismatched = SummarySemanticPage::build_with_dependencies(
+            key,
+            &root,
+            Some((
+                ReferenceRevision::new(RevisionFingerprint::new(92, 93)),
+                &reference,
+                contig_length,
+            )),
+            None,
+            &ledger,
+            ReservationKind::Normal,
+            20,
+        )
+        .unwrap_err();
+        assert_eq!(mismatched, SummarySemanticPageError::AuthorityMismatch);
+
+        let short_interval = GenomicInterval::new(interval.contig(), 0, interval.end()).unwrap();
+        let short = ReferenceSlice {
+            interval: short_interval,
+            bases: vec![b'A'; short_interval.len() as usize],
+        };
+        assert!(matches!(
+            SummarySemanticPage::build_with_dependencies(
+                key,
+                &root,
+                Some((revision, &short, contig_length)),
+                None,
+                &ledger,
+                ReservationKind::Normal,
+                21,
+            )
+            .unwrap_err(),
+            SummarySemanticPageError::ReferenceCoverageMismatch { .. }
+        ));
+
+        let malformed = ReferenceSlice {
+            interval: reference_interval,
+            bases: vec![b'A'; interval.len() as usize],
+        };
+        assert!(matches!(
+            SummarySemanticPage::build_with_dependencies(
+                key,
+                &root,
+                Some((revision, &malformed, contig_length)),
+                None,
+                &ledger,
+                ReservationKind::Normal,
+                22,
+            )
+            .unwrap_err(),
+            SummarySemanticPageError::ReferenceBaseCoverageMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn allele_reference_context_requires_two_exact_neighbors_and_matches_legacy_contexts() {
+        let contig = ContigId::new(0);
+        let page = GenomicInterval::new(contig, 100, 120).unwrap();
+        assert_eq!(
+            allele_reference_context_interval(page, 1_000).unwrap(),
+            GenomicInterval::new(contig, 98, 122).unwrap()
+        );
+        assert_eq!(
+            allele_reference_context_interval(GenomicInterval::new(contig, 0, 20).unwrap(), 20)
+                .unwrap(),
+            GenomicInterval::new(contig, 0, 20).unwrap()
+        );
+
+        let interval = GenomicInterval::new(contig, 98, 122).unwrap();
+        let reference = ReferenceSlice {
+            interval,
+            bases: b"AAACGACAGACATAGCATAAAAAA".to_vec(),
+        };
+        for position in 100..120 {
+            let captured = SummaryAlleleReferenceContext::capture(&reference, position);
+            for context in [
+                BisulfiteContext::Cg,
+                BisulfiteContext::Chg,
+                BisulfiteContext::Chh,
+                BisulfiteContext::Hcg,
+                BisulfiteContext::Gch,
+                BisulfiteContext::Wcg,
+            ] {
+                for reverse in [false, true] {
+                    assert_eq!(
+                        captured.matches(reverse, context),
+                        bisulfite_context_matches(&reference, position, reverse, context),
+                        "position={position}, reverse={reverse}, context={context:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn stale_summary_key_cannot_publish_against_another_root() {
         let ledger = AllocationLedger::new(64 << 20, 0);
         let first = exact_root(&ledger);
@@ -802,10 +2103,10 @@ mod tests {
             first.depth_tiles()[0].tile(),
             SummaryPageFamily::Depth,
         );
-        // Both helpers intentionally use the same semantic revisions, proving compatible roots
-        // can share a key; changing the revision makes staleness explicit.
+        // Both helpers intentionally describe compatible content, so they share a key. A family
+        // contract mismatch remains stale even though publication revisions are not content.
         let stale = SummaryPageKey {
-            summary_revision: SummaryRevision::new(RevisionFingerprint::new(99, 100)),
+            family_contract: ContractFingerprint::new(99),
             ..key
         };
         assert_eq!(
@@ -1004,6 +2305,7 @@ mod tests {
             crate::CpuSummaryProjectionOptions::Alleles(crate::CpuAlleleProjectionOptions {
                 minimum_fraction: 0.0,
                 quality_weighted: true,
+                ..Default::default()
             }),
             crate::CpuSummaryProjectionOptions::Junctions(crate::CpuJunctionProjectionOptions {
                 display_mode: rgv_core::JunctionDisplayMode::Expanded,
@@ -1025,7 +2327,18 @@ mod tests {
             .unwrap();
             assert_eq!(frame.family, options.family());
             assert_eq!(frame.covered_interval, Some(interval));
-            assert!(!frame.primitives.is_empty());
+            if options.family() == SummaryPageFamily::Alleles {
+                assert!(
+                    frame.primitives.is_empty(),
+                    "reference-independent allele facts must not be labelled substitutions"
+                );
+            } else {
+                assert!(
+                    !frame.primitives.is_empty(),
+                    "{:?} projection unexpectedly emitted no primitives",
+                    options.family()
+                );
+            }
         }
         assert_eq!(
             ledger.snapshot().unwrap().charged,
@@ -1078,6 +2391,106 @@ mod tests {
             replacement.reads().pages()[0].key(),
             current.reads().pages()[0].key()
         );
+
+        let republished_summaries = republished_exact_root(
+            &summaries,
+            SummaryRevision::new(RevisionFingerprint::new(84, 85)),
+            &ledger,
+        );
+        let republished = store
+            .prepare(
+                &evidence,
+                &republished_summaries,
+                &atlas,
+                presentation,
+                interval,
+                0..1,
+                100,
+                NonZeroU64::new(100).unwrap(),
+                NonZeroU32::new(16).unwrap(),
+                None,
+                ReservationKind::Normal,
+            )
+            .unwrap();
+        assert_eq!(store.summary_page_count(), 6);
+        for original in current.summary_pages() {
+            let reused = republished
+                .snapshot()
+                .summary_pages()
+                .iter()
+                .find(|candidate| candidate.key() == original.key())
+                .expect("republished scene contains every compatible summary family");
+            assert!(
+                Arc::ptr_eq(original, reused),
+                "{:?} page was rebuilt solely because its root was republished",
+                original.key().family()
+            );
+        }
+
+        let reference_revision = ReferenceRevision::new(RevisionFingerprint::new(86, 87));
+        let reference_presentation = PresentationContract {
+            reference: Some(reference_revision),
+            ..presentation
+        };
+        let minimum_reference_interval = GenomicInterval::new(interval.contig(), 0, 102).unwrap();
+        let minimum_reference = ReferenceSlice {
+            interval: minimum_reference_interval,
+            bases: vec![b'A'; minimum_reference_interval.len() as usize],
+        };
+        let wider_reference_interval = GenomicInterval::new(interval.contig(), 0, 150).unwrap();
+        let wider_reference = ReferenceSlice {
+            interval: wider_reference_interval,
+            bases: vec![b'A'; wider_reference_interval.len() as usize],
+        };
+        let mut reference_store = AlignmentPresentationStore::new(ledger.clone());
+        let minimum = reference_store
+            .prepare(
+                &evidence,
+                &summaries,
+                &atlas,
+                reference_presentation,
+                interval,
+                0..1,
+                200,
+                NonZeroU64::new(100).unwrap(),
+                NonZeroU32::new(16).unwrap(),
+                Some(&minimum_reference),
+                ReservationKind::Normal,
+            )
+            .unwrap();
+        let minimum_alleles = minimum
+            .snapshot()
+            .summary_pages()
+            .iter()
+            .find(|page| page.key().family() == SummaryPageFamily::Alleles)
+            .cloned()
+            .unwrap();
+        let wider = reference_store
+            .prepare(
+                &evidence,
+                &summaries,
+                &atlas,
+                reference_presentation,
+                interval,
+                0..1,
+                200,
+                NonZeroU64::new(100).unwrap(),
+                NonZeroU32::new(16).unwrap(),
+                Some(&wider_reference),
+                ReservationKind::Normal,
+            )
+            .unwrap();
+        let wider_alleles = wider
+            .snapshot()
+            .summary_pages()
+            .iter()
+            .find(|page| page.key().family() == SummaryPageFamily::Alleles)
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&minimum_alleles, wider_alleles),
+            "a wider slice of one immutable reference revision must reuse the allele page"
+        );
+        assert_eq!(reference_store.summary_page_count(), 6);
 
         let mut family_store = AlignmentPresentationStore::new(ledger.clone());
         let read_presentation = PresentationContract {

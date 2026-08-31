@@ -162,6 +162,7 @@ impl Viewer {
         self.resolve_landmark_assembly(dictionary, &BTreeMap::new());
     }
 
+    #[cfg(any())]
     pub(crate) fn update_landmark_resolution_from_header(
         &mut self,
         header: &rgv_hts::AlignmentHeaderMetadata,

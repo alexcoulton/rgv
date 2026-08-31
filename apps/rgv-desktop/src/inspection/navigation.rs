@@ -1,4 +1,5 @@
 use super::super::*;
+#[cfg(any())]
 use crate::display::alignment;
 
 impl Viewer {
@@ -202,6 +203,7 @@ impl Viewer {
         Ok((opened, requested))
     }
 
+    #[cfg(any())]
     pub(crate) fn resolve_pending_read_selection(
         &mut self,
         panel_id: PanelId,

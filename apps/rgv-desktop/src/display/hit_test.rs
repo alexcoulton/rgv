@@ -169,7 +169,7 @@ pub(crate) fn alignment_track_at_content_y(
 #[cfg(test)]
 pub(crate) fn alignment_lane_at_screen_y(
     frames: &[TrackFrame],
-    label: &str,
+    alignment_subtrack: AlignmentSubtrack,
     screen_y: f32,
     vertical_scroll: f32,
     annotation_scroll: f32,
@@ -193,7 +193,7 @@ pub(crate) fn alignment_lane_at_screen_y(
             return None;
         }
         frame.subtracks.iter().find_map(|subtrack| {
-            if subtrack.label != label || subtrack.collapsed {
+            if subtrack.alignment_subtrack != Some(alignment_subtrack) || subtrack.collapsed {
                 return None;
             }
             let (scroll, clip_top, frame_bottom) = if annotation_frame {

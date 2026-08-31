@@ -1073,6 +1073,15 @@ impl<C> AlignmentSourceActorSchedule<C> {
         self.desired_foreground.get(&owner).map(|slot| &slot.intent)
     }
 
+    /// Whether this owner's exact latest foreground intent is queued or actively decoding. This
+    /// is a constant-time liveness observation; it does not inspect evidence or cache records.
+    #[must_use]
+    pub fn foreground_pending_for(&self, owner: SourceOwnerId) -> bool {
+        self.desired_foreground.get(&owner).is_some_and(|slot| {
+            self.satisfied_foreground.get(&owner) != Some(&slot.intent.sequence)
+        })
+    }
+
     #[must_use]
     pub fn desired_speculation(&self) -> Option<&AlignmentSourceIntent> {
         self.desired_speculation.as_ref()

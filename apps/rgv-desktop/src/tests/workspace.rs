@@ -4,16 +4,384 @@ use crate::display::navigation_preview::{
 };
 use crate::display::panel_display_rebuild_allowed;
 use crate::workspace::alignment_management::{
-    alignment_scene_frame_for_ui_against_retained_interval,
-    alignment_scene_intervals_share_authority,
+    alignment_gpu_bundle_error_is_deferred, alignment_read_camera_capture_error_is_deferred,
+    alignment_scene_covered_clip, alignment_scene_frame_for_ui_against_retained_interval,
+    alignment_scene_intervals_share_authority, alignment_scene_staging_frame_is_current,
+    alignment_summary_camera_capture_error_is_deferred,
 };
 use crate::workspace::queries::{
     AlignmentReferenceLanePlan, AlignmentReferenceLaneRequirement, AlignmentSceneFrameSettlement,
-    alignment_scene_event_token_is_current, alignment_scene_frame_is_current,
-    alignment_scene_frame_settlement, alignment_scene_refusal_is_current,
+    alignment_scene_budget_event_is_current, alignment_scene_event_token_is_current,
+    alignment_scene_frame_is_current, alignment_scene_frame_settlement,
+    alignment_scene_pressure_is_current, alignment_scene_pressure_preserves_visible_epoch,
+    alignment_scene_pressure_requires_resume, alignment_scene_refusal_is_current,
     plan_alignment_reference_lanes, reference_dependency_is_settled,
     reference_failure_matches_requirement, reference_query_completion_matches,
 };
+
+fn alignment_publication_target(
+    viewport: Viewport,
+    workspace_layout_revision: u64,
+    surface_size: [u32; 2],
+    scale_factor: f64,
+    row_scroll: f64,
+    reads_visible: bool,
+    coverage_visible: bool,
+) -> AlignmentSceneTargetIdentity {
+    let clip = CpuClipRect {
+        x: 12.0,
+        y: 30.0,
+        width: viewport.pixel_width(),
+        height: 80.0,
+    };
+    let read_camera = reads_visible
+        .then(|| AlignmentCamera::from_viewport(viewport, row_scroll, 8.0, 7.0, clip).unwrap());
+    let preparation_camera = read_camera.map_or_else(
+        || AlignmentSceneCamera::without_visible_rows(viewport),
+        AlignmentSceneCamera::from,
+    );
+    let derived_lanes = coverage_visible
+        .then_some(AlignmentDerivedLaneTargetIdentity {
+            kind: AlignmentDerivedLaneKind::Coverage,
+            clip: CpuClipRect {
+                x: 12.0,
+                y: 10.0,
+                width: viewport.pixel_width(),
+                height: 20.0,
+            },
+        })
+        .into_iter()
+        .collect();
+    AlignmentSceneTargetIdentity {
+        workspace_layout_revision,
+        surface_size,
+        scale_factor,
+        panels: vec![AlignmentPanelTargetIdentity {
+            panel_id: PanelId::new(1),
+            viewport,
+            lanes: vec![AlignmentLaneTargetIdentity {
+                track_id: TrackId::new(2),
+                preparation_camera,
+                read_camera,
+                derived_lanes,
+            }],
+        }],
+    }
+}
+
+#[test]
+fn publication_authority_separates_same_target_failure_from_changed_target_failure() {
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+        100.0,
+    )
+    .unwrap();
+    let target = alignment_publication_target(viewport, 4, [1_200, 800], 2.0, 3.5, true, true);
+    let mut authority = AlignmentScenePublicationAuthority::default();
+
+    let published = authority.begin_attempt(&target);
+    assert_eq!(published.target_revision, 1);
+    assert_eq!(published.sequence, 1);
+    assert!(published.target_changed);
+    assert!(authority.authorizes_target(published.target_revision));
+    assert!(authority.commit_attempt(&published));
+    assert!(authority.authorizes_target(published.target_revision));
+
+    // Model a failed hover/selection or same-target content refresh. The new attempt is distinct,
+    // but the previously published target remains exact and therefore remains renderable/pickable.
+    let failed_same_target = authority.begin_attempt(&target);
+    assert_eq!(
+        failed_same_target.target_revision,
+        published.target_revision
+    );
+    assert_eq!(failed_same_target.sequence, 2);
+    assert!(!failed_same_target.target_changed);
+    assert!(authority.authorizes_target(published.target_revision));
+    assert!(alignment_gpu_sequences_match_attempt(
+        published.sequence,
+        Some(&[published.sequence]),
+        Some(&[published.sequence]),
+    ));
+
+    // A real pan changes the target before its fallible publication starts. If that attempt fails,
+    // the old pixels remain privately owned but cannot claim the new destination.
+    let moved_viewport = viewport.pan_pixels(1.0, 10_000).unwrap();
+    let moved_target =
+        alignment_publication_target(moved_viewport, 4, [1_200, 800], 2.0, 3.5, true, true);
+    let failed_moved_target = authority.begin_attempt(&moved_target);
+    assert_eq!(failed_moved_target.target_revision, 2);
+    assert_eq!(failed_moved_target.sequence, 3);
+    assert!(failed_moved_target.target_changed);
+    assert!(!authority.authorizes_target(published.target_revision));
+    assert!(authority.authorizes_target(failed_moved_target.target_revision));
+
+    // A subsequent success for that same moved target gets a newer publication sequence without
+    // manufacturing yet another camera revision.
+    let published_moved_target = authority.begin_attempt(&moved_target);
+    assert_eq!(published_moved_target.target_revision, 2);
+    assert_eq!(published_moved_target.sequence, 4);
+    assert!(published_moved_target.target_changed);
+    assert!(!authority.commit_attempt(&failed_moved_target));
+    assert!(authority.commit_attempt(&published_moved_target));
+    assert!(authority.authorizes_target(published_moved_target.target_revision));
+    assert!(alignment_gpu_sequences_match_attempt(
+        published_moved_target.sequence,
+        Some(&[published_moved_target.sequence]),
+        Some(&[published_moved_target.sequence]),
+    ));
+    assert!(!alignment_gpu_sequences_match_attempt(
+        published_moved_target.sequence,
+        Some(&[failed_moved_target.sequence]),
+        Some(&[published_moved_target.sequence]),
+    ));
+}
+
+#[test]
+fn vertical_camera_change_preserves_row_target_but_genomic_pan_does_not() {
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+        100.0,
+    )
+    .unwrap();
+    let committed = alignment_publication_target(viewport, 4, [1_200, 800], 2.0, 0.0, true, true);
+    let vertically_scrolled =
+        alignment_publication_target(viewport, 4, [1_200, 800], 2.0, 90.0, true, true);
+    let panned = alignment_publication_target(
+        viewport.pan_pixels(1.0, 10_000).unwrap(),
+        4,
+        [1_200, 800],
+        2.0,
+        90.0,
+        true,
+        true,
+    );
+    let mut authority = AlignmentScenePublicationAuthority::default();
+    let first = authority.begin_attempt(&committed);
+    assert!(authority.commit_attempt(&first));
+
+    authority.begin_attempt(&vertically_scrolled);
+    assert!(authority.committed_row_target_matches_desired(PanelId::new(1), TrackId::new(2)));
+
+    authority.begin_attempt(&panned);
+    assert!(!authority.committed_row_target_matches_desired(PanelId::new(1), TrackId::new(2)));
+}
+
+#[test]
+fn returning_to_the_committed_target_reauthorizes_it_without_reusing_failed_target_ids() {
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+        100.0,
+    )
+    .unwrap();
+    let committed = alignment_publication_target(viewport, 4, [1_200, 800], 2.0, 0.0, true, true);
+    let moved = alignment_publication_target(
+        viewport.pan_pixels(1.0, 10_000).unwrap(),
+        4,
+        [1_200, 800],
+        2.0,
+        0.0,
+        true,
+        true,
+    );
+    let resized = alignment_publication_target(viewport, 4, [1_201, 800], 2.0, 0.0, true, true);
+    let mut authority = AlignmentScenePublicationAuthority::default();
+    let first = authority.begin_attempt(&committed);
+    assert!(authority.commit_attempt(&first));
+
+    let failed_moved = authority.begin_attempt(&moved);
+    assert_eq!(failed_moved.target_revision, 2);
+    assert!(!authority.authorizes_target(first.target_revision));
+
+    let returned = authority.begin_attempt(&committed);
+    assert_eq!(returned.target_revision, first.target_revision);
+    assert!(authority.authorizes_target(first.target_revision));
+
+    let later_changed = authority.begin_attempt(&resized);
+    assert_eq!(later_changed.target_revision, 3);
+    assert_ne!(later_changed.target_revision, failed_moved.target_revision);
+}
+
+#[test]
+fn staging_capture_requires_the_exact_desired_request_and_camera_pair() {
+    let first = AlignmentSceneCamera::without_visible_rows(
+        Viewport::new(
+            GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+            800.0,
+        )
+        .unwrap(),
+    );
+    let second = AlignmentSceneCamera::without_visible_rows(
+        Viewport::new(
+            GenomicInterval::new(ContigId::new(0), 110, 210).unwrap(),
+            800.0,
+        )
+        .unwrap(),
+    );
+    let first_token = AlignmentSceneRequestToken::new(41);
+    let second_token = AlignmentSceneRequestToken::new(42);
+
+    assert!(!alignment_scene_staging_frame_is_current(
+        Some(second_token),
+        Some(first_token),
+        Some(second),
+        first,
+        second,
+    ));
+    assert!(!alignment_scene_staging_frame_is_current(
+        Some(second_token),
+        Some(second_token),
+        Some(second),
+        second,
+        first,
+    ));
+    assert!(alignment_scene_staging_frame_is_current(
+        Some(second_token),
+        Some(second_token),
+        Some(second),
+        second,
+        second,
+    ));
+}
+
+#[test]
+fn active_replacement_transition_is_deferred_in_both_ledger_error_forms() {
+    assert!(alignment_gpu_bundle_error_is_deferred(
+        &AllocationBundleError::ReplacementTransitionActive { bundle_id: 17 }
+    ));
+    assert!(alignment_gpu_bundle_error_is_deferred(
+        &AllocationBundleError::Ledger(LedgerError::ReplacementTransitionActive { bundle_id: 18 })
+    ));
+    assert!(alignment_gpu_bundle_error_is_deferred(
+        &AllocationBundleError::PolicyRevisionChanged {
+            planned: 1,
+            current: 2,
+        }
+    ));
+}
+
+#[test]
+fn camera_capture_defers_only_typed_transient_ledger_contention() {
+    let read_transition =
+        AlignmentGpuCameraCaptureError::Prepare(AlignmentGpuPrepareError::Ledger(
+            LedgerError::ReplacementTransitionActive { bundle_id: 21 },
+        ));
+    let summary_transient = AlignmentSummaryGpuCameraCaptureError::Prepare(
+        AlignmentSummaryGpuPrepareError::Ledger(LedgerError::TransientBudgetExceeded {
+            class: rgv_alignment_scene::TransientResourceClass::GpuDriver,
+            requested: 64,
+            transient: 256,
+            limit: 1_024,
+        }),
+    );
+    let label_projection_transient =
+        AlignmentGpuCameraCaptureError::Prepare(AlignmentGpuPrepareError::LabelProjection(
+            CpuProjectionError::Ledger(LedgerError::TransientBudgetExceeded {
+                class: rgv_alignment_scene::TransientResourceClass::GpuUpload,
+                requested: 64,
+                transient: 256,
+                limit: 1_024,
+            }),
+        ));
+    assert!(alignment_read_camera_capture_error_is_deferred(
+        &read_transition
+    ));
+    assert!(alignment_summary_camera_capture_error_is_deferred(
+        &summary_transient
+    ));
+    assert!(alignment_read_camera_capture_error_is_deferred(
+        &label_projection_transient
+    ));
+
+    let permanent_read =
+        AlignmentGpuCameraCaptureError::Prepare(AlignmentGpuPrepareError::InvalidFrameGeometry);
+    let poisoned_summary = AlignmentSummaryGpuCameraCaptureError::Prepare(
+        AlignmentSummaryGpuPrepareError::Ledger(LedgerError::Poisoned),
+    );
+    let intrinsically_oversized = AlignmentGpuCameraCaptureError::Prepare(
+        AlignmentGpuPrepareError::Ledger(LedgerError::BudgetExceeded {
+            requested: 2_048,
+            charged: 0,
+            reserved: 0,
+            limit: 1_024,
+        }),
+    );
+    let busy_slot = AlignmentGpuCameraCaptureError::FrameSlotBusy { slots: 2 };
+    let invalid_label_camera = AlignmentGpuCameraCaptureError::Prepare(
+        AlignmentGpuPrepareError::LabelProjection(CpuProjectionError::InvalidCamera),
+    );
+    assert!(!alignment_read_camera_capture_error_is_deferred(
+        &permanent_read
+    ));
+    assert!(!alignment_summary_camera_capture_error_is_deferred(
+        &poisoned_summary
+    ));
+    assert!(!alignment_read_camera_capture_error_is_deferred(
+        &intrinsically_oversized
+    ));
+    assert!(!alignment_read_camera_capture_error_is_deferred(&busy_slot));
+    assert!(!alignment_read_camera_capture_error_is_deferred(
+        &invalid_label_camera
+    ));
+}
+
+#[test]
+fn camera_target_identity_covers_every_gpu_geometry_input() {
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+        100.0,
+    )
+    .unwrap();
+    let base = alignment_publication_target(viewport, 4, [1_200, 800], 2.0, 3.5, true, true);
+    let changed = [
+        alignment_publication_target(viewport, 5, [1_200, 800], 2.0, 3.5, true, true),
+        alignment_publication_target(viewport, 4, [1_201, 800], 2.0, 3.5, true, true),
+        alignment_publication_target(viewport, 4, [1_200, 800], 1.5, 3.5, true, true),
+        alignment_publication_target(
+            viewport.pan_pixels(0.5, 10_000).unwrap(),
+            4,
+            [1_200, 800],
+            2.0,
+            3.5,
+            true,
+            true,
+        ),
+        alignment_publication_target(viewport, 4, [1_200, 800], 2.0, 4.5, true, true),
+        alignment_publication_target(viewport, 4, [1_200, 800], 2.0, 3.5, false, true),
+        alignment_publication_target(viewport, 4, [1_200, 800], 2.0, 3.5, true, false),
+    ];
+    assert!(changed.iter().all(|candidate| candidate != &base));
+}
+
+#[test]
+fn native_alignment_live_clip_owns_only_the_snapshot_covered_horizontal_interval() {
+    let contig = ContigId::new(0);
+    let viewport = Viewport::new(GenomicInterval::new(contig, 100, 200).unwrap(), 1_000.0).unwrap();
+    let clip = CpuClipRect {
+        x: 10.0,
+        y: 20.0,
+        width: 1_000.0,
+        height: 80.0,
+    };
+    let covered = GenomicInterval::new(contig, 120, 180).unwrap();
+
+    assert_eq!(
+        alignment_scene_covered_clip(viewport, clip, covered),
+        Some(CpuClipRect {
+            x: 210.0,
+            y: 20.0,
+            width: 600.0,
+            height: 80.0,
+        })
+    );
+    assert!(
+        alignment_scene_covered_clip(
+            viewport,
+            clip,
+            GenomicInterval::new(ContigId::new(1), 120, 180).unwrap(),
+        )
+        .is_none()
+    );
+}
 
 #[test]
 fn initial_scene_layout_bootstraps_without_weakening_later_navigation_gates() {
@@ -37,6 +405,223 @@ fn initial_scene_layout_bootstraps_without_weakening_later_navigation_gates() {
         NavigationPresentationPhase::Settled,
         true,
     ));
+}
+
+#[test]
+fn scene_coverage_options_share_one_scale_and_require_reference_for_substitutions() {
+    let filters = SessionFilters {
+        minimum_allele_fraction: 0.37,
+        quality_weighted_alleles: false,
+        coverage_scale_maximum: Some(321),
+        coverage_scale_transform: CoverageScaleTransform::SquareRoot,
+        show_coverage_center_line: false,
+        ..SessionFilters::default()
+    };
+    let without_reference = alignment_scene_coverage_lane_options(&filters, false, Some(123));
+    assert!(without_reference.alleles.is_none());
+    assert_eq!(without_reference.depth.scale_maximum, Some(321));
+    assert_eq!(
+        without_reference.depth.transform,
+        CoverageScaleTransform::SquareRoot
+    );
+    assert!(!without_reference.depth.show_center_line);
+    assert_eq!(without_reference.depth.selected_position, Some(123));
+
+    let with_reference = alignment_scene_coverage_lane_options(&filters, true, Some(123));
+    let alleles = with_reference.alleles.unwrap();
+    assert!((alleles.minimum_fraction - 0.37).abs() < 1.0e-6);
+    assert!(!alleles.quality_weighted);
+    assert_eq!(alleles.scale_maximum, with_reference.depth.scale_maximum);
+    assert_eq!(alleles.transform, with_reference.depth.transform);
+    assert_eq!(
+        alleles.interpretation,
+        CoverageAlleleInterpretation::GenericReferenceAware
+    );
+
+    let bisulfite = alignment_scene_coverage_lane_options(
+        &SessionFilters {
+            alignment_color_mode: AlignmentColorMode::Bisulfite(BisulfiteContext::Chh),
+            ..filters
+        },
+        true,
+        None,
+    );
+    assert_eq!(
+        bisulfite.alleles.unwrap().interpretation,
+        CoverageAlleleInterpretation::Bisulfite(BisulfiteContext::Chh)
+    );
+}
+
+#[test]
+fn scene_coverage_and_modification_selection_are_captured_only_for_the_selected_track() {
+    let selected = TrackId::new(11);
+    let other = TrackId::new(12);
+    assert_eq!(
+        alignment_scene_selected_position(Some(selected), selected, Some(123)),
+        Some(123)
+    );
+    assert_eq!(
+        alignment_scene_selected_position(Some(selected), other, Some(123)),
+        None
+    );
+    assert_eq!(
+        alignment_scene_selected_position(None, selected, Some(123)),
+        None
+    );
+    assert_eq!(
+        alignment_scene_selected_position(Some(selected), selected, None),
+        None
+    );
+}
+
+#[test]
+fn scene_sashimi_options_preserve_unresolved_shared_epoch_policy() {
+    let mut filters = SessionFilters {
+        minimum_junction_depth: 17,
+        minimum_junction_flank: 9,
+        junction_display_mode: JunctionDisplayMode::Expanded,
+        sashimi_count_mode: SashimiCountMode::CountsPerMillion,
+        show_junction_labels: false,
+        ..SessionFilters::default()
+    };
+    filters.sashimi_scale_mode = SashimiScaleMode::Shared;
+    assert!(alignment_scene_sashimi_lane_options(&filters, None).is_none());
+    let group = AlignmentCoherenceGroupId::new(42);
+    let shared = alignment_scene_sashimi_lane_options(&filters, Some(group)).unwrap();
+    assert_eq!(shared.scale, AlignmentSashimiScalePolicy::Shared(group));
+    assert_eq!(shared.projection.scale_maximum, None);
+    assert_eq!(shared.projection.minimum_depth, 17);
+    assert_eq!(shared.projection.minimum_flank, 9);
+    assert_eq!(
+        shared.projection.count_mode,
+        SashimiCountMode::CountsPerMillion
+    );
+    assert!(!shared.projection.show_labels);
+
+    filters.sashimi_scale_mode = SashimiScaleMode::Fixed;
+    filters.sashimi_fixed_scale_maximum = 250;
+    let fixed = alignment_scene_sashimi_lane_options(&filters, None).unwrap();
+    assert_eq!(fixed.scale, AlignmentSashimiScalePolicy::Fixed(250.0));
+    assert_eq!(fixed.projection.scale_maximum, Some(250.0));
+}
+
+#[test]
+fn shared_sashimi_units_use_distinct_stable_coherence_groups() {
+    let mut filters = SessionFilters {
+        sashimi_scale_mode: SashimiScaleMode::Shared,
+        sashimi_count_mode: SashimiCountMode::Raw,
+        ..SessionFilters::default()
+    };
+    let raw = alignment_scene_sashimi_group(&filters).unwrap();
+    assert_eq!(raw, ALIGNMENT_SASHIMI_RAW_GROUP);
+    filters.sashimi_count_mode = SashimiCountMode::CountsPerMillion;
+    let cpm = alignment_scene_sashimi_group(&filters).unwrap();
+    assert_eq!(cpm, ALIGNMENT_SASHIMI_CPM_GROUP);
+    assert_ne!(raw, cpm);
+    filters.sashimi_scale_mode = SashimiScaleMode::Automatic;
+    assert_eq!(alignment_scene_sashimi_group(&filters), None);
+}
+
+#[test]
+fn scene_modification_options_capture_style_selection_and_normalized_hidden_codes() {
+    let filters = SessionFilters {
+        modified_base_color_mode: ModifiedBaseColorMode::ModifiedVsUnmodified,
+        hidden_modification_codes: vec![
+            "m".to_owned(),
+            "CHEBI:76792".to_owned(),
+            "m".to_owned(),
+            "not-a-code".to_owned(),
+        ],
+        ..SessionFilters::default()
+    };
+    let options = alignment_scene_modification_lane_options(&filters, Some(123));
+    assert!(options.projection.probability_weighted);
+    assert_eq!(options.projection.hidden_codes.len(), 2);
+    assert!(
+        options
+            .projection
+            .hidden_codes
+            .contains(&ModificationCode::Letter(b'm'))
+    );
+    assert!(
+        options
+            .projection
+            .hidden_codes
+            .contains(&ModificationCode::Chebi(76_792))
+    );
+    assert_eq!(
+        options.color_mode,
+        ModifiedBaseColorMode::ModifiedVsUnmodified
+    );
+    assert_eq!(options.selected_position, Some(123));
+}
+
+#[test]
+fn scene_lane_clips_use_final_pane_layout_and_stable_subtrack_identity() {
+    let track_id = TrackId::new(91);
+    let mut annotation = ui::PaneLayoutSnapshot {
+        channel: ui::TrackPane::Annotation,
+        pane_rect: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 100.0)),
+        content_bottom: 150.0,
+        scroll_points: 0.0,
+        stack_scroll_points: 0.0,
+        items: vec![ui::PaneItemLayout {
+            id: PresentationNodeId::Track {
+                channel: ui::TrackPane::Annotation,
+                track_id,
+            },
+            frame: TrackFrame {
+                key: TrackFrameKey::Alignment(track_id),
+                channel: ui::TrackPane::Annotation,
+                name: "RNA".to_owned(),
+                kind: TrackKind::Alignment,
+                source_label: None,
+                top: 20.0,
+                bottom: 150.0,
+                visible: true,
+                collapsed: false,
+                frozen_bottom: None,
+                subtracks: vec![TrackSubtrack {
+                    alignment_subtrack: Some(ui::AlignmentSubtrack::Coverage),
+                    // Deliberately not the canonical label: semantics must come from the identity.
+                    label: "Depth profile".to_owned(),
+                    detail: None,
+                    top: 50.0,
+                    bottom: 120.0,
+                    collapsed: false,
+                    composite_member: None,
+                }],
+            },
+            row_rect: egui::Rect::ZERO,
+            header_rect: egui::Rect::ZERO,
+            content_rect: None,
+            clip_rect: egui::Rect::ZERO,
+            desired_content_visible: true,
+            effective_content_visible: true,
+        }],
+    };
+    annotation.reproject_scroll(10.0);
+    let captures = alignment_scene_derived_lane_captures(
+        &annotation,
+        track_id,
+        168.0,
+        632.0,
+        &SessionFilters::default(),
+        true,
+        None,
+        Some(117),
+        None,
+    )
+    .unwrap();
+    assert_eq!(captures.len(), 1);
+    assert_eq!(captures[0].clip.x, 168.0);
+    assert_eq!(captures[0].clip.width, 632.0);
+    assert_eq!(captures[0].clip.y, 40.0);
+    assert_eq!(captures[0].clip.height, 60.0);
+    let AlignmentDerivedLaneOptions::Coverage(options) = captures[0].options else {
+        panic!("expected coverage capture");
+    };
+    assert_eq!(options.depth.selected_position, Some(117));
 }
 
 #[test]
@@ -119,21 +704,23 @@ fn stripping_a_discontinuous_snapshot_preserves_the_new_camera_reference_require
         revision,
         horizon: bap1,
     };
-    let camera = AlignmentCamera::new(
-        bap1,
-        0.0,
-        7.0,
-        5.0,
-        CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 1_000.0,
-            height: 500.0,
-        },
-    )
-    .unwrap();
+    let camera = AlignmentSceneCamera::from(
+        AlignmentCamera::new(
+            bap1,
+            0.0,
+            7.0,
+            5.0,
+            CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1_000.0,
+                height: 500.0,
+            },
+        )
+        .unwrap(),
+    );
     let frame = AlignmentCoordinatorFrame {
-        camera,
+        camera: camera.into(),
         camera_sequence: 2,
         snapshot: None,
         row_activity: None,
@@ -142,6 +729,7 @@ fn stripping_a_discontinuous_snapshot_preserves_the_new_camera_reference_require
         covered_rows: 0..10,
         reference_requirement: requirement,
         scene_contracts_current: true,
+        reference_products_current: false,
         individual_reads: AlignmentIndividualReadCapability::Pending,
         vertical_residency: AlignmentVerticalResidency::ViewportBounded,
     };
@@ -173,7 +761,7 @@ fn stripping_a_discontinuous_snapshot_preserves_only_a_camera_covering_refusal()
     let reference_revision =
         ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
     let frame = AlignmentCoordinatorFrame {
-        camera,
+        camera: camera.into(),
         camera_sequence: 3,
         snapshot: None,
         row_activity: None,
@@ -185,6 +773,7 @@ fn stripping_a_discontinuous_snapshot_preserves_only_a_camera_covering_refusal()
             horizon: bap1,
         },
         scene_contracts_current: true,
+        reference_products_current: false,
         individual_reads: AlignmentIndividualReadCapability::Refused {
             target: GenomicInterval::new(ContigId::new(2), 52_390_000, 52_420_000).unwrap(),
             complete_read_limit: 50_000,
@@ -217,7 +806,7 @@ fn stripping_a_discontinuous_snapshot_preserves_only_a_camera_covering_refusal()
     );
     assert_eq!(
         alignment_scene_frame_settlement(&normalized_stale),
-        AlignmentSceneFrameSettlement::WaitingForReference
+        AlignmentSceneFrameSettlement::WaitingForScene
     );
 }
 
@@ -238,19 +827,21 @@ fn overview_resolution_is_index_only_and_regional_resolution_requests_records() 
 #[test]
 fn browsing_buffer_setting_controls_horizontal_and_vertical_scene_margins() {
     let interval = GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap();
-    let camera = AlignmentCamera::new(
-        interval,
-        0.0,
-        10.0,
-        8.0,
-        CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 1_000.0,
-            height: 100.0,
-        },
-    )
-    .unwrap();
+    let camera = AlignmentSceneCamera::from(
+        AlignmentCamera::new(
+            interval,
+            0.0,
+            10.0,
+            8.0,
+            CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1_000.0,
+                height: 100.0,
+            },
+        )
+        .unwrap(),
+    );
     let visible_rows = u32::try_from(camera.visible_rows().len()).unwrap();
 
     let disabled = alignment_scene_preparation_policy(0, camera);
@@ -282,18 +873,42 @@ fn projection_is_checking_until_the_current_generation_settles() {
     let mut projection = AlignmentPanelProjection::default();
     assert!(projection.query_is_checking());
 
-    projection.settled_generation = Some(projection.clock.current().get());
+    projection.navigation.begin(
+        projection.clock.current().get(),
+        AlignmentSceneRequestToken::new(1),
+        "test target",
+    );
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::Running, "source owns target");
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::CandidateReady, "candidate ready");
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::Committed, "candidate committed");
     assert!(projection.query_is_current());
 
     projection.clock.advance();
     assert!(projection.query_is_checking());
     assert!(!projection.query_is_current());
 
-    projection.pending_query = true;
-    projection.settled_generation = Some(projection.clock.current().get());
+    projection.navigation.begin(
+        projection.clock.current().get(),
+        AlignmentSceneRequestToken::new(2),
+        "new target",
+    );
     assert!(projection.query_is_checking());
 
-    projection.pending_query = false;
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::Running, "source owns target");
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::CandidateReady, "candidate ready");
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::Committed, "committed");
     assert!(projection.query_is_current());
 }
 
@@ -301,6 +916,11 @@ fn projection_is_checking_until_the_current_generation_settles() {
 fn terminal_scene_error_settles_generation_without_discarding_scene_authority() {
     let mut projection = AlignmentPanelProjection::default();
     projection.advance_query_generation();
+    projection.navigation.begin(
+        projection.clock.current().get(),
+        AlignmentSceneRequestToken::new(7),
+        "test target",
+    );
     projection.pending_query = true;
     projection.begin_checking(Instant::now());
     projection.scene_owner = Some(SourceOwnerId::new(7));
@@ -317,8 +937,15 @@ fn terminal_scene_error_settles_generation_without_discarding_scene_authority() 
 #[test]
 fn checking_notice_is_debounced_without_delaying_the_truth_state() {
     let mut projection = AlignmentPanelProjection::default();
-    projection.settled_generation = Some(projection.clock.current().get());
     projection.clock.advance();
+    projection.navigation.begin(
+        projection.clock.current().get(),
+        AlignmentSceneRequestToken::new(1),
+        "test target",
+    );
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::Running, "source owns target");
     let started = Instant::now();
     projection.begin_checking(started);
 
@@ -335,7 +962,12 @@ fn checking_notice_is_debounced_without_delaying_the_truth_state() {
     ));
 
     projection.finish_checking();
-    projection.settled_generation = Some(projection.clock.current().get());
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::CandidateReady, "candidate ready");
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::Committed, "committed");
     assert!(projection.query_is_current());
     assert!(!projection.checking_notice_visible);
     assert!(projection.checking_started.is_none());
@@ -1366,32 +1998,36 @@ fn scene_frame_acceptance_waits_for_the_exact_transaction_camera() {
     let stale = AlignmentSceneRequestToken::new(11);
     let interval = GenomicInterval::new(ContigId::new(6), 100, 200).unwrap();
     let shifted = GenomicInterval::new(ContigId::new(6), 150, 250).unwrap();
-    let camera = AlignmentCamera::new(
-        interval,
-        0.0,
-        7.0,
-        5.0,
-        CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 1_000.0,
-            height: 500.0,
-        },
-    )
-    .unwrap();
-    let shifted_camera = AlignmentCamera::new(
-        shifted,
-        0.0,
-        7.0,
-        5.0,
-        CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 1_000.0,
-            height: 500.0,
-        },
-    )
-    .unwrap();
+    let camera = AlignmentSceneCamera::from(
+        AlignmentCamera::new(
+            interval,
+            0.0,
+            7.0,
+            5.0,
+            CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1_000.0,
+                height: 500.0,
+            },
+        )
+        .unwrap(),
+    );
+    let shifted_camera = AlignmentSceneCamera::from(
+        AlignmentCamera::new(
+            shifted,
+            0.0,
+            7.0,
+            5.0,
+            CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1_000.0,
+                height: 500.0,
+            },
+        )
+        .unwrap(),
+    );
 
     assert!(alignment_scene_frame_is_current(
         Some(current),
@@ -1425,32 +2061,36 @@ fn refusal_acceptance_requires_the_exact_request_camera_and_covering_horizon() {
     let stale = AlignmentSceneRequestToken::new(11);
     let interval = GenomicInterval::new(ContigId::new(6), 100, 200).unwrap();
     let shifted = GenomicInterval::new(ContigId::new(6), 150, 250).unwrap();
-    let camera = AlignmentCamera::new(
-        interval,
-        0.0,
-        7.0,
-        5.0,
-        CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 1_000.0,
-            height: 500.0,
-        },
-    )
-    .unwrap();
-    let shifted_camera = AlignmentCamera::new(
-        shifted,
-        0.0,
-        7.0,
-        5.0,
-        CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 1_000.0,
-            height: 500.0,
-        },
-    )
-    .unwrap();
+    let camera = AlignmentSceneCamera::from(
+        AlignmentCamera::new(
+            interval,
+            0.0,
+            7.0,
+            5.0,
+            CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1_000.0,
+                height: 500.0,
+            },
+        )
+        .unwrap(),
+    );
+    let shifted_camera = AlignmentSceneCamera::from(
+        AlignmentCamera::new(
+            shifted,
+            0.0,
+            7.0,
+            5.0,
+            CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1_000.0,
+                height: 500.0,
+            },
+        )
+        .unwrap(),
+    );
     let horizon = GenomicInterval::new(ContigId::new(6), 50, 250).unwrap();
     let short = GenomicInterval::new(ContigId::new(6), 125, 175).unwrap();
 
@@ -1481,6 +2121,110 @@ fn refusal_acceptance_requires_the_exact_request_camera_and_covering_horizon() {
         Some(camera),
         camera,
         short,
+    ));
+}
+
+#[test]
+fn resource_pressure_retry_requires_the_current_token_and_a_target_covering_the_live_camera() {
+    let current = AlignmentSceneRequestToken::new(12);
+    let stale = AlignmentSceneRequestToken::new(11);
+    let interval = GenomicInterval::new(ContigId::new(6), 100, 200).unwrap();
+    let camera = AlignmentSceneCamera::from(
+        AlignmentCamera::new(
+            interval,
+            0.0,
+            7.0,
+            5.0,
+            CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1_000.0,
+                height: 500.0,
+            },
+        )
+        .unwrap(),
+    );
+    let horizon = GenomicInterval::new(ContigId::new(6), 50, 250).unwrap();
+    let short = GenomicInterval::new(ContigId::new(6), 125, 175).unwrap();
+
+    assert!(alignment_scene_pressure_is_current(
+        Some(current),
+        current,
+        Some(camera),
+        horizon,
+    ));
+    assert!(!alignment_scene_pressure_is_current(
+        Some(current),
+        stale,
+        Some(camera),
+        horizon,
+    ));
+    assert!(!alignment_scene_pressure_is_current(
+        Some(current),
+        current,
+        Some(camera),
+        short,
+    ));
+    assert!(!alignment_scene_pressure_is_current(
+        Some(current),
+        current,
+        None,
+        horizon,
+    ));
+}
+
+#[test]
+fn vertical_presentation_pressure_is_resumed_even_though_its_work_is_speculative() {
+    assert!(alignment_scene_pressure_requires_resume(
+        AlignmentSceneEngineOperation::PumpPresentation,
+        SourceIntentKind::Speculative,
+    ));
+    assert!(!alignment_scene_pressure_requires_resume(
+        AlignmentSceneEngineOperation::PumpSource,
+        SourceIntentKind::Speculative,
+    ));
+    assert!(!alignment_scene_pressure_requires_resume(
+        AlignmentSceneEngineOperation::PrewarmPresentation,
+        SourceIntentKind::Speculative,
+    ));
+    assert!(alignment_scene_pressure_requires_resume(
+        AlignmentSceneEngineOperation::PumpSource,
+        SourceIntentKind::Foreground,
+    ));
+}
+
+#[test]
+fn only_infeasible_speculative_presentation_pressure_preserves_the_visible_epoch() {
+    assert!(alignment_scene_pressure_preserves_visible_epoch(
+        AlignmentSceneEngineOperation::PumpPresentation,
+        SourceIntentKind::Speculative,
+        AlignmentSceneResourcePressureDisposition::Infeasible,
+    ));
+    assert!(!alignment_scene_pressure_preserves_visible_epoch(
+        AlignmentSceneEngineOperation::PumpPresentation,
+        SourceIntentKind::Speculative,
+        AlignmentSceneResourcePressureDisposition::Retryable,
+    ));
+    assert!(!alignment_scene_pressure_preserves_visible_epoch(
+        AlignmentSceneEngineOperation::PumpSource,
+        SourceIntentKind::Speculative,
+        AlignmentSceneResourcePressureDisposition::Infeasible,
+    ));
+    assert!(!alignment_scene_pressure_preserves_visible_epoch(
+        AlignmentSceneEngineOperation::PumpPresentation,
+        SourceIntentKind::Foreground,
+        AlignmentSceneResourcePressureDisposition::Infeasible,
+    ));
+}
+
+#[test]
+fn budget_pressure_reducer_accepts_only_the_latest_workspace_and_source_value() {
+    assert!(alignment_scene_budget_event_is_current(2_048, 2_048, 2_048));
+    assert!(!alignment_scene_budget_event_is_current(
+        4_096, 2_048, 2_048
+    ));
+    assert!(!alignment_scene_budget_event_is_current(
+        4_096, 4_096, 2_048
     ));
 }
 

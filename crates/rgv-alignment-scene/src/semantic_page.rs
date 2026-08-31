@@ -2535,12 +2535,10 @@ fn validate_style_capabilities(
     if quality_required && evidence.payload().qualities() != CapabilityRequirement::Required {
         return Err(SemanticPageError::StyleQualityPayloadRequired);
     }
-    if family == AlignmentPageFamily::SpecialistOverlay
-        && matches!(style.color_mode, AlignmentColorMode::Bisulfite(_))
-        && presentation.reference.is_none()
-    {
-        return Err(SemanticPageError::StyleReferenceRequired);
-    }
+    // Reference-backed specialist modes deliberately remain buildable without a FASTA slice.
+    // Their page emits `SpecialistUnavailable::MissingReference` while independent modified-base
+    // overlays and the core read geometry remain truthful. A later immutable scene upgrades the
+    // same family when the requested reference revision becomes available.
 
     let mut tags = Vec::<[u8; 2]>::new();
     if family == AlignmentPageFamily::ReadGeometry {

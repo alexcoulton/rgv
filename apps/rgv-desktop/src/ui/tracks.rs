@@ -54,16 +54,13 @@ impl AlignmentSubtrack {
             Self::Reads => "Reads",
         }
     }
-
-    fn from_label(label: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|subtrack| subtrack.label() == label)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrackSubtrack {
+    /// Stable semantic identity for alignment-owned lanes. Display labels remain freely mutable
+    /// presentation text and must never determine visibility actions or lane ownership.
+    pub alignment_subtrack: Option<AlignmentSubtrack>,
     pub label: String,
     pub detail: Option<String>,
     pub top: f32,
@@ -1040,6 +1037,7 @@ pub fn paint_vertical_scrollbar(
         camera_viewport_height,
         preview_scroll_fraction,
         overview,
+        false,
     )
 }
 
@@ -1055,6 +1053,7 @@ pub fn paint_read_panel_scrollbar(
     camera_viewport_height: f32,
     preview_scroll_fraction: Option<f32>,
     overview: Option<&ScrollbarOverview>,
+    provisional: bool,
 ) -> ScrollbarInteraction {
     paint_vertical_scrollbar_with_id(
         ui,
@@ -1070,6 +1069,7 @@ pub fn paint_read_panel_scrollbar(
         camera_viewport_height,
         preview_scroll_fraction,
         overview,
+        provisional,
     )
 }
 
@@ -1084,15 +1084,30 @@ fn paint_vertical_scrollbar_with_id(
     camera_viewport_height: f32,
     preview_scroll_fraction: Option<f32>,
     overview: Option<&ScrollbarOverview>,
+    provisional: bool,
 ) -> ScrollbarInteraction {
     let maximum = maximum.max(0.0);
     *offset = offset.clamp(0.0, maximum);
     let response = ui
-        .interact(rect, id, Sense::click_and_drag())
-        .on_hover_cursor(egui::CursorIcon::AllScroll)
-        .on_hover_text(
-            "Read stack · drag up/down to scroll · drag left/right to change read-row density",
-        );
+        .interact(
+            rect,
+            id,
+            if provisional {
+                Sense::hover()
+            } else {
+                Sense::click_and_drag()
+            },
+        )
+        .on_hover_cursor(if provisional {
+            egui::CursorIcon::Wait
+        } else {
+            egui::CursorIcon::AllScroll
+        })
+        .on_hover_text(if provisional {
+            "Read stack extent is updating · previous position shown"
+        } else {
+            "Read stack · drag up/down to scroll · drag left/right to change read-row density"
+        });
     let scroll_percent = if maximum <= f32::EPSILON {
         0.0
     } else {
@@ -1100,13 +1115,13 @@ fn paint_vertical_scrollbar_with_id(
     };
     response.widget_info(|| {
         egui::WidgetInfo::slider(
-            true,
+            !provisional,
             scroll_percent,
             "Read stack overview; arrow up and down scroll, Page Up and Page Down scroll by a page, Home and End reach the read boundaries, arrow left and right change read-row density",
         )
     });
     let mut keyboard_density_pixels = 0.0;
-    if response.has_focus() {
+    if response.has_focus() && !provisional {
         ui.input_mut(|input| {
             if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
                 *offset -= 40.0;
@@ -1128,7 +1143,7 @@ fn paint_vertical_scrollbar_with_id(
         });
         *offset = offset.clamp(0.0, maximum);
     }
-    let pointer_down = response.is_pointer_button_down_on() || response.dragged();
+    let pointer_down = !provisional && (response.is_pointer_button_down_on() || response.dragged());
     let geometry = preview_scroll_fraction.map_or_else(
         || {
             scrollbar_geometry_for_density_in_viewport(
@@ -1177,27 +1192,45 @@ fn paint_vertical_scrollbar_with_id(
         Stroke::new(0.75, Color32::from_gray(95)),
         egui::StrokeKind::Inside,
     );
+    if provisional {
+        painter.rect_filled(
+            geometry.track,
+            0.0,
+            Color32::from_rgba_unmultiplied(245, 247, 250, 150),
+        );
+    }
     painter.rect_filled(
         geometry.thumb,
         1.0,
-        Color32::from_rgba_unmultiplied(
-            45,
-            92,
-            175,
-            if response.hovered() || response.dragged() {
-                52
-            } else {
-                30
-            },
-        ),
+        if provisional {
+            Color32::from_rgba_unmultiplied(110, 116, 124, 42)
+        } else {
+            Color32::from_rgba_unmultiplied(
+                45,
+                92,
+                175,
+                if response.hovered() || response.dragged() {
+                    52
+                } else {
+                    30
+                },
+            )
+        },
     );
     painter.rect_stroke(
         geometry.thumb,
         1.0,
-        Stroke::new(2.0, Color32::from_rgb(45, 92, 175)),
+        Stroke::new(
+            if provisional { 1.0 } else { 2.0 },
+            if provisional {
+                Color32::from_gray(110)
+            } else {
+                Color32::from_rgb(45, 92, 175)
+            },
+        ),
         egui::StrokeKind::Outside,
     );
-    if response.has_focus() {
+    if response.has_focus() && !provisional {
         painter.rect_stroke(
             rect.shrink(1.0),
             1.0,
@@ -2227,7 +2260,7 @@ pub fn paint_track_viewport_chrome_with_sections(
                 continue;
             }
             let alignment_subtrack = match frame.key {
-                TrackFrameKey::Alignment(_) => AlignmentSubtrack::from_label(&subtrack.label),
+                TrackFrameKey::Alignment(_) => subtrack.alignment_subtrack,
                 TrackFrameKey::Reference
                 | TrackFrameKey::Group { .. }
                 | TrackFrameKey::Auxiliary(_) => None,
@@ -2815,14 +2848,20 @@ mod tests {
     }
 
     #[test]
-    fn alignment_subtrack_labels_round_trip_to_gutter_actions() {
-        for subtrack in AlignmentSubtrack::ALL {
-            assert_eq!(
-                AlignmentSubtrack::from_label(subtrack.label()),
-                Some(subtrack)
-            );
-        }
-        assert_eq!(AlignmentSubtrack::from_label("Genes"), None);
+    fn alignment_subtrack_identity_does_not_depend_on_mutable_label_text() {
+        let subtrack = TrackSubtrack {
+            alignment_subtrack: Some(AlignmentSubtrack::Coverage),
+            label: "Renamed signal lane".to_owned(),
+            detail: None,
+            top: 10.0,
+            bottom: 30.0,
+            collapsed: false,
+            composite_member: None,
+        };
+        assert_eq!(
+            subtrack.alignment_subtrack,
+            Some(AlignmentSubtrack::Coverage)
+        );
     }
 
     fn read_frame_with_status(track_id: TrackId) -> TrackFrame {
@@ -2838,6 +2877,7 @@ mod tests {
             collapsed: false,
             frozen_bottom: Some(42.0),
             subtracks: vec![TrackSubtrack {
+                alignment_subtrack: Some(AlignmentSubtrack::Reads),
                 label: "Reads".to_owned(),
                 detail: Some("159 visible · 211 loaded".to_owned()),
                 top: 42.0,
@@ -3393,6 +3433,7 @@ mod tests {
                     200.0,
                     None,
                     None,
+                    false,
                 );
                 let mut second_offset = 700.0;
                 let _ = paint_read_panel_scrollbar(
@@ -3406,6 +3447,7 @@ mod tests {
                     200.0,
                     None,
                     None,
+                    false,
                 );
             },
         );
@@ -4505,6 +4547,7 @@ mod tests {
                     collapsed: false,
                     frozen_bottom: None,
                     subtracks: vec![TrackSubtrack {
+                        alignment_subtrack: Some(AlignmentSubtrack::Coverage),
                         label: "Coverage".to_owned(),
                         detail: None,
                         top: 42.0,
@@ -4537,7 +4580,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_closed_eye_on_collapsed_subtrack_requests_reenable() {
+    fn renamed_alignment_subtrack_uses_explicit_identity_for_gutter_action() {
         let context = egui::Context::default();
         let screen_rect = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 500.0));
         let track_id = TrackId::new(9);
@@ -4553,7 +4596,8 @@ mod tests {
             collapsed: false,
             frozen_bottom: None,
             subtracks: vec![TrackSubtrack {
-                label: "Coverage".to_owned(),
+                alignment_subtrack: Some(AlignmentSubtrack::Coverage),
+                label: "Renamed signal lane".to_owned(),
                 detail: None,
                 top: 42.0,
                 bottom: 62.0,
@@ -4646,6 +4690,7 @@ mod tests {
             collapsed: false,
             frozen_bottom: None,
             subtracks: vec![TrackSubtrack {
+                alignment_subtrack: None,
                 label: "normal".to_owned(),
                 detail: Some("overlay 1".to_owned()),
                 top: 42.0,
@@ -4744,6 +4789,7 @@ mod tests {
             collapsed: false,
             frozen_bottom: Some(222.0),
             subtracks: vec![TrackSubtrack {
+                alignment_subtrack: Some(AlignmentSubtrack::Reads),
                 label: "Reads".to_owned(),
                 detail: None,
                 top: 222.0,
@@ -4816,6 +4862,7 @@ mod tests {
             collapsed: false,
             frozen_bottom: Some(222.0),
             subtracks: vec![TrackSubtrack {
+                alignment_subtrack: Some(AlignmentSubtrack::Reads),
                 label: "Reads".to_owned(),
                 detail: None,
                 top: 222.0,
@@ -5094,6 +5141,7 @@ mod tests {
             frozen_bottom: Some(260.0),
             subtracks: vec![
                 TrackSubtrack {
+                    alignment_subtrack: Some(AlignmentSubtrack::Reference),
                     label: "Reference".to_owned(),
                     detail: None,
                     top: 125.0,
@@ -5102,6 +5150,7 @@ mod tests {
                     composite_member: None,
                 },
                 TrackSubtrack {
+                    alignment_subtrack: Some(AlignmentSubtrack::Reads),
                     label: "Reads".to_owned(),
                     detail: None,
                     top: 260.0,
@@ -5194,6 +5243,7 @@ mod tests {
 
         split.bottom = 800.0;
         split.subtracks = vec![TrackSubtrack {
+            alignment_subtrack: Some(AlignmentSubtrack::Reads),
             label: "Reads".to_owned(),
             detail: None,
             top: 260.0,

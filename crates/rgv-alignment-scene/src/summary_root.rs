@@ -115,6 +115,17 @@ impl ExactSummaryRoot {
                 return Err(ExactSummaryRootError::ContractMismatch);
             }
         }
+        let junction_normalization = junctions
+            .first()
+            .and_then(|tile| tile.summary().provenance.normalization_mapped_records);
+        if junctions.iter().any(|tile| {
+            tile.summary().provenance.normalization_mapped_records != junction_normalization
+        }) {
+            // Raw counts and CPM are different semantic authorities. A root with per-tile
+            // denominators could not provide one exact shared Sashimi scale or a stable page
+            // content identity, so reject it at publication rather than reconciling downstream.
+            return Err(ExactSummaryRootError::ContractMismatch);
+        }
         for tile in &pairs {
             let expected = ExactPairSummaryKey::new(
                 source_revision,
