@@ -1,12 +1,13 @@
-use std::{mem::size_of, num::NonZeroU64, sync::Arc};
+use std::{cmp::Reverse, collections::HashMap, mem::size_of, num::NonZeroU64, sync::Arc};
 
 use rgv_core::GenomicInterval;
 use thiserror::Error;
 
 use crate::{
-    AlignmentFilterEvaluationError, AlignmentRowAtlas, AlignmentRowAtlasError,
-    AlignmentRowAtlasPins, AlignmentSourceRevision, AlignmentViewFilterContract,
-    AlleleSummaryContract, AllocationLedger, CanonicalGenomicTile, DepthSummaryContract,
+    AlignmentCacheResidencyClass, AlignmentCacheResidencyInventory, AlignmentFilterEvaluationError,
+    AlignmentRowAtlas, AlignmentRowAtlasError, AlignmentRowAtlasPins, AlignmentSourceRevision,
+    AlignmentViewFilterContract, AlleleSummaryContract, AllocationId, AllocationLease,
+    AllocationLedger, AllocationRecordSnapshot, CanonicalGenomicTile, DepthSummaryContract,
     EvidenceAcquisition, EvidenceBuildError, EvidenceChunk, EvidencePins, EvidenceRevision,
     EvidenceRoot, EvidenceRootBuilder, ExactAlleleSummaryError, ExactAlleleSummaryKey,
     ExactAlleleSummaryTile, ExactDepthSummaryError, ExactDepthSummaryKey, ExactDepthSummaryTile,
@@ -40,22 +41,30 @@ pub struct EvidenceStore {
     row_atlases: Vec<CachedRowAtlas>,
     current: Option<PublishedEvidence>,
     next_revision: u64,
+    eviction_order_dirty: bool,
 }
 
 #[derive(Debug)]
 struct CachedAcquisition {
+    residency: AlignmentCacheResidencyClass,
     admitted_revision: u64,
     acquisition: Arc<EvidenceAcquisition>,
 }
 
 #[derive(Debug)]
 struct CachedEvidenceChunk {
+    residency: AlignmentCacheResidencyClass,
     admitted_revision: u64,
+    /// Conservative genomic span calculated once at admission. `None` means the physical source
+    /// unit crossed contigs or contained no positioned record and cannot be classified as
+    /// disjoint without reopening its complete batch.
+    interval: Option<GenomicInterval>,
     chunk: Arc<EvidenceChunk>,
 }
 
 #[derive(Debug)]
 struct CachedDepthSummary {
+    residency: AlignmentCacheResidencyClass,
     admitted_revision: u64,
     key: ExactDepthSummaryKey,
     view_filter: crate::ContractFingerprint,
@@ -64,6 +73,7 @@ struct CachedDepthSummary {
 
 #[derive(Debug)]
 struct CachedAlleleSummary {
+    residency: AlignmentCacheResidencyClass,
     admitted_revision: u64,
     key: ExactAlleleSummaryKey,
     view_filter: crate::ContractFingerprint,
@@ -72,6 +82,7 @@ struct CachedAlleleSummary {
 
 #[derive(Debug)]
 struct CachedJunctionSummary {
+    residency: AlignmentCacheResidencyClass,
     admitted_revision: u64,
     key: ExactJunctionSummaryKey,
     view_filter: crate::ContractFingerprint,
@@ -80,6 +91,7 @@ struct CachedJunctionSummary {
 
 #[derive(Debug)]
 struct CachedPairSummary {
+    residency: AlignmentCacheResidencyClass,
     admitted_revision: u64,
     key: ExactPairSummaryKey,
     view_filter: crate::ContractFingerprint,
@@ -88,6 +100,7 @@ struct CachedPairSummary {
 
 #[derive(Debug)]
 struct CachedModificationSummary {
+    residency: AlignmentCacheResidencyClass,
     admitted_revision: u64,
     key: ExactModificationSummaryKey,
     view_filter: crate::ContractFingerprint,
@@ -96,6 +109,7 @@ struct CachedModificationSummary {
 
 #[derive(Debug)]
 struct CachedFilterSummary {
+    residency: AlignmentCacheResidencyClass,
     admitted_revision: u64,
     key: ExactFilterSummaryKey,
     view_filter: crate::ContractFingerprint,
@@ -104,8 +118,25 @@ struct CachedFilterSummary {
 
 #[derive(Debug)]
 struct CachedRowAtlas {
+    residency: AlignmentCacheResidencyClass,
     admitted_revision: u64,
     atlas: Arc<AlignmentRowAtlas>,
+}
+
+/// One reloadable evidence-cache owner. Variant order is the tie-break policy after LRU age:
+/// derived products yield before decoded source material when several disjoint entries were
+/// demoted to the same return-cache revision.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum EvidenceCacheLocation {
+    RowAtlas,
+    DepthSummary,
+    AlleleSummary,
+    JunctionSummary,
+    PairSummary,
+    ModificationSummary,
+    FilterSummary,
+    Chunk,
+    Acquisition,
 }
 
 impl EvidenceStore {
@@ -130,12 +161,21 @@ impl EvidenceStore {
             row_atlases: Vec::new(),
             current: None,
             next_revision: 1,
+            eviction_order_dirty: false,
         }
     }
 
     #[must_use]
     pub const fn source_revision(&self) -> AlignmentSourceRevision {
         self.source_revision
+    }
+
+    /// Exact distinct byte inventory for aggregate cache policy and diagnostics. Shared chunk
+    /// allocations referenced by acquisitions and chunk lookup entries are counted once.
+    pub fn cache_residency_inventory(
+        &self,
+    ) -> Result<AlignmentCacheResidencyInventory, EvidenceStoreError> {
+        self.residency_inventory()
     }
 
     #[must_use]
@@ -279,6 +319,7 @@ impl EvidenceStore {
         }
         let revision = self.take_revision()?;
         self.acquisitions.push(CachedAcquisition {
+            residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             acquisition,
         });
@@ -316,6 +357,7 @@ impl EvidenceStore {
             }
             if payload_satisfies(&self.chunks[index].chunk, &chunk) {
                 let cached = &mut self.chunks[index];
+                cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
                 cached.admitted_revision = revision;
                 self.ledger
                     .touch(cached.chunk.core_allocation().id(), revision)?;
@@ -331,14 +373,20 @@ impl EvidenceStore {
             self.chunks[*index].chunk.chunk().handles() == chunk.chunk().handles()
                 && payload_satisfies(&chunk, &self.chunks[*index].chunk)
         }) {
+            let interval = evidence_chunk_interval(&chunk);
             self.chunks[index] = CachedEvidenceChunk {
+                residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
                 admitted_revision: revision,
+                interval,
                 chunk: Arc::clone(&chunk),
             };
             return Ok(chunk);
         }
+        let interval = evidence_chunk_interval(&chunk);
         self.chunks.push(CachedEvidenceChunk {
+            residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
+            interval,
             chunk: Arc::clone(&chunk),
         });
         Ok(chunk)
@@ -613,6 +661,7 @@ impl EvidenceStore {
         if let Some(cached) = self.depth_summaries.iter_mut().find(|cached| {
             cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
         }) {
+            cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -629,6 +678,7 @@ impl EvidenceStore {
         )?;
         debug_assert_eq!(summary.key(), key);
         self.depth_summaries.push(CachedDepthSummary {
+            residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
             view_filter: evidence.view_filter().fingerprint(),
@@ -653,6 +703,7 @@ impl EvidenceStore {
         if let Some(cached) = self.allele_summaries.iter_mut().find(|cached| {
             cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
         }) {
+            cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -669,6 +720,7 @@ impl EvidenceStore {
         )?;
         debug_assert_eq!(summary.key(), key);
         self.allele_summaries.push(CachedAlleleSummary {
+            residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
             view_filter: evidence.view_filter().fingerprint(),
@@ -699,6 +751,7 @@ impl EvidenceStore {
         if let Some(cached) = self.junction_summaries.iter_mut().find(|cached| {
             cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
         }) {
+            cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -716,6 +769,7 @@ impl EvidenceStore {
         )?;
         debug_assert_eq!(summary.key(), key);
         self.junction_summaries.push(CachedJunctionSummary {
+            residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
             view_filter: evidence.view_filter().fingerprint(),
@@ -740,6 +794,7 @@ impl EvidenceStore {
         if let Some(cached) = self.pair_summaries.iter_mut().find(|cached| {
             cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
         }) {
+            cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -756,6 +811,7 @@ impl EvidenceStore {
         )?;
         debug_assert_eq!(summary.key(), key);
         self.pair_summaries.push(CachedPairSummary {
+            residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
             view_filter: evidence.view_filter().fingerprint(),
@@ -784,6 +840,7 @@ impl EvidenceStore {
         if let Some(cached) = self.modification_summaries.iter_mut().find(|cached| {
             cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
         }) {
+            cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -800,6 +857,7 @@ impl EvidenceStore {
         )?;
         debug_assert_eq!(summary.key(), key);
         self.modification_summaries.push(CachedModificationSummary {
+            residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
             view_filter: evidence.view_filter().fingerprint(),
@@ -831,6 +889,7 @@ impl EvidenceStore {
         if let Some(cached) = self.filter_summaries.iter_mut().find(|cached| {
             cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
         }) {
+            cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -848,6 +907,7 @@ impl EvidenceStore {
         )?;
         debug_assert_eq!(summary.key(), key);
         self.filter_summaries.push(CachedFilterSummary {
+            residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
             view_filter: evidence.view_filter().fingerprint(),
@@ -1030,6 +1090,7 @@ impl EvidenceStore {
             .map(|(index, _)| index);
         if let Some(index) = containing {
             let cached = &mut self.row_atlases[index];
+            cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision_number;
             cached.atlas.touch(&self.ledger, revision_number)?;
             let pins = cached.atlas.pin()?;
@@ -1073,6 +1134,7 @@ impl EvidenceStore {
         };
         let pins = atlas.pin()?;
         self.row_atlases.push(CachedRowAtlas {
+            residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision_number,
             atlas: Arc::clone(&atlas),
         });
@@ -1188,6 +1250,70 @@ impl EvidenceStore {
             .saturating_add(before_atlases.saturating_sub(self.row_atlases.len()))
     }
 
+    /// Marks cache entries outside every active locus as explicit return-cache material. Their
+    /// immutable values remain reusable, but they yield before active buffers when the shared
+    /// ledger next needs headroom.
+    pub fn demote_cache_outside(&mut self, active: &[GenomicInterval]) -> usize {
+        let mut demoted = 0_usize;
+        macro_rules! demote {
+            ($entries:expr, $interval:expr) => {
+                for cached in $entries {
+                    if !active
+                        .iter()
+                        .any(|target| ($interval)(cached).overlaps(*target))
+                        && cached.residency != AlignmentCacheResidencyClass::RecentLocusReturnCache
+                    {
+                        cached.residency = AlignmentCacheResidencyClass::RecentLocusReturnCache;
+                        demoted = demoted.saturating_add(1);
+                    }
+                }
+            };
+        }
+        demote!(&mut self.depth_summaries, |cached: &CachedDepthSummary| {
+            cached.summary.tile()
+        });
+        demote!(
+            &mut self.allele_summaries,
+            |cached: &CachedAlleleSummary| cached.summary.tile()
+        );
+        demote!(
+            &mut self.junction_summaries,
+            |cached: &CachedJunctionSummary| cached.summary.tile()
+        );
+        demote!(&mut self.pair_summaries, |cached: &CachedPairSummary| {
+            cached.summary.tile()
+        });
+        demote!(
+            &mut self.filter_summaries,
+            |cached: &CachedFilterSummary| cached.summary.tile()
+        );
+        demote!(
+            &mut self.modification_summaries,
+            |cached: &CachedModificationSummary| cached.summary.tile()
+        );
+        demote!(&mut self.row_atlases, |cached: &CachedRowAtlas| cached
+            .atlas
+            .interval());
+        for cached in &mut self.chunks {
+            if cached
+                .interval
+                .is_some_and(|interval| !active.iter().any(|target| interval.overlaps(*target)))
+                && cached.residency != AlignmentCacheResidencyClass::RecentLocusReturnCache
+            {
+                cached.residency = AlignmentCacheResidencyClass::RecentLocusReturnCache;
+                demoted = demoted.saturating_add(1);
+            }
+        }
+        demote!(&mut self.acquisitions, |cached: &CachedAcquisition| cached
+            .acquisition
+            .coverage()
+            .interval());
+        if demoted > 0 {
+            self.eviction_order_dirty = true;
+        }
+        demoted
+    }
+
     /// Applies a smaller budget and releases derived summaries before oldest source acquisitions.
     /// Pinned current evidence is never destroyed and remains visible as explicit pinned overage.
     pub fn reduce_budget(&mut self, budget: usize) -> Result<StorePressure, EvidenceStoreError> {
@@ -1201,52 +1327,108 @@ impl EvidenceStore {
         &mut self,
         target_charged: usize,
     ) -> Result<StorePressure, EvidenceStoreError> {
-        self.acquisitions
-            .sort_by_key(|cached| cached.admitted_revision);
-        self.chunks.sort_by_key(|cached| cached.admitted_revision);
-        self.depth_summaries
-            .sort_by_key(|cached| cached.admitted_revision);
-        self.allele_summaries
-            .sort_by_key(|cached| cached.admitted_revision);
-        self.junction_summaries
-            .sort_by_key(|cached| cached.admitted_revision);
-        self.pair_summaries
-            .sort_by_key(|cached| cached.admitted_revision);
-        self.filter_summaries
-            .sort_by_key(|cached| cached.admitted_revision);
-        self.modification_summaries
-            .sort_by_key(|cached| cached.admitted_revision);
-        self.row_atlases
-            .sort_by_key(|cached| cached.admitted_revision);
+        self.evict_inactive_batch(target_charged, usize::MAX)
+    }
+
+    /// Releases a bounded number of reloadable evidence entries. Collections are ordered with
+    /// their oldest entry at the tail so removal is `Vec::pop`, avoiding the repeated whole-vector
+    /// shifts previously caused by `remove(0)` at dense loci.
+    pub fn evict_inactive_batch(
+        &mut self,
+        target_charged: usize,
+        maximum_entries: usize,
+    ) -> Result<StorePressure, EvidenceStoreError> {
+        if self.eviction_order_dirty {
+            self.acquisitions
+                .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
+            self.chunks
+                .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
+            self.depth_summaries
+                .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
+            self.allele_summaries
+                .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
+            self.junction_summaries
+                .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
+            self.pair_summaries
+                .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
+            self.filter_summaries
+                .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
+            self.modification_summaries
+                .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
+            self.row_atlases
+                .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
+            self.eviction_order_dirty = false;
+        }
+        let mut candidates_inspected = 0_usize;
         let mut evicted_acquisitions = 0;
         let mut evicted_chunks = 0;
         let mut evicted_exact_summaries = 0;
         let mut evicted_row_atlases = 0;
-        while self.ledger.snapshot()?.charged > target_charged {
-            if !self.row_atlases.is_empty() {
-                self.row_atlases.remove(0);
-                evicted_row_atlases += 1;
-            } else if self.evict_oldest_exact_summary() {
-                evicted_exact_summaries += 1;
-            } else if !self.chunks.is_empty() {
-                self.chunks.remove(0);
-                evicted_chunks += 1;
-            } else if !self.acquisitions.is_empty() {
-                self.acquisitions.remove(0);
-                evicted_acquisitions += 1;
-            } else {
+        let mut removed = 0_usize;
+        while removed < maximum_entries && self.ledger.progress()?.charged > target_charged {
+            let (candidate, inspected) = self.oldest_cache_entry();
+            candidates_inspected = candidates_inspected.saturating_add(inspected);
+            let Some(candidate) = candidate else {
                 break;
+            };
+            match candidate {
+                EvidenceCacheLocation::RowAtlas => {
+                    self.row_atlases.pop();
+                    evicted_row_atlases += 1;
+                }
+                EvidenceCacheLocation::DepthSummary => {
+                    self.depth_summaries.pop();
+                    evicted_exact_summaries += 1;
+                }
+                EvidenceCacheLocation::AlleleSummary => {
+                    self.allele_summaries.pop();
+                    evicted_exact_summaries += 1;
+                }
+                EvidenceCacheLocation::JunctionSummary => {
+                    self.junction_summaries.pop();
+                    evicted_exact_summaries += 1;
+                }
+                EvidenceCacheLocation::PairSummary => {
+                    self.pair_summaries.pop();
+                    evicted_exact_summaries += 1;
+                }
+                EvidenceCacheLocation::ModificationSummary => {
+                    self.modification_summaries.pop();
+                    evicted_exact_summaries += 1;
+                }
+                EvidenceCacheLocation::FilterSummary => {
+                    self.filter_summaries.pop();
+                    evicted_exact_summaries += 1;
+                }
+                EvidenceCacheLocation::Chunk => {
+                    self.chunks.pop();
+                    evicted_chunks += 1;
+                }
+                EvidenceCacheLocation::Acquisition => {
+                    self.acquisitions.pop();
+                    evicted_acquisitions += 1;
+                }
             }
+            removed = removed.saturating_add(1);
         }
-        let snapshot = self.ledger.snapshot()?;
+        let progress = self.ledger.progress()?;
+        let reclaim_complete = progress.charged <= target_charged || removed < maximum_entries;
+        let residency = if reclaim_complete && maximum_entries == usize::MAX {
+            self.residency_inventory()?
+        } else {
+            AlignmentCacheResidencyInventory::default()
+        };
         Ok(StorePressure {
             evicted_acquisitions,
             evicted_chunks,
             evicted_exact_summaries,
             evicted_row_atlases,
-            charged: snapshot.charged,
-            pinned: snapshot.pinned,
-            pinned_overage: snapshot.pinned_overage,
+            candidates_inspected,
+            reclaim_complete,
+            residency,
+            charged: progress.charged,
+            pinned: progress.pinned,
+            pinned_overage: progress.pinned_overage,
         })
     }
 
@@ -1256,6 +1438,7 @@ impl EvidenceStore {
             .next_revision
             .checked_add(1)
             .ok_or(EvidenceStoreError::RevisionOverflow)?;
+        self.eviction_order_dirty = true;
         Ok(revision)
     }
 
@@ -1269,53 +1452,195 @@ impl EvidenceStore {
         Ok(())
     }
 
-    fn evict_oldest_exact_summary(&mut self) -> bool {
+    /// Returns the highest-priority legal eviction owner using only the tail of each
+    /// already-ordered collection. Return-cache material yields before every active entry;
+    /// within one residency tier, reproducible derived products yield before source evidence and
+    /// each family remains LRU. Selection therefore stays constant-sized.
+    fn oldest_cache_entry(&self) -> (Option<EvidenceCacheLocation>, usize) {
+        let key = |residency, revision, location| (residency, location, revision);
         let candidates = [
-            self.depth_summaries
-                .first()
-                .map(|cached| (cached.admitted_revision, 0_u8)),
-            self.allele_summaries
-                .first()
-                .map(|cached| (cached.admitted_revision, 1)),
-            self.junction_summaries
-                .first()
-                .map(|cached| (cached.admitted_revision, 2)),
-            self.pair_summaries
-                .first()
-                .map(|cached| (cached.admitted_revision, 3)),
-            self.modification_summaries
-                .first()
-                .map(|cached| (cached.admitted_revision, 4)),
-            self.filter_summaries
-                .first()
-                .map(|cached| (cached.admitted_revision, 5)),
+            self.row_atlases.last().map(|cached| {
+                key(
+                    cached.residency,
+                    cached.admitted_revision,
+                    EvidenceCacheLocation::RowAtlas,
+                )
+            }),
+            self.depth_summaries.last().map(|cached| {
+                key(
+                    cached.residency,
+                    cached.admitted_revision,
+                    EvidenceCacheLocation::DepthSummary,
+                )
+            }),
+            self.allele_summaries.last().map(|cached| {
+                key(
+                    cached.residency,
+                    cached.admitted_revision,
+                    EvidenceCacheLocation::AlleleSummary,
+                )
+            }),
+            self.junction_summaries.last().map(|cached| {
+                key(
+                    cached.residency,
+                    cached.admitted_revision,
+                    EvidenceCacheLocation::JunctionSummary,
+                )
+            }),
+            self.pair_summaries.last().map(|cached| {
+                key(
+                    cached.residency,
+                    cached.admitted_revision,
+                    EvidenceCacheLocation::PairSummary,
+                )
+            }),
+            self.modification_summaries.last().map(|cached| {
+                key(
+                    cached.residency,
+                    cached.admitted_revision,
+                    EvidenceCacheLocation::ModificationSummary,
+                )
+            }),
+            self.filter_summaries.last().map(|cached| {
+                key(
+                    cached.residency,
+                    cached.admitted_revision,
+                    EvidenceCacheLocation::FilterSummary,
+                )
+            }),
+            self.chunks.last().map(|cached| {
+                key(
+                    cached.residency,
+                    cached.admitted_revision,
+                    EvidenceCacheLocation::Chunk,
+                )
+            }),
+            self.acquisitions.last().map(|cached| {
+                key(
+                    cached.residency,
+                    cached.admitted_revision,
+                    EvidenceCacheLocation::Acquisition,
+                )
+            }),
         ];
-        let Some((_, kind)) = candidates.into_iter().flatten().min() else {
-            return false;
-        };
-        match kind {
-            0 => {
-                self.depth_summaries.remove(0);
-            }
-            1 => {
-                self.allele_summaries.remove(0);
-            }
-            2 => {
-                self.junction_summaries.remove(0);
-            }
-            3 => {
-                self.pair_summaries.remove(0);
-            }
-            4 => {
-                self.modification_summaries.remove(0);
-            }
-            5 => {
-                self.filter_summaries.remove(0);
-            }
-            _ => unreachable!("summary family is bounded by the candidate table"),
-        }
-        true
+        let inspected = candidates.iter().flatten().count();
+        (
+            candidates
+                .into_iter()
+                .flatten()
+                .min()
+                .map(|(_, location, _)| location),
+            inspected,
+        )
     }
+
+    fn residency_inventory(&self) -> Result<AlignmentCacheResidencyInventory, EvidenceStoreError> {
+        let mut inventory = AlignmentCacheResidencyInventory::default();
+        let mut allocations =
+            HashMap::<AllocationId, (AlignmentCacheResidencyClass, AllocationRecordSnapshot)>::new(
+            );
+        macro_rules! observe_entries {
+            ($entries:expr) => {
+                for cached in $entries {
+                    inventory.observe_entry(cached.residency);
+                }
+            };
+        }
+        observe_entries!(&self.acquisitions);
+        observe_entries!(&self.chunks);
+        observe_entries!(&self.depth_summaries);
+        observe_entries!(&self.allele_summaries);
+        observe_entries!(&self.junction_summaries);
+        observe_entries!(&self.pair_summaries);
+        observe_entries!(&self.modification_summaries);
+        observe_entries!(&self.filter_summaries);
+        observe_entries!(&self.row_atlases);
+
+        for cached in &self.acquisitions {
+            for chunk in cached.acquisition.chunks() {
+                observe_cache_allocation(
+                    &mut allocations,
+                    cached.residency,
+                    chunk.core_allocation(),
+                )?;
+                observe_cache_allocation(
+                    &mut allocations,
+                    cached.residency,
+                    chunk.overlap_allocation(),
+                )?;
+                if let Some(payload) = chunk.payload() {
+                    observe_cache_allocation(
+                        &mut allocations,
+                        cached.residency,
+                        payload.allocation(),
+                    )?;
+                }
+            }
+        }
+        for cached in &self.chunks {
+            observe_cache_allocation(
+                &mut allocations,
+                cached.residency,
+                cached.chunk.core_allocation(),
+            )?;
+            observe_cache_allocation(
+                &mut allocations,
+                cached.residency,
+                cached.chunk.overlap_allocation(),
+            )?;
+            if let Some(payload) = cached.chunk.payload() {
+                observe_cache_allocation(&mut allocations, cached.residency, payload.allocation())?;
+            }
+        }
+        macro_rules! observe_summary_allocations {
+            ($entries:expr) => {
+                for cached in $entries {
+                    observe_cache_allocation(
+                        &mut allocations,
+                        cached.residency,
+                        cached.summary.allocation(),
+                    )?;
+                }
+            };
+        }
+        observe_summary_allocations!(&self.depth_summaries);
+        observe_summary_allocations!(&self.allele_summaries);
+        observe_summary_allocations!(&self.junction_summaries);
+        observe_summary_allocations!(&self.pair_summaries);
+        observe_summary_allocations!(&self.modification_summaries);
+        observe_summary_allocations!(&self.filter_summaries);
+        for cached in &self.row_atlases {
+            observe_cache_allocation(
+                &mut allocations,
+                cached.residency,
+                cached.atlas.metadata_allocation(),
+            )?;
+            for layer in cached.atlas.layers() {
+                observe_cache_allocation(&mut allocations, cached.residency, layer.allocation())?;
+            }
+        }
+        for (_, (residency, allocation)) in allocations {
+            inventory.observe_distinct_allocation(residency, allocation);
+        }
+        Ok(inventory)
+    }
+}
+
+fn observe_cache_allocation(
+    allocations: &mut HashMap<
+        AllocationId,
+        (AlignmentCacheResidencyClass, AllocationRecordSnapshot),
+    >,
+    residency: AlignmentCacheResidencyClass,
+    allocation: &AllocationLease,
+) -> Result<(), LedgerError> {
+    if let Some((current, _)) = allocations.get_mut(&allocation.id()) {
+        *current = (*current).max(residency);
+        return Ok(());
+    }
+    let snapshot = allocation.snapshot()?;
+    allocations.insert(snapshot.id, (residency, snapshot));
+    Ok(())
 }
 
 fn atlas_compatible(
@@ -1357,6 +1682,27 @@ fn payload_satisfies(available: &EvidenceChunk, requested: &EvidenceChunk) -> bo
             .payload()
             .is_some_and(|payload| payload.contract().satisfies(required.contract()))
     })
+}
+
+fn evidence_chunk_interval(chunk: &EvidenceChunk) -> Option<GenomicInterval> {
+    let batch = chunk.chunk().batch();
+    let mut contig = None;
+    let mut start = u64::MAX;
+    let mut end = 0_u64;
+    for index in 0..batch.len() {
+        let (Some(record_contig), Some(record_start), Some(record_end)) =
+            (batch.contig(index), batch.start(index), batch.end(index))
+        else {
+            continue;
+        };
+        if contig.is_some_and(|existing| existing != record_contig) {
+            return None;
+        }
+        contig = Some(record_contig);
+        start = start.min(record_start);
+        end = end.max(record_end);
+    }
+    GenomicInterval::new(contig?, start, end).ok()
 }
 
 fn evidence_chunk_overlaps(chunk: &EvidenceChunk, target: GenomicInterval) -> bool {
@@ -1454,6 +1800,9 @@ pub struct StorePressure {
     pub evicted_chunks: usize,
     pub evicted_exact_summaries: usize,
     pub evicted_row_atlases: usize,
+    pub candidates_inspected: usize,
+    pub reclaim_complete: bool,
+    pub residency: AlignmentCacheResidencyInventory,
     pub charged: usize,
     pub pinned: usize,
     pub pinned_overage: usize,
@@ -1984,6 +2333,49 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn bounded_reclaim_evicts_demoted_source_before_an_active_row_atlas() {
+        let ledger = AllocationLedger::new(1 << 20, 0);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        let old = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let active = GenomicInterval::new(ContigId::new(0), 1_000, 1_100).unwrap();
+        store
+            .admit(one_record_acquisition(&ledger, old.start(), old.end(), 7))
+            .unwrap();
+        store
+            .admit(one_record_acquisition(
+                &ledger,
+                active.start(),
+                active.end(),
+                8,
+            ))
+            .unwrap();
+        let evidence = store
+            .prepare(active, no_payload(), ReservationKind::Normal)
+            .unwrap();
+        let _atlas = store
+            .prepare_row_atlas(
+                evidence.root(),
+                active,
+                layout_contract(),
+                ReservationKind::Normal,
+            )
+            .unwrap();
+
+        assert_eq!(store.demote_cache_outside(&[active]), 2);
+        let pressure = store.evict_inactive_batch(0, 1).unwrap();
+
+        assert_eq!(pressure.evicted_chunks, 1);
+        assert_eq!(pressure.evicted_row_atlases, 0);
+        assert_eq!(store.chunk_count(), 1);
+        assert_eq!(store.row_atlas_count(), 1);
+        assert!(!pressure.reclaim_complete);
     }
 
     #[test]

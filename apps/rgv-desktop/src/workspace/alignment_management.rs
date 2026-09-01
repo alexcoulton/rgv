@@ -542,11 +542,18 @@ fn alignment_gpu_pressure_target_charged(
         rgv_render::GpuBudgetPressureCause::RetainedBudget
         | rgv_render::GpuBudgetPressureCause::TransitionOverlap => 0,
     };
-    pressure
+    let exact_admission_threshold = pressure
         .limit_bytes
         .saturating_sub(pressure.requested_bytes)
         .saturating_add(retirement_credit)
-        .saturating_sub(snapshot.reserved)
+        .saturating_sub(snapshot.reserved);
+    // Reclaim to a low-water mark, not the single byte at which this one failed bundle happens to
+    // fit. The extra reserve is exactly one measured foreground bundle (the current refusal), so
+    // it adapts to sparse and dense loci without an ACTB-specific byte constant. Pinned committed
+    // authority remains the hard floor.
+    exact_admission_threshold
+        .saturating_sub(pressure.requested_bytes)
+        .max(snapshot.pinned)
 }
 
 fn alignment_gpu_publication_retry_gate(
@@ -935,6 +942,20 @@ mod alignment_gpu_policy_tests {
     }
 
     #[test]
+    fn adaptive_gpu_headroom_never_demands_reclaim_below_the_pinned_floor() {
+        let pressure = GpuBudgetPressure::from_budget_failure(200, 900, 0, 1_000);
+        let goal =
+            GpuReclaimGoal::new(pressure, 900).with_additional_headroom_above_floor(200, 750);
+        assert_eq!(goal.required_reclaim_bytes(), 150);
+        assert!(goal.is_satisfied_at(750));
+
+        let pinned_at_exact_fit =
+            GpuReclaimGoal::new(pressure, 900).with_additional_headroom_above_floor(200, 800);
+        assert_eq!(pinned_at_exact_fit.required_reclaim_bytes(), 100);
+        assert!(pinned_at_exact_fit.is_satisfied_at(800));
+    }
+
+    #[test]
     fn intrinsically_oversized_steady_candidate_retains_typed_capacity_pressure() {
         for (occupied, retiring) in [(128, 64), (4_096, 3_500)] {
             let error = AllocationBundleError::SteadyBudgetExceeded {
@@ -1265,7 +1286,8 @@ impl Viewer {
         if let Some(pressure) = alignment_source_pressure_gpu_budget(pressure) {
             let baseline = self.alignment_scene_ledger.progress()?;
             let occupied = baseline.charged.saturating_add(baseline.reserved);
-            let goal = GpuReclaimGoal::new(pressure, occupied);
+            let goal = GpuReclaimGoal::new(pressure, occupied)
+                .with_additional_headroom_above_floor(pressure.requested_bytes, baseline.pinned);
             if goal.is_feasible() && !goal.is_satisfied_at(occupied) {
                 let reads = self.alignment_gpu_renderer.reclaim_for_goal(
                     &self.alignment_scene_ledger,
@@ -1298,7 +1320,8 @@ impl Viewer {
     ) -> std::result::Result<AlignmentGpuReclaimOutcome, LedgerError> {
         let baseline = self.alignment_scene_ledger.progress()?;
         let baseline_occupied = baseline.charged.saturating_add(baseline.reserved);
-        let goal = GpuReclaimGoal::new(pressure, baseline_occupied);
+        let goal = GpuReclaimGoal::new(pressure, baseline_occupied)
+            .with_additional_headroom_above_floor(pressure.requested_bytes, baseline.pinned);
         if !goal.is_feasible() {
             self.alignment_gpu_prefetch.clear();
             self.alignment_gpu_speculation_gate
@@ -1564,8 +1587,8 @@ impl Viewer {
         self.queue_alignment_navigation_for_track(
             track_index,
             panel_id,
-            true,
-            "alignment camera changed",
+            false,
+            "alignment row camera changed",
         );
         self.panels.active_mut().pending_queries.alignment = true;
         self.dispatch_alignment_query();
@@ -1980,6 +2003,7 @@ impl Viewer {
             camera: Option<AlignmentCamera>,
             row_activity: Option<Arc<AlignmentRowActivityProfile>>,
             native_reads_present: bool,
+            materialized_row_ranges: Option<Arc<[(usize, usize)]>>,
         }
 
         let expected = self
@@ -1993,20 +2017,36 @@ impl Viewer {
                             .panel_frames
                             .values()
                             .flat_map(|frame| {
-                                frame.lanes.iter().map(|lane| CommittedReadCacheUpdate {
-                                    panel_id: frame.panel_id,
-                                    track_id: lane.track_id,
-                                    target_revision: bundle.target_revision,
-                                    camera: lane.read_camera,
-                                    row_activity: lane.row_activity.as_ref().map(Arc::clone),
-                                    native_reads_present: bundle.read_authorities.iter().any(
-                                        |authority| {
+                                frame.lanes.iter().map(|lane| {
+                                    let native_reads_present =
+                                        bundle.read_authorities.iter().any(|authority| {
                                             authority.panel_id == frame.panel_id
                                                 && authority.track_id == lane.track_id
                                                 && authority.target_revision
                                                     == bundle.target_revision
-                                        },
-                                    ),
+                                        });
+                                    let materialized_row_ranges = native_reads_present
+                                        .then(|| {
+                                            lane.snapshot.as_ref().map(|scene| {
+                                                super::panels::normalize_materialized_row_ranges(
+                                                    scene
+                                                        .reads()
+                                                        .pages()
+                                                        .iter()
+                                                        .map(|page| page.row_range()),
+                                                )
+                                            })
+                                        })
+                                        .flatten();
+                                    CommittedReadCacheUpdate {
+                                        panel_id: frame.panel_id,
+                                        track_id: lane.track_id,
+                                        target_revision: bundle.target_revision,
+                                        camera: lane.read_camera,
+                                        row_activity: lane.row_activity.as_ref().map(Arc::clone),
+                                        native_reads_present,
+                                        materialized_row_ranges,
+                                    }
                                 })
                             })
                             .collect::<Vec<_>>()
@@ -2084,7 +2124,7 @@ impl Viewer {
                     "raw_row_coordinate_authority": format!("{:?}", read_panel.row_coordinate_authority),
                     "row_activity_atlas_revision": read_panel.row_activity_atlas_revision.map(|revision| format!("{revision:?}")),
                     "total_rows": read_panel.total_rows,
-                    "materialized_row_range": read_panel.materialized_row_range.map(|(start, end)| serde_json::json!({ "start": start, "end": end })),
+                    "materialized_row_ranges": read_panel.materialized_row_ranges.as_deref(),
                 });
                 cache_mismatches.push(serde_json::json!({
                     "panel_id": update.panel_id.get(),
@@ -2119,7 +2159,7 @@ impl Viewer {
                 read_panel.row_height = None;
                 read_panel.row_coordinate_authority = ReadRowCoordinateAuthority::Absent;
                 read_panel.row_activity_atlas_revision = None;
-                read_panel.materialized_row_range = None;
+                read_panel.materialized_row_ranges = None;
                 read_panel.total_rows = None;
                 read_panel.authoritative_overview = None;
                 read_panel.overview = ui::ScrollbarOverview::default();
@@ -2164,7 +2204,7 @@ impl Viewer {
                 read_panel.row_coordinate_authority =
                     ReadRowCoordinateAuthority::Exact(profile.row_coordinate_space());
                 read_panel.row_activity_atlas_revision = Some(profile.atlas_revision());
-                read_panel.materialized_row_range = None;
+                read_panel.materialized_row_ranges = update.materialized_row_ranges;
                 read_panel.total_rows = Some(profile.active_row_end());
                 read_panel.authoritative_overview = Some(authoritative_overview.clone());
                 read_panel.overview = authoritative_overview;
@@ -4756,7 +4796,8 @@ impl Viewer {
 
     /// Begins the sole liveness transaction for one panel/track target. Callers which already
     /// advanced the projection clock (ordinary viewport navigation) pass `advance_generation =
-    /// false`; presentation-contract and camera-only changes advance here.
+    /// false`. Contract changes advance explicitly at their call site; row-camera-only changes
+    /// keep the same immutable source generation and receive only a new request token.
     pub(crate) fn queue_alignment_navigation_for_track(
         &mut self,
         track_index: usize,
@@ -5906,12 +5947,12 @@ mod gpu_publication_retry_tests {
 
         let refused = ledger.progress().unwrap();
         assert!(alignment_gpu_publication_blocker_remains(blocker, &refused));
-        // Only 100 physical bytes must leave: 600 bytes of the old 1,000-byte epoch are already
-        // guaranteed to retire with the successor. A generic blocker would incorrectly target
-        // 300 charged bytes and attempt to purge another 600 bytes.
+        // The exact fit point is 900 bytes: 600 bytes of the old epoch retire with the successor.
+        // Reclaim deliberately continues to a 400-byte low-water mark, leaving one additional
+        // measured 500-byte foreground bundle of headroom after this replacement.
         assert_eq!(
             alignment_gpu_pressure_target_charged(pressure, &refused),
-            900
+            400
         );
 
         drop(releasable);
@@ -5922,7 +5963,7 @@ mod gpu_publication_retry_tests {
         ));
         assert_eq!(
             alignment_gpu_pressure_target_charged(pressure, &fitting),
-            900
+            400
         );
         drop(retained);
     }

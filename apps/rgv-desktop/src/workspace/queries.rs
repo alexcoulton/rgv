@@ -1750,7 +1750,7 @@ impl Viewer {
                     frame,
                     work,
                     telemetry,
-                    update: _,
+                    update,
                 } => {
                     let frame = alignment_scene_frame_for_ui(frame);
                     let panel_id = self.alignment_tracks[track_index]
@@ -1764,6 +1764,29 @@ impl Viewer {
                             self.navigation_stale_result_rejections.saturating_add(1);
                         continue;
                     };
+                    if self.manual_diagnostic_trace_is_recording()
+                        && let Some(capacity) = update.and_then(|update| update.capacity_plan)
+                    {
+                        self.record_manual_diagnostic_event(
+                            "alignment_cache",
+                            "foreground_capacity_plan",
+                            serde_json::json!({
+                                "track_id": track_id.get(),
+                                "panel_id": panel_id.get(),
+                                "owner": owner.get(),
+                                "camera_sequence": frame.camera_sequence,
+                                "budget": capacity.budget,
+                                "charged": capacity.charged,
+                                "pinned": capacity.pinned,
+                                "reserved": capacity.reserved,
+                                "foreground_reserve_bytes": capacity.foreground_reserve_bytes,
+                                "low_water_target": capacity.low_water_target,
+                                "return_cache_bytes": capacity.return_cache_bytes,
+                                "disposable_speculation_bytes": capacity.disposable_speculation_bytes,
+                                "proactive_reclaim_target": update.and_then(|update| update.proactive_reclaim_target),
+                            }),
+                        );
+                    }
                     if self.alignment_tracks[track_index]
                         .projection(panel_id)
                         .is_some_and(|projection| projection.index_only_overview)
@@ -2292,6 +2315,49 @@ impl Viewer {
                     request_id,
                     eviction,
                 } => {
+                    if self.manual_diagnostic_trace_is_recording() {
+                        self.record_manual_diagnostic_event(
+                            "alignment_cache",
+                            "reclaim_completed",
+                            serde_json::json!({
+                                "track_id": track_id.get(),
+                                "request_id": request_id,
+                                "target_charged": eviction.target_charged,
+                                "charged_before": eviction.charged_before,
+                                "charged_after": eviction.charged,
+                                "pinned_after": eviction.pinned,
+                                "released_bytes": eviction.released,
+                                "relinquished_cache_entries": eviction.relinquished_cache_entries,
+                                "quantum_entries": eviction.quantum_entries,
+                                "quanta": eviction.quanta,
+                                "elapsed_nanoseconds": eviction.elapsed_nanoseconds,
+                                "reclaim_complete": eviction.reclaim_complete,
+                                "remaining_bytes": eviction.remaining,
+                                "semantic_candidates_inspected": eviction.presentation.candidates_inspected,
+                                "semantic_speculation_entries": eviction.presentation.residency.disposable_speculation_entries,
+                                "semantic_speculation_bytes": eviction.presentation.residency.disposable_speculation_bytes,
+                                "semantic_active_cold_entries": eviction.presentation.residency.active_locus_cold_entries,
+                                "semantic_active_cold_bytes": eviction.presentation.residency.active_locus_cold_bytes,
+                                "semantic_active_near_entries": eviction.presentation.residency.active_near_buffer_entries,
+                                "semantic_active_near_bytes": eviction.presentation.residency.active_near_buffer_bytes,
+                                "semantic_foreground_entries": eviction.presentation.residency.foreground_visible_entries,
+                                "semantic_foreground_bytes": eviction.presentation.residency.foreground_visible_bytes,
+                                "semantic_return_cache_entries": eviction.presentation.residency.recent_locus_return_cache_entries,
+                                "semantic_return_cache_bytes": eviction.presentation.residency.recent_locus_return_cache_bytes,
+                                "semantic_read_pages_evicted": eviction.presentation.evicted_read_pages,
+                                "semantic_summary_pages_evicted": eviction.presentation.evicted_summary_pages,
+                                "evidence_candidates_inspected": eviction.evidence.candidates_inspected,
+                                "evidence_active_near_entries": eviction.evidence.residency.active_near_buffer_entries,
+                                "evidence_active_near_bytes": eviction.evidence.residency.active_near_buffer_bytes,
+                                "evidence_return_cache_entries": eviction.evidence.residency.recent_locus_return_cache_entries,
+                                "evidence_return_cache_bytes": eviction.evidence.residency.recent_locus_return_cache_bytes,
+                                "evidence_acquisitions_evicted": eviction.evidence.evicted_acquisitions,
+                                "evidence_chunks_evicted": eviction.evidence.evicted_chunks,
+                                "exact_summaries_evicted": eviction.evidence.evicted_exact_summaries,
+                                "row_atlases_evicted": eviction.evidence.evicted_row_atlases,
+                            }),
+                        );
+                    }
                     self.observe_alignment_capacity_reclaim(
                         track_id,
                         request_id,

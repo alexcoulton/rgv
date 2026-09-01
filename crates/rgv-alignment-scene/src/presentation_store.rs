@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     num::{NonZeroU32, NonZeroU64},
     ops::Range,
     sync::Arc,
@@ -11,12 +11,13 @@ use thiserror::Error;
 
 use crate::summary_page::required_summary_page_keys;
 use crate::{
-    AlignmentPageKey, AlignmentPresentationScene, AlignmentPresentationSceneError,
-    AlignmentRowAtlas, AlignmentSceneSnapshot, AlignmentSceneSnapshotError, AlignmentSemanticPage,
-    AllocationLedger, CanonicalGenomicTile, CanonicalRowBlock, ExactSummaryRoot,
-    JunctionAnnotationIndex, LedgerError, PresentationContract, ReferenceRevision, ReservationKind,
-    RevisionFingerprint, SceneRevision, SemanticPageError, SummaryPageFamily, SummaryPageKey,
-    SummarySemanticPage, SummarySemanticPageError,
+    AlignmentCacheResidencyClass, AlignmentCacheResidencyInventory, AlignmentPageKey,
+    AlignmentPresentationScene, AlignmentPresentationSceneError, AlignmentRowAtlas,
+    AlignmentSceneSnapshot, AlignmentSceneSnapshotError, AlignmentSemanticPage, AllocationId,
+    AllocationLedger, AllocationRecordSnapshot, CanonicalGenomicTile, CanonicalRowBlock,
+    ExactSummaryRoot, JunctionAnnotationIndex, LedgerError, PresentationContract,
+    ReferenceRevision, ReservationKind, RevisionFingerprint, SceneRevision, SemanticPageError,
+    SummaryPageFamily, SummaryPageKey, SummarySemanticPage, SummarySemanticPageError,
 };
 
 /// Stable publication slot within one source-owned presentation repository. Multiple panels can
@@ -36,14 +37,26 @@ impl AlignmentPresentationOwner {
     }
 }
 
+/// Latest visible demand for one presentation owner. The store combines every owner before
+/// assigning cache priority, so independent panels retain independent cameras without creating
+/// independent cache policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlignmentPresentationOwnerDemand {
+    pub owner: AlignmentPresentationOwner,
+    pub visible_interval: GenomicInterval,
+    pub visible_rows: Range<u32>,
+}
+
 #[derive(Debug)]
 struct CachedReadPage {
+    residency: AlignmentCacheResidencyClass,
     last_used_revision: u64,
     page: Arc<AlignmentSemanticPage>,
 }
 
 #[derive(Debug)]
 struct CachedSummaryPage {
+    residency: AlignmentCacheResidencyClass,
     last_used_revision: u64,
     page: Arc<SummarySemanticPage>,
 }
@@ -57,9 +70,19 @@ pub struct AlignmentPresentationStore {
     ledger: AllocationLedger,
     read_pages: HashMap<AlignmentPageKey, CachedReadPage>,
     summary_pages: HashMap<SummaryPageKey, CachedSummaryPage>,
+    /// Ordered LRU ownership directory. Page maps remain the identity lookup; this index makes
+    /// bounded reclaim select its next legal entries without sorting or rescanning the cache.
+    eviction_index: BTreeSet<(
+        AlignmentCacheResidencyClass,
+        u64,
+        AllocationId,
+        CachedPageLocation,
+    )>,
     /// Source-worker preparation authority. These snapshots are reusable private candidates;
     /// they are never the desktop's observable presented epoch.
     prepared_by_owner: HashMap<AlignmentPresentationOwner, Arc<AlignmentSceneSnapshot>>,
+    demanded_read_residency: HashMap<AlignmentPageKey, AlignmentCacheResidencyClass>,
+    demanded_summary_residency: HashMap<SummaryPageKey, AlignmentCacheResidencyClass>,
     next_revision: u64,
 }
 
@@ -70,7 +93,10 @@ impl AlignmentPresentationStore {
             ledger,
             read_pages: HashMap::new(),
             summary_pages: HashMap::new(),
+            eviction_index: BTreeSet::new(),
             prepared_by_owner: HashMap::new(),
+            demanded_read_residency: HashMap::new(),
+            demanded_summary_residency: HashMap::new(),
             next_revision: 1,
         }
     }
@@ -172,6 +198,7 @@ impl AlignmentPresentationStore {
                         presentation,
                         contig_length,
                         reference,
+                        AlignmentCacheResidencyClass::ForegroundVisible,
                         reservation_kind,
                         revision_number,
                     )?);
@@ -209,6 +236,7 @@ impl AlignmentPresentationStore {
                         .map(|(revision, reference)| (revision, reference, contig_length))
                         .filter(|_| key.family() == SummaryPageFamily::Alleles),
                     annotation.map(Arc::as_ref),
+                    AlignmentCacheResidencyClass::ForegroundVisible,
                     reservation_kind,
                     revision_number,
                 )?,
@@ -278,6 +306,7 @@ impl AlignmentPresentationStore {
                     presentation,
                     contig_length,
                     reference,
+                    AlignmentCacheResidencyClass::DisposableSpeculation,
                     reservation_kind,
                     revision_number,
                 )?;
@@ -288,6 +317,45 @@ impl AlignmentPresentationStore {
             page_occurrences,
             cache_misses,
         })
+    }
+
+    /// Returns whether every semantic page needed to present one canonical row block is still
+    /// owned by this cache. This is the exact residency predicate used after partial reclaim: a
+    /// missing page invalidates only its row block, never the whole lane directory.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_row_block_is_fully_cached(
+        &self,
+        evidence: &crate::EvidenceRoot,
+        atlas: &AlignmentRowAtlas,
+        presentation: PresentationContract,
+        prepared_interval: GenomicInterval,
+        row_block: CanonicalRowBlock,
+        contig_length: u64,
+        geometry_tile_bases: NonZeroU64,
+    ) -> Result<bool, AlignmentPresentationStoreError> {
+        validate_read_roots(evidence, atlas, prepared_interval)?;
+        row_block.range(atlas.row_count())?;
+        let genomic_tiles =
+            CanonicalGenomicTile::covering(prepared_interval, geometry_tile_bases, contig_length)?;
+        for genomic_tile in genomic_tiles {
+            for family in presentation.required_page_families().iter().copied() {
+                let key = AlignmentPageKey::new(
+                    evidence.source_revision(),
+                    evidence.revision(),
+                    atlas.revision(),
+                    atlas.layout_contract().fingerprint(),
+                    presentation.page_fingerprint(family),
+                    genomic_tile,
+                    row_block,
+                    family,
+                    presentation.geometry_lod,
+                );
+                if !self.read_pages.contains_key(&key) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub fn stage(&mut self, candidate: AlignmentSceneCandidate) -> Arc<AlignmentSceneSnapshot> {
@@ -364,6 +432,14 @@ impl AlignmentPresentationStore {
         self.ledger.clone()
     }
 
+    /// Exact distinct byte inventory for cache policy and diagnostics. This is intentionally a
+    /// control/trace operation rather than a per-frame rendering query.
+    pub fn cache_residency_inventory(
+        &self,
+    ) -> Result<AlignmentCacheResidencyInventory, AlignmentPresentationStoreError> {
+        self.residency_inventory()
+    }
+
     /// Drops cached semantic pages which cannot contribute to a disjoint target. Published
     /// snapshots retain their own leases and pins, so removing a lookup entry can never make the
     /// current scene disappear or pretend that its live allocation was reclaimed.
@@ -380,10 +456,192 @@ impl AlignmentPresentationStore {
         });
         self.summary_pages
             .retain(|_, cached| cached.page.indexed_interval().overlaps(target));
+        self.rebuild_eviction_index();
         PresentationCacheDiscard {
             read_pages: read_pages_before.saturating_sub(self.read_pages.len()),
             summary_pages: summary_pages_before.saturating_sub(self.summary_pages.len()),
         }
+    }
+
+    /// Demotes semantic entries outside every active working-set island without discarding them.
+    /// They remain useful as a return cache, but sort ahead of active-locus buffers during the
+    /// next bounded reclaim pass.
+    pub fn demote_cache_outside(
+        &mut self,
+        active: &[GenomicInterval],
+    ) -> PresentationCacheDemotion {
+        let mut read_pages = 0_usize;
+        let mut summary_pages = 0_usize;
+        for cached in self.read_pages.values_mut() {
+            if !active
+                .iter()
+                .any(|target| cached.page.interval().overlaps(*target))
+                && cached.residency != AlignmentCacheResidencyClass::RecentLocusReturnCache
+            {
+                cached.residency = AlignmentCacheResidencyClass::RecentLocusReturnCache;
+                read_pages = read_pages.saturating_add(1);
+            }
+        }
+        for cached in self.summary_pages.values_mut() {
+            if !active
+                .iter()
+                .any(|target| cached.page.indexed_interval().overlaps(*target))
+                && cached.residency != AlignmentCacheResidencyClass::RecentLocusReturnCache
+            {
+                cached.residency = AlignmentCacheResidencyClass::RecentLocusReturnCache;
+                summary_pages = summary_pages.saturating_add(1);
+            }
+        }
+        self.rebuild_eviction_index();
+        PresentationCacheDemotion {
+            read_pages,
+            summary_pages,
+        }
+    }
+
+    /// Reclassifies semantic cache ownership from the exact latest lane demands. Prepared scene
+    /// pages form the nearby buffer; the subset intersecting each camera is foreground-visible.
+    /// Same-island leftovers become cold, disjoint pages become return cache, and optional warmed
+    /// pages remain disposable until an actual demand promotes them.
+    pub fn reclassify_for_demands(
+        &mut self,
+        active_intervals: &[GenomicInterval],
+        demands: &[AlignmentPresentationOwnerDemand],
+        reclassify_unowned: bool,
+    ) {
+        let mut demanded_reads = HashMap::<AlignmentPageKey, AlignmentCacheResidencyClass>::new();
+        let mut demanded_summaries = HashMap::<SummaryPageKey, AlignmentCacheResidencyClass>::new();
+        for demand in demands {
+            let Some(scene) = self.prepared_by_owner.get(&demand.owner) else {
+                continue;
+            };
+            for page in scene.reads().pages() {
+                let key = page.key();
+                let residency = if page.interval().overlaps(demand.visible_interval)
+                    && ranges_overlap(page.row_range(), demand.visible_rows.clone())
+                {
+                    AlignmentCacheResidencyClass::ForegroundVisible
+                } else {
+                    AlignmentCacheResidencyClass::ActiveNearBuffer
+                };
+                demanded_reads
+                    .entry(key)
+                    .and_modify(|current| *current = (*current).max(residency))
+                    .or_insert(residency);
+            }
+            for page in scene.summary_pages() {
+                let key = page.key();
+                let residency = if page.indexed_interval().overlaps(demand.visible_interval) {
+                    AlignmentCacheResidencyClass::ForegroundVisible
+                } else {
+                    AlignmentCacheResidencyClass::ActiveNearBuffer
+                };
+                demanded_summaries
+                    .entry(key)
+                    .and_modify(|current| *current = (*current).max(residency))
+                    .or_insert(residency);
+            }
+        }
+
+        if reclassify_unowned {
+            for (key, cached) in &mut self.read_pages {
+                cached.residency = demanded_reads.get(key).copied().unwrap_or_else(|| {
+                    if active_intervals
+                        .iter()
+                        .any(|interval| cached.page.interval().overlaps(*interval))
+                    {
+                        if cached.residency == AlignmentCacheResidencyClass::DisposableSpeculation {
+                            AlignmentCacheResidencyClass::DisposableSpeculation
+                        } else {
+                            AlignmentCacheResidencyClass::ActiveLocusCold
+                        }
+                    } else {
+                        AlignmentCacheResidencyClass::RecentLocusReturnCache
+                    }
+                });
+            }
+            for (key, cached) in &mut self.summary_pages {
+                cached.residency = demanded_summaries.get(key).copied().unwrap_or_else(|| {
+                    if active_intervals
+                        .iter()
+                        .any(|interval| cached.page.indexed_interval().overlaps(*interval))
+                    {
+                        AlignmentCacheResidencyClass::ActiveLocusCold
+                    } else {
+                        AlignmentCacheResidencyClass::RecentLocusReturnCache
+                    }
+                });
+            }
+            self.rebuild_eviction_index();
+        } else {
+            let affected_reads = self
+                .demanded_read_residency
+                .keys()
+                .chain(demanded_reads.keys())
+                .copied()
+                .collect::<HashSet<_>>();
+            for key in affected_reads {
+                let Some(cached) = self.read_pages.get_mut(&key) else {
+                    continue;
+                };
+                let old_index = (
+                    cached.residency,
+                    cached.last_used_revision,
+                    cached.page.allocation().id(),
+                    CachedPageLocation::Read(key),
+                );
+                let next = demanded_reads.get(&key).copied().unwrap_or_else(|| {
+                    if cached.residency == AlignmentCacheResidencyClass::DisposableSpeculation {
+                        AlignmentCacheResidencyClass::DisposableSpeculation
+                    } else {
+                        AlignmentCacheResidencyClass::ActiveLocusCold
+                    }
+                });
+                if next != cached.residency {
+                    self.eviction_index.remove(&old_index);
+                    cached.residency = next;
+                    self.eviction_index.insert((
+                        next,
+                        cached.last_used_revision,
+                        cached.page.allocation().id(),
+                        CachedPageLocation::Read(key),
+                    ));
+                }
+            }
+            let affected_summaries = self
+                .demanded_summary_residency
+                .keys()
+                .chain(demanded_summaries.keys())
+                .copied()
+                .collect::<HashSet<_>>();
+            for key in affected_summaries {
+                let Some(cached) = self.summary_pages.get_mut(&key) else {
+                    continue;
+                };
+                let old_index = (
+                    cached.residency,
+                    cached.last_used_revision,
+                    cached.page.allocation().id(),
+                    CachedPageLocation::Summary(key),
+                );
+                let next = demanded_summaries
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(AlignmentCacheResidencyClass::ActiveLocusCold);
+                if next != cached.residency {
+                    self.eviction_index.remove(&old_index);
+                    cached.residency = next;
+                    self.eviction_index.insert((
+                        next,
+                        cached.last_used_revision,
+                        cached.page.allocation().id(),
+                        CachedPageLocation::Summary(key),
+                    ));
+                }
+            }
+        }
+        self.demanded_read_residency = demanded_reads;
+        self.demanded_summary_residency = demanded_summaries;
     }
 
     /// Applies a lower shared allocation budget and relinquishes semantic-page cache ownership in
@@ -409,6 +667,18 @@ impl AlignmentPresentationStore {
         &mut self,
         target_charged: usize,
     ) -> Result<PresentationStorePressure, AlignmentPresentationStoreError> {
+        self.evict_inactive_batch(target_charged, usize::MAX)
+    }
+
+    /// Relinquishes at most `maximum_entries` inactive semantic cache entries. Candidate
+    /// selection is one ordered pass per quantum, replacing the former full-cache scan for every
+    /// removed page. The bounded form lets the scene worker interleave foreground requests with
+    /// maintenance instead of disappearing into one uninterruptible reclaim loop.
+    pub fn evict_inactive_batch(
+        &mut self,
+        target_charged: usize,
+        maximum_entries: usize,
+    ) -> Result<PresentationStorePressure, AlignmentPresentationStoreError> {
         let mut evicted_read_pages = 0_usize;
         let mut evicted_summary_pages = 0_usize;
         let protected_read_pages = self
@@ -421,16 +691,26 @@ impl AlignmentPresentationStore {
             .values()
             .flat_map(|snapshot| snapshot.summary_pages().iter().map(|page| page.key()))
             .collect::<HashSet<_>>();
-
-        loop {
+        let mut candidates = Vec::new();
+        let mut candidates_inspected = 0_usize;
+        for indexed @ (_, _, _, candidate) in &self.eviction_index {
+            if candidates.len() >= maximum_entries {
+                break;
+            }
+            candidates_inspected = candidates_inspected.saturating_add(1);
+            let protected = match candidate {
+                CachedPageLocation::Read(key) => protected_read_pages.contains(key),
+                CachedPageLocation::Summary(key) => protected_summary_pages.contains(key),
+            };
+            if !protected {
+                candidates.push(*indexed);
+            }
+        }
+        for indexed @ (_, _, _, candidate) in candidates {
             if self.ledger.progress()?.charged <= target_charged {
                 break;
             }
-            let Some(candidate) =
-                self.oldest_cached_page(&protected_read_pages, &protected_summary_pages)
-            else {
-                break;
-            };
+            self.eviction_index.remove(&indexed);
             match candidate {
                 CachedPageLocation::Read(key) => {
                     self.read_pages.remove(&key);
@@ -443,15 +723,25 @@ impl AlignmentPresentationStore {
             }
         }
 
-        let snapshot = self.ledger.snapshot()?;
+        let progress = self.ledger.progress()?;
+        let reclaim_complete = progress.charged <= target_charged
+            || evicted_read_pages.saturating_add(evicted_summary_pages) < maximum_entries;
+        let residency = if reclaim_complete && maximum_entries == usize::MAX {
+            self.residency_inventory()?
+        } else {
+            AlignmentCacheResidencyInventory::default()
+        };
         Ok(PresentationStorePressure {
             budget: target_charged,
             evicted_read_pages,
             evicted_summary_pages,
-            charged: snapshot.charged,
-            pinned: snapshot.pinned,
-            pinned_overage: snapshot.pinned_overage,
-            remaining_overage: snapshot.charged.saturating_sub(target_charged),
+            candidates_inspected,
+            reclaim_complete,
+            residency,
+            charged: progress.charged,
+            pinned: progress.pinned,
+            pinned_overage: progress.pinned_overage,
+            remaining_overage: progress.charged.saturating_sub(target_charged),
         })
     }
 
@@ -463,12 +753,27 @@ impl AlignmentPresentationStore {
         presentation: PresentationContract,
         contig_length: u64,
         reference: Option<&ReferenceSlice>,
+        requested_residency: AlignmentCacheResidencyClass,
         reservation_kind: ReservationKind,
         revision: u64,
     ) -> Result<Arc<AlignmentSemanticPage>, AlignmentPresentationStoreError> {
         if let Some(cached) = self.read_pages.get_mut(&key) {
+            let previous = (
+                cached.residency,
+                cached.last_used_revision,
+                cached.page.allocation().id(),
+                CachedPageLocation::Read(key),
+            );
             cached.last_used_revision = revision;
+            cached.residency = cached.residency.max(requested_residency);
             self.ledger.touch(cached.page.allocation().id(), revision)?;
+            self.eviction_index.remove(&previous);
+            self.eviction_index.insert((
+                cached.residency,
+                revision,
+                cached.page.allocation().id(),
+                CachedPageLocation::Read(key),
+            ));
             return Ok(Arc::clone(&cached.page));
         }
         let page = AlignmentSemanticPage::build(
@@ -485,10 +790,17 @@ impl AlignmentPresentationStore {
         self.read_pages.insert(
             key,
             CachedReadPage {
+                residency: requested_residency,
                 last_used_revision: revision,
                 page: Arc::clone(&page),
             },
         );
+        self.eviction_index.insert((
+            requested_residency,
+            revision,
+            page.allocation().id(),
+            CachedPageLocation::Read(key),
+        ));
         Ok(page)
     }
 
@@ -498,12 +810,27 @@ impl AlignmentPresentationStore {
         summaries: &Arc<ExactSummaryRoot>,
         reference: Option<(ReferenceRevision, &ReferenceSlice, u64)>,
         annotation: Option<&JunctionAnnotationIndex>,
+        requested_residency: AlignmentCacheResidencyClass,
         reservation_kind: ReservationKind,
         revision: u64,
     ) -> Result<Arc<SummarySemanticPage>, AlignmentPresentationStoreError> {
         if let Some(cached) = self.summary_pages.get_mut(&key) {
+            let previous = (
+                cached.residency,
+                cached.last_used_revision,
+                cached.page.allocation().id(),
+                CachedPageLocation::Summary(key),
+            );
             cached.last_used_revision = revision;
+            cached.residency = cached.residency.max(requested_residency);
             self.ledger.touch(cached.page.allocation().id(), revision)?;
+            self.eviction_index.remove(&previous);
+            self.eviction_index.insert((
+                cached.residency,
+                revision,
+                cached.page.allocation().id(),
+                CachedPageLocation::Summary(key),
+            ));
             return Ok(Arc::clone(&cached.page));
         }
         let page = SummarySemanticPage::build_with_dependencies(
@@ -518,10 +845,17 @@ impl AlignmentPresentationStore {
         self.summary_pages.insert(
             key,
             CachedSummaryPage {
+                residency: requested_residency,
                 last_used_revision: revision,
                 page: Arc::clone(&page),
             },
         );
+        self.eviction_index.insert((
+            requested_residency,
+            revision,
+            page.allocation().id(),
+            CachedPageLocation::Summary(key),
+        ));
         Ok(page)
     }
 
@@ -534,49 +868,61 @@ impl AlignmentPresentationStore {
         Ok(revision)
     }
 
-    fn oldest_cached_page(
-        &self,
-        protected_read_pages: &HashSet<AlignmentPageKey>,
-        protected_summary_pages: &HashSet<SummaryPageKey>,
-    ) -> Option<CachedPageLocation> {
-        let read = self
-            .read_pages
-            .iter()
-            .filter(|(key, _)| !protected_read_pages.contains(key))
-            .min_by_key(|(_, cached)| (cached.last_used_revision, cached.page.allocation().id()))
-            .map(|(key, cached)| {
+    fn rebuild_eviction_index(&mut self) {
+        self.eviction_index.clear();
+        self.eviction_index
+            .extend(self.read_pages.iter().map(|(key, cached)| {
                 (
+                    cached.residency,
                     cached.last_used_revision,
                     cached.page.allocation().id(),
                     CachedPageLocation::Read(*key),
                 )
-            });
-        let summary = self
-            .summary_pages
-            .iter()
-            .filter(|(key, _)| !protected_summary_pages.contains(key))
-            .min_by_key(|(_, cached)| (cached.last_used_revision, cached.page.allocation().id()))
-            .map(|(key, cached)| {
+            }));
+        self.eviction_index
+            .extend(self.summary_pages.iter().map(|(key, cached)| {
                 (
+                    cached.residency,
                     cached.last_used_revision,
                     cached.page.allocation().id(),
                     CachedPageLocation::Summary(*key),
                 )
-            });
-        match (read, summary) {
-            (Some(read), Some(summary)) => Some(if (read.0, read.1) <= (summary.0, summary.1) {
-                read.2
+            }));
+    }
+
+    fn residency_inventory(
+        &self,
+    ) -> Result<AlignmentCacheResidencyInventory, AlignmentPresentationStoreError> {
+        let mut inventory = AlignmentCacheResidencyInventory::default();
+        let mut allocations =
+            HashMap::<AllocationId, (AlignmentCacheResidencyClass, AllocationRecordSnapshot)>::new(
+            );
+        for cached in self.read_pages.values() {
+            inventory.observe_entry(cached.residency);
+            let id = cached.page.allocation().id();
+            if let Some((residency, _)) = allocations.get_mut(&id) {
+                *residency = (*residency).max(cached.residency);
             } else {
-                summary.2
-            }),
-            (Some(read), None) => Some(read.2),
-            (None, Some(summary)) => Some(summary.2),
-            (None, None) => None,
+                allocations.insert(id, (cached.residency, cached.page.allocation().snapshot()?));
+            }
         }
+        for cached in self.summary_pages.values() {
+            inventory.observe_entry(cached.residency);
+            let id = cached.page.allocation().id();
+            if let Some((residency, _)) = allocations.get_mut(&id) {
+                *residency = (*residency).max(cached.residency);
+            } else {
+                allocations.insert(id, (cached.residency, cached.page.allocation().snapshot()?));
+            }
+        }
+        for (_, (residency, allocation)) in allocations {
+            inventory.observe_distinct_allocation(residency, allocation);
+        }
+        Ok(inventory)
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum CachedPageLocation {
     Read(AlignmentPageKey),
     Summary(SummaryPageKey),
@@ -586,6 +932,19 @@ enum CachedPageLocation {
 pub struct PresentationCacheDiscard {
     pub read_pages: usize,
     pub summary_pages: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PresentationCacheDemotion {
+    pub read_pages: usize,
+    pub summary_pages: usize,
+}
+
+impl PresentationCacheDemotion {
+    #[must_use]
+    pub const fn total(self) -> usize {
+        self.read_pages.saturating_add(self.summary_pages)
+    }
 }
 
 impl PresentationCacheDiscard {
@@ -600,6 +959,12 @@ pub struct PresentationStorePressure {
     pub budget: usize,
     pub evicted_read_pages: usize,
     pub evicted_summary_pages: usize,
+    /// Legal inactive candidates inspected when constructing this bounded reclaim quantum.
+    pub candidates_inspected: usize,
+    /// The target was reached or this store exhausted its legal candidates before the quantum
+    /// limit. `false` means the caller should yield and resume another bounded quantum later.
+    pub reclaim_complete: bool,
+    pub residency: AlignmentCacheResidencyInventory,
     pub charged: usize,
     pub pinned: usize,
     pub pinned_overage: usize,

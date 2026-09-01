@@ -107,11 +107,12 @@ pub use presentation_scene::{
     AlignmentPresentationSceneError, AlignmentTraversalDirection,
 };
 pub use presentation_store::{
-    AlignmentPresentationOwner, AlignmentPresentationStore, AlignmentPresentationStoreError,
-    AlignmentReadPageWarm, AlignmentSceneCandidate, PresentationCacheDiscard,
-    PresentationStorePressure,
+    AlignmentPresentationOwner, AlignmentPresentationOwnerDemand, AlignmentPresentationStore,
+    AlignmentPresentationStoreError, AlignmentReadPageWarm, AlignmentSceneCandidate,
+    PresentationCacheDemotion, PresentationCacheDiscard, PresentationStorePressure,
 };
 pub use resource::{
+    AlignmentCacheResidencyClass, AlignmentCacheResidencyInventory,
     AllocationBundleAccountingOperation, AllocationBundleActual, AllocationBundleCommit,
     AllocationBundleDemand, AllocationBundleError, AllocationBundleLease,
     AllocationBundleReservation, AllocationBundleSlot, AllocationBundleSpec, AllocationClass,

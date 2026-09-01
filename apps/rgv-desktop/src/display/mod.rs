@@ -1474,7 +1474,7 @@ impl Viewer {
                     row_activity_atlas_revision: row_activity
                         .as_deref()
                         .map(AlignmentRowActivityProfile::atlas_revision),
-                    materialized_row_range: None,
+                    materialized_row_ranges: None,
                     total_rows,
                     authoritative_overview: match row_activity.as_deref() {
                         Some(profile) => Some(alignment_row_activity_overview(profile)),
@@ -2634,39 +2634,56 @@ impl Viewer {
         true
     }
 
-    fn active_panel_materialization_covers_scroll(&self) -> bool {
+    pub(crate) fn active_read_panel_materialization_coverage(
+        &self,
+        track_id: TrackId,
+    ) -> ReadPanelMaterializationCoverage {
         let panel = self.panels.active();
         let Some(cache) = panel.scroll_display_cache.as_ref() else {
-            return false;
+            return ReadPanelMaterializationCoverage::Unknown;
         };
-        cache.read_panels.iter().all(|read_panel| {
-            let (
-                Some((materialized_start, materialized_end)),
-                Some(total_rows),
-                Some(row_origin),
-                Some(row_height),
-            ) = (
-                read_panel.materialized_row_range,
-                read_panel.total_rows,
-                read_panel.row_origin,
-                read_panel.row_height,
-            )
-            else {
-                return true;
-            };
-            let (required_start, required_end) = alignment::materialized_alignment_row_range(
-                row_origin,
-                row_height,
-                read_panel.clip_top,
-                read_panel.clip_bottom,
-                panel
-                    .read_panel_scroll_state(read_panel.track_id)
-                    .effective_scroll_points(),
-                total_rows,
-                0,
-            );
-            materialized_start <= required_start && required_end <= materialized_end
-        })
+        let Some(read_panel) = cache
+            .read_panels
+            .iter()
+            .find(|read_panel| read_panel.track_id == track_id)
+        else {
+            return ReadPanelMaterializationCoverage::Unknown;
+        };
+        let required = read_panel
+            .total_rows
+            .zip(read_panel.row_origin)
+            .zip(read_panel.row_height)
+            .map(|((total_rows, row_origin), row_height)| {
+                alignment::materialized_alignment_row_range(
+                    row_origin,
+                    row_height,
+                    read_panel.clip_top,
+                    read_panel.clip_bottom,
+                    panel
+                        .read_panel_scroll_state(read_panel.track_id)
+                        .effective_scroll_points(),
+                    total_rows,
+                    0,
+                )
+            });
+        read_panel_materialization_coverage(read_panel.materialized_row_ranges.as_deref(), required)
+    }
+
+    fn active_panel_materialization_covers_scroll(&self) -> bool {
+        self.panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .is_some_and(|cache| {
+                cache
+                    .read_panels
+                    .iter()
+                    .filter(|read_panel| read_panel.density_camera)
+                    .all(|read_panel| {
+                        self.active_read_panel_materialization_coverage(read_panel.track_id)
+                            .is_covered()
+                    })
+            })
     }
 
     /// Applies the one workspace annotation camera to every locus and refreshes

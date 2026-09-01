@@ -1612,16 +1612,11 @@ impl Viewer {
                     0,
                 )
             });
-        let materialization_covers_required =
-            match (cached.materialized_row_range, required_materialized_rows) {
-                (
-                    Some((materialized_start, materialized_end)),
-                    Some((required_start, required_end)),
-                ) => materialized_start <= required_start && required_end <= materialized_end,
-                // A cache without an explicit CPU materialization window delegates row residency to
-                // the native alignment scene and therefore does not reject fast scroll here.
-                _ => true,
-            };
+        let materialization_coverage = read_panel_materialization_coverage(
+            cached.materialized_row_ranges.as_deref(),
+            required_materialized_rows,
+        );
+        let materialization_covers_required = materialization_coverage.is_covered();
         serde_json::json!({
             "panel_present": true,
             "scroll_cache_present": true,
@@ -1639,8 +1634,9 @@ impl Viewer {
             "raw_row_coordinate_authority": format!("{:?}", cached.row_coordinate_authority),
             "effective_row_coordinate_authority": format!("{effective_authority:?}"),
             "row_activity_atlas_revision": cached.row_activity_atlas_revision.map(|revision| diagnostic_revision_fingerprint(revision.fingerprint())),
-            "materialized_row_range": cached.materialized_row_range.map(|(start, end)| serde_json::json!({ "start": start, "end": end })),
+            "materialized_row_ranges": cached.materialized_row_ranges.as_deref(),
             "required_materialized_row_range": required_materialized_rows.map(|(start, end)| serde_json::json!({ "start": start, "end": end })),
+            "materialization_coverage": format!("{materialization_coverage:?}"),
             "materialization_covers_required": materialization_covers_required,
             "total_rows": cached.total_rows,
             "row_origin": cached.row_origin,
@@ -1840,7 +1836,7 @@ impl Viewer {
                                 "outcome": format!("{:?}", pump.outcome),
                             })
                         });
-                        let telemetry = serde_json::json!({
+                        let mut telemetry = serde_json::json!({
                             "camera_updates": work.camera_updates,
                             "camera_only_updates": work.camera_only_updates,
                             "source_work_started": work.source_work_started,
@@ -1882,6 +1878,24 @@ impl Viewer {
                             "row_activity_intervals_changed": work.row_activity_intervals_changed,
                             "last_vertical_pump": last_pump,
                         });
+                        if let Some(telemetry) = telemetry.as_object_mut() {
+                            telemetry.insert(
+                                "row_camera_updates_deferred".to_owned(),
+                                work.row_camera_updates_deferred.into(),
+                            );
+                            telemetry.insert(
+                                "foreground_row_block_publications".to_owned(),
+                                work.foreground_row_block_publications.into(),
+                            );
+                            telemetry.insert(
+                                "return_cache_demotions".to_owned(),
+                                work.return_cache_demotions.into(),
+                            );
+                            telemetry.insert(
+                                "return_cache_entries_demoted".to_owned(),
+                                work.return_cache_entries_demoted.into(),
+                            );
+                        }
                         (navigation, staged, telemetry)
                     },
                 );

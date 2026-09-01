@@ -10,7 +10,8 @@ use std::{
 
 use rgv_alignment_scene::{
     AlignmentSceneCamera, AlignmentSourceRevision, AllocationLedger, ContractFingerprint,
-    EvidenceStore, LedgerError, PresentationContract, SceneRevision,
+    EvidenceStore, LedgerError, PresentationContract, PresentationStorePressure, SceneRevision,
+    StorePressure,
 };
 use rgv_core::ReferenceDictionary;
 use rgv_hts::{
@@ -31,6 +32,9 @@ use crate::{
 
 const WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
 const MAXIMUM_INPUT_BURST: usize = 32;
+/// Maintenance deliberately yields after this many ownership removals. The value bounds work per
+/// checkpoint; it is not a memory-policy constant and does not change which exact data is kept.
+const MAXIMUM_RECLAIM_ENTRIES_PER_QUANTUM: usize = 256;
 
 /// Identity of one desktop request transaction for an alignment-scene lane.
 ///
@@ -125,6 +129,9 @@ pub enum AlignmentSceneFrameCause {
     SourceControlRetry,
     ResourcePressureRetry,
     SourcePublication,
+    /// Latest-wins publication for a vertical row-camera change; source and atlas authority are
+    /// unchanged.
+    RowCamera,
     VerticalResidency,
 }
 
@@ -711,6 +718,92 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingInactiveEviction {
+    request_id: u64,
+    target_charged: usize,
+    accumulated: Option<AlignmentCoordinatorEviction>,
+}
+
+fn merge_inactive_eviction(
+    previous: Option<AlignmentCoordinatorEviction>,
+    next: AlignmentCoordinatorEviction,
+) -> AlignmentCoordinatorEviction {
+    let Some(previous) = previous else {
+        return next;
+    };
+    AlignmentCoordinatorEviction {
+        target_charged: next.target_charged,
+        speculation_was_pending: previous.speculation_was_pending || next.speculation_was_pending,
+        active_speculation_aborted: previous.active_speculation_aborted
+            || next.active_speculation_aborted,
+        presentation: PresentationStorePressure {
+            budget: next.presentation.budget,
+            evicted_read_pages: previous
+                .presentation
+                .evicted_read_pages
+                .saturating_add(next.presentation.evicted_read_pages),
+            evicted_summary_pages: previous
+                .presentation
+                .evicted_summary_pages
+                .saturating_add(next.presentation.evicted_summary_pages),
+            candidates_inspected: previous
+                .presentation
+                .candidates_inspected
+                .saturating_add(next.presentation.candidates_inspected),
+            reclaim_complete: next.presentation.reclaim_complete,
+            residency: next.presentation.residency,
+            charged: next.presentation.charged,
+            pinned: next.presentation.pinned,
+            pinned_overage: next.presentation.pinned_overage,
+            remaining_overage: next.presentation.remaining_overage,
+        },
+        evidence: StorePressure {
+            evicted_acquisitions: previous
+                .evidence
+                .evicted_acquisitions
+                .saturating_add(next.evidence.evicted_acquisitions),
+            evicted_chunks: previous
+                .evidence
+                .evicted_chunks
+                .saturating_add(next.evidence.evicted_chunks),
+            evicted_exact_summaries: previous
+                .evidence
+                .evicted_exact_summaries
+                .saturating_add(next.evidence.evicted_exact_summaries),
+            evicted_row_atlases: previous
+                .evidence
+                .evicted_row_atlases
+                .saturating_add(next.evidence.evicted_row_atlases),
+            candidates_inspected: previous
+                .evidence
+                .candidates_inspected
+                .saturating_add(next.evidence.candidates_inspected),
+            reclaim_complete: next.evidence.reclaim_complete,
+            residency: next.evidence.residency,
+            charged: next.evidence.charged,
+            pinned: next.evidence.pinned,
+            pinned_overage: next.evidence.pinned_overage,
+        },
+        charged_before: previous.charged_before,
+        charged: next.charged,
+        pinned: next.pinned,
+        released: previous.charged_before.saturating_sub(next.charged),
+        relinquished_cache_entries: previous
+            .relinquished_cache_entries
+            .saturating_add(next.relinquished_cache_entries),
+        remaining: next.remaining,
+        quantum_entries: previous
+            .quantum_entries
+            .saturating_add(next.quantum_entries),
+        quanta: previous.quanta.saturating_add(next.quanta),
+        elapsed_nanoseconds: previous
+            .elapsed_nanoseconds
+            .saturating_add(next.elapsed_nanoseconds),
+        reclaim_complete: next.reclaim_complete,
+    }
+}
+
 fn scene_worker_loop<B>(
     mut coordinator: AlignmentSceneSourceCoordinator<B>,
     input: &CoalescingReceiver<AlignmentSceneEngineRequest<B::Control>>,
@@ -720,9 +813,11 @@ fn scene_worker_loop<B>(
     B::Error: Error + Send + Sync + 'static,
 {
     let mut request_tokens = BTreeMap::new();
+    let mut pending_eviction = None;
     loop {
         let first = if coordinator.has_pending_source_work()
             || coordinator.has_pending_presentation_work()
+            || pending_eviction.is_some()
         {
             input.try_receive()
         } else {
@@ -730,7 +825,13 @@ fn scene_worker_loop<B>(
         };
         match first {
             Ok(Some(request)) => {
-                if !apply_request(&mut coordinator, &mut request_tokens, output, request) {
+                if !apply_request(
+                    &mut coordinator,
+                    &mut request_tokens,
+                    &mut pending_eviction,
+                    output,
+                    request,
+                ) {
                     return;
                 }
                 for _ in 1..MAXIMUM_INPUT_BURST {
@@ -739,6 +840,7 @@ fn scene_worker_loop<B>(
                             if !apply_request(
                                 &mut coordinator,
                                 &mut request_tokens,
+                                &mut pending_eviction,
                                 output,
                                 request,
                             ) {
@@ -754,7 +856,53 @@ fn scene_worker_loop<B>(
             Err(_) => return,
         }
 
-        if coordinator.has_pending_source_work() {
+        // Reclaim yields to the mailbox between bounded quanta, but not to foreground allocation.
+        // Letting one page build between quanta consumed freshly released bytes and made a large
+        // low-water target mathematically unreachable—the exact saturation loop this worker is
+        // responsible for breaking.
+        let run_maintenance = pending_eviction.is_some();
+        if run_maintenance {
+            let mut pending = pending_eviction
+                .take()
+                .expect("the selected maintenance turn still has a reclaim transaction");
+            match coordinator
+                .evict_inactive_batch(pending.target_charged, MAXIMUM_RECLAIM_ENTRIES_PER_QUANTUM)
+            {
+                Ok(eviction) => {
+                    let stopped_without_progress = eviction.quantum_entries == 0;
+                    let complete = eviction.reclaim_complete || stopped_without_progress;
+                    pending.accumulated =
+                        Some(merge_inactive_eviction(pending.accumulated, eviction));
+                    if complete {
+                        let eviction = pending
+                            .accumulated
+                            .expect("a completed reclaim has at least one bounded result");
+                        if !send_control(
+                            output,
+                            AlignmentSceneEngineEvent::InactiveEvicted {
+                                request_id: pending.request_id,
+                                eviction,
+                            },
+                        ) {
+                            return;
+                        }
+                    } else {
+                        pending_eviction = Some(pending);
+                    }
+                }
+                Err(error) => {
+                    if !send_error(
+                        output,
+                        None,
+                        None,
+                        AlignmentSceneEngineOperation::EvictInactive,
+                        error,
+                    ) {
+                        return;
+                    }
+                }
+            }
+        } else if coordinator.has_pending_source_work() {
             match coordinator.pump_once() {
                 Ok(pump) => {
                     for publication in pump.publications {
@@ -818,6 +966,12 @@ fn scene_worker_loop<B>(
                         }
                     }
                     for pressure in pump.pressures {
+                        schedule_internal_reclaim(
+                            &mut coordinator,
+                            &mut pending_eviction,
+                            pressure.owner,
+                            pressure.pressure,
+                        );
                         if !send_resource_pressure(
                             output,
                             pressure.owner,
@@ -832,7 +986,13 @@ fn scene_worker_loop<B>(
                     }
                 }
                 Err(error) => {
-                    if !handle_source_pump_error(&mut coordinator, &request_tokens, output, error) {
+                    if !handle_source_pump_error(
+                        &mut coordinator,
+                        &request_tokens,
+                        &mut pending_eviction,
+                        output,
+                        error,
+                    ) {
                         return;
                     }
                 }
@@ -841,6 +1001,14 @@ fn scene_worker_loop<B>(
             match coordinator.pump_presentation_once() {
                 Ok(Some(pump)) => {
                     if let Some(pressure) = pump.pressure {
+                        if pump.intent == SourceIntentKind::Foreground {
+                            schedule_internal_reclaim(
+                                &mut coordinator,
+                                &mut pending_eviction,
+                                pump.owner,
+                                pressure,
+                            );
+                        }
                         let target = coordinator
                             .frame(pump.owner)
                             .ok()
@@ -858,7 +1026,9 @@ fn scene_worker_loop<B>(
                             }
                             continue;
                         };
-                        if pressure.intrinsically_exceeds_limit() {
+                        if pump.intent == SourceIntentKind::Speculative
+                            && pressure.intrinsically_exceeds_limit()
+                        {
                             // Full-height residency is optional. The coordinator has already
                             // latched this lane as BudgetLimited while preserving its current
                             // visible-complete snapshot, so publish that truthful state instead of
@@ -880,12 +1050,12 @@ fn scene_worker_loop<B>(
                             current_request_token(&request_tokens, pump.owner),
                             target,
                             AlignmentSceneEngineOperation::PumpPresentation,
-                            SourceIntentKind::Speculative,
+                            pump.intent,
                             pressure,
                         ) {
                             return;
                         }
-                    } else if pump.completed || pump.failed {
+                    } else if pump.published_scene.is_some() || pump.completed || pump.failed {
                         // Intermediate independent row-block warms neither replace the semantic
                         // scene nor require a desktop redraw. Publish one coalesced status/frame
                         // update only when the whole directory becomes warm or optional warming
@@ -895,9 +1065,13 @@ fn scene_worker_loop<B>(
                             output,
                             pump.owner,
                             current_request_token(&request_tokens, pump.owner),
-                            AlignmentSceneFrameCause::VerticalResidency,
+                            if pump.intent == SourceIntentKind::Foreground {
+                                AlignmentSceneFrameCause::RowCamera
+                            } else {
+                                AlignmentSceneFrameCause::VerticalResidency
+                            },
                             None,
-                            None,
+                            pump.published_scene,
                         ) {
                             return;
                         }
@@ -922,12 +1096,64 @@ fn scene_worker_loop<B>(
     }
 }
 
+/// Converts a retained-budget refusal into the demand-derived low-water target maintained by the
+/// source coordinator. The refused allocation expands the measured island envelope; it is never
+/// used as an exact-fit reclaim threshold.
+fn schedule_internal_reclaim<B>(
+    coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    owner: SourceOwnerId,
+    pressure: LedgerError,
+) where
+    B: CanonicalAlignmentSourceBackend,
+{
+    let LedgerError::BudgetExceeded { requested, .. } = pressure else {
+        return;
+    };
+    let Ok(plan) = coordinator.foreground_capacity_plan(owner, requested) else {
+        return;
+    };
+    if plan.charged <= plan.low_water_target {
+        return;
+    }
+    schedule_reclaim_target(pending_eviction, 0, plan.low_water_target);
+}
+
+fn schedule_reclaim_target(
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    request_id: u64,
+    target_charged: usize,
+) {
+    if let Some(pending) = pending_eviction {
+        pending.target_charged = pending.target_charged.min(target_charged);
+        // Preserve a desktop request ID so its cross-owner transaction receives completion even
+        // when an internal foreground target tightens the same coalesced reclaim cycle.
+        if pending.request_id == 0 && request_id != 0 {
+            pending.request_id = request_id;
+        }
+        return;
+    }
+    *pending_eviction = Some(PendingInactiveEviction {
+        request_id,
+        target_charged,
+        accumulated: None,
+    });
+}
+
+fn camera_change_retargets_reclaim(
+    previous: Option<AlignmentSceneCamera>,
+    next: AlignmentSceneCamera,
+) -> bool {
+    previous.is_none_or(|previous| !previous.interval().overlaps(next.interval()))
+}
+
 /// Handles a failed bounded source checkpoint without widening an intent-local resource refusal
 /// into a source-wide outage. The actor has already abandoned and cancelled the half-consumed
 /// decoder transaction before this function runs.
 fn handle_source_pump_error<B>(
     coordinator: &mut AlignmentSceneSourceCoordinator<B>,
     request_tokens: &BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
     output: &CoalescingSender<AlignmentSceneEngineEvent>,
     error: crate::AlignmentSceneCoordinatorError<B::Error>,
 ) -> bool
@@ -946,6 +1172,12 @@ where
         if !coordinator.actor_mut().cancel_failed_work_if_current(&work) {
             return true;
         }
+        schedule_internal_reclaim(
+            coordinator,
+            pending_eviction,
+            work.intent().owner(),
+            pressure,
+        );
         return send_resource_pressure(
             output,
             work.intent().owner(),
@@ -1046,6 +1278,7 @@ where
 /// identity, and backend failures remain ordinary terminal errors for the exact operation.
 fn send_owner_operation_error<B>(
     coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
     output: &CoalescingSender<AlignmentSceneEngineEvent>,
     owner: SourceOwnerId,
     request_token: AlignmentSceneRequestToken,
@@ -1061,6 +1294,9 @@ where
         source_allocation_pressure::<B>(&error),
         owner_pressure_target(coordinator, owner),
     ) {
+        if intent == SourceIntentKind::Foreground {
+            schedule_internal_reclaim(coordinator, pending_eviction, owner, pressure);
+        }
         // The desired lane state is already durable. Stop any older source authority from being
         // pumped under that newer token while capacity is unavailable; the explicit retry will
         // reconcile and resume only the still-current desired target.
@@ -1152,6 +1388,7 @@ where
 fn apply_request<B>(
     coordinator: &mut AlignmentSceneSourceCoordinator<B>,
     request_tokens: &mut BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
     output: &CoalescingSender<AlignmentSceneEngineEvent>,
     request: AlignmentSceneEngineRequest<B::Control>,
 ) -> bool
@@ -1191,19 +1428,36 @@ where
             request_token,
             camera,
         } => {
+            let previous_camera = coordinator
+                .frame(owner)
+                .ok()
+                .flatten()
+                .map(|frame| frame.camera);
+            if camera_change_retargets_reclaim(previous_camera, camera) {
+                // Only a genuinely disjoint navigation island invalidates the old reserve.
+                // Contained pans, zooms, and row motion keep making low-water progress instead of
+                // cancelling maintenance on every pointer sample.
+                *pending_eviction = None;
+            }
             request_tokens.insert(owner, request_token);
             match coordinator.update_camera(owner, camera) {
-                Ok(update) => send_frame(
-                    coordinator,
-                    output,
-                    owner,
-                    request_token,
-                    AlignmentSceneFrameCause::Camera,
-                    Some(update),
-                    update.published_scene,
-                ),
+                Ok(update) => {
+                    if let Some(target) = update.proactive_reclaim_target {
+                        schedule_reclaim_target(pending_eviction, 0, target);
+                    }
+                    send_frame(
+                        coordinator,
+                        output,
+                        owner,
+                        request_token,
+                        AlignmentSceneFrameCause::Camera,
+                        Some(update),
+                        update.published_scene,
+                    )
+                }
                 Err(error) => send_owner_operation_error(
                     coordinator,
+                    pending_eviction,
                     output,
                     owner,
                     request_token,
@@ -1232,6 +1486,7 @@ where
             request_token,
             contract,
         } => {
+            *pending_eviction = None;
             request_tokens.insert(owner, request_token);
             match coordinator.replace_contract(owner, contract) {
                 Ok(update) => send_frame(
@@ -1245,6 +1500,7 @@ where
                 ),
                 Err(error) => send_owner_operation_error(
                     coordinator,
+                    pending_eviction,
                     output,
                     owner,
                     request_token,
@@ -1255,6 +1511,7 @@ where
             }
         }
         AlignmentSceneEngineRequest::InstallReferenceAuthority { owner, authority } => {
+            *pending_eviction = None;
             let request_token = current_request_token(request_tokens, owner);
             match coordinator.install_reference_authority(owner, authority) {
                 Ok(outcome) if outcome.installed => send_frame(
@@ -1269,6 +1526,7 @@ where
                 Ok(_) => true,
                 Err(error) => send_owner_operation_error(
                     coordinator,
+                    pending_eviction,
                     output,
                     owner,
                     request_token,
@@ -1283,6 +1541,7 @@ where
             request_token,
             policy,
         } => {
+            *pending_eviction = None;
             request_tokens.insert(owner, request_token);
             match coordinator.set_preparation_policy(owner, policy) {
                 Ok(Some(update)) => send_frame(
@@ -1297,6 +1556,7 @@ where
                 Ok(None) => true,
                 Err(error) => send_owner_operation_error(
                     coordinator,
+                    pending_eviction,
                     output,
                     owner,
                     request_token,
@@ -1316,6 +1576,7 @@ where
             ),
             Err(error) => send_owner_operation_error(
                 coordinator,
+                pending_eviction,
                 output,
                 owner,
                 current_request_token(request_tokens, owner),
@@ -1325,6 +1586,7 @@ where
             ),
         },
         AlignmentSceneEngineRequest::SetSourceControl(control) => {
+            *pending_eviction = None;
             let retry_refusals = B::control_invalidates_read_refusals(&control);
             match coordinator.actor_mut().submit_control(control) {
                 Ok(()) => {
@@ -1365,6 +1627,7 @@ where
             }
         }
         AlignmentSceneEngineRequest::ReduceBudget { budget } => {
+            *pending_eviction = None;
             match coordinator.reduce_budget(budget) {
                 Ok(pressure) => send_control(
                     output,
@@ -1382,14 +1645,15 @@ where
         AlignmentSceneEngineRequest::EvictInactive {
             request_id,
             target_charged,
-        } => match coordinator.evict_inactive_until(target_charged) {
-            Ok(eviction) => send_control(
-                output,
-                AlignmentSceneEngineEvent::InactiveEvicted {
+        } => match coordinator.aggregate_foreground_low_water_target() {
+            Ok(measured_target) => {
+                schedule_reclaim_target(
+                    pending_eviction,
                     request_id,
-                    eviction,
-                },
-            ),
+                    measured_target.map_or(target_charged, |measured| measured.min(target_charged)),
+                );
+                true
+            }
             Err(error) => send_error(
                 output,
                 None,
@@ -1399,6 +1663,7 @@ where
             ),
         },
         AlignmentSceneEngineRequest::ClearCacheBudget { restore_budget } => {
+            *pending_eviction = None;
             match coordinator.reduce_budget(0) {
                 Ok(_) => match coordinator.reduce_budget(restore_budget) {
                     Ok(pressure) => send_control(
@@ -1593,6 +1858,72 @@ mod tests {
         AlignmentSourceIntentSpec, CanonicalDecodeCheckpoint, LocalBamCanonicalBackend,
         LocalBamCanonicalBackendError, LocalBamSourceControl, SourceWork,
     };
+
+    #[test]
+    fn row_camera_changes_preserve_a_valid_reclaim_transaction() {
+        let contig = ContigId::new(0);
+        let render_camera = AlignmentCamera::new(
+            GenomicInterval::new(contig, 100, 200).unwrap(),
+            0.0,
+            12.0,
+            9.0,
+            rgv_alignment_scene::CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 400.0,
+                height: 72.0,
+            },
+        )
+        .unwrap();
+        let current: AlignmentSceneCamera = render_camera.into();
+        let scrolled = AlignmentSceneCamera::with_visible_rows(current.viewport(), 10..20).unwrap();
+        assert!(!camera_change_retargets_reclaim(Some(current), scrolled));
+
+        let panned: AlignmentSceneCamera = AlignmentCamera::new(
+            GenomicInterval::new(contig, 101, 201).unwrap(),
+            0.0,
+            12.0,
+            9.0,
+            rgv_alignment_scene::CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 400.0,
+                height: 72.0,
+            },
+        )
+        .unwrap()
+        .into();
+        assert!(!camera_change_retargets_reclaim(Some(current), panned));
+        let disjoint: AlignmentSceneCamera = AlignmentCamera::new(
+            GenomicInterval::new(contig, 500, 600).unwrap(),
+            0.0,
+            12.0,
+            9.0,
+            rgv_alignment_scene::CpuClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 400.0,
+                height: 72.0,
+            },
+        )
+        .unwrap()
+        .into();
+        assert!(camera_change_retargets_reclaim(Some(current), disjoint));
+        assert!(camera_change_retargets_reclaim(None, current));
+    }
+
+    #[test]
+    fn reclaim_requests_coalesce_to_the_strictest_low_water_without_losing_completion_identity() {
+        let mut pending = None;
+        schedule_reclaim_target(&mut pending, 0, 900);
+        schedule_reclaim_target(&mut pending, 41, 800);
+        schedule_reclaim_target(&mut pending, 0, 850);
+
+        let pending = pending.expect("coalesced reclaim remains scheduled");
+        assert_eq!(pending.request_id, 41);
+        assert_eq!(pending.target_charged, 800);
+        assert!(pending.accumulated.is_none());
+    }
 
     #[test]
     fn worker_error_message_preserves_the_concrete_backend_cause() {

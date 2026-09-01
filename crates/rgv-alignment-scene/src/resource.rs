@@ -19,6 +19,149 @@ impl AllocationId {
     }
 }
 
+/// Reuse priority carried by mutable cache ownership. Protection is deliberately orthogonal:
+/// committed/candidate scenes retain immutable pins while this class answers only why a cache
+/// owner should keep its reloadable lookup reference. Variant order is eviction order.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AlignmentCacheResidencyClass {
+    /// Work prepared without a current visible demand (for example whole-stack warming).
+    DisposableSpeculation,
+    /// A disjoint previous working-set island. It may use only residual capacity.
+    RecentLocusReturnCache,
+    /// Same-locus pages outside the current horizontal/vertical working buffer.
+    ActiveLocusCold,
+    #[default]
+    /// Pages inside the configured nearby pan/scroll buffer.
+    ActiveNearBuffer,
+    /// Exact pages required by the current camera or its in-flight successor.
+    ForegroundVisible,
+}
+
+/// Byte-weighted cache ownership inventory. An allocation shared by several cache entries is
+/// assigned once, to the strongest residency class which references it. Entry counts remain
+/// useful complexity telemetry but never drive capacity policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentCacheResidencyInventory {
+    pub disposable_speculation_entries: usize,
+    pub disposable_speculation_allocations: usize,
+    pub disposable_speculation_bytes: usize,
+    pub recent_locus_return_cache_entries: usize,
+    pub recent_locus_return_cache_allocations: usize,
+    pub recent_locus_return_cache_bytes: usize,
+    pub active_locus_cold_entries: usize,
+    pub active_locus_cold_allocations: usize,
+    pub active_locus_cold_bytes: usize,
+    pub active_near_buffer_entries: usize,
+    pub active_near_buffer_allocations: usize,
+    pub active_near_buffer_bytes: usize,
+    pub foreground_visible_entries: usize,
+    pub foreground_visible_allocations: usize,
+    pub foreground_visible_bytes: usize,
+    /// Distinct bytes which currently have at least one committed/candidate pin.
+    pub pinned_bytes: usize,
+    /// Distinct bytes with no committed/candidate pin. Other shared object owners may still keep
+    /// them charged after this cache reference yields, so physical release remains ledger-proven.
+    pub unpinned_bytes: usize,
+}
+
+impl AlignmentCacheResidencyInventory {
+    pub(crate) fn observe_entry(&mut self, residency: AlignmentCacheResidencyClass) {
+        match residency {
+            AlignmentCacheResidencyClass::DisposableSpeculation => {
+                self.disposable_speculation_entries =
+                    self.disposable_speculation_entries.saturating_add(1);
+            }
+            AlignmentCacheResidencyClass::RecentLocusReturnCache => {
+                self.recent_locus_return_cache_entries =
+                    self.recent_locus_return_cache_entries.saturating_add(1);
+            }
+            AlignmentCacheResidencyClass::ActiveLocusCold => {
+                self.active_locus_cold_entries = self.active_locus_cold_entries.saturating_add(1);
+            }
+            AlignmentCacheResidencyClass::ActiveNearBuffer => {
+                self.active_near_buffer_entries = self.active_near_buffer_entries.saturating_add(1);
+            }
+            AlignmentCacheResidencyClass::ForegroundVisible => {
+                self.foreground_visible_entries = self.foreground_visible_entries.saturating_add(1);
+            }
+        }
+    }
+
+    pub(crate) fn observe_distinct_allocation(
+        &mut self,
+        residency: AlignmentCacheResidencyClass,
+        allocation: AllocationRecordSnapshot,
+    ) {
+        let (allocations, bytes) = match residency {
+            AlignmentCacheResidencyClass::DisposableSpeculation => (
+                &mut self.disposable_speculation_allocations,
+                &mut self.disposable_speculation_bytes,
+            ),
+            AlignmentCacheResidencyClass::RecentLocusReturnCache => (
+                &mut self.recent_locus_return_cache_allocations,
+                &mut self.recent_locus_return_cache_bytes,
+            ),
+            AlignmentCacheResidencyClass::ActiveLocusCold => (
+                &mut self.active_locus_cold_allocations,
+                &mut self.active_locus_cold_bytes,
+            ),
+            AlignmentCacheResidencyClass::ActiveNearBuffer => (
+                &mut self.active_near_buffer_allocations,
+                &mut self.active_near_buffer_bytes,
+            ),
+            AlignmentCacheResidencyClass::ForegroundVisible => (
+                &mut self.foreground_visible_allocations,
+                &mut self.foreground_visible_bytes,
+            ),
+        };
+        *allocations = allocations.saturating_add(1);
+        *bytes = bytes.saturating_add(allocation.charged_capacity);
+        if allocation.pins > 0 {
+            self.pinned_bytes = self
+                .pinned_bytes
+                .saturating_add(allocation.charged_capacity);
+        } else {
+            self.unpinned_bytes = self
+                .unpinned_bytes
+                .saturating_add(allocation.charged_capacity);
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        macro_rules! add {
+            ($field:ident) => {
+                self.$field = self.$field.saturating_add(other.$field);
+            };
+        }
+        add!(disposable_speculation_entries);
+        add!(disposable_speculation_allocations);
+        add!(disposable_speculation_bytes);
+        add!(recent_locus_return_cache_entries);
+        add!(recent_locus_return_cache_allocations);
+        add!(recent_locus_return_cache_bytes);
+        add!(active_locus_cold_entries);
+        add!(active_locus_cold_allocations);
+        add!(active_locus_cold_bytes);
+        add!(active_near_buffer_entries);
+        add!(active_near_buffer_allocations);
+        add!(active_near_buffer_bytes);
+        add!(foreground_visible_entries);
+        add!(foreground_visible_allocations);
+        add!(foreground_visible_bytes);
+        add!(pinned_bytes);
+        add!(unpinned_bytes);
+    }
+
+    #[must_use]
+    pub const fn distinct_bytes(self) -> usize {
+        self.disposable_speculation_bytes
+            .saturating_add(self.recent_locus_return_cache_bytes)
+            .saturating_add(self.active_locus_cold_bytes)
+            .saturating_add(self.active_near_buffer_bytes)
+            .saturating_add(self.foreground_visible_bytes)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AllocationClass {
     CoreChunk,
@@ -3505,5 +3648,50 @@ mod tests {
         drop(evidence);
         drop(gpu);
         assert_eq!(ledger.progress().unwrap().retained.total(), 0);
+    }
+
+    #[test]
+    fn cache_residency_order_disposes_speculation_and_return_cache_first() {
+        assert!(
+            AlignmentCacheResidencyClass::DisposableSpeculation
+                < AlignmentCacheResidencyClass::RecentLocusReturnCache
+        );
+        assert!(
+            AlignmentCacheResidencyClass::RecentLocusReturnCache
+                < AlignmentCacheResidencyClass::ActiveLocusCold
+        );
+        assert!(
+            AlignmentCacheResidencyClass::ActiveLocusCold
+                < AlignmentCacheResidencyClass::ActiveNearBuffer
+        );
+        assert!(
+            AlignmentCacheResidencyClass::ActiveNearBuffer
+                < AlignmentCacheResidencyClass::ForegroundVisible
+        );
+    }
+
+    #[test]
+    fn cache_inventory_reports_distinct_bytes_separately_from_entry_count() {
+        let ledger = AllocationLedger::new(1_000, 0);
+        let mut reservation = ledger
+            .reserve(AllocationClass::SemanticPage, 320, ReservationKind::Normal)
+            .unwrap();
+        let lease = reservation.register(320, 1).unwrap();
+        let pin = lease.pin().unwrap();
+        let mut inventory = AlignmentCacheResidencyInventory::default();
+        inventory.observe_entry(AlignmentCacheResidencyClass::ForegroundVisible);
+        inventory.observe_entry(AlignmentCacheResidencyClass::ForegroundVisible);
+        inventory.observe_distinct_allocation(
+            AlignmentCacheResidencyClass::ForegroundVisible,
+            lease.snapshot().unwrap(),
+        );
+
+        assert_eq!(inventory.foreground_visible_entries, 2);
+        assert_eq!(inventory.foreground_visible_allocations, 1);
+        assert_eq!(inventory.foreground_visible_bytes, 320);
+        assert_eq!(inventory.pinned_bytes, 320);
+        assert_eq!(inventory.unpinned_bytes, 0);
+        assert_eq!(inventory.distinct_bytes(), 320);
+        drop(pin);
     }
 }

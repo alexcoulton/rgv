@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     ops::Range,
     sync::Arc,
@@ -8,13 +8,14 @@ use std::{
 };
 
 use rgv_alignment_scene::{
-    AlignmentFilterEvaluationError, AlignmentPresentationOwner, AlignmentPresentationSceneError,
-    AlignmentPresentationStore, AlignmentPresentationStoreError, AlignmentRowActivityCursor,
-    AlignmentRowActivityProfile, AlignmentRowAtlasError, AlignmentSceneCamera,
-    AlignmentSceneSnapshot, AlignmentSceneSnapshotError, AlignmentSourceRevision,
-    AlignmentViewFilterContract, AlleleSummaryDetail, CanonicalGenomicTile, CanonicalRowBlock,
-    ContractFingerprint, EvidenceBuildError, EvidenceRevision, EvidenceSelectionError,
-    EvidenceStoreError, ExactAlleleSummaryError, ExactDepthSummaryError, ExactFilterSummaryError,
+    AlignmentFilterEvaluationError, AlignmentPresentationOwner, AlignmentPresentationOwnerDemand,
+    AlignmentPresentationSceneError, AlignmentPresentationStore, AlignmentPresentationStoreError,
+    AlignmentRowActivityCursor, AlignmentRowActivityProfile, AlignmentRowAtlasError,
+    AlignmentSceneCamera, AlignmentSceneSnapshot, AlignmentSceneSnapshotError,
+    AlignmentSourceRevision, AlignmentViewFilterContract, AlleleSummaryDetail, AllocationId,
+    AllocationLease, CanonicalGenomicTile, CanonicalRowBlock, ContractFingerprint,
+    EvidenceBuildError, EvidenceRevision, EvidenceSelectionError, EvidenceStoreError,
+    ExactAlleleSummaryError, ExactDepthSummaryError, ExactFilterSummaryError,
     ExactJunctionSummaryError, ExactModificationSummaryError, ExactPairSummaryError,
     ExactSummaryRootError, GeometryLod, JunctionAnnotationIndex, LayoutContract, LedgerError,
     PayloadContract, PresentationContract, PresentationStorePressure, ReferenceRevision,
@@ -418,6 +419,11 @@ pub struct AlignmentVerticalResidencyPumpTelemetry {
 pub struct AlignmentSceneCoordinatorTelemetry {
     pub camera_updates: u64,
     pub camera_only_updates: u64,
+    /// Row-camera intents coalesced behind one bounded visible-block presentation checkpoint.
+    pub row_camera_updates_deferred: u64,
+    pub foreground_row_block_publications: u64,
+    pub return_cache_demotions: u64,
+    pub return_cache_entries_demoted: u64,
     pub source_work_started: u64,
     pub source_checkpoints: u64,
     pub source_retargets: u64,
@@ -484,6 +490,25 @@ pub struct AlignmentCoordinatorUpdate {
     pub speculation_submitted: Option<SourceIntentSequence>,
     pub visible_complete: bool,
     pub reused_current_scene: bool,
+    /// Byte-derived aggregate capacity policy calculated for this exact latest demand.
+    pub capacity_plan: Option<AlignmentForegroundCapacityPlan>,
+    /// A disjoint transition must establish this low-water mark before old-locus cache ownership
+    /// can compete with foreground work. `None` means no proactive reclaim is currently needed.
+    pub proactive_reclaim_target: Option<usize>,
+}
+
+/// Constant-size explanation of one foreground admission/reclaim decision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentForegroundCapacityPlan {
+    pub budget: usize,
+    pub charged: usize,
+    pub pinned: usize,
+    pub reserved: usize,
+    /// Measured upper envelope of a complete visible+near CPU/GPU successor at this island.
+    pub foreground_reserve_bytes: usize,
+    pub low_water_target: usize,
+    pub return_cache_bytes: usize,
+    pub disposable_speculation_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -532,6 +557,12 @@ pub struct AlignmentCoordinatorEviction {
     /// replacement may be able to prove those allocations retire atomically with the old epoch.
     pub relinquished_cache_entries: usize,
     pub remaining: usize,
+    /// Cache entries processed by this bounded maintenance quantum.
+    pub quantum_entries: usize,
+    pub quanta: u64,
+    pub elapsed_nanoseconds: u64,
+    /// Whether the target was reached or every legal inactive owner was exhausted.
+    pub reclaim_complete: bool,
 }
 
 /// Convenience façade for callers that display one lane from a source. It owns no scheduling,
@@ -733,8 +764,10 @@ pub struct AlignmentSceneSourcePump {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AlignmentPresentationPump {
     pub owner: SourceOwnerId,
-    /// Compatibility publication field. Independent warm-up never changes the current scene.
+    /// Foreground row-camera work publishes one exact bounded scene; independent warm-up leaves
+    /// this empty and changes cache residency only.
     pub published_scene: Option<SceneRevision>,
+    pub intent: SourceIntentKind,
     pub budget_limited: bool,
     /// An unexpected optional warm-up failure was latched without invalidating the visible scene.
     pub failed: bool,
@@ -790,6 +823,18 @@ where
     presentation: AlignmentPresentationStore,
     lanes: BTreeMap<SourceOwnerId, AlignmentSceneSourceLane>,
     last_presentation_owner: Option<SourceOwnerId>,
+    /// Bounded measured upper envelopes by overlapping working-set island. This preserves the
+    /// cost learned at ACTB across a disjoint visit without retaining ACTB's derivative pages.
+    foreground_working_set_history: VecDeque<ForegroundWorkingSetSample>,
+    last_measured_scene_by_owner: BTreeMap<SourceOwnerId, SceneRevision>,
+}
+
+const MAXIMUM_FOREGROUND_WORKING_SET_ISLANDS: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ForegroundWorkingSetSample {
+    interval: GenomicInterval,
+    bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -905,6 +950,8 @@ where
             presentation,
             lanes: BTreeMap::new(),
             last_presentation_owner: None,
+            foreground_working_set_history: VecDeque::new(),
+            last_measured_scene_by_owner: BTreeMap::new(),
         }
     }
 
@@ -951,6 +998,7 @@ where
         self.actor.cancel_foreground_for(owner);
         self.actor.cancel_speculation_for(owner);
         self.presentation.remove_owner(presentation_owner(owner));
+        self.last_measured_scene_by_owner.remove(&owner);
         self.lanes.remove(&owner).is_some()
     }
 
@@ -983,11 +1031,233 @@ where
         camera: impl Into<AlignmentSceneCamera>,
     ) -> Result<AlignmentCoordinatorUpdate, AlignmentSceneCoordinatorError<B::Error>> {
         let camera = camera.into();
-        let lane = self
+        let previous_horizon = self
             .lanes
-            .get_mut(&owner)
-            .ok_or(AlignmentSceneCoordinatorError::UnknownOwner(owner))?;
-        lane.update_camera(owner, &mut self.actor, &mut self.presentation, camera, true)
+            .get(&owner)
+            .and_then(|lane| lane.desired.as_ref())
+            .map(|desired| desired.source_horizon);
+        // `update_camera` installs the durable desired camera before it attempts synchronous
+        // reconciliation. Keep that desired state even when admission reports pressure: cache
+        // ownership must still be reclassified for the new locus before reclaim is scheduled.
+        let update_result = {
+            let lane = self
+                .lanes
+                .get_mut(&owner)
+                .ok_or(AlignmentSceneCoordinatorError::UnknownOwner(owner))?;
+            lane.update_camera(owner, &mut self.actor, &mut self.presentation, camera, true)
+        };
+        let Some(current_horizon) = self
+            .lanes
+            .get(&owner)
+            .and_then(|lane| lane.desired.as_ref())
+            .map(|desired| desired.source_horizon)
+        else {
+            return update_result;
+        };
+        let entered_disjoint_island =
+            previous_horizon.is_some_and(|previous| !previous.overlaps(current_horizon));
+        if entered_disjoint_island && update_result.is_err() {
+            // A failed disjoint candidate must not leave the worker's obsolete private scene in
+            // the presentation store's protected-key set. The desktop's committed epoch keeps
+            // its own immutable leases/pins, so detaching this redundant owner is visually safe
+            // and lets cache lookup ownership yield during low-water reclaim.
+            self.presentation.remove_owner(presentation_owner(owner));
+        }
+        let active = self.active_source_horizons();
+        if entered_disjoint_island {
+            let semantic = self.presentation.demote_cache_outside(&active).total();
+            let evidence = self.actor.store_mut().demote_cache_outside(&active);
+            if let Some(lane) = self.lanes.get_mut(&owner) {
+                lane.telemetry.return_cache_demotions =
+                    lane.telemetry.return_cache_demotions.saturating_add(1);
+                lane.telemetry.return_cache_entries_demoted = lane
+                    .telemetry
+                    .return_cache_entries_demoted
+                    .saturating_add(usize_as_u64(semantic.saturating_add(evidence)));
+            }
+        }
+        let published_scene = update_result
+            .as_ref()
+            .ok()
+            .and_then(|update| update.published_scene);
+        if entered_disjoint_island || published_scene.is_some() {
+            self.reclassify_presentation_cache(entered_disjoint_island);
+        }
+        if published_scene.is_some() {
+            self.observe_prepared_foreground_working_sets()?;
+        }
+        let capacity_plan = entered_disjoint_island
+            .then(|| self.foreground_capacity_plan(owner, 0))
+            .transpose()?;
+        update_result.map(|mut update| {
+            update.capacity_plan = capacity_plan;
+            update.proactive_reclaim_target = capacity_plan.and_then(|capacity| {
+                (capacity.charged > capacity.low_water_target).then_some(capacity.low_water_target)
+            });
+            update
+        })
+    }
+
+    fn active_source_horizons(&self) -> Vec<GenomicInterval> {
+        self.lanes
+            .values()
+            .filter_map(|lane| lane.desired.as_ref().map(|desired| desired.source_horizon))
+            .collect()
+    }
+
+    fn reclassify_presentation_cache(&mut self, reclassify_unowned: bool) {
+        let active = self.active_source_horizons();
+        let demands = self
+            .lanes
+            .iter()
+            .filter_map(|(owner, lane)| {
+                let desired = lane.desired.as_ref()?;
+                Some(AlignmentPresentationOwnerDemand {
+                    owner: presentation_owner(*owner),
+                    visible_interval: desired.camera.interval(),
+                    visible_rows: desired.camera.visible_rows(),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.presentation
+            .reclassify_for_demands(&active, &demands, reclassify_unowned);
+    }
+
+    fn observe_prepared_foreground_working_sets(
+        &mut self,
+    ) -> Result<(), AlignmentSceneCoordinatorError<B::Error>> {
+        let observations = self
+            .lanes
+            .iter()
+            .filter_map(|(owner, lane)| {
+                let desired = lane.desired.as_ref()?;
+                let scene = self.presentation.prepared_for(presentation_owner(*owner))?;
+                (self.last_measured_scene_by_owner.get(owner).copied() != Some(scene.revision()))
+                    .then(|| (*owner, desired.source_horizon, Arc::clone(scene)))
+            })
+            .collect::<Vec<_>>();
+        for (owner, interval, scene) in observations {
+            let bytes =
+                alignment_scene_derivative_bytes(&scene).map_err(EvidenceStoreError::from)?;
+            self.last_measured_scene_by_owner
+                .insert(owner, scene.revision());
+            self.record_foreground_working_set(interval, bytes);
+        }
+        Ok(())
+    }
+
+    fn record_foreground_working_set(&mut self, interval: GenomicInterval, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(index) = self
+            .foreground_working_set_history
+            .iter()
+            .rposition(|sample| sample.interval.overlaps(interval))
+        {
+            let mut sample = self
+                .foreground_working_set_history
+                .remove(index)
+                .expect("the located foreground sample remains present");
+            sample.bytes = sample.bytes.max(bytes);
+            sample.interval = GenomicInterval::new(
+                interval.contig(),
+                sample.interval.start().min(interval.start()),
+                sample.interval.end().max(interval.end()),
+            )
+            .expect("the union of two overlapping non-empty horizons remains non-empty");
+            self.foreground_working_set_history.push_back(sample);
+        } else {
+            self.foreground_working_set_history
+                .push_back(ForegroundWorkingSetSample { interval, bytes });
+            if self.foreground_working_set_history.len() > MAXIMUM_FOREGROUND_WORKING_SET_ISLANDS {
+                self.foreground_working_set_history.pop_front();
+            }
+        }
+    }
+
+    /// Calculates the stable aggregate low-water mark for one latest foreground demand. A
+    /// measured matching island wins; the most recently measured working set is only a first-visit
+    /// fallback. A failed allocation expands the island envelope so the next reclaim reserves the
+    /// whole known demand instead of exactly one page.
+    pub fn foreground_capacity_plan(
+        &mut self,
+        owner: SourceOwnerId,
+        refused_foreground_bytes: usize,
+    ) -> Result<AlignmentForegroundCapacityPlan, AlignmentSceneCoordinatorError<B::Error>> {
+        self.observe_prepared_foreground_working_sets()?;
+        let interval = self
+            .lanes
+            .get(&owner)
+            .and_then(|lane| lane.desired.as_ref())
+            .map(|desired| desired.source_horizon)
+            .ok_or(AlignmentSceneCoordinatorError::MissingCamera)?;
+        if refused_foreground_bytes > 0 {
+            self.record_foreground_working_set(interval, refused_foreground_bytes);
+        }
+        let foreground_reserve_bytes =
+            foreground_working_set_reserve(&self.foreground_working_set_history, interval)
+                .max(refused_foreground_bytes);
+        let progress = self
+            .actor
+            .store()
+            .ledger()
+            .progress()
+            .map_err(EvidenceStoreError::from)?;
+        let mut residency = self.presentation.cache_residency_inventory()?;
+        residency.merge(self.actor.store().cache_residency_inventory()?);
+        let low_water_target = alignment_foreground_low_water_target(
+            progress.budget,
+            progress.reserved,
+            progress.pinned,
+            foreground_reserve_bytes,
+        );
+        Ok(AlignmentForegroundCapacityPlan {
+            budget: progress.budget,
+            charged: progress.charged,
+            pinned: progress.pinned,
+            reserved: progress.reserved,
+            foreground_reserve_bytes,
+            low_water_target,
+            return_cache_bytes: residency.recent_locus_return_cache_bytes,
+            disposable_speculation_bytes: residency.disposable_speculation_bytes,
+        })
+    }
+
+    /// Strictest low-water mark across every live lane, used when a desktop GPU replacement asks
+    /// the source worker to release aggregate CPU ownership. This prevents an external exact-fit
+    /// request from weakening the measured reserve already learned by the source coordinator.
+    pub fn aggregate_foreground_low_water_target(
+        &mut self,
+    ) -> Result<Option<usize>, AlignmentSceneCoordinatorError<B::Error>> {
+        self.observe_prepared_foreground_working_sets()?;
+        let intervals = self
+            .lanes
+            .values()
+            .filter_map(|lane| lane.desired.as_ref().map(|desired| desired.source_horizon))
+            .collect::<Vec<_>>();
+        if intervals.is_empty() {
+            return Ok(None);
+        }
+        let reserve = intervals
+            .iter()
+            .map(|interval| {
+                foreground_working_set_reserve(&self.foreground_working_set_history, *interval)
+            })
+            .max()
+            .unwrap_or(0);
+        let progress = self
+            .actor
+            .store()
+            .ledger()
+            .progress()
+            .map_err(EvidenceStoreError::from)?;
+        Ok(Some(alignment_foreground_low_water_target(
+            progress.budget,
+            progress.reserved,
+            progress.pinned,
+            reserve,
+        )))
     }
 
     pub fn set_preparation_policy(
@@ -1173,6 +1443,10 @@ where
                 }
             }
         }
+        if !publications.is_empty() {
+            self.reclassify_presentation_cache(false);
+            self.observe_prepared_foreground_working_sets()?;
+        }
         Ok(AlignmentSceneSourcePump {
             source_event: event,
             publications,
@@ -1290,7 +1564,8 @@ where
             .ok_or(AlignmentSceneCoordinatorConfigError::UnknownOwner(owner))?;
         Ok(AlignmentSceneOwnerWorkState {
             source_pending: self.actor.schedule().foreground_pending_for(owner),
-            presentation_pending: lane.needs_vertical_residency(owner, &self.presentation),
+            presentation_pending: lane.needs_foreground_row_presentation(owner, &self.presentation)
+                || lane.needs_vertical_residency(owner, &self.presentation),
         })
     }
 
@@ -1299,9 +1574,20 @@ where
     /// scene truthfully covers the live camera.
     #[must_use]
     pub fn has_pending_presentation_work(&self) -> bool {
+        self.lanes.iter().any(|(owner, lane)| {
+            lane.needs_foreground_row_presentation(*owner, &self.presentation)
+                || lane.needs_vertical_residency(*owner, &self.presentation)
+        })
+    }
+
+    /// Whether an exact visible row block is missing. This is separate from optional whole-stack
+    /// warming so the worker can yield bounded cache maintenance to user-visible work without
+    /// allowing speculation to delay reclaim.
+    #[must_use]
+    pub fn has_pending_foreground_presentation_work(&self) -> bool {
         self.lanes
             .iter()
-            .any(|(owner, lane)| lane.needs_vertical_residency(*owner, &self.presentation))
+            .any(|(owner, lane)| lane.needs_foreground_row_presentation(*owner, &self.presentation))
     }
 
     /// Builds and atomically publishes at most one additional canonical row block. A normal
@@ -1310,6 +1596,30 @@ where
     pub fn pump_presentation_once(
         &mut self,
     ) -> Result<Option<AlignmentPresentationPump>, AlignmentSceneCoordinatorError<B::Error>> {
+        let foreground = self
+            .lanes
+            .iter()
+            .filter_map(|(owner, lane)| {
+                lane.needs_foreground_row_presentation(*owner, &self.presentation)
+                    .then_some(*owner)
+            })
+            .collect::<Vec<_>>();
+        if !foreground.is_empty() {
+            let owner = self.next_presentation_owner(&foreground);
+            let outcome = {
+                let lane = self
+                    .lanes
+                    .get_mut(&owner)
+                    .expect("an eligible foreground presentation owner remains installed");
+                lane.prepare_foreground_row_presentation_once(owner, &mut self.presentation)?
+            };
+            if outcome.published_scene.is_some() {
+                self.reclassify_presentation_cache(false);
+                self.observe_prepared_foreground_working_sets()?;
+            }
+            return Ok(Some(outcome));
+        }
+
         let eligible = self
             .lanes
             .iter()
@@ -1321,6 +1631,16 @@ where
         if eligible.is_empty() {
             return Ok(None);
         }
+        let owner = self.next_presentation_owner(&eligible);
+        let lane = self
+            .lanes
+            .get_mut(&owner)
+            .expect("an eligible presentation owner remains installed");
+        let outcome = lane.expand_vertical_residency_once(owner, &mut self.presentation)?;
+        Ok(Some(outcome))
+    }
+
+    fn next_presentation_owner(&mut self, eligible: &[SourceOwnerId]) -> SourceOwnerId {
         let owner = self.last_presentation_owner.map_or(eligible[0], |last| {
             eligible
                 .iter()
@@ -1329,12 +1649,7 @@ where
                 .unwrap_or(eligible[0])
         });
         self.last_presentation_owner = Some(owner);
-        let lane = self
-            .lanes
-            .get_mut(&owner)
-            .expect("an eligible presentation owner remains installed");
-        let outcome = lane.expand_vertical_residency_once(owner, &mut self.presentation)?;
-        Ok(Some(outcome))
+        owner
     }
 
     /// Cancels every lane-owned foreground and speculative requirement while preserving the
@@ -1434,6 +1749,11 @@ where
             self.actor.cancel_speculation_for(owner);
             update.foreground_submitted = lane.ensure_foreground(owner, &mut self.actor)?;
         }
+        if published.is_some() {
+            self.reclassify_presentation_cache(false);
+            self.observe_prepared_foreground_working_sets()?;
+        }
+        update.capacity_plan = Some(self.foreground_capacity_plan(owner, 0)?);
         Ok(Some(update))
     }
 
@@ -1464,9 +1784,7 @@ where
         }
         let presentation = self.presentation.reduce_budget(budget)?;
         if presentation.evicted_read_pages > 0 {
-            for lane in self.lanes.values_mut() {
-                lane.vertical_read_residency = None;
-            }
+            self.reconcile_vertical_residency_after_reclaim();
         }
         let evidence = self.actor.store_mut().reduce_budget(budget)?;
         let progress = self
@@ -1496,6 +1814,18 @@ where
         &mut self,
         target_charged: usize,
     ) -> Result<AlignmentCoordinatorEviction, AlignmentSceneCoordinatorError<B::Error>> {
+        self.evict_inactive_batch(target_charged, usize::MAX)
+    }
+
+    /// Performs one bounded cache-maintenance quantum. Foreground work remains on the same owner
+    /// thread, but the engine can now inspect newer camera intent between quanta and cancel or
+    /// retarget stale reclaim work.
+    pub fn evict_inactive_batch(
+        &mut self,
+        target_charged: usize,
+        maximum_entries: usize,
+    ) -> Result<AlignmentCoordinatorEviction, AlignmentSceneCoordinatorError<B::Error>> {
+        let started = Instant::now();
         let before = self
             .actor
             .store()
@@ -1517,22 +1847,36 @@ where
                 .resource_pressure_speculation_aborts
                 .saturating_add(1);
         }
-        let presentation = self.presentation.evict_inactive_until(target_charged)?;
+        let mut presentation = self
+            .presentation
+            .evict_inactive_batch(target_charged, maximum_entries)?;
         if presentation.evicted_read_pages > 0 {
-            for lane in self.lanes.values_mut() {
-                lane.vertical_read_residency = None;
-            }
+            self.reconcile_vertical_residency_after_reclaim();
         }
-        let evidence = self
+        let presentation_entries = presentation.evicted_pages();
+        let remaining_entries = maximum_entries.saturating_sub(presentation_entries);
+        let mut evidence = self
             .actor
             .store_mut()
-            .evict_inactive_until(target_charged)?;
+            .evict_inactive_batch(target_charged, remaining_entries)?;
         let progress = self
             .actor
             .store()
             .ledger()
             .progress()
             .map_err(EvidenceStoreError::from)?;
+        let evidence_entries = evidence
+            .evicted_acquisitions
+            .saturating_add(evidence.evicted_chunks)
+            .saturating_add(evidence.evicted_exact_summaries)
+            .saturating_add(evidence.evicted_row_atlases);
+        let relinquished_cache_entries = presentation_entries.saturating_add(evidence_entries);
+        let reclaim_complete = progress.charged <= target_charged
+            || (presentation.reclaim_complete && evidence.reclaim_complete);
+        if reclaim_complete {
+            presentation.residency = self.presentation.cache_residency_inventory()?;
+            evidence.residency = self.actor.store().cache_residency_inventory()?;
+        }
         Ok(AlignmentCoordinatorEviction {
             target_charged,
             speculation_was_pending,
@@ -1543,20 +1887,92 @@ where
             charged: progress.charged,
             pinned: progress.pinned,
             released: before.charged.saturating_sub(progress.charged),
-            relinquished_cache_entries: presentation.evicted_pages().saturating_add(
-                evidence
-                    .evicted_acquisitions
-                    .saturating_add(evidence.evicted_chunks)
-                    .saturating_add(evidence.evicted_exact_summaries)
-                    .saturating_add(evidence.evicted_row_atlases),
-            ),
+            relinquished_cache_entries,
             remaining: progress.charged.saturating_sub(target_charged),
+            quantum_entries: relinquished_cache_entries,
+            quanta: 1,
+            elapsed_nanoseconds: elapsed_nanoseconds(started),
+            reclaim_complete,
         })
+    }
+
+    fn reconcile_vertical_residency_after_reclaim(&mut self) {
+        let presentation = &self.presentation;
+        for (owner, lane) in &mut self.lanes {
+            let removed = lane.reconcile_vertical_residency_cache(*owner, presentation);
+            if removed > 0 {
+                // Full-stack warming is disposable cache work. Do not immediately refill pages
+                // just relinquished for foreground admission; a new preparation policy or source
+                // horizon explicitly makes it eligible again.
+                lane.vertical_residency_budget_limited = true;
+            }
+        }
     }
 }
 
 const fn presentation_owner(owner: SourceOwnerId) -> AlignmentPresentationOwner {
     AlignmentPresentationOwner::new(owner.get())
+}
+
+pub(crate) fn alignment_foreground_low_water_target(
+    budget: usize,
+    reserved: usize,
+    pinned: usize,
+    measured_foreground_reserve: usize,
+) -> usize {
+    budget
+        .saturating_sub(measured_foreground_reserve)
+        .saturating_sub(reserved)
+        .max(pinned)
+}
+
+fn alignment_scene_derivative_bytes(scene: &AlignmentSceneSnapshot) -> Result<usize, LedgerError> {
+    let mut allocations = HashSet::<AllocationId>::new();
+    let mut bytes = 0_usize;
+    observe_distinct_derivative_allocation(
+        &mut allocations,
+        &mut bytes,
+        scene.metadata_allocation(),
+    )?;
+    observe_distinct_derivative_allocation(
+        &mut allocations,
+        &mut bytes,
+        scene.reads().metadata_allocation(),
+    )?;
+    for page in scene.reads().pages() {
+        observe_distinct_derivative_allocation(&mut allocations, &mut bytes, page.allocation())?;
+    }
+    for page in scene.summary_pages() {
+        observe_distinct_derivative_allocation(&mut allocations, &mut bytes, page.allocation())?;
+    }
+    Ok(bytes)
+}
+
+fn foreground_working_set_reserve(
+    history: &VecDeque<ForegroundWorkingSetSample>,
+    interval: GenomicInterval,
+) -> usize {
+    let matching = history
+        .iter()
+        .filter(|sample| sample.interval.overlaps(interval))
+        .map(|sample| sample.bytes)
+        .max();
+    // A locus which has not yet produced a measured scene inherits the bounded recent upper
+    // envelope, not merely the last visited locus. Otherwise visiting one sparse locus after
+    // ACTB would erase the only useful first-admission estimate and recreate exact-fit reclaim
+    // when the next dense island was opened.
+    matching.unwrap_or_else(|| history.iter().map(|sample| sample.bytes).max().unwrap_or(0))
+}
+
+fn observe_distinct_derivative_allocation(
+    allocations: &mut HashSet<AllocationId>,
+    bytes: &mut usize,
+    allocation: &AllocationLease,
+) -> Result<(), LedgerError> {
+    if allocations.insert(allocation.id()) {
+        *bytes = bytes.saturating_add(allocation.snapshot()?.charged_capacity);
+    }
+    Ok(())
 }
 
 fn source_event_owner(event: &AlignmentSourceActorEvent) -> Option<SourceOwnerId> {
@@ -1593,7 +2009,10 @@ impl AlignmentSceneSourceLane {
                 contig_length: self.contract.contig_length,
             });
         }
-        let previous_source_horizon = self.desired.as_ref().map(|desired| desired.source_horizon);
+        let previous_desired = self.desired.clone();
+        let previous_source_horizon = previous_desired
+            .as_ref()
+            .map(|desired| desired.source_horizon);
         let camera_sequence = self.take_camera_sequence()?;
         let direction = camera_direction(self.previous_exact_start, camera.exact_start());
         self.previous_exact_start = Some(camera.exact_start());
@@ -1608,7 +2027,23 @@ impl AlignmentSceneSourceLane {
         // pinning every locus traversed and eventually making an ordinary source reservation fail.
         // The current immutable scene remains published below while the bounded replacement is
         // acquired, so removing the union does not replace truthful overlap with a blank sentinel.
-        let (prepared_interval, prepared_rows) = retained.unwrap_or((proposed_interval, None));
+        let unchanged_genomic_camera = retain_prepared_scene
+            && previous_desired
+                .as_ref()
+                .is_some_and(|previous| previous.camera.viewport() == camera.viewport());
+        let (prepared_interval, prepared_rows) = retained.unwrap_or_else(|| {
+            if unchanged_genomic_camera {
+                // Crossing a vertical trigger must not silently reopen the horizontal/source
+                // working set. Keep the already-authoritative genomic horizon and request only a
+                // replacement row block.
+                previous_desired
+                    .as_ref()
+                    .map(|previous| (previous.prepared_interval, None))
+                    .unwrap_or((proposed_interval, None))
+            } else {
+                (proposed_interval, None)
+            }
+        });
         let source_horizon = source_horizon(prepared_interval, &self.contract)?;
         if previous_source_horizon != Some(source_horizon) {
             self.vertical_residency_budget_limited = false;
@@ -1634,7 +2069,22 @@ impl AlignmentSceneSourceLane {
         let before = presentation
             .prepared_for(presentation_owner(owner))
             .map(|scene| scene.revision());
-        let published = self.reconcile_from_resident_or_cache(owner, actor, presentation)?;
+        let row_camera_only = previous_desired.as_ref().is_some_and(|previous| {
+            previous.camera.viewport() == camera.viewport()
+                && previous.source_horizon == source_horizon
+                && previous.prepared_interval == prepared_interval
+        });
+        let defer_row_presentation = row_camera_only
+            && !self.prepared_covers_desired(owner, presentation)
+            && self.current_roots_cover_desired_except_rows(owner, presentation)
+            && !self.desired_row_pages_are_fully_cached(owner, presentation);
+        let published = if defer_row_presentation {
+            self.telemetry.row_camera_updates_deferred =
+                self.telemetry.row_camera_updates_deferred.saturating_add(1);
+            None
+        } else {
+            self.reconcile_from_resident_or_cache(owner, actor, presentation)?
+        };
         let frame = self
             .frame(owner, presentation)
             .expect("a camera update installs desired state");
@@ -1651,7 +2101,13 @@ impl AlignmentSceneSourceLane {
                 self.telemetry.camera_only_updates.saturating_add(1);
         }
 
-        if self.prepared_covers_desired(owner, presentation) {
+        if defer_row_presentation {
+            // Vertical movement reuses immutable evidence and row identity. Do not schedule BAM
+            // acquisition merely because the newest visible block is waiting for its bounded
+            // semantic checkpoint.
+            actor.cancel_foreground_for(owner);
+            actor.cancel_speculation_for(owner);
+        } else if self.prepared_covers_desired(owner, presentation) {
             actor.cancel_foreground_for(owner);
             actor.cancel_speculation_for(owner);
         } else if update.visible_complete {
@@ -1680,7 +2136,6 @@ impl AlignmentSceneSourceLane {
         // the asynchronously installed slice empty. Preserve an already installed immutable
         // slice when the replacement still names that exact reference and contig; horizon
         // sufficiency remains checked by `matching_reference_slice` and can request a larger
-        // slice normally.
         if contract.reference.is_none()
             && let Some(authority) = self.contract.reference.as_ref()
             && contract.presentation.reference == Some(authority.revision())
@@ -1851,8 +2306,7 @@ impl AlignmentSceneSourceLane {
             |scene| {
                 let row_count =
                     u32::try_from(scene.reads().atlas().row_count()).unwrap_or(u32::MAX);
-                let visible = desired.camera.visible_rows();
-                visible.start.min(row_count)..visible.end.min(row_count)
+                clamp_visible_rows(desired.camera.visible_rows(), row_count)
             },
         );
         let (covered_interval, covered_rows) = snapshot.as_ref().map_or((None, 0..0), |scene| {
@@ -2142,6 +2596,175 @@ impl AlignmentSceneSourceLane {
             .fold(0_u32, |rows, range| {
                 rows.saturating_add(range.end.saturating_sub(range.start))
             })
+    }
+
+    fn current_roots_cover_desired_except_rows(
+        &self,
+        owner: SourceOwnerId,
+        presentation: &AlignmentPresentationStore,
+    ) -> bool {
+        let Some(desired) = &self.desired else {
+            return false;
+        };
+        let Some(current) = presentation.prepared_for(presentation_owner(owner)) else {
+            return false;
+        };
+        let reads = current.reads();
+        presentation_core_matches(reads.presentation(), self.contract.presentation)
+            && reads.evidence().payload().satisfies(&self.contract.payload)
+            && reads.evidence().view_filter().fingerprint()
+                == self.contract.view_filter_evaluation_fingerprint()
+            && current.summaries().contract() == self.contract.summaries
+            && reads.atlas().layout_contract() == self.contract.layout
+            && reads.evidence().coverage().covers(desired.source_horizon)
+            && current
+                .summaries()
+                .prepared_interval()
+                .contains_interval(desired.prepared_interval)
+            && reads
+                .atlas()
+                .interval()
+                .contains_interval(desired.source_horizon)
+    }
+
+    fn needs_foreground_row_presentation(
+        &self,
+        owner: SourceOwnerId,
+        presentation: &AlignmentPresentationStore,
+    ) -> bool {
+        self.desired
+            .as_ref()
+            .is_some_and(|desired| desired.camera.has_visible_rows())
+            && !self.prepared_covers_desired(owner, presentation)
+            && self.current_roots_cover_desired_except_rows(owner, presentation)
+    }
+
+    fn desired_row_pages_are_fully_cached(
+        &self,
+        owner: SourceOwnerId,
+        presentation: &AlignmentPresentationStore,
+    ) -> bool {
+        let (Some(desired), Some(current)) = (
+            self.desired.as_ref(),
+            presentation.prepared_for(presentation_owner(owner)),
+        ) else {
+            return false;
+        };
+        let Ok(rows) = desired_rows(
+            desired,
+            current.reads().atlas().row_count(),
+            self.policy.vertical_margin_rows,
+        ) else {
+            return false;
+        };
+        if rows.is_empty() {
+            return true;
+        }
+        let block_rows = self.contract.row_block_rows;
+        let first = rows.start / block_rows.get();
+        let last = rows.end.saturating_sub(1) / block_rows.get();
+        let (presentation_contract, _) =
+            self.available_presentation_contract(desired.source_horizon);
+        (first..=last).all(|coordinate| {
+            presentation
+                .read_row_block_is_fully_cached(
+                    current.reads().evidence(),
+                    current.reads().atlas(),
+                    presentation_contract,
+                    desired.prepared_interval,
+                    CanonicalRowBlock::new(coordinate, block_rows),
+                    self.contract.contig_length,
+                    self.contract.geometry_tile_bases,
+                )
+                .unwrap_or(false)
+        })
+    }
+
+    fn prepare_foreground_row_presentation_once<E>(
+        &mut self,
+        owner: SourceOwnerId,
+        presentation: &mut AlignmentPresentationStore,
+    ) -> Result<AlignmentPresentationPump, AlignmentSceneCoordinatorError<E>> {
+        let desired = self
+            .desired
+            .clone()
+            .ok_or(AlignmentSceneCoordinatorError::MissingCamera)?;
+        match self.prepare_from_current_roots(owner, presentation, &desired) {
+            Ok(Some(scene)) => {
+                self.telemetry.foreground_row_block_publications = self
+                    .telemetry
+                    .foreground_row_block_publications
+                    .saturating_add(1);
+                Ok(AlignmentPresentationPump {
+                    owner,
+                    published_scene: Some(scene.revision()),
+                    intent: SourceIntentKind::Foreground,
+                    budget_limited: false,
+                    failed: false,
+                    completed: true,
+                    pressure: None,
+                })
+            }
+            Ok(None) => Err(AlignmentSceneCoordinatorError::MissingCamera),
+            Err(error) => {
+                let Some(pressure) = coordinator_budget_pressure(&error) else {
+                    return Err(error);
+                };
+                Ok(AlignmentPresentationPump {
+                    owner,
+                    published_scene: None,
+                    intent: SourceIntentKind::Foreground,
+                    budget_limited: false,
+                    failed: false,
+                    completed: false,
+                    pressure: Some(pressure),
+                })
+            }
+        }
+    }
+
+    /// Reconciles the lane's exact row-block directory with semantic cache ownership after a
+    /// bounded eviction pass. Published snapshot leases remain valid independently; this method
+    /// only subtracts blocks whose complete reusable page set is no longer cached.
+    fn reconcile_vertical_residency_cache(
+        &mut self,
+        owner: SourceOwnerId,
+        presentation: &AlignmentPresentationStore,
+    ) -> usize {
+        let Some(scene) = presentation
+            .prepared_for(presentation_owner(owner))
+            .cloned()
+        else {
+            let removed = self
+                .vertical_read_residency
+                .as_ref()
+                .map_or(0, |residency| residency.warmed_blocks.len());
+            self.vertical_read_residency = None;
+            return removed;
+        };
+        let authority = self.vertical_residency_authority(&scene);
+        let Some(residency) = self
+            .vertical_read_residency
+            .as_mut()
+            .filter(|residency| residency.authority == authority)
+        else {
+            return 0;
+        };
+        let before = residency.warmed_blocks.len();
+        residency.warmed_blocks.retain(|row_block| {
+            presentation
+                .read_row_block_is_fully_cached(
+                    scene.reads().evidence(),
+                    scene.reads().atlas(),
+                    authority.presentation,
+                    authority.prepared_interval,
+                    *row_block,
+                    self.contract.contig_length,
+                    authority.geometry_tile_bases,
+                )
+                .unwrap_or(false)
+        });
+        before.saturating_sub(residency.warmed_blocks.len())
     }
 
     fn reconcile_from_resident_or_cache<B>(
@@ -2647,6 +3270,7 @@ impl AlignmentSceneSourceLane {
                 return Ok(AlignmentPresentationPump {
                     owner,
                     published_scene: None,
+                    intent: SourceIntentKind::Speculative,
                     budget_limited: true,
                     failed: false,
                     completed: false,
@@ -2674,6 +3298,7 @@ impl AlignmentSceneSourceLane {
                 return Ok(AlignmentPresentationPump {
                     owner,
                     published_scene: None,
+                    intent: SourceIntentKind::Speculative,
                     budget_limited: false,
                     failed: true,
                     completed: false,
@@ -2715,6 +3340,7 @@ impl AlignmentSceneSourceLane {
         Ok(AlignmentPresentationPump {
             owner,
             published_scene: None,
+            intent: SourceIntentKind::Speculative,
             budget_limited: false,
             failed: false,
             completed,
@@ -3008,7 +3634,7 @@ fn prepared_rows(
     if row_count == 0 {
         return Ok(0..0);
     }
-    let visible = camera.visible_rows();
+    let visible = clamp_visible_rows(camera.visible_rows(), row_count);
     if visible.is_empty() {
         return Ok(0..0);
     }
@@ -3024,9 +3650,20 @@ fn desired_rows(
     if let Some(rows) = &desired.prepared_rows {
         let row_count = u32::try_from(row_count)
             .map_err(|_| AlignmentSceneCoordinatorConfigError::RowCoordinateOverflow)?;
-        return Ok(rows.start.min(row_count)..rows.end.min(row_count));
+        return Ok(clamp_visible_rows(rows.clone(), row_count));
     }
     prepared_rows(row_count, desired.camera, margin)
+}
+
+fn clamp_visible_rows(rows: Range<u32>, row_count: u32) -> Range<u32> {
+    if rows.is_empty() || row_count == 0 {
+        return 0..0;
+    }
+    let width = rows.end.saturating_sub(rows.start).max(1).min(row_count);
+    if rows.start >= row_count || rows.end > row_count {
+        return row_count.saturating_sub(width)..row_count;
+    }
+    rows.start..rows.end.max(rows.start.saturating_add(1)).min(row_count)
 }
 
 const fn supports_full_vertical_residency(lod: GeometryLod) -> bool {
@@ -3292,6 +3929,48 @@ mod tests {
     use crate::{LocalBamCanonicalBackend, LocalBamSourceControl};
 
     type TestCoordinator = AlignmentSceneCoordinator<LocalBamCanonicalBackend>;
+
+    #[test]
+    fn foreground_low_water_reserves_the_measured_working_set_not_one_page() {
+        let budget = 4 * 1024 * 1024 * 1024_usize;
+        let measured_bundle = 115 * 1024 * 1024_usize;
+        let one_page = 1024 * 1024_usize;
+        let target =
+            alignment_foreground_low_water_target(budget, 0, 900 * 1024 * 1024, measured_bundle);
+
+        assert_eq!(budget.saturating_sub(target), measured_bundle);
+        assert!(budget.saturating_sub(target) > one_page);
+    }
+
+    #[test]
+    fn foreground_low_water_never_crosses_the_committed_pin_floor() {
+        assert_eq!(
+            alignment_foreground_low_water_target(1_000, 100, 850, 400),
+            850
+        );
+    }
+
+    #[test]
+    fn unseen_island_inherits_the_recent_upper_envelope_not_the_last_sparse_sample() {
+        let contig = ContigId::new(0);
+        let dense = GenomicInterval::new(contig, 100, 200).unwrap();
+        let sparse = GenomicInterval::new(contig, 300, 400).unwrap();
+        let unseen = GenomicInterval::new(contig, 500, 600).unwrap();
+        let history = VecDeque::from([
+            ForegroundWorkingSetSample {
+                interval: dense,
+                bytes: 900,
+            },
+            ForegroundWorkingSetSample {
+                interval: sparse,
+                bytes: 100,
+            },
+        ]);
+
+        assert_eq!(foreground_working_set_reserve(&history, dense), 900);
+        assert_eq!(foreground_working_set_reserve(&history, sparse), 100);
+        assert_eq!(foreground_working_set_reserve(&history, unseen), 900);
+    }
 
     fn no_payload() -> PayloadContract {
         PayloadContract::new(
@@ -5076,6 +5755,64 @@ mod tests {
     }
 
     #[test]
+    fn missing_vertical_block_is_deferred_without_reopening_source_authority() {
+        let (mut coordinator, camera) = test_coordinator_with_contract(|contract| {
+            contract.row_block_rows = NonZeroU32::new(1).unwrap();
+        });
+        coordinator.update_camera(camera).unwrap();
+        pump_until_publication(&mut coordinator);
+        let before = coordinator.telemetry();
+        let atlas_revision = coordinator
+            .frame()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .reads()
+            .atlas()
+            .revision();
+        let scrolled = AlignmentCamera::from_viewport(
+            camera.viewport(),
+            72.0,
+            camera.row_height(),
+            camera.read_height(),
+            camera.clip(),
+        )
+        .unwrap();
+
+        let update = coordinator.update_camera(scrolled).unwrap();
+        assert!(update.published_scene.is_none());
+        assert!(update.foreground_submitted.is_none());
+        assert!(!update.visible_complete);
+        assert!(coordinator.has_pending_presentation_work());
+        assert_eq!(
+            coordinator.telemetry().row_camera_updates_deferred,
+            before.row_camera_updates_deferred + 1
+        );
+
+        let pump = coordinator.pump_presentation_once().unwrap().unwrap();
+        assert_eq!(pump.intent, SourceIntentKind::Foreground);
+        assert!(pump.published_scene.is_some());
+        assert!(coordinator.frame().unwrap().visible_complete());
+        let after = coordinator.telemetry();
+        assert_eq!(after.source_work_started, before.source_work_started);
+        assert_eq!(after.evidence_candidates, before.evidence_candidates);
+        assert_eq!(after.row_atlas_candidates, before.row_atlas_candidates);
+        assert_eq!(after.foreground_row_block_publications, 1);
+        assert_eq!(
+            coordinator
+                .frame()
+                .unwrap()
+                .snapshot
+                .unwrap()
+                .reads()
+                .atlas()
+                .revision(),
+            atlas_revision
+        );
+    }
+
+    #[test]
     fn visible_scene_publishes_before_incremental_full_vertical_residency() {
         let (mut coordinator, camera) = test_coordinator();
         let policy = AlignmentScenePreparationPolicy::new(0.0, 0.0, 0.0, 0, 1)
@@ -5436,6 +6173,8 @@ mod tests {
         let update = coordinator.update_camera(disjoint).unwrap();
         assert!(!update.visible_complete);
         assert!(update.foreground_submitted.is_some());
+        assert_eq!(coordinator.telemetry().return_cache_demotions, 1);
+        assert!(coordinator.telemetry().return_cache_entries_demoted > 0);
         assert!(!coordinator.has_pending_presentation_work());
         assert!(coordinator.pump_presentation_once().unwrap().is_none());
         assert_eq!(
@@ -5454,6 +6193,15 @@ mod tests {
         assert!(supports_full_vertical_residency(GeometryLod::Span));
         assert!(supports_full_vertical_residency(GeometryLod::Read));
         assert!(!supports_full_vertical_residency(GeometryLod::Base));
+    }
+
+    #[test]
+    fn bottom_row_camera_clamps_to_a_non_empty_exact_range() {
+        assert_eq!(clamp_visible_rows(100..120, 100), 80..100);
+        assert_eq!(clamp_visible_rows(100..101, 100), 99..100);
+        assert_eq!(clamp_visible_rows(95..105, 100), 90..100);
+        assert_eq!(clamp_visible_rows(0..1, 1), 0..1);
+        assert_eq!(clamp_visible_rows(0..1, 0), 0..0);
     }
 
     #[test]

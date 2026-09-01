@@ -225,6 +225,27 @@ impl Viewer {
         };
         let row_authority = self.read_panel_row_authority(track_id);
         if !row_authority.is_exact() {
+            // Preserve user intent while exact row authority is transitioning. The fraction is
+            // rebound to the successor's exact extent when it arrives; silently discarding this
+            // movement is what made a captured thumb appear permanently locked.
+            let state = self.panels.active().read_panel_scroll_state(track_id);
+            let maximum = self.read_panel_presented_scroll_maximum(track_id, clip_bottom);
+            let desired_fraction = if maximum > f32::EPSILON {
+                Some((requested / maximum).clamp(0.0, 1.0))
+            } else {
+                state.latent_scroll_fraction
+            };
+            if let Some(fraction) = desired_fraction {
+                self.panels
+                    .active_mut()
+                    .read_panel_scrolls
+                    .entry(track_id)
+                    .or_default()
+                    .latent_scroll_fraction = Some(fraction);
+                if track_id == self.primary_alignment_track_id() {
+                    self.panels.active_mut().latent_vertical_scroll_fraction = Some(fraction);
+                }
+            }
             if self.manual_diagnostic_trace_is_recording() {
                 self.record_manual_diagnostic_event(
                     "vertical_navigation",
@@ -242,6 +263,7 @@ impl Viewer {
                     }),
                 );
             }
+            self.window.request_redraw();
             return;
         }
         let state = self.panels.active().read_panel_scroll_state(track_id);
@@ -258,7 +280,6 @@ impl Viewer {
         if (next - state.scroll_points).abs() <= f32::EPSILON {
             return;
         }
-        self.invalidate_navigation_contract("read panel vertical scroll changed");
         let primary_track_id = self.primary_alignment_track_id();
         let latent_fraction = {
             let state = self
@@ -277,8 +298,24 @@ impl Viewer {
             self.panels.active_mut().vertical_scroll_points = next;
             self.panels.active_mut().latent_vertical_scroll_fraction = latent_fraction;
         }
-        if self.synthetic || !self.refresh_active_panel_scroll_display() {
-            self.mark_display_dirty("read-panel fast-scroll refresh was unavailable");
+        let materialization = self.active_read_panel_materialization_coverage(track_id);
+        if self.synthetic {
+            self.mark_display_dirty("read-panel synthetic scroll requires display rebuild");
+        } else if materialization.is_covered() {
+            if !self.refresh_active_panel_scroll_display() {
+                self.mark_display_dirty("covered read-panel fast-scroll refresh was unavailable");
+            }
+        } else if self.manual_diagnostic_trace_is_recording() {
+            self.record_manual_diagnostic_event(
+                "vertical_navigation",
+                "scroll_waiting_for_materialization",
+                serde_json::json!({
+                    "panel_id": self.panels.active().id.get(),
+                    "track_id": track_id.get(),
+                    "coverage": format!("{materialization:?}"),
+                    "preserved_committed_display": true,
+                }),
+            );
         }
         self.request_alignment_scene_camera_update(track_id);
         self.window.request_redraw();
@@ -723,6 +760,54 @@ impl Viewer {
             return false;
         };
         if !self.read_panel_row_authority(drag.track_id).is_exact() {
+            let state = self.panels.active().read_panel_scroll_state(drag.track_id);
+            let maximum = self.read_panel_presented_scroll_maximum(drag.track_id, clip_bottom);
+            let camera_viewport_height = (clip_bottom - clip_top).max(1.0);
+            let density = self.alignment_density_for_panel_track(drag.panel_id, drag.track_id);
+            let scrollbar_rect = self
+                .read_panel_scrollbar_rect(drag.track_id)
+                .unwrap_or(self.canvas_geometry().scrollbar);
+            let geometry = state.latent_scroll_fraction.map_or_else(
+                || {
+                    ui::scrollbar_geometry_for_density_in_viewport(
+                        scrollbar_rect,
+                        maximum,
+                        state.scroll_points,
+                        density,
+                        camera_viewport_height,
+                    )
+                },
+                |fraction| {
+                    ui::scrollbar_geometry_for_density_at_fraction_in_viewport(
+                        scrollbar_rect,
+                        maximum,
+                        density,
+                        fraction,
+                        camera_viewport_height,
+                    )
+                },
+            );
+            drag.virtual_pointer_y = pointer
+                .y
+                .clamp(geometry.track.top(), geometry.track.bottom());
+            drag.virtual_scroll_fraction = ui::scrollbar_fraction_at_grab(
+                geometry,
+                drag.virtual_pointer_y,
+                drag.thumb_grab_fraction,
+            );
+            drag.last_pointer_x = pointer.x;
+            self.panels
+                .active_mut()
+                .read_panel_scrolls
+                .entry(drag.track_id)
+                .or_default()
+                .latent_scroll_fraction = Some(drag.virtual_scroll_fraction);
+            if drag.track_id == self.primary_alignment_track_id() {
+                self.panels.active_mut().latent_vertical_scroll_fraction =
+                    Some(drag.virtual_scroll_fraction);
+            }
+            self.vertical_overview_drag = Some(drag);
+            self.window.request_redraw();
             return true;
         }
         let state = self.panels.active().read_panel_scroll_state(drag.track_id);
@@ -732,12 +817,25 @@ impl Viewer {
         let scrollbar_rect = self
             .read_panel_scrollbar_rect(drag.track_id)
             .unwrap_or(self.canvas_geometry().scrollbar);
-        let geometry = ui::scrollbar_geometry_for_density_in_viewport(
-            scrollbar_rect,
-            maximum,
-            state.scroll_points,
-            density,
-            camera_viewport_height,
+        let geometry = state.latent_scroll_fraction.map_or_else(
+            || {
+                ui::scrollbar_geometry_for_density_in_viewport(
+                    scrollbar_rect,
+                    maximum,
+                    state.scroll_points,
+                    density,
+                    camera_viewport_height,
+                )
+            },
+            |fraction| {
+                ui::scrollbar_geometry_for_density_at_fraction_in_viewport(
+                    scrollbar_rect,
+                    maximum,
+                    density,
+                    fraction,
+                    camera_viewport_height,
+                )
+            },
         );
         let next = ui::scrollbar_offset_at_grab(geometry, maximum, pointer.y, drag.grab_offset);
         self.set_read_panel_scroll(drag.track_id, next);
@@ -951,9 +1049,24 @@ impl Viewer {
             self.interaction_trace
                 .record_once(InteractionTraceStage::DensityChanged);
         } else if scroll_changed {
-            self.invalidate_navigation_contract("read panel vertical scroll changed");
-            if self.synthetic || !self.refresh_active_panel_scroll_display() {
-                self.mark_display_dirty("vertical overview fast-scroll refresh was unavailable");
+            let materialization = self.active_read_panel_materialization_coverage(drag.track_id);
+            if self.synthetic {
+                self.mark_display_dirty("synthetic vertical overview requires display rebuild");
+            } else if materialization.is_covered() && !self.refresh_active_panel_scroll_display() {
+                self.mark_display_dirty(
+                    "covered vertical overview fast-scroll refresh was unavailable",
+                );
+            } else if !materialization.is_covered() && self.manual_diagnostic_trace_is_recording() {
+                self.record_manual_diagnostic_event(
+                    "vertical_navigation",
+                    "scroll_waiting_for_materialization",
+                    serde_json::json!({
+                        "panel_id": drag.panel_id.get(),
+                        "track_id": drag.track_id.get(),
+                        "coverage": format!("{materialization:?}"),
+                        "preserved_committed_display": true,
+                    }),
+                );
             }
         } else if (drag.virtual_scroll_fraction - previous_fraction).abs() > f32::EPSILON {
             self.window.request_redraw();

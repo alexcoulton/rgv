@@ -35,7 +35,9 @@ pub(crate) struct ReadPanelDisplayCache {
     /// Immutable activity atlas revision which supplied exact vertical extent and navigator
     /// density. `None` is required for Pending/Absent authority.
     pub(crate) row_activity_atlas_revision: Option<RowAtlasRevision>,
-    pub(crate) materialized_row_range: Option<(usize, usize)>,
+    /// Exact normalized committed row intervals represented by the current native display. `None`
+    /// means authority is pending/legacy; `Some(empty)` truthfully means no row is materialized.
+    pub(crate) materialized_row_ranges: Option<Arc<[(usize, usize)]>>,
     pub(crate) total_rows: Option<usize>,
     /// Optional semantic authority for the read navigator miniature. `Some(empty)` is
     /// deliberately distinct from `None`: a unified scene can truthfully report that the
@@ -45,6 +47,101 @@ pub(crate) struct ReadPanelDisplayCache {
     pub(crate) actual_content_bottom: f32,
     pub(crate) clip_top: f32,
     pub(crate) clip_bottom: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadPanelMaterializationCoverage {
+    Covered {
+        materialized: (usize, usize),
+        required: (usize, usize),
+    },
+    PartiallyCovered {
+        materialized: (usize, usize),
+        required: (usize, usize),
+        intersection: (usize, usize),
+    },
+    Unknown,
+    Absent {
+        required: (usize, usize),
+    },
+}
+
+impl ReadPanelMaterializationCoverage {
+    pub(crate) const fn is_covered(self) -> bool {
+        matches!(self, Self::Covered { .. })
+    }
+}
+
+pub(crate) fn read_panel_materialization_coverage(
+    materialized: Option<&[(usize, usize)]>,
+    required: Option<(usize, usize)>,
+) -> ReadPanelMaterializationCoverage {
+    let Some(required @ (required_start, required_end)) = required else {
+        return ReadPanelMaterializationCoverage::Unknown;
+    };
+    let Some(materialized) = materialized else {
+        return ReadPanelMaterializationCoverage::Unknown;
+    };
+    let materialized_hull = materialized.iter().fold(None, |hull, &(start, end)| {
+        Some(hull.map_or((start, end), |(left, right): (usize, usize)| {
+            (left.min(start), right.max(end))
+        }))
+    });
+    let mut covered_until = required_start;
+    let mut intersection = None;
+    for &(start, end) in materialized {
+        let overlap_start = start.max(required_start);
+        let overlap_end = end.min(required_end);
+        if overlap_start < overlap_end {
+            intersection = Some(intersection.map_or(
+                (overlap_start, overlap_end),
+                |(left, right): (usize, usize)| (left.min(overlap_start), right.max(overlap_end)),
+            ));
+        }
+        if start <= covered_until && end > covered_until {
+            covered_until = end.min(required_end);
+        }
+    }
+    if covered_until >= required_end {
+        return ReadPanelMaterializationCoverage::Covered {
+            materialized: materialized_hull.unwrap_or(required),
+            required,
+        };
+    }
+    if let Some(intersection) = intersection {
+        ReadPanelMaterializationCoverage::PartiallyCovered {
+            materialized: materialized_hull.unwrap_or(intersection),
+            required,
+            intersection,
+        }
+    } else {
+        ReadPanelMaterializationCoverage::Absent { required }
+    }
+}
+
+/// Canonicalizes the exact row blocks carried by a committed native read scene. Several genomic
+/// tiles and geometry families can reference the same row block, so production materialization
+/// authority must deduplicate those occurrences and merge only genuinely touching intervals.
+pub(crate) fn normalize_materialized_row_ranges(
+    ranges: impl IntoIterator<Item = std::ops::Range<u32>>,
+) -> Arc<[(usize, usize)]> {
+    let mut ranges = ranges
+        .into_iter()
+        .filter(|range| !range.is_empty())
+        .map(|range| (range.start as usize, range.end as usize))
+        .collect::<Vec<_>>();
+    ranges.sort_unstable();
+    let mut normalized = Vec::<(usize, usize)>::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = normalized.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            normalized.push((start, end));
+        }
+    }
+    Arc::from(normalized)
 }
 
 /// Identity of the immutable scene row atlas used by a vertical read camera.
@@ -1010,6 +1107,51 @@ mod tests {
                 .read_panel_scroll_state(track_id)
                 .content_bottom_points
         );
+    }
+
+    #[test]
+    fn materialization_coverage_never_promotes_missing_authority_to_covered() {
+        assert_eq!(
+            read_panel_materialization_coverage(None, Some((10, 20))),
+            ReadPanelMaterializationCoverage::Unknown
+        );
+        assert_eq!(
+            read_panel_materialization_coverage(Some(&[(0, 100)]), None),
+            ReadPanelMaterializationCoverage::Unknown
+        );
+        assert!(
+            read_panel_materialization_coverage(Some(&[(0, 100)]), Some((10, 20))).is_covered()
+        );
+        assert_eq!(
+            read_panel_materialization_coverage(Some(&[(0, 15)]), Some((10, 20))),
+            ReadPanelMaterializationCoverage::PartiallyCovered {
+                materialized: (0, 15),
+                required: (10, 20),
+                intersection: (10, 15),
+            }
+        );
+        assert_eq!(
+            read_panel_materialization_coverage(Some(&[(0, 5)]), Some((10, 20))),
+            ReadPanelMaterializationCoverage::Absent { required: (10, 20) }
+        );
+        assert!(
+            read_panel_materialization_coverage(
+                Some(&[(0, 12), (12, 18), (18, 30)]),
+                Some((10, 20)),
+            )
+            .is_covered()
+        );
+        assert!(matches!(
+            read_panel_materialization_coverage(Some(&[(0, 12), (18, 30)]), Some((10, 20)),),
+            ReadPanelMaterializationCoverage::PartiallyCovered { .. }
+        ));
+    }
+
+    #[test]
+    fn committed_materialization_normalizes_duplicate_and_disjoint_row_blocks() {
+        let normalized =
+            normalize_materialized_row_ranges([16..24, 0..8, 0..8, 8..16, 40..48, 44..52, 60..60]);
+        assert_eq!(normalized.as_ref(), &[(0, 24), (40, 52)]);
     }
 }
 

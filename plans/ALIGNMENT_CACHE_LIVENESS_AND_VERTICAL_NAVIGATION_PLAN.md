@@ -1,6 +1,7 @@
 # Alignment cache liveness and vertical-navigation plan
 
-Status: proposed; implementation has not started
+Status: implementation checkpoint failed native acceptance; corrective work is defined in
+[Alignment cache thrash and scroll-materialization recovery](ALIGNMENT_CACHE_THRASH_AND_SCROLL_MATERIALIZATION_RECOVERY_PLAN.md)
 
 Plan date: 2026-09-01
 
@@ -18,6 +19,53 @@ Related plans:
 - [Unified alignment-scene interaction and capacity remediation](UNIFIED_ALIGNMENT_SCENE_INTERACTION_AND_CAPACITY_REMEDIATION_PLAN.md)
 - [Alignment browsing working set](ALIGNMENT_BROWSING_WORKING_SET_PLAN.md)
 - [Complete read presentation](COMPLETE_READ_PRESENTATION_PLAN.md)
+
+## Implementation record — 2026-09-01
+
+The production implementation is now present across the alignment scene, engine, renderer, and
+desktop boundaries described by this plan. It preserves complete evidence and makes the following
+architectural changes:
+
+- cache entries carry an explicit `AlignmentCacheResidencyClass`, separating the active browsing
+  buffer from demoted recent-locus return cache;
+- disjoint transitions are detected per source lane, then demote only entries outside every live
+  panel/track horizon before the new source work is pumped;
+- semantic pages use an ordered eviction index, while evidence collections use tail removal and a
+  constant-sized cross-family priority selection; the former repeated full scans and
+  `Vec::remove(0)` paths are gone;
+- reclaim executes in bounded 256-entry quanta, observes new mailbox intent between quanta, and
+  alternates with already-pending foreground source or visible-row work;
+- a changed genomic target cancels stale reclaim, while row-only movement retains the still-valid
+  byte target so rapid vertical dragging cannot starve capacity recovery;
+- retained-budget failures reclaim to the exact fit point plus one measured foreground allocation
+  of hysteresis, bounded by committed/pinned authority; GPU replacement uses the same measured,
+  floor-bounded low-water rule;
+- semantic eviction reconciles exact canonical row-block residency and removes only blocks whose
+  complete reusable page set is actually absent;
+- row-camera movement is separate from genomic/source navigation: cached blocks publish
+  immediately, missing visible blocks are one latest-wins foreground presentation checkpoint, and
+  unchanged evidence, summaries, and row-atlas authority are reused;
+- optional whole-stack warming remains speculative and yields to visible rows and reclaim;
+- pending scrollbar authority retains a normalized desired fraction and live drag state, including
+  exact non-empty clamping at the bottom of a stack;
+- materialization coverage is typed as `Covered`, `PartiallyCovered`, `Unknown`, or `Absent`; a
+  missing range can no longer authorize the fast path; and
+- diagnostics now report row-camera deferrals/publications, return-cache demotions and inventories,
+  bounded reclaim quanta, entries inspected/removed, bytes released, elapsed time, and completion.
+
+Automated verification completed on the implementation worktree:
+
+- `cargo check -p rgv-desktop --all-targets`;
+- 174 `rgv-alignment-scene` unit tests;
+- 110 `rgv-engine` unit tests;
+- 80 `rgv-render` unit tests plus its atomic alignment-bundle integration test; and
+- 431 `rgv-desktop` unit tests.
+
+The implementation is deliberately not marked accepted yet. Phase 6 still requires the user to
+exercise the release application at ACTB and BAP1, including carry-over browsing and rapid vertical
+dragging, and save a trace if any lag, lock, stale scrollbar extent, blanking, or critical error
+remains. That trace is also the final Phase 5 check that no independent BAM/backend phase—not the
+now-bounded reclaim path—accounts for the previously unobserved long source interval.
 
 This plan is the execution authority for the cache, eviction, scheduling, vertical-residency, and
 scrollbar-liveness defects exposed by the latest ACTB trace. The separate stress-automation plan

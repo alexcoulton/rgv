@@ -16,6 +16,7 @@ The remaining documents preserve detailed implementation, remediation, and desig
 
 ## Focused plans
 
+- [Alignment cache thrash and scroll-materialization recovery](ALIGNMENT_CACHE_THRASH_AND_SCROLL_MATERIALIZATION_RECOVERY_PLAN.md)
 - [Alignment cache liveness and vertical navigation](ALIGNMENT_CACHE_LIVENESS_AND_VERTICAL_NAVIGATION_PLAN.md)
 - [Native interaction stress automation](NATIVE_INTERACTION_STRESS_AUTOMATION_PLAN.md)
 - [Alignment context menu, filtering, and read presentation](ALIGNMENT_CONTEXT_MENU_AND_FILTERING_PLAN.md)

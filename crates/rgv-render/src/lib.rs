@@ -189,6 +189,10 @@ impl GpuBudgetPressure {
 pub struct GpuReclaimGoal {
     pub pressure: GpuBudgetPressure,
     pub baseline_occupied_bytes: usize,
+    /// Hysteresis beyond the exact fit point. This is derived from measured foreground demand by
+    /// the coordinator and never changes whether the underlying candidate is intrinsically
+    /// feasible.
+    pub additional_headroom_bytes: usize,
 }
 
 impl GpuReclaimGoal {
@@ -197,12 +201,39 @@ impl GpuReclaimGoal {
         Self {
             pressure,
             baseline_occupied_bytes,
+            additional_headroom_bytes: 0,
         }
     }
 
     #[must_use]
+    pub const fn with_additional_headroom(mut self, bytes: usize) -> Self {
+        self.additional_headroom_bytes = bytes;
+        self
+    }
+
+    /// Adds hysteresis without demanding eviction below an exact committed/pinned occupancy
+    /// floor. Low-water headroom is desirable, but it cannot turn an otherwise admissible
+    /// foreground candidate into a terminal failure merely because the full reserve is
+    /// unavailable.
+    #[must_use]
+    pub const fn with_additional_headroom_above_floor(
+        mut self,
+        bytes: usize,
+        minimum_occupied_bytes: usize,
+    ) -> Self {
+        let maximum = self
+            .baseline_occupied_bytes
+            .saturating_sub(minimum_occupied_bytes)
+            .saturating_sub(self.pressure.required_reclaim_bytes());
+        self.additional_headroom_bytes = if bytes < maximum { bytes } else { maximum };
+        self
+    }
+
+    #[must_use]
     pub const fn required_reclaim_bytes(self) -> usize {
-        self.pressure.required_reclaim_bytes()
+        self.pressure
+            .required_reclaim_bytes()
+            .saturating_add(self.additional_headroom_bytes)
     }
 
     #[must_use]
@@ -220,7 +251,7 @@ impl GpuReclaimGoal {
     #[must_use]
     pub const fn is_feasible(self) -> bool {
         self.pressure.requested_bytes <= self.pressure.limit_bytes
-            && self.required_reclaim_bytes() <= self.baseline_occupied_bytes
+            && self.pressure.required_reclaim_bytes() <= self.baseline_occupied_bytes
     }
 }
 
