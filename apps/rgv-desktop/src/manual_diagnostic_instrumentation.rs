@@ -3,6 +3,258 @@ use super::*;
 const MANUAL_TRACE_STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const MANUAL_TRACE_WHEEL_IDLE_INTERVAL: Duration = Duration::from_millis(250);
 
+fn diagnostic_revision_fingerprint(fingerprint: RevisionFingerprint) -> serde_json::Value {
+    serde_json::json!({
+        "high": fingerprint.high(),
+        "low": fingerprint.low(),
+    })
+}
+
+fn diagnostic_optional_reference_revision(
+    revision: Option<ReferenceRevision>,
+) -> serde_json::Value {
+    revision.map_or(serde_json::Value::Null, |revision| {
+        diagnostic_revision_fingerprint(revision.fingerprint())
+    })
+}
+
+fn diagnostic_alignment_predicate_scope(scope: &AlignmentPredicateScope) -> serde_json::Value {
+    match scope {
+        AlignmentPredicateScope::Anywhere => serde_json::json!({ "kind": "anywhere" }),
+        AlignmentPredicateScope::Position { contig, position } => serde_json::json!({
+            "kind": "position",
+            "contig": contig,
+            "position": position,
+        }),
+        AlignmentPredicateScope::Interval { contig, start, end } => serde_json::json!({
+            "kind": "interval",
+            "contig": contig,
+            "start": start,
+            "end": end,
+        }),
+    }
+}
+
+/// Privacy-preserving predicate representation for saved traces. Numeric thresholds and genomic
+/// scopes are useful diagnostic inputs, but auxiliary values can contain sample/read-group names
+/// and are therefore represented only by their type and presence.
+fn diagnostic_alignment_predicate(predicate: &AlignmentViewPredicate) -> serde_json::Value {
+    match predicate {
+        AlignmentViewPredicate::MappingQuality { minimum, maximum } => serde_json::json!({
+            "kind": "mapping_quality",
+            "minimum": minimum,
+            "maximum": maximum,
+            "requires_reference": false,
+        }),
+        AlignmentViewPredicate::Flag { flag, expected } => serde_json::json!({
+            "kind": "flag",
+            "flag": format!("{flag:?}"),
+            "expected": expected,
+            "requires_reference": false,
+        }),
+        AlignmentViewPredicate::TemplateLength { minimum, maximum } => serde_json::json!({
+            "kind": "template_length",
+            "minimum": minimum,
+            "maximum": maximum,
+            "requires_reference": false,
+        }),
+        AlignmentViewPredicate::MateContig { contig } => serde_json::json!({
+            "kind": "mate_contig",
+            "contig": contig,
+            "requires_reference": false,
+        }),
+        AlignmentViewPredicate::Auxiliary {
+            tag,
+            comparison,
+            value,
+        } => {
+            let value_kind = value.as_ref().map(|value| match value {
+                AlignmentAuxFilterValue::Integer(_) => "integer",
+                AlignmentAuxFilterValue::FloatBits(_) => "float",
+                AlignmentAuxFilterValue::String(_) => "string",
+            });
+            serde_json::json!({
+                "kind": "auxiliary",
+                "tag": String::from_utf8_lossy(tag),
+                "comparison": format!("{comparison:?}"),
+                "value_present": value.is_some(),
+                "value_kind": value_kind,
+                "value_redacted": value.is_some(),
+                "requires_reference": false,
+            })
+        }
+        AlignmentViewPredicate::CigarEvent {
+            event,
+            scope,
+            minimum_length,
+            maximum_length,
+        } => serde_json::json!({
+            "kind": "cigar_event",
+            "event": format!("{event:?}"),
+            "scope": diagnostic_alignment_predicate_scope(scope),
+            "minimum_length": minimum_length,
+            "maximum_length": maximum_length,
+            "requires_reference": false,
+        }),
+        AlignmentViewPredicate::AlignedLength { minimum, maximum } => serde_json::json!({
+            "kind": "aligned_length",
+            "minimum": minimum,
+            "maximum": maximum,
+            "requires_reference": false,
+        }),
+        AlignmentViewPredicate::Substitution {
+            scope,
+            observed_base,
+            minimum_count,
+            maximum_count,
+        } => serde_json::json!({
+            "kind": "substitution",
+            "scope": diagnostic_alignment_predicate_scope(scope),
+            "observed_base": observed_base.map(|base| char::from(base.to_ascii_uppercase()).to_string()),
+            "minimum_count": minimum_count,
+            "maximum_count": maximum_count,
+            "requires_reference": true,
+        }),
+    }
+}
+
+fn diagnostic_alignment_expression(
+    version: u16,
+    predicates: &[AlignmentViewPredicate],
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": version,
+        "predicate_count": predicates.len(),
+        "requires_reference": predicates.iter().any(AlignmentViewPredicate::requires_reference),
+        "predicates": predicates
+            .iter()
+            .map(diagnostic_alignment_predicate)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn diagnostic_alignment_filter_contract(
+    contract: &AlignmentViewFilterContract,
+    reference: Option<ReferenceRevision>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "contract_fingerprint": contract.fingerprint().get(),
+        "evaluation_fingerprint": contract.evaluation_fingerprint(reference).get(),
+        "predicate_count": contract.predicates().len(),
+        "requires_reference": contract.requires_reference(),
+        "reference_revision": diagnostic_optional_reference_revision(reference),
+    })
+}
+
+fn diagnostic_certified_coverage(
+    coverage: &rgv_alignment_scene::CertifiedCoverageSet,
+) -> serde_json::Value {
+    serde_json::json!({
+        "merged_interval_count": coverage.intervals().len(),
+        "certificate_count": coverage.certificates().len(),
+        "intervals": coverage
+            .intervals()
+            .iter()
+            .map(|interval| serde_json::json!({
+                "contig": interval.contig().get(),
+                "start": interval.start(),
+                "end": interval.end(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn diagnostic_alignment_scene_snapshot(
+    snapshot: &AlignmentSceneSnapshot,
+    expected_filter: Option<ContractFingerprint>,
+    read_authority_scene: Option<rgv_alignment_scene::SceneRevision>,
+) -> serde_json::Value {
+    let reads = snapshot.reads();
+    let evidence = reads.evidence();
+    let atlas = reads.atlas();
+    let summaries = snapshot.summaries();
+    let filter = evidence.view_filter();
+    let evidence_filter = filter.fingerprint();
+    let atlas_filter = atlas.view_filter();
+    let filter_tiles = summaries.filter_tiles();
+    let filter_coverage_fingerprint = filter_tiles
+        .first()
+        .map(|tile| tile.coverage_fingerprint().get());
+    let filter_coverage_uniform = filter_tiles
+        .iter()
+        .all(|tile| Some(tile.coverage_fingerprint().get()) == filter_coverage_fingerprint);
+    let filter_tile_evidence_coherent = filter_tiles
+        .iter()
+        .all(|tile| tile.evidence_revision() == evidence.revision());
+    let evidence_atlas_filter_coherent = evidence_filter == atlas_filter;
+    let summary_evidence_coherent = summaries.evidence_revision() == evidence.revision();
+    let expected_filter_coherent =
+        expected_filter.is_none_or(|expected| expected == evidence_filter);
+    let read_authority_scene_coherent =
+        read_authority_scene.is_none_or(|revision| revision == reads.revision());
+    serde_json::json!({
+        "snapshot_revision": diagnostic_revision_fingerprint(snapshot.revision().fingerprint()),
+        "read_scene_revision": diagnostic_revision_fingerprint(reads.revision().fingerprint()),
+        "evidence_revision": diagnostic_revision_fingerprint(evidence.revision().fingerprint()),
+        "row_atlas_revision": diagnostic_revision_fingerprint(atlas.revision().fingerprint()),
+        "summary_revision": diagnostic_revision_fingerprint(summaries.revision().fingerprint()),
+        "record_count": reads.evidence().record_count(),
+        "row_count": atlas.row_count(),
+        "read_pages": reads.pages().len(),
+        "summary_pages": snapshot.summary_pages().len(),
+        "filtered_coverage": diagnostic_certified_coverage(evidence.coverage()),
+        "eligible_coverage": diagnostic_certified_coverage(evidence.eligible_coverage()),
+        "view_filter": {
+            "evaluation_fingerprint": evidence_filter.get(),
+            "eligible_records": filter.eligible_records(),
+            "matching_records": filter.matching_records(),
+            "predicate_matches": filter.predicate_matches(),
+        },
+        "authorities": {
+            "expected_filter_evaluation_fingerprint": expected_filter.map(ContractFingerprint::get),
+            "row_atlas_filter_evaluation_fingerprint": atlas_filter.get(),
+            "filter_provenance_coverage_fingerprint": filter_coverage_fingerprint,
+            "filter_provenance_tiles": filter_tiles.len(),
+            "filter_provenance_uniform": filter_coverage_uniform,
+            "filter_tile_evidence_coherent": filter_tile_evidence_coherent,
+            "evidence_atlas_filter_coherent": evidence_atlas_filter_coherent,
+            "summary_evidence_coherent": summary_evidence_coherent,
+            "expected_filter_coherent": expected_filter_coherent,
+            "read_authority_scene_coherent": read_authority_scene_coherent,
+            "all_coherent": evidence_atlas_filter_coherent
+                && summary_evidence_coherent
+                && filter_coverage_uniform
+                && filter_tile_evidence_coherent
+                && expected_filter_coherent
+                && read_authority_scene_coherent,
+        },
+    })
+}
+
+fn diagnostic_alignment_component(component: AlignmentComponent) -> &'static str {
+    match component {
+        AlignmentComponent::ReadSpan => "read_span",
+        AlignmentComponent::AlignedSegment { .. } => "aligned_segment",
+        AlignmentComponent::Insertion { .. } => "insertion",
+        AlignmentComponent::Deletion { .. } => "deletion",
+        AlignmentComponent::ReferenceSkip { .. } => "reference_skip",
+        AlignmentComponent::SoftClip { .. } => "soft_clip",
+        AlignmentComponent::HardClip { .. } => "hard_clip",
+        AlignmentComponent::Padding { .. } => "padding",
+        AlignmentComponent::DirectionTerminal => "direction_terminal",
+        AlignmentComponent::PairConnector { .. } => "pair_connector",
+        AlignmentComponent::Label { .. } => "label",
+        AlignmentComponent::ModifiedBase { .. } => "modified_base",
+        AlignmentComponent::BisulfiteBase { .. } => "bisulfite_base",
+        AlignmentComponent::SmrtKinetics { .. } => "smrt_kinetics",
+        AlignmentComponent::UltimaIndel { .. } => "ultima_indel",
+        AlignmentComponent::SbxInsertion { .. } => "sbx_insertion",
+        AlignmentComponent::SbxTailBase { .. } => "sbx_tail_base",
+        AlignmentComponent::SpecialistUnavailable { .. } => "specialist_unavailable",
+        AlignmentComponent::Base { .. } => "base",
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ManualDiagnosticFramePhase {
     PollBackground,
@@ -243,7 +495,16 @@ impl Viewer {
                 "pixel_width": panel.viewport.pixel_width(),
             },
             "alignment_tracks": source_kinds,
-            "privacy": "No sequence, read names, auxiliary-tag values, credentials, or remote URLs are intentionally recorded. User-visible diagnostic/status text and genomic loci are included.",
+            "capabilities": [
+                "alignment_navigation_and_publication",
+                "alignment_filter_and_highlight_authority",
+                "alignment_context_menu_actions",
+                "retained_evidence_source_reuse",
+                "all_panel_read_scroll_authority",
+                "base_label_projection",
+                "reference_filter_dependency",
+            ],
+            "privacy": "No sequence, read names, auxiliary-tag values, credentials, or remote URLs are intentionally recorded. Filter kinds, numeric thresholds, redacted auxiliary value types, user-visible diagnostic/status text, and genomic loci are included.",
         }));
         let session = self.manual_diagnostic_trace.start_with_metadata(metadata);
         tracing::info!(
@@ -788,6 +1049,326 @@ impl Viewer {
         );
     }
 
+    /// Complete privacy-preserving filter authority for one panel/track pair. Context-menu
+    /// events and periodic snapshots share this representation so a requested mutation can be
+    /// followed through worker staging and atomic publication without consulting MCP after a
+    /// lock-up.
+    pub(crate) fn alignment_filter_diagnostic_state(
+        &self,
+        panel_id: PanelId,
+        track_id: TrackId,
+    ) -> serde_json::Value {
+        if !self.manual_diagnostic_trace_is_recording() {
+            return serde_json::Value::Null;
+        }
+        let Some(track) = self
+            .alignment_tracks
+            .iter()
+            .find(|track| track.config.id == track_id)
+        else {
+            return serde_json::Value::Null;
+        };
+        let effective_view =
+            alignment_effective_view_predicates(&track.config.filters, &track.active_filters);
+        let configured = serde_json::json!({
+            "view": diagnostic_alignment_expression(
+                track.config.filters.alignment_view_filter.version,
+                &effective_view,
+            ),
+            "highlight": diagnostic_alignment_expression(
+                track.config.filters.alignment_highlight_filter.version,
+                &track.config.filters.alignment_highlight_filter.all,
+            ),
+        });
+        let projection = track.projection(panel_id);
+        let requested = projection
+            .and_then(|projection| projection.scene_contract.as_ref())
+            .map_or(serde_json::Value::Null, |contract| {
+                serde_json::json!({
+                    "view": diagnostic_alignment_filter_contract(
+                        &contract.view_filter,
+                        contract.presentation.reference,
+                    ),
+                    "highlight": diagnostic_alignment_filter_contract(
+                        &contract.highlight_filter,
+                        contract.presentation.reference,
+                    ),
+                    "scene_reference_revision": diagnostic_optional_reference_revision(
+                        contract.presentation.reference,
+                    ),
+                    "reference_authority_embedded_in_requested_contract": contract.reference.is_some(),
+                })
+            });
+        let expected_filter = projection
+            .and_then(|projection| projection.scene_contract.as_ref())
+            .map(|contract| {
+                contract
+                    .view_filter
+                    .evaluation_fingerprint(contract.presentation.reference)
+            });
+        let staged = projection
+            .and_then(|projection| projection.scene_frame.as_ref())
+            .and_then(|frame| frame.snapshot.as_ref().map(|snapshot| (frame, snapshot)))
+            .map_or(serde_json::Value::Null, |(frame, snapshot)| {
+                serde_json::json!({
+                    "scene_contracts_current": frame.scene_contracts_current,
+                    "snapshot": diagnostic_alignment_scene_snapshot(
+                        snapshot,
+                        expected_filter,
+                        None,
+                    ),
+                })
+            });
+        let committed = self
+            .presented_alignment_lane(panel_id, track_id)
+            .and_then(|presented| {
+                presented
+                    .lane
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| (presented, snapshot))
+            })
+            .map_or(serde_json::Value::Null, |(presented, snapshot)| {
+                serde_json::json!({
+                    "target_revision": presented.target_revision,
+                    "scene_contracts_current": presented.lane.scene_contracts_current,
+                    "source_request_token": presented.source.source_request_token.get(),
+                    "desired_request_token": presented.source.desired_request_token.get(),
+                    "reference_ready": presented.source.reference_ready,
+                    "snapshot": diagnostic_alignment_scene_snapshot(
+                        snapshot,
+                        expected_filter,
+                        presented.read_authority.map(|authority| authority.scene_revision),
+                    ),
+                })
+            });
+        let highlight = projection.map_or(serde_json::Value::Null, |projection| {
+            serde_json::json!({
+                "cache_key": projection.scene_highlight_key.map(|(evidence, filter, reference)| {
+                    serde_json::json!({
+                        "evidence_revision": diagnostic_revision_fingerprint(evidence.fingerprint()),
+                        "filter_evaluation_fingerprint": filter.get(),
+                        "reference_revision": diagnostic_optional_reference_revision(reference),
+                    })
+                }),
+                "matching_handles": projection.scene_highlighted.len(),
+                "interaction_bound_handles": projection.scene_interaction.highlighted().len(),
+                "status": projection.scene_highlight_status,
+            })
+        });
+        let reference_install_receipt = projection
+            .and_then(|projection| projection.scene_owner)
+            .and_then(|owner| {
+                self.panels.get(panel_id).and_then(|panel| {
+                    panel
+                        .reference_installs_queued
+                        .get(&owner)
+                        .map(|(revision, interval)| {
+                            serde_json::json!({
+                                "owner": owner.get(),
+                                "revision": diagnostic_revision_fingerprint(revision.fingerprint()),
+                                "interval": {
+                                    "contig": interval.contig().get(),
+                                    "start": interval.start(),
+                                    "end": interval.end(),
+                                },
+                            })
+                        })
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+        let panel_reference = self.panels.get(panel_id).map_or(
+            serde_json::Value::Null,
+            |panel| {
+                serde_json::json!({
+                    "viewer_revision": diagnostic_optional_reference_revision(self.reference_revision),
+                    "slice_revision": diagnostic_optional_reference_revision(panel.reference_slice_revision),
+                    "request_revision": diagnostic_optional_reference_revision(panel.reference_request_revision),
+                    "request_interval": panel.reference_request_interval.map(|interval| {
+                        serde_json::json!({
+                            "contig": interval.contig().get(),
+                            "start": interval.start(),
+                            "end": interval.end(),
+                        })
+                    }),
+                    "slice_interval": panel.reference_slice.as_ref().map(|slice| {
+                        serde_json::json!({
+                            "contig": slice.interval.contig().get(),
+                            "start": slice.interval.start(),
+                            "end": slice.interval.end(),
+                        })
+                    }),
+                    "install_receipt": reference_install_receipt,
+                })
+            },
+        );
+        serde_json::json!({
+            "configured": configured,
+            "requested": requested,
+            "staged": staged,
+            "committed": committed,
+            "highlight": highlight,
+            "reference": panel_reference,
+            "source_acquisitions": projection.map_or(0, |projection| projection.scene_telemetry.source_acquisitions),
+        })
+    }
+
+    fn alignment_base_label_diagnostic_state(
+        &self,
+        panel_id: PanelId,
+        track_id: TrackId,
+    ) -> serde_json::Value {
+        let Some(bundle) = self
+            .alignment_presented_epoch
+            .as_ref()
+            .and_then(|epoch| epoch.gpu_bundle.as_ref())
+            .filter(|bundle| {
+                alignment_gpu_bundle_is_current(bundle, &self.alignment_scene_publication_authority)
+            })
+        else {
+            return serde_json::Value::Null;
+        };
+        let Some((index, authority)) =
+            bundle
+                .read_authorities
+                .iter()
+                .enumerate()
+                .find(|(_, authority)| {
+                    authority.panel_id == panel_id && authority.track_id == track_id
+                })
+        else {
+            return serde_json::Value::Null;
+        };
+        let Some(labels) = bundle
+            .reads
+            .as_ref()
+            .and_then(|frame| frame.label_frames().get(index))
+        else {
+            return serde_json::Value::Null;
+        };
+        let presented_base_labels = labels
+            .labels
+            .iter()
+            .filter(|label| matches!(label.component, AlignmentComponent::Base { .. }))
+            .count();
+        serde_json::json!({
+            "scene_revision": diagnostic_revision_fingerprint(labels.scene_revision.fingerprint()),
+            "camera_sequence": labels.camera_sequence,
+            "anchors_examined": labels.anchors_examined,
+            "labels_projected": labels.labels.len(),
+            "base_anchors_examined": labels.base_anchors_examined,
+            "base_labels_projected": labels.base_labels_projected,
+            "base_labels_presented": presented_base_labels,
+            "base_anchors_rejected_by_legibility_or_clipping": labels
+                .base_anchors_examined
+                .saturating_sub(labels.base_labels_projected),
+            "projector_presenter_count_coherent": labels.base_labels_projected == presented_base_labels,
+            "read_authority_scene_coherent": authority.scene_revision == labels.scene_revision,
+        })
+    }
+
+    fn all_panel_alignment_diagnostic_state(&self) -> Vec<serde_json::Value> {
+        let current_target_revision = self
+            .alignment_scene_publication_authority
+            .desired_target_revision();
+        self.panels
+            .iter()
+            .map(|panel| {
+                let tracks = self
+                    .alignment_tracks
+                    .iter()
+                    .map(|track| {
+                        let track_id = track.config.id;
+                        let state = panel.read_panel_scroll_state(track_id);
+                        let cached = panel.scroll_display_cache.as_ref().and_then(|cache| {
+                            cache
+                                .read_panels
+                                .iter()
+                                .find(|read_panel| read_panel.track_id == track_id)
+                        });
+                        let row_authority = cached.map_or(
+                            ReadRowCoordinateAuthority::Absent,
+                            |cached| {
+                                current_read_row_authority(
+                                    cached.presentation_target_revision,
+                                    current_target_revision,
+                                    self.alignment_scene_publication_authority
+                                        .committed_row_target_matches_desired(panel.id, track_id),
+                                    cached.row_coordinate_authority,
+                                )
+                            },
+                        );
+                        let (clip_top, clip_bottom, actual_content_bottom) = cached.map_or(
+                            (0.0, 0.0, 0.0),
+                            |cached| {
+                                (
+                                    cached.clip_top,
+                                    cached.clip_bottom,
+                                    cached.actual_content_bottom,
+                                )
+                            },
+                        );
+                        let scroll_maximum = crate::display::read_panel_scrollbar_maximum(
+                            state,
+                            clip_bottom,
+                            row_authority,
+                        );
+                        let presented = self
+                            .presented_alignment_lane(panel.id, track_id)
+                            .and_then(|presented| {
+                                presented.lane.snapshot.as_ref().map(|snapshot| {
+                                    let filter = snapshot.reads().evidence().view_filter();
+                                    serde_json::json!({
+                                        "target_revision": presented.target_revision,
+                                        "scene_revision": diagnostic_revision_fingerprint(snapshot.revision().fingerprint()),
+                                        "scene_contracts_current": presented.lane.scene_contracts_current,
+                                        "filter_evaluation_fingerprint": filter.fingerprint().get(),
+                                        "filter_eligible_records": filter.eligible_records(),
+                                        "filter_matching_records": filter.matching_records(),
+                                        "row_atlas_filter_evaluation_fingerprint": snapshot.reads().atlas().view_filter().get(),
+                                        "summary_evidence_coherent": snapshot.summaries().evidence_revision()
+                                            == snapshot.reads().evidence().revision(),
+                                        "read_authority": presented.read_authority.is_some(),
+                                    })
+                                })
+                            })
+                            .unwrap_or(serde_json::Value::Null);
+                        serde_json::json!({
+                            "track_id": track_id.get(),
+                            "row_authority": format!("{row_authority:?}"),
+                            "scroll": {
+                                "points": state.scroll_points,
+                                "effective_points": state.effective_scroll_points(),
+                                "content_origin_points": state.content_origin_points,
+                                "content_bottom_points": state.content_bottom_points,
+                                "latent_fraction": state.latent_scroll_fraction,
+                                "maximum_points": scroll_maximum,
+                                "clip_top": clip_top,
+                                "clip_bottom": clip_bottom,
+                                "actual_content_bottom": actual_content_bottom,
+                                "density": self.alignment_density_for_panel_track(panel.id, track_id),
+                            },
+                            "presented": presented,
+                            "base_labels": self.alignment_base_label_diagnostic_state(panel.id, track_id),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "panel_id": panel.id.get(),
+                    "active": panel.id == self.panels.active().id,
+                    "contig": panel.contig_name,
+                    "start": panel.viewport.interval().start(),
+                    "end": panel.viewport.interval().end(),
+                    "generation": panel.generation_clock.current().get(),
+                    "reference_slice_revision": diagnostic_optional_reference_revision(panel.reference_slice_revision),
+                    "read_stack_scroll_points": panel.read_stack_scroll_points,
+                    "read_stack_content_bottom_points": panel.read_stack_content_bottom_points,
+                    "tracks": tracks,
+                })
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_lines)]
     fn manual_diagnostic_state_snapshot(&self) -> serde_json::Value {
         let panel = self.panels.active();
@@ -858,6 +1439,15 @@ impl Viewer {
                             "source_yields": work.source_yields,
                             "source_acquisitions": work.source_acquisitions,
                             "source_refusals": work.source_refusals,
+                            "evidence_candidates": work.evidence_candidates,
+                            "view_filter_evaluations": work.view_filter_evaluations,
+                            "view_filter_records_examined": work.view_filter_records_examined,
+                            "view_filter_records_matched": work.view_filter_records_matched,
+                            "view_filter_evaluation_nanoseconds": work.view_filter_evaluation_nanoseconds,
+                            "last_view_filter_evaluation_nanoseconds": work.last_view_filter_evaluation_nanoseconds,
+                            "last_view_filter_contract_fingerprint": work.last_view_filter_contract_fingerprint,
+                            "last_view_filter_evaluation_fingerprint": work.last_view_filter_evaluation_fingerprint,
+                            "exact_summary_candidates": work.exact_summary_candidates,
                             "row_atlas_candidates": work.row_atlas_candidates,
                             "presentation_candidates": work.presentation_candidates,
                             "scene_publications": work.scene_publications,
@@ -918,6 +1508,8 @@ impl Viewer {
                     "staged": staged,
                     "telemetry": telemetry,
                     "presented": presented,
+                    "filtering": self.alignment_filter_diagnostic_state(panel.id, track.config.id),
+                    "base_labels": self.alignment_base_label_diagnostic_state(panel.id, track.config.id),
                     "row_authority": format!("{:?}", self.read_panel_row_authority(track.config.id)),
                     "scroll": {
                         "points": scroll.scroll_points,
@@ -934,6 +1526,22 @@ impl Viewer {
                 })
             })
             .collect::<Vec<_>>();
+        let panels = self.all_panel_alignment_diagnostic_state();
+        let alignment_context_menu = self.alignment_context_menu.as_ref().map_or(
+            serde_json::Value::Null,
+            |menu| {
+                serde_json::json!({
+                    "panel_id": menu.target.panel_id.get(),
+                    "track_id": menu.target.track_id.get(),
+                    "committed_target_revision": menu.target.committed_target_revision,
+                    "scene_revision": diagnostic_revision_fingerprint(menu.target.scene_revision.fingerprint()),
+                    "genomic_position": menu.target.genomic_position,
+                    "hit_present": menu.target.hit.is_some(),
+                    "hit_component": menu.target.hit.map(|hit| diagnostic_alignment_component(hit.component)),
+                    "target_current": self.alignment_context_target_is_current(menu.target),
+                })
+            },
+        );
         let read_ops = self.alignment_gpu_renderer.operation_counters();
         let summary_ops = self.alignment_summary_gpu_renderer.operation_counters();
         let rectangle_ops = self.rectangle_renderer.operation_counters();
@@ -992,6 +1600,7 @@ impl Viewer {
                 "horizontal_overview_drag": self.horizontal_overview_drag.is_some(),
                 "vertical_overview_drag": self.vertical_overview_drag.is_some(),
                 "overview_capture": format!("{:?}", self.overview_capture),
+                "alignment_context_menu": alignment_context_menu,
             },
             "publication": {
                 "committed_target_revision": self.alignment_scene_publication_authority.target_revision,
@@ -1083,6 +1692,7 @@ impl Viewer {
                 },
             },
             "tracks": tracks,
+            "panels": panels,
             "data_status": self.data_status,
         })
     }
@@ -1236,5 +1846,44 @@ mod tests {
         assert_eq!(timings.first_display_rebuild_us, 42);
         assert_eq!(timings.queue_submission_us, 7);
         assert_eq!(timings.shell_us, 0);
+    }
+
+    #[test]
+    fn diagnostic_predicates_preserve_structure_without_auxiliary_values() {
+        let predicate = AlignmentViewPredicate::Auxiliary {
+            tag: *b"RG",
+            comparison: AlignmentAuxComparison::Equal,
+            value: Some(AlignmentAuxFilterValue::String(
+                "private-read-group".to_owned(),
+            )),
+        };
+        let diagnostic = diagnostic_alignment_predicate(&predicate);
+        let serialized = diagnostic.to_string();
+        assert_eq!(diagnostic["kind"], "auxiliary");
+        assert_eq!(diagnostic["tag"], "RG");
+        assert_eq!(diagnostic["value_kind"], "string");
+        assert_eq!(diagnostic["value_redacted"], true);
+        assert!(!serialized.contains("private-read-group"));
+    }
+
+    #[test]
+    fn diagnostic_predicates_keep_reference_scope_and_exact_thresholds() {
+        let predicate = AlignmentViewPredicate::Substitution {
+            scope: AlignmentPredicateScope::Position {
+                contig: "chr7".to_owned(),
+                position: 5_525_000,
+            },
+            observed_base: Some(b'T'),
+            minimum_count: Some(2),
+            maximum_count: Some(4),
+        };
+        let diagnostic = diagnostic_alignment_predicate(&predicate);
+        assert_eq!(diagnostic["kind"], "substitution");
+        assert_eq!(diagnostic["requires_reference"], true);
+        assert_eq!(diagnostic["scope"]["kind"], "position");
+        assert_eq!(diagnostic["scope"]["position"], 5_525_000);
+        assert_eq!(diagnostic["observed_base"], "T");
+        assert_eq!(diagnostic["minimum_count"], 2);
+        assert_eq!(diagnostic["maximum_count"], 4);
     }
 }

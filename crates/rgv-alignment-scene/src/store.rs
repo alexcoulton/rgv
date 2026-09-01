@@ -4,7 +4,8 @@ use rgv_core::GenomicInterval;
 use thiserror::Error;
 
 use crate::{
-    AlignmentRowAtlas, AlignmentRowAtlasError, AlignmentRowAtlasPins, AlignmentSourceRevision,
+    AlignmentFilterEvaluationError, AlignmentRowAtlas, AlignmentRowAtlasError,
+    AlignmentRowAtlasPins, AlignmentSourceRevision, AlignmentViewFilterContract,
     AlleleSummaryContract, AllocationLedger, CanonicalGenomicTile, DepthSummaryContract,
     EvidenceAcquisition, EvidenceBuildError, EvidenceChunk, EvidencePins, EvidenceRevision,
     EvidenceRoot, EvidenceRootBuilder, ExactAlleleSummaryError, ExactAlleleSummaryKey,
@@ -16,7 +17,7 @@ use crate::{
     ExactSummaryRoot, ExactSummaryRootError, JunctionSummaryContract, LayoutContract, LedgerError,
     ModificationSummaryContract, PairSummaryContract, PayloadContract, ReservationKind,
     RevisionFingerprint, RowAtlasRevision, SourceChunkId, SummaryContract, SummaryRevision,
-    TransientResourceClass,
+    TransientResourceClass, evaluate_alignment_filter,
 };
 
 /// Mutable cache authority intended to be owned by exactly one source actor.
@@ -57,6 +58,7 @@ struct CachedEvidenceChunk {
 struct CachedDepthSummary {
     admitted_revision: u64,
     key: ExactDepthSummaryKey,
+    view_filter: crate::ContractFingerprint,
     summary: Arc<ExactDepthSummaryTile>,
 }
 
@@ -64,6 +66,7 @@ struct CachedDepthSummary {
 struct CachedAlleleSummary {
     admitted_revision: u64,
     key: ExactAlleleSummaryKey,
+    view_filter: crate::ContractFingerprint,
     summary: Arc<ExactAlleleSummaryTile>,
 }
 
@@ -71,6 +74,7 @@ struct CachedAlleleSummary {
 struct CachedJunctionSummary {
     admitted_revision: u64,
     key: ExactJunctionSummaryKey,
+    view_filter: crate::ContractFingerprint,
     summary: Arc<ExactJunctionSummaryTile>,
 }
 
@@ -78,6 +82,7 @@ struct CachedJunctionSummary {
 struct CachedPairSummary {
     admitted_revision: u64,
     key: ExactPairSummaryKey,
+    view_filter: crate::ContractFingerprint,
     summary: Arc<ExactPairSummaryTile>,
 }
 
@@ -85,6 +90,7 @@ struct CachedPairSummary {
 struct CachedModificationSummary {
     admitted_revision: u64,
     key: ExactModificationSummaryKey,
+    view_filter: crate::ContractFingerprint,
     summary: Arc<ExactModificationSummaryTile>,
 }
 
@@ -92,6 +98,7 @@ struct CachedModificationSummary {
 struct CachedFilterSummary {
     admitted_revision: u64,
     key: ExactFilterSummaryKey,
+    view_filter: crate::ContractFingerprint,
     summary: Arc<ExactFilterSummaryTile>,
 }
 
@@ -141,6 +148,12 @@ impl EvidenceStore {
     /// physical chunks alone never imply coverage.
     #[must_use]
     pub fn cached_covers(&self, target: GenomicInterval, payload: &PayloadContract) -> bool {
+        if self.current.as_ref().is_some_and(|current| {
+            current.root.payload().satisfies(payload)
+                && current.root.eligible_coverage().covers(target)
+        }) {
+            return true;
+        }
         let mut cursor = target.start();
         loop {
             let next = self
@@ -182,6 +195,12 @@ impl EvidenceStore {
         payload: &PayloadContract,
         prefer_right: bool,
     ) -> Option<GenomicInterval> {
+        if self.current.as_ref().is_some_and(|current| {
+            current.root.payload().satisfies(payload)
+                && current.root.eligible_coverage().covers(target)
+        }) {
+            return None;
+        }
         if prefer_right {
             let mut cursor = target.end();
             loop {
@@ -351,6 +370,29 @@ impl EvidenceStore {
         payload: PayloadContract,
         reservation_kind: ReservationKind,
     ) -> Result<EvidenceCandidate, EvidenceStoreError> {
+        let retained_filtered = self.current.as_ref().and_then(|current| {
+            (current.root.view_filter().fingerprint() != crate::ContractFingerprint::new(0)
+                && current.root.payload().satisfies(&payload)
+                && current.root.eligible_coverage().covers(target))
+            .then(|| Arc::clone(&current.root))
+        });
+        if let Some(current) = retained_filtered {
+            let revision_number = self.take_revision()?;
+            let revision = EvidenceRevision::new(RevisionFingerprint::new(0, revision_number));
+            let root = current.derive_unfiltered(
+                revision,
+                target,
+                &self.ledger,
+                reservation_kind,
+                revision_number,
+            )?;
+            let pins = root.pin()?;
+            return Ok(EvidenceCandidate {
+                target,
+                root,
+                _pins: pins,
+            });
+        }
         let no_payload_required = payload.sequence() == crate::CapabilityRequirement::NotRequired
             && payload.qualities() == crate::CapabilityRequirement::NotRequired
             && !payload.all_auxiliary_tags()
@@ -392,6 +434,45 @@ impl EvidenceStore {
         if !root.coverage().covers(target) {
             return Err(EvidenceStoreError::UncoveredTarget(target));
         }
+        let pins = root.pin()?;
+        Ok(EvidenceCandidate {
+            target,
+            root,
+            _pins: pins,
+        })
+    }
+
+    /// Derives a filtered immutable evidence root while retaining the candidate's canonical
+    /// chunks. The broad acquisition remains cached, so clearing or changing the filter does not
+    /// require source I/O. The input candidate is never published independently of its filtered
+    /// summaries and row atlas.
+    pub fn prepare_filtered(
+        &mut self,
+        candidate: EvidenceCandidate,
+        target: GenomicInterval,
+        contract: &AlignmentViewFilterContract,
+        evaluation_fingerprint: crate::ContractFingerprint,
+        reference: Option<&rgv_hts::ReferenceSlice>,
+        reservation_kind: ReservationKind,
+    ) -> Result<EvidenceCandidate, EvidenceStoreError> {
+        if contract.is_empty() {
+            return Ok(candidate);
+        }
+        let evaluation = evaluate_alignment_filter(candidate.root(), target, contract, reference)?;
+        let (handles, predicate_matches, eligible_records) = evaluation.into_parts();
+        let revision_number = self.take_revision()?;
+        let revision = EvidenceRevision::new(RevisionFingerprint::new(0, revision_number));
+        let root = candidate.root.derive_filtered(
+            revision,
+            target,
+            evaluation_fingerprint,
+            handles,
+            predicate_matches,
+            eligible_records,
+            &self.ledger,
+            reservation_kind,
+            revision_number,
+        )?;
         let pins = root.pin()?;
         Ok(EvidenceCandidate {
             target,
@@ -529,11 +610,9 @@ impl EvidenceStore {
         let key =
             ExactDepthSummaryKey::new(self.source_revision, self.record_contract, contract, tile);
         let revision = self.take_revision()?;
-        if let Some(cached) = self
-            .depth_summaries
-            .iter_mut()
-            .find(|cached| cached.key == key)
-        {
+        if let Some(cached) = self.depth_summaries.iter_mut().find(|cached| {
+            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
+        }) {
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -552,6 +631,7 @@ impl EvidenceStore {
         self.depth_summaries.push(CachedDepthSummary {
             admitted_revision: revision,
             key,
+            view_filter: evidence.view_filter().fingerprint(),
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -570,11 +650,9 @@ impl EvidenceStore {
         let key =
             ExactAlleleSummaryKey::new(self.source_revision, self.record_contract, contract, tile);
         let revision = self.take_revision()?;
-        if let Some(cached) = self
-            .allele_summaries
-            .iter_mut()
-            .find(|cached| cached.key == key)
-        {
+        if let Some(cached) = self.allele_summaries.iter_mut().find(|cached| {
+            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
+        }) {
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -593,6 +671,7 @@ impl EvidenceStore {
         self.allele_summaries.push(CachedAlleleSummary {
             admitted_revision: revision,
             key,
+            view_filter: evidence.view_filter().fingerprint(),
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -617,11 +696,9 @@ impl EvidenceStore {
             tile,
         );
         let revision = self.take_revision()?;
-        if let Some(cached) = self
-            .junction_summaries
-            .iter_mut()
-            .find(|cached| cached.key == key)
-        {
+        if let Some(cached) = self.junction_summaries.iter_mut().find(|cached| {
+            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
+        }) {
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -641,6 +718,7 @@ impl EvidenceStore {
         self.junction_summaries.push(CachedJunctionSummary {
             admitted_revision: revision,
             key,
+            view_filter: evidence.view_filter().fingerprint(),
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -659,11 +737,9 @@ impl EvidenceStore {
         let key =
             ExactPairSummaryKey::new(self.source_revision, self.record_contract, contract, tile);
         let revision = self.take_revision()?;
-        if let Some(cached) = self
-            .pair_summaries
-            .iter_mut()
-            .find(|cached| cached.key == key)
-        {
+        if let Some(cached) = self.pair_summaries.iter_mut().find(|cached| {
+            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
+        }) {
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -682,6 +758,7 @@ impl EvidenceStore {
         self.pair_summaries.push(CachedPairSummary {
             admitted_revision: revision,
             key,
+            view_filter: evidence.view_filter().fingerprint(),
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -704,11 +781,9 @@ impl EvidenceStore {
             tile,
         );
         let revision = self.take_revision()?;
-        if let Some(cached) = self
-            .modification_summaries
-            .iter_mut()
-            .find(|cached| cached.key == key)
-        {
+        if let Some(cached) = self.modification_summaries.iter_mut().find(|cached| {
+            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
+        }) {
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -727,6 +802,7 @@ impl EvidenceStore {
         self.modification_summaries.push(CachedModificationSummary {
             admitted_revision: revision,
             key,
+            view_filter: evidence.view_filter().fingerprint(),
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -752,11 +828,9 @@ impl EvidenceStore {
             tile,
         );
         let revision = self.take_revision()?;
-        if let Some(cached) = self
-            .filter_summaries
-            .iter_mut()
-            .find(|cached| cached.key == key)
-        {
+        if let Some(cached) = self.filter_summaries.iter_mut().find(|cached| {
+            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
+        }) {
             cached.admitted_revision = revision;
             self.ledger
                 .touch(cached.summary.allocation().id(), revision)?;
@@ -776,6 +850,7 @@ impl EvidenceStore {
         self.filter_summaries.push(CachedFilterSummary {
             admitted_revision: revision,
             key,
+            view_filter: evidence.view_filter().fingerprint(),
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -1406,6 +1481,8 @@ pub enum EvidenceStoreError {
     ExactSummaryRoot(#[from] ExactSummaryRootError),
     #[error(transparent)]
     RowAtlas(#[from] AlignmentRowAtlasError),
+    #[error(transparent)]
+    ViewFilter(#[from] AlignmentFilterEvaluationError),
     #[error("acquisition belongs to a different source revision")]
     SourceRevisionMismatch,
     #[error("acquisition belongs to a different record contract")]
@@ -1582,6 +1659,83 @@ mod tests {
         )
     }
 
+    fn boundary_spanning_acquisition(
+        ledger: &AllocationLedger,
+        coverage_start: u64,
+        coverage_end: u64,
+        block: u64,
+    ) -> Arc<EvidenceAcquisition> {
+        let interval =
+            GenomicInterval::new(ContigId::new(0), coverage_start, coverage_end).unwrap();
+        let record = AlignmentRecord {
+            contig: ContigId::new(0),
+            start: 40,
+            end: 60,
+            flags: AlignmentFlags::from_bits(0),
+            mapping_quality: Some(60),
+            mate_contig: None,
+            mate_start: None,
+            template_length: 0,
+            read_name: b"crosses-certificate-boundary".to_vec(),
+            cigar: Vec::new(),
+            sequence: SequenceData::NotLoaded,
+            auxiliary_fields: Vec::new(),
+        };
+        let mut batch = AlignmentBatch::default();
+        batch
+            .push_with_source_position(
+                &record,
+                AlignmentSourcePosition::bam_virtual_offset((block << 16) | 1),
+            )
+            .unwrap();
+        let chunk = CanonicalRecordChunk::new(
+            source_revision(),
+            SourceChunkId::BamBlock {
+                compressed_offset: block,
+            },
+            Arc::new(batch),
+            ContractFingerprint::new(9),
+        )
+        .unwrap();
+        let footprint = EvidenceChunk::footprint(&chunk);
+        let core = ledger
+            .reserve(
+                AllocationClass::CoreChunk,
+                footprint.core_bytes,
+                ReservationKind::Normal,
+            )
+            .unwrap()
+            .register(footprint.core_bytes, block)
+            .unwrap();
+        let overlap = ledger
+            .reserve(
+                AllocationClass::OverlapIndex,
+                footprint.overlap_index_bytes,
+                ReservationKind::Normal,
+            )
+            .unwrap()
+            .register(footprint.overlap_index_bytes, block)
+            .unwrap();
+        let chunk = Arc::new(EvidenceChunk::new(chunk, core, overlap).unwrap());
+        Arc::new(
+            EvidenceAcquisition::new(
+                CompleteCoverage::new(
+                    source_revision(),
+                    ContractFingerprint::new(9),
+                    interval,
+                    FilteredRecordProvenance {
+                        records_seen: 1,
+                        eligible_records: 1,
+                        ..FilteredRecordProvenance::default()
+                    },
+                )
+                .unwrap(),
+                [chunk],
+            )
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn candidate_failure_and_cancellation_leave_current_byte_identical() {
         let ledger = AllocationLedger::new(1 << 20, 1 << 10);
@@ -1633,6 +1787,168 @@ mod tests {
             )
             .unwrap();
         assert!(candidate.root().coverage().covers(candidate.target()));
+    }
+
+    #[test]
+    fn adjacent_query_provenance_does_not_double_count_a_boundary_spanning_record() {
+        let ledger = AllocationLedger::new(1 << 20, 1 << 20);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        // This is the production trace shape: both adjacent indexed queries truthfully observe
+        // the same physical alignment because it overlaps their shared genomic boundary.
+        store
+            .admit(boundary_spanning_acquisition(&ledger, 0, 50, 17))
+            .unwrap();
+        store
+            .admit(boundary_spanning_acquisition(&ledger, 50, 100, 17))
+            .unwrap();
+        let target = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let canonical = store
+            .prepare(target, no_payload(), ReservationKind::Normal)
+            .unwrap();
+
+        assert!(canonical.root().coverage().covers(target));
+        assert_eq!(canonical.root().select(target).unwrap().len(), 1);
+        assert_eq!(canonical.root().exact_filter_provenance(target), None);
+
+        let filter = crate::AlignmentViewFilterContract::new(
+            1,
+            [crate::AlignmentFilterPredicate::MappingQuality {
+                minimum: Some(0),
+                maximum: None,
+            }],
+        );
+        let filtered = store
+            .prepare_filtered(
+                canonical,
+                target,
+                &filter,
+                filter.evaluation_fingerprint(None),
+                None,
+                ReservationKind::Transition,
+            )
+            .unwrap();
+
+        assert_eq!(filtered.root().view_filter().eligible_records(), 1);
+        assert_eq!(filtered.root().view_filter().matching_records(), 1);
+        assert_eq!(
+            filtered.root().exact_filter_provenance(target),
+            Some(FilteredRecordProvenance {
+                records_seen: 1,
+                eligible_records: 1,
+                ..FilteredRecordProvenance::default()
+            })
+        );
+    }
+
+    #[test]
+    fn filtered_candidate_shares_canonical_chunks_and_clears_without_source_io() {
+        let ledger = AllocationLedger::new(1 << 20, 1 << 20);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        store
+            .admit(one_record_acquisition(&ledger, 0, 100, 17))
+            .unwrap();
+        let target = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let canonical = store
+            .prepare(target, no_payload(), ReservationKind::Normal)
+            .unwrap();
+        let canonical_chunk = Arc::clone(&canonical.root().chunks()[0]);
+        let retained_handle = canonical_chunk.chunk().handles()[0];
+        let filter = crate::AlignmentViewFilterContract::new(
+            1,
+            [crate::AlignmentFilterPredicate::MappingQuality {
+                minimum: Some(61),
+                maximum: None,
+            }],
+        );
+        let filtered = store
+            .prepare_filtered(
+                canonical,
+                target,
+                &filter,
+                filter.evaluation_fingerprint(None),
+                None,
+                ReservationKind::Transition,
+            )
+            .unwrap();
+        assert_eq!(filtered.root().record_count(), 0);
+        assert_eq!(filtered.root().view_filter().eligible_records(), 1);
+        assert_eq!(filtered.root().view_filter().matching_records(), 0);
+        assert!(Arc::ptr_eq(&canonical_chunk, &filtered.root().chunks()[0]));
+        assert!(!filtered.root().contains_handle(retained_handle));
+        store.publish(filtered);
+        let pressure = store.evict_inactive_until(0).unwrap();
+        assert!(pressure.evicted_acquisitions > 0);
+
+        let restored = store
+            .prepare(target, no_payload(), ReservationKind::Transition)
+            .unwrap();
+        assert_eq!(restored.root().record_count(), 1);
+        assert!(restored.root().contains_handle(retained_handle));
+        assert_eq!(store.acquisition_count(), 0);
+        assert!(Arc::ptr_eq(&canonical_chunk, &restored.root().chunks()[0]));
+    }
+
+    #[test]
+    fn filtered_current_rederives_a_broader_cached_target_from_eligible_authority() {
+        let ledger = AllocationLedger::new(1 << 20, 1 << 20);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        store
+            .admit(one_record_acquisition(&ledger, 0, 100, 18))
+            .unwrap();
+        let broad = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let narrow = GenomicInterval::new(ContigId::new(0), 0, 20).unwrap();
+        let canonical = store
+            .prepare(broad, no_payload(), ReservationKind::Normal)
+            .unwrap();
+        let canonical_chunk = Arc::clone(&canonical.root().chunks()[0]);
+        let filter = crate::AlignmentViewFilterContract::new(
+            1,
+            [crate::AlignmentFilterPredicate::MappingQuality {
+                minimum: Some(61),
+                maximum: None,
+            }],
+        );
+        let filtered = store
+            .prepare_filtered(
+                canonical,
+                narrow,
+                &filter,
+                filter.evaluation_fingerprint(None),
+                None,
+                ReservationKind::Transition,
+            )
+            .unwrap();
+        assert!(filtered.root().coverage().covers(narrow));
+        assert!(!filtered.root().coverage().covers(broad));
+        assert!(filtered.root().eligible_coverage().covers(broad));
+        store.publish(filtered);
+
+        // Model the production cache-pressure state from the trace: the immutable filtered root
+        // is current, while the independently cached acquisition has been released. Its shared
+        // canonical chunks and broader eligible certificate are still sufficient for zoom-out.
+        let pressure = store.evict_inactive_until(0).unwrap();
+        assert!(pressure.evicted_acquisitions > 0);
+        assert_eq!(store.acquisition_count(), 0);
+        assert!(store.cached_covers(broad, &no_payload()));
+
+        let restored = store
+            .prepare(broad, no_payload(), ReservationKind::Transition)
+            .unwrap();
+        assert!(restored.root().coverage().covers(broad));
+        assert_eq!(restored.root().record_count(), 1);
+        assert!(Arc::ptr_eq(&canonical_chunk, &restored.root().chunks()[0]));
     }
 
     #[test]
@@ -1958,8 +2274,8 @@ mod tests {
             summaries
                 .root()
                 .filter_provenance(GenomicInterval::new(ContigId::new(0), 0, 200).unwrap())
-                .unwrap(),
-            FilteredRecordProvenance::default()
+                .unwrap_err(),
+            crate::ExactSummaryQueryError::IndivisibleFilterProvenance
         );
         assert_eq!(
             summaries

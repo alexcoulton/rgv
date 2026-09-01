@@ -5,6 +5,13 @@ use super::super::*;
 const ALIGNMENT_GPU_PREFETCH_TARGET_QUANTUM: Duration = Duration::from_millis(2);
 const ALIGNMENT_GPU_PREFETCH_MAXIMUM_PAGES_PER_QUANTUM: usize = 64;
 
+fn retire_reference_install_receipt_for_contract_epoch(
+    receipts: &mut BTreeMap<SourceOwnerId, (ReferenceRevision, GenomicInterval)>,
+    owner: SourceOwnerId,
+) -> bool {
+    receipts.remove(&owner).is_some()
+}
+
 impl AlignmentGpuPrefetchState {
     fn maximum_pages(&self) -> NonZeroUsize {
         NonZeroUsize::new(
@@ -2192,6 +2199,52 @@ impl Viewer {
         }
     }
 
+    fn alignment_filter_authorities_for_trace(
+        &self,
+        authorities: &[AlignmentCommittedLaneAuthority],
+    ) -> Vec<serde_json::Value> {
+        if !self.manual_diagnostic_trace_is_recording() {
+            return Vec::new();
+        }
+        authorities
+            .iter()
+            .map(|authority| {
+                let projection = self
+                    .alignment_tracks
+                    .iter()
+                    .find(|track| track.config.id == authority.track_id)
+                    .and_then(|track| track.projection(authority.panel_id));
+                let presented = self
+                    .presented_alignment_lane(authority.panel_id, authority.track_id)
+                    .and_then(|presented| presented.lane.snapshot.as_ref())
+                    .map(|snapshot| {
+                        let filter = snapshot.reads().evidence().view_filter();
+                        serde_json::json!({
+                            "scene_revision": {
+                                "high": snapshot.revision().fingerprint().high(),
+                                "low": snapshot.revision().fingerprint().low(),
+                            },
+                            "filter_evaluation_fingerprint": filter.fingerprint().get(),
+                            "eligible_records": filter.eligible_records(),
+                            "matching_records": filter.matching_records(),
+                            "predicate_matches": filter.predicate_matches(),
+                            "row_atlas_filter_evaluation_fingerprint": snapshot.reads().atlas().view_filter().get(),
+                            "summary_evidence_coherent": snapshot.summaries().evidence_revision()
+                                == snapshot.reads().evidence().revision(),
+                        })
+                    });
+                serde_json::json!({
+                    "panel_id": authority.panel_id.get(),
+                    "track_id": authority.track_id.get(),
+                    "source_request_token": authority.source_request_token.get(),
+                    "desired_request_token": authority.desired_request_token.get(),
+                    "source_acquisitions_after": projection.map_or(0, |projection| projection.scene_telemetry.source_acquisitions),
+                    "presented": presented,
+                })
+            })
+            .collect()
+    }
+
     fn prepare_alignment_scene_frame_atomic(&mut self) {
         // Capture first, then expose the desired target before fallible publication. The prior
         // committed epoch retains ownership for rollback, but render/hit/live-region consumers
@@ -2519,6 +2572,8 @@ impl Viewer {
                 if self.alignment_gpu_prefetch.pending() {
                     self.window.request_redraw();
                 }
+                let filter_authorities =
+                    self.alignment_filter_authorities_for_trace(&navigation_candidates);
                 self.record_manual_diagnostic_event(
                     "alignment_publication",
                     "camera_only_capture_committed",
@@ -2527,6 +2582,7 @@ impl Viewer {
                         "publication_attempt_sequence": publication_attempt_sequence,
                         "read_requests": read_requests.len(),
                         "summary_requests": summary_requests.len(),
+                        "filter_authorities": filter_authorities,
                     }),
                 );
                 return;
@@ -2759,6 +2815,8 @@ impl Viewer {
                 if self.alignment_gpu_prefetch.pending() {
                     self.window.request_redraw();
                 }
+                let filter_authorities =
+                    self.alignment_filter_authorities_for_trace(&navigation_candidates);
                 self.record_manual_diagnostic_event(
                     "alignment_publication",
                     "content_replacement_committed",
@@ -2769,6 +2827,7 @@ impl Viewer {
                         "summary_requests": summary_requests.len(),
                         "prefetch_reads": self.alignment_gpu_prefetch.reads,
                         "prefetch_summaries": self.alignment_gpu_prefetch.summaries,
+                        "filter_authorities": filter_authorities,
                     }),
                 );
             }
@@ -4346,7 +4405,20 @@ impl Viewer {
         let (hovered, selected) = self.panels.get(panel_id).map_or((None, None), |panel| {
             (panel.hovered_alignment_hit, panel.selected_alignment_hit)
         });
-        for track in &mut self.alignment_tracks {
+        let track_ids = self
+            .alignment_tracks
+            .iter()
+            .map(|track| track.config.id)
+            .collect::<Vec<_>>();
+        for track_id in track_ids {
+            let highlighted = self.alignment_highlight_handles(panel_id, track_id);
+            let Some(track) = self
+                .alignment_tracks
+                .iter_mut()
+                .find(|track| track.config.id == track_id)
+            else {
+                continue;
+            };
             let hovered = hovered
                 .filter(|hit| hit.track == track.config.id)
                 .map(|hit| hit.handle);
@@ -4354,8 +4426,85 @@ impl Viewer {
                 .filter(|hit| hit.track == track.config.id)
                 .map(|hit| hit.handle);
             track.projection_mut(panel_id).scene_interaction =
-                AlignmentInteractionState::new(hovered, selected, std::iter::empty());
+                AlignmentInteractionState::new(hovered, selected, std::iter::empty())
+                    .with_highlighted(highlighted.iter().copied());
         }
+    }
+
+    fn alignment_highlight_handles(
+        &mut self,
+        panel_id: PanelId,
+        track_id: TrackId,
+    ) -> Arc<[AlignmentHandle]> {
+        let Some(track_index) = self
+            .alignment_tracks
+            .iter()
+            .position(|track| track.config.id == track_id)
+        else {
+            return Arc::from([]);
+        };
+        let Some(metadata) = self.alignment_tracks[track_index].scene_metadata.as_ref() else {
+            return Arc::from([]);
+        };
+        let contract = alignment_highlight_filter_contract(
+            &self.alignment_tracks[track_index].config.filters,
+            &metadata.dictionary,
+        );
+        if contract.is_empty() {
+            let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+            projection.scene_highlight_key = None;
+            projection.scene_highlighted = Arc::from([]);
+            projection.scene_highlight_status = None;
+            return Arc::clone(&projection.scene_highlighted);
+        }
+        let Some(snapshot) = self.alignment_tracks[track_index]
+            .projection(panel_id)
+            .and_then(|projection| projection.scene_frame.as_ref())
+            .and_then(|frame| frame.snapshot.as_ref())
+            .cloned()
+        else {
+            return Arc::from([]);
+        };
+        let reference_revision = self
+            .panels
+            .get(panel_id)
+            .and_then(|panel| panel.reference_slice_revision);
+        let key = (
+            snapshot.reads().evidence().revision(),
+            contract.fingerprint(),
+            reference_revision,
+        );
+        if let Some(projection) = self.alignment_tracks[track_index].projection(panel_id)
+            && projection.scene_highlight_key == Some(key)
+        {
+            return Arc::clone(&projection.scene_highlighted);
+        }
+        let reference = self.panels.get(panel_id).and_then(|panel| {
+            panel.reference_slice.as_deref().filter(|slice| {
+                panel.reference_slice_revision == reference_revision
+                    && slice
+                        .interval
+                        .contains_interval(snapshot.prepared_interval())
+            })
+        });
+        let evaluation = evaluate_alignment_filter(
+            snapshot.reads().evidence(),
+            snapshot.prepared_interval(),
+            &contract,
+            reference,
+        );
+        let (highlighted, status): (Arc<[AlignmentHandle]>, Option<String>) = match evaluation {
+            Ok(evaluation) => (evaluation.into_matching_handles().into(), None),
+            Err(error) => (
+                Arc::from([]),
+                Some(format!("Highlights unavailable: {error}")),
+            ),
+        };
+        let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+        projection.scene_highlight_key = Some(key);
+        projection.scene_highlighted = Arc::clone(&highlighted);
+        projection.scene_highlight_status = status;
+        highlighted
     }
 
     pub(crate) fn alignment_scene_snapshot_for_panel_track(
@@ -4762,6 +4911,7 @@ impl Viewer {
                 .map(|(_, hash)| hash);
             let contract = alignment_scene_build_contract(
                 &self.alignment_tracks[track_index].config,
+                &self.alignment_tracks[track_index].active_filters,
                 &metadata,
                 contig,
                 contig_length,
@@ -4818,6 +4968,33 @@ impl Viewer {
             let contract_changed = existing_contract
                 .as_ref()
                 .is_none_or(|existing| !alignment_scene_contract_equivalent(existing, &contract));
+            let previous_view_filter = existing_contract.as_ref().map(|existing| {
+                existing
+                    .view_filter
+                    .evaluation_fingerprint(existing.presentation.reference)
+                    .get()
+            });
+            let previous_highlight_filter = existing_contract.as_ref().map(|existing| {
+                existing
+                    .highlight_filter
+                    .evaluation_fingerprint(existing.presentation.reference)
+                    .get()
+            });
+            let requested_view_filter = contract
+                .view_filter
+                .evaluation_fingerprint(contract.presentation.reference)
+                .get();
+            let requested_highlight_filter = contract
+                .highlight_filter
+                .evaluation_fingerprint(contract.presentation.reference)
+                .get();
+            let filter_authority_changed = previous_view_filter != Some(requested_view_filter)
+                || previous_highlight_filter != Some(requested_highlight_filter);
+            let source_acquisitions_before = self.alignment_tracks[track_index]
+                .projection(panel_id)
+                .map_or(0, |projection| {
+                    projection.scene_telemetry.source_acquisitions
+                });
             let limit_changed =
                 self.alignment_tracks[track_index].scene_complete_read_limit != complete_read_limit;
             let mut limit_queued = false;
@@ -4915,18 +5092,54 @@ impl Viewer {
                     projection.scene_policy = Some(policy);
                 }
             }
+            if contract_replaced && let Some(panel) = self.panels.get_mut(panel_id) {
+                // The receipt acknowledges delivery to the previous coordinator contract epoch.
+                // A replacement may preserve compatible authority, but it may also retire it.
+                // Invalidate the receipt in either case so a still-pending exact requirement can
+                // enqueue the cached slice again instead of waiting forever for a command which
+                // already ran against the old contract.
+                retire_reference_install_receipt_for_contract_epoch(
+                    &mut panel.reference_installs_queued,
+                    owner,
+                );
+            }
             match queue_error {
                 None => {
-                    let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
-                    projection.begin_checking(Instant::now());
-                    projection.last_scene_resolution = Some(resolution);
-                    projection.scene_pressure_retry = None;
-                    projection.unavailable = None;
-                    projection.index_only_overview = false;
-                    projection.navigation.transition(
-                        AlignmentNavigationPhase::Running,
-                        "source worker accepted the exact target",
-                    );
+                    {
+                        let projection =
+                            self.alignment_tracks[track_index].projection_mut(panel_id);
+                        projection.begin_checking(Instant::now());
+                        projection.last_scene_resolution = Some(resolution);
+                        projection.scene_pressure_retry = None;
+                        projection.unavailable = None;
+                        projection.index_only_overview = false;
+                        projection.navigation.transition(
+                            AlignmentNavigationPhase::Running,
+                            "source worker accepted the exact target",
+                        );
+                    }
+                    if filter_authority_changed && (lane_inserted || contract_replaced) {
+                        let filter_state =
+                            self.alignment_filter_diagnostic_state(panel_id, track_id);
+                        self.record_manual_diagnostic_event(
+                            "alignment_filter",
+                            "contract_queued",
+                            serde_json::json!({
+                                "panel_id": panel_id.get(),
+                                "track_id": track_id.get(),
+                                "request_token": request_token.get(),
+                                "lane_inserted": lane_inserted,
+                                "contract_replaced": contract_replaced,
+                                "previous_view_filter_evaluation_fingerprint": previous_view_filter,
+                                "requested_view_filter_evaluation_fingerprint": requested_view_filter,
+                                "previous_highlight_filter_evaluation_fingerprint": previous_highlight_filter,
+                                "requested_highlight_filter_evaluation_fingerprint": requested_highlight_filter,
+                                "source_acquisitions_before": source_acquisitions_before,
+                                "expected_source_reacquisition": false,
+                                "filter_state": filter_state,
+                            }),
+                        );
+                    }
                     sent = sent.saturating_add(1);
                 }
                 Some(EngineQueueError::Full) => {}
@@ -5505,6 +5718,29 @@ pub(crate) fn alignment_scene_intervals_share_authority(
 #[cfg(test)]
 mod gpu_publication_retry_tests {
     use super::*;
+
+    #[test]
+    fn contract_replacement_retires_only_its_reference_install_receipt() {
+        let first = SourceOwnerId::new(7);
+        let second = SourceOwnerId::new(8);
+        let revision = ReferenceRevision::new(RevisionFingerprint::new(1, 2));
+        let interval = GenomicInterval::new(ContigId::new(0), 10, 20).unwrap();
+        let mut receipts = BTreeMap::from([
+            (first, (revision, interval)),
+            (second, (revision, interval)),
+        ]);
+
+        assert!(retire_reference_install_receipt_for_contract_epoch(
+            &mut receipts,
+            first,
+        ));
+        assert!(!receipts.contains_key(&first));
+        assert_eq!(receipts.get(&second), Some(&(revision, interval)));
+        assert!(!retire_reference_install_receipt_for_contract_epoch(
+            &mut receipts,
+            first,
+        ));
+    }
 
     fn target(workspace_layout_revision: u64) -> AlignmentSceneTargetIdentity {
         AlignmentSceneTargetIdentity {

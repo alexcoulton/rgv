@@ -459,7 +459,9 @@ fn write_group_mode(hash: &mut StableHasher, mode: AlignmentGroupMode) {
         AlignmentGroupMode::MateContig => (10, None),
         AlignmentGroupMode::ReadOrder => (11, None),
         AlignmentGroupMode::FirstOfPairStrand => (12, None),
-        AlignmentGroupMode::Tag(tag) => (13, Some(tag)),
+        AlignmentGroupMode::Base => (13, None),
+        AlignmentGroupMode::Insertion => (14, None),
+        AlignmentGroupMode::Tag(tag) => (15, Some(tag)),
     };
     hash.write(&[kind]);
     if let Some(tag) = tag {

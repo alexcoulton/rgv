@@ -523,7 +523,8 @@ fn structured_alignment_exports_use_the_committed_scene_authority() {
         },
     }];
 
-    let alignments = automation_alignments_export("GRCh38", "chr1", interval, &tracks).unwrap();
+    let alignments =
+        automation_alignments_export("GRCh38", "chr1", interval, &tracks, false).unwrap();
     let pileup = automation_pileup_export("GRCh38", "chr1", interval, &tracks).unwrap();
 
     assert!(alignments.contains("authority=committed_scene"));

@@ -37,6 +37,7 @@ mod summary;
 mod summary_page;
 mod summary_root;
 mod tile;
+mod view_filter;
 
 pub use acquisition::{EvidenceAcquisition, EvidenceAcquisitionError};
 pub use allele_summary::{ExactAlleleSummaryError, ExactAlleleSummaryKey, ExactAlleleSummaryTile};
@@ -67,7 +68,7 @@ pub use cpu_summary_projector::{
 pub use evidence::{
     EvidenceBuildError, EvidenceChunk, EvidenceChunkError, EvidenceChunkFootprint, EvidencePins,
     EvidenceRecordRef, EvidenceRoot, EvidenceRootBuilder, EvidenceSelection,
-    EvidenceSelectionError,
+    EvidenceSelectionError, EvidenceViewFilter,
 };
 pub use filter_summary::{ExactFilterSummaryError, ExactFilterSummaryKey, ExactFilterSummaryTile};
 pub use fingerprint::ContractFingerprint;
@@ -162,3 +163,8 @@ pub use summary_root::{
     ExactSummaryRoot, ExactSummaryRootError,
 };
 pub use tile::{CanonicalGenomicTile, CanonicalTileError};
+pub use view_filter::{
+    AlignmentFilterEvaluation, AlignmentFilterEvaluationError, AlignmentFilterPredicate,
+    AlignmentFilterScope, AlignmentViewFilterContract, alignment_filter_reference_horizon,
+    evaluate_alignment_filter,
+};

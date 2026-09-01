@@ -281,6 +281,16 @@ pub(crate) fn alignment_style_controls(
                         AlignmentGroupMode::FirstOfPairStrand,
                         "First-of-pair strand",
                     );
+                    ui.selectable_value(
+                        group_mode,
+                        AlignmentGroupMode::Base,
+                        "Base at fixed position",
+                    );
+                    ui.selectable_value(
+                        group_mode,
+                        AlignmentGroupMode::Insertion,
+                        "Insertion at fixed position",
+                    );
                     let tag = parse_style_tag(style_tag).unwrap_or(*b"NM");
                     ui.selectable_value(group_mode, AlignmentGroupMode::Tag(tag), "Custom tag");
                 })

@@ -84,7 +84,9 @@ impl ApplicationHandler for Application {
                 if event.state == ElementState::Pressed
                     && event.logical_key == Key::Named(NamedKey::Escape) =>
             {
-                if viewer.exit_confirmation_open {
+                if viewer.close_alignment_context_menu("escape") {
+                    viewer.window.request_redraw();
+                } else if viewer.exit_confirmation_open {
                     viewer.exit_confirmation_open = false;
                     viewer.window.request_redraw();
                 } else if viewer.open_panel.take().is_some() {
@@ -94,6 +96,15 @@ impl ApplicationHandler for Application {
                     viewer.save_recording_manual_diagnostic_trace_before_exit();
                     event_loop.exit();
                 }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && (event.logical_key == Key::Named(NamedKey::ContextMenu)
+                        || (event.logical_key == Key::Named(NamedKey::F10)
+                            && viewer.modifiers.shift_key())) =>
+            {
+                viewer.open_alignment_context_menu_at_cursor("keyboard");
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !egui_response.consumed =>
@@ -183,6 +194,15 @@ impl ApplicationHandler for Application {
                 button: MouseButton::Left,
                 ..
             } => {
+                if state == ElementState::Pressed
+                    && viewer.modifiers.control_key()
+                    && viewer.open_alignment_context_menu_at_cursor("control_click")
+                {
+                    viewer.dragging = false;
+                    viewer.press_cursor = None;
+                    viewer.last_cursor = None;
+                    return;
+                }
                 if state == ElementState::Pressed {
                     viewer.begin_vertical_scrollbar_drag();
                 }
@@ -234,6 +254,13 @@ impl ApplicationHandler for Application {
                         viewer.select_at_cursor();
                     }
                 }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                viewer.open_alignment_context_menu_at_cursor("secondary_click");
             }
             WindowEvent::MouseWheel { delta, phase, .. }
                 if viewer.cursor_over_unobstructed_track_viewport() =>

@@ -1314,13 +1314,20 @@ impl Viewer {
                 mode,
                 direction,
                 tag,
+                anchor_position,
             } => {
                 let requested_mode = tag
                     .as_deref()
                     .and_then(|tag| parse_automation_sam_tag(tag).ok())
                     .map_or(mode, AlignmentGroupMode::Tag);
                 let before = self.automation_alignment_group_state(&track_ids);
-                match self.apply_automation_group(&track_ids, mode, direction, tag.as_deref()) {
+                match self.apply_automation_group(
+                    &track_ids,
+                    mode,
+                    direction,
+                    tag.as_deref(),
+                    anchor_position,
+                ) {
                     Ok(()) => {
                         let effective = self.automation_alignment_group_state(&track_ids);
                         let changed = before != effective;
@@ -1328,7 +1335,7 @@ impl Viewer {
                         AutomationExecution::Complete {
                             message: format!("Grouped {} alignment tracks", track_ids.len()),
                             data: serde_json::json!({
-                                "requested": {"mode": requested_mode, "direction": direction},
+                                "requested": {"mode": requested_mode, "direction": direction, "anchor": anchor_position},
                                 "effective": effective,
                                 "changed": changed,
                                 "clamped": false,
@@ -1346,13 +1353,20 @@ impl Viewer {
                 mode,
                 direction,
                 tag,
+                anchor_position,
             } => {
                 let requested_mode = tag
                     .as_deref()
                     .and_then(|tag| parse_automation_sam_tag(tag).ok())
                     .map_or(mode, AlignmentSortMode::Tag);
                 let before = self.automation_alignment_sort_state(&track_ids);
-                match self.apply_automation_sort(&track_ids, mode, direction, tag.as_deref()) {
+                match self.apply_automation_sort(
+                    &track_ids,
+                    mode,
+                    direction,
+                    tag.as_deref(),
+                    anchor_position,
+                ) {
                     Ok(()) => {
                         let effective = self.automation_alignment_sort_state(&track_ids);
                         let changed = before != effective;
@@ -1360,7 +1374,7 @@ impl Viewer {
                         AutomationExecution::Complete {
                             message: format!("Sorted {} alignment tracks", track_ids.len()),
                             data: serde_json::json!({
-                                "requested": {"mode": requested_mode, "direction": direction},
+                                "requested": {"mode": requested_mode, "direction": direction, "anchor": anchor_position},
                                 "effective": effective,
                                 "changed": changed,
                                 "clamped": false,
@@ -2122,6 +2136,42 @@ impl Viewer {
                         sort_order: track.config.filters.alignment_sort_order,
                         sort_anchor: track.config.filters.alignment_sort_anchor,
                         filter_expression: track.filter_editor.expression.clone(),
+                        view_filter: track.config.filters.alignment_view_filter.clone(),
+                        highlight_filter: track.config.filters.alignment_highlight_filter.clone(),
+                        view_filter_fingerprint: presented_scene
+                            .and_then(|presented| presented.lane.snapshot.as_ref())
+                            .map_or(0, |snapshot| {
+                                snapshot
+                                    .reads()
+                                    .evidence()
+                                    .view_filter()
+                                    .fingerprint()
+                                    .get()
+                            }),
+                        view_filter_eligible_records: presented_scene
+                            .and_then(|presented| presented.lane.snapshot.as_ref())
+                            .map_or(0, |snapshot| {
+                                snapshot.reads().evidence().view_filter().eligible_records()
+                            }),
+                        view_filter_matching_records: presented_scene
+                            .and_then(|presented| presented.lane.snapshot.as_ref())
+                            .map_or(0, |snapshot| {
+                                snapshot.reads().evidence().view_filter().matching_records()
+                            }),
+                        view_filter_predicate_matches: presented_scene
+                            .and_then(|presented| presented.lane.snapshot.as_ref())
+                            .map_or_else(Vec::new, |snapshot| {
+                                snapshot
+                                    .reads()
+                                    .evidence()
+                                    .view_filter()
+                                    .predicate_matches()
+                                    .to_vec()
+                            }),
+                        view_filter_effective_predicates: alignment_effective_view_predicates(
+                            &track.config.filters,
+                            &track.active_filters,
+                        ),
                         view_as_pairs: track.config.filters.view_as_pairs,
                         read_stacking_mode: track.config.filters.read_stacking_mode,
                         read_presentation_state: read_presentation.state,
@@ -3495,6 +3545,51 @@ impl Viewer {
                 self.invalidate_automation_alignment_layouts(Some(track_ids), false);
                 self.rebuild_all_panel_displays();
             }
+            AutomationSetting::AlignmentViewFilter { track_ids, value } => {
+                self.ensure_automation_alignment_tracks(track_ids)?;
+                anyhow::ensure!(
+                    self.reference_source.is_some()
+                        || !value
+                            .all
+                            .iter()
+                            .any(AlignmentViewPredicate::requires_reference),
+                    "reference-backed alignment filters require a matching reference FASTA"
+                );
+                for track in self
+                    .alignment_tracks
+                    .iter_mut()
+                    .filter(|track| track_ids.contains(&track.config.id))
+                {
+                    track.config.filters.alignment_view_filter = value.clone();
+                }
+                self.invalidate_automation_alignment_layouts(Some(track_ids), true);
+                self.request_all_panel_queries();
+                self.rebuild_all_panel_displays();
+            }
+            AutomationSetting::AlignmentHighlightFilter { track_ids, value } => {
+                self.ensure_automation_alignment_tracks(track_ids)?;
+                anyhow::ensure!(
+                    self.reference_source.is_some()
+                        || !value
+                            .all
+                            .iter()
+                            .any(AlignmentViewPredicate::requires_reference),
+                    "reference-backed alignment highlights require a matching reference FASTA"
+                );
+                for track in self
+                    .alignment_tracks
+                    .iter_mut()
+                    .filter(|track| track_ids.contains(&track.config.id))
+                {
+                    track.config.filters.alignment_highlight_filter = value.clone();
+                    for projection in track.projections.values_mut() {
+                        projection.scene_highlight_key = None;
+                        projection.scene_highlight_status = None;
+                    }
+                }
+                self.invalidate_automation_alignment_layouts(Some(track_ids), false);
+                self.rebuild_all_panel_displays();
+            }
             AutomationSetting::ReadStackingMode { track_ids, value } => {
                 self.ensure_automation_alignment_tracks(track_ids)?;
                 for track in self
@@ -4424,11 +4519,26 @@ impl Viewer {
         mode: AlignmentGroupMode,
         direction: AlignmentOrderDirection,
         tag: Option<&str>,
+        anchor_position: Option<u64>,
     ) -> Result<()> {
         self.ensure_automation_alignment_tracks(track_ids)?;
         let mode = tag.map_or(Ok(mode), |tag| {
             parse_automation_sam_tag(tag).map(AlignmentGroupMode::Tag)
         })?;
+        let captured_anchor = matches!(
+            mode,
+            AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
+        )
+        .then(|| {
+            anchor_position.unwrap_or_else(|| {
+                self.panels
+                    .active()
+                    .viewport
+                    .interval()
+                    .start()
+                    .saturating_add(self.panels.active().viewport.interval().len() / 2)
+            })
+        });
         for track in self
             .alignment_tracks
             .iter_mut()
@@ -4436,6 +4546,9 @@ impl Viewer {
         {
             track.config.filters.alignment_group_mode = mode;
             track.config.filters.alignment_group_order = direction;
+            if captured_anchor.is_some() {
+                track.config.filters.alignment_sort_anchor = captured_anchor;
+            }
         }
         if track_ids.contains(&self.primary_alignment_track_id()) {
             self.activate_first_alignment_track()?;
@@ -4451,10 +4564,17 @@ impl Viewer {
             .iter()
             .filter(|track| track_ids.contains(&track.config.id))
             .map(|track| {
+                let anchor = matches!(
+                    track.config.filters.alignment_group_mode,
+                    AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
+                )
+                .then_some(track.config.filters.alignment_sort_anchor)
+                .flatten();
                 serde_json::json!({
                     "track_id": track.config.id.get(),
                     "mode": track.config.filters.alignment_group_mode,
                     "direction": track.config.filters.alignment_group_order,
+                    "anchor": anchor,
                 })
             })
             .collect()
@@ -4465,11 +4585,14 @@ impl Viewer {
             .iter()
             .filter(|track| track_ids.contains(&track.config.id))
             .map(|track| {
+                let anchor = (track.config.filters.alignment_sort_mode == AlignmentSortMode::Base)
+                    .then_some(track.config.filters.alignment_sort_anchor)
+                    .flatten();
                 serde_json::json!({
                     "track_id": track.config.id.get(),
                     "mode": track.config.filters.alignment_sort_mode,
                     "direction": track.config.filters.alignment_sort_order,
-                    "anchor": track.config.filters.alignment_sort_anchor,
+                    "anchor": anchor,
                 })
             })
             .collect()
@@ -4494,12 +4617,18 @@ impl Viewer {
         mode: AlignmentSortMode,
         direction: AlignmentOrderDirection,
         tag: Option<&str>,
+        anchor_position: Option<u64>,
     ) -> Result<()> {
         self.ensure_automation_alignment_tracks(track_ids)?;
         let mode = tag.map_or(Ok(mode), |tag| {
             parse_automation_sam_tag(tag).map(AlignmentSortMode::Tag)
         })?;
-        let captured_anchor = alignment_sort_position(mode, None, self.panels.active().viewport);
+        let captured_anchor = if mode == AlignmentSortMode::Base {
+            anchor_position
+                .or_else(|| alignment_sort_position(mode, None, self.panels.active().viewport))
+        } else {
+            None
+        };
         for track in self
             .alignment_tracks
             .iter_mut()
@@ -4507,7 +4636,14 @@ impl Viewer {
         {
             track.config.filters.alignment_sort_mode = mode;
             track.config.filters.alignment_sort_order = direction;
-            track.config.filters.alignment_sort_anchor = captured_anchor;
+            if captured_anchor.is_some() {
+                track.config.filters.alignment_sort_anchor = captured_anchor;
+            } else if !matches!(
+                track.config.filters.alignment_group_mode,
+                AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
+            ) {
+                track.config.filters.alignment_sort_anchor = None;
+            }
         }
         if track_ids.contains(&self.primary_alignment_track_id()) {
             self.activate_first_alignment_track()?;
@@ -5031,6 +5167,8 @@ impl Viewer {
                 })
             }
             AutomationExportKind::Alignments
+            | AutomationExportKind::FilteredAlignments
+            | AutomationExportKind::EligibleAlignments
             | AutomationExportKind::Pileup
             | AutomationExportKind::Modifications
             | AutomationExportKind::Junctions => {
@@ -5075,7 +5213,12 @@ impl Viewer {
                         snapshot.prepared_interval().contains_interval(interval),
                         "the committed alignment scene does not cover the export interval"
                     );
-                    if kind == AutomationExportKind::Alignments {
+                    if matches!(
+                        kind,
+                        AutomationExportKind::Alignments
+                            | AutomationExportKind::FilteredAlignments
+                            | AutomationExportKind::EligibleAlignments
+                    ) {
                         anyhow::ensure!(
                             matches!(
                                 presented.source.individual_reads,
@@ -5100,9 +5243,13 @@ impl Viewer {
                 );
                 self.start_automation_export_job(command_index, path, move |path| {
                     let contents = match kind {
-                        AutomationExportKind::Alignments => {
-                            automation_alignments_export(&assembly, &contig, interval, &tracks)
-                        }
+                        AutomationExportKind::Alignments
+                        | AutomationExportKind::FilteredAlignments => automation_alignments_export(
+                            &assembly, &contig, interval, &tracks, false,
+                        ),
+                        AutomationExportKind::EligibleAlignments => automation_alignments_export(
+                            &assembly, &contig, interval, &tracks, true,
+                        ),
                         AutomationExportKind::Pileup => {
                             automation_pileup_export(&assembly, &contig, interval, &tracks)
                         }

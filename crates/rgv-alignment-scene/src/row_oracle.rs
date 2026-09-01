@@ -152,6 +152,7 @@ struct Candidate {
     has_sa: bool,
     pair: PairEvidence,
     base_sort: (u8, u8),
+    position_group: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -237,7 +238,9 @@ fn build_candidates(
             } else {
                 false
             };
-            let base_sort = if contract.sorting == AlignmentSortMode::Base {
+            let position_base_key = if contract.sorting == AlignmentSortMode::Base
+                || contract.grouping == AlignmentGroupMode::Base
+            {
                 alignment_base_sort_key(
                     record.start(),
                     record.end(),
@@ -247,6 +250,17 @@ fn build_candidates(
                 )
             } else {
                 (7, 0)
+            };
+            let position_group = match contract.grouping {
+                AlignmentGroupMode::Base => {
+                    Some(alignment_base_group_label(position_base_key).to_owned())
+                }
+                AlignmentGroupMode::Insertion => Some(alignment_insertion_group_label(
+                    record.start(),
+                    record.cigar(),
+                    contract.sort_anchor,
+                )),
+                _ => None,
             };
             Ok(Candidate {
                 handle: reference.handle,
@@ -264,7 +278,8 @@ fn build_candidates(
                 sort_tag,
                 has_sa,
                 pair: pair_evidence_view(record, interval, contract.pair_length_bounds),
-                base_sort,
+                base_sort: position_base_key,
+                position_group,
             })
         })
         .collect()
@@ -274,7 +289,8 @@ fn validate_capabilities(
     evidence: &EvidenceRoot,
     contract: LayoutContract,
 ) -> Result<(), RowOracleError> {
-    if contract.sorting == AlignmentSortMode::Base
+    if (contract.sorting == AlignmentSortMode::Base
+        || contract.grouping == AlignmentGroupMode::Base)
         && evidence.payload().sequence() != CapabilityRequirement::Required
     {
         return Err(RowOracleError::SequencePayloadRequired);
@@ -465,6 +481,10 @@ fn group_key(candidate: &Candidate, mode: AlignmentGroupMode) -> OracleGroupKey 
                 None => "Unknown",
             })
         }
+        AlignmentGroupMode::Base | AlignmentGroupMode::Insertion => candidate
+            .position_group
+            .as_ref()
+            .map_or(OracleGroupKey::Missing, |label| tagged(label)),
     }
 }
 
@@ -806,6 +826,51 @@ fn alignment_base_sort_key(
         }
     }
     (7, 0)
+}
+
+const fn alignment_base_group_label(key: (u8, u8)) -> &'static str {
+    match key {
+        (0, _) => "A",
+        (1, _) => "C",
+        (2, _) => "G",
+        (3, _) => "T",
+        (4, _) => "N",
+        (5, b'-') => "Deletion",
+        (5, b'~') => "Reference skip",
+        (5, _) => "Other base",
+        (6, _) => "Sequence unavailable",
+        _ => "Does not overlap position",
+    }
+}
+
+fn alignment_insertion_group_label(
+    record_start: u64,
+    cigar: &[CigarOp],
+    target: Option<u64>,
+) -> String {
+    let Some(target) = target else {
+        return "No position anchor".to_owned();
+    };
+    let mut reference_position = record_start;
+    for operation in cigar {
+        match operation.kind {
+            CigarOpKind::Insertion if reference_position == target => {
+                return format!("Insertion {} bp", operation.len);
+            }
+            CigarOpKind::Match
+            | CigarOpKind::SequenceMatch
+            | CigarOpKind::SequenceMismatch
+            | CigarOpKind::Deletion
+            | CigarOpKind::ReferenceSkip => {
+                reference_position = reference_position.saturating_add(u64::from(operation.len));
+            }
+            CigarOpKind::Insertion
+            | CigarOpKind::SoftClip
+            | CigarOpKind::HardClip
+            | CigarOpKind::Padding => {}
+        }
+    }
+    "No insertion".to_owned()
 }
 
 fn aligned_length(cigar: &[CigarOp]) -> u64 {

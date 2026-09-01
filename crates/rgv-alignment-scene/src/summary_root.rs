@@ -615,7 +615,12 @@ impl ExactSummaryRoot {
         Ok(summarize_pair_candidate_iter(candidates, true))
     }
 
-    /// Returns exact provenance only for a union of complete canonical filter tiles.
+    /// Returns exact provenance only when one indivisible source certificate owns the complete
+    /// prepared horizon.
+    ///
+    /// Adjacent genomic certificates prove complete coverage, but their record populations can
+    /// overlap at the boundary. The individual certificates remain available through
+    /// `filter_provenance_certificates`; this aggregate accessor refuses to invent a sum.
     pub fn filter_provenance(
         &self,
         interval: GenomicInterval,
@@ -624,22 +629,12 @@ impl ExactSummaryRoot {
         if interval != self.prepared {
             return Err(ExactSummaryQueryError::IndivisibleFilterProvenance);
         }
-        let mut cursor = interval.start();
-        let mut provenance = FilteredRecordProvenance::default();
-        while cursor < interval.end() {
-            let certificate = self
-                .filters
-                .iter()
-                .flat_map(|tile| tile.provenances())
-                .filter(|certificate| certificate.interval().contig() == interval.contig())
-                .filter(|certificate| certificate.interval().start() == cursor)
-                .filter(|certificate| certificate.interval().end() <= interval.end())
-                .max_by_key(|certificate| certificate.interval().end())
-                .ok_or(ExactSummaryQueryError::IndivisibleFilterProvenance)?;
-            provenance = provenance.saturating_add(certificate.provenance());
-            cursor = certificate.interval().end();
-        }
-        Ok(provenance)
+        self.filters
+            .iter()
+            .flat_map(|tile| tile.provenances())
+            .find(|certificate| certificate.interval() == interval)
+            .map(|certificate| certificate.provenance())
+            .ok_or(ExactSummaryQueryError::IndivisibleFilterProvenance)
     }
 
     /// Exact transaction certificates retained by the scene. Overlapping certificates remain

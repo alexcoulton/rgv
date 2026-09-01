@@ -14,6 +14,33 @@ pub(crate) const ANNOTATION_PANE_BACKGROUND: Rgba = Rgba::new(0.953, 0.969, 0.98
 const SYNTHETIC_READ_ROW_HEIGHT: f32 = 5.0;
 pub(crate) const SYNTHETIC_READ_ROW_STRIDE: f32 = 7.0;
 
+fn alignment_text_primitive(
+    label: &rgv_alignment_scene::CpuProjectedPrimitive,
+) -> Option<rgv_layout::TextPrimitive> {
+    let text = label.text.as_deref()?;
+    let color = match label.component {
+        AlignmentComponent::Base { base, .. } => match base.to_ascii_uppercase() {
+            // Dark ink has the stronger contrast on the bright A/G fills; white remains clearer
+            // on the darker C/T fills. N and other ambiguous symbols use white on neutral grey.
+            b'A' | b'G' => Rgba::new(0.06, 0.07, 0.08, 0.96),
+            _ => Rgba::new(1.0, 1.0, 1.0, 0.98),
+        },
+        _ => Rgba::new(0.08, 0.09, 0.11, 0.94),
+    };
+    let font_size = if matches!(label.component, AlignmentComponent::Base { .. }) {
+        (label.width.min(label.height) as f32 - 1.0).clamp(8.0, 12.0)
+    } else {
+        (label.height as f32 - 2.0).clamp(8.0, 12.0)
+    };
+    Some(rgv_layout::TextPrimitive {
+        x: (label.x + label.width * 0.5) as f32,
+        y: (label.y + label.height * 0.5) as f32,
+        text: text.to_owned(),
+        font_size,
+        color,
+    })
+}
+
 fn display_content_bottom(display: &DisplayList, fallback: f32) -> f32 {
     let rectangle_bottom = display
         .rectangles
@@ -1460,10 +1487,60 @@ impl Viewer {
                     clip_bottom: bottom.min(scroll_clip_bottom),
                 });
             }
+            let filter_count = alignment_active_filter_count(&track.config.filters);
+            let filter_requires_missing_reference = track
+                .config
+                .filters
+                .alignment_view_filter
+                .all
+                .iter()
+                .any(AlignmentViewPredicate::requires_reference)
+                && self.reference_revision.is_none();
+            let filter_status = if filter_count == 0 {
+                String::new()
+            } else if filter_requires_missing_reference {
+                format!(" · Filters {filter_count}: reference required")
+            } else {
+                presented
+                    .filter(|presented| presented.lane.scene_contracts_current)
+                    .and_then(|presented| presented.lane.snapshot.as_ref())
+                    .map(|snapshot| snapshot.reads().evidence().view_filter())
+                    .map(|filter| {
+                        format!(
+                            " · Filters {filter_count}: {}/{}",
+                            filter.matching_records(),
+                            filter.eligible_records()
+                        )
+                    })
+                    .unwrap_or_else(|| format!(" · Filters {filter_count}: updating"))
+            };
+            let highlight_count = track.config.filters.alignment_highlight_filter.all.len();
+            let highlight_status = if highlight_count == 0 {
+                String::new()
+            } else if let Some(status) = track
+                .projection(self.panels.active().id)
+                .and_then(|projection| projection.scene_highlight_status.as_deref())
+            {
+                format!(" · {status}")
+            } else if let Some(projection) = track
+                .projection(self.panels.active().id)
+                .filter(|projection| projection.scene_highlight_key.is_some())
+            {
+                format!(
+                    " · Highlights {highlight_count}: {} reads",
+                    projection.scene_highlighted.len()
+                )
+            } else {
+                format!(" · Highlights {highlight_count}: updating")
+            };
+            let read_frame_name = format!(
+                "Reads · {}{filter_status}{highlight_status}",
+                track.config.name
+            );
             self.panels.active_mut().track_frames.push(TrackFrame {
                 key: TrackFrameKey::Alignment(track_id),
                 channel: ui::TrackPane::Reads,
-                name: format!("Reads · {}", track.config.name),
+                name: read_frame_name,
                 kind: TrackKind::Alignment,
                 source_label: Some(track.config.source.redacted_label()),
                 top: bounds.top,
@@ -2154,6 +2231,26 @@ impl Viewer {
             .and_then(|bundle| bundle.summaries.as_ref())
             .map(|frame| self.alignment_summary_gpu_renderer.junction_labels(frame))
             .unwrap_or_default();
+        let native_read_labels = self
+            .alignment_presented_epoch
+            .as_ref()
+            .and_then(|epoch| epoch.gpu_bundle.as_ref())
+            .filter(|bundle| {
+                alignment_gpu_bundle_is_current(bundle, &self.alignment_scene_publication_authority)
+            })
+            .and_then(|bundle| {
+                bundle.reads.as_ref().map(|frame| {
+                    bundle
+                        .read_authorities
+                        .iter()
+                        .zip(frame.label_frames())
+                        .filter(|(authority, _)| authority.panel_id == active_panel_id)
+                        .flat_map(|(_, frame)| frame.labels.iter())
+                        .filter_map(alignment_text_primitive)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
         let active_drag = self
             .vertical_overview_drag
             .filter(|drag| drag.density_dragging && drag.panel_id == active_panel_id);
@@ -2385,6 +2482,7 @@ impl Viewer {
                     color: Rgba::new(0.10, 0.10, 0.12, 0.94),
                 }),
         );
+        display.texts.extend(native_read_labels);
         let (interaction_enabled, content_revision) = {
             let presentation = &self.panels.active().navigation_presentation;
             (

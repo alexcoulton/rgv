@@ -891,7 +891,7 @@ impl AlignmentGpuRenderer {
                             .filter(|primitive| {
                                 let token = request.interaction.token(primitive.handle);
                                 !matches!(primitive.component, AlignmentComponent::Label { .. })
-                                    && (token.hovered || token.selected || token.selected_chain)
+                                    && interaction_token_requires_overlay(token)
                             })
                             .count(),
                     );
@@ -969,12 +969,25 @@ impl AlignmentGpuRenderer {
                 let ordinary_overlays = camera_pages
                     .saturating_mul(request.scene.maximum_handle_primitives_per_page())
                     .saturating_mul(ORDINARY_INTERACTION_HANDLES);
+                // Unlike hover and selection, a predicate highlight can legitimately match every
+                // read in the viewport. Provision for a completely highlighted camera envelope,
+                // but never for duplicated geometry across the whole prepared scene.
+                let highlight_overlays = (!request.interaction.highlighted().is_empty())
+                    .then(|| {
+                        camera_pages
+                            .saturating_mul(request.scene.maximum_non_label_primitives_per_page())
+                    })
+                    .unwrap_or(0);
                 let current_overlays = request
                     .scene
                     .interaction_overlay_instances(request.interaction);
                 (
                     draw_total.saturating_add(camera_pages),
-                    overlay_total.saturating_add(ordinary_overlays.max(current_overlays)),
+                    overlay_total.saturating_add(
+                        ordinary_overlays
+                            .max(highlight_overlays)
+                            .max(current_overlays),
+                    ),
                 )
             },
         );
@@ -1521,7 +1534,7 @@ impl AlignmentGpuRenderer {
                 if !request.interaction.is_empty() {
                     for primitive in page.primitives() {
                         let token = request.interaction.token(primitive.handle);
-                        if !token.hovered && !token.selected && !token.selected_chain {
+                        if !interaction_token_requires_overlay(token) {
                             continue;
                         }
                         if let Some(instance) = pack_primitive(
@@ -2277,7 +2290,7 @@ impl AlignmentGpuRenderer {
                             .filter(|primitive| {
                                 let token = request.interaction.token(primitive.handle);
                                 !matches!(primitive.component, AlignmentComponent::Label { .. })
-                                    && (token.hovered || token.selected || token.selected_chain)
+                                    && interaction_token_requires_overlay(token)
                             })
                             .count(),
                     );
@@ -2361,7 +2374,7 @@ impl AlignmentGpuRenderer {
                 if !request.interaction.is_empty() {
                     for primitive in page.primitives() {
                         let token = request.interaction.token(primitive.handle);
-                        if !token.hovered && !token.selected && !token.selected_chain {
+                        if !interaction_token_requires_overlay(token) {
                             continue;
                         }
                         if let Some(instance) = pack_primitive(
@@ -3723,7 +3736,10 @@ fn color_for(primitive: AlignmentSemanticPrimitive) -> [f32; 4] {
 
 fn style_color(style: AlignmentStyleToken) -> [f32; 4] {
     match style.body {
-        AlignmentBodyColorToken::Neutral => [0.38, 0.48, 0.64, 1.0],
+        // Keep ordinary reads visually quiet. Interaction is applied independently below, so
+        // hover and selection still receive RGV's blue emphasis without making every unselected
+        // record look active.
+        AlignmentBodyColorToken::Neutral => [0.73, 0.73, 0.73, 1.0],
         AlignmentBodyColorToken::Strand { reverse: false } => [0.30, 0.50, 0.78, 1.0],
         AlignmentBodyColorToken::Strand { reverse: true } => [0.78, 0.34, 0.38, 1.0],
         AlignmentBodyColorToken::MappingQuality(quality) => {
@@ -3757,6 +3773,12 @@ fn style_color(style: AlignmentStyleToken) -> [f32; 4] {
     }
 }
 
+const fn interaction_token_requires_overlay(
+    token: rgv_alignment_scene::AlignmentInteractionToken,
+) -> bool {
+    token.hovered || token.selected || token.selected_chain || token.highlighted
+}
+
 fn interaction_color(
     mut color: [f32; 4],
     token: rgv_alignment_scene::AlignmentInteractionToken,
@@ -3767,6 +3789,8 @@ fn interaction_color(
         ([0.28, 0.52, 0.94], 0.32)
     } else if token.selected_chain {
         ([0.90, 0.62, 0.16], 0.38)
+    } else if token.highlighted {
+        ([0.96, 0.70, 0.12], 0.46)
     } else {
         return color;
     };
@@ -4689,6 +4713,40 @@ mod tests {
         assert_eq!(base.row_offset, overlay.row_offset);
         assert_eq!(base.shape, overlay.shape);
         assert_ne!(base.color, overlay.color);
+    }
+
+    #[test]
+    fn neutral_hover_selection_and_highlight_have_distinct_read_colours() {
+        let mut semantic = primitive(AlignmentComponent::ReadSpan);
+        semantic.style.body = AlignmentBodyColorToken::Neutral;
+        let neutral = style_color(semantic.style);
+        assert_eq!(neutral, [0.73, 0.73, 0.73, 1.0]);
+        let hovered = interaction_color(
+            neutral,
+            rgv_alignment_scene::AlignmentInteractionToken {
+                hovered: true,
+                ..rgv_alignment_scene::AlignmentInteractionToken::default()
+            },
+        );
+        let selected = interaction_color(
+            neutral,
+            rgv_alignment_scene::AlignmentInteractionToken {
+                selected: true,
+                ..rgv_alignment_scene::AlignmentInteractionToken::default()
+            },
+        );
+        let highlighted = interaction_color(
+            neutral,
+            rgv_alignment_scene::AlignmentInteractionToken {
+                highlighted: true,
+                ..rgv_alignment_scene::AlignmentInteractionToken::default()
+            },
+        );
+        assert_ne!(neutral, hovered);
+        assert_ne!(hovered, selected);
+        assert_ne!(selected, highlighted);
+        assert!(selected[2] > selected[0]);
+        assert!(highlighted[0] > highlighted[2]);
     }
 
     #[test]
@@ -5655,6 +5713,83 @@ mod tests {
                 reason: AlignmentGpuContentReplacementReason::DeviceGeneration { .. }
             })
         ));
+    }
+
+    #[test]
+    fn predicate_highlight_generates_a_real_gpu_overlay_frame() {
+        let Some((device, queue)) = headless_device() else {
+            return;
+        };
+        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+        let scene = test_scene_with_page_shape(
+            &ledger,
+            NonZeroU64::new(20).unwrap(),
+            8,
+            NonZeroU32::new(2).unwrap(),
+        );
+        let highlighted_handles = scene
+            .pages()
+            .iter()
+            .flat_map(|page| page.primitives())
+            .filter(|primitive| !matches!(primitive.component, AlignmentComponent::Label { .. }))
+            .map(|primitive| primitive.handle)
+            .collect::<BTreeSet<_>>();
+        assert!(highlighted_handles.len() > ORDINARY_INTERACTION_HANDLES);
+        let interaction = AlignmentInteractionState::default()
+            .with_highlighted(highlighted_handles.iter().copied());
+        let clip = rgv_alignment_scene::CpuClipRect {
+            x: 0.0,
+            y: 0.0,
+            width: 256.0,
+            height: 128.0,
+        };
+        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
+        let request = AlignmentGpuSceneRequest {
+            scene: &scene,
+            camera_sequence: 1,
+            camera,
+            screen_size_points: [256.0, 128.0],
+            scissor: AlignmentGpuScissor {
+                x: 0,
+                y: 0,
+                width: 256,
+                height: 128,
+            },
+            interaction: &interaction,
+        };
+        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let (frame, stats, _) = publish_bundled_frame(
+            &device,
+            &queue,
+            &mut renderer,
+            &[request],
+            &ledger,
+            None,
+            760,
+            860,
+        );
+
+        assert!(stats.overlay_instances > 0);
+        assert!(
+            frame
+                .draws
+                .iter()
+                .any(|draw| !draw.overlay_range.is_empty())
+        );
+        let visible_rows = camera.visible_rows();
+        let full_highlight_envelope = scene
+            .camera_page_envelope(
+                scene.prepared_interval().len(),
+                visible_rows.end.saturating_sub(visible_rows.start),
+            )
+            .saturating_mul(scene.maximum_non_label_primitives_per_page());
+        assert!(
+            renderer
+                .frame_buffers
+                .iter()
+                .all(|slot| slot.overlay_capacity >= full_highlight_envelope)
+        );
+        render_test_frame(&device, &queue, &renderer, &frame).unwrap();
     }
 
     #[test]

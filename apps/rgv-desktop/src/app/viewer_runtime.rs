@@ -715,6 +715,7 @@ impl Viewer {
             captured_motion: (0.0, 0.0),
             captured_motion_distance: 0.0,
             suppress_horizontal_overview_click: false,
+            alignment_context_menu: None,
         };
         if start_diagnostic_trace && (viewer.synthetic || viewer.alignment_tracks.is_empty()) {
             viewer.manual_diagnostic_trace_autostart_pending = false;

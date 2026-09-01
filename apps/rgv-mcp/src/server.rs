@@ -2,16 +2,19 @@ use std::path::Path;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rgv_core::{
-    AUTOMATION_SCHEMA_VERSION, AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection,
-    AlignmentSortMode, AutomationAlignmentRelationship, AutomationAlignmentReveal,
-    AutomationAlignmentSelector, AutomationAlignmentState, AutomationBatch, AutomationCommand,
-    AutomationCommandStatus, AutomationExportKind, AutomationHistoryNavigation,
-    AutomationInteractionTrace, AutomationNavigationDestination, AutomationReviewNavigation,
-    AutomationRunReport, AutomationSelection, AutomationSelectionGranularity, AutomationSetting,
-    AutomationSnapshotFormat, AutomationSnapshotScope, AutomationUnsavedChangesPolicy,
-    AutomationViewportOperation, AutomationWorkspaceSnapshot, CoverageScaleTransform,
-    ModifiedBaseColorMode, OverlappingMatePolicy, PanelId, PresentationNodeId, ReadBaseDisplayMode,
-    TrackChannel, TrackId, TrackKind, TrackSource,
+    AUTOMATION_SCHEMA_VERSION, AlignmentAuxComparison, AlignmentAuxFilterValue,
+    AlignmentCigarEventPredicate, AlignmentColorMode, AlignmentFlagPredicate, AlignmentGroupMode,
+    AlignmentOrderDirection, AlignmentPredicateExpression, AlignmentPredicateScope,
+    AlignmentSortMode, AlignmentViewPredicate, AutomationAlignmentRelationship,
+    AutomationAlignmentReveal, AutomationAlignmentSelector, AutomationAlignmentState,
+    AutomationBatch, AutomationCommand, AutomationCommandStatus, AutomationExportKind,
+    AutomationHistoryNavigation, AutomationInteractionTrace, AutomationNavigationDestination,
+    AutomationReviewNavigation, AutomationRunReport, AutomationSelection,
+    AutomationSelectionGranularity, AutomationSetting, AutomationSnapshotFormat,
+    AutomationSnapshotScope, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
+    AutomationWorkspaceSnapshot, CoverageScaleTransform, ModifiedBaseColorMode,
+    OverlappingMatePolicy, PanelId, PresentationNodeId, ReadBaseDisplayMode, TrackChannel, TrackId,
+    TrackKind, TrackSource,
 };
 use rmcp::schemars;
 use rmcp::{
@@ -624,6 +627,7 @@ impl RgvMcpServer {
                 mode,
                 direction: args.direction.into_core(),
                 tag,
+                anchor_position: args.anchor_position,
             }],
             args.wait_until_settled,
             args.timeout_millis,
@@ -654,6 +658,7 @@ impl RgvMcpServer {
                 mode,
                 direction: args.direction.into_core(),
                 tag,
+                anchor_position: args.anchor_position,
             }],
             args.wait_until_settled,
             args.timeout_millis,
@@ -1499,6 +1504,238 @@ impl ToolPresentationNode {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum ToolAlignmentPredicateScope {
+    #[default]
+    Anywhere,
+    Position {
+        contig: String,
+        position: u64,
+    },
+    Interval {
+        contig: String,
+        start: u64,
+        end: u64,
+    },
+}
+
+impl ToolAlignmentPredicateScope {
+    fn into_core(self) -> AlignmentPredicateScope {
+        match self {
+            Self::Anywhere => AlignmentPredicateScope::Anywhere,
+            Self::Position { contig, position } => {
+                AlignmentPredicateScope::Position { contig, position }
+            }
+            Self::Interval { contig, start, end } => {
+                AlignmentPredicateScope::Interval { contig, start, end }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAlignmentFlagPredicate {
+    Duplicate,
+    Secondary,
+    Supplementary,
+    FailedQualityControl,
+    Paired,
+    ProperPair,
+    MateMapped,
+    ReverseStrand,
+}
+
+impl ToolAlignmentFlagPredicate {
+    const fn into_core(self) -> AlignmentFlagPredicate {
+        match self {
+            Self::Duplicate => AlignmentFlagPredicate::Duplicate,
+            Self::Secondary => AlignmentFlagPredicate::Secondary,
+            Self::Supplementary => AlignmentFlagPredicate::Supplementary,
+            Self::FailedQualityControl => AlignmentFlagPredicate::FailedQualityControl,
+            Self::Paired => AlignmentFlagPredicate::Paired,
+            Self::ProperPair => AlignmentFlagPredicate::ProperPair,
+            Self::MateMapped => AlignmentFlagPredicate::MateMapped,
+            Self::ReverseStrand => AlignmentFlagPredicate::ReverseStrand,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAlignmentCigarEventPredicate {
+    Insertion,
+    Deletion,
+    Indel,
+    SoftClip,
+    HardClip,
+    ReferenceSkip,
+}
+
+impl ToolAlignmentCigarEventPredicate {
+    const fn into_core(self) -> AlignmentCigarEventPredicate {
+        match self {
+            Self::Insertion => AlignmentCigarEventPredicate::Insertion,
+            Self::Deletion => AlignmentCigarEventPredicate::Deletion,
+            Self::Indel => AlignmentCigarEventPredicate::Indel,
+            Self::SoftClip => AlignmentCigarEventPredicate::SoftClip,
+            Self::HardClip => AlignmentCigarEventPredicate::HardClip,
+            Self::ReferenceSkip => AlignmentCigarEventPredicate::ReferenceSkip,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAlignmentAuxComparison {
+    Exists,
+    Equal,
+    NotEqual,
+    Greater,
+    GreaterOrEqual,
+    Less,
+    LessOrEqual,
+}
+
+impl ToolAlignmentAuxComparison {
+    const fn into_core(self) -> AlignmentAuxComparison {
+        match self {
+            Self::Exists => AlignmentAuxComparison::Exists,
+            Self::Equal => AlignmentAuxComparison::Equal,
+            Self::NotEqual => AlignmentAuxComparison::NotEqual,
+            Self::Greater => AlignmentAuxComparison::Greater,
+            Self::GreaterOrEqual => AlignmentAuxComparison::GreaterOrEqual,
+            Self::Less => AlignmentAuxComparison::Less,
+            Self::LessOrEqual => AlignmentAuxComparison::LessOrEqual,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum ToolAlignmentAuxValue {
+    Integer(i64),
+    Float(f64),
+    String(String),
+}
+
+impl ToolAlignmentAuxValue {
+    fn into_core(self) -> AlignmentAuxFilterValue {
+        match self {
+            Self::Integer(value) => AlignmentAuxFilterValue::Integer(value),
+            Self::Float(value) => AlignmentAuxFilterValue::FloatBits(value.to_bits()),
+            Self::String(value) => AlignmentAuxFilterValue::String(value),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(tag = "predicate", rename_all = "snake_case")]
+pub enum ToolAlignmentPredicate {
+    MappingQuality {
+        minimum: Option<u8>,
+        maximum: Option<u8>,
+    },
+    Flag {
+        flag: ToolAlignmentFlagPredicate,
+        expected: bool,
+    },
+    TemplateLength {
+        minimum: Option<u64>,
+        maximum: Option<u64>,
+    },
+    MateContig {
+        contig: String,
+    },
+    Auxiliary {
+        #[schemars(length(min = 2, max = 2))]
+        #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
+        tag: String,
+        comparison: ToolAlignmentAuxComparison,
+        value: Option<ToolAlignmentAuxValue>,
+    },
+    CigarEvent {
+        event: ToolAlignmentCigarEventPredicate,
+        #[serde(default)]
+        scope: ToolAlignmentPredicateScope,
+        minimum_length: Option<u32>,
+        maximum_length: Option<u32>,
+    },
+    AlignedLength {
+        minimum: Option<u64>,
+        maximum: Option<u64>,
+    },
+    Substitution {
+        #[serde(default)]
+        scope: ToolAlignmentPredicateScope,
+        observed_base: Option<char>,
+        minimum_count: Option<u32>,
+        maximum_count: Option<u32>,
+    },
+}
+
+impl ToolAlignmentPredicate {
+    fn into_core(self) -> AlignmentViewPredicate {
+        match self {
+            Self::MappingQuality { minimum, maximum } => {
+                AlignmentViewPredicate::MappingQuality { minimum, maximum }
+            }
+            Self::Flag { flag, expected } => AlignmentViewPredicate::Flag {
+                flag: flag.into_core(),
+                expected,
+            },
+            Self::TemplateLength { minimum, maximum } => {
+                AlignmentViewPredicate::TemplateLength { minimum, maximum }
+            }
+            Self::MateContig { contig } => AlignmentViewPredicate::MateContig { contig },
+            Self::Auxiliary {
+                tag,
+                comparison,
+                value,
+            } => {
+                let bytes = tag.as_bytes();
+                AlignmentViewPredicate::Auxiliary {
+                    tag: [
+                        bytes.first().copied().unwrap_or_default(),
+                        bytes.get(1).copied().unwrap_or_default(),
+                    ],
+                    comparison: comparison.into_core(),
+                    value: value.map(ToolAlignmentAuxValue::into_core),
+                }
+            }
+            Self::CigarEvent {
+                event,
+                scope,
+                minimum_length,
+                maximum_length,
+            } => AlignmentViewPredicate::CigarEvent {
+                event: event.into_core(),
+                scope: scope.into_core(),
+                minimum_length,
+                maximum_length,
+            },
+            Self::AlignedLength { minimum, maximum } => {
+                AlignmentViewPredicate::AlignedLength { minimum, maximum }
+            }
+            Self::Substitution {
+                scope,
+                observed_base,
+                minimum_count,
+                maximum_count,
+            } => AlignmentViewPredicate::Substitution {
+                scope: scope.into_core(),
+                // Preserve an invalid non-ASCII request as an invalid byte so the canonical
+                // automation validator rejects it; never reinterpret it as the omitted/"any"
+                // base case.
+                observed_base: observed_base.map(|base| u8::try_from(base).unwrap_or_default()),
+                minimum_count,
+                maximum_count,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "setting", rename_all = "snake_case")]
 pub enum ToolSetting {
@@ -1551,6 +1788,18 @@ pub enum ToolSetting {
         #[schemars(length(min = 2, max = 2))]
         #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
         tag: String,
+    },
+    AlignmentViewFilter {
+        #[schemars(length(min = 1, max = 1024))]
+        track_ids: Vec<u64>,
+        #[schemars(length(max = 64))]
+        predicates: Vec<ToolAlignmentPredicate>,
+    },
+    AlignmentHighlightFilter {
+        #[schemars(length(min = 1, max = 1024))]
+        track_ids: Vec<u64>,
+        #[schemars(length(max = 64))]
+        predicates: Vec<ToolAlignmentPredicate>,
     },
     AlignmentDensity {
         #[schemars(range(min = 0.25, max = 4.0))]
@@ -1714,6 +1963,32 @@ impl ToolSetting {
                     value: AlignmentColorMode::Tag(tag),
                 }
             }
+            Self::AlignmentViewFilter {
+                track_ids: ids,
+                predicates,
+            } => AutomationSetting::AlignmentViewFilter {
+                track_ids: track_ids(&ids),
+                value: AlignmentPredicateExpression {
+                    version: 1,
+                    all: predicates
+                        .into_iter()
+                        .map(ToolAlignmentPredicate::into_core)
+                        .collect(),
+                },
+            },
+            Self::AlignmentHighlightFilter {
+                track_ids: ids,
+                predicates,
+            } => AutomationSetting::AlignmentHighlightFilter {
+                track_ids: track_ids(&ids),
+                value: AlignmentPredicateExpression {
+                    version: 1,
+                    all: predicates
+                        .into_iter()
+                        .map(ToolAlignmentPredicate::into_core)
+                        .collect(),
+                },
+            },
             Self::AlignmentDensity { value } => AutomationSetting::AlignmentDensity { value },
             Self::IncludeSecondary { value } => AutomationSetting::IncludeSecondary { value },
             Self::IncludeSupplementary { value } => {
@@ -1938,6 +2213,9 @@ pub struct GroupArgs {
     pub direction: ToolDirection,
     #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
     pub tag: Option<String>,
+    /// Zero-based fixed genomic position for base/insertion grouping. Defaults to the current
+    /// viewport centre when a position-aware mode is selected.
+    pub anchor_position: Option<u64>,
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
     #[serde(default = "default_timeout")]
@@ -1961,6 +2239,8 @@ pub enum ToolGroupMode {
     MateContig,
     ReadOrder,
     FirstOfPairStrand,
+    Base,
+    Insertion,
     Tag,
 }
 
@@ -1980,6 +2260,8 @@ impl ToolGroupMode {
             Self::MateContig => AlignmentGroupMode::MateContig,
             Self::ReadOrder => AlignmentGroupMode::ReadOrder,
             Self::FirstOfPairStrand => AlignmentGroupMode::FirstOfPairStrand,
+            Self::Base => AlignmentGroupMode::Base,
+            Self::Insertion => AlignmentGroupMode::Insertion,
             Self::Tag => {
                 let tag = valid_tag(tag?)?;
                 return Some((AlignmentGroupMode::None, Some(tag)));
@@ -1998,6 +2280,9 @@ pub struct SortArgs {
     pub direction: ToolDirection,
     #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
     pub tag: Option<String>,
+    /// Zero-based fixed genomic position for base sorting. Defaults to the current viewport
+    /// centre when base sorting is selected.
+    pub anchor_position: Option<u64>,
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
     #[serde(default = "default_timeout")]
@@ -2435,6 +2720,8 @@ pub struct ExportArgs {
 #[serde(rename_all = "snake_case")]
 pub enum ToolExportKind {
     Alignments,
+    FilteredAlignments,
+    EligibleAlignments,
     Pileup,
     SelectedEvidence,
     Modifications,
@@ -2449,6 +2736,8 @@ impl ToolExportKind {
     fn into_core(self) -> AutomationExportKind {
         match self {
             Self::Alignments => AutomationExportKind::Alignments,
+            Self::FilteredAlignments => AutomationExportKind::FilteredAlignments,
+            Self::EligibleAlignments => AutomationExportKind::EligibleAlignments,
             Self::Pileup => AutomationExportKind::Pileup,
             Self::SelectedEvidence => AutomationExportKind::SelectedEvidence,
             Self::Modifications => AutomationExportKind::Modifications,
@@ -2675,15 +2964,13 @@ mod tests {
         );
         assert!(tools.iter().all(|tool| tool.annotations.is_some()));
         assert!(tools.iter().all(|tool| tool.description.is_some()));
-        let configure_schema = serde_json::to_string(
-            tools
-                .iter()
-                .find(|tool| tool.name == "rgv_configure")
-                .unwrap()
-                .input_schema
-                .as_ref(),
-        )
-        .unwrap();
+        let configure_input_schema = tools
+            .iter()
+            .find(|tool| tool.name == "rgv_configure")
+            .unwrap()
+            .input_schema
+            .as_ref();
+        let configure_schema = serde_json::to_string(configure_input_schema).unwrap();
         assert!(configure_schema.contains("show_reference"));
         assert!(configure_schema.contains("window_size"));
         assert!(configure_schema.contains("interface_scale_percent"));
@@ -2700,8 +2987,12 @@ mod tests {
         assert!(configure_schema.contains("alignment_color_mode"));
         assert!(configure_schema.contains("read_base_display_mode"));
         assert!(configure_schema.contains("^[A-Za-z][A-Za-z0-9]$"));
-        assert!(!configure_schema.contains("\"scope\""));
-        assert!(!configure_schema.contains("\"key\""));
+        let configure_properties = configure_input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("configure input schema should expose its top-level properties");
+        assert!(!configure_properties.contains_key("scope"));
+        assert!(!configure_properties.contains_key("key"));
         let viewport_schema = serde_json::to_string(
             tools
                 .iter()

@@ -160,11 +160,13 @@ pub(crate) fn alignment_scene_pressure_preserves_visible_epoch(
 pub(crate) enum AlignmentSceneFrameSettlement {
     Settled,
     SettledWithReferencePending,
+    WaitingForReference,
     WaitingForScene,
 }
 
 pub(crate) fn alignment_scene_frame_settlement(
     frame: &AlignmentCoordinatorFrame,
+    reference_blocks_core_scene: bool,
 ) -> AlignmentSceneFrameSettlement {
     if frame.individual_reads_refused_for_camera() {
         AlignmentSceneFrameSettlement::Settled
@@ -175,11 +177,16 @@ pub(crate) fn alignment_scene_frame_settlement(
         )
     {
         AlignmentSceneFrameSettlement::SettledWithReferencePending
-    } else if matches!(
-        frame.reference_requirement,
-        AlignmentReferenceRequirement::Pending { .. }
-    ) {
-        AlignmentSceneFrameSettlement::WaitingForScene
+    } else if reference_blocks_core_scene
+        && matches!(
+            frame.reference_requirement,
+            AlignmentReferenceRequirement::Pending { .. }
+        )
+    {
+        // The reference is optional only after the core scene is already visible-complete. When
+        // the same pending authority blocks completeness (for example an Anywhere substitution
+        // filter), FASTA acquisition owns forward progress and must be scheduled explicitly.
+        AlignmentSceneFrameSettlement::WaitingForReference
     } else if frame.visible_complete() {
         AlignmentSceneFrameSettlement::Settled
     } else {
@@ -1532,9 +1539,17 @@ impl Viewer {
                             .iter_mut()
                             .flat_map(|track| track.projections.values_mut())
                         {
-                            projection.navigation.observe_reference_failure(
-                                "reference source failed; core alignment navigation remains independent",
-                            );
+                            if projection.navigation.phase()
+                                == AlignmentNavigationPhase::WaitingForReference
+                            {
+                                projection.settle_failed(
+                                    "reference source failed while evaluating the alignment view filter",
+                                );
+                            } else {
+                                projection.navigation.observe_reference_failure(
+                                    "reference source failed; core alignment navigation remains independent",
+                                );
+                            }
                         }
                     }
                     let current = query.is_none_or(|query| {
@@ -1587,14 +1602,23 @@ impl Viewer {
                                             )
                                     });
                                 if matching_current_requirement {
-                                    // A terminal FASTA dependency failure is not an alignment
-                                    // navigation transition. Keep the core scene transaction in
-                                    // its existing candidate/committed phase and record the
-                                    // optional-product failure on the panel only.
-                                    projection.finish_checking();
-                                    projection.navigation.observe_reference_failure(
-                                        "reference query failed; core alignment navigation remains independent",
-                                    );
+                                    if projection.navigation.phase()
+                                        == AlignmentNavigationPhase::WaitingForReference
+                                    {
+                                        // Reference interpretation is optional for an already
+                                        // complete scene, but it is a mandatory dependency of a
+                                        // reference-backed view filter. Settle that exact request
+                                        // truthfully instead of leaving it ownerless or showing
+                                        // rows evaluated under the previous filter.
+                                        projection.settle_failed(
+                                            "reference query failed while evaluating the alignment view filter",
+                                        );
+                                    } else {
+                                        projection.finish_checking();
+                                        projection.navigation.observe_reference_failure(
+                                            "reference query failed; core alignment navigation remains independent",
+                                        );
+                                    }
                                     if let Some(owner) = projection.scene_owner {
                                         failed_owners.push(owner);
                                     }
@@ -1682,6 +1706,7 @@ impl Viewer {
         let mut rebuild_display = false;
         let mut prepare_frame = false;
         let mut reference_panels_to_request = BTreeSet::new();
+        let mut ownerless_progress_frames = Vec::new();
         for (track_id, event) in events {
             let Some(track_index) = self
                 .alignment_tracks
@@ -1751,7 +1776,7 @@ impl Viewer {
                     let projection = track.projection_mut(panel_id);
                     if !projection
                         .navigation
-                        .event_is_current(request_token, frame.camera)
+                        .worker_frame_is_admissible(request_token, frame.camera)
                     {
                         self.navigation_stale_result_rejections =
                             self.navigation_stale_result_rejections.saturating_add(1);
@@ -1781,7 +1806,12 @@ impl Viewer {
                         projection.unavailable = None;
                         projection.index_only_overview = false;
                         projection.navigation.observe_frame_products(&frame);
-                        let settlement = alignment_scene_frame_settlement(&frame);
+                        let reference_blocks_core_scene = projection
+                            .scene_contract
+                            .as_ref()
+                            .is_some_and(|contract| contract.view_filter.requires_reference());
+                        let settlement =
+                            alignment_scene_frame_settlement(&frame, reference_blocks_core_scene);
                         if settlement != AlignmentSceneFrameSettlement::WaitingForScene {
                             projection.scene_pressure_retry = None;
                         }
@@ -1815,6 +1845,21 @@ impl Viewer {
                                     );
                                 }
                             }
+                            AlignmentSceneFrameSettlement::WaitingForReference => {
+                                // A reference-backed view filter cannot produce a truthful row
+                                // atlas or semantic scene until the exact FASTA authority arrives.
+                                // Transfer navigation ownership away from the now-idle alignment
+                                // source and queue the panel's current reference requirement.
+                                reference_panels_to_request.insert(panel_id);
+                                if projection.navigation.phase()
+                                    != AlignmentNavigationPhase::WaitingForReference
+                                {
+                                    projection.navigation.transition(
+                                        AlignmentNavigationPhase::WaitingForReference,
+                                        "reference authority is required to evaluate the alignment view filter",
+                                    );
+                                }
+                            }
                             AlignmentSceneFrameSettlement::WaitingForScene => {
                                 if projection.navigation.phase()
                                     != AlignmentNavigationPhase::Running
@@ -1824,16 +1869,18 @@ impl Viewer {
                                         "source or row-presentation work is active",
                                     );
                                 }
-                                if projection.navigation.fail_if_source_owner_is_idle(
-                                    work.source_pending,
-                                    work.presentation_pending,
-                                ) {
-                                    projection.finish_checking();
-                                    projection.unavailable = Some(
-                                        "Internal liveness failure: the alignment worker became idle before completing this target"
-                                            .to_owned(),
-                                    );
-                                    rebuild_display = true;
+                                ownerless_progress_frames.retain(
+                                    |(candidate_track, candidate_panel, _, _)| {
+                                        *candidate_track != track_id || *candidate_panel != panel_id
+                                    },
+                                );
+                                if !work.source_pending && !work.presentation_pending {
+                                    ownerless_progress_frames.push((
+                                        track_id,
+                                        panel_id,
+                                        request_token,
+                                        frame.camera,
+                                    ));
                                 }
                             }
                         }
@@ -2316,6 +2363,43 @@ impl Viewer {
                 | AlignmentSceneEngineEvent::LaneRemoved { .. }
                 | AlignmentSceneEngineEvent::PresentationPrewarmed { .. }
                 | AlignmentSceneEngineEvent::SourceControlQueued => {}
+            }
+        }
+
+        // Error and progress events can already coexist in one drained mailbox batch. Defer the
+        // ownerless-worker invariant until every event has had a chance to settle the request;
+        // otherwise an earlier progress frame can replace the real terminal error with a
+        // synthetic liveness failure. A later frame for the same lane supersedes the candidate
+        // above, and a terminal event makes it inadmissible here.
+        for (track_id, panel_id, request_token, camera) in ownerless_progress_frames {
+            let Some(track_index) = self
+                .alignment_tracks
+                .iter()
+                .position(|track| track.config.id == track_id)
+            else {
+                continue;
+            };
+            let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+            if !projection
+                .navigation
+                .worker_frame_is_admissible(request_token, camera)
+            {
+                continue;
+            }
+            if projection
+                .navigation
+                .fail_if_source_owner_is_idle(false, false)
+            {
+                projection.finish_checking();
+                projection.unavailable = Some(
+                    "Internal liveness failure: the alignment worker became idle before completing this target"
+                        .to_owned(),
+                );
+                if Some(track_id) == primary_id && panel_id == active_panel_id {
+                    "Internal liveness failure: the alignment worker became idle before completing this target"
+                        .clone_into(&mut self.data_status);
+                }
+                rebuild_display = true;
             }
         }
 

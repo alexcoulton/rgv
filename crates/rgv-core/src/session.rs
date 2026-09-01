@@ -399,6 +399,8 @@ pub enum AlignmentGroupMode {
     MateContig,
     ReadOrder,
     FirstOfPairStrand,
+    Base,
+    Insertion,
     Tag([u8; 2]),
 }
 
@@ -431,6 +433,144 @@ pub enum AlignmentSortMode {
     ReadOrder,
     Base,
     Tag([u8; 2]),
+}
+
+/// Versioned logical AND of alignment predicates. Keeping the expression wrapper in the session
+/// schema lets future versions add OR/NOT nodes without reinterpreting today's flat list.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AlignmentPredicateExpression {
+    #[serde(default = "default_alignment_predicate_version")]
+    pub version: u16,
+    #[serde(default)]
+    pub all: Vec<AlignmentViewPredicate>,
+}
+
+impl Default for AlignmentPredicateExpression {
+    fn default() -> Self {
+        Self {
+            version: default_alignment_predicate_version(),
+            all: Vec::new(),
+        }
+    }
+}
+
+const fn default_alignment_predicate_version() -> u16 {
+    1
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum AlignmentPredicateScope {
+    Anywhere,
+    Position {
+        contig: String,
+        position: u64,
+    },
+    Interval {
+        contig: String,
+        start: u64,
+        end: u64,
+    },
+}
+
+impl Default for AlignmentPredicateScope {
+    fn default() -> Self {
+        Self::Anywhere
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlignmentFlagPredicate {
+    Duplicate,
+    Secondary,
+    Supplementary,
+    FailedQualityControl,
+    Paired,
+    ProperPair,
+    MateMapped,
+    ReverseStrand,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlignmentCigarEventPredicate {
+    Insertion,
+    Deletion,
+    Indel,
+    SoftClip,
+    HardClip,
+    ReferenceSkip,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlignmentAuxComparison {
+    Exists,
+    Equal,
+    NotEqual,
+    Greater,
+    GreaterOrEqual,
+    Less,
+    LessOrEqual,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum AlignmentAuxFilterValue {
+    Integer(i64),
+    FloatBits(u64),
+    String(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "predicate", rename_all = "snake_case")]
+pub enum AlignmentViewPredicate {
+    MappingQuality {
+        minimum: Option<u8>,
+        maximum: Option<u8>,
+    },
+    Flag {
+        flag: AlignmentFlagPredicate,
+        expected: bool,
+    },
+    TemplateLength {
+        minimum: Option<u64>,
+        maximum: Option<u64>,
+    },
+    MateContig {
+        contig: String,
+    },
+    Auxiliary {
+        tag: [u8; 2],
+        comparison: AlignmentAuxComparison,
+        value: Option<AlignmentAuxFilterValue>,
+    },
+    CigarEvent {
+        event: AlignmentCigarEventPredicate,
+        #[serde(default)]
+        scope: AlignmentPredicateScope,
+        minimum_length: Option<u32>,
+        maximum_length: Option<u32>,
+    },
+    AlignedLength {
+        minimum: Option<u64>,
+        maximum: Option<u64>,
+    },
+    Substitution {
+        #[serde(default)]
+        scope: AlignmentPredicateScope,
+        observed_base: Option<u8>,
+        minimum_count: Option<u32>,
+        maximum_count: Option<u32>,
+    },
+}
+
+impl AlignmentViewPredicate {
+    #[must_use]
+    pub const fn requires_reference(&self) -> bool {
+        matches!(self, Self::Substitution { .. })
+    }
 }
 
 /// Controls whether alignment rows preserve navigation history or are packed
@@ -558,6 +698,13 @@ pub struct SessionFilters {
     pub include_secondary: bool,
     pub include_supplementary: bool,
     pub auxiliary_predicates: Vec<String>,
+    /// Additional typed retained-evidence predicates. Legacy MAPQ/flag/tag fields above are
+    /// migrated into the same runtime expression and remain serialized for project compatibility.
+    #[serde(default)]
+    pub alignment_view_filter: AlignmentPredicateExpression,
+    /// Uses the same predicate vocabulary without changing evidence membership or summaries.
+    #[serde(default)]
+    pub alignment_highlight_filter: AlignmentPredicateExpression,
 }
 
 impl Default for SessionFilters {
@@ -606,6 +753,8 @@ impl Default for SessionFilters {
             include_secondary: false,
             include_supplementary: true,
             auxiliary_predicates: Vec::new(),
+            alignment_view_filter: AlignmentPredicateExpression::default(),
+            alignment_highlight_filter: AlignmentPredicateExpression::default(),
         }
     }
 }
@@ -2628,7 +2777,97 @@ fn validate_filters(filters: &SessionFilters) -> Result<(), SessionError> {
     {
         return Err(SessionError::InvalidModificationCodes);
     }
+    validate_alignment_predicate_expression(&filters.alignment_view_filter)?;
+    validate_alignment_predicate_expression(&filters.alignment_highlight_filter)?;
     Ok(())
+}
+
+pub(crate) fn validate_alignment_predicate_expression(
+    expression: &AlignmentPredicateExpression,
+) -> Result<(), SessionError> {
+    const MAXIMUM_PREDICATES: usize = 64;
+    const MAXIMUM_CONTIG_NAME_BYTES: usize = 1_024;
+    if expression.version != 1 || expression.all.len() > MAXIMUM_PREDICATES {
+        return Err(SessionError::InvalidAlignmentPredicate);
+    }
+    for predicate in &expression.all {
+        let valid = match predicate {
+            AlignmentViewPredicate::MappingQuality { minimum, maximum } => minimum
+                .zip(*maximum)
+                .is_none_or(|(minimum, maximum)| minimum <= maximum),
+            AlignmentViewPredicate::Flag { .. } => true,
+            AlignmentViewPredicate::TemplateLength { minimum, maximum }
+            | AlignmentViewPredicate::AlignedLength { minimum, maximum } => minimum
+                .zip(*maximum)
+                .is_none_or(|(minimum, maximum)| minimum <= maximum),
+            AlignmentViewPredicate::MateContig { contig } => {
+                !contig.is_empty() && contig.len() <= MAXIMUM_CONTIG_NAME_BYTES
+            }
+            AlignmentViewPredicate::Auxiliary {
+                tag,
+                comparison,
+                value,
+            } => {
+                tag[0].is_ascii_alphabetic()
+                    && tag[1].is_ascii_alphanumeric()
+                    && match comparison {
+                        AlignmentAuxComparison::Exists => value.is_none(),
+                        AlignmentAuxComparison::Equal
+                        | AlignmentAuxComparison::NotEqual
+                        | AlignmentAuxComparison::Greater
+                        | AlignmentAuxComparison::GreaterOrEqual
+                        | AlignmentAuxComparison::Less
+                        | AlignmentAuxComparison::LessOrEqual => value.is_some(),
+                    }
+                    && value.as_ref().is_none_or(|value| match value {
+                        AlignmentAuxFilterValue::FloatBits(bits) => {
+                            f64::from_bits(*bits).is_finite()
+                        }
+                        AlignmentAuxFilterValue::String(value) => value.len() <= 64 * 1_024,
+                        AlignmentAuxFilterValue::Integer(_) => true,
+                    })
+            }
+            AlignmentViewPredicate::CigarEvent {
+                scope,
+                minimum_length,
+                maximum_length,
+                ..
+            } => {
+                valid_alignment_predicate_scope(scope, MAXIMUM_CONTIG_NAME_BYTES)
+                    && minimum_length
+                        .zip(*maximum_length)
+                        .is_none_or(|(minimum, maximum)| minimum <= maximum)
+            }
+            AlignmentViewPredicate::Substitution {
+                scope,
+                observed_base,
+                minimum_count,
+                maximum_count,
+            } => {
+                valid_alignment_predicate_scope(scope, MAXIMUM_CONTIG_NAME_BYTES)
+                    && observed_base.is_none_or(|base| {
+                        matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'N')
+                    })
+                    && maximum_count.is_none_or(|maximum| minimum_count.unwrap_or(1) <= maximum)
+            }
+        };
+        if !valid {
+            return Err(SessionError::InvalidAlignmentPredicate);
+        }
+    }
+    Ok(())
+}
+
+fn valid_alignment_predicate_scope(scope: &AlignmentPredicateScope, max_name: usize) -> bool {
+    match scope {
+        AlignmentPredicateScope::Anywhere => true,
+        AlignmentPredicateScope::Position { contig, .. } => {
+            !contig.is_empty() && contig.len() <= max_name
+        }
+        AlignmentPredicateScope::Interval { contig, start, end } => {
+            !contig.is_empty() && contig.len() <= max_name && start < end
+        }
+    }
 }
 
 fn next_available_track_id(tracks: &[TrackConfig]) -> TrackId {
@@ -2703,6 +2942,8 @@ pub enum SessionError {
     InvalidTemplateLengthBounds,
     #[error("session hidden modification codes are invalid")]
     InvalidModificationCodes,
+    #[error("session alignment predicate expression is invalid or unsupported")]
+    InvalidAlignmentPredicate,
     #[error("session auxiliary track has an invalid name, height, or variant setting")]
     InvalidAuxiliaryTrack,
     #[error("could not import IGV session: {0}")]

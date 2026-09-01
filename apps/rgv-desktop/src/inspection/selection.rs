@@ -2,7 +2,7 @@ use super::super::*;
 use crate::display::primary_pinned_gene_id;
 
 impl Viewer {
-    fn visible_track_frame_at_screen_y(
+    pub(crate) fn visible_track_frame_at_screen_y(
         &self,
         screen_y: f32,
         predicate: impl Fn(&TrackFrame) -> bool,

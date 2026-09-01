@@ -936,6 +936,81 @@ mod tests {
         // valid scrollbar target while that cache catches up.
         assert_eq!(read_panel_allocation_at_y(&layout, 500.0), Some(track_id));
     }
+
+    #[test]
+    fn mate_panel_read_camera_is_independent_from_the_source_panel() {
+        let track_id = TrackId::new(81);
+        let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+        let viewport = Viewport::new(interval, 800.0).unwrap();
+        let mut source = ViewPanelController::new(
+            PanelId::new(1),
+            viewport,
+            Some("chr1:101-200".to_owned()),
+            "chr1".to_owned(),
+            10_000,
+        );
+        let mut mate = ViewPanelController::new(
+            PanelId::new(2),
+            viewport,
+            Some("chr1:101-200".to_owned()),
+            "chr1".to_owned(),
+            10_000,
+        );
+        source.read_panel_scrolls.insert(
+            track_id,
+            ReadPanelScrollState {
+                scroll_points: 420.0,
+                content_origin_points: 20.0,
+                latent_scroll_fraction: Some(0.4),
+                content_bottom_points: 1_600.0,
+                density: Some(2.0),
+                stable_row_anchor: None,
+                scene_contig: Some(ContigId::new(0)),
+            },
+        );
+        mate.read_panel_scrolls.insert(
+            track_id,
+            ReadPanelScrollState {
+                scroll_points: 35.0,
+                content_origin_points: 5.0,
+                latent_scroll_fraction: Some(0.1),
+                content_bottom_points: 340.0,
+                density: Some(1.0),
+                stable_row_anchor: None,
+                scene_contig: Some(ContigId::new(0)),
+            },
+        );
+
+        let mut workspace = PanelWorkspace::from_ordered(vec![source, mate], PanelId::new(2))
+            .expect("two independent panels are valid");
+        workspace
+            .active_mut()
+            .read_panel_scrolls
+            .get_mut(&track_id)
+            .unwrap()
+            .scroll_points = 210.0;
+
+        assert_eq!(
+            workspace.panels[0]
+                .read_panel_scroll_state(track_id)
+                .scroll_points,
+            420.0
+        );
+        assert_eq!(
+            workspace.panels[1]
+                .read_panel_scroll_state(track_id)
+                .scroll_points,
+            210.0
+        );
+        assert_ne!(
+            workspace.panels[0]
+                .read_panel_scroll_state(track_id)
+                .content_bottom_points,
+            workspace.panels[1]
+                .read_panel_scroll_state(track_id)
+                .content_bottom_points
+        );
+    }
 }
 
 impl ViewPanelController {

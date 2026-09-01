@@ -372,8 +372,15 @@ pub(crate) fn automation_alignments_export(
     contig: &str,
     interval: GenomicInterval,
     tracks: &[AutomationAlignmentExportTrack],
+    eligible: bool,
 ) -> Result<String> {
-    let mut output = automation_export_header("alignment", assembly, contig, interval);
+    let export_scope = if eligible { "eligible" } else { "filtered" };
+    let mut output = automation_export_header(
+        &format!("alignment ({export_scope} view)"),
+        assembly,
+        contig,
+        interval,
+    );
     if !push_automation_export_line(
         &mut output,
         "track_id\ttrack_name\tcontig\tstart\tend\tread_name\tflags\tmapq\tcigar\tmate_contig_id\tmate_start\ttemplate_length",
@@ -382,20 +389,44 @@ pub(crate) fn automation_alignments_export(
     }
     for track in tracks {
         let snapshot = &track.authority.snapshot;
-        let exported_records = snapshot.reads().evidence().select(interval)?.len();
+        let exported_records = if eligible {
+            snapshot.reads().evidence().select_eligible(interval)?.len()
+        } else {
+            snapshot.reads().evidence().select(interval)?.len()
+        };
         let prepared = snapshot.prepared_interval();
-        let provenance = snapshot.summaries().filter_provenance(prepared).ok();
+        let provenance = if eligible {
+            snapshot
+                .reads()
+                .evidence()
+                .eligible_coverage()
+                .exact_provenance(prepared)
+        } else {
+            snapshot.summaries().filter_provenance(prepared).ok()
+        };
+        let view_filter = snapshot.reads().evidence().view_filter();
+        let predicate_matches = view_filter
+            .predicate_matches()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let unavailable = || ".".to_owned();
         let _ = push_automation_export_line(
             &mut output,
             &format!(
-                "# track_provenance\t{}\t{}\tauthority=committed_scene\tread_presentation=complete\tcomplete_read_limit={}\tprepared_start={}\tprepared_end={}\texported_records={}\tfilter_provenance_exact={}\trecords_seen={}\trecords_eligible={}\tunmapped_ignored={}\tsecondary_filtered={}\tsupplementary_filtered={}\tuser_filtered={}",
+                "# track_provenance\t{}\t{}\tauthority=committed_scene\texport_scope={}\tread_presentation=complete\tcomplete_read_limit={}\tprepared_start={}\tprepared_end={}\texported_records={}\tfilter_fingerprint={}\tfilter_matching_records={}\tfilter_eligible_records={}\tpredicate_matches={}\tfilter_provenance_exact={}\trecords_seen={}\trecords_eligible={}\tunmapped_ignored={}\tsecondary_filtered={}\tsupplementary_filtered={}\tuser_filtered={}",
                 track.id.get(),
                 sanitized_tsv_field(&track.name, 4_096),
+                export_scope,
                 track.complete_read_limit,
                 prepared.start().saturating_add(1),
                 prepared.end(),
                 exported_records,
+                view_filter.fingerprint().get(),
+                view_filter.matching_records(),
+                view_filter.eligible_records(),
+                predicate_matches,
                 provenance.is_some(),
                 provenance.map_or_else(unavailable, |value| value.records_seen.to_string()),
                 provenance.map_or_else(
@@ -409,13 +440,20 @@ pub(crate) fn automation_alignments_export(
             ),
         );
         let mut output_complete = true;
-        snapshot.reads().for_each_full(interval, |exported| {
+        let mut visit = |exported: rgv_alignment_scene::AlignmentExportRecord| {
             output_complete = push_automation_export_line(
                 &mut output,
                 &automation_alignment_record_line(track, contig, &exported.record),
             );
             output_complete
-        })?;
+        };
+        if eligible {
+            snapshot
+                .reads()
+                .for_each_eligible_full(interval, &mut visit)?;
+        } else {
+            snapshot.reads().for_each_full(interval, &mut visit)?;
+        }
         if !output_complete {
             return Ok(output);
         }

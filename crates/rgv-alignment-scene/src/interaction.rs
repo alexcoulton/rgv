@@ -7,6 +7,7 @@ pub struct AlignmentInteractionToken {
     pub hovered: bool,
     pub selected: bool,
     pub selected_chain: bool,
+    pub highlighted: bool,
 }
 
 /// Camera- and page-independent interaction state keyed only by stable source handles.
@@ -15,6 +16,7 @@ pub struct AlignmentInteractionState {
     hovered: Option<AlignmentHandle>,
     selected: Option<AlignmentHandle>,
     selected_chain: Arc<[AlignmentHandle]>,
+    highlighted: Arc<[AlignmentHandle]>,
 }
 
 impl AlignmentInteractionState {
@@ -31,7 +33,20 @@ impl AlignmentInteractionState {
             hovered,
             selected,
             selected_chain: selected_chain.into(),
+            highlighted: Arc::from([]),
         }
+    }
+
+    #[must_use]
+    pub fn with_highlighted(
+        mut self,
+        highlighted: impl IntoIterator<Item = AlignmentHandle>,
+    ) -> Self {
+        let mut highlighted = highlighted.into_iter().collect::<Vec<_>>();
+        highlighted.sort_unstable();
+        highlighted.dedup();
+        self.highlighted = highlighted.into();
+        self
     }
 
     #[must_use]
@@ -50,8 +65,16 @@ impl AlignmentInteractionState {
     }
 
     #[must_use]
+    pub fn highlighted(&self) -> &[AlignmentHandle] {
+        &self.highlighted
+    }
+
+    #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.hovered.is_none() && self.selected.is_none() && self.selected_chain.is_empty()
+        self.hovered.is_none()
+            && self.selected.is_none()
+            && self.selected_chain.is_empty()
+            && self.highlighted.is_empty()
     }
 
     #[must_use]
@@ -60,6 +83,7 @@ impl AlignmentInteractionState {
             hovered: self.hovered == Some(handle),
             selected: self.selected == Some(handle),
             selected_chain: self.selected_chain.binary_search(&handle).is_ok(),
+            highlighted: self.highlighted.binary_search(&handle).is_ok(),
         }
     }
 }
@@ -94,6 +118,7 @@ mod tests {
                 hovered: true,
                 selected: false,
                 selected_chain: true,
+                highlighted: false,
             }
         );
     }

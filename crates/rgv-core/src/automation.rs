@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
-    CoverageScaleTransform, DetailLevel, ModifiedBaseColorMode, OverlappingMatePolicy, PanelId,
-    ReadBaseDisplayMode, ReadStackingMode, ReviewStatus, TrackId, TrackKind, TrackSource,
+    AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentPredicateExpression,
+    AlignmentSortMode, AlignmentViewPredicate, CoverageScaleTransform, DetailLevel,
+    ModifiedBaseColorMode, OverlappingMatePolicy, PanelId, ReadBaseDisplayMode, ReadStackingMode,
+    ReviewStatus, TrackId, TrackKind, TrackSource,
 };
 
 pub const AUTOMATION_SCHEMA_VERSION: u32 = 6;
@@ -162,6 +163,9 @@ pub enum AutomationCommand {
         direction: AlignmentOrderDirection,
         #[serde(default)]
         tag: Option<String>,
+        /// Fixed zero-based genomic anchor for position-aware grouping modes.
+        #[serde(default)]
+        anchor_position: Option<u64>,
     },
     Sort {
         track_ids: Vec<TrackId>,
@@ -170,6 +174,9 @@ pub enum AutomationCommand {
         direction: AlignmentOrderDirection,
         #[serde(default)]
         tag: Option<String>,
+        /// Fixed zero-based genomic anchor for base sorting.
+        #[serde(default)]
+        anchor_position: Option<u64>,
     },
     Filter {
         track_ids: Vec<TrackId>,
@@ -336,9 +343,42 @@ impl AutomationCommand {
                 Ok(())
             }
             Self::Configure { setting } => setting.validate(),
-            Self::Group { track_ids, tag, .. } | Self::Sort { track_ids, tag, .. } => {
+            Self::Group {
+                track_ids,
+                mode,
+                tag,
+                anchor_position,
+                ..
+            } => {
                 validate_track_selection(track_ids)?;
-                validate_optional_sam_tag(tag.as_deref())
+                validate_optional_sam_tag(tag.as_deref())?;
+                if anchor_position.is_some()
+                    && (tag.is_some()
+                        || !matches!(
+                            mode,
+                            AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
+                        ))
+                {
+                    return Err(
+                        "anchor_position is only valid for base or insertion grouping".to_owned(),
+                    );
+                }
+                Ok(())
+            }
+            Self::Sort {
+                track_ids,
+                mode,
+                tag,
+                anchor_position,
+                ..
+            } => {
+                validate_track_selection(track_ids)?;
+                validate_optional_sam_tag(tag.as_deref())?;
+                if anchor_position.is_some() && (tag.is_some() || *mode != AlignmentSortMode::Base)
+                {
+                    return Err("anchor_position is only valid for base sorting".to_owned());
+                }
+                Ok(())
             }
             Self::Filter {
                 track_ids,
@@ -582,6 +622,14 @@ pub enum AutomationSetting {
         track_ids: Vec<TrackId>,
         value: AlignmentColorMode,
     },
+    AlignmentViewFilter {
+        track_ids: Vec<TrackId>,
+        value: AlignmentPredicateExpression,
+    },
+    AlignmentHighlightFilter {
+        track_ids: Vec<TrackId>,
+        value: AlignmentPredicateExpression,
+    },
     ReadStackingMode {
         track_ids: Vec<TrackId>,
         value: ReadStackingMode,
@@ -742,6 +790,12 @@ impl AutomationSetting {
                     validate_sam_tag_bytes(*tag)?;
                 }
                 Ok(())
+            }
+            Self::AlignmentViewFilter { track_ids, value }
+            | Self::AlignmentHighlightFilter { track_ids, value } => {
+                validate_track_selection(track_ids)?;
+                crate::session::validate_alignment_predicate_expression(value)
+                    .map_err(|error| error.to_string())
             }
             Self::ReadStackingMode { track_ids, .. } => validate_track_selection(track_ids),
             Self::CompleteReadLimit { track_ids, value } => {
@@ -1549,6 +1603,24 @@ pub struct AutomationAlignmentTrackSnapshot {
     pub sort_anchor: Option<u64>,
     pub filter_expression: String,
     #[serde(default)]
+    pub view_filter: AlignmentPredicateExpression,
+    #[serde(default)]
+    pub highlight_filter: AlignmentPredicateExpression,
+    #[serde(default)]
+    pub view_filter_fingerprint: u64,
+    #[serde(default)]
+    pub view_filter_eligible_records: usize,
+    #[serde(default)]
+    pub view_filter_matching_records: usize,
+    /// Independent match count for each predicate in canonical expression order. Together with
+    /// the exact eligible/matching totals this exposes why the logical-AND view excluded reads.
+    #[serde(default)]
+    pub view_filter_predicate_matches: Vec<usize>,
+    /// Canonical predicate list corresponding index-for-index with
+    /// `view_filter_predicate_matches`, including legacy controls compiled into the typed view.
+    #[serde(default)]
+    pub view_filter_effective_predicates: Vec<AlignmentViewPredicate>,
+    #[serde(default)]
     pub view_as_pairs: bool,
     #[serde(default)]
     pub read_stacking_mode: ReadStackingMode,
@@ -1892,7 +1964,10 @@ pub enum AutomationSnapshotFormat {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationExportKind {
+    /// Backward-compatible alias for the committed filtered alignment view.
     Alignments,
+    FilteredAlignments,
+    EligibleAlignments,
     Pileup,
     SelectedEvidence,
     Modifications,
@@ -2327,6 +2402,58 @@ mod tests {
             };
             assert!(matches!(
                 batch.to_json(),
+                Err(AutomationError::InvalidCommand { index: 0, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn alignment_arrangement_anchors_round_trip_and_reject_irrelevant_modes() {
+        let track = TrackId::new(7);
+        let batch = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![
+                AutomationCommand::Group {
+                    track_ids: vec![track],
+                    mode: AlignmentGroupMode::Insertion,
+                    direction: AlignmentOrderDirection::Natural,
+                    tag: None,
+                    anchor_position: Some(1_234),
+                },
+                AutomationCommand::Sort {
+                    track_ids: vec![track],
+                    mode: AlignmentSortMode::Base,
+                    direction: AlignmentOrderDirection::Reverse,
+                    tag: None,
+                    anchor_position: Some(1_235),
+                },
+            ],
+        };
+        let json = batch.to_json().unwrap();
+        assert_eq!(AutomationBatch::from_json(&json).unwrap(), batch);
+
+        for command in [
+            AutomationCommand::Group {
+                track_ids: vec![track],
+                mode: AlignmentGroupMode::Strand,
+                direction: AlignmentOrderDirection::Natural,
+                tag: None,
+                anchor_position: Some(1_234),
+            },
+            AutomationCommand::Sort {
+                track_ids: vec![track],
+                mode: AlignmentSortMode::MappingQuality,
+                direction: AlignmentOrderDirection::Natural,
+                tag: None,
+                anchor_position: Some(1_234),
+            },
+        ] {
+            let invalid = AutomationBatch {
+                schema_version: AUTOMATION_SCHEMA_VERSION,
+                commands: vec![command],
+            };
+            assert!(matches!(
+                invalid.to_json(),
                 Err(AutomationError::InvalidCommand { index: 0, .. })
             ));
         }

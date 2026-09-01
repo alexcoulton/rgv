@@ -473,6 +473,26 @@ fn sum_scene_telemetry(
             sum.evidence_candidates = sum
                 .evidence_candidates
                 .saturating_add(item.evidence_candidates);
+            sum.view_filter_evaluations = sum
+                .view_filter_evaluations
+                .saturating_add(item.view_filter_evaluations);
+            sum.view_filter_records_examined = sum
+                .view_filter_records_examined
+                .saturating_add(item.view_filter_records_examined);
+            sum.view_filter_records_matched = sum
+                .view_filter_records_matched
+                .saturating_add(item.view_filter_records_matched);
+            sum.view_filter_evaluation_nanoseconds = sum
+                .view_filter_evaluation_nanoseconds
+                .saturating_add(item.view_filter_evaluation_nanoseconds);
+            if item.last_view_filter_evaluation_nanoseconds > 0 {
+                sum.last_view_filter_evaluation_nanoseconds =
+                    item.last_view_filter_evaluation_nanoseconds;
+                sum.last_view_filter_contract_fingerprint =
+                    item.last_view_filter_contract_fingerprint;
+                sum.last_view_filter_evaluation_fingerprint =
+                    item.last_view_filter_evaluation_fingerprint;
+            }
             sum.exact_summary_candidates = sum
                 .exact_summary_candidates
                 .saturating_add(item.exact_summary_candidates);
@@ -542,6 +562,8 @@ fn build_contract(
             CapabilityRequirement::Required,
             None,
         ),
+        view_filter: rgv_alignment_scene::AlignmentViewFilterContract::default(),
+        highlight_filter: rgv_alignment_scene::AlignmentViewFilterContract::default(),
         summaries: SummaryContract {
             overlapping_mate_policy: OverlappingMatePolicy::CountOnce,
             minimum_base_quality: 0,
@@ -550,7 +572,6 @@ fn build_contract(
             collect_modifications: false,
         },
         layout: LayoutContract {
-            row_scale_class: 0,
             stacking: ReadStackingMode::Compact,
             grouping: AlignmentGroupMode::None,
             group_order: AlignmentOrderDirection::Natural,

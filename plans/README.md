@@ -16,6 +16,7 @@ The remaining documents preserve detailed implementation, remediation, and desig
 
 ## Focused plans
 
+- [Alignment context menu, filtering, and read presentation](ALIGNMENT_CONTEXT_MENU_AND_FILTERING_PLAN.md)
 - [Unified alignment-scene interaction and capacity remediation](UNIFIED_ALIGNMENT_SCENE_INTERACTION_AND_CAPACITY_REMEDIATION_PLAN.md)
 - [Unified alignment-scene recovery and desktop cutover](UNIFIED_ALIGNMENT_SCENE_RECOVERY_PLAN.md)
 - [Unified alignment scene and legacy removal](UNIFIED_ALIGNMENT_SCENE_IMPLEMENTATION_PLAN.md)

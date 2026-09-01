@@ -769,6 +769,7 @@ pub struct AlignmentRowAtlas {
     derived_from_evidence: EvidenceRevision,
     source_revision: AlignmentSourceRevision,
     record_contract: ContractFingerprint,
+    view_filter: ContractFingerprint,
     layout_contract: LayoutContract,
     interval: GenomicInterval,
     layers: Arc<[Arc<RowAtlasLayer>]>,
@@ -850,6 +851,7 @@ impl AlignmentRowAtlas {
             evidence.revision(),
             evidence.source_revision(),
             evidence.record_contract(),
+            evidence.view_filter().fingerprint(),
             layout_contract,
             interval,
             vec![layer],
@@ -957,6 +959,7 @@ impl AlignmentRowAtlas {
             evidence.revision(),
             self.source_revision,
             self.record_contract,
+            self.view_filter,
             self.layout_contract,
             target,
             layers,
@@ -976,6 +979,7 @@ impl AlignmentRowAtlas {
         derived_from_evidence: EvidenceRevision,
         source_revision: AlignmentSourceRevision,
         record_contract: ContractFingerprint,
+        view_filter: ContractFingerprint,
         layout_contract: LayoutContract,
         interval: GenomicInterval,
         mut layers: Vec<Arc<RowAtlasLayer>>,
@@ -1004,6 +1008,7 @@ impl AlignmentRowAtlas {
             derived_from_evidence,
             source_revision,
             record_contract,
+            view_filter,
             layout_contract,
             interval,
             layers: layers.into(),
@@ -1026,6 +1031,9 @@ impl AlignmentRowAtlas {
             return Err(AlignmentRowAtlasError::SourceRevisionMismatch);
         }
         if evidence.record_contract() != self.record_contract {
+            return Err(AlignmentRowAtlasError::RecordContractMismatch);
+        }
+        if evidence.view_filter().fingerprint() != self.view_filter {
             return Err(AlignmentRowAtlasError::RecordContractMismatch);
         }
         if target.contig() != self.interval.contig() || !target.contains_interval(self.interval) {
@@ -1098,6 +1106,12 @@ impl AlignmentRowAtlas {
     pub fn shares_stable_record_authority(&self, evidence: &EvidenceRoot) -> bool {
         self.source_revision == evidence.source_revision()
             && self.record_contract == evidence.record_contract()
+            && self.view_filter == evidence.view_filter().fingerprint()
+    }
+
+    #[must_use]
+    pub const fn view_filter(&self) -> ContractFingerprint {
+        self.view_filter
     }
 
     #[must_use]
@@ -2499,6 +2513,8 @@ mod tests {
             AlignmentGroupMode::MateContig,
             AlignmentGroupMode::ReadOrder,
             AlignmentGroupMode::FirstOfPairStrand,
+            AlignmentGroupMode::Base,
+            AlignmentGroupMode::Insertion,
             AlignmentGroupMode::Tag(*b"ZZ"),
         ];
         let sort_modes = [
@@ -2529,6 +2545,11 @@ mod tests {
             } else {
                 AlignmentOrderDirection::Reverse
             };
+            layout.sort_anchor = matches!(
+                grouping,
+                AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
+            )
+            .then_some(12);
             let first = AlignmentRowAtlas::build(
                 revision(200 + index as u64 * 2),
                 &evidence,

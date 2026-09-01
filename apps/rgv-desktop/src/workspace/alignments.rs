@@ -897,6 +897,13 @@ pub(crate) struct AlignmentPanelProjection {
     pub(crate) scene_frame_request_token: Option<AlignmentSceneRequestToken>,
     pub(crate) scene_telemetry: AlignmentSceneCoordinatorTelemetry,
     pub(crate) scene_interaction: AlignmentInteractionState,
+    pub(crate) scene_highlight_key: Option<(
+        rgv_alignment_scene::EvidenceRevision,
+        ContractFingerprint,
+        Option<ReferenceRevision>,
+    )>,
+    pub(crate) scene_highlighted: Arc<[AlignmentHandle]>,
+    pub(crate) scene_highlight_status: Option<String>,
 }
 
 impl AlignmentPanelProjection {
@@ -1316,6 +1323,17 @@ pub(crate) fn alignment_panel_projections(
 pub(crate) const MAXIMUM_COVERAGE_BINS: usize = 4_096;
 pub(crate) const MAXIMUM_ALLELE_COVERAGE_BASES_PER_PIXEL: f64 = 2.0;
 
+pub(crate) fn alignment_active_filter_count(filters: &SessionFilters) -> usize {
+    filters
+        .alignment_view_filter
+        .all
+        .len()
+        .saturating_add(usize::from(filters.minimum_mapping_quality.is_some()))
+        .saturating_add(usize::from(!filters.include_secondary))
+        .saturating_add(usize::from(!filters.include_supplementary))
+        .saturating_add(filters.auxiliary_predicates.len())
+}
+
 pub(crate) fn alignment_coverage_query_plan(
     visible_bases: usize,
     pixel_width: f64,
@@ -1341,9 +1359,9 @@ pub(crate) fn alignment_coverage_query_plan(
 /// Source-level options for the unified scene. Presentation and summary contracts remain typed
 /// and independent; these options contain only source eligibility, resumable decode policy, and
 /// the richest payload currently required by desktop alignment consumers.
-fn alignment_scene_source_query_options(
+pub(crate) fn alignment_scene_source_query_options(
     config: &SessionAlignmentTrack,
-    active_filters: &ActiveFilters,
+    _active_filters: &ActiveFilters,
 ) -> QueryOptions {
     let filters = &config.filters;
     let mut retained_auxiliary_tags = alignment_row_policy_auxiliary_tags(filters);
@@ -1364,16 +1382,178 @@ fn alignment_scene_source_query_options(
         overlapping_mate_policy: filters.overlapping_mate_policy,
         minimum_base_quality: filters.minimum_base_quality,
         minimum_junction_flank: filters.minimum_junction_flank,
-        include_secondary: active_filters.include_secondary,
-        include_supplementary: active_filters.include_supplementary,
+        // Interactive eligibility is a derived immutable view over this retained superset. These
+        // records must not disappear from canonical evidence when a chip is toggled or cleared.
+        include_secondary: true,
+        include_supplementary: true,
         include_reference: true,
-        filter: active_filters.alignment.clone(),
+        filter: AlignmentFilter::default(),
         ..QueryOptions::default()
+    }
+}
+
+pub(crate) fn alignment_view_filter_contract(
+    filters: &SessionFilters,
+    active: &ActiveFilters,
+    dictionary: &ReferenceDictionary,
+) -> AlignmentViewFilterContract {
+    let predicates = alignment_effective_view_predicates(filters, active)
+        .into_iter()
+        .map(|predicate| compile_alignment_view_predicate(&predicate, dictionary));
+    AlignmentViewFilterContract::new(filters.alignment_view_filter.version, predicates)
+}
+
+/// Canonical user-visible predicate order, including the older controls which have not yet been
+/// removed from the session schema. Counts and exports use this same order so provenance never
+/// exposes an unlabeled prefix before the typed expression.
+pub(crate) fn alignment_effective_view_predicates(
+    filters: &SessionFilters,
+    active: &ActiveFilters,
+) -> Vec<AlignmentViewPredicate> {
+    let mut predicates = Vec::new();
+    if let Some(minimum) = active.alignment.minimum_mapping_quality {
+        predicates.push(AlignmentViewPredicate::MappingQuality {
+            minimum: Some(minimum),
+            maximum: None,
+        });
+    }
+    if !active.include_secondary {
+        predicates.push(AlignmentViewPredicate::Flag {
+            flag: rgv_core::AlignmentFlagPredicate::Secondary,
+            expected: false,
+        });
+    }
+    if !active.include_supplementary {
+        predicates.push(AlignmentViewPredicate::Flag {
+            flag: rgv_core::AlignmentFlagPredicate::Supplementary,
+            expected: false,
+        });
+    }
+    predicates.extend(active.alignment.auxiliary.iter().map(|predicate| {
+        AlignmentViewPredicate::Auxiliary {
+            tag: predicate.tag,
+            comparison: match predicate.comparison {
+                AuxComparison::Exists => AlignmentAuxComparison::Exists,
+                AuxComparison::Equal => AlignmentAuxComparison::Equal,
+                AuxComparison::NotEqual => AlignmentAuxComparison::NotEqual,
+                AuxComparison::Greater => AlignmentAuxComparison::Greater,
+                AuxComparison::GreaterOrEqual => AlignmentAuxComparison::GreaterOrEqual,
+                AuxComparison::Less => AlignmentAuxComparison::Less,
+                AuxComparison::LessOrEqual => AlignmentAuxComparison::LessOrEqual,
+            },
+            value: predicate.value.as_ref().map(|value| match value {
+                FilterValue::Integer(value) => AlignmentAuxFilterValue::Integer(*value),
+                FilterValue::Float(value) => AlignmentAuxFilterValue::FloatBits(value.to_bits()),
+                FilterValue::String(value) => AlignmentAuxFilterValue::String(value.clone()),
+            }),
+        }
+    }));
+    predicates.extend(filters.alignment_view_filter.all.iter().cloned());
+    predicates
+}
+
+pub(crate) fn alignment_highlight_filter_contract(
+    filters: &SessionFilters,
+    dictionary: &ReferenceDictionary,
+) -> AlignmentViewFilterContract {
+    let predicates = filters
+        .alignment_highlight_filter
+        .all
+        .iter()
+        .map(|predicate| compile_alignment_view_predicate(predicate, dictionary));
+    AlignmentViewFilterContract::new(filters.alignment_highlight_filter.version, predicates)
+}
+
+fn compile_alignment_filter_scope(
+    scope: &AlignmentPredicateScope,
+    dictionary: &ReferenceDictionary,
+) -> AlignmentFilterScope {
+    match scope {
+        AlignmentPredicateScope::Anywhere => AlignmentFilterScope::Anywhere,
+        AlignmentPredicateScope::Position { contig, position } => dictionary
+            .id_by_name(contig)
+            .map_or(AlignmentFilterScope::UnresolvedContig, |contig| {
+                AlignmentFilterScope::Position {
+                    contig,
+                    position: *position,
+                }
+            }),
+        AlignmentPredicateScope::Interval { contig, start, end } => dictionary
+            .id_by_name(contig)
+            .and_then(|contig| GenomicInterval::new(contig, *start, *end).ok())
+            .map_or(AlignmentFilterScope::UnresolvedContig, |interval| {
+                AlignmentFilterScope::Interval { interval }
+            }),
+    }
+}
+
+fn compile_alignment_view_predicate(
+    predicate: &AlignmentViewPredicate,
+    dictionary: &ReferenceDictionary,
+) -> AlignmentFilterPredicate {
+    match predicate {
+        AlignmentViewPredicate::MappingQuality { minimum, maximum } => {
+            AlignmentFilterPredicate::MappingQuality {
+                minimum: *minimum,
+                maximum: *maximum,
+            }
+        }
+        AlignmentViewPredicate::Flag { flag, expected } => AlignmentFilterPredicate::Flag {
+            flag: *flag,
+            expected: *expected,
+        },
+        AlignmentViewPredicate::TemplateLength { minimum, maximum } => {
+            AlignmentFilterPredicate::TemplateLength {
+                minimum: *minimum,
+                maximum: *maximum,
+            }
+        }
+        AlignmentViewPredicate::MateContig { contig } => AlignmentFilterPredicate::MateContig {
+            contig: dictionary.id_by_name(contig),
+        },
+        AlignmentViewPredicate::Auxiliary {
+            tag,
+            comparison,
+            value,
+        } => AlignmentFilterPredicate::Auxiliary {
+            tag: *tag,
+            comparison: *comparison,
+            value: value.clone(),
+        },
+        AlignmentViewPredicate::CigarEvent {
+            event,
+            scope,
+            minimum_length,
+            maximum_length,
+        } => AlignmentFilterPredicate::CigarEvent {
+            event: *event,
+            scope: compile_alignment_filter_scope(scope, dictionary),
+            minimum_length: *minimum_length,
+            maximum_length: *maximum_length,
+        },
+        AlignmentViewPredicate::AlignedLength { minimum, maximum } => {
+            AlignmentFilterPredicate::AlignedLength {
+                minimum: *minimum,
+                maximum: *maximum,
+            }
+        }
+        AlignmentViewPredicate::Substitution {
+            scope,
+            observed_base,
+            minimum_count,
+            maximum_count,
+        } => AlignmentFilterPredicate::Substitution {
+            scope: compile_alignment_filter_scope(scope, dictionary),
+            observed_base: *observed_base,
+            minimum_count: *minimum_count,
+            maximum_count: *maximum_count,
+        },
     }
 }
 
 pub(crate) fn alignment_scene_build_contract(
     config: &SessionAlignmentTrack,
+    active_filters: &ActiveFilters,
     metadata: &AlignmentSceneSourceMetadata,
     contig: ContigId,
     contig_length: u64,
@@ -1414,7 +1594,29 @@ pub(crate) fn alignment_scene_build_contract(
         DetailLevel::Reads => GeometryLod::Read,
         DetailLevel::Bases => GeometryLod::Base,
     };
-    let scene_reference_revision = if allele_detail != AlleleSummaryDetail::None {
+    let requested_view_filter =
+        alignment_view_filter_contract(filters, active_filters, &metadata.dictionary);
+    let requested_highlight_filter =
+        alignment_highlight_filter_contract(filters, &metadata.dictionary);
+    // A portable session can contain a reference-backed predicate before its FASTA has opened.
+    // Keep the previously complete/unfiltered authority usable and expose the missing capability
+    // in the UI; never submit a filter which the coordinator could only leave pending forever.
+    let view_filter = if requested_view_filter.requires_reference() && reference_revision.is_none()
+    {
+        AlignmentViewFilterContract::default()
+    } else {
+        requested_view_filter.clone()
+    };
+    let highlight_filter =
+        if requested_highlight_filter.requires_reference() && reference_revision.is_none() {
+            AlignmentViewFilterContract::default()
+        } else {
+            requested_highlight_filter.clone()
+        };
+    let scene_reference_revision = if allele_detail != AlleleSummaryDetail::None
+        || requested_view_filter.requires_reference()
+        || requested_highlight_filter.requires_reference()
+    {
         reference_revision
     } else {
         alignment_scene_reference_revision(geometry_lod, reference_revision)
@@ -1431,6 +1633,8 @@ pub(crate) fn alignment_scene_build_contract(
             CapabilityRequirement::Required,
             None,
         ),
+        view_filter,
+        highlight_filter,
         summaries: SummaryContract {
             overlapping_mate_policy: filters.overlapping_mate_policy,
             minimum_base_quality: filters.minimum_base_quality,
@@ -1444,11 +1648,18 @@ pub(crate) fn alignment_scene_build_contract(
             group_order: filters.alignment_group_order,
             sorting: filters.alignment_sort_mode,
             sort_order: filters.alignment_sort_order,
-            sort_anchor: alignment_sort_position(
-                filters.alignment_sort_mode,
-                filters.alignment_sort_anchor,
-                viewport,
-            ),
+            sort_anchor: if matches!(
+                filters.alignment_group_mode,
+                AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
+            ) {
+                filters.alignment_sort_anchor
+            } else {
+                alignment_sort_position(
+                    filters.alignment_sort_mode,
+                    filters.alignment_sort_anchor,
+                    viewport,
+                )
+            },
             view_as_pairs: filters.view_as_pairs,
             pair_length_bounds: TemplateLengthBounds {
                 minimum: filters.minimum_template_length,
@@ -1543,6 +1754,8 @@ pub(crate) fn alignment_scene_contract_equivalent(
         && left.contig == right.contig
         && left.contig_length == right.contig_length
         && left.payload == right.payload
+        && left.view_filter == right.view_filter
+        && left.highlight_filter == right.highlight_filter
         && left.summaries == right.summaries
         && left.layout == right.layout
         && left.presentation == right.presentation

@@ -279,6 +279,12 @@ pub struct CpuAlignmentLabelFrame {
     /// Immutable page-local anchors examined for this camera. This is deliberately bounded by
     /// intersecting genomic tiles and row blocks rather than the complete retained scene.
     pub anchors_examined: usize,
+    /// Base-cell anchors examined before applying the eight-point width/height legibility gate.
+    /// This lets diagnostics distinguish "no base evidence" from "base evidence was present but
+    /// deliberately too small to label" without inspecting sequence or rebuilding geometry.
+    pub base_anchors_examined: usize,
+    /// Base labels accepted by the camera-dependent projector and handed to the presenter.
+    pub base_labels_projected: usize,
     _resources: Arc<CpuFrameResources>,
 }
 
@@ -290,6 +296,8 @@ impl PartialEq for CpuAlignmentLabelFrame {
             && self.coverage == other.coverage
             && self.labels == other.labels
             && self.anchors_examined == other.anchors_examined
+            && self.base_anchors_examined == other.base_anchors_examined
+            && self.base_labels_projected == other.base_labels_projected
     }
 }
 
@@ -444,17 +452,36 @@ impl CpuAlignmentProjector {
         let requested_rows = camera.visible_rows();
         let covered_interval = intersect_intervals(camera.interval(), scene.prepared_interval());
         let covered_rows = intersect_ranges(requested_rows.clone(), scene.prepared_rows());
-        let visible_label_pages = covered_interval.map_or_else(Vec::new, |interval| {
+        let visible_text_pages = covered_interval.map_or_else(Vec::new, |interval| {
             scene
                 .visible_pages(interval, covered_rows.clone())
                 .into_iter()
-                .filter(|page| page.key().family() == AlignmentPageFamily::Labels)
+                .filter(|page| {
+                    matches!(
+                        page.key().family(),
+                        AlignmentPageFamily::Labels | AlignmentPageFamily::ReadGeometry
+                    )
+                })
                 .collect::<Vec<_>>()
         });
-        let maximum_labels = visible_label_pages
-            .iter()
-            .map(|page| page.label_anchor_count())
-            .sum();
+        let (maximum_labels, base_anchors_examined) =
+            visible_text_pages
+                .iter()
+                .fold((0_usize, 0_usize), |(all_labels, all_bases), page| {
+                    let bases = page
+                        .primitives()
+                        .iter()
+                        .filter(|primitive| {
+                            matches!(primitive.component, AlignmentComponent::Base { .. })
+                        })
+                        .count();
+                    (
+                        all_labels
+                            .saturating_add(page.label_anchor_count())
+                            .saturating_add(bases),
+                        all_bases.saturating_add(bases),
+                    )
+                });
         let mut projection_resources = scene.metadata_allocation().ledger().reserve_transient(
             TransientResourceClass::CpuProjection,
             cpu_label_projection_scratch_bytes(maximum_labels),
@@ -465,23 +492,35 @@ impl CpuAlignmentProjector {
                 maximum_labels,
             );
         if covered_interval.is_some() {
-            for page in visible_label_pages {
-                for primitive in page.label_anchors().copied() {
+            for page in visible_text_pages {
+                for primitive in page.primitives().iter().copied().filter(|primitive| {
+                    matches!(
+                        primitive.component,
+                        AlignmentComponent::Label { .. } | AlignmentComponent::Base { .. }
+                    )
+                }) {
                     let global_row = page.row_range().start.saturating_add(primitive.row_offset);
                     if global_row < covered_rows.start || global_row >= covered_rows.end {
                         continue;
                     }
-                    let AlignmentComponent::Label { id, .. } = primitive.component else {
-                        unreachable!("the iterator retains only labels");
+                    let text = match primitive.component {
+                        AlignmentComponent::Label { id, .. } => page.label_arc(id),
+                        AlignmentComponent::Base { base, .. } => Some(Arc::<str>::from(
+                            char::from(base.to_ascii_uppercase()).to_string(),
+                        )),
+                        _ => unreachable!("the iterator retains only text-bearing primitives"),
                     };
-                    if let Some(projected) = project_primitive(
+                    if let Some(mut projected) = project_primitive(
                         primitive,
                         page.interval().start(),
                         global_row,
                         camera,
-                        page.label_arc(id),
+                        text,
                         interaction.token(primitive.handle),
                     ) {
+                        // The same genomic base cell remains GPU geometry. This is a second,
+                        // camera-bound text presentation of its already-retained identity.
+                        projected.shape = CpuPrimitiveShape::TextLabel;
                         fragments
                             .entry((projected.handle, projected.component))
                             .and_modify(|existing| merge_label_fragments(existing, &projected))
@@ -492,6 +531,10 @@ impl CpuAlignmentProjector {
         }
         let mut labels = Vec::with_capacity(maximum_labels);
         reconcile_labels(&mut labels, fragments.into_values(), camera.clip);
+        let base_labels_projected = labels
+            .iter()
+            .filter(|label| matches!(label.component, AlignmentComponent::Base { .. }))
+            .count();
         labels.sort_by(|left, right| {
             left.row
                 .cmp(&right.row)
@@ -519,6 +562,8 @@ impl CpuAlignmentProjector {
             },
             labels: labels.into(),
             anchors_examined: maximum_labels,
+            base_anchors_examined,
+            base_labels_projected,
             _resources: Arc::new(CpuFrameResources {
                 _projection: projection_resources,
             }),
@@ -749,9 +794,19 @@ fn reconcile_labels(
     const GLYPH_ASPECT_RATIO: f64 = 0.56;
 
     let clip_right = clip.x + clip.width;
+    let mut base_labels = Vec::new();
     let mut candidates = labels
         .filter_map(|mut label| {
             let text = label.text.as_deref()?;
+            if matches!(label.component, AlignmentComponent::Base { .. }) {
+                // Match IGV's legibility boundary: a glyph requires an eight-point cell in both
+                // dimensions. Keep the anchor itself so adjacent bases do not incorrectly collide
+                // in the generic label sweep.
+                if label.width >= 8.0 && label.height >= 8.0 {
+                    base_labels.push(label);
+                }
+                return None;
+            }
             if label.height < MIN_TEXT_HEIGHT {
                 return None;
             }
@@ -777,6 +832,8 @@ fn reconcile_labels(
             Some(label)
         })
         .collect::<Vec<_>>();
+
+    primitives.append(&mut base_labels);
 
     candidates.sort_by(|left, right| {
         left.x

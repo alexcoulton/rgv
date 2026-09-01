@@ -8,6 +8,7 @@ pub(crate) enum AlignmentNavigationOwner {
     DesktopQueue,
     SourceWorker,
     SourcePressure,
+    ReferenceQuery,
     GpuCandidate,
     GpuPressure,
 }
@@ -66,6 +67,7 @@ pub(crate) enum AlignmentNavigationPhase {
     Queued,
     Running,
     WaitingForSourcePressure,
+    WaitingForReference,
     CandidateReady,
     WaitingForGpuPressure,
     BudgetLimited,
@@ -82,6 +84,7 @@ impl AlignmentNavigationPhase {
             Self::Queued => Some(AlignmentNavigationOwner::DesktopQueue),
             Self::Running => Some(AlignmentNavigationOwner::SourceWorker),
             Self::WaitingForSourcePressure => Some(AlignmentNavigationOwner::SourcePressure),
+            Self::WaitingForReference => Some(AlignmentNavigationOwner::ReferenceQuery),
             Self::CandidateReady => Some(AlignmentNavigationOwner::GpuCandidate),
             Self::WaitingForGpuPressure => Some(AlignmentNavigationOwner::GpuPressure),
             Self::Dormant
@@ -123,6 +126,7 @@ impl AlignmentNavigationPhase {
             Self::Queued => "Alignment target queued",
             Self::Running => "Loading complete alignment evidence",
             Self::WaitingForSourcePressure => "Waiting for alignment cache capacity",
+            Self::WaitingForReference => "Waiting for reference sequence",
             Self::CandidateReady => "Preparing alignment presentation",
             Self::WaitingForGpuPressure => "Waiting for GPU cache capacity",
             Self::BudgetLimited => "Alignment presentation exceeds the cache budget",
@@ -386,6 +390,28 @@ impl AlignmentNavigationTransaction {
         self.request_token == Some(request_token) && self.desired_camera == Some(camera)
     }
 
+    /// Whether a worker progress frame may still advance this exact request.
+    ///
+    /// A terminal error and an already-queued progress frame can arrive in one UI mailbox drain.
+    /// Identity alone is insufficient in that case: the progress frame must not revive or mask
+    /// the failure. Committed requests remain admissible because optional vertical-residency
+    /// frames legitimately continue under the same token after the visible scene commits.
+    pub(crate) fn worker_frame_is_admissible(
+        &self,
+        request_token: AlignmentSceneRequestToken,
+        camera: AlignmentSceneCamera,
+    ) -> bool {
+        self.event_is_current(request_token, camera)
+            && !matches!(
+                self.phase,
+                AlignmentNavigationPhase::BudgetLimited
+                    | AlignmentNavigationPhase::IndexOverview
+                    | AlignmentNavigationPhase::Unavailable
+                    | AlignmentNavigationPhase::Failed
+                    | AlignmentNavigationPhase::Superseded
+            )
+    }
+
     pub(crate) fn fail_if_source_owner_is_idle(
         &mut self,
         source_pending: bool,
@@ -471,6 +497,11 @@ impl AlignmentNavigationTransaction {
             AlignmentNavigationPhase::WaitingForSourcePressure => {
                 self.products.source = Product::Pressure;
             }
+            AlignmentNavigationPhase::WaitingForReference => {
+                self.products.source = Product::Ready;
+                self.products.reference = Product::Queued;
+                self.products.gpu = Product::Pending;
+            }
             AlignmentNavigationPhase::CandidateReady => {
                 self.products.source = Product::Ready;
                 if self.products.row_atlas != Product::NotRequired {
@@ -547,6 +578,7 @@ const fn alignment_navigation_transition_is_legal(
         Phase::Running => matches!(
             to,
             Phase::WaitingForSourcePressure
+                | Phase::WaitingForReference
                 | Phase::CandidateReady
                 | Phase::Unavailable
                 | Phase::Failed
@@ -555,6 +587,14 @@ const fn alignment_navigation_transition_is_legal(
         Phase::WaitingForSourcePressure => matches!(
             to,
             Phase::Running | Phase::Unavailable | Phase::Failed | Phase::Superseded
+        ),
+        Phase::WaitingForReference => matches!(
+            to,
+            Phase::Running
+                | Phase::CandidateReady
+                | Phase::Unavailable
+                | Phase::Failed
+                | Phase::Superseded
         ),
         Phase::CandidateReady => matches!(
             to,
@@ -606,6 +646,7 @@ mod tests {
             AlignmentNavigationPhase::Queued,
             AlignmentNavigationPhase::Running,
             AlignmentNavigationPhase::WaitingForSourcePressure,
+            AlignmentNavigationPhase::WaitingForReference,
             AlignmentNavigationPhase::CandidateReady,
             AlignmentNavigationPhase::WaitingForGpuPressure,
         ] {
@@ -835,6 +876,47 @@ mod tests {
     }
 
     #[test]
+    fn reference_backed_filter_waits_on_reference_owner_then_commits_same_request() {
+        let mut transaction = AlignmentNavigationTransaction::default();
+        let token = AlignmentSceneRequestToken::new(92);
+        let target = camera(4_100);
+        transaction.begin(13, token, "reference-backed filter target");
+        transaction.bind_camera(target);
+        transaction.transition(
+            AlignmentNavigationPhase::Running,
+            "cached evidence accepted",
+        );
+        transaction.transition(
+            AlignmentNavigationPhase::WaitingForReference,
+            "filter evaluation requires exact FASTA authority",
+        );
+
+        let waiting = transaction.diagnostic();
+        assert_eq!(
+            waiting.owner,
+            Some(AlignmentNavigationOwner::ReferenceQuery)
+        );
+        assert_eq!(
+            waiting.products.source,
+            AlignmentNavigationProductState::Ready
+        );
+        assert_eq!(
+            waiting.products.reference,
+            AlignmentNavigationProductState::Queued
+        );
+        assert!(!transaction.fail_if_source_owner_is_idle(false, false));
+
+        transaction.transition(
+            AlignmentNavigationPhase::CandidateReady,
+            "reference-backed scene ready",
+        );
+        transaction.transition(AlignmentNavigationPhase::Committed, "published");
+        assert_eq!(transaction.request_token(), Some(token));
+        assert_eq!(transaction.desired_camera(), Some(target));
+        assert!(transaction.is_current_settled(13));
+    }
+
+    #[test]
     fn cache_clear_reissues_a_committed_camera_and_rejects_the_pre_clear_token() {
         let mut transaction = AlignmentNavigationTransaction::default();
         transaction.bind_identity(PanelId::new(4), TrackId::new(9));
@@ -952,5 +1034,28 @@ mod tests {
                 .is_some_and(|detail| detail.contains("illegal alignment navigation transition"))
         );
         assert!(transaction.is_current_settled(3));
+    }
+
+    #[test]
+    fn queued_progress_cannot_revive_a_terminal_failure_for_the_same_token() {
+        let mut transaction = AlignmentNavigationTransaction::default();
+        let token = AlignmentSceneRequestToken::new(34);
+        let target = camera(400);
+        transaction.begin(4, token, "target");
+        transaction.bind_camera(target);
+        transaction.transition(AlignmentNavigationPhase::Running, "source accepted");
+        transaction.transition(
+            AlignmentNavigationPhase::Failed,
+            "candidate construction failed",
+        );
+
+        assert!(transaction.event_is_current(token, target));
+        assert!(!transaction.worker_frame_is_admissible(token, target));
+        assert_eq!(transaction.phase(), AlignmentNavigationPhase::Failed);
+
+        let replacement = AlignmentSceneRequestToken::new(35);
+        transaction.begin(5, replacement, "explicit retry");
+        transaction.bind_camera(target);
+        assert!(transaction.worker_frame_is_admissible(replacement, target));
     }
 }

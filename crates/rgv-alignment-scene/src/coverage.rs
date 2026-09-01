@@ -170,24 +170,19 @@ impl CertifiedCoverageSet {
         &self.certificates
     }
 
-    /// Returns exact filter provenance when non-overlapping retained certificates partition the
-    /// requested interval. A larger indivisible certificate is not silently apportioned.
+    /// Returns exact filter provenance only when one indivisible source transaction certifies the
+    /// requested interval exactly.
+    ///
+    /// Genomically adjacent query intervals do not partition alignment records: a read spanning
+    /// their boundary is observed by both queries. Their coverage certificates may therefore be
+    /// composed to prove that the union is complete, but their record counters must never be
+    /// added. A larger certificate likewise cannot be spatially apportioned.
     #[must_use]
     pub fn exact_provenance(&self, interval: GenomicInterval) -> Option<FilteredRecordProvenance> {
-        let mut cursor = interval.start();
-        let mut provenance = FilteredRecordProvenance::default();
-        while cursor < interval.end() {
-            let next = self
-                .certificates
-                .iter()
-                .filter(|certificate| certificate.interval.contig() == interval.contig())
-                .filter(|certificate| certificate.interval.start() == cursor)
-                .filter(|certificate| certificate.interval.end() <= interval.end())
-                .max_by_key(|certificate| certificate.interval.end())?;
-            provenance = provenance.saturating_add(next.provenance);
-            cursor = next.interval.end();
-        }
-        Some(provenance)
+        self.certificates
+            .iter()
+            .find(|certificate| certificate.interval == interval)
+            .map(|certificate| certificate.provenance)
     }
 
     #[must_use]
@@ -288,14 +283,16 @@ mod tests {
             &[GenomicInterval::new(ContigId::new(0), 0, 30).unwrap()]
         );
         assert!(coverage.covers(GenomicInterval::new(ContigId::new(0), 5, 25).unwrap()));
+        // Adjacent genomic queries may both contain an alignment which spans their boundary, so
+        // their counters are not an exact record partition even though their intervals form
+        // complete coverage.
         assert_eq!(
             coverage.exact_provenance(GenomicInterval::new(ContigId::new(0), 0, 30).unwrap()),
-            Some(FilteredRecordProvenance {
-                records_seen: 30,
-                eligible_records: 21,
-                user_filter: 9,
-                ..FilteredRecordProvenance::default()
-            })
+            None
+        );
+        assert_eq!(
+            coverage.exact_provenance(GenomicInterval::new(ContigId::new(0), 0, 10).unwrap()),
+            Some(certificate(0, 10).provenance())
         );
         assert_eq!(
             coverage.exact_provenance(GenomicInterval::new(ContigId::new(0), 5, 25).unwrap()),

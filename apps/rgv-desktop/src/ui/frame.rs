@@ -415,7 +415,7 @@ impl Viewer {
                     track.config.name.clone(),
                 )
             });
-        let settings_filters = if settings_alignment_id == primary_alignment_id {
+        let mut settings_filters = if settings_alignment_id == primary_alignment_id {
             self.live_session_filters()
         } else {
             settings_controller
@@ -477,6 +477,7 @@ impl Viewer {
         let mut filter_expression = settings_filter_editor.expression.clone();
         let filter_error = settings_filter_editor.error.clone();
         let mut apply_filter = false;
+        let mut typed_alignment_predicates_changed = false;
         let (bulk_alignment_ids, bulk_alignment_pane) = editing_alignment_id.map_or_else(
             || (Vec::new(), None),
             |id| {
@@ -1074,6 +1075,55 @@ impl Viewer {
         } else {
             "Ctrl"
         };
+        let reference_configured = self.reference_revision.is_some();
+        let mut alignment_context_menu = self.alignment_context_menu.clone();
+        let alignment_context_menu_view = alignment_context_menu.as_ref().and_then(|menu| {
+            let track = self
+                .alignment_tracks
+                .iter()
+                .find(|track| track.config.id == menu.target.track_id)?;
+            let record = menu
+                .target
+                .hit
+                .and_then(|hit| self.alignment_scene_record_for_hit(menu.target.panel_id, hit));
+            let read_name = record
+                .as_ref()
+                .map(|record| String::from_utf8_lossy(&record.read_name).into_owned());
+            let mate_available = record.as_ref().is_some_and(|record| {
+                record.flags.is_paired()
+                    && !record.flags.is_mate_unmapped()
+                    && record.mate_contig.is_some()
+                    && record.mate_start.is_some()
+            });
+            let supplementary_segments_available = record.as_ref().is_some_and(|record| {
+                selected_supplementary_chain(record, &self.panels.active().contig_name)
+                    .is_some_and(|chain| chain.segments.len() > 1)
+            });
+            let sequence_available = record
+                .as_ref()
+                .is_some_and(|record| matches!(&record.sequence, SequenceData::Present { .. }));
+            let view_filter = self
+                .presented_alignment_lane(menu.target.panel_id, menu.target.track_id)
+                .filter(|presented| presented.lane.scene_contracts_current)
+                .and_then(|presented| presented.lane.snapshot.as_ref())
+                .map(|snapshot| snapshot.reads().evidence().view_filter());
+            Some(AlignmentContextMenuView {
+                filters: track.config.filters.clone(),
+                contig_name: self
+                    .panels
+                    .get(menu.target.panel_id)
+                    .map(|panel| panel.contig_name.clone())
+                    .unwrap_or_default(),
+                read_name,
+                mate_available,
+                supplementary_segments_available,
+                sequence_available,
+                eligible_records: view_filter.map(|filter| filter.eligible_records()),
+                matching_records: view_filter.map(|filter| filter.matching_records()),
+                reference_configured: self.reference_revision.is_some(),
+            })
+        });
+        let mut alignment_context_action = None;
         self.record_manual_diagnostic_frame_phase(
             ManualDiagnosticFramePhase::ShellPreparation,
             shell_preparation_started.elapsed(),
@@ -2732,8 +2782,99 @@ impl Viewer {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut filter_expression)
                                         .hint_text("HP=1;RG=tumour;MM"),
-                                );
+                                    );
                             });
+                            if !settings_filters.alignment_view_filter.all.is_empty() {
+                                ui.label("Active read filters");
+                                let mut remove = None;
+                                for (index, predicate) in settings_filters
+                                    .alignment_view_filter
+                                    .all
+                                    .iter()
+                                    .enumerate()
+                                {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(alignment_predicate_label(predicate));
+                                        if ui.small_button("×").on_hover_text("Remove filter").clicked() {
+                                            remove = Some(index);
+                                        }
+                                    });
+                                }
+                                if let Some(index) = remove {
+                                    settings_filters.alignment_view_filter.all.remove(index);
+                                    typed_alignment_predicates_changed = true;
+                                }
+                            }
+                            ui.menu_button("Add biological filter…", |ui| {
+                                for (label, quick) in [
+                                    ("Contains substitution", AlignmentQuickPredicate::Substitution),
+                                    ("Contains insertion", AlignmentQuickPredicate::Insertion),
+                                    ("Contains deletion", AlignmentQuickPredicate::Deletion),
+                                    ("Contains any indel", AlignmentQuickPredicate::Indel),
+                                    ("Contains soft clipping", AlignmentQuickPredicate::SoftClip),
+                                    ("Contains splice", AlignmentQuickPredicate::Splice),
+                                    ("Duplicate", AlignmentQuickPredicate::Duplicate),
+                                    ("Secondary", AlignmentQuickPredicate::Secondary),
+                                    ("Supplementary", AlignmentQuickPredicate::Supplementary),
+                                ] {
+                                    let enabled = !quick.requires_reference() || reference_configured;
+                                    let response = ui.add_enabled(enabled, egui::Button::new(label));
+                                    let response = if enabled {
+                                        response
+                                    } else {
+                                        response.on_disabled_hover_text(
+                                            "Requires a matching reference FASTA",
+                                        )
+                                    };
+                                    if response.clicked() {
+                                        let predicate = quick_alignment_predicate(
+                                            quick,
+                                            &self.panels.active().contig_name,
+                                            self
+                                                .panels
+                                                .active()
+                                                .viewport
+                                                .interval()
+                                                .start()
+                                                .saturating_add(
+                                                    self
+                                                        .panels
+                                                        .active()
+                                                        .viewport
+                                                        .interval()
+                                                        .len()
+                                                        / 2,
+                                                ),
+                                        );
+                                        if !settings_filters.alignment_view_filter.all.contains(&predicate) {
+                                            settings_filters.alignment_view_filter.all.push(predicate);
+                                            typed_alignment_predicates_changed = true;
+                                        }
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            if !settings_filters.alignment_highlight_filter.all.is_empty() {
+                                ui.label("Highlighted read predicates");
+                                let mut remove = None;
+                                for (index, predicate) in settings_filters
+                                    .alignment_highlight_filter
+                                    .all
+                                    .iter()
+                                    .enumerate()
+                                {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(alignment_predicate_label(predicate));
+                                        if ui.small_button("×").on_hover_text("Remove highlight").clicked() {
+                                            remove = Some(index);
+                                        }
+                                    });
+                                }
+                                if let Some(index) = remove {
+                                    settings_filters.alignment_highlight_filter.all.remove(index);
+                                    typed_alignment_predicates_changed = true;
+                                }
+                            }
                             ui.horizontal(|ui| {
                                 ui.label("Complete read limit").on_hover_text(
                                     "At or below the effective limit, every eligible viewport read is shown. Above it, RGV shows no individual reads and asks you to zoom in or raise the limit. The default is 50,000; raising it can increase memory, query/layout time, and GPU work. Values in the millions are experimental and can exhaust available memory. Multi-panel or multi-track workspace allocation can make the effective limit lower than this requested value.",
@@ -3090,6 +3231,12 @@ impl Viewer {
             recovery_open = system_dialogs.recovery_open;
             recovery_requested = system_dialogs.recovery_requested;
             dismiss_recovery = system_dialogs.dismiss_recovery;
+            show_alignment_context_menu(
+                ui,
+                &mut alignment_context_menu,
+                alignment_context_menu_view.as_ref(),
+                &mut alignment_context_action,
+            );
         });
         self.record_manual_diagnostic_frame_phase(
             ManualDiagnosticFramePhase::ShellUiRun,
@@ -3099,6 +3246,14 @@ impl Viewer {
         self.egui_context.data_mut(|data| {
             data.insert_temp(properties_expanded_id, properties_expanded);
         });
+        if self.alignment_context_menu.is_some() && alignment_context_menu.is_none() {
+            self.close_alignment_context_menu(if alignment_context_action.is_some() {
+                "action_selected"
+            } else {
+                "dismissed"
+            });
+        }
+        self.alignment_context_menu = alignment_context_menu;
         let repaint_delay = full_output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -4112,6 +4267,13 @@ impl Viewer {
             self.display_dirty = true;
         }
         let editing_primary_settings = settings_alignment_id == primary_alignment_id;
+        if editing_primary_settings && typed_alignment_predicates_changed {
+            self.primary_alignment_filters_mut().alignment_view_filter =
+                settings_filters.alignment_view_filter.clone();
+            self.primary_alignment_filters_mut()
+                .alignment_highlight_filter = settings_filters.alignment_highlight_filter.clone();
+            self.query_options_changed();
+        }
         if editing_primary_settings {
             self.primary_filter_editor_mut().minimum_mapq = minimum_mapq;
             self.primary_filter_editor_mut().include_secondary = include_secondary;
@@ -4428,9 +4590,18 @@ impl Viewer {
                 sort_mode = AlignmentSortMode::Tag(tag);
             }
         }
-        let alignment_sort_anchor = (sort_mode == AlignmentSortMode::Base)
+        let position_grouping = matches!(
+            group_mode,
+            AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
+        );
+        let previous_position_grouping = matches!(
+            settings_filters.alignment_group_mode,
+            AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
+        );
+        let alignment_sort_anchor = (sort_mode == AlignmentSortMode::Base || position_grouping)
             .then(|| {
-                (settings_filters.alignment_sort_mode == AlignmentSortMode::Base)
+                (settings_filters.alignment_sort_mode == AlignmentSortMode::Base
+                    || previous_position_grouping)
                     .then_some(settings_filters.alignment_sort_anchor)
                     .flatten()
                     .or_else(|| {
@@ -4660,6 +4831,9 @@ impl Viewer {
             && let Err(error) = self.remove_alignment_track(id)
         {
             self.data_status = error.to_string();
+        }
+        if let Some((target, action)) = alignment_context_action {
+            self.apply_alignment_context_action(target, action);
         }
         self.record_manual_diagnostic_frame_phase(
             ManualDiagnosticFramePhase::ShellPostProcess,

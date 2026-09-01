@@ -251,6 +251,7 @@ impl EvidenceRootBuilder {
         let metadata_allocation = self
             .metadata_reservation
             .register(retained_metadata_bytes, publication_revision)?;
+        let coverage = Arc::new(self.coverage);
         Ok(Arc::new(EvidenceRoot {
             revision: self.revision,
             source_revision: self.source_revision,
@@ -258,7 +259,10 @@ impl EvidenceRootBuilder {
             payload: self.payload,
             chunks: self.chunks.into(),
             record_count,
-            coverage: self.coverage,
+            coverage: Arc::clone(&coverage),
+            eligible_coverage: coverage,
+            view_filter: EvidenceViewFilter::unfiltered(record_count),
+            allowed_handles: None,
             metadata_allocation,
         }))
     }
@@ -273,8 +277,52 @@ pub struct EvidenceRoot {
     payload: PayloadContract,
     chunks: Arc<[Arc<EvidenceChunk>]>,
     record_count: usize,
-    coverage: CertifiedCoverageSet,
+    coverage: Arc<CertifiedCoverageSet>,
+    /// Broad acquisition provenance retained beside a derived view. This remains immutable and
+    /// lets explicit full-eligible export tell the truth without consulting a filtered summary.
+    eligible_coverage: Arc<CertifiedCoverageSet>,
+    view_filter: EvidenceViewFilter,
+    allowed_handles: Option<Arc<[AlignmentHandle]>>,
     metadata_allocation: AllocationLease,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceViewFilter {
+    fingerprint: ContractFingerprint,
+    eligible_records: usize,
+    matching_records: usize,
+    predicate_matches: Arc<[usize]>,
+}
+
+impl EvidenceViewFilter {
+    fn unfiltered(records: usize) -> Self {
+        Self {
+            fingerprint: ContractFingerprint::new(0),
+            eligible_records: records,
+            matching_records: records,
+            predicate_matches: Arc::new([]),
+        }
+    }
+
+    #[must_use]
+    pub const fn fingerprint(&self) -> ContractFingerprint {
+        self.fingerprint
+    }
+
+    #[must_use]
+    pub const fn eligible_records(&self) -> usize {
+        self.eligible_records
+    }
+
+    #[must_use]
+    pub const fn matching_records(&self) -> usize {
+        self.matching_records
+    }
+
+    #[must_use]
+    pub fn predicate_matches(&self) -> &[usize] {
+        &self.predicate_matches
+    }
 }
 
 impl EvidenceRoot {
@@ -304,8 +352,13 @@ impl EvidenceRoot {
     }
 
     #[must_use]
-    pub const fn coverage(&self) -> &CertifiedCoverageSet {
+    pub fn coverage(&self) -> &CertifiedCoverageSet {
         &self.coverage
+    }
+
+    #[must_use]
+    pub fn eligible_coverage(&self) -> &CertifiedCoverageSet {
+        &self.eligible_coverage
     }
 
     /// Allocation owned directly by this root. Exposed only to the crate's move-only semantic
@@ -327,10 +380,28 @@ impl EvidenceRoot {
         self.record_count
     }
 
+    #[must_use]
+    pub const fn view_filter(&self) -> &EvidenceViewFilter {
+        &self.view_filter
+    }
+
+    /// Whether the handle belongs to this exact derived view, not merely to one of the broad
+    /// canonical chunks retained behind it.
+    #[must_use]
+    pub fn contains_handle(&self, handle: AlignmentHandle) -> bool {
+        self.allowed_handles
+            .as_ref()
+            .is_none_or(|allowed| allowed.binary_search(&handle).is_ok())
+            && self.record_ref(handle).is_some()
+    }
+
     /// Conservative number of physical records retained by the root without allocating a
     /// temporary deduplication set. Builders use this to reserve before selecting records.
     #[must_use]
     pub fn record_count_upper_bound(&self) -> usize {
+        if let Some(handles) = &self.allowed_handles {
+            return handles.len();
+        }
         self.chunks.iter().fold(0_usize, |total, chunk| {
             total.saturating_add(chunk.chunk.handles().len())
         })
@@ -362,7 +433,38 @@ impl EvidenceRoot {
         interval: GenomicInterval,
         reservation_kind: ReservationKind,
     ) -> Result<EvidenceSelection, EvidenceSelectionError> {
-        if !self.coverage.covers(interval) {
+        self.select_impl(interval, reservation_kind, true)
+    }
+
+    /// Selects the complete broad acquisition population, ignoring this root's derived view
+    /// selection. This is deliberately separate from ordinary scene consumers and is used only
+    /// for explicitly labelled full-eligible exports.
+    pub fn select_eligible(
+        self: &Arc<Self>,
+        interval: GenomicInterval,
+    ) -> Result<EvidenceSelection, EvidenceSelectionError> {
+        self.select_impl(interval, ReservationKind::Normal, false)
+    }
+
+    fn select_impl(
+        self: &Arc<Self>,
+        interval: GenomicInterval,
+        reservation_kind: ReservationKind,
+        apply_view_filter: bool,
+    ) -> Result<EvidenceSelection, EvidenceSelectionError> {
+        // A derived filtered root deliberately has two authorities: `coverage` certifies the
+        // interval for which its allowed-handle set is complete, while `eligible_coverage`
+        // certifies the broader canonical population retained behind that view. Normal consumers
+        // must stay inside the filtered certificate. The explicit `select_eligible` path is the
+        // inverse: it ignores the allowed-handle set so it must validate against the eligible
+        // certificate. Checking filtered coverage for both paths falsely rejects a cache-backed
+        // zoom-out even though every canonical record is still resident.
+        let certified_coverage = if apply_view_filter {
+            &self.coverage
+        } else {
+            &self.eligible_coverage
+        };
+        if !certified_coverage.covers(interval) {
             return Err(EvidenceSelectionError::UncertifiedInterval(interval));
         }
         let (maximum_records, maximum_chunk_records) =
@@ -388,6 +490,14 @@ impl EvidenceRoot {
                     .handles()
                     .get(record_index)
                     .ok_or(EvidenceSelectionError::InvalidChunkIndex)?;
+                if apply_view_filter
+                    && self
+                        .allowed_handles
+                        .as_ref()
+                        .is_some_and(|handles| handles.binary_search(&handle).is_err())
+                {
+                    continue;
+                }
                 if !seen.insert(handle) {
                     continue;
                 }
@@ -447,6 +557,13 @@ impl EvidenceRoot {
         )?;
         let mut records = Vec::with_capacity(handles.len());
         for handle in handles {
+            if self
+                .allowed_handles
+                .as_ref()
+                .is_some_and(|allowed| allowed.binary_search(&handle).is_err())
+            {
+                return Err(EvidenceSelectionError::MissingHandle(handle));
+            }
             records.push(
                 self.record_ref(handle)
                     .ok_or(EvidenceSelectionError::MissingHandle(handle))?,
@@ -486,6 +603,119 @@ impl EvidenceRoot {
             });
         }
         None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn derive_filtered(
+        self: &Arc<Self>,
+        revision: EvidenceRevision,
+        target: GenomicInterval,
+        fingerprint: ContractFingerprint,
+        mut handles: Vec<AlignmentHandle>,
+        predicate_matches: Vec<usize>,
+        eligible_records: usize,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, EvidenceBuildError> {
+        handles.sort_unstable();
+        handles.dedup();
+        let excluded = eligible_records.saturating_sub(handles.len());
+        let source_provenance = self.coverage.exact_provenance(target);
+        let provenance = source_provenance.map_or(
+            crate::FilteredRecordProvenance {
+                records_seen: eligible_records as u64,
+                eligible_records: handles.len() as u64,
+                user_filter: excluded as u64,
+                ..crate::FilteredRecordProvenance::default()
+            },
+            |source| crate::FilteredRecordProvenance {
+                records_seen: source.records_seen,
+                eligible_records: handles.len() as u64,
+                unmapped: source.unmapped,
+                secondary: source.secondary,
+                supplementary: source.supplementary,
+                user_filter: source.user_filter.saturating_add(excluded as u64),
+            },
+        );
+        let mut coverage = CertifiedCoverageSet::new(self.source_revision, self.record_contract);
+        coverage.insert(crate::CompleteCoverage::new(
+            self.source_revision,
+            self.record_contract,
+            target,
+            provenance,
+        )?)?;
+        let retained_bytes = self
+            .chunks
+            .len()
+            .saturating_mul(size_of::<Arc<EvidenceChunk>>())
+            .saturating_add(handles.len().saturating_mul(size_of::<AlignmentHandle>()))
+            .saturating_add(predicate_matches.len().saturating_mul(size_of::<usize>()))
+            .saturating_add(size_of::<GenomicInterval>())
+            .saturating_add(size_of::<crate::CompleteCoverage>());
+        let allocation = ledger
+            .reserve(
+                AllocationClass::EvidenceRootMetadata,
+                retained_bytes,
+                reservation_kind,
+            )?
+            .register(retained_bytes, publication_revision)?;
+        let matching_records = handles.len();
+        Ok(Arc::new(Self {
+            revision,
+            source_revision: self.source_revision,
+            record_contract: self.record_contract,
+            payload: self.payload.clone(),
+            chunks: Arc::clone(&self.chunks),
+            record_count: matching_records,
+            coverage: Arc::new(coverage),
+            eligible_coverage: Arc::clone(&self.eligible_coverage),
+            view_filter: EvidenceViewFilter {
+                fingerprint,
+                eligible_records,
+                matching_records,
+                predicate_matches: predicate_matches.into(),
+            },
+            allowed_handles: Some(handles.into()),
+            metadata_allocation: allocation,
+        }))
+    }
+
+    pub(crate) fn derive_unfiltered(
+        self: &Arc<Self>,
+        revision: EvidenceRevision,
+        target: GenomicInterval,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, EvidenceBuildError> {
+        let record_count = self.select_eligible(target)?.len();
+        let retained_bytes = self
+            .chunks
+            .len()
+            .saturating_mul(size_of::<Arc<EvidenceChunk>>())
+            .saturating_add(size_of::<Arc<CertifiedCoverageSet>>() * 2)
+            .saturating_add(size_of::<GenomicInterval>());
+        let allocation = ledger
+            .reserve(
+                AllocationClass::EvidenceRootMetadata,
+                retained_bytes,
+                reservation_kind,
+            )?
+            .register(retained_bytes, publication_revision)?;
+        Ok(Arc::new(Self {
+            revision,
+            source_revision: self.source_revision,
+            record_contract: self.record_contract,
+            payload: self.payload.clone(),
+            chunks: Arc::clone(&self.chunks),
+            record_count,
+            coverage: Arc::clone(&self.eligible_coverage),
+            eligible_coverage: Arc::clone(&self.eligible_coverage),
+            view_filter: EvidenceViewFilter::unfiltered(record_count),
+            allowed_handles: None,
+            metadata_allocation: allocation,
+        }))
     }
 }
 
@@ -666,6 +896,8 @@ pub enum EvidenceBuildError {
     Ledger(#[from] LedgerError),
     #[error(transparent)]
     Coverage(#[from] CoverageError),
+    #[error(transparent)]
+    Selection(#[from] EvidenceSelectionError),
     #[error("evidence chunk belongs to a different source revision")]
     SourceRevisionMismatch,
     #[error("evidence chunk belongs to a different record contract")]
@@ -901,6 +1133,45 @@ mod tests {
             root.select(interval).unwrap_err(),
             EvidenceSelectionError::UncertifiedInterval(interval)
         );
+    }
+
+    #[test]
+    fn filtered_root_selects_broader_eligible_evidence_only_through_explicit_boundary() {
+        let ledger = AllocationLedger::new(1 << 20, 0);
+        let canonical = root(&ledger);
+        let broad = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let narrow = GenomicInterval::new(ContigId::new(0), 40, 50).unwrap();
+        let narrow_selection = canonical.select(narrow).unwrap();
+        let retained = narrow_selection
+            .records()
+            .iter()
+            .map(|record| record.handle)
+            .take(1)
+            .collect::<Vec<_>>();
+        let eligible_records = narrow_selection.len();
+        drop(narrow_selection);
+        let filtered = canonical
+            .derive_filtered(
+                EvidenceRevision::new(RevisionFingerprint::new(10, 12)),
+                narrow,
+                ContractFingerprint::new(77),
+                retained,
+                vec![1],
+                eligible_records,
+                &ledger,
+                ReservationKind::Normal,
+                13,
+            )
+            .unwrap();
+
+        assert!(filtered.coverage().covers(narrow));
+        assert!(!filtered.coverage().covers(broad));
+        assert!(filtered.eligible_coverage().covers(broad));
+        assert_eq!(
+            filtered.select(broad).unwrap_err(),
+            EvidenceSelectionError::UncertifiedInterval(broad)
+        );
+        assert_eq!(filtered.select_eligible(broad).unwrap().len(), 3);
     }
 
     #[test]

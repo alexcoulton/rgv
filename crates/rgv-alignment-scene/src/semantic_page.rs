@@ -2839,7 +2839,8 @@ mod tests {
 
     use rgv_core::{
         AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, BisulfiteContext, ContigId,
-        ReadStackingMode, SbxDisplayOptions, SmrtKineticsMode, UltimaDisplayOptions,
+        ReadBaseDisplayMode, ReadStackingMode, SbxDisplayOptions, SmrtKineticsMode,
+        UltimaDisplayOptions,
     };
     use rgv_hts::{
         AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
@@ -4214,6 +4215,108 @@ mod tests {
             .collect::<Vec<_>>();
         projected_page_keys.sort_unstable();
         assert_eq!(projected_page_keys, page_keys);
+    }
+
+    #[test]
+    fn base_glyphs_cross_only_the_eight_pixel_width_and_height_threshold() {
+        let ledger = AllocationLedger::new(8 << 20, 0);
+        let (evidence, atlas) = evidence_and_atlas(&ledger);
+        let reference = ReferenceSlice {
+            interval: GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+            bases: vec![b'A'; 300],
+        };
+        let style = crate::AlignmentStyleContract {
+            base_display: ReadBaseDisplayMode::All,
+            ..crate::AlignmentStyleContract::default()
+        };
+        let presentation = PresentationContract {
+            geometry_lod: GeometryLod::Base,
+            style,
+            reference: Some(crate::ReferenceRevision::new(RevisionFingerprint::new(
+                10, 11,
+            ))),
+            annotation: None,
+        };
+        let mut pages = Vec::new();
+        for tile in 0..3 {
+            for family in presentation.required_page_families() {
+                pages.push(page_with_style(
+                    &ledger,
+                    &evidence,
+                    &atlas,
+                    tile,
+                    GeometryLod::Base,
+                    Some(&reference),
+                    style,
+                    family,
+                ));
+            }
+        }
+        let scene = crate::AlignmentPresentationScene::new(
+            crate::SceneRevision::new(RevisionFingerprint::new(51, 52)),
+            evidence,
+            atlas,
+            presentation,
+            GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+            0..1,
+            pages,
+            &ledger,
+            ReservationKind::Normal,
+            53,
+        )
+        .unwrap();
+        let camera = |width: f64, row_height: f64| {
+            crate::AlignmentCamera::new(
+                GenomicInterval::new(ContigId::new(0), 0, 100).unwrap(),
+                0.0,
+                row_height,
+                row_height,
+                crate::CpuClipRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width,
+                    height: row_height,
+                },
+            )
+            .unwrap()
+        };
+        let legible =
+            crate::CpuAlignmentProjector::project_labels(&scene, 1, camera(800.0, 8.0)).unwrap();
+        assert!(legible.base_anchors_examined > 0);
+        assert!(legible.base_labels_projected > 0);
+        assert!(legible.labels.iter().any(|label| {
+            matches!(label.component, AlignmentComponent::Base { .. })
+                && label
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| matches!(text, "A" | "C" | "G" | "T" | "N"))
+        }));
+        let too_narrow =
+            crate::CpuAlignmentProjector::project_labels(&scene, 2, camera(799.0, 8.0)).unwrap();
+        assert_eq!(
+            too_narrow.base_anchors_examined,
+            legible.base_anchors_examined
+        );
+        assert_eq!(too_narrow.base_labels_projected, 0);
+        assert!(
+            too_narrow
+                .labels
+                .iter()
+                .all(|label| !matches!(label.component, AlignmentComponent::Base { .. }))
+        );
+        let too_short =
+            crate::CpuAlignmentProjector::project_labels(&scene, 3, camera(800.0, 7.9)).unwrap();
+        assert_eq!(
+            too_short.base_anchors_examined,
+            legible.base_anchors_examined
+        );
+        assert_eq!(too_short.base_labels_projected, 0);
+        assert!(
+            too_short
+                .labels
+                .iter()
+                .all(|label| !matches!(label.component, AlignmentComponent::Base { .. }))
+        );
     }
 
     #[test]

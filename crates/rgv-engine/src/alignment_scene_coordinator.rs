@@ -8,17 +8,18 @@ use std::{
 };
 
 use rgv_alignment_scene::{
-    AlignmentPresentationOwner, AlignmentPresentationSceneError, AlignmentPresentationStore,
-    AlignmentPresentationStoreError, AlignmentRowActivityCursor, AlignmentRowActivityProfile,
-    AlignmentRowAtlasError, AlignmentSceneCamera, AlignmentSceneSnapshot,
-    AlignmentSceneSnapshotError, AlignmentSourceRevision, AlleleSummaryDetail,
-    CanonicalGenomicTile, CanonicalRowBlock, ContractFingerprint, EvidenceBuildError,
-    EvidenceRevision, EvidenceSelectionError, EvidenceStoreError, ExactAlleleSummaryError,
-    ExactDepthSummaryError, ExactFilterSummaryError, ExactJunctionSummaryError,
-    ExactModificationSummaryError, ExactPairSummaryError, ExactSummaryRootError, GeometryLod,
-    JunctionAnnotationIndex, LayoutContract, LedgerError, PayloadContract, PresentationContract,
-    PresentationStorePressure, ReferenceRevision, ReservationKind, RowAtlasRevision, SceneRevision,
-    SemanticPageError, StorePressure, SummaryContract, SummarySemanticPageError,
+    AlignmentFilterEvaluationError, AlignmentPresentationOwner, AlignmentPresentationSceneError,
+    AlignmentPresentationStore, AlignmentPresentationStoreError, AlignmentRowActivityCursor,
+    AlignmentRowActivityProfile, AlignmentRowAtlasError, AlignmentSceneCamera,
+    AlignmentSceneSnapshot, AlignmentSceneSnapshotError, AlignmentSourceRevision,
+    AlignmentViewFilterContract, AlleleSummaryDetail, CanonicalGenomicTile, CanonicalRowBlock,
+    ContractFingerprint, EvidenceBuildError, EvidenceRevision, EvidenceSelectionError,
+    EvidenceStoreError, ExactAlleleSummaryError, ExactDepthSummaryError, ExactFilterSummaryError,
+    ExactJunctionSummaryError, ExactModificationSummaryError, ExactPairSummaryError,
+    ExactSummaryRootError, GeometryLod, JunctionAnnotationIndex, LayoutContract, LedgerError,
+    PayloadContract, PresentationContract, PresentationStorePressure, ReferenceRevision,
+    ReservationKind, RowAtlasRevision, SceneRevision, SemanticPageError, StorePressure,
+    SummaryContract, SummarySemanticPageError, alignment_filter_reference_horizon,
 };
 use rgv_core::{ContigId, GenomicInterval};
 use rgv_hts::ReferenceSlice;
@@ -99,6 +100,10 @@ pub struct AlignmentSceneBuildContract {
     pub contig: ContigId,
     pub contig_length: u64,
     pub payload: PayloadContract,
+    pub view_filter: AlignmentViewFilterContract,
+    /// Non-destructive overlay predicates do not change rows or summaries, but reference-backed
+    /// highlights still need the same certified reference horizon as a true view filter.
+    pub highlight_filter: AlignmentViewFilterContract,
     pub summaries: SummaryContract,
     pub layout: LayoutContract,
     pub presentation: PresentationContract,
@@ -111,6 +116,11 @@ pub struct AlignmentSceneBuildContract {
 }
 
 impl AlignmentSceneBuildContract {
+    fn view_filter_evaluation_fingerprint(&self) -> ContractFingerprint {
+        self.view_filter
+            .evaluation_fingerprint(self.presentation.reference)
+    }
+
     fn validate(&self) -> Result<(), AlignmentSceneCoordinatorConfigError> {
         if self.contig_length == 0 {
             return Err(AlignmentSceneCoordinatorConfigError::EmptyContig);
@@ -173,6 +183,7 @@ fn alignment_row_atlas_satisfies_contract(
         && atlas.shares_stable_record_authority(evidence)
         && atlas.source_revision() == contract.source_revision
         && atlas.record_contract() == contract.record_contract
+        && atlas.view_filter() == contract.view_filter_evaluation_fingerprint()
         && atlas.layout_contract() == contract.layout
 }
 
@@ -414,6 +425,15 @@ pub struct AlignmentSceneCoordinatorTelemetry {
     pub source_acquisitions: u64,
     pub source_refusals: u64,
     pub evidence_candidates: u64,
+    /// Non-empty typed view-filter derivations evaluated over already retained canonical
+    /// evidence. These counters distinguish CPU predicate work from BAM/CRAM source acquisition.
+    pub view_filter_evaluations: u64,
+    pub view_filter_records_examined: u64,
+    pub view_filter_records_matched: u64,
+    pub view_filter_evaluation_nanoseconds: u64,
+    pub last_view_filter_evaluation_nanoseconds: u64,
+    pub last_view_filter_contract_fingerprint: u64,
+    pub last_view_filter_evaluation_fingerprint: u64,
     pub exact_summary_candidates: u64,
     pub row_atlas_candidates: u64,
     pub presentation_candidates: u64,
@@ -796,6 +816,10 @@ struct AlignmentSceneSourceLane {
     /// current scrollbar truth.
     row_activity_cache: RefCell<Option<AlignmentRowActivityCache>>,
     row_activity_telemetry: Cell<AlignmentRowActivityTelemetry>,
+    /// Once broad evidence is resident we can derive the exact aligned span needed by
+    /// reference-backed view/highlight predicates. Until then the ordinary source horizon is the
+    /// truthful initial request; the expanded requirement is published on the next frame.
+    filter_reference_horizon: Option<GenomicInterval>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -917,6 +941,7 @@ where
                 optional_work_paused: false,
                 row_activity_cache: RefCell::new(None),
                 row_activity_telemetry: Cell::new(AlignmentRowActivityTelemetry::default()),
+                filter_reference_horizon: None,
             },
         );
         Ok(())
@@ -1588,6 +1613,7 @@ impl AlignmentSceneSourceLane {
         if previous_source_horizon != Some(source_horizon) {
             self.vertical_residency_budget_limited = false;
             self.vertical_residency_failed = false;
+            self.filter_reference_horizon = None;
         }
         if self
             .refusal
@@ -1648,6 +1674,20 @@ impl AlignmentSceneSourceLane {
     where
         B: CanonicalAlignmentSourceBackend,
     {
+        let mut contract = contract;
+        // Reference authority belongs to the source revision named by the presentation contract,
+        // not to one transient filter generation. Desktop contract builders deliberately leave
+        // the asynchronously installed slice empty. Preserve an already installed immutable
+        // slice when the replacement still names that exact reference and contig; horizon
+        // sufficiency remains checked by `matching_reference_slice` and can request a larger
+        // slice normally.
+        if contract.reference.is_none()
+            && let Some(authority) = self.contract.reference.as_ref()
+            && contract.presentation.reference == Some(authority.revision())
+            && authority.slice().interval.contig() == contract.contig
+        {
+            contract.reference = Some(authority.clone());
+        }
         contract.validate()?;
         if contract.source_revision != self.contract.source_revision {
             return Err(AlignmentSceneCoordinatorConfigError::SourceAuthorityMismatch.into());
@@ -1665,6 +1705,12 @@ impl AlignmentSceneSourceLane {
             .as_ref()
             .map(|desired| desired.camera)
             .ok_or(AlignmentSceneCoordinatorError::MissingCamera)?;
+        if self.contract.view_filter.fingerprint() != contract.view_filter.fingerprint()
+            || self.contract.highlight_filter.fingerprint()
+                != contract.highlight_filter.fingerprint()
+        {
+            self.filter_reference_horizon = None;
+        }
         self.contract = contract;
         self.vertical_residency_budget_limited = false;
         self.vertical_residency_failed = false;
@@ -1684,7 +1730,7 @@ impl AlignmentSceneSourceLane {
         let Some(desired) = self.desired.clone() else {
             return Ok(AlignmentReferenceInstallOutcome::default());
         };
-        let required_reference = required_reference_horizon(&self.contract, desired.source_horizon);
+        let required_reference = self.required_reference_horizon(desired.source_horizon);
         if self.contract.presentation.reference != Some(authority.revision)
             || authority.slice.interval.contig() != self.contract.contig
             || !authority
@@ -1733,9 +1779,7 @@ impl AlignmentSceneSourceLane {
                         AlignmentSceneCoordinatorConfigError::ReferenceAuthorityMismatch.into(),
                     );
                 }
-                let Some(reference) =
-                    matching_reference_slice(&self.contract, desired.source_horizon)
-                else {
+                let Some(reference) = self.matching_reference_slice(desired.source_horizon) else {
                     return Ok(false);
                 };
                 Some(reference)
@@ -1749,6 +1793,8 @@ impl AlignmentSceneSourceLane {
         };
         if current.summaries().contract() != self.contract.summaries
             || current.reads().atlas().layout_contract() != self.contract.layout
+            || current.reads().evidence().view_filter().fingerprint()
+                != self.contract.view_filter_evaluation_fingerprint()
             || !current
                 .reads()
                 .evidence()
@@ -1819,6 +1865,8 @@ impl AlignmentSceneSourceLane {
             presentation_core_matches(scene.reads().presentation(), self.contract.presentation)
                 && scene.summaries().contract() == self.contract.summaries
                 && scene.reads().atlas().layout_contract() == self.contract.layout
+                && scene.reads().evidence().view_filter().fingerprint()
+                    == self.contract.view_filter_evaluation_fingerprint()
         });
         let reference_requirement = self.reference_requirement(desired);
         let reference_products_current = snapshot.as_ref().is_some_and(|scene| {
@@ -1891,8 +1939,11 @@ impl AlignmentSceneSourceLane {
         let Some(revision) = self.contract.presentation.reference else {
             return AlignmentReferenceRequirement::NotRequired;
         };
-        let horizon = required_reference_horizon(&self.contract, desired.source_horizon);
-        if matching_reference_slice(&self.contract, desired.source_horizon).is_some() {
+        let horizon = self.required_reference_horizon(desired.source_horizon);
+        if self
+            .matching_reference_slice(desired.source_horizon)
+            .is_some()
+        {
             AlignmentReferenceRequirement::Ready { revision, horizon }
         } else {
             AlignmentReferenceRequirement::Pending { revision, horizon }
@@ -1907,12 +1958,41 @@ impl AlignmentSceneSourceLane {
         &self,
         source_horizon: GenomicInterval,
     ) -> (PresentationContract, Option<&ReferenceSlice>) {
-        let reference = matching_reference_slice(&self.contract, source_horizon);
+        let reference = self.matching_reference_slice(source_horizon);
         let mut presentation = self.contract.presentation;
         if reference.is_none() {
             presentation.reference = None;
         }
         (presentation, reference)
+    }
+
+    fn required_reference_horizon(&self, source_horizon: GenomicInterval) -> GenomicInterval {
+        let ordinary = required_reference_horizon(&self.contract, source_horizon);
+        let Some(filter) = self
+            .filter_reference_horizon
+            .filter(|interval| interval.contig() == ordinary.contig())
+        else {
+            return ordinary;
+        };
+        GenomicInterval::new(
+            ordinary.contig(),
+            ordinary.start().min(filter.start()),
+            ordinary
+                .end()
+                .max(filter.end())
+                .min(self.contract.contig_length),
+        )
+        .expect("the union of non-empty reference horizons remains non-empty")
+    }
+
+    fn matching_reference_slice(&self, source_horizon: GenomicInterval) -> Option<&ReferenceSlice> {
+        let revision = self.contract.presentation.reference?;
+        let reference = self.contract.reference.as_ref()?;
+        let required = self.required_reference_horizon(source_horizon);
+        (reference.revision == revision
+            && reference.slice.interval.contig() == self.contract.contig
+            && reference.slice.interval.contains_interval(required))
+        .then_some(reference.slice.as_ref())
     }
 
     fn row_activity_for_frame(
@@ -2091,8 +2171,10 @@ impl AlignmentSceneSourceLane {
         {
             return Ok(None);
         }
-        if !self.source_roots_cover(actor, &desired) {
-            self.publish_source_roots_from_cache(actor, &desired)?;
+        if !self.source_roots_cover(actor, &desired)
+            && !self.publish_source_roots_from_cache(actor, &desired)?
+        {
+            return Ok(None);
         }
         let scene = self
             .prepare_from_source_roots(owner, actor, presentation, &desired)?
@@ -2118,6 +2200,8 @@ impl AlignmentSceneSourceLane {
         let evidence = reads.evidence();
         let atlas = reads.atlas();
         if !evidence.payload().satisfies(&self.contract.payload)
+            || evidence.view_filter().fingerprint()
+                != self.contract.view_filter_evaluation_fingerprint()
             || current.summaries().contract() != self.contract.summaries
             || atlas.layout_contract() != self.contract.layout
             || !evidence.coverage().covers(desired.source_horizon)
@@ -2176,6 +2260,8 @@ impl AlignmentSceneSourceLane {
             return Ok(None);
         };
         if !evidence.payload().satisfies(&self.contract.payload)
+            || evidence.view_filter().fingerprint()
+                != self.contract.view_filter_evaluation_fingerprint()
             || !evidence.coverage().covers(desired.source_horizon)
             || summaries.contract() != self.contract.summaries
             || !summaries
@@ -2224,6 +2310,8 @@ impl AlignmentSceneSourceLane {
             return false;
         };
         evidence.payload().satisfies(&self.contract.payload)
+            && evidence.view_filter().fingerprint()
+                == self.contract.view_filter_evaluation_fingerprint()
             && evidence.coverage().covers(desired.source_horizon)
             && summaries.contract() == self.contract.summaries
             && summaries
@@ -2237,16 +2325,16 @@ impl AlignmentSceneSourceLane {
         &mut self,
         actor: &mut AlignmentSourceActor<B>,
         desired: &DesiredScene,
-    ) -> Result<(), AlignmentSceneCoordinatorError<B::Error>>
+    ) -> Result<bool, AlignmentSceneCoordinatorError<B::Error>>
     where
         B: CanonicalAlignmentSourceBackend,
     {
-        let evidence_candidate = actor.store_mut().prepare(
+        let canonical_candidate = actor.store_mut().prepare(
             desired.prepared_interval,
             self.contract.payload.clone(),
             ReservationKind::Transition,
         )?;
-        if !evidence_candidate
+        if !canonical_candidate
             .root()
             .coverage()
             .covers(desired.source_horizon)
@@ -2256,6 +2344,70 @@ impl AlignmentSceneSourceLane {
             ));
         }
         self.telemetry.evidence_candidates = self.telemetry.evidence_candidates.saturating_add(1);
+        if self.contract.view_filter.requires_reference()
+            || self.contract.highlight_filter.requires_reference()
+        {
+            let mut required = desired.source_horizon;
+            for filter in [&self.contract.view_filter, &self.contract.highlight_filter] {
+                if filter.requires_reference() {
+                    let horizon = alignment_filter_reference_horizon(
+                        canonical_candidate.root(),
+                        desired.source_horizon,
+                        filter,
+                        self.contract.contig_length,
+                    )
+                    .map_err(EvidenceStoreError::ViewFilter)?;
+                    required = GenomicInterval::new(
+                        required.contig(),
+                        required.start().min(horizon.start()),
+                        required.end().max(horizon.end()),
+                    )
+                    .expect("the union of non-empty filter reference horizons is non-empty");
+                }
+            }
+            self.filter_reference_horizon = Some(required);
+        } else {
+            self.filter_reference_horizon = None;
+        }
+        let reference = self.matching_reference_slice(desired.source_horizon);
+        if self.contract.view_filter.requires_reference() && reference.is_none() {
+            return Ok(false);
+        }
+        let filter_started = Instant::now();
+        let filter_was_evaluated = !self.contract.view_filter.is_empty();
+        let filter_contract_fingerprint = self.contract.view_filter.fingerprint();
+        let filter_evaluation_fingerprint = self.contract.view_filter_evaluation_fingerprint();
+        let evidence_candidate = actor.store_mut().prepare_filtered(
+            canonical_candidate,
+            desired.source_horizon,
+            &self.contract.view_filter,
+            filter_evaluation_fingerprint,
+            reference,
+            ReservationKind::Transition,
+        )?;
+        if filter_was_evaluated {
+            let elapsed = elapsed_nanoseconds(filter_started);
+            let filter = evidence_candidate.root().view_filter();
+            self.telemetry.view_filter_evaluations =
+                self.telemetry.view_filter_evaluations.saturating_add(1);
+            self.telemetry.view_filter_records_examined = self
+                .telemetry
+                .view_filter_records_examined
+                .saturating_add(u64::try_from(filter.eligible_records()).unwrap_or(u64::MAX));
+            self.telemetry.view_filter_records_matched = self
+                .telemetry
+                .view_filter_records_matched
+                .saturating_add(u64::try_from(filter.matching_records()).unwrap_or(u64::MAX));
+            self.telemetry.view_filter_evaluation_nanoseconds = self
+                .telemetry
+                .view_filter_evaluation_nanoseconds
+                .saturating_add(elapsed);
+            self.telemetry.last_view_filter_evaluation_nanoseconds = elapsed;
+            self.telemetry.last_view_filter_contract_fingerprint =
+                filter_contract_fingerprint.get();
+            self.telemetry.last_view_filter_evaluation_fingerprint =
+                filter_evaluation_fingerprint.get();
+        }
         let evidence = Arc::clone(evidence_candidate.root());
         let summary_candidate = actor.store_mut().prepare_exact_summaries(
             &evidence,
@@ -2281,7 +2433,7 @@ impl AlignmentSceneSourceLane {
             summary_candidate,
             atlas_candidate,
         )?;
-        Ok(())
+        Ok(true)
     }
 
     fn prepared_covers_desired(
@@ -2300,6 +2452,8 @@ impl AlignmentSceneSourceLane {
         if scene.reads().presentation() != available_presentation
             || scene.summaries().contract() != self.contract.summaries
             || scene.reads().atlas().layout_contract() != self.contract.layout
+            || scene.reads().evidence().view_filter().fingerprint()
+                != self.contract.view_filter_evaluation_fingerprint()
             || !scene
                 .reads()
                 .evidence()
@@ -2330,6 +2484,8 @@ impl AlignmentSceneSourceLane {
         if !presentation_core_matches(scene.reads().presentation(), self.contract.presentation)
             || scene.summaries().contract() != self.contract.summaries
             || scene.reads().atlas().layout_contract() != self.contract.layout
+            || scene.reads().evidence().view_filter().fingerprint()
+                != self.contract.view_filter_evaluation_fingerprint()
             || !scene
                 .prepared_interval()
                 .contains_interval(camera.interval())
@@ -2399,6 +2555,8 @@ impl AlignmentSceneSourceLane {
             || scene.reads().presentation() != available_presentation
             || scene.summaries().contract() != self.contract.summaries
             || scene.reads().atlas().layout_contract() != self.contract.layout
+            || scene.reads().evidence().view_filter().fingerprint()
+                != self.contract.view_filter_evaluation_fingerprint()
             || !scene
                 .reads()
                 .evidence()
@@ -2738,19 +2896,6 @@ fn source_spec(
     )
 }
 
-fn matching_reference_slice(
-    contract: &AlignmentSceneBuildContract,
-    horizon: GenomicInterval,
-) -> Option<&ReferenceSlice> {
-    let revision = contract.presentation.reference?;
-    let reference = contract.reference.as_ref()?;
-    let required = required_reference_horizon(contract, horizon);
-    (reference.revision == revision
-        && reference.slice.interval.contig() == contract.contig
-        && reference.slice.interval.contains_interval(required))
-    .then_some(reference.slice.as_ref())
-}
-
 /// Reference revisions invalidate only reference-interpreted page products. Comparing contracts
 /// with that optional dependency erased lets the immutable core scene remain current while FASTA
 /// work is pending, unavailable, or being upgraded.
@@ -2976,6 +3121,9 @@ fn evidence_store_budget_pressure(error: &EvidenceStoreError) -> Option<LedgerEr
         | EvidenceStoreError::RowAtlas(AlignmentRowAtlasError::EvidenceSelection(error)) => {
             evidence_selection_budget_pressure(error)
         }
+        EvidenceStoreError::ViewFilter(AlignmentFilterEvaluationError::Evidence(error)) => {
+            evidence_selection_budget_pressure(error)
+        }
         EvidenceStoreError::Build(_)
         | EvidenceStoreError::ExactDepthSummary(_)
         | EvidenceStoreError::ExactAlleleSummary(_)
@@ -2985,6 +3133,7 @@ fn evidence_store_budget_pressure(error: &EvidenceStoreError) -> Option<LedgerEr
         | EvidenceStoreError::ExactFilterSummary(_)
         | EvidenceStoreError::ExactSummaryRoot(_)
         | EvidenceStoreError::RowAtlas(_)
+        | EvidenceStoreError::ViewFilter(_)
         | EvidenceStoreError::SourceRevisionMismatch
         | EvidenceStoreError::RecordContractMismatch
         | EvidenceStoreError::SummaryEvidenceMismatch
@@ -3125,14 +3274,14 @@ mod tests {
     use std::{num::NonZeroUsize, path::Path, sync::Arc};
 
     use rgv_alignment_scene::{
-        AlignmentCamera, AlignmentComponent, AlignmentPanelLaneCapture,
-        AlignmentPanelLanePublication, AlignmentPanelSceneAdmission, AlignmentPanelSceneStore,
-        AlignmentStyleContract, AlleleSummaryDetail, AllocationLedger, CapabilityRequirement,
-        EvidenceStore, GeometryLod, RevisionFingerprint,
+        AlignmentCamera, AlignmentComponent, AlignmentFilterPredicate, AlignmentFilterScope,
+        AlignmentPanelLaneCapture, AlignmentPanelLanePublication, AlignmentPanelSceneAdmission,
+        AlignmentPanelSceneStore, AlignmentStyleContract, AlleleSummaryDetail, AllocationLedger,
+        CapabilityRequirement, EvidenceStore, GeometryLod, RevisionFingerprint,
     };
     use rgv_core::{
-        AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, OverlappingMatePolicy,
-        PanelId, ReadStackingMode, TrackId,
+        AlignmentCigarEventPredicate, AlignmentGroupMode, AlignmentOrderDirection,
+        AlignmentSortMode, OverlappingMatePolicy, PanelId, ReadStackingMode, TrackId,
     };
     use rgv_hts::{
         AlignedBaseClassification, AlignmentOpenOptions, AlignmentSource, LocalAlignmentSource,
@@ -3187,6 +3336,8 @@ mod tests {
             contig,
             contig_length,
             payload: no_payload(),
+            view_filter: AlignmentViewFilterContract::default(),
+            highlight_filter: AlignmentViewFilterContract::default(),
             summaries: SummaryContract {
                 overlapping_mate_policy: OverlappingMatePolicy::CountBoth,
                 minimum_base_quality: 0,
@@ -3767,6 +3918,253 @@ mod tests {
                 contract.contig_length,
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn substitution_filter_expands_reference_to_full_eligible_read_spans_without_more_bam_io() {
+        let revision = test_reference_revision(151);
+        let (mut coordinator, camera) = test_coordinator_with_contract(|contract| {
+            contract.payload = PayloadContract::new(
+                CapabilityRequirement::Required,
+                CapabilityRequirement::Required,
+                [*b"XS"],
+                None,
+            );
+            contract.view_filter = AlignmentViewFilterContract::new(
+                1,
+                [AlignmentFilterPredicate::Substitution {
+                    scope: AlignmentFilterScope::Anywhere,
+                    observed_base: None,
+                    minimum_count: Some(1),
+                    maximum_count: None,
+                }],
+            );
+            contract.presentation.reference = Some(revision);
+        });
+        coordinator.update_camera(camera).unwrap();
+        let initial = match coordinator.frame().unwrap().reference_requirement {
+            AlignmentReferenceRequirement::Pending { horizon, .. } => horizon,
+            other => panic!("expected pending reference requirement, got {other:?}"),
+        };
+
+        for _ in 0..256 {
+            let event = coordinator.pump_once().unwrap();
+            if matches!(
+                event.source_event,
+                Some(AlignmentSourceActorEvent::AcquisitionCompleted { .. })
+            ) {
+                break;
+            }
+        }
+        let expanded = match coordinator.frame().unwrap().reference_requirement {
+            AlignmentReferenceRequirement::Pending { horizon, .. } => horizon,
+            other => panic!("expected expanded pending reference requirement, got {other:?}"),
+        };
+        assert!(expanded.contains_interval(initial));
+        let before = coordinator.telemetry().source_acquisitions;
+
+        let installed = coordinator
+            .install_reference_authority(reference_authority(revision, expanded))
+            .unwrap();
+        assert!(installed.installed);
+        assert!(installed.published_scene.is_some());
+        assert_eq!(coordinator.telemetry().source_acquisitions, before);
+        let frame = coordinator.frame().unwrap();
+        let evidence = frame.snapshot.unwrap().reads().evidence().clone();
+        assert_eq!(
+            evidence.view_filter().fingerprint(),
+            coordinator.contract().view_filter_evaluation_fingerprint()
+        );
+        assert_eq!(
+            evidence.view_filter().matching_records(),
+            evidence.record_count()
+        );
+    }
+
+    #[test]
+    fn compatible_reference_authority_survives_a_stacked_filter_contract_replacement() {
+        let revision = test_reference_revision(152);
+        let (mut coordinator, camera) = test_coordinator_with_contract(|contract| {
+            contract.payload = PayloadContract::new(
+                CapabilityRequirement::Required,
+                CapabilityRequirement::Required,
+                [*b"XS"],
+                None,
+            );
+            contract.view_filter = AlignmentViewFilterContract::new(
+                1,
+                [AlignmentFilterPredicate::Substitution {
+                    scope: AlignmentFilterScope::Anywhere,
+                    observed_base: None,
+                    minimum_count: Some(1),
+                    maximum_count: None,
+                }],
+            );
+            contract.presentation.reference = Some(revision);
+        });
+        coordinator.update_camera(camera).unwrap();
+        let mut source_completed = false;
+        for _ in 0..256 {
+            let event = coordinator.pump_once().unwrap();
+            if matches!(
+                event.source_event,
+                Some(AlignmentSourceActorEvent::AcquisitionCompleted { .. })
+            ) {
+                source_completed = true;
+                break;
+            }
+        }
+        assert!(source_completed);
+        let expanded = match coordinator.frame().unwrap().reference_requirement {
+            AlignmentReferenceRequirement::Pending { horizon, .. } => horizon,
+            other => panic!("expected pending reference requirement, got {other:?}"),
+        };
+        assert!(
+            coordinator
+                .install_reference_authority(reference_authority(revision, expanded))
+                .unwrap()
+                .installed
+        );
+        let source_acquisitions = coordinator.telemetry().source_acquisitions;
+
+        let mut stacked = coordinator.contract().clone();
+        stacked.reference = None;
+        stacked.view_filter = AlignmentViewFilterContract::new(
+            1,
+            [
+                AlignmentFilterPredicate::Substitution {
+                    scope: AlignmentFilterScope::Anywhere,
+                    observed_base: None,
+                    minimum_count: Some(1),
+                    maximum_count: None,
+                },
+                AlignmentFilterPredicate::CigarEvent {
+                    event: AlignmentCigarEventPredicate::Indel,
+                    scope: AlignmentFilterScope::Anywhere,
+                    minimum_length: None,
+                    maximum_length: None,
+                },
+            ],
+        );
+        let stacked_fingerprint = stacked.view_filter_evaluation_fingerprint();
+        let update = coordinator.replace_contract(stacked).unwrap();
+        if update.published_scene.is_none() {
+            pump_until_publication(&mut coordinator);
+        }
+
+        assert!(coordinator.contract().reference.is_some());
+        assert!(matches!(
+            coordinator.frame().unwrap().reference_requirement,
+            AlignmentReferenceRequirement::Ready { revision: ready, .. } if ready == revision
+        ));
+        assert_eq!(
+            coordinator
+                .frame()
+                .unwrap()
+                .snapshot
+                .unwrap()
+                .reads()
+                .evidence()
+                .view_filter()
+                .fingerprint(),
+            stacked_fingerprint
+        );
+        assert_eq!(
+            coordinator.telemetry().source_acquisitions,
+            source_acquisitions,
+            "stacking an intrinsic filter must not trigger another BAM acquisition"
+        );
+    }
+
+    #[test]
+    fn intrinsic_filter_and_clear_rederive_atomically_without_more_source_io() {
+        let (mut coordinator, camera) = test_coordinator();
+        coordinator.update_camera(camera).unwrap();
+        pump_until_publication(&mut coordinator);
+        let source_acquisitions = coordinator.telemetry().source_acquisitions;
+        let original = coordinator.contract().clone();
+
+        let mut filtered = original.clone();
+        filtered.view_filter = AlignmentViewFilterContract::new(
+            1,
+            [AlignmentFilterPredicate::MappingQuality {
+                minimum: Some(61),
+                maximum: None,
+            }],
+        );
+        let filtered_fingerprint = filtered.view_filter.fingerprint();
+        let update = coordinator.replace_contract(filtered).unwrap();
+        if update.published_scene.is_none() {
+            pump_until_publication(&mut coordinator);
+        }
+        let filtered_scene = coordinator.frame().unwrap().snapshot.unwrap();
+        assert_eq!(
+            filtered_scene
+                .reads()
+                .evidence()
+                .view_filter()
+                .fingerprint(),
+            filtered_fingerprint
+        );
+        assert!(
+            filtered_scene
+                .reads()
+                .evidence()
+                .view_filter()
+                .eligible_records()
+                > 0
+        );
+        assert_eq!(
+            filtered_scene
+                .reads()
+                .evidence()
+                .view_filter()
+                .matching_records(),
+            0
+        );
+        assert_eq!(filtered_scene.reads().atlas().row_count(), 0);
+        assert_eq!(
+            filtered_scene
+                .summaries()
+                .maximum_depth(filtered_scene.prepared_interval())
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            coordinator.telemetry().source_acquisitions,
+            source_acquisitions
+        );
+        let filter_telemetry = coordinator.telemetry();
+        assert!(filter_telemetry.view_filter_evaluations > 0);
+        assert_eq!(
+            filter_telemetry.last_view_filter_contract_fingerprint,
+            filtered_fingerprint.get()
+        );
+        assert_eq!(
+            filter_telemetry.last_view_filter_evaluation_fingerprint,
+            filtered_fingerprint.get()
+        );
+        assert!(filter_telemetry.view_filter_records_examined > 0);
+        assert_eq!(filter_telemetry.view_filter_records_matched, 0);
+
+        let update = coordinator.replace_contract(original).unwrap();
+        if update.published_scene.is_none() {
+            pump_until_publication(&mut coordinator);
+        }
+        let restored = coordinator.frame().unwrap().snapshot.unwrap();
+        assert_eq!(
+            restored.reads().evidence().view_filter().fingerprint(),
+            ContractFingerprint::new(0)
+        );
+        assert_eq!(
+            coordinator.telemetry().source_acquisitions,
+            source_acquisitions
+        );
+        assert_eq!(
+            coordinator.telemetry().view_filter_evaluations,
+            filter_telemetry.view_filter_evaluations,
+            "clearing the filter restores broad evidence without another predicate scan"
         );
     }
 

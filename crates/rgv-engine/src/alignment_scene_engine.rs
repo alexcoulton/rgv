@@ -1959,6 +1959,8 @@ mod tests {
                 [*b"XS"],
                 None,
             ),
+            view_filter: rgv_alignment_scene::AlignmentViewFilterContract::default(),
+            highlight_filter: rgv_alignment_scene::AlignmentViewFilterContract::default(),
             summaries: SummaryContract {
                 overlapping_mate_policy: OverlappingMatePolicy::CountBoth,
                 minimum_base_quality: 0,

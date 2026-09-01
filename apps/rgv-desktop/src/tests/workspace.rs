@@ -862,7 +862,7 @@ fn stripping_a_discontinuous_snapshot_preserves_only_a_camera_covering_refusal()
         alignment_scene_frame_for_ui_against_retained_interval(frame.clone(), Some(actb));
     assert!(normalized.individual_reads_refused_for_camera());
     assert_eq!(
-        alignment_scene_frame_settlement(&normalized),
+        alignment_scene_frame_settlement(&normalized, true),
         AlignmentSceneFrameSettlement::Settled,
         "a later typed frame must settle the request even if its FASTA is still pending"
     );
@@ -881,8 +881,14 @@ fn stripping_a_discontinuous_snapshot_preserves_only_a_camera_covering_refusal()
         "a refusal which does not cover the current camera is stale, not terminal"
     );
     assert_eq!(
-        alignment_scene_frame_settlement(&normalized_stale),
-        AlignmentSceneFrameSettlement::WaitingForScene
+        alignment_scene_frame_settlement(&normalized_stale, true),
+        AlignmentSceneFrameSettlement::WaitingForReference,
+        "a reference-backed filter transfers this incomplete target to the reference owner"
+    );
+    assert_eq!(
+        alignment_scene_frame_settlement(&normalized_stale, false),
+        AlignmentSceneFrameSettlement::WaitingForScene,
+        "optional reference rendering must not take ownership while the core scene is incomplete"
     );
 }
 
@@ -1971,6 +1977,9 @@ fn background_pressure_cannot_reopen_a_settled_navigation_transaction() {
     ));
     assert!(!alignment_scene_pressure_owns_navigation(
         AlignmentNavigationPhase::WaitingForGpuPressure,
+    ));
+    assert!(!alignment_scene_pressure_owns_navigation(
+        AlignmentNavigationPhase::WaitingForReference,
     ));
     assert!(!alignment_scene_pressure_owns_navigation(
         AlignmentNavigationPhase::Committed,
@@ -3260,6 +3269,95 @@ fn every_alignment_track_filter_is_parsed_independently() {
         ..SessionFilters::default()
     };
     assert!(active_filters_from_session(&invalid).is_err());
+}
+
+#[test]
+fn scene_acquisition_retains_a_broad_filterable_superset() {
+    let mut config = SessionAlignmentTrack::new(
+        TrackId::new(1),
+        "RNA".to_owned(),
+        TrackSource::Local {
+            path: "rna.bam".to_owned(),
+        },
+    );
+    config.filters.minimum_mapping_quality = Some(50);
+    config.filters.include_secondary = false;
+    config.filters.include_supplementary = false;
+    config.filters.auxiliary_predicates = vec!["HP=1".to_owned()];
+    let active = active_filters_from_session(&config.filters).unwrap();
+
+    let query = alignment_scene_source_query_options(&config, &active);
+    assert!(query.include_secondary);
+    assert!(query.include_supplementary);
+    assert_eq!(query.filter, AlignmentFilter::default());
+
+    let dictionary = ReferenceDictionary::from_contigs([("chr7".to_owned(), 100_000)]);
+    let view = alignment_view_filter_contract(&config.filters, &active, &dictionary);
+    assert_eq!(view.predicates().len(), 4);
+    assert!(!view.is_empty());
+}
+
+#[test]
+fn scene_contract_equivalence_includes_view_and_highlight_filter_authority() {
+    let dictionary = ReferenceDictionary::from_contigs([("chr7".to_owned(), 100_000)]);
+    let metadata = AlignmentSceneSourceMetadata {
+        dictionary,
+        header: Arc::new(rgv_hts::AlignmentHeaderMetadata::default()),
+        index_overview: None,
+        source_revision: rgv_alignment_scene::AlignmentSourceRevision::new(
+            rgv_alignment_scene::SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
+            RevisionFingerprint::new(3, 4),
+        ),
+        record_contract: ContractFingerprint::new(5),
+        normalization_mapped_records: None,
+    };
+    let config = SessionAlignmentTrack::new(
+        TrackId::new(1),
+        "RNA".to_owned(),
+        TrackSource::Local {
+            path: "rna.bam".to_owned(),
+        },
+    );
+    let active = active_filters_from_session(&config.filters).unwrap();
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+        1_000.0,
+    )
+    .unwrap();
+    let baseline = alignment_scene_build_contract(
+        &config,
+        &active,
+        &metadata,
+        ContigId::new(0),
+        100_000,
+        viewport,
+        None,
+        None,
+    );
+    assert!(alignment_scene_contract_equivalent(&baseline, &baseline));
+
+    let intrinsic_filter = AlignmentViewFilterContract::new(
+        1,
+        [AlignmentFilterPredicate::MappingQuality {
+            minimum: Some(30),
+            maximum: None,
+        }],
+    );
+    let mut view_changed = baseline.clone();
+    view_changed.view_filter = intrinsic_filter.clone();
+    assert!(view_changed.presentation == baseline.presentation);
+    assert!(!alignment_scene_contract_equivalent(
+        &baseline,
+        &view_changed
+    ));
+
+    let mut highlight_changed = baseline.clone();
+    highlight_changed.highlight_filter = intrinsic_filter;
+    assert!(highlight_changed.presentation == baseline.presentation);
+    assert!(!alignment_scene_contract_equivalent(
+        &baseline,
+        &highlight_changed
+    ));
 }
 
 #[test]

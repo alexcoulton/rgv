@@ -41,6 +41,7 @@ pub struct AlignmentPresentationScene {
     page_tile_bases: NonZeroU64,
     page_row_block_rows: NonZeroU32,
     maximum_handle_primitives_per_page: usize,
+    maximum_non_label_primitives_per_page: usize,
     metadata_allocation: AllocationLease,
     _pins: AlignmentPresentationScenePins,
 }
@@ -115,6 +116,18 @@ impl AlignmentPresentationScene {
             .map(|page| page_maximum_handle_primitives(page))
             .max()
             .unwrap_or(0);
+        let maximum_non_label_primitives_per_page = pages
+            .iter()
+            .map(|page| {
+                page.primitives()
+                    .iter()
+                    .filter(|primitive| {
+                        !matches!(primitive.component, crate::AlignmentComponent::Label { .. })
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
         let metadata_bytes = scene_metadata_bytes(pages.len(), page_index.capacity());
         let mut reservation = ledger.reserve(
             AllocationClass::PresentationScene,
@@ -143,6 +156,7 @@ impl AlignmentPresentationScene {
             page_tile_bases,
             page_row_block_rows,
             maximum_handle_primitives_per_page,
+            maximum_non_label_primitives_per_page,
             metadata_allocation,
             _pins: AlignmentPresentationScenePins {
                 _evidence: evidence_pins,
@@ -201,6 +215,15 @@ impl AlignmentPresentationScene {
     #[must_use]
     pub const fn maximum_handle_primitives_per_page(&self) -> usize {
         self.maximum_handle_primitives_per_page
+    }
+
+    /// Largest drawable primitive population in one canonical page. A highlight predicate may
+    /// match every handle visible to a camera, so the renderer uses this worker-built bound to
+    /// provision a viewport-sized overlay ring without scanning or retaining the whole scene as
+    /// duplicate GPU geometry.
+    #[must_use]
+    pub const fn maximum_non_label_primitives_per_page(&self) -> usize {
+        self.maximum_non_label_primitives_per_page
     }
 
     /// Conservative number of canonical pages which any camera of the supplied genomic/row span
@@ -381,6 +404,9 @@ impl AlignmentPresentationScene {
         &self,
         handle: AlignmentHandle,
     ) -> Result<Option<AlignmentRecord>, AlignmentExportError> {
+        if !self.evidence.contains_handle(handle) {
+            return Ok(None);
+        }
         for chunk in self.evidence.chunks() {
             let Some(index) = chunk
                 .chunk()
@@ -422,6 +448,26 @@ impl AlignmentPresentationScene {
     pub fn for_each_full(
         &self,
         interval: GenomicInterval,
+        visit: impl FnMut(AlignmentExportRecord) -> bool,
+    ) -> Result<(), AlignmentExportError> {
+        self.for_each_full_selection(interval, false, visit)
+    }
+
+    /// Visits the complete acquisition-eligible population even when the committed scene has a
+    /// view filter. Callers must label this choice explicitly; ordinary export follows the
+    /// committed filtered view.
+    pub fn for_each_eligible_full(
+        &self,
+        interval: GenomicInterval,
+        visit: impl FnMut(AlignmentExportRecord) -> bool,
+    ) -> Result<(), AlignmentExportError> {
+        self.for_each_full_selection(interval, true, visit)
+    }
+
+    fn for_each_full_selection(
+        &self,
+        interval: GenomicInterval,
+        eligible: bool,
         mut visit: impl FnMut(AlignmentExportRecord) -> bool,
     ) -> Result<(), AlignmentExportError> {
         if !self.prepared_interval.contains_interval(interval) {
@@ -434,7 +480,11 @@ impl AlignmentPresentationScene {
         {
             return Err(AlignmentExportError::FullPayloadUnavailable);
         }
-        let selection = self.evidence.select(interval)?;
+        let selection = if eligible {
+            self.evidence.select_eligible(interval)?
+        } else {
+            self.evidence.select(interval)?
+        };
         for reference in selection.records() {
             let chunk = self
                 .evidence
@@ -488,25 +538,16 @@ impl AlignmentPresentationScene {
             return Ok(Vec::new());
         }
         let mut codes = BTreeSet::new();
-        let mut examined = 0_usize;
-        for chunk in self.evidence.chunks() {
-            for index in 0..chunk.chunk().batch().len() {
-                if examined == maximum_records || codes.len() == maximum_codes {
+        let selection = self.evidence.select(self.prepared_interval)?;
+        for index in 0..selection.len().min(maximum_records) {
+            let record = selection.materialize_retained_record(index)?;
+            let Ok(calls) = decode_modified_bases(&record) else {
+                continue;
+            };
+            for call in calls {
+                codes.insert(call.code);
+                if codes.len() == maximum_codes {
                     return Ok(codes.into_iter().collect());
-                }
-                examined = examined.saturating_add(1);
-                let record = chunk.payload().map_or_else(
-                    || chunk.chunk().batch().materialize_record(index),
-                    |payload| payload.materialize_retained_record(chunk.chunk(), index),
-                )?;
-                let Ok(calls) = decode_modified_bases(&record) else {
-                    continue;
-                };
-                for call in calls {
-                    codes.insert(call.code);
-                    if codes.len() == maximum_codes {
-                        return Ok(codes.into_iter().collect());
-                    }
                 }
             }
         }
@@ -515,12 +556,7 @@ impl AlignmentPresentationScene {
 
     #[must_use]
     pub fn contains_handle(&self, handle: AlignmentHandle) -> bool {
-        handle.source_revision() == self.evidence.source_revision()
-            && self
-                .evidence
-                .chunks()
-                .iter()
-                .any(|chunk| chunk.chunk().handles().contains(&handle))
+        self.evidence.contains_handle(handle)
     }
 
     /// Resolves the primary/supplementary chain from the immutable evidence root. This runs only
@@ -626,6 +662,9 @@ impl AlignmentPresentationScene {
         &self,
         handle: AlignmentHandle,
     ) -> Option<(Vec<u8>, rgv_hts::AlignmentFlags)> {
+        if !self.evidence.contains_handle(handle) {
+            return None;
+        }
         for chunk in self.evidence.chunks() {
             let Some(index) = chunk
                 .chunk()
@@ -649,7 +688,8 @@ impl AlignmentPresentationScene {
         for chunk in self.evidence.chunks() {
             let batch = chunk.chunk().batch();
             for (index, handle) in chunk.chunk().handles().iter().copied().enumerate() {
-                if batch.read_name(index) == Some(read_name)
+                if self.evidence.contains_handle(handle)
+                    && batch.read_name(index) == Some(read_name)
                     && let Some(flags) = batch.flags(index)
                 {
                     output.push((handle, flags));

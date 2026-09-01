@@ -64,6 +64,32 @@ fn json_round_trip_preserves_schema_and_sources() {
     filters.minimum_modification_probability = 128;
     filters.modified_base_color_mode = ModifiedBaseColorMode::ModifiedVsUnmodified;
     filters.hidden_modification_codes = vec!["m".to_owned(), "CHEBI:76792".to_owned()];
+    filters.alignment_view_filter.all = vec![
+        AlignmentViewPredicate::CigarEvent {
+            event: AlignmentCigarEventPredicate::Insertion,
+            scope: AlignmentPredicateScope::Position {
+                contig: "chr1".to_owned(),
+                position: 150,
+            },
+            minimum_length: Some(2),
+            maximum_length: Some(20),
+        },
+        AlignmentViewPredicate::Auxiliary {
+            tag: *b"HP",
+            comparison: AlignmentAuxComparison::Equal,
+            value: Some(AlignmentAuxFilterValue::Integer(1)),
+        },
+    ];
+    filters.alignment_highlight_filter.all = vec![AlignmentViewPredicate::Substitution {
+        scope: AlignmentPredicateScope::Interval {
+            contig: "chr1".to_owned(),
+            start: 140,
+            end: 160,
+        },
+        observed_base: Some(b'T'),
+        minimum_count: Some(1),
+        maximum_count: Some(4),
+    }];
     document
         .contig_aliases
         .insert("1".to_owned(), "chr1".to_owned());
@@ -1764,6 +1790,54 @@ fn malformed_or_excessive_hidden_modification_codes_are_rejected() {
     assert!(matches!(
         document.to_json(),
         Err(SessionError::InvalidModificationCodes)
+    ));
+}
+
+#[test]
+fn invalid_alignment_predicate_contracts_are_rejected() {
+    let mut document = SessionDocument::new(SessionLocus {
+        contig: "chr1".to_owned(),
+        start: 0,
+        end: 100,
+    });
+    let filters = &mut add_test_alignment(&mut document).filters;
+    filters.alignment_view_filter.version = 2;
+    assert!(matches!(
+        document.to_json(),
+        Err(SessionError::InvalidAlignmentPredicate)
+    ));
+
+    {
+        let filters = &mut document.alignment_tracks[0].filters;
+        filters.alignment_view_filter.version = 1;
+        filters.alignment_view_filter.all = vec![AlignmentViewPredicate::CigarEvent {
+            event: AlignmentCigarEventPredicate::Deletion,
+            scope: AlignmentPredicateScope::Interval {
+                contig: "chr1".to_owned(),
+                start: 20,
+                end: 20,
+            },
+            minimum_length: Some(10),
+            maximum_length: Some(2),
+        }];
+    }
+    assert!(matches!(
+        document.to_json(),
+        Err(SessionError::InvalidAlignmentPredicate)
+    ));
+
+    document.alignment_tracks[0]
+        .filters
+        .alignment_view_filter
+        .all = vec![AlignmentViewPredicate::Substitution {
+        scope: AlignmentPredicateScope::Anywhere,
+        observed_base: Some(b'!'),
+        minimum_count: None,
+        maximum_count: None,
+    }];
+    assert!(matches!(
+        document.to_json(),
+        Err(SessionError::InvalidAlignmentPredicate)
     ));
 }
 
