@@ -63,6 +63,47 @@ struct CapturedAlignmentPanelSceneEpoch {
     panel_scene_stores: HashMap<PanelId, AlignmentPanelSceneStore>,
 }
 
+/// Visual inputs owned by one read-panel scroll derivative. Presentation target revision and exact
+/// materialized-page coverage are intentionally absent: both can advance with a camera-only native
+/// commit while the already-built scrollbar/read-stack geometry remains valid.
+#[derive(Clone, Debug, PartialEq)]
+struct ReadPanelDisplayDerivativeAuthority {
+    density_camera: bool,
+    row_origin: Option<f32>,
+    row_height: Option<f32>,
+    row_coordinate_authority: ReadRowCoordinateAuthority,
+    row_activity_atlas_revision: Option<RowAtlasRevision>,
+    total_rows: Option<usize>,
+    authoritative_overview: Option<ui::ScrollbarOverview>,
+    overview: ui::ScrollbarOverview,
+    actual_content_bottom: f32,
+    scroll: ReadPanelScrollState,
+}
+
+fn read_panel_display_derivative_authority(
+    panel: &ViewPanelController,
+    read_panel_index: usize,
+    track_id: TrackId,
+) -> ReadPanelDisplayDerivativeAuthority {
+    let read_panel = &panel
+        .scroll_display_cache
+        .as_ref()
+        .expect("read panel index came from this cache")
+        .read_panels[read_panel_index];
+    ReadPanelDisplayDerivativeAuthority {
+        density_camera: read_panel.density_camera,
+        row_origin: read_panel.row_origin,
+        row_height: read_panel.row_height,
+        row_coordinate_authority: read_panel.row_coordinate_authority,
+        row_activity_atlas_revision: read_panel.row_activity_atlas_revision,
+        total_rows: read_panel.total_rows,
+        authoritative_overview: read_panel.authoritative_overview.clone(),
+        overview: read_panel.overview.clone(),
+        actual_content_bottom: read_panel.actual_content_bottom,
+        scroll: panel.read_panel_scroll_state(track_id),
+    }
+}
+
 struct AlignmentPanelSceneEpochCaptureFailure {
     message: String,
     fields: ManualDiagnosticTraceFields,
@@ -2018,26 +2059,17 @@ impl Viewer {
                             .values()
                             .flat_map(|frame| {
                                 frame.lanes.iter().map(|lane| {
-                                    let native_reads_present =
-                                        bundle.read_authorities.iter().any(|authority| {
+                                    let read_authority =
+                                        bundle.read_authorities.iter().find(|authority| {
                                             authority.panel_id == frame.panel_id
                                                 && authority.track_id == lane.track_id
                                                 && authority.target_revision
                                                     == bundle.target_revision
                                         });
-                                    let materialized_row_ranges = native_reads_present
-                                        .then(|| {
-                                            lane.snapshot.as_ref().map(|scene| {
-                                                super::panels::normalize_materialized_row_ranges(
-                                                    scene
-                                                        .reads()
-                                                        .pages()
-                                                        .iter()
-                                                        .map(|page| page.row_range()),
-                                                )
-                                            })
-                                        })
-                                        .flatten();
+                                    let native_reads_present = read_authority.is_some();
+                                    let materialized_row_ranges = read_authority.map(|authority| {
+                                        Arc::clone(&authority.materialized_row_ranges)
+                                    });
                                     CommittedReadCacheUpdate {
                                         panel_id: frame.panel_id,
                                         track_id: lane.track_id,
@@ -2081,6 +2113,8 @@ impl Viewer {
                 needs_rebuild |= update.camera.is_some();
                 continue;
             };
+            let display_derivative_before =
+                read_panel_display_derivative_authority(panel, read_panel_index, update.track_id);
 
             let activity_identity = update.row_activity.as_deref().map(|profile| {
                 (
@@ -2112,7 +2146,6 @@ impl Viewer {
                 };
                 current
             };
-            needs_rebuild |= !cache_was_current;
             if record_cache_mismatches && !cache_was_current {
                 let read_panel = &panel
                     .scroll_display_cache
@@ -2164,6 +2197,12 @@ impl Viewer {
                 read_panel.authoritative_overview = None;
                 read_panel.overview = ui::ScrollbarOverview::default();
                 read_panel.actual_content_bottom = read_panel.clip_bottom;
+                needs_rebuild |= display_derivative_before
+                    != read_panel_display_derivative_authority(
+                        panel,
+                        read_panel_index,
+                        update.track_id,
+                    );
                 continue;
             };
 
@@ -2179,6 +2218,12 @@ impl Viewer {
                 read_panel.presentation_target_revision = update.target_revision;
                 read_panel.row_coordinate_authority = ReadRowCoordinateAuthority::Pending;
                 read_panel.row_activity_atlas_revision = None;
+                needs_rebuild |= display_derivative_before
+                    != read_panel_display_derivative_authority(
+                        panel,
+                        read_panel_index,
+                        update.track_id,
+                    );
                 continue;
             };
 
@@ -2265,6 +2310,12 @@ impl Viewer {
                 panel.latent_vertical_scroll_fraction = state.latent_scroll_fraction;
                 panel.content_bottom_points = state.content_bottom_points;
             }
+            needs_rebuild |= display_derivative_before
+                != read_panel_display_derivative_authority(
+                    panel,
+                    read_panel_index,
+                    update.track_id,
+                );
         }
         for mismatch in cache_mismatches {
             self.record_manual_diagnostic_event(
@@ -2571,6 +2622,9 @@ impl Viewer {
                     desired_request_token: source.desired_request_token,
                     source_camera: source.source_camera,
                     scene_revision: request.scene.revision(),
+                    materialized_row_ranges: super::panels::normalize_materialized_row_ranges(
+                        request.scene.pages().iter().map(|page| page.row_range()),
+                    ),
                     clip,
                 })
             })

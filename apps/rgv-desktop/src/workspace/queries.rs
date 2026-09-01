@@ -2365,6 +2365,77 @@ impl Viewer {
                         eviction.relinquished_cache_entries,
                     );
                 }
+                AlignmentSceneEngineEvent::InactiveEvictionProgress {
+                    request_id,
+                    eviction,
+                } => {
+                    if self.manual_diagnostic_trace_is_recording() {
+                        self.record_manual_diagnostic_event(
+                            "alignment_cache",
+                            "reclaim_quantum",
+                            serde_json::json!({
+                                "track_id": track_id.get(),
+                                "request_id": request_id,
+                                "target_charged": eviction.target_charged,
+                                "charged_before": eviction.charged_before,
+                                "charged_after": eviction.charged,
+                                "pinned_after": eviction.pinned,
+                                "released_bytes": eviction.released,
+                                "relinquished_cache_entries": eviction.relinquished_cache_entries,
+                                "quantum_entries": eviction.quantum_entries,
+                                "elapsed_nanoseconds": eviction.elapsed_nanoseconds,
+                                "reclaim_complete": eviction.reclaim_complete,
+                                "remaining_bytes": eviction.remaining,
+                            }),
+                        );
+                    }
+                }
+                AlignmentSceneEngineEvent::InactiveEvictionSuperseded {
+                    request_id,
+                    target_charged,
+                    released_bytes,
+                    relinquished_cache_entries,
+                    reason,
+                } => {
+                    if self.manual_diagnostic_trace_is_recording() {
+                        self.record_manual_diagnostic_event(
+                            "alignment_cache",
+                            "reclaim_superseded",
+                            serde_json::json!({
+                                "track_id": track_id.get(),
+                                "request_id": request_id,
+                                "target_charged": target_charged,
+                                "released_bytes": released_bytes,
+                                "relinquished_cache_entries": relinquished_cache_entries,
+                                "reason": format!("{reason:?}"),
+                            }),
+                        );
+                    }
+                    self.observe_alignment_capacity_reclaim(
+                        track_id,
+                        request_id,
+                        released_bytes,
+                        relinquished_cache_entries,
+                    );
+                }
+                AlignmentSceneEngineEvent::WorkerPhaseCompleted {
+                    phase,
+                    owner,
+                    elapsed_nanoseconds,
+                } => {
+                    if self.manual_diagnostic_trace_is_recording() {
+                        self.record_manual_diagnostic_event(
+                            "alignment_worker",
+                            "slow_phase_completed",
+                            serde_json::json!({
+                                "track_id": track_id.get(),
+                                "owner": owner.map(SourceOwnerId::get),
+                                "phase": format!("{phase:?}"),
+                                "elapsed_nanoseconds": elapsed_nanoseconds,
+                            }),
+                        );
+                    }
+                }
                 AlignmentSceneEngineEvent::Error {
                     owner,
                     request_token,

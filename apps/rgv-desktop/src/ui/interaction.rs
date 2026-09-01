@@ -1279,7 +1279,9 @@ impl Viewer {
             self.window.set_cursor(CursorIcon::Default);
         }
         self.refresh_active_panel_context();
-        self.mark_display_dirty("explicit display invalidation");
+        if changed {
+            self.mark_display_dirty("active panel changed");
+        }
         if changed && !self.synthetic {
             // A panel switch must not turn its semantic selection back into an
             // unsafe query-local record index when activation refreshes data.

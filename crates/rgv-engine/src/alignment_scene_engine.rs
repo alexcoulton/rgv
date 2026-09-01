@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rgv_alignment_scene::{
@@ -35,6 +35,7 @@ const MAXIMUM_INPUT_BURST: usize = 32;
 /// Maintenance deliberately yields after this many ownership removals. The value bounds work per
 /// checkpoint; it is not a memory-policy constant and does not change which exact data is kept.
 const MAXIMUM_RECLAIM_ENTRIES_PER_QUANTUM: usize = 256;
+const SLOW_WORKER_PHASE: Duration = Duration::from_millis(25);
 
 /// Identity of one desktop request transaction for an alignment-scene lane.
 ///
@@ -72,6 +73,37 @@ pub enum AlignmentSceneEngineOperation {
     PumpSource,
     PumpPresentation,
     RetryResourcePressure,
+}
+
+/// Why an in-flight inactive-cache reclaim ceased to own the worker. Supersession is terminal for
+/// the old transaction: callers must never be left waiting for a completion that can no longer be
+/// produced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlignmentInactiveEvictionSupersession {
+    DisjointCamera,
+    BudgetPolicyChange,
+    CacheClear,
+}
+
+/// Coarse worker boundary used only for slow-phase diagnostics. It identifies which synchronous
+/// owner operation withheld the mailbox without coupling the engine to desktop tracing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlignmentSceneWorkerPhase {
+    UpdateCamera,
+    PublishFrame,
+    PumpSource,
+    PumpPresentation,
+}
+
+impl AlignmentSceneWorkerPhase {
+    const fn diagnostic_key(self) -> u64 {
+        match self {
+            Self::UpdateCamera => 10,
+            Self::PublishFrame => 11,
+            Self::PumpSource => 12,
+            Self::PumpPresentation => 13,
+        }
+    }
 }
 
 /// Whether the failed allocation can become admissible without changing the scene contract.
@@ -185,6 +217,28 @@ pub enum AlignmentSceneEngineEvent {
     InactiveEvicted {
         request_id: u64,
         eviction: AlignmentCoordinatorEviction,
+    },
+    /// One bounded maintenance checkpoint. This is diagnostic progress, not a terminal answer;
+    /// the transaction still ends in `InactiveEvicted` or `InactiveEvictionSuperseded`.
+    InactiveEvictionProgress {
+        request_id: u64,
+        eviction: AlignmentCoordinatorEviction,
+    },
+    /// The demand or budget authority changed before the old reclaim completed. Ownership progress
+    /// is retained in the shared ledger and reported so aggregate callers can settle the old ID.
+    InactiveEvictionSuperseded {
+        request_id: u64,
+        target_charged: usize,
+        released_bytes: usize,
+        relinquished_cache_entries: usize,
+        reason: AlignmentInactiveEvictionSupersession,
+    },
+    /// A normally synchronous worker boundary exceeded the diagnostic duration threshold. Events
+    /// are replaceable by phase and therefore cannot backpressure navigation.
+    WorkerPhaseCompleted {
+        phase: AlignmentSceneWorkerPhase,
+        owner: Option<SourceOwnerId>,
+        elapsed_nanoseconds: u64,
     },
     /// A source-local budget reduction was temporarily blocked by the workspace-shared ledger's
     /// prepared GPU replacement. No budget was reported as applied and no lane/source is failed.
@@ -725,6 +779,52 @@ struct PendingInactiveEviction {
     accumulated: Option<AlignmentCoordinatorEviction>,
 }
 
+fn report_slow_worker_phase(
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+    phase: AlignmentSceneWorkerPhase,
+    owner: Option<SourceOwnerId>,
+    started: Instant,
+) -> bool {
+    let elapsed = started.elapsed();
+    if elapsed < SLOW_WORKER_PHASE {
+        return true;
+    }
+    output
+        .send_latest_system(
+            phase.diagnostic_key(),
+            AlignmentSceneEngineEvent::WorkerPhaseCompleted {
+                phase,
+                owner,
+                elapsed_nanoseconds: u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            },
+        )
+        .is_ok()
+}
+
+fn supersede_pending_eviction(
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+    reason: AlignmentInactiveEvictionSupersession,
+) -> bool {
+    let Some(pending) = pending_eviction.take() else {
+        return true;
+    };
+    let released_bytes = pending.accumulated.map_or(0, |eviction| eviction.released);
+    let relinquished_cache_entries = pending
+        .accumulated
+        .map_or(0, |eviction| eviction.relinquished_cache_entries);
+    send_control(
+        output,
+        AlignmentSceneEngineEvent::InactiveEvictionSuperseded {
+            request_id: pending.request_id,
+            target_charged: pending.target_charged,
+            released_bytes,
+            relinquished_cache_entries,
+            reason,
+        },
+    )
+}
+
 fn merge_inactive_eviction(
     previous: Option<AlignmentCoordinatorEviction>,
     next: AlignmentCoordinatorEviction,
@@ -869,6 +969,18 @@ fn scene_worker_loop<B>(
                 .evict_inactive_batch(pending.target_charged, MAXIMUM_RECLAIM_ENTRIES_PER_QUANTUM)
             {
                 Ok(eviction) => {
+                    if output
+                        .send_latest_system(
+                            0,
+                            AlignmentSceneEngineEvent::InactiveEvictionProgress {
+                                request_id: pending.request_id,
+                                eviction,
+                            },
+                        )
+                        .is_err()
+                    {
+                        return;
+                    }
                     let stopped_without_progress = eviction.quantum_entries == 0;
                     let complete = eviction.reclaim_complete || stopped_without_progress;
                     pending.accumulated =
@@ -903,7 +1015,17 @@ fn scene_worker_loop<B>(
                 }
             }
         } else if coordinator.has_pending_source_work() {
-            match coordinator.pump_once() {
+            let pump_started = Instant::now();
+            let pump_result = coordinator.pump_once();
+            if !report_slow_worker_phase(
+                output,
+                AlignmentSceneWorkerPhase::PumpSource,
+                None,
+                pump_started,
+            ) {
+                return;
+            }
+            match pump_result {
                 Ok(pump) => {
                     for publication in pump.publications {
                         let Ok(Some(frame)) = coordinator.frame(publication.owner) else {
@@ -998,7 +1120,17 @@ fn scene_worker_loop<B>(
                 }
             }
         } else if coordinator.has_pending_presentation_work() {
-            match coordinator.pump_presentation_once() {
+            let pump_started = Instant::now();
+            let pump_result = coordinator.pump_presentation_once();
+            if !report_slow_worker_phase(
+                output,
+                AlignmentSceneWorkerPhase::PumpPresentation,
+                None,
+                pump_started,
+            ) {
+                return;
+            }
+            match pump_result {
                 Ok(Some(pump)) => {
                     if let Some(pressure) = pump.pressure {
                         if pump.intent == SourceIntentKind::Foreground {
@@ -1437,10 +1569,26 @@ where
                 // Only a genuinely disjoint navigation island invalidates the old reserve.
                 // Contained pans, zooms, and row motion keep making low-water progress instead of
                 // cancelling maintenance on every pointer sample.
-                *pending_eviction = None;
+                if !supersede_pending_eviction(
+                    pending_eviction,
+                    output,
+                    AlignmentInactiveEvictionSupersession::DisjointCamera,
+                ) {
+                    return false;
+                }
             }
             request_tokens.insert(owner, request_token);
-            match coordinator.update_camera(owner, camera) {
+            let update_started = Instant::now();
+            let update_result = coordinator.update_camera(owner, camera);
+            if !report_slow_worker_phase(
+                output,
+                AlignmentSceneWorkerPhase::UpdateCamera,
+                Some(owner),
+                update_started,
+            ) {
+                return false;
+            }
+            match update_result {
                 Ok(update) => {
                     if let Some(target) = update.proactive_reclaim_target {
                         schedule_reclaim_target(pending_eviction, 0, target);
@@ -1486,7 +1634,6 @@ where
             request_token,
             contract,
         } => {
-            *pending_eviction = None;
             request_tokens.insert(owner, request_token);
             match coordinator.replace_contract(owner, contract) {
                 Ok(update) => send_frame(
@@ -1511,7 +1658,6 @@ where
             }
         }
         AlignmentSceneEngineRequest::InstallReferenceAuthority { owner, authority } => {
-            *pending_eviction = None;
             let request_token = current_request_token(request_tokens, owner);
             match coordinator.install_reference_authority(owner, authority) {
                 Ok(outcome) if outcome.installed => send_frame(
@@ -1541,7 +1687,6 @@ where
             request_token,
             policy,
         } => {
-            *pending_eviction = None;
             request_tokens.insert(owner, request_token);
             match coordinator.set_preparation_policy(owner, policy) {
                 Ok(Some(update)) => send_frame(
@@ -1586,7 +1731,6 @@ where
             ),
         },
         AlignmentSceneEngineRequest::SetSourceControl(control) => {
-            *pending_eviction = None;
             let retry_refusals = B::control_invalidates_read_refusals(&control);
             match coordinator.actor_mut().submit_control(control) {
                 Ok(()) => {
@@ -1627,7 +1771,13 @@ where
             }
         }
         AlignmentSceneEngineRequest::ReduceBudget { budget } => {
-            *pending_eviction = None;
+            if !supersede_pending_eviction(
+                pending_eviction,
+                output,
+                AlignmentInactiveEvictionSupersession::BudgetPolicyChange,
+            ) {
+                return false;
+            }
             match coordinator.reduce_budget(budget) {
                 Ok(pressure) => send_control(
                     output,
@@ -1663,7 +1813,13 @@ where
             ),
         },
         AlignmentSceneEngineRequest::ClearCacheBudget { restore_budget } => {
-            *pending_eviction = None;
+            if !supersede_pending_eviction(
+                pending_eviction,
+                output,
+                AlignmentInactiveEvictionSupersession::CacheClear,
+            ) {
+                return false;
+            }
             match coordinator.reduce_budget(0) {
                 Ok(_) => match coordinator.reduce_budget(restore_budget) {
                     Ok(pressure) => send_control(
@@ -1746,6 +1902,7 @@ fn send_frame<B>(
 where
     B: CanonicalAlignmentSourceBackend,
 {
+    let started = Instant::now();
     let Ok(Some(frame)) = coordinator.frame(owner) else {
         return send_error(
             output,
@@ -1773,7 +1930,7 @@ where
             AlignmentSceneCoordinatorConfigError::UnknownOwner(owner),
         );
     };
-    output
+    let sent = output
         .send_latest_for(
             owner.get(),
             AlignmentSceneEngineEvent::FrameUpdated {
@@ -1787,7 +1944,13 @@ where
                 telemetry,
             },
         )
-        .is_ok()
+        .is_ok();
+    sent && report_slow_worker_phase(
+        output,
+        AlignmentSceneWorkerPhase::PublishFrame,
+        Some(owner),
+        started,
+    )
 }
 
 fn send_control(
@@ -1923,6 +2086,37 @@ mod tests {
         assert_eq!(pending.request_id, 41);
         assert_eq!(pending.target_charged, 800);
         assert!(pending.accumulated.is_none());
+    }
+
+    #[test]
+    fn reclaim_supersession_is_an_explicit_terminal_event() {
+        let (output, input) = bounded_coalescing(4);
+        let mut pending = Some(PendingInactiveEviction {
+            request_id: 73,
+            target_charged: 800,
+            accumulated: None,
+        });
+
+        assert!(supersede_pending_eviction(
+            &mut pending,
+            &output,
+            AlignmentInactiveEvictionSupersession::DisjointCamera,
+        ));
+        assert!(pending.is_none());
+        let event = input
+            .try_receive()
+            .unwrap()
+            .expect("supersession emits one terminal event");
+        assert!(matches!(
+            event,
+            AlignmentSceneEngineEvent::InactiveEvictionSuperseded {
+                request_id: 73,
+                target_charged: 800,
+                released_bytes: 0,
+                relinquished_cache_entries: 0,
+                reason: AlignmentInactiveEvictionSupersession::DisjointCamera,
+            }
+        ));
     }
 
     #[test]

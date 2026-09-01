@@ -1092,7 +1092,7 @@ impl AlignmentScenePublicationAuthority {
 /// Exact read-lane authority published with the native frame. Hit testing consumes this record
 /// rather than inferring visibility from a semantic snapshot that may have survived a failed or
 /// superseded GPU replacement.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct AlignmentNativeReadAuthority {
     panel_id: PanelId,
     track_id: TrackId,
@@ -1101,6 +1101,11 @@ struct AlignmentNativeReadAuthority {
     desired_request_token: AlignmentSceneRequestToken,
     source_camera: AlignmentSceneCamera,
     scene_revision: rgv_alignment_scene::SceneRevision,
+    /// Exact row blocks represented by the immutable native read pages committed with this
+    /// authority. Camera-only epochs retain these pages even when their independently captured
+    /// semantic lane has no snapshot, so scroll materialization must travel with the native
+    /// authority rather than being inferred from that optional snapshot.
+    materialized_row_ranges: Arc<[(usize, usize)]>,
     clip: CpuClipRect,
 }
 
