@@ -822,6 +822,22 @@ impl AlignmentSemanticPage {
         &self.primitives
     }
 
+    /// Number of primitives with GPU geometry. Text labels are projected by the CPU and have an
+    /// immutable index of their own, so this is an O(1) classification rather than a scan of a
+    /// potentially very deep label page.
+    #[must_use]
+    pub fn drawable_primitive_count(&self) -> usize {
+        self.primitives
+            .len()
+            .saturating_sub(self.label_primitive_indices.len())
+    }
+
+    /// Whether this semantic page requires a GPU vertex buffer.
+    #[must_use]
+    pub fn has_drawable_primitives(&self) -> bool {
+        self.drawable_primitive_count() > 0
+    }
+
     /// Camera-visible text anchors prepared once with the immutable semantic page.
     pub fn label_anchors(&self) -> impl ExactSizeIterator<Item = &AlignmentSemanticPrimitive> {
         self.label_primitive_indices.iter().map(|index| {

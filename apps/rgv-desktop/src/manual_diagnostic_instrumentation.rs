@@ -3,6 +3,19 @@ use super::*;
 const MANUAL_TRACE_STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const MANUAL_TRACE_WHEEL_IDLE_INTERVAL: Duration = Duration::from_millis(250);
 
+fn diagnostic_caller_file(path: &str) -> String {
+    path.rsplit_once("/src/").map_or_else(
+        || {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("unknown")
+                .to_owned()
+        },
+        |(_, suffix)| format!("src/{suffix}"),
+    )
+}
+
 fn diagnostic_revision_fingerprint(fingerprint: RevisionFingerprint) -> serde_json::Value {
     serde_json::json!({
         "high": fingerprint.high(),
@@ -279,9 +292,71 @@ pub(crate) enum ManualDiagnosticFramePhase {
     Prefetch,
 }
 
+impl ManualDiagnosticFramePhase {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PollBackground => "poll_background",
+            Self::ApplyCapturedMotion => "apply_captured_motion",
+            Self::FirstDisplayRebuild => "first_display_rebuild",
+            Self::Shell => "shell",
+            Self::ShellPreparation => "shell_preparation",
+            Self::ShellDiagnostics => "shell_diagnostics",
+            Self::ShellInspectors => "shell_inspectors",
+            Self::ShellPairSummary => "shell_pair_summary",
+            Self::ShellScrollbars => "shell_scrollbars",
+            Self::ShellTextCopy => "shell_text_copy",
+            Self::ShellOverviewProjection => "shell_overview_projection",
+            Self::ShellUiRun => "shell_ui_run",
+            Self::ShellPostProcess => "shell_post_process",
+            Self::SecondDisplayRebuild => "second_display_rebuild",
+            Self::Tessellation => "tessellation",
+            Self::SurfaceAcquisition => "surface_acquisition",
+            Self::EguiBuffers => "egui_buffers",
+            Self::QueueSubmission => "queue_submission",
+            Self::Present => "present",
+            Self::Prefetch => "prefetch",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManualDiagnosticDisplayInvalidation {
+    sequence: u64,
+    reason: String,
+    caller_file: String,
+    caller_line: u32,
+    caller_column: u32,
+    frame_id: Option<u64>,
+    after_phase: Option<&'static str>,
+    was_already_dirty: bool,
+}
+
+impl ManualDiagnosticDisplayInvalidation {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "sequence": self.sequence,
+            "reason": self.reason,
+            "caller_file": self.caller_file,
+            "caller_line": self.caller_line,
+            "caller_column": self.caller_column,
+            "frame_id": self.frame_id,
+            "after_phase": self.after_phase,
+            "was_already_dirty": self.was_already_dirty,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct ManualDiagnosticFrameTimings {
     frame_id: u64,
+    display_dirty_marks_at_begin: u64,
+    display_dirty_clears_at_begin: u64,
+    display_dirty_marks_after_first_rebuild: Option<u64>,
+    display_dirty_clears_after_first_rebuild: Option<u64>,
+    display_dirty_marks_after_shell: Option<u64>,
+    display_dirty_clears_after_shell: Option<u64>,
+    display_dirty_marks_after_second_rebuild: Option<u64>,
+    display_dirty_clears_after_second_rebuild: Option<u64>,
     poll_background_us: u64,
     apply_captured_motion_us: u64,
     first_display_rebuild_us: u64,
@@ -380,6 +455,45 @@ impl ManualDiagnosticFrameTimings {
             }
         }
     }
+
+    fn note_display_invalidation_progress(
+        &mut self,
+        phase: ManualDiagnosticFramePhase,
+        marks: u64,
+        clears: u64,
+    ) {
+        match phase {
+            ManualDiagnosticFramePhase::FirstDisplayRebuild => {
+                self.display_dirty_marks_after_first_rebuild = Some(marks);
+                self.display_dirty_clears_after_first_rebuild = Some(clears);
+            }
+            ManualDiagnosticFramePhase::Shell => {
+                self.display_dirty_marks_after_shell = Some(marks);
+                self.display_dirty_clears_after_shell = Some(clears);
+            }
+            ManualDiagnosticFramePhase::SecondDisplayRebuild => {
+                self.display_dirty_marks_after_second_rebuild = Some(marks);
+                self.display_dirty_clears_after_second_rebuild = Some(clears);
+            }
+            ManualDiagnosticFramePhase::PollBackground
+            | ManualDiagnosticFramePhase::ApplyCapturedMotion
+            | ManualDiagnosticFramePhase::ShellPreparation
+            | ManualDiagnosticFramePhase::ShellDiagnostics
+            | ManualDiagnosticFramePhase::ShellInspectors
+            | ManualDiagnosticFramePhase::ShellPairSummary
+            | ManualDiagnosticFramePhase::ShellScrollbars
+            | ManualDiagnosticFramePhase::ShellTextCopy
+            | ManualDiagnosticFramePhase::ShellOverviewProjection
+            | ManualDiagnosticFramePhase::ShellUiRun
+            | ManualDiagnosticFramePhase::ShellPostProcess
+            | ManualDiagnosticFramePhase::Tessellation
+            | ManualDiagnosticFramePhase::SurfaceAcquisition
+            | ManualDiagnosticFramePhase::EguiBuffers
+            | ManualDiagnosticFramePhase::QueueSubmission
+            | ManualDiagnosticFramePhase::Present
+            | ManualDiagnosticFramePhase::Prefetch => {}
+        }
+    }
 }
 
 pub(crate) struct ManualDiagnosticTraceRuntime {
@@ -397,6 +511,10 @@ pub(crate) struct ManualDiagnosticTraceRuntime {
     last_state: Option<serde_json::Value>,
     last_observed_data_status: String,
     pending_critical_failure: Option<PendingManualDiagnosticFailure>,
+    display_dirty_mark_sequence: u64,
+    display_dirty_clear_sequence: u64,
+    last_completed_frame_phase: Option<&'static str>,
+    last_display_invalidation: Option<ManualDiagnosticDisplayInvalidation>,
 }
 
 impl ManualDiagnosticTraceRuntime {
@@ -416,6 +534,10 @@ impl ManualDiagnosticTraceRuntime {
             last_state: None,
             last_observed_data_status: String::new(),
             pending_critical_failure: None,
+            display_dirty_mark_sequence: 0,
+            display_dirty_clear_sequence: 0,
+            last_completed_frame_phase: None,
+            last_display_invalidation: None,
         }
     }
 
@@ -430,10 +552,93 @@ impl ManualDiagnosticTraceRuntime {
         self.last_state = None;
         self.last_observed_data_status = current_data_status.to_owned();
         self.pending_critical_failure = None;
+        self.display_dirty_mark_sequence = 0;
+        self.display_dirty_clear_sequence = 0;
+        self.last_completed_frame_phase = None;
+        self.last_display_invalidation = None;
     }
 }
 
 impl Viewer {
+    /// Marks the generic display derivative stale and, while a manual trace is recording,
+    /// preserves the exact producer and frame phase. Recording repeated marks while already dirty
+    /// is intentional: those marks reveal the feedback loop that can re-dirty a just-rebuilt
+    /// display every frame.
+    #[track_caller]
+    pub(crate) fn mark_display_dirty(&mut self, reason: &'static str) {
+        let was_already_dirty = self.display_dirty;
+        self.display_dirty = true;
+        if !self.manual_diagnostic_trace_is_recording() {
+            return;
+        }
+        let caller = std::panic::Location::caller();
+        let runtime = &mut self.manual_diagnostic_trace_runtime;
+        runtime.display_dirty_mark_sequence = runtime.display_dirty_mark_sequence.saturating_add(1);
+        let invalidation = ManualDiagnosticDisplayInvalidation {
+            sequence: runtime.display_dirty_mark_sequence,
+            reason: reason.to_owned(),
+            caller_file: diagnostic_caller_file(caller.file()),
+            caller_line: caller.line(),
+            caller_column: caller.column(),
+            frame_id: runtime.current_frame.as_ref().map(|frame| frame.frame_id),
+            after_phase: runtime.last_completed_frame_phase,
+            was_already_dirty,
+        };
+        runtime.last_display_invalidation = Some(invalidation.clone());
+        let interaction_id = self
+            .manual_diagnostic_trace_runtime
+            .pointer_interaction
+            .or(self.manual_diagnostic_trace_runtime.wheel_interaction)
+            .map(ManualDiagnosticInteractionId::get);
+        self.manual_diagnostic_trace.record(
+            "display_invalidation",
+            "marked_dirty",
+            object_fields(serde_json::json!({
+                "causal_interaction_id": interaction_id,
+                "display_dirty_after": self.display_dirty,
+                "invalidation": invalidation.json(),
+            })),
+        );
+    }
+
+    /// Clears display invalidation only after the complete CPU/GPU display derivative has been
+    /// rebuilt. The clear sequence is paired with mark sequences in per-frame diagnostics.
+    #[track_caller]
+    pub(crate) fn clear_display_dirty(&mut self, reason: &'static str) {
+        let was_dirty = self.display_dirty;
+        self.display_dirty = false;
+        if !self.manual_diagnostic_trace_is_recording() {
+            return;
+        }
+        let caller = std::panic::Location::caller();
+        let runtime = &mut self.manual_diagnostic_trace_runtime;
+        runtime.display_dirty_clear_sequence =
+            runtime.display_dirty_clear_sequence.saturating_add(1);
+        let frame_id = self
+            .manual_diagnostic_trace_runtime
+            .current_frame
+            .as_ref()
+            .map(|frame| frame.frame_id);
+        let after_phase = self
+            .manual_diagnostic_trace_runtime
+            .last_completed_frame_phase;
+        self.manual_diagnostic_trace.record(
+            "display_invalidation",
+            "cleared_dirty",
+            object_fields(serde_json::json!({
+                "sequence": self.manual_diagnostic_trace_runtime.display_dirty_clear_sequence,
+                "reason": reason,
+                "caller_file": diagnostic_caller_file(caller.file()),
+                "caller_line": caller.line(),
+                "caller_column": caller.column(),
+                "frame_id": frame_id,
+                "after_phase": after_phase,
+                "was_dirty": was_dirty,
+                "display_dirty_after": self.display_dirty,
+            })),
+        );
+    }
+
     pub(crate) fn maybe_start_pending_manual_diagnostic_trace(&mut self) {
         if !self.manual_diagnostic_trace_autostart_pending {
             return;
@@ -503,6 +708,10 @@ impl Viewer {
                 "all_panel_read_scroll_authority",
                 "base_label_projection",
                 "reference_filter_dependency",
+                "display_invalidation_provenance",
+                "scroll_cache_authority",
+                "renderer_invariant_failures",
+                "ledger_retained_breakdown",
             ],
             "privacy": "No sequence, read names, auxiliary-tag values, credentials, or remote URLs are intentionally recorded. Filter kinds, numeric thresholds, redacted auxiliary value types, user-visible diagnostic/status text, and genomic loci are included.",
         }));
@@ -786,8 +995,16 @@ impl Viewer {
             .frame_clock
             .saturating_add(1);
         let frame_id = self.manual_diagnostic_trace_runtime.frame_clock;
+        self.manual_diagnostic_trace_runtime
+            .last_completed_frame_phase = Some("frame_begin");
         self.manual_diagnostic_trace_runtime.current_frame = Some(ManualDiagnosticFrameTimings {
             frame_id,
+            display_dirty_marks_at_begin: self
+                .manual_diagnostic_trace_runtime
+                .display_dirty_mark_sequence,
+            display_dirty_clears_at_begin: self
+                .manual_diagnostic_trace_runtime
+                .display_dirty_clear_sequence,
             ..ManualDiagnosticFrameTimings::default()
         });
         self.manual_diagnostic_trace.record(
@@ -806,9 +1023,18 @@ impl Viewer {
         phase: ManualDiagnosticFramePhase,
         duration: Duration,
     ) {
+        let marks = self
+            .manual_diagnostic_trace_runtime
+            .display_dirty_mark_sequence;
+        let clears = self
+            .manual_diagnostic_trace_runtime
+            .display_dirty_clear_sequence;
         if let Some(frame) = self.manual_diagnostic_trace_runtime.current_frame.as_mut() {
             frame.add(phase, duration);
+            frame.note_display_invalidation_progress(phase, marks, clears);
         }
+        self.manual_diagnostic_trace_runtime
+            .last_completed_frame_phase = Some(phase.label());
     }
 
     pub(crate) fn finish_manual_diagnostic_frame(&mut self, total: Duration) {
@@ -821,6 +1047,38 @@ impl Viewer {
             .pointer_interaction
             .or(self.manual_diagnostic_trace_runtime.wheel_interaction)
             .map(ManualDiagnosticInteractionId::get);
+        let marks_at_end = self
+            .manual_diagnostic_trace_runtime
+            .display_dirty_mark_sequence;
+        let clears_at_end = self
+            .manual_diagnostic_trace_runtime
+            .display_dirty_clear_sequence;
+        let marks_after_first = frame
+            .display_dirty_marks_after_first_rebuild
+            .unwrap_or(frame.display_dirty_marks_at_begin);
+        let clears_after_first = frame
+            .display_dirty_clears_after_first_rebuild
+            .unwrap_or(frame.display_dirty_clears_at_begin);
+        let marks_after_shell = frame
+            .display_dirty_marks_after_shell
+            .unwrap_or(marks_after_first);
+        let clears_after_shell = frame
+            .display_dirty_clears_after_shell
+            .unwrap_or(clears_after_first);
+        let marks_after_second = frame
+            .display_dirty_marks_after_second_rebuild
+            .unwrap_or(marks_after_shell);
+        let clears_after_second = frame
+            .display_dirty_clears_after_second_rebuild
+            .unwrap_or(clears_after_shell);
+        let last_display_invalidation = self
+            .manual_diagnostic_trace_runtime
+            .last_display_invalidation
+            .as_ref()
+            .map_or(
+                serde_json::Value::Null,
+                ManualDiagnosticDisplayInvalidation::json,
+            );
         self.manual_diagnostic_trace.record(
             "frame",
             "present_cycle_finished",
@@ -849,6 +1107,21 @@ impl Viewer {
                 "present_us": frame.present_us,
                 "prefetch_us": frame.prefetch_us,
                 "display_dirty_after": self.display_dirty,
+                "display_invalidation": {
+                    "mark_sequence_at_begin": frame.display_dirty_marks_at_begin,
+                    "mark_sequence_at_end": marks_at_end,
+                    "marks_before_or_during_first_rebuild": marks_after_first.saturating_sub(frame.display_dirty_marks_at_begin),
+                    "marks_during_shell": marks_after_shell.saturating_sub(marks_after_first),
+                    "marks_during_second_rebuild": marks_after_second.saturating_sub(marks_after_shell),
+                    "marks_after_second_rebuild": marks_at_end.saturating_sub(marks_after_second),
+                    "clear_sequence_at_begin": frame.display_dirty_clears_at_begin,
+                    "clear_sequence_at_end": clears_at_end,
+                    "clears_before_or_during_first_rebuild": clears_after_first.saturating_sub(frame.display_dirty_clears_at_begin),
+                    "clears_during_shell": clears_after_shell.saturating_sub(clears_after_first),
+                    "clears_during_second_rebuild": clears_after_second.saturating_sub(clears_after_shell),
+                    "clears_after_second_rebuild": clears_at_end.saturating_sub(clears_after_second),
+                    "last": last_display_invalidation,
+                },
             })),
         );
         self.record_manual_diagnostic_state_if_needed(frame.frame_id);
@@ -866,6 +1139,8 @@ impl Viewer {
         }
         self.record_manual_data_status_change();
         self.save_frozen_manual_diagnostic_trace_if_needed();
+        self.manual_diagnostic_trace_runtime
+            .last_completed_frame_phase = Some("frame_finished");
     }
 
     pub(crate) fn record_manual_navigation_intent(&mut self, kind: &str) {
@@ -1267,6 +1542,137 @@ impl Viewer {
         })
     }
 
+    /// Captures every authority involved in deciding whether vertical scrolling can reuse the
+    /// current display derivative. This is intentionally redundant with the high-level presented
+    /// state: a target-revision or row-atlas disagreement must remain visible even when the normal
+    /// accessor correctly rejects the stale lane.
+    pub(crate) fn manual_read_panel_scroll_cache_diagnostic_state(
+        &self,
+        panel_id: PanelId,
+        track_id: TrackId,
+    ) -> serde_json::Value {
+        let Some(panel) = self.panels.get(panel_id) else {
+            return serde_json::json!({ "panel_present": false });
+        };
+        let desired_target_revision = self
+            .alignment_scene_publication_authority
+            .desired_target_revision();
+        let committed_target_revision = self.alignment_scene_publication_authority.target_revision;
+        let committed_row_target_matches_desired = self
+            .alignment_scene_publication_authority
+            .committed_row_target_matches_desired(panel_id, track_id);
+        let presented_target_revision = self
+            .alignment_presented_epoch
+            .as_ref()
+            .and_then(|epoch| epoch.gpu_bundle.as_ref())
+            .map(|bundle| bundle.target_revision);
+        let current_presented_target_revision = self
+            .presented_alignment_lane(panel_id, track_id)
+            .map(|presented| presented.target_revision);
+        let cache = panel.scroll_display_cache.as_ref();
+        let cached = cache.and_then(|cache| {
+            cache
+                .read_panels
+                .iter()
+                .find(|read_panel| read_panel.track_id == track_id)
+        });
+        let Some(cached) = cached else {
+            return serde_json::json!({
+                "panel_present": true,
+                "scroll_cache_present": cache.is_some(),
+                "read_panel_cache_present": false,
+                "cache_supports_fast_scroll": cache.is_some_and(|cache| cache.supports_fast_scroll),
+                "display_dirty": self.display_dirty,
+                "desired_target_revision": desired_target_revision,
+                "committed_target_revision": committed_target_revision,
+                "presented_epoch_target_revision": presented_target_revision,
+                "current_presented_target_revision": current_presented_target_revision,
+                "committed_row_target_matches_desired": committed_row_target_matches_desired,
+            });
+        };
+        let state = panel.read_panel_scroll_state(track_id);
+        let effective_authority = current_read_row_authority(
+            cached.presentation_target_revision,
+            desired_target_revision,
+            committed_row_target_matches_desired,
+            cached.row_coordinate_authority,
+        );
+        let required_materialized_rows = cached
+            .total_rows
+            .zip(cached.row_origin)
+            .zip(cached.row_height)
+            .map(|((total_rows, row_origin), row_height)| {
+                materialized_alignment_row_range(
+                    row_origin,
+                    row_height,
+                    cached.clip_top,
+                    cached.clip_bottom,
+                    state.effective_scroll_points(),
+                    total_rows,
+                    0,
+                )
+            });
+        let materialization_covers_required =
+            match (cached.materialized_row_range, required_materialized_rows) {
+                (
+                    Some((materialized_start, materialized_end)),
+                    Some((required_start, required_end)),
+                ) => materialized_start <= required_start && required_end <= materialized_end,
+                // A cache without an explicit CPU materialization window delegates row residency to
+                // the native alignment scene and therefore does not reject fast scroll here.
+                _ => true,
+            };
+        serde_json::json!({
+            "panel_present": true,
+            "scroll_cache_present": true,
+            "read_panel_cache_present": true,
+            "cache_supports_fast_scroll": cache.is_some_and(|cache| cache.supports_fast_scroll),
+            "display_dirty": self.display_dirty,
+            "desired_target_revision": desired_target_revision,
+            "committed_target_revision": committed_target_revision,
+            "presented_epoch_target_revision": presented_target_revision,
+            "current_presented_target_revision": current_presented_target_revision,
+            "committed_row_target_matches_desired": committed_row_target_matches_desired,
+            "cache_presentation_target_revision": cached.presentation_target_revision,
+            "cache_target_matches_desired": cached.presentation_target_revision == desired_target_revision,
+            "cache_target_matches_committed": cached.presentation_target_revision == committed_target_revision,
+            "raw_row_coordinate_authority": format!("{:?}", cached.row_coordinate_authority),
+            "effective_row_coordinate_authority": format!("{effective_authority:?}"),
+            "row_activity_atlas_revision": cached.row_activity_atlas_revision.map(|revision| diagnostic_revision_fingerprint(revision.fingerprint())),
+            "materialized_row_range": cached.materialized_row_range.map(|(start, end)| serde_json::json!({ "start": start, "end": end })),
+            "required_materialized_row_range": required_materialized_rows.map(|(start, end)| serde_json::json!({ "start": start, "end": end })),
+            "materialization_covers_required": materialization_covers_required,
+            "total_rows": cached.total_rows,
+            "row_origin": cached.row_origin,
+            "row_height": cached.row_height,
+            "density_camera": cached.density_camera,
+            "clip_top": cached.clip_top,
+            "clip_bottom": cached.clip_bottom,
+            "actual_content_bottom": cached.actual_content_bottom,
+            "scroll_points": state.scroll_points,
+            "effective_scroll_points": state.effective_scroll_points(),
+            "content_origin_points": state.content_origin_points,
+        })
+    }
+
+    pub(crate) fn manual_active_scroll_cache_diagnostic_state(&self) -> serde_json::Value {
+        let panel_id = self.panels.active().id;
+        serde_json::Value::Array(
+            self.alignment_tracks
+                .iter()
+                .map(|track| {
+                    serde_json::json!({
+                        "track_id": track.config.id.get(),
+                        "authority": self.manual_read_panel_scroll_cache_diagnostic_state(
+                            panel_id,
+                            track.config.id,
+                        ),
+                    })
+                })
+                .collect(),
+        )
+    }
+
     fn all_panel_alignment_diagnostic_state(&self) -> Vec<serde_json::Value> {
         let current_target_revision = self
             .alignment_scene_publication_authority
@@ -1336,6 +1742,10 @@ impl Viewer {
                         serde_json::json!({
                             "track_id": track_id.get(),
                             "row_authority": format!("{row_authority:?}"),
+                            "scroll_cache_authority": self.manual_read_panel_scroll_cache_diagnostic_state(
+                                panel.id,
+                                track_id,
+                            ),
                             "scroll": {
                                 "points": state.scroll_points,
                                 "effective_points": state.effective_scroll_points(),
@@ -1511,6 +1921,10 @@ impl Viewer {
                     "filtering": self.alignment_filter_diagnostic_state(panel.id, track.config.id),
                     "base_labels": self.alignment_base_label_diagnostic_state(panel.id, track.config.id),
                     "row_authority": format!("{:?}", self.read_panel_row_authority(track.config.id)),
+                    "scroll_cache_authority": self.manual_read_panel_scroll_cache_diagnostic_state(
+                        panel.id,
+                        track.config.id,
+                    ),
                     "scroll": {
                         "points": scroll.scroll_points,
                         "effective_points": scroll.effective_scroll_points(),
@@ -1549,6 +1963,26 @@ impl Viewer {
         let read_stats = self.alignment_gpu_last_prepare_stats;
         let summary_stats = self.alignment_summary_gpu_last_prepare_stats;
         let budget = self.alignment_scene_budget;
+        let ledger_progress = self.alignment_scene_ledger.progress().ok();
+        let retained_breakdown = ledger_progress.map_or(serde_json::Value::Null, |progress| {
+            let retained = progress.retained;
+            serde_json::json!({
+                "evidence_bytes": retained.evidence_bytes(),
+                "summary_bytes": retained.summary_bytes(),
+                "row_atlas_bytes": retained.row_atlas_bytes(),
+                "semantic_scene_bytes": retained.semantic_scene_bytes(),
+                "gpu_bytes": retained.gpu_bytes(),
+                "total_bytes": retained.total(),
+            })
+        });
+        let last_display_invalidation = self
+            .manual_diagnostic_trace_runtime
+            .last_display_invalidation
+            .as_ref()
+            .map_or(
+                serde_json::Value::Null,
+                ManualDiagnosticDisplayInvalidation::json,
+            );
         let presented_epoch = self.alignment_presented_epoch.as_ref().map_or(
             serde_json::Value::Null,
             |epoch| {
@@ -1594,6 +2028,9 @@ impl Viewer {
                 "surface_height": self.surface_config.height,
                 "scale_factor": self.window.scale_factor(),
                 "display_dirty": self.display_dirty,
+                "display_dirty_mark_sequence": self.manual_diagnostic_trace_runtime.display_dirty_mark_sequence,
+                "display_dirty_clear_sequence": self.manual_diagnostic_trace_runtime.display_dirty_clear_sequence,
+                "last_display_invalidation": last_display_invalidation,
             },
             "input": {
                 "dragging": self.dragging,
@@ -1624,6 +2061,7 @@ impl Viewer {
                 "pinned_overage_bytes": budget.pinned_overage_bytes,
                 "active_replacement_bundle": budget.active_replacement_bundle,
                 "refreshes": budget.refreshes,
+                "retained_breakdown": retained_breakdown,
             },
             "prefetch": {
                 "reads": self.alignment_gpu_prefetch.reads,
@@ -1846,6 +2284,39 @@ mod tests {
         assert_eq!(timings.first_display_rebuild_us, 42);
         assert_eq!(timings.queue_submission_us, 7);
         assert_eq!(timings.shell_us, 0);
+    }
+
+    #[test]
+    fn frame_phase_timings_capture_display_invalidation_boundaries() {
+        let mut timings = ManualDiagnosticFrameTimings::default();
+        timings.note_display_invalidation_progress(
+            ManualDiagnosticFramePhase::FirstDisplayRebuild,
+            4,
+            2,
+        );
+        timings.note_display_invalidation_progress(ManualDiagnosticFramePhase::Shell, 7, 3);
+        timings.note_display_invalidation_progress(
+            ManualDiagnosticFramePhase::SecondDisplayRebuild,
+            8,
+            4,
+        );
+        assert_eq!(timings.display_dirty_marks_after_first_rebuild, Some(4));
+        assert_eq!(timings.display_dirty_clears_after_first_rebuild, Some(2));
+        assert_eq!(timings.display_dirty_marks_after_shell, Some(7));
+        assert_eq!(timings.display_dirty_clears_after_shell, Some(3));
+        assert_eq!(timings.display_dirty_marks_after_second_rebuild, Some(8));
+        assert_eq!(timings.display_dirty_clears_after_second_rebuild, Some(4));
+    }
+
+    #[test]
+    fn diagnostic_caller_paths_do_not_retain_workspace_prefixes() {
+        assert_eq!(
+            diagnostic_caller_file(
+                "/Users/private/work/rgv/apps/rgv-desktop/src/ui/interaction.rs"
+            ),
+            "src/ui/interaction.rs"
+        );
+        assert_eq!(diagnostic_caller_file("generated.rs"), "generated.rs");
     }
 
     #[test]

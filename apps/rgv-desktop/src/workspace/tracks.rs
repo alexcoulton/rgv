@@ -716,7 +716,7 @@ impl Viewer {
         panel.selected_presentation_nodes = next;
         panel.presentation_selection_anchor = next_anchor;
         synchronize_panel_track_selection(panel, &alignment_ids);
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 
     pub(crate) fn apply_bulk_alignment_appearance(
@@ -758,7 +758,7 @@ impl Viewer {
             self.request_all_alignment_queries();
         }
         self.rebuild_genomic_display();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok(())
     }
 
@@ -871,7 +871,7 @@ impl Viewer {
         );
         if changed {
             self.rebuild_all_panel_displays();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
     }
 
@@ -903,7 +903,7 @@ impl Viewer {
         }
         self.request_all_panel_queries();
         self.rebuild_all_panel_displays();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok(())
     }
 
@@ -915,7 +915,7 @@ impl Viewer {
         let changed = apply_quantitative_bulk_action(self.tracks.tracks_mut(), selected, action);
         if changed {
             self.rebuild_all_panel_displays();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
     }
 
@@ -1000,7 +1000,7 @@ impl Viewer {
         self.begin_all_panel_refresh_transactions();
         self.request_all_auxiliary_track_queries();
         self.rebuild_all_panel_displays();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok(actual.len())
     }
 
@@ -1029,7 +1029,7 @@ impl Viewer {
         if removed > 0 {
             self.metadata_selected_tracks.clear();
             self.rebuild_all_panel_displays();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         Ok(removed)
     }
@@ -1075,7 +1075,7 @@ impl Viewer {
         }
         if outcome.configuration_changed {
             self.rebuild_genomic_display();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         if outcome.query_changed {
             self.request_all_alignment_queries();

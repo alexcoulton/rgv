@@ -451,7 +451,7 @@ impl Viewer {
             }
             runner.finished = true;
             self.automation_exit_requested = exit;
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
             return;
         }
         if runner.report_worker.is_some() {
@@ -711,7 +711,7 @@ impl Viewer {
         self.automation = Some(AutomationRunner::for_control(request));
         self.data_status =
             format!("Running authenticated local-control batch ({command_count} commands)…");
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 
     pub(crate) fn finish_automation_command(
@@ -751,7 +751,7 @@ impl Viewer {
             );
             return;
         }
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 
     pub(crate) fn start_automation_report(&mut self) {
@@ -777,7 +777,7 @@ impl Viewer {
             }
             runner.finished = true;
             self.automation_exit_requested = runner.exit_after_report;
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
             return;
         }
         let json = match report.to_json() {
@@ -3280,7 +3280,7 @@ impl Viewer {
                 if let Some(intent) = presentation_intent {
                     self.apply_track_intents(&[intent])?;
                     self.rebuild_all_panel_displays();
-                    self.display_dirty = true;
+                    self.mark_display_dirty("explicit display invalidation");
                     return Ok(());
                 }
                 let primary_id = self.primary_alignment_track_id();
@@ -3364,7 +3364,7 @@ impl Viewer {
                 self.rebuild_all_panel_displays();
             }
         }
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok(())
     }
 
@@ -4478,17 +4478,7 @@ impl Viewer {
             (
                 AutomationAlignmentRelationship::Mate,
                 AutomationNavigationDestination::CurrentPanel,
-            ) => {
-                let (pending_selection, locus) = self
-                    .selected_mate_target()
-                    .context("the selected alignment has no mapped mate")?;
-                let track_id = pending_selection.track_id;
-                self.navigate_to_locus(&locus)?;
-                let panel = self.panels.active_mut();
-                panel.pending_read_selection = Some(pending_selection);
-                panel.selected_alignment_track = Some(track_id);
-                panel.id
-            }
+            ) => self.go_to_selected_mate_in_current_panel()?,
             (
                 AutomationAlignmentRelationship::SupplementarySegment,
                 AutomationNavigationDestination::NewPanel,
@@ -4555,7 +4545,7 @@ impl Viewer {
         }
         self.invalidate_automation_alignment_layouts(Some(track_ids), false);
         self.rebuild_all_panel_displays();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok(())
     }
 
@@ -4650,7 +4640,7 @@ impl Viewer {
         }
         self.invalidate_automation_alignment_layouts(Some(track_ids), false);
         self.rebuild_all_panel_displays();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok(())
     }
 
@@ -4686,7 +4676,7 @@ impl Viewer {
         self.invalidate_automation_alignment_layouts(Some(track_ids), true);
         self.request_all_panel_queries();
         self.rebuild_all_panel_displays();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok(())
     }
 
@@ -4863,7 +4853,7 @@ impl Viewer {
                         });
                 }
                 self.rebuild_genomic_display();
-                self.display_dirty = true;
+                self.mark_display_dirty("explicit display invalidation");
                 self.bump_workspace_revision();
                 self.retain_active_selection(Some(granularity));
                 Ok(serde_json::json!({
@@ -4967,7 +4957,7 @@ impl Viewer {
                     "evidence_revision": self.automation_selection_snapshot().map(|selection| selection.evidence_revision),
                 }),
             });
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
             self.window.request_redraw();
             return Ok(());
         }
@@ -5125,7 +5115,7 @@ impl Viewer {
         self.panels.active_mut().read_panel_scrolls = original_read_panel_scrolls;
         self.rebuild_genomic_display();
         self.composite_display_list = composite_panel_display_lists(&self.panels);
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
 
         let scope = if truncated {
             format!(

@@ -107,7 +107,7 @@ impl Viewer {
                 CursorIcon::Default
             });
             if self.synthetic || !self.refresh_active_panel_scroll_display() {
-                self.display_dirty = true;
+                self.mark_display_dirty("wheel read-panel fast-scroll refresh was unavailable");
             }
             self.window.request_redraw();
         }
@@ -205,9 +205,43 @@ impl Viewer {
 
     fn set_read_panel_scroll(&mut self, track_id: TrackId, requested: f32) {
         let Some((_, clip_bottom, _)) = self.read_panel_metrics(track_id) else {
+            if self.manual_diagnostic_trace_is_recording() {
+                self.record_manual_diagnostic_event(
+                    "vertical_navigation",
+                    "scroll_rejected",
+                    serde_json::json!({
+                        "reason": "read panel metrics are unavailable",
+                        "panel_id": self.panels.active().id.get(),
+                        "track_id": track_id.get(),
+                        "requested_points": requested,
+                        "scroll_cache_authority": self.manual_read_panel_scroll_cache_diagnostic_state(
+                            self.panels.active().id,
+                            track_id,
+                        ),
+                    }),
+                );
+            }
             return;
         };
-        if !self.read_panel_row_authority(track_id).is_exact() {
+        let row_authority = self.read_panel_row_authority(track_id);
+        if !row_authority.is_exact() {
+            if self.manual_diagnostic_trace_is_recording() {
+                self.record_manual_diagnostic_event(
+                    "vertical_navigation",
+                    "scroll_rejected",
+                    serde_json::json!({
+                        "reason": "read row authority is not exact",
+                        "panel_id": self.panels.active().id.get(),
+                        "track_id": track_id.get(),
+                        "requested_points": requested,
+                        "row_authority": format!("{row_authority:?}"),
+                        "scroll_cache_authority": self.manual_read_panel_scroll_cache_diagnostic_state(
+                            self.panels.active().id,
+                            track_id,
+                        ),
+                    }),
+                );
+            }
             return;
         }
         let state = self.panels.active().read_panel_scroll_state(track_id);
@@ -244,7 +278,7 @@ impl Viewer {
             self.panels.active_mut().latent_vertical_scroll_fraction = latent_fraction;
         }
         if self.synthetic || !self.refresh_active_panel_scroll_display() {
-            self.display_dirty = true;
+            self.mark_display_dirty("read-panel fast-scroll refresh was unavailable");
         }
         self.request_alignment_scene_camera_update(track_id);
         self.window.request_redraw();
@@ -258,7 +292,7 @@ impl Viewer {
         }
         self.invalidate_navigation_contract("annotation vertical scroll changed");
         if !self.refresh_shared_annotation_scroll_display(next) {
-            self.display_dirty = true;
+            self.mark_display_dirty("annotation fast-scroll refresh was unavailable");
         }
         self.window.request_redraw();
     }
@@ -496,7 +530,28 @@ impl Viewer {
         interaction: ui::ScrollbarInteraction,
         requested_scroll: &mut f32,
     ) {
-        if !self.read_panel_row_authority(track_id).is_exact() {
+        let row_authority = self.read_panel_row_authority(track_id);
+        if !row_authority.is_exact() {
+            if self.manual_diagnostic_trace_is_recording()
+                && (interaction.pointer_down
+                    || interaction.keyboard_density_pixels.abs() > f32::EPSILON)
+            {
+                self.record_manual_diagnostic_event(
+                    "vertical_navigation",
+                    "overview_interaction_rejected",
+                    serde_json::json!({
+                        "reason": "read row authority is not exact",
+                        "panel_id": self.panels.active().id.get(),
+                        "track_id": track_id.get(),
+                        "requested_points": *requested_scroll,
+                        "row_authority": format!("{row_authority:?}"),
+                        "scroll_cache_authority": self.manual_read_panel_scroll_cache_diagnostic_state(
+                            self.panels.active().id,
+                            track_id,
+                        ),
+                    }),
+                );
+            }
             return;
         }
         if interaction.pointer_down {
@@ -520,7 +575,7 @@ impl Viewer {
             );
             if (density - previous_density).abs() > 1.0e-4 {
                 self.set_read_panel_density(panel_id, track_id, density);
-                self.display_dirty = true;
+                self.mark_display_dirty("keyboard changed read-panel density");
             }
             let maximum = self
                 .read_panel_metrics(track_id)
@@ -528,7 +583,7 @@ impl Viewer {
                     self.read_panel_presented_scroll_maximum(track_id, bottom)
                 });
             *requested_scroll = scroll.clamp(0.0, maximum);
-            self.display_dirty = true;
+            self.mark_display_dirty("keyboard changed read-panel scroll camera");
         }
         self.set_read_panel_scroll(track_id, *requested_scroll);
     }
@@ -892,13 +947,13 @@ impl Viewer {
         }
         if density_changed {
             self.set_read_panel_density(drag.panel_id, drag.track_id, density);
-            self.display_dirty = true;
+            self.mark_display_dirty("vertical overview changed read-panel density");
             self.interaction_trace
                 .record_once(InteractionTraceStage::DensityChanged);
         } else if scroll_changed {
             self.invalidate_navigation_contract("read panel vertical scroll changed");
             if self.synthetic || !self.refresh_active_panel_scroll_display() {
-                self.display_dirty = true;
+                self.mark_display_dirty("vertical overview fast-scroll refresh was unavailable");
             }
         } else if (drag.virtual_scroll_fraction - previous_fraction).abs() > f32::EPSILON {
             self.window.request_redraw();
@@ -931,7 +986,7 @@ impl Viewer {
                 }
             }
             OverviewCapture::VerticalDensity => {
-                self.display_dirty = true;
+                self.mark_display_dirty("vertical density capture finished");
             }
         }
         self.window.request_redraw();
@@ -939,7 +994,7 @@ impl Viewer {
 
     pub(crate) fn query_options_changed(&mut self) {
         self.remember_current_locus();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         self.invalidate_navigation_contract("query or presentation options changed");
         if !self.synthetic && (self.has_alignment_engine() || self.track_engine.is_some()) {
             for panel in &mut self.panels.panels {
@@ -1093,7 +1148,7 @@ impl Viewer {
                 panel.viewport = viewport;
             }
         }
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 
     pub(crate) fn activate_view_panel(&mut self, id: PanelId) -> bool {
@@ -1111,7 +1166,7 @@ impl Viewer {
             self.window.set_cursor(CursorIcon::Default);
         }
         self.refresh_active_panel_context();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         if changed && !self.synthetic {
             // A panel switch must not turn its semantic selection back into an
             // unsafe query-local record index when activation refreshes data.
@@ -1201,7 +1256,7 @@ impl Viewer {
         let moved = self.panels.move_panel(id, new_index);
         if moved {
             self.invalidate_navigation_contract("view panel order changed");
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
             self.rebuild_all_panel_displays();
         }
         moved

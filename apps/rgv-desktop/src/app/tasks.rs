@@ -123,7 +123,7 @@ impl Viewer {
             }),
             Err(error) => {
                 self.data_status = format!("Could not start recovery autosave: {error}");
-                self.display_dirty = true;
+                self.mark_display_dirty("explicit display invalidation");
             }
         }
     }
@@ -193,7 +193,7 @@ impl Viewer {
             if let (Some(command_index), Some(outcome)) = (automation_command, automation_outcome) {
                 self.finish_automation_command(command_index, outcome);
             }
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
     }
 
@@ -330,7 +330,7 @@ impl Viewer {
                     );
                 }
             }
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
     }
 
@@ -405,7 +405,7 @@ impl Viewer {
             if let (Some(command_index), Some(outcome)) = (automation_command, automation_outcome) {
                 self.finish_automation_command(command_index, outcome);
             }
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
     }
 
@@ -479,7 +479,7 @@ impl Viewer {
                 Ok(Err(error)) => self.data_status = format!("Could not import {path}: {error}"),
                 Err(_) => self.data_status = format!("Import worker failed while reading {path}"),
             }
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
     }
 

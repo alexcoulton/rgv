@@ -682,7 +682,7 @@ impl Viewer {
             }
             self.invalidate_navigation_contract("read track visibility changed");
             self.rebuild_all_panel_displays();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
             return;
         }
         let primary_id = self.primary_alignment_track_id();
@@ -745,7 +745,7 @@ impl Viewer {
             self.request_all_alignment_queries();
         }
         self.rebuild_all_panel_displays();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 }
 

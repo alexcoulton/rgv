@@ -3320,10 +3320,10 @@ impl Viewer {
                     self.schedule_resolution_query_refresh();
                 }
             } else if self.synthetic {
-                self.display_dirty = true;
+                self.mark_display_dirty("explicit display invalidation");
             } else {
                 self.rebuild_all_panel_displays();
-                self.display_dirty = true;
+                self.mark_display_dirty("explicit display invalidation");
             }
         }
         if properties_resize_ended {
@@ -3343,7 +3343,7 @@ impl Viewer {
                         Some((workspace.panel_id, ui::TrackPane::Annotation));
                 }
                 if !self.refresh_shared_annotation_scroll_display(workspace.annotation_offset) {
-                    self.display_dirty = true;
+                    self.mark_display_dirty("annotation scrollbar fast refresh was unavailable");
                 }
                 self.window.request_redraw();
             }
@@ -3361,7 +3361,7 @@ impl Viewer {
                 self.activate_view_panel(workspace.panel_id);
                 self.panels.active_mut().read_stack_scroll_points = workspace.read_stack_offset;
                 self.rebuild_genomic_display();
-                self.display_dirty = true;
+                self.mark_display_dirty("read-track stack scrollbar changed");
                 self.window.request_redraw();
             }
             for scrollbar in &mut workspace.read_panels {
@@ -3521,20 +3521,20 @@ impl Viewer {
         if alignment_configuration_changed {
             self.invalidate_navigation_contract("alignment track layout changed");
             self.rebuild_genomic_display();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         if self.alignment_tracks.is_empty() && alignment_visible != self.primary_alignment_visible()
         {
             self.set_primary_alignment_visible(alignment_visible);
             self.rebuild_genomic_display();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         if self.alignment_tracks.is_empty()
             && alignment_collapsed != self.primary_alignment_collapsed()
         {
             self.set_primary_alignment_collapsed(alignment_collapsed);
             self.rebuild_genomic_display();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         if self.alignment_tracks.is_empty()
             && !alignment_name.trim().is_empty()
@@ -3542,7 +3542,7 @@ impl Viewer {
         {
             self.set_primary_alignment_name(alignment_name);
             self.rebuild_genomic_display();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         self.locus_editor = locus_editor;
         if locus_search_changed
@@ -3852,9 +3852,9 @@ impl Viewer {
         if regions_changed {
             self.invalidate_navigation_contract("region overlays changed");
             self.rebuild_all_panel_displays();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         } else if review_changed {
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         if metadata_remove_requested {
             self.sample_metadata = None;
@@ -4032,7 +4032,7 @@ impl Viewer {
         self.settings.reduced_motion = reduced_motion;
         if accessibility_changed {
             apply_accessibility_preferences(&self.egui_context, &self.settings);
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         if autosave_schedule_changed {
             self.schedule_next_autosave();
@@ -4229,7 +4229,7 @@ impl Viewer {
             // actor may reuse the exact still-pinned current scene, but all speculative/cache
             // residency is rebuilt under the post-clear budget policy.
             self.request_all_alignment_queries();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         truncate_string_to_bytes(&mut read_name_editor, 1_024);
         self.read_name_editor.clone_from(&read_name_editor);
@@ -4264,7 +4264,7 @@ impl Viewer {
         if clear_selection {
             self.clear_promoted_read();
             self.panels.active_mut().clear_selection();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         let editing_primary_settings = settings_alignment_id == primary_alignment_id;
         if editing_primary_settings && typed_alignment_predicates_changed {
@@ -4320,7 +4320,7 @@ impl Viewer {
             self.reference_genetic_code = reference_genetic_code;
             self.invalidate_navigation_contract("reference presentation changed");
             self.rebuild_all_panel_displays();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         let requested_coverage_scale =
             use_fixed_coverage_scale.then_some(coverage_scale_maximum.max(1));
@@ -4418,7 +4418,7 @@ impl Viewer {
                 .collect();
             self.invalidate_navigation_contract("alignment presentation changed");
             self.rebuild_genomic_display();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         let previous_auxiliary_query_membership = auxiliary_query_track_ids(self.tracks.tracks())
             .into_iter()
@@ -4569,7 +4569,7 @@ impl Viewer {
             self.invalidate_navigation_contract("auxiliary track presentation changed");
             self.reconcile_track_presentation();
             self.rebuild_genomic_display();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         if auxiliary_query_membership_changed {
             self.invalidate_and_request_all_auxiliary_track_queries();
@@ -4801,7 +4801,7 @@ impl Viewer {
             && apply_compatible_auxiliary_appearance(self.tracks.tracks_mut(), &metadata_selected)
         {
             self.rebuild_all_panel_displays();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         if metadata_bulk_quantitative_autoscale_requested {
             self.apply_metadata_quantitative_action(

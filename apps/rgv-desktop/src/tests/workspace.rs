@@ -2993,11 +2993,57 @@ fn mate_panel_locus_is_centered_bounded_and_requires_a_mapped_pair() {
         mate_locus(&record, &dictionary, 400).as_deref(),
         Some("chr2:1601-2000")
     );
+    record.mate_start = Some(500);
+    assert_eq!(
+        mate_locus(&record, &dictionary, 20).as_deref(),
+        Some("chr2:491-510"),
+        "mate navigation must preserve a sub-100-base zoom span"
+    );
+    record.mate_start = Some(1_900);
     record.flags = rgv_hts::AlignmentFlags::from_bits(0x9);
     assert!(mate_locus(&record, &dictionary, 400).is_none());
     record.flags = rgv_hts::AlignmentFlags::from_bits(0x1);
     record.mate_start = Some(2_000);
     assert!(mate_locus(&record, &dictionary, 400).is_none());
+}
+
+#[test]
+fn same_panel_mate_viewport_preserves_the_exact_fractional_camera() {
+    let dictionary =
+        ReferenceDictionary::from_contigs([("chr1".to_owned(), 1_000), ("chr2".to_owned(), 2_000)]);
+    let record = AlignmentRecord {
+        contig: ContigId::new(0),
+        start: 100,
+        end: 150,
+        flags: rgv_hts::AlignmentFlags::from_bits(0x1),
+        mapping_quality: Some(60),
+        mate_contig: Some(ContigId::new(1)),
+        mate_start: Some(500),
+        template_length: 0,
+        read_name: b"pair".to_vec(),
+        cigar: Vec::new(),
+        sequence: SequenceData::Missing,
+        auxiliary_fields: Vec::new(),
+    };
+    let source = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 101).unwrap(),
+        1_000.0,
+    )
+    .unwrap()
+    .pan_pixels(0.5, 1_000)
+    .unwrap();
+    assert_eq!(source.span(), 1.0);
+    assert_eq!(source.interval().len(), 2);
+
+    let (mate, contig_name, contig_length) = mate_viewport(&record, &dictionary, source).unwrap();
+
+    assert_eq!(contig_name, "chr2");
+    assert_eq!(contig_length, 2_000);
+    assert_eq!(mate.interval().contig(), ContigId::new(1));
+    assert_eq!(mate.span(), source.span());
+    assert_eq!(mate.pixel_width(), source.pixel_width());
+    assert!((mate.bases_per_pixel() - source.bases_per_pixel()).abs() < f64::EPSILON);
+    assert!((mate.genomic_at_pixel(500.0) - 500.0).abs() < f64::EPSILON);
 }
 
 #[test]

@@ -6,6 +6,12 @@ struct FrameTargetPlan {
     render_capture: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AlignmentRendererFailure {
+    lane: &'static str,
+    message: String,
+}
+
 const fn frame_target_plan(capture_requested: bool) -> FrameTargetPlan {
     FrameTargetPlan {
         // A capture is an additional output, never a replacement for the
@@ -735,7 +741,7 @@ impl Viewer {
         // persisted Properties width. Keep the currently displayed geometry
         // committed until that frame can replace the UI and genomic display
         // list together.
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         self.window.request_redraw();
     }
 
@@ -753,7 +759,8 @@ impl Viewer {
         paint_jobs: &[egui::ClippedPrimitive],
         screen_descriptor: &ScreenDescriptor,
         scale_factor: f32,
-    ) {
+    ) -> Vec<AlignmentRendererFailure> {
+        let mut failures = Vec::new();
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("RGV genomic canvas"),
@@ -800,11 +807,19 @@ impl Viewer {
                         %error,
                         "could not render unified alignment summary frame"
                     );
+                    failures.push(AlignmentRendererFailure {
+                        lane: "summaries",
+                        message: error.to_string(),
+                    });
                 }
                 if let Some(frame) = &bundle.reads
                     && let Err(error) = self.alignment_gpu_renderer.render(&mut pass, frame)
                 {
                     tracing::error!(%error, "could not render unified alignment scene frame");
+                    failures.push(AlignmentRendererFailure {
+                        lane: "reads",
+                        message: error.to_string(),
+                    });
                 }
             }
         }
@@ -825,6 +840,7 @@ impl Viewer {
             self.egui_renderer
                 .render(&mut pass.forget_lifetime(), paint_jobs, screen_descriptor);
         }
+        failures
     }
 
     #[allow(clippy::too_many_lines)]
@@ -997,25 +1013,48 @@ impl Viewer {
         }
         let scale_factor = self.window.scale_factor() as f32;
         let targets = frame_target_plan(capture_texture.is_some());
+        let mut alignment_renderer_failures = Vec::new();
         if targets.render_surface {
-            self.render_composed_frame_target(
+            alignment_renderer_failures.extend(self.render_composed_frame_target(
                 &mut encoder,
                 &surface_view,
                 &paint_jobs,
                 &screen_descriptor,
                 scale_factor,
-            );
+            ));
         }
         if targets.render_capture
             && let Some(texture) = capture_texture.as_ref()
         {
             let capture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.render_composed_frame_target(
+            alignment_renderer_failures.extend(self.render_composed_frame_target(
                 &mut encoder,
                 &capture_view,
                 &paint_jobs,
                 &screen_descriptor,
                 scale_factor,
+            ));
+        }
+        alignment_renderer_failures.dedup();
+        for failure in alignment_renderer_failures {
+            let name = if failure.message.contains("pinned GPU") {
+                "pinned_page_missing"
+            } else {
+                "render_failed"
+            };
+            let message = failure.message.clone();
+            let fields = object_fields(serde_json::json!({
+                "lane": failure.lane,
+                "error": failure.message,
+                "committed_target_revision": self.alignment_scene_publication_authority.target_revision,
+                "desired_target_revision": self.alignment_scene_publication_authority.desired_target_revision(),
+                "scroll_cache_authority": self.manual_active_scroll_cache_diagnostic_state(),
+            }));
+            self.queue_manual_diagnostic_trace_failure(
+                "alignment_renderer",
+                name,
+                &message,
+                fields,
             );
         }
 
@@ -1066,7 +1105,7 @@ impl Viewer {
             // handoff, visible sashimi curves remain non-interactive until an
             // unrelated layout or scroll rebuild happens.
             if !self.refresh_active_panel_scroll_display() {
-                self.display_dirty = true;
+                self.mark_display_dirty("explicit display invalidation");
                 self.window.request_redraw();
             }
         }

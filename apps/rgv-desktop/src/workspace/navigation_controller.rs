@@ -1,6 +1,21 @@
 use super::super::*;
 
 impl Viewer {
+    pub(crate) fn navigate_to_viewport(
+        &mut self,
+        viewport: Viewport,
+        contig_name: String,
+        contig_length: u64,
+    ) {
+        let interval = viewport.interval();
+        let panel = self.panels.active_mut();
+        panel.viewport = viewport;
+        panel.contig_name = contig_name;
+        panel.contig_length = contig_length;
+        panel.navigation_history.visit(interval);
+        self.viewport_changed();
+    }
+
     pub(crate) fn navigate_to_locus(&mut self, locus: &str) -> Result<()> {
         let (interval, contig_name, contig_length) = if let Some(dictionary) = self
             .panels

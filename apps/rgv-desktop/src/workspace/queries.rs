@@ -356,7 +356,7 @@ impl Viewer {
                 || self.track_engine.is_some())
         {
             self.rebuild_genomic_display();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
             return;
         }
 
@@ -551,7 +551,7 @@ impl Viewer {
                 panel.navigation_presentation.mark_ready_to_commit();
             }
         }
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         self.window.request_redraw();
     }
 
@@ -1248,7 +1248,7 @@ impl Viewer {
         if self.reveal_due_alignment_checking_notices(now)
             || self.reveal_due_navigation_notices(now)
         {
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         if self.display_dirty {
             self.window.request_redraw();
@@ -1454,7 +1454,7 @@ impl Viewer {
                     }
                     self.refresh_active_panel_context();
                     self.request_all_panel_queries();
-                    self.display_dirty = true;
+                    self.mark_display_dirty("explicit display invalidation");
                 }
                 ReferenceEngineEvent::QueryCompleted {
                     query,
@@ -1485,7 +1485,7 @@ impl Viewer {
                         panel.reference_request_revision = None;
                         panel.reference_request_interval = None;
                         panel.reference_query_error_generation = None;
-                        self.display_dirty = true;
+                        self.mark_display_dirty("explicit display invalidation");
                         if is_active && !self.has_alignment_engine() {
                             "Reference sequence loaded".clone_into(&mut self.data_status);
                         }
@@ -2596,7 +2596,7 @@ impl Viewer {
                     self.annotation_search_results
                         .hits
                         .retain(|hit| !removed.contains(&hit.track_id));
-                    self.display_dirty = true;
+                    self.mark_display_dirty("explicit display invalidation");
                 }
                 TrackEngineEvent::TdfChannelsDiscovered {
                     id,
@@ -2653,7 +2653,7 @@ impl Viewer {
                         panel.selected_interaction = panel
                             .selected_interaction
                             .filter(|selection| selection.track_id != track_id);
-                        self.display_dirty = true;
+                        self.mark_display_dirty("explicit display invalidation");
                         if is_active {
                             self.rebuild_genomic_display();
                         }
@@ -2671,7 +2671,7 @@ impl Viewer {
                     {
                         panel.track_request_interval = None;
                         panel.track_settled_generation = Some(request.generation().get());
-                        self.display_dirty = true;
+                        self.mark_display_dirty("explicit display invalidation");
                         if is_active {
                             self.rebuild_genomic_display();
                         }
@@ -2690,7 +2690,7 @@ impl Viewer {
                     if let Some(query) = pending {
                         self.submit_annotation_search_results(&query);
                     }
-                    self.display_dirty = true;
+                    self.mark_display_dirty("explicit display invalidation");
                 }
                 TrackEngineEvent::AdjacentFeatureCompleted { generation, hit }
                     if generation == self.annotation_navigation_generation =>
@@ -2721,7 +2721,7 @@ impl Viewer {
                                         .insert(track_id, request.generation().get());
                                 }
                             }
-                            self.display_dirty = true;
+                            self.mark_display_dirty("explicit display invalidation");
                             if is_active {
                                 self.data_status = message;
                             }

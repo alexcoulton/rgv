@@ -1202,7 +1202,7 @@ impl Viewer {
         );
         self.settle_alignment_navigation_gpu_budget_limited(&message);
         self.data_status = message;
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         self.window.request_redraw();
     }
 
@@ -2015,6 +2015,8 @@ impl Viewer {
             .unwrap_or_default();
         let primary_track_id = self.primary_alignment_track_id();
         let mut needs_rebuild = false;
+        let record_cache_mismatches = self.manual_diagnostic_trace_is_recording();
+        let mut cache_mismatches = Vec::new();
         for update in expected {
             let density = self.alignment_density_for_panel_track(update.panel_id, update.track_id);
             let density_drag_fraction = self
@@ -2053,7 +2055,7 @@ impl Viewer {
                     .as_ref()
                     .expect("read panel index came from this cache")
                     .read_panels[read_panel_index];
-                if update.camera.is_none() {
+                let current = if update.camera.is_none() {
                     read_panel.presentation_target_revision == update.target_revision
                         && read_panel.row_coordinate_authority == ReadRowCoordinateAuthority::Absent
                         && read_panel.row_activity_atlas_revision.is_none()
@@ -2067,9 +2069,40 @@ impl Viewer {
                         update.target_revision,
                         activity_identity,
                     )
-                }
+                };
+                current
             };
             needs_rebuild |= !cache_was_current;
+            if record_cache_mismatches && !cache_was_current {
+                let read_panel = &panel
+                    .scroll_display_cache
+                    .as_ref()
+                    .expect("read panel index came from this cache")
+                    .read_panels[read_panel_index];
+                let cached_authority = serde_json::json!({
+                    "presentation_target_revision": read_panel.presentation_target_revision,
+                    "raw_row_coordinate_authority": format!("{:?}", read_panel.row_coordinate_authority),
+                    "row_activity_atlas_revision": read_panel.row_activity_atlas_revision.map(|revision| format!("{revision:?}")),
+                    "total_rows": read_panel.total_rows,
+                    "materialized_row_range": read_panel.materialized_row_range.map(|(start, end)| serde_json::json!({ "start": start, "end": end })),
+                });
+                cache_mismatches.push(serde_json::json!({
+                    "panel_id": update.panel_id.get(),
+                    "track_id": update.track_id.get(),
+                    "desired_target_revision": self.alignment_scene_publication_authority.desired_target_revision(),
+                    "committed_target_revision": self.alignment_scene_publication_authority.target_revision,
+                    "committed_row_target_matches_desired": self.alignment_scene_publication_authority.committed_row_target_matches_desired(update.panel_id, update.track_id),
+                    "incoming_target_revision": update.target_revision,
+                    "incoming_camera_present": update.camera.is_some(),
+                    "incoming_native_reads_present": update.native_reads_present,
+                    "incoming_row_activity_identity": activity_identity.map(|(coordinate_space, atlas_revision, rows)| serde_json::json!({
+                        "coordinate_space": format!("{coordinate_space:?}"),
+                        "atlas_revision": format!("{atlas_revision:?}"),
+                        "active_rows": rows,
+                    })),
+                    "cached": cached_authority,
+                }));
+            }
 
             let Some(camera) = update.camera else {
                 // A committed summary-only lane has no live read coordinate space. Clear current
@@ -2193,8 +2226,15 @@ impl Viewer {
                 panel.content_bottom_points = state.content_bottom_points;
             }
         }
+        for mismatch in cache_mismatches {
+            self.record_manual_diagnostic_event(
+                "display_invalidation",
+                "scroll_cache_authority_mismatch",
+                mismatch,
+            );
+        }
         if needs_rebuild {
-            self.display_dirty = true;
+            self.mark_display_dirty("committed scroll-cache authority changed");
             self.window.request_redraw();
         }
     }
@@ -2279,6 +2319,30 @@ impl Viewer {
         let uncovered_vertical_lanes =
             self.uncovered_vertical_candidate_lane_count(&candidate_epoch);
         if uncovered_vertical_lanes > 0 {
+            let lane_diagnostics = candidate_epoch
+                .panel_frames
+                .iter()
+                .flat_map(|(panel_id, frame)| {
+                    frame.lanes.iter().map(|lane| {
+                        serde_json::json!({
+                            "panel_id": panel_id.get(),
+                            "track_id": lane.track_id.get(),
+                            "camera_revision": frame.camera_revision,
+                            "preparation_interval": format!("{:?}", lane.preparation_camera.interval()),
+                            "read_camera_present": lane.read_camera.is_some(),
+                            "requested_rows": {
+                                "start": lane.requested_rows.start,
+                                "end": lane.requested_rows.end,
+                            },
+                            "covered_rows": {
+                                "start": lane.covered_rows.start,
+                                "end": lane.covered_rows.end,
+                            },
+                            "reads_complete": lane.reads_complete(),
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
             self.record_manual_diagnostic_event(
                 "alignment_publication",
                 "uncovered_vertical_candidate_retained",
@@ -2286,6 +2350,10 @@ impl Viewer {
                     "lane_count": uncovered_vertical_lanes,
                     "capture_elapsed_us": capture_elapsed.as_micros(),
                     "reason": "requested vertical rows have no prepared intersection; retaining the coherent committed epoch",
+                    "desired_target_revision": self.alignment_scene_publication_authority.desired_target_revision(),
+                    "committed_target_revision": self.alignment_scene_publication_authority.target_revision,
+                    "candidate_lanes": lane_diagnostics,
+                    "scroll_cache_authorities": self.manual_active_scroll_cache_diagnostic_state(),
                 }),
             );
             return;
@@ -2759,7 +2827,7 @@ impl Viewer {
                             );
                             self.settle_alignment_navigation_gpu_budget_limited(&message);
                             self.data_status = message;
-                            self.display_dirty = true;
+                            self.mark_display_dirty("explicit display invalidation");
                             self.window.request_redraw();
                             return;
                         }
@@ -4578,7 +4646,7 @@ impl Viewer {
         for panel_id in resolved_panels {
             self.synchronize_alignment_scene_interactions(panel_id);
         }
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         self.window.request_redraw();
     }
 
@@ -5216,7 +5284,7 @@ impl Viewer {
                 self.data_status =
                     format!("Opening {opened_name} and rebalancing alignment-track caches…");
                 self.rebuild_genomic_display();
-                self.display_dirty = true;
+                self.mark_display_dirty("explicit display invalidation");
             }
             Err(error) => self.data_status = error.to_string(),
         }
@@ -5323,7 +5391,7 @@ impl Viewer {
                 self.panels.active_mut().display_list = DisplayList::default();
                 self.synthetic = false;
                 self.data_status = format!("Opening {}…", source.redacted_label());
-                self.display_dirty = true;
+                self.mark_display_dirty("explicit display invalidation");
             }
             Err(error) => self.data_status = error.to_string(),
         }
@@ -5394,7 +5462,7 @@ impl Viewer {
         self.invalidate_navigation_contract("reference source changed");
         self.begin_all_panel_refresh_transactions();
         self.rebuild_all_panel_displays();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 
     pub(crate) fn open_genome_configuration(&mut self, path: &Path) -> Result<()> {
@@ -5595,7 +5663,7 @@ impl Viewer {
         self.begin_all_panel_refresh_transactions();
         self.request_all_alignment_queries();
         self.rebuild_all_panel_displays();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok(true)
     }
 }

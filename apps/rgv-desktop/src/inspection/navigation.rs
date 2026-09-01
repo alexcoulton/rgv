@@ -1,6 +1,18 @@
 use super::super::*;
 
 impl Viewer {
+    fn selected_mate_record(&self) -> Option<(TrackId, AlignmentRecord, &ReferenceDictionary)> {
+        let panel = self.panels.active();
+        let track_id = panel
+            .selected_alignment_hit
+            .map(|hit| hit.track)
+            .or(panel.selected_alignment_track)?;
+        let record =
+            self.alignment_scene_record_for_hit(panel.id, panel.selected_alignment_hit?)?;
+        let dictionary = self.alignment_dictionary_for_track(track_id)?;
+        Some((track_id, record, dictionary))
+    }
+
     pub(crate) fn visible_consensus(&self) -> Option<BoundedSequenceCopy> {
         let track_id = self.primary_alignment_track_id();
         if let Some(presented) = self
@@ -74,19 +86,27 @@ impl Viewer {
     }
 
     pub(crate) fn selected_mate_target(&self) -> Option<(PendingReadSelection, String)> {
-        let panel = self.panels.active();
-        let track_id = panel
-            .selected_alignment_hit
-            .map(|hit| hit.track)
-            .or(panel.selected_alignment_track)?;
-        let record =
-            self.alignment_scene_record_for_hit(panel.id, panel.selected_alignment_hit?)?;
+        let (track_id, record, dictionary) = self.selected_mate_record()?;
         let locus = mate_locus(
             &record,
-            self.alignment_dictionary_for_track(track_id)?,
+            dictionary,
             self.panels.active().viewport.interval().len(),
         )?;
         Some((PendingReadSelection::for_mate(track_id, &record)?, locus))
+    }
+
+    fn selected_mate_viewport_target(
+        &self,
+    ) -> Option<(PendingReadSelection, Viewport, String, u64)> {
+        let (track_id, record, dictionary) = self.selected_mate_record()?;
+        let (viewport, contig_name, contig_length) =
+            mate_viewport(&record, dictionary, self.panels.active().viewport)?;
+        Some((
+            PendingReadSelection::for_mate(track_id, &record)?,
+            viewport,
+            contig_name,
+            contig_length,
+        ))
     }
 
     pub(crate) fn open_selected_mate_in_new_panel(&mut self) -> Result<PanelId> {
@@ -110,8 +130,41 @@ impl Viewer {
             TrackFrameKey::Alignment(track_id),
             ui::TrackPane::Reads,
         );
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok(id)
+    }
+
+    /// Replaces the active panel's locus with the selected read's mate locus while retaining the
+    /// current genomic span. The mate is resolved by stable record identity only after the
+    /// destination alignment scene commits, at which point it is selected and revealed in the
+    /// read stack.
+    pub(crate) fn go_to_selected_mate_in_current_panel(&mut self) -> Result<PanelId> {
+        let (pending_selection, viewport, contig_name, contig_length) = self
+            .selected_mate_viewport_target()
+            .context("the selected read has no mapped mate location")?;
+        let track_id = pending_selection.track_id;
+        let panel_id = self.panels.active().id;
+
+        self.retain_active_read_selection_for_query_refresh();
+        self.navigate_to_viewport(viewport, contig_name, contig_length);
+
+        let panel = self
+            .panels
+            .get_mut(panel_id)
+            .context("the mate destination panel is unavailable")?;
+        panel.pending_read_selection = Some(pending_selection);
+        panel.pending_alignment_reveal = None;
+        panel.selected_alignment_track = Some(track_id);
+        panel.selected_alignment_hit = None;
+        panel.selected_chain = None;
+        replace_panel_track_selection(
+            panel,
+            TrackFrameKey::Alignment(track_id),
+            ui::TrackPane::Reads,
+        );
+        self.synchronize_alignment_scene_interactions(panel_id);
+        self.mark_display_dirty("explicit display invalidation");
+        Ok(panel_id)
     }
 
     pub(crate) fn open_genomic_position_in_new_panel(
@@ -184,7 +237,7 @@ impl Viewer {
             ui::TrackPane::Reads,
         );
         panel.selected_chain = Some(chain);
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok(id)
     }
 
@@ -234,7 +287,7 @@ impl Viewer {
             opened += 1;
         }
         self.activate_view_panel(origin);
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         Ok((opened, requested))
     }
 }

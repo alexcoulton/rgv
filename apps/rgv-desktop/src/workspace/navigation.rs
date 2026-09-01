@@ -196,9 +196,31 @@ pub(crate) fn mate_locus(
     if contig.length() == 0 || mate_start >= contig.length() {
         return None;
     }
-    let span = visible_span.max(100).min(contig.length());
+    let span = visible_span.max(1).min(contig.length());
     let mut start = mate_start.saturating_sub(span / 2);
     let end = start.saturating_add(span).min(contig.length());
     start = end.saturating_sub(span);
     Some(format!("{}:{}-{}", contig.name(), start + 1, end))
+}
+
+pub(crate) fn mate_viewport(
+    record: &AlignmentRecord,
+    dictionary: &ReferenceDictionary,
+    source: Viewport,
+) -> Option<(Viewport, String, u64)> {
+    if !record.flags.is_paired() || record.flags.is_mate_unmapped() {
+        return None;
+    }
+    let mate_contig = record.mate_contig?;
+    let mate_start = record.mate_start?;
+    let contig = dictionary.get(mate_contig)?;
+    if contig.length() == 0 || mate_start >= contig.length() {
+        return None;
+    }
+    let viewport = source
+        .remapped_contig(mate_contig, contig.length())
+        .ok()?
+        .centered_on(mate_start, contig.length())
+        .ok()?;
+    Some((viewport, contig.name().to_owned(), contig.length()))
 }

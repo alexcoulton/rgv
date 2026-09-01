@@ -37,6 +37,7 @@ pub struct AlignmentPresentationScene {
     prepared_rows: Range<u32>,
     pages: Arc<[Arc<AlignmentSemanticPage>]>,
     page_keys: Arc<[AlignmentPageKey]>,
+    drawable_page_keys: Arc<[AlignmentPageKey]>,
     page_index: HashMap<AlignmentPageSpatialKey, usize>,
     page_tile_bases: NonZeroU64,
     page_row_block_rows: NonZeroU32,
@@ -98,10 +99,15 @@ impl AlignmentPresentationScene {
         }
         page_index.shrink_to_fit();
         let mut page_keys = pages.iter().map(|page| page.key()).collect::<Vec<_>>();
+        let mut drawable_page_keys = pages
+            .iter()
+            .filter(|page| page.has_drawable_primitives())
+            .map(|page| page.key())
+            .collect::<Vec<_>>();
         // Warm one horizontal browsing band at a time. Visible pages are admitted atomically by
         // the foreground replacement; this ordering then fills every prepared genomic tile for
         // the nearest/top row block before proceeding deeper down the stack.
-        page_keys.sort_unstable_by_key(|key| {
+        let warm_order = |key: &AlignmentPageKey| {
             (
                 key.row_block(),
                 key.genomic_tile(),
@@ -109,8 +115,11 @@ impl AlignmentPresentationScene {
                 key.lod(),
                 *key,
             )
-        });
+        };
+        page_keys.sort_unstable_by_key(warm_order);
+        drawable_page_keys.sort_unstable_by_key(warm_order);
         let page_keys = page_keys.into();
+        let drawable_page_keys: Arc<[AlignmentPageKey]> = drawable_page_keys.into();
         let maximum_handle_primitives_per_page = pages
             .iter()
             .map(|page| page_maximum_handle_primitives(page))
@@ -128,7 +137,8 @@ impl AlignmentPresentationScene {
             })
             .max()
             .unwrap_or(0);
-        let metadata_bytes = scene_metadata_bytes(pages.len(), page_index.capacity());
+        let metadata_bytes =
+            scene_metadata_bytes(pages.len(), drawable_page_keys.len(), page_index.capacity());
         let mut reservation = ledger.reserve(
             AllocationClass::PresentationScene,
             metadata_bytes,
@@ -152,6 +162,7 @@ impl AlignmentPresentationScene {
             prepared_rows,
             pages: pages.into(),
             page_keys,
+            drawable_page_keys,
             page_index,
             page_tile_bases,
             page_row_block_rows,
@@ -207,6 +218,15 @@ impl AlignmentPresentationScene {
     #[must_use]
     pub const fn page_keys(&self) -> &Arc<[AlignmentPageKey]> {
         &self.page_keys
+    }
+
+    /// Exact worker-built authority for semantic pages containing GPU-drawable primitives.
+    /// Label-only and otherwise empty pages remain in `pages`/`page_keys` for CPU projection,
+    /// picking, inspection, export, and vertical semantic completeness, but never acquire fake
+    /// zero-byte GPU residency.
+    #[must_use]
+    pub const fn drawable_page_keys(&self) -> &Arc<[AlignmentPageKey]> {
+        &self.drawable_page_keys
     }
 
     /// Largest non-label primitive count owned by one stable handle in one canonical page. The
@@ -814,10 +834,15 @@ fn validate_mandatory_coverage(
     Ok(())
 }
 
-const fn scene_metadata_bytes(pages: usize, page_index_capacity: usize) -> usize {
+const fn scene_metadata_bytes(
+    pages: usize,
+    drawable_pages: usize,
+    page_index_capacity: usize,
+) -> usize {
     size_of::<AlignmentPresentationScene>()
         .saturating_add(pages.saturating_mul(size_of::<Arc<AlignmentSemanticPage>>()))
         .saturating_add(pages.saturating_mul(size_of::<AlignmentPageKey>()))
+        .saturating_add(drawable_pages.saturating_mul(size_of::<AlignmentPageKey>()))
         // Hash-table bucket/control overhead is implementation-specific. Charge two key/value
         // widths per reserved bucket so the index is conservatively inside the scene budget.
         .saturating_add(

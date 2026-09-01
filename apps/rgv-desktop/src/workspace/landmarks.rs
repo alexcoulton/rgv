@@ -430,7 +430,7 @@ impl Viewer {
         if added_track.is_some() {
             self.request_all_panel_queries();
         } else {
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         self.landmark_catalogue_error = None;
         if added_track.is_some() {

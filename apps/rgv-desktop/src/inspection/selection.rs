@@ -178,7 +178,7 @@ impl Viewer {
         let panel_id = self.panels.active().id;
         self.synchronize_alignment_scene_interactions(panel_id);
         self.prepare_alignment_scene_frame();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 
     pub(crate) fn feature_at_cursor(&self) -> Option<FeatureSelection> {
@@ -1028,7 +1028,7 @@ impl Viewer {
         self.panels.active_mut().selected_pileup_position = (!modification).then_some(position);
         self.panels.active_mut().selected_modification_position = modification.then_some(position);
         self.rebuild_genomic_display();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 
     pub(crate) fn modification_position_at_cursor(&self) -> Option<(TrackId, u64)> {
@@ -1388,7 +1388,7 @@ impl Viewer {
             );
             self.synchronize_alignment_scene_interactions(panel_id);
             self.prepare_alignment_scene_frame();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
             return;
         }
     }
@@ -1492,7 +1492,7 @@ impl Viewer {
                         format!("Selected complete scene read in track {}", track_id.get());
                     self.synchronize_alignment_scene_interactions(panel_id);
                     self.prepare_alignment_scene_frame();
-                    self.display_dirty = true;
+                    self.mark_display_dirty("explicit display invalidation");
                     return;
                 }
                 "The selected alignment track has no committed complete scene"
@@ -1650,7 +1650,7 @@ impl Viewer {
             }
         }
         self.retain_active_read_selection_for_query_refresh();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 
     pub(crate) fn promote_selected_read_to_top(&mut self) -> bool {
@@ -1727,7 +1727,7 @@ impl Viewer {
         self.panels.active_mut().selected_chain = chain;
         self.synchronize_alignment_scene_interactions(panel_id);
         self.prepare_alignment_scene_frame();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         true
     }
 
@@ -1747,6 +1747,6 @@ impl Viewer {
             }
         }
         self.request_all_panel_queries();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 }

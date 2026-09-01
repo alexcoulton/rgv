@@ -317,7 +317,7 @@ impl Viewer {
             self.panels.active_mut().display_list = DisplayList::default();
             self.rebuild_all_panel_displays();
             self.request_all_panel_queries();
-            self.display_dirty = true;
+            self.mark_display_dirty("explicit display invalidation");
         }
         Ok(())
     }

@@ -128,7 +128,7 @@ impl ApplicationHandler for Application {
                     .take()
                     .is_some()
                 {
-                    viewer.display_dirty = true;
+                    viewer.mark_display_dirty("runtime window invalidation");
                     viewer.window.request_redraw();
                 }
                 viewer.panels.active_mut().hover_inspector_target = None;
@@ -141,7 +141,7 @@ impl ApplicationHandler for Application {
                 {
                     viewer.window.set_cursor(CursorIcon::Default);
                     if viewer.synthetic || !viewer.refresh_active_panel_scroll_display() {
-                        viewer.display_dirty = true;
+                        viewer.mark_display_dirty("runtime window invalidation");
                     }
                     viewer.window.request_redraw();
                 }
@@ -171,7 +171,7 @@ impl ApplicationHandler for Application {
                         .hover_redraws
                         .saturating_add(1);
                     if viewer.synthetic || !viewer.refresh_active_panel_scroll_display() {
-                        viewer.display_dirty = true;
+                        viewer.mark_display_dirty("runtime window invalidation");
                     }
                     viewer.window.request_redraw();
                 }

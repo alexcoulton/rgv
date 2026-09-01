@@ -2556,16 +2556,51 @@ impl Viewer {
     }
 
     pub(crate) fn refresh_active_panel_scroll_display(&mut self) -> bool {
-        if self.display_dirty
-            || !self
-                .panels
-                .active()
-                .scroll_display_cache
-                .as_ref()
-                .is_some_and(|cache| cache.supports_fast_scroll)
-            || !self.active_panel_materialization_covers_scroll()
-            || !self.rebuild_active_panel_from_scroll_cache()
+        let refusal = if self.display_dirty {
+            Some("display derivative is already dirty")
+        } else if !self
+            .panels
+            .active()
+            .scroll_display_cache
+            .as_ref()
+            .is_some_and(|cache| cache.supports_fast_scroll)
         {
+            Some("active panel has no fast-scroll display cache")
+        } else if !self.active_panel_materialization_covers_scroll() {
+            Some("requested rows fall outside the materialized scroll cache")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            if self.manual_diagnostic_trace_is_recording() {
+                let panel_id = self.panels.active().id.get();
+                let authorities = self.manual_active_scroll_cache_diagnostic_state();
+                self.record_manual_diagnostic_event(
+                    "vertical_navigation",
+                    "fast_scroll_refresh_refused",
+                    serde_json::json!({
+                        "reason": reason,
+                        "panel_id": panel_id,
+                        "scroll_cache_authorities": authorities,
+                    }),
+                );
+            }
+            return false;
+        }
+        if !self.rebuild_active_panel_from_scroll_cache() {
+            if self.manual_diagnostic_trace_is_recording() {
+                let panel_id = self.panels.active().id.get();
+                let authorities = self.manual_active_scroll_cache_diagnostic_state();
+                self.record_manual_diagnostic_event(
+                    "vertical_navigation",
+                    "fast_scroll_refresh_refused",
+                    serde_json::json!({
+                        "reason": "scroll cache disappeared before reprojection",
+                        "panel_id": panel_id,
+                        "scroll_cache_authorities": authorities,
+                    }),
+                );
+            }
             return false;
         }
         self.composite_display_list = composite_panel_display_lists(&self.panels);
@@ -2844,7 +2879,7 @@ impl Viewer {
 
     pub(crate) fn rebuild_display_list(&mut self) {
         if self.begin_ready_navigation_commits() {
-            self.display_dirty = true;
+            self.mark_display_dirty("ready navigation transaction committed");
         }
         if !self.display_dirty {
             return;
@@ -3008,7 +3043,7 @@ impl Viewer {
             self.rebuild_all_panel_displays();
         }
         self.prepare_rectangle_renderer();
-        self.display_dirty = false;
+        self.clear_display_dirty("display list and renderer derivative rebuilt");
         self.refresh_alignment_scene_cameras_after_layout();
     }
 

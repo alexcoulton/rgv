@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 pub(crate) const MANUAL_DIAGNOSTIC_TRACE_SCHEMA_NAME: &str = "rgv.manual_diagnostic_trace";
-pub(crate) const MANUAL_DIAGNOSTIC_TRACE_SCHEMA_VERSION: u64 = 2;
+pub(crate) const MANUAL_DIAGNOSTIC_TRACE_SCHEMA_VERSION: u64 = 3;
 pub(crate) const MANUAL_DIAGNOSTIC_TRACE_MAX_EVENTS: usize = 100_000;
 pub(crate) const MANUAL_DIAGNOSTIC_TRACE_RETENTION: Duration = Duration::from_secs(300);
 
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn document_has_versioned_privacy_friendly_metadata_and_generic_fields() {
-        assert_eq!(MANUAL_DIAGNOSTIC_TRACE_SCHEMA_VERSION, 2);
+        assert_eq!(MANUAL_DIAGNOSTIC_TRACE_SCHEMA_VERSION, 3);
         let origin = Instant::now();
         let mut recorder = recorder_with_limits(8, Duration::from_secs(120));
         recorder.start_at(

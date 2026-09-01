@@ -68,6 +68,7 @@ pub(crate) enum AlignmentContextAction {
     CopyReadName,
     CopyReadDetails,
     CopyReadSequence,
+    GoToMate,
     OpenMateInNewPanel,
     OpenSupplementarySegments,
     SetColor(AlignmentColorMode),
@@ -138,6 +139,7 @@ impl AlignmentContextAction {
             | Self::CopyReadName
             | Self::CopyReadDetails
             | Self::CopyReadSequence
+            | Self::GoToMate
             | Self::OpenMateInNewPanel
             | Self::OpenSupplementarySegments
             | Self::OpenTrackSettings => AlignmentContextEffect::ReadAction,
@@ -375,7 +377,7 @@ impl Viewer {
         self.bump_workspace_revision();
         self.synchronize_alignment_scene_interactions(target.panel_id);
         self.prepare_alignment_scene_frame();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
         true
     }
 
@@ -398,7 +400,7 @@ impl Viewer {
         }
         self.panels.activate(active);
         self.rebuild_all_panel_displays();
-        self.display_dirty = true;
+        self.mark_display_dirty("explicit display invalidation");
     }
 
     pub(crate) fn apply_alignment_context_action(
@@ -546,6 +548,18 @@ impl Viewer {
                 } else {
                     action_outcome = "no_op";
                     action_reason = Some("sequence_unavailable");
+                }
+            }
+            AlignmentContextAction::GoToMate => {
+                if self.select_alignment_context_read(target) {
+                    if let Err(error) = self.go_to_selected_mate_in_current_panel() {
+                        self.data_status = error.to_string();
+                        action_outcome = "failed";
+                        action_reason = Some("mate_navigation_failed");
+                    }
+                } else {
+                    action_outcome = "no_op";
+                    action_reason = Some("no_read_at_target");
                 }
             }
             AlignmentContextAction::OpenMateInNewPanel => {
@@ -708,6 +722,7 @@ impl Viewer {
                     | AlignmentContextAction::CopyReadName
                     | AlignmentContextAction::CopyReadDetails
                     | AlignmentContextAction::CopyReadSequence
+                    | AlignmentContextAction::GoToMate
                     | AlignmentContextAction::OpenMateInNewPanel
                     | AlignmentContextAction::OpenSupplementarySegments
                     | AlignmentContextAction::OpenTrackSettings => unreachable!(),
@@ -746,7 +761,7 @@ impl Viewer {
                         self.synchronize_alignment_scene_interactions(panel_id);
                     }
                     self.rebuild_all_panel_displays();
-                    self.display_dirty = true;
+                    self.mark_display_dirty("explicit display invalidation");
                     self.window.request_redraw();
                     self.record_alignment_context_action_result(
                         target,
@@ -1115,10 +1130,19 @@ pub(crate) fn show_alignment_context_menu(
                 return;
             }
             if ui
+                .add_enabled(view.mate_available, egui::Button::new("Go to mate"))
+                .on_disabled_hover_text("This read does not have a mapped mate")
+                .clicked()
+            {
+                *action = Some((menu.target, AlignmentContextAction::GoToMate));
+                return;
+            }
+            if ui
                 .add_enabled(
                     view.mate_available,
                     egui::Button::new("Open mate in new panel"),
                 )
+                .on_disabled_hover_text("This read does not have a mapped mate")
                 .clicked()
             {
                 *action = Some((menu.target, AlignmentContextAction::OpenMateInNewPanel));
@@ -1542,6 +1566,10 @@ mod tests {
         );
         assert_eq!(
             AlignmentContextAction::InspectRead.effect(),
+            AlignmentContextEffect::ReadAction
+        );
+        assert_eq!(
+            AlignmentContextAction::GoToMate.effect(),
             AlignmentContextEffect::ReadAction
         );
         assert_eq!(
