@@ -809,6 +809,30 @@ impl Viewer {
             self.panels.active_mut().pending_queries.reference = false;
             return;
         };
+        let reference_contig_name = match self.compatible_reference_contig_for_panel(panel_id) {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                self.panels.active_mut().pending_queries.reference = false;
+                return;
+            }
+            Err(reason) => {
+                let panel = self.panels.active_mut();
+                panel.pending_queries.reference = false;
+                panel.reference_slice = None;
+                panel.reference_slice_revision = None;
+                panel.reference_slice_generation = None;
+                panel.reference_request_revision = None;
+                panel.reference_request_interval = None;
+                panel.reference_installs_queued.clear();
+                panel.reference_settled_generation = Some(panel.generation_clock.current().get());
+                panel.reference_query_error_generation =
+                    Some(panel.generation_clock.current().get());
+                self.data_status = format!(
+                    "Reference incompatible with alignment: {reason}. Reference-dependent bases and substitutions are disabled"
+                );
+                return;
+            }
+        };
         let cached = self.panels.get(panel_id).and_then(|panel| {
             (panel.reference_slice_revision == Some(revision))
                 .then(|| panel.reference_slice.as_ref())
@@ -873,7 +897,7 @@ impl Viewer {
         match engine.try_query(
             query,
             self.panels.active_mut().generation_clock.clone(),
-            self.panels.active_mut().contig_name.clone(),
+            reference_contig_name,
         ) {
             Ok(()) => {
                 let panel = self.panels.active_mut();
@@ -1371,6 +1395,19 @@ impl Viewer {
                     remote_io_stats,
                 } => {
                     let reference_contig_count = dictionary.len();
+                    let alignment_incompatibility =
+                        self.primary_alignment_dictionary().and_then(|alignment| {
+                            match alignment_reference_compatibility(
+                                alignment,
+                                &dictionary,
+                                &self.contig_aliases,
+                            ) {
+                                AlignmentReferenceCompatibility::Compatible => None,
+                                AlignmentReferenceCompatibility::Incompatible(reason) => {
+                                    Some(reason)
+                                }
+                            }
+                        });
                     self.reference_open_error = None;
                     self.reference_revision = Some(revision);
                     self.reference_remote_io_stats = remote_io_stats;
@@ -1451,6 +1488,10 @@ impl Viewer {
                             TrackSource::redacted_label,
                         );
                         self.data_status = format!("Opened {source}");
+                    } else if let Some(reason) = alignment_incompatibility {
+                        self.data_status = format!(
+                            "Reference incompatible with alignment: {reason}. Reference-dependent bases and substitutions are disabled"
+                        );
                     }
                     self.refresh_active_panel_context();
                     self.request_all_panel_queries();
@@ -2566,6 +2607,7 @@ impl Viewer {
         }
 
         if let Some(dictionary) = opened_primary_dictionary {
+            let reference_incompatibility = self.alignment_reference_incompatibility(&dictionary);
             if let Some(source) = self.primary_alignment_source().cloned() {
                 self.settings.remember_alignment(&source);
                 self.persist_settings();
@@ -2616,6 +2658,19 @@ impl Viewer {
                 .as_ref()
                 .map_or(dictionary.len(), ReferenceDictionary::len);
             self.assembly.identity.clone_from(&self.assembly_identity);
+            if let Some(reason) = reference_incompatibility {
+                for panel in self.panels.iter_mut() {
+                    panel.reference_slice = None;
+                    panel.reference_slice_revision = None;
+                    panel.reference_slice_generation = None;
+                    panel.reference_request_revision = None;
+                    panel.reference_request_interval = None;
+                    panel.reference_installs_queued.clear();
+                }
+                self.data_status = format!(
+                    "Reference incompatible with alignment: {reason}. Reference-dependent bases and substitutions are disabled"
+                );
+            }
         }
         if source_opened {
             // Rebuild first so dispatch can derive the read-pane clip from committed layout.

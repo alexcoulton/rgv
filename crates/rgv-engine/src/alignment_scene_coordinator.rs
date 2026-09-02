@@ -100,6 +100,9 @@ pub struct AlignmentSceneBuildContract {
     pub record_contract: ContractFingerprint,
     pub contig: ContigId,
     pub contig_length: u64,
+    /// Maximum number of eligible records which may be exposed in the exact live viewport.
+    /// A wider immutable browsing horizon may retain more records under the separate byte budget.
+    pub complete_read_limit: NonZeroUsize,
     pub payload: PayloadContract,
     pub view_filter: AlignmentViewFilterContract,
     /// Non-destructive overlay predicates do not change rows or summaries, but reference-backed
@@ -845,7 +848,11 @@ struct AlignmentSceneSourceLane {
     previous_exact_start: Option<f64>,
     next_camera_sequence: u64,
     telemetry: AlignmentSceneCoordinatorTelemetry,
+    /// Terminal refusal for the exact visible camera population.
     refusal: Option<AlignmentSceneOwnerRefusal>,
+    /// Optional margin which exceeded its own bounded acquisition policy. This suppresses only
+    /// an identical speculative retry and is cleared by a new source horizon.
+    speculation_refusal: Option<GenomicInterval>,
     vertical_residency_budget_limited: bool,
     /// Terminal only for optional full-height warming under the current scene authority. This
     /// prevents a deterministic semantic-page failure from spinning in the worker and from
@@ -982,6 +989,7 @@ where
                 next_camera_sequence: 1,
                 telemetry: AlignmentSceneCoordinatorTelemetry::default(),
                 refusal: None,
+                speculation_refusal: None,
                 vertical_residency_budget_limited: false,
                 vertical_residency_failed: false,
                 vertical_read_residency: None,
@@ -1343,27 +1351,43 @@ where
         }
         if let Some(AlignmentSourceActorEvent::AcquisitionRefused {
             work,
-            coverage,
             complete_read_limit,
+            eligible_records,
             publish: Some(_),
+            ..
         }) = &event
             && let Some(lane) = self.lanes.get_mut(&work.intent().owner())
         {
-            let target = work.intent().spec().target();
-            if lane
-                .desired
-                .as_ref()
-                .is_some_and(|desired| desired.source_horizon == target)
-            {
+            let target = work.intent().spec().admission_target();
+            if lane.desired.as_ref().is_some_and(|desired| {
+                work.kind() == SourceIntentKind::Foreground && desired.camera.interval() == target
+            }) {
                 let refusal = AlignmentSceneOwnerRefusal {
                     owner: work.intent().owner(),
                     target,
                     complete_read_limit: *complete_read_limit,
-                    eligible_records: coverage.provenance().eligible_records,
+                    eligible_records: u64::try_from(*eligible_records).unwrap_or(u64::MAX),
                 };
                 lane.refusal = Some(refusal);
                 refusals.push(refusal);
             }
+        }
+        if let Some(AlignmentSourceActorEvent::AcquisitionRefused { work, .. }) = &event
+            && work.kind() == SourceIntentKind::Speculative
+            && let Some(lane) = self.lanes.get_mut(&work.intent().owner())
+            && lane.desired.as_ref().is_some_and(|desired| {
+                desired
+                    .source_horizon
+                    .contains_interval(work.intent().spec().target())
+            })
+        {
+            lane.speculation_refusal = Some(work.intent().spec().target());
+        }
+        if let Some(AlignmentSourceActorEvent::AcquisitionCompleted { work, .. }) = &event
+            && work.kind() == SourceIntentKind::Speculative
+            && let Some(lane) = self.lanes.get_mut(&work.intent().owner())
+        {
+            lane.speculation_refusal = None;
         }
         if matches!(
             event,
@@ -2049,10 +2073,11 @@ impl AlignmentSceneSourceLane {
             self.vertical_residency_budget_limited = false;
             self.vertical_residency_failed = false;
             self.filter_reference_horizon = None;
+            self.speculation_refusal = None;
         }
         if self
             .refusal
-            .is_some_and(|refusal| refusal.target != source_horizon)
+            .is_some_and(|refusal| refusal.target != camera.interval())
         {
             self.refusal = None;
         }
@@ -2332,10 +2357,36 @@ impl AlignmentSceneSourceLane {
                 .is_some_and(|covered| covered.contains_interval(desired.camera.interval()))
             && covered_rows.start <= requested_rows.start
             && covered_rows.end >= requested_rows.end;
+        let row_activity = desired
+            .camera
+            .has_visible_rows()
+            .then(|| {
+                snapshot
+                    .as_ref()
+                    .and_then(|scene| self.row_activity_for_frame(scene, desired.camera.interval()))
+            })
+            .flatten();
+        let buffered_camera_refusal = visible_complete
+            .then(|| row_activity.as_ref())
+            .flatten()
+            .filter(|activity| {
+                activity.visible_record_count() > self.contract.complete_read_limit.get()
+            })
+            .map(|activity| AlignmentIndividualReadCapability::Refused {
+                target: desired.camera.interval(),
+                complete_read_limit: self.contract.complete_read_limit.get(),
+                eligible_records: u64::try_from(activity.visible_record_count())
+                    .unwrap_or(u64::MAX),
+            });
         let individual_reads = if !desired.camera.has_visible_rows() {
             // This camera requested genomic summary authority only. Do not report an
             // individual-read capability for work the caller deliberately omitted.
             AlignmentIndividualReadCapability::Pending
+        } else if let Some(refusal) = buffered_camera_refusal {
+            // The immutable read-ahead scene may contain more total records than the viewport
+            // limit. Its camera-exact activity index enforces the limit after a contained pan
+            // without throwing away the buffer or reopening BAM I/O.
+            refusal
         } else if visible_complete {
             AlignmentIndividualReadCapability::Complete {
                 scene_revision: snapshot
@@ -2345,7 +2396,7 @@ impl AlignmentSceneSourceLane {
             }
         } else if let Some(refusal) = self
             .refusal
-            .filter(|refusal| refusal.target == desired.source_horizon)
+            .filter(|refusal| refusal.target == desired.camera.interval())
         {
             AlignmentIndividualReadCapability::Refused {
                 target: refusal.target,
@@ -2364,15 +2415,6 @@ impl AlignmentSceneSourceLane {
                     self.vertical_residency_state(scene)
                 })
         };
-        let row_activity = desired
-            .camera
-            .has_visible_rows()
-            .then(|| {
-                snapshot
-                    .as_ref()
-                    .and_then(|scene| self.row_activity_for_frame(scene, desired.camera.interval()))
-            })
-            .flatten();
         Some(AlignmentCoordinatorFrame {
             camera: desired.camera,
             camera_sequence: desired.camera_sequence,
@@ -3067,6 +3109,15 @@ impl AlignmentSceneSourceLane {
         let Some(desired) = &self.desired else {
             return false;
         };
+        self.prepared_covers(owner, presentation, desired)
+    }
+
+    fn prepared_covers(
+        &self,
+        owner: SourceOwnerId,
+        presentation: &AlignmentPresentationStore,
+        desired: &DesiredScene,
+    ) -> bool {
         let Some(scene) = presentation.prepared_for(presentation_owner(owner)) else {
             return false;
         };
@@ -3428,14 +3479,35 @@ impl AlignmentSceneSourceLane {
         ) else {
             return Ok(None);
         };
-        if actor
-            .schedule()
-            .desired_foreground_for(owner)
-            .is_some_and(|intent| source_intent_covers(intent.spec(), missing, &self.contract))
+        let admission_target = desired.camera.interval();
+        // The physical acquisition fills the coherent browsing horizon, while Complete-read
+        // admission is evaluated only against the exact visible camera. If independently cached
+        // coverage leaves only an edge missing, repeat the bounded horizon so the decoder can
+        // still count the whole camera rather than making a decision from a partial interval.
+        let acquisition_target = if missing.contains_interval(admission_target) {
+            missing
+        } else {
+            desired.source_horizon
+        };
+        if actor.schedule().foreground_pending_for(owner)
+            && actor
+                .schedule()
+                .desired_foreground_for(owner)
+                .is_some_and(|intent| {
+                    source_intent_covers(
+                        intent.spec(),
+                        acquisition_target,
+                        admission_target,
+                        &self.contract,
+                    )
+                })
         {
             return Ok(None);
         }
-        let sequence = actor.submit_foreground_for(owner, source_spec(missing, &self.contract))?;
+        let sequence = actor.submit_foreground_for(
+            owner,
+            source_spec(acquisition_target, admission_target, &self.contract),
+        )?;
         self.telemetry.foreground_submissions =
             self.telemetry.foreground_submissions.saturating_add(1);
         Ok(Some(sequence))
@@ -3460,15 +3532,22 @@ impl AlignmentSceneSourceLane {
         ) else {
             return Ok(None);
         };
-        if actor
-            .schedule()
-            .desired_speculation()
-            .filter(|intent| intent.owner() == owner)
-            .is_some_and(|intent| source_intent_covers(intent.spec(), missing, &self.contract))
+        if self.speculation_refusal == Some(missing) {
+            return Ok(None);
+        }
+        if actor.schedule().speculation_pending_for(owner)
+            && actor
+                .schedule()
+                .desired_speculation()
+                .filter(|intent| intent.owner() == owner)
+                .is_some_and(|intent| {
+                    source_intent_covers(intent.spec(), missing, missing, &self.contract)
+                })
         {
             return Ok(None);
         }
-        let sequence = actor.submit_speculation_for(owner, source_spec(missing, &self.contract))?;
+        let sequence =
+            actor.submit_speculation_for(owner, source_spec(missing, missing, &self.contract))?;
         self.telemetry.speculation_submissions =
             self.telemetry.speculation_submissions.saturating_add(1);
         Ok(Some(sequence))
@@ -3512,6 +3591,7 @@ impl AlignmentSceneSourceLane {
 
 fn source_spec(
     target: GenomicInterval,
+    admission_target: GenomicInterval,
     contract: &AlignmentSceneBuildContract,
 ) -> AlignmentSourceIntentSpec {
     AlignmentSourceIntentSpec::new(
@@ -3520,6 +3600,7 @@ fn source_spec(
         contract.payload.clone(),
         target,
     )
+    .with_admission_target(admission_target)
 }
 
 /// Reference revisions invalidate only reference-interpreted page products. Comparing contracts
@@ -3557,12 +3638,14 @@ fn required_reference_horizon(
 fn source_intent_covers(
     intent: &AlignmentSourceIntentSpec,
     target: GenomicInterval,
+    admission_target: GenomicInterval,
     contract: &AlignmentSceneBuildContract,
 ) -> bool {
     intent.source_revision() == contract.source_revision
         && intent.record_contract() == contract.record_contract
         && intent.payload().satisfies(&contract.payload)
         && intent.target().contains_interval(target)
+        && intent.admission_target() == admission_target
 }
 
 fn camera_direction(previous: Option<f64>, current: f64) -> CameraDirection {
@@ -4014,6 +4097,7 @@ mod tests {
             record_contract,
             contig,
             contig_length,
+            complete_read_limit: NonZeroUsize::new(1_000).unwrap(),
             payload: no_payload(),
             view_filter: AlignmentViewFilterContract::default(),
             highlight_filter: AlignmentViewFilterContract::default(),
@@ -6529,6 +6613,172 @@ mod tests {
                 scene_revision: final_revision,
             }
         );
+    }
+
+    #[test]
+    fn narrower_camera_restarts_after_a_containing_foreground_refusal() {
+        let (mut coordinator, contract, policy, camera) = test_source_coordinator();
+        let owner = SourceOwnerId::new(304);
+        coordinator.insert_lane(owner, contract, policy).unwrap();
+        coordinator
+            .actor_mut()
+            .submit_control(LocalBamSourceControl::SetCompleteReadLimit(
+                NonZeroUsize::new(1).unwrap(),
+            ))
+            .unwrap();
+        assert!(matches!(
+            coordinator.pump_once().unwrap().source_event,
+            Some(AlignmentSourceActorEvent::ControlApplied)
+        ));
+
+        let broad = AlignmentCamera::new(
+            GenomicInterval::new(camera.interval().contig(), 0, 10_100).unwrap(),
+            0.0,
+            camera.row_height(),
+            camera.read_height(),
+            camera.clip(),
+        )
+        .unwrap();
+        coordinator.update_camera(owner, broad).unwrap();
+        let refused_work = (0..256)
+            .find_map(|_| {
+                let pump = coordinator.pump_once().unwrap();
+                pump.refusals
+                    .iter()
+                    .any(|refusal| refusal.owner == owner)
+                    .then(|| pump.source_event)
+                    .flatten()
+            })
+            .expect("the broad exact camera should exceed the limit");
+        let AlignmentSourceActorEvent::AcquisitionRefused { work, .. } = refused_work else {
+            panic!("a typed refusal must carry the completed source work")
+        };
+        assert!(
+            work.intent()
+                .spec()
+                .target()
+                .contains_interval(GenomicInterval::new(camera.interval().contig(), 0, 1).unwrap())
+        );
+        assert!(!coordinator.has_pending_source_work());
+
+        let narrow = AlignmentCamera::new(
+            GenomicInterval::new(camera.interval().contig(), 0, 1).unwrap(),
+            0.0,
+            camera.row_height(),
+            camera.read_height(),
+            camera.clip(),
+        )
+        .unwrap();
+        let update = coordinator.update_camera(owner, narrow).unwrap();
+        assert!(
+            update.foreground_submitted.is_some(),
+            "settled refused intent must not masquerade as pending work for a new camera"
+        );
+        assert!(coordinator.owner_work_state(owner).unwrap().source_pending);
+        let revision = (0..256)
+            .find_map(|_| {
+                coordinator
+                    .pump_once()
+                    .unwrap()
+                    .publications
+                    .into_iter()
+                    .find(|publication| publication.owner == owner)
+                    .map(|publication| publication.revision)
+            })
+            .expect("the narrower admissible camera should publish");
+        let frame = coordinator.frame(owner).unwrap().unwrap();
+        assert!(frame.visible_complete());
+        assert_eq!(
+            frame.individual_reads,
+            AlignmentIndividualReadCapability::Complete {
+                scene_revision: revision,
+            }
+        );
+    }
+
+    #[test]
+    fn offscreen_buffer_population_does_not_affect_visible_admission() {
+        let (mut coordinator, mut contract, _, camera) = test_source_coordinator();
+        let owner = SourceOwnerId::new(305);
+        let policy = AlignmentScenePreparationPolicy::new(10_000.0, 10_000.0, 0.25, 4, 1).unwrap();
+        contract.complete_read_limit = NonZeroUsize::new(1).unwrap();
+        coordinator.insert_lane(owner, contract, policy).unwrap();
+        coordinator
+            .actor_mut()
+            .submit_control(LocalBamSourceControl::SetCompleteReadLimit(
+                NonZeroUsize::new(1).unwrap(),
+            ))
+            .unwrap();
+        assert!(matches!(
+            coordinator.pump_once().unwrap().source_event,
+            Some(AlignmentSourceActorEvent::ControlApplied)
+        ));
+
+        let visible = AlignmentCamera::new(
+            GenomicInterval::new(camera.interval().contig(), 0, 1).unwrap(),
+            0.0,
+            camera.row_height(),
+            camera.read_height(),
+            camera.clip(),
+        )
+        .unwrap();
+        let update = coordinator.update_camera(owner, visible).unwrap();
+        assert!(update.foreground_submitted.is_some());
+        let first_work = loop {
+            let pump = coordinator.pump_once().unwrap();
+            if let Some(AlignmentSourceActorEvent::WorkStarted(work)) = pump.source_event {
+                break work;
+            }
+        };
+        assert_eq!(first_work.kind(), SourceIntentKind::Foreground);
+        assert_eq!(
+            first_work.intent().spec().admission_target(),
+            visible.interval()
+        );
+        assert!(
+            first_work.intent().spec().target().len() > visible.interval().len(),
+            "the physical acquisition should retain a coherent offscreen browsing horizon"
+        );
+
+        let revision = (0..256)
+            .find_map(|_| {
+                coordinator
+                    .pump_once()
+                    .unwrap()
+                    .publications
+                    .into_iter()
+                    .find(|publication| publication.owner == owner)
+                    .map(|publication| publication.revision)
+            })
+            .expect("the empty visible camera should admit its coherent buffered scene");
+        let frame = coordinator.frame(owner).unwrap().unwrap();
+        assert!(frame.visible_complete());
+        assert_eq!(
+            frame.individual_reads,
+            AlignmentIndividualReadCapability::Complete {
+                scene_revision: revision,
+            }
+        );
+        assert!(
+            frame
+                .snapshot
+                .unwrap()
+                .prepared_interval()
+                .contains_interval(visible.interval())
+        );
+
+        let update = coordinator.update_camera(owner, camera).unwrap();
+        assert!(update.foreground_submitted.is_none());
+        let dense = coordinator.frame(owner).unwrap().unwrap();
+        assert!(dense.visible_complete());
+        assert!(matches!(
+            dense.individual_reads,
+            AlignmentIndividualReadCapability::Refused {
+                target,
+                complete_read_limit: 1,
+                eligible_records,
+            } if target == camera.interval() && eligible_records > 1
+        ));
     }
 
     #[test]

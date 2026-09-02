@@ -3461,6 +3461,10 @@ impl Viewer {
                     continue;
                 };
                 if lane.scene_contracts_current
+                    && !matches!(
+                        source_authority.individual_reads,
+                        AlignmentIndividualReadCapability::Refused { .. }
+                    )
                     && let (Some(snapshot), Some(camera)) = (&lane.snapshot, lane.read_camera)
                     && let Some(live_clip) = lane.covered_interval.and_then(|covered| {
                         alignment_scene_covered_clip(camera.viewport(), camera.clip(), covered)
@@ -4627,10 +4631,13 @@ impl Viewer {
         else {
             return Arc::from([]);
         };
-        let reference_revision = self
-            .panels
-            .get(panel_id)
-            .and_then(|panel| panel.reference_slice_revision);
+        let compatible_revision =
+            self.compatible_alignment_reference_revision(&metadata.dictionary);
+        let reference_revision = self.panels.get(panel_id).and_then(|panel| {
+            (panel.reference_slice_revision == compatible_revision)
+                .then_some(panel.reference_slice_revision)
+                .flatten()
+        });
         let key = (
             snapshot.reads().evidence().revision(),
             contract.fingerprint(),
@@ -5072,6 +5079,8 @@ impl Viewer {
                 .promoted_read
                 .filter(|(candidate, _)| *candidate == track_id)
                 .map(|(_, hash)| hash);
+            let reference_revision =
+                self.compatible_alignment_reference_revision(&metadata.dictionary);
             let contract = alignment_scene_build_contract(
                 &self.alignment_tracks[track_index].config,
                 &self.alignment_tracks[track_index].active_filters,
@@ -5080,7 +5089,7 @@ impl Viewer {
                 contig_length,
                 viewport,
                 promoted_template,
-                self.reference_revision,
+                reference_revision,
             );
             let reference_backed_alleles = contract.summaries.allele_detail
                 != AlleleSummaryDetail::None

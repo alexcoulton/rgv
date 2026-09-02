@@ -1811,6 +1811,8 @@ impl Viewer {
                                     "scene_contracts_current": frame.scene_contracts_current,
                                     "visible_complete": frame.visible_complete(),
                                     "record_count": frame.snapshot.as_ref().map_or(0, |snapshot| snapshot.reads().evidence().record_count()),
+                                    "visible_record_count": frame.row_activity.as_ref().map(|activity| activity.visible_record_count()),
+                                    "complete_read_limit": track.config.maximum_alignments,
                                     "atlas_rows": frame.snapshot.as_ref().map_or(0, |snapshot| snapshot.reads().atlas().row_count()),
                                     "read_pages": frame.snapshot.as_ref().map_or(0, |snapshot| snapshot.reads().pages().len()),
                                     "summary_pages": frame.snapshot.as_ref().map_or(0, |snapshot| snapshot.summary_pages().len()),

@@ -210,7 +210,13 @@ fn main() -> Result<()> {
             engine.try_insert_lane_for_request(
                 owner,
                 request_token,
-                build_contract(&metadata, viewport, contig_length, arguments.view_as_pairs),
+                build_contract(
+                    &metadata,
+                    viewport,
+                    contig_length,
+                    arguments.view_as_pairs,
+                    maximum_alignments,
+                ),
                 policy,
             )?;
             engine.try_update_camera_for_request(
@@ -551,12 +557,14 @@ fn build_contract(
     viewport: Viewport,
     contig_length: u64,
     view_as_pairs: bool,
+    complete_read_limit: NonZeroUsize,
 ) -> AlignmentSceneBuildContract {
     AlignmentSceneBuildContract {
         source_revision: metadata.source_revision,
         record_contract: metadata.record_contract,
         contig: viewport.interval().contig(),
         contig_length,
+        complete_read_limit,
         payload: PayloadContract::new_all_auxiliary(
             CapabilityRequirement::Required,
             CapabilityRequirement::Required,

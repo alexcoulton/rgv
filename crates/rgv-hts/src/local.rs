@@ -188,6 +188,10 @@ pub struct QueryStats {
     pub records_filtered_qc_failed: usize,
     /// Records that passed flags and user filters in the backing query interval.
     pub records_eligible: usize,
+    /// Eligible records overlapping the exact foreground admission interval. This equals
+    /// `records_eligible` for ordinary exact queries, but excludes offscreen records acquired
+    /// only for a tiled or speculative browsing horizon.
+    pub complete_read_records_eligible: usize,
     /// Records loaded for individual layout/inspection. This equals
     /// `records_eligible` for a complete result and is zero for Too dense.
     pub records_emitted: usize,
@@ -417,6 +421,7 @@ pub fn derive_alignment_query_with_summary_index_and_phase(
         .copy_filtered_records_within(interval, &mut batch);
     stats.records_seen = stats.records_seen.saturating_add(selected.len());
     stats.records_eligible = selected.len();
+    stats.complete_read_records_eligible = selected.len();
     stats.complete_read_limit = maximum_records;
     stats.records_emitted = if too_dense { 0 } else { selected.len() };
     stats.truncated = too_dense;
@@ -857,6 +862,7 @@ pub enum PositionedAlignmentStreamCheckpoint {
 
 struct LocalPositionedStreamState {
     interval: GenomicInterval,
+    admission_interval: GenomicInterval,
     options: QueryOptions,
     stats: QueryStats,
     current_block: Option<u64>,
@@ -1014,8 +1020,26 @@ impl LocalAlignmentSource {
         interval: GenomicInterval,
         options: QueryOptions,
     ) -> Result<(), AlignmentError> {
+        self.begin_positioned_stream_with_admission(interval, interval, options)
+    }
+
+    /// Starts a resumable physical acquisition while applying Complete-read admission only to
+    /// the contained exact foreground interval. This keeps adjacent cache population out of the
+    /// user-visible viewport limit without weakening completeness of the acquired evidence.
+    pub fn begin_positioned_stream_with_admission(
+        &mut self,
+        interval: GenomicInterval,
+        admission_interval: GenomicInterval,
+        options: QueryOptions,
+    ) -> Result<(), AlignmentError> {
         if self.encoding != LocalAlignmentEncoding::Bam {
             return Err(AlignmentError::PositionedStreamUnsupported);
+        }
+        if !interval.contains_interval(admission_interval) {
+            return Err(AlignmentError::AdmissionIntervalOutsideQuery {
+                query: interval,
+                admission: admission_interval,
+            });
         }
         if let Some(guard) = &self.source_guard
             && !guard.validate()?
@@ -1030,6 +1054,7 @@ impl LocalAlignmentSource {
         self.reader.fetch((tid, start, end))?;
         self.positioned_stream = Some(LocalPositionedStreamState {
             interval,
+            admission_interval,
             stats: QueryStats {
                 complete_read_limit: options.max_records.get(),
                 ..QueryStats::default()
@@ -1312,6 +1337,8 @@ impl AlignmentSource for LocalAlignmentSource {
                 continue;
             }
             stats.records_eligible += 1;
+            stats.complete_read_records_eligible =
+                stats.complete_read_records_eligible.saturating_add(1);
             if stats.records_eligible > maximum_records && !too_dense {
                 retained.clear();
                 retained.shrink_to_fit();
@@ -1468,10 +1495,16 @@ fn process_positioned_bam_record(
         return Ok(());
     }
     state.stats.records_eligible = state.stats.records_eligible.saturating_add(1);
+    if record_span.is_some_and(|(start, end)| {
+        start < state.admission_interval.end() && end > state.admission_interval.start()
+    }) {
+        state.stats.complete_read_records_eligible =
+            state.stats.complete_read_records_eligible.saturating_add(1);
+    }
     // Continue evaluating the exact filter population after the Complete admission limit is
     // crossed, but do not retain an unbounded rejected individual-read candidate. Blocks already
     // returned remain valid salvageable fragments for a later smaller target.
-    if state.stats.records_eligible > state.options.max_records.get() {
+    if state.stats.complete_read_records_eligible > state.options.max_records.get() {
         return Ok(());
     }
     let detail = if state.options.collect_modifications {
@@ -1498,7 +1531,7 @@ fn process_positioned_bam_record(
 
 fn finalize_positioned_stream_stats(stats: &mut QueryStats) {
     let limit = stats.complete_read_limit;
-    if stats.records_eligible > limit {
+    if stats.complete_read_records_eligible > limit {
         stats.records_emitted = 0;
         stats.truncated = true;
         stats.individual_reads = IndividualReadStatus::TooDense { limit };
@@ -1766,6 +1799,11 @@ pub enum AlignmentError {
     PackedRecord(#[from] crate::PackedRecordError),
     #[error("resident alignment data cannot authoritatively answer this target")]
     IncompatibleResidentQuery,
+    #[error("Complete-read admission interval {admission:?} is outside source query {query:?}")]
+    AdmissionIntervalOutsideQuery {
+        query: GenomicInterval,
+        admission: GenomicInterval,
+    },
     #[error("auxiliary tag was not exactly two bytes")]
     InvalidAuxTag,
     #[error("reference dictionary has no contig id {0}")]
@@ -2181,6 +2219,52 @@ mod tests {
                 Some(&exact.batch.materialize_record(index).unwrap())
             );
         }
+    }
+
+    #[test]
+    fn positioned_stream_applies_complete_limit_to_exact_admission_interval_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("positioned-admission.bam");
+        write_positioned_stream_fixture(&path, 4_000);
+        let query = GenomicInterval::new(ContigId::new(0), 0, 20_000).unwrap();
+        let admission = GenomicInterval::new(ContigId::new(0), 19_000, 19_001).unwrap();
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        source
+            .begin_positioned_stream_with_admission(
+                query,
+                admission,
+                QueryOptions {
+                    detail: QueryDetail::Full,
+                    max_records: NonZeroUsize::new(1).unwrap(),
+                    ..QueryOptions::default()
+                },
+            )
+            .unwrap();
+        let mut emitted = 0_usize;
+        let completion = loop {
+            match source.next_positioned_stream_checkpoint(&|| true).unwrap() {
+                PositionedAlignmentStreamCheckpoint::Block(block) => {
+                    emitted = emitted.saturating_add(block.records.len());
+                }
+                PositionedAlignmentStreamCheckpoint::Complete(completion) => break completion,
+                PositionedAlignmentStreamCheckpoint::Cancelled(_) => {
+                    panic!("an uncancelled positioned stream was cancelled")
+                }
+            }
+        };
+
+        assert!(completion.stats.records_eligible > 1);
+        assert_eq!(completion.stats.complete_read_records_eligible, 0);
+        assert_eq!(
+            completion.stats.individual_reads,
+            IndividualReadStatus::Complete
+        );
+        assert_eq!(completion.stats.records_emitted, emitted);
+        assert_eq!(
+            completion.stats.records_emitted,
+            completion.stats.records_eligible
+        );
     }
 
     #[test]

@@ -119,8 +119,11 @@ impl LocalBamCanonicalBackend {
     ) -> Result<(), LocalBamCanonicalBackendError> {
         self.validate_work(work)?;
         let options = self.options_for(work.intent().spec().payload())?;
-        self.source
-            .begin_positioned_stream(work.intent().spec().target(), options)?;
+        self.source.begin_positioned_stream_with_admission(
+            work.intent().spec().target(),
+            work.intent().spec().admission_target(),
+            options,
+        )?;
         Ok(())
     }
 
@@ -313,6 +316,7 @@ impl CanonicalAlignmentSourceBackend for LocalBamCanonicalBackend {
             PositionedAlignmentStreamCheckpoint::Complete(completion) => {
                 let status = completion.stats.individual_reads;
                 let limit = completion.stats.complete_read_limit;
+                let eligible_records = completion.stats.complete_read_records_eligible;
                 let coverage = self.coverage(work, completion.interval, completion.stats)?;
                 match status {
                     IndividualReadStatus::Complete => {
@@ -322,6 +326,7 @@ impl CanonicalAlignmentSourceBackend for LocalBamCanonicalBackend {
                         Ok(CanonicalDecodeCheckpoint::Refused {
                             coverage,
                             complete_read_limit: limit,
+                            eligible_records,
                         })
                     }
                 }

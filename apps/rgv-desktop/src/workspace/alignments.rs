@@ -6,6 +6,113 @@ use super::super::*;
 const DESKTOP_ALIGNMENT_SCENE_TILE_BASES: u64 = 32_768;
 const DESKTOP_ALIGNMENT_SCENE_ROW_BLOCK_ROWS: u32 = 256;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AlignmentReferenceCompatibility {
+    Compatible,
+    Incompatible(String),
+}
+
+/// Compares the immutable dictionaries before a FASTA revision is admitted into an alignment
+/// scene. Extra decoy/alternate contigs are allowed, but every shared contig must retain the same
+/// length and at least one contig must resolve. Name matching honours configured aliases and the
+/// conventional `chr` spelling difference; neither can hide an assembly-length mismatch.
+pub(crate) fn alignment_reference_compatibility(
+    alignment: &ReferenceDictionary,
+    reference: &ReferenceDictionary,
+    aliases: &ContigAliases,
+) -> AlignmentReferenceCompatibility {
+    let mut matched = 0_usize;
+    for alignment_contig in alignment.iter() {
+        let Some(reference_contig) =
+            matching_reference_contig(alignment_contig.name(), reference, aliases)
+        else {
+            continue;
+        };
+        matched = matched.saturating_add(1);
+        if alignment_contig.length() != reference_contig.length() {
+            return AlignmentReferenceCompatibility::Incompatible(format!(
+                "contig {} is {} bp in the alignment but {} is {} bp in the FASTA",
+                alignment_contig.name(),
+                alignment_contig.length(),
+                reference_contig.name(),
+                reference_contig.length(),
+            ));
+        }
+    }
+    if matched == 0 {
+        AlignmentReferenceCompatibility::Incompatible(
+            "the alignment and FASTA dictionaries have no resolvable contigs in common".to_owned(),
+        )
+    } else {
+        AlignmentReferenceCompatibility::Compatible
+    }
+}
+
+/// Returns the FASTA spelling for one alignment contig only after the dictionaries are globally
+/// compatible and this exact contig has the same length.
+pub(crate) fn compatible_reference_contig_name(
+    alignment: &ReferenceDictionary,
+    reference: &ReferenceDictionary,
+    aliases: &ContigAliases,
+    alignment_name: &str,
+) -> Result<String, String> {
+    if let AlignmentReferenceCompatibility::Incompatible(reason) =
+        alignment_reference_compatibility(alignment, reference, aliases)
+    {
+        return Err(reason);
+    }
+    let alignment_contig = alignment
+        .id_by_name(alignment_name)
+        .and_then(|id| alignment.get(id))
+        .ok_or_else(|| format!("alignment dictionary has no contig named {alignment_name}"))?;
+    let reference_contig = matching_reference_contig(alignment_name, reference, aliases)
+        .ok_or_else(|| format!("FASTA dictionary has no contig matching {alignment_name}"))?;
+    if alignment_contig.length() != reference_contig.length() {
+        return Err(format!(
+            "contig {} is {} bp in the alignment but {} is {} bp in the FASTA",
+            alignment_contig.name(),
+            alignment_contig.length(),
+            reference_contig.name(),
+            reference_contig.length(),
+        ));
+    }
+    Ok(reference_contig.name().to_owned())
+}
+
+fn matching_reference_contig<'a>(
+    alignment_name: &str,
+    reference: &'a ReferenceDictionary,
+    aliases: &ContigAliases,
+) -> Option<&'a rgv_core::Contig> {
+    let mut candidates = Vec::with_capacity(5);
+    candidates.push(alignment_name.to_owned());
+    if let Some(canonical) = aliases.get(alignment_name) {
+        candidates.push(canonical.clone());
+    }
+    candidates.extend(
+        aliases
+            .iter()
+            .filter(|(_, canonical)| canonical.as_str() == alignment_name)
+            .map(|(alias, _)| alias.clone()),
+    );
+    if let Some(stripped) = alignment_name.strip_prefix("chr") {
+        candidates.push(stripped.to_owned());
+        if stripped == "M" {
+            candidates.push("MT".to_owned());
+        }
+    } else {
+        candidates.push(format!("chr{alignment_name}"));
+        if alignment_name == "MT" {
+            candidates.push("chrM".to_owned());
+        }
+    }
+    candidates.into_iter().find_map(|candidate| {
+        reference
+            .id_by_name(&candidate)
+            .and_then(|id| reference.get(id))
+    })
+}
+
 /// Panel-local coherence identities. Raw and CPM scales are deliberately different groups: a
 /// numerical maximum in one unit can never be applied to the other.
 pub(crate) const ALIGNMENT_SASHIMI_RAW_GROUP: AlignmentCoherenceGroupId =
@@ -1086,6 +1193,55 @@ impl AlignmentTrackController {
 }
 
 impl Viewer {
+    pub(crate) fn compatible_alignment_reference_revision(
+        &self,
+        alignment: &ReferenceDictionary,
+    ) -> Option<ReferenceRevision> {
+        self.reference_revision.filter(|_| {
+            self.reference_dictionary.as_ref().is_some_and(|reference| {
+                alignment_reference_compatibility(alignment, reference, &self.contig_aliases)
+                    == AlignmentReferenceCompatibility::Compatible
+            })
+        })
+    }
+
+    /// Resolves the active panel's alignment spelling to the actual FASTA contig name. A loaded
+    /// but incompatible FASTA is an explicit unavailable capability, never a query destined to
+    /// fail later inside the reference worker.
+    pub(crate) fn compatible_reference_contig_for_panel(
+        &self,
+        panel_id: PanelId,
+    ) -> Result<Option<String>, String> {
+        let (Some(_revision), Some(reference), Some(panel)) = (
+            self.reference_revision,
+            self.reference_dictionary.as_ref(),
+            self.panels.get(panel_id),
+        ) else {
+            return Ok(None);
+        };
+        let Some(alignment) = self.primary_alignment_dictionary() else {
+            return Ok(Some(panel.contig_name.clone()));
+        };
+        compatible_reference_contig_name(
+            alignment,
+            reference,
+            &self.contig_aliases,
+            &panel.contig_name,
+        )
+        .map(Some)
+    }
+
+    pub(crate) fn alignment_reference_incompatibility(
+        &self,
+        alignment: &ReferenceDictionary,
+    ) -> Option<String> {
+        let reference = self.reference_dictionary.as_ref()?;
+        match alignment_reference_compatibility(alignment, reference, &self.contig_aliases) {
+            AlignmentReferenceCompatibility::Compatible => None,
+            AlignmentReferenceCompatibility::Incompatible(reason) => Some(reason),
+        }
+    }
+
     pub(crate) fn primary_alignment_filters(&self) -> &SessionFilters {
         self.alignment_tracks
             .first()
@@ -1626,6 +1782,8 @@ pub(crate) fn alignment_scene_build_contract(
         record_contract: metadata.record_contract,
         contig,
         contig_length,
+        complete_read_limit: NonZeroUsize::new(config.maximum_alignments.max(1))
+            .expect("the complete read limit is non-zero"),
         // Complete record inspection/export is a product consumer. Retain the full payload once
         // in canonical evidence rather than creating a second query authority on demand.
         payload: PayloadContract::new_all_auxiliary(
@@ -1753,6 +1911,7 @@ pub(crate) fn alignment_scene_contract_equivalent(
         && left.record_contract == right.record_contract
         && left.contig == right.contig
         && left.contig_length == right.contig_length
+        && left.complete_read_limit == right.complete_read_limit
         && left.payload == right.payload
         && left.view_filter == right.view_filter
         && left.highlight_filter == right.highlight_filter
@@ -1987,7 +2146,7 @@ pub(crate) fn spawn_alignment_track_controller(
     config: SessionAlignmentTrack,
     cache_bytes: NonZeroUsize,
     scene_ledger: AllocationLedger,
-    reference_path: Option<PathBuf>,
+    _reference_path: Option<PathBuf>,
     remote_reference_index_url: Option<String>,
     panel_ids: &[PanelId],
 ) -> Result<AlignmentTrackController> {
@@ -2003,8 +2162,12 @@ pub(crate) fn spawn_alignment_track_controller(
                 Some(AlignmentSceneEngine::spawn_local_bam(
                     LocalAlignmentSceneEngineConfig {
                         path: PathBuf::from(path),
+                        // BAM decoding is reference-independent. FASTA authority is validated
+                        // against the opened BAM dictionary and installed into semantic scenes
+                        // separately; passing it into HTSlib here would couple core reads to an
+                        // incompatible optional reference before that validation can run.
                         open_options: alignment_open_options(
-                            reference_path,
+                            None,
                             config.remote_index_url.clone(),
                             remote_reference_index_url,
                         ),

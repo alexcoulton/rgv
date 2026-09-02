@@ -1020,6 +1020,8 @@ where
             }
         }
         stats.records_eligible = stats.records_eligible.saturating_add(1);
+        stats.complete_read_records_eligible =
+            stats.complete_read_records_eligible.saturating_add(1);
         if stats.records_eligible > maximum_records && !too_dense {
             retained.clear();
             retained.shrink_to_fit();

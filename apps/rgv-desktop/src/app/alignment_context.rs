@@ -440,11 +440,18 @@ impl Viewer {
             );
             return;
         }
+        let compatible_reference_available = self
+            .alignment_tracks
+            .iter()
+            .find(|track| track.config.id == target.track_id)
+            .and_then(|track| track.dictionary.as_ref())
+            .and_then(|dictionary| self.compatible_alignment_reference_revision(dictionary))
+            .is_some();
         if matches!(
             action,
             AlignmentContextAction::AddFilter(predicate)
                 | AlignmentContextAction::AddHighlight(predicate)
-                if predicate.requires_reference() && self.reference_revision.is_none()
+                if predicate.requires_reference() && !compatible_reference_available
         ) {
             "Substitution predicates require a matching reference FASTA"
                 .clone_into(&mut self.data_status);

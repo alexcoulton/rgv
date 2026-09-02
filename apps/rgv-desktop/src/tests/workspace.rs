@@ -1545,6 +1545,40 @@ fn only_base_scene_geometry_depends_on_the_current_fasta_revision() {
 }
 
 #[test]
+fn alignment_reference_compatibility_accepts_alias_spelling_but_rejects_build_lengths() {
+    let alignment = ReferenceDictionary::from_contigs([
+        ("1".to_owned(), 249_250_621),
+        ("2".to_owned(), 243_199_373),
+        ("hs37d5".to_owned(), 35_477_943),
+    ]);
+    let matching = ReferenceDictionary::from_contigs([
+        ("chr1".to_owned(), 249_250_621),
+        ("chr2".to_owned(), 243_199_373),
+    ]);
+    let grch38 = ReferenceDictionary::from_contigs([
+        ("chr1".to_owned(), 248_956_422),
+        ("chr2".to_owned(), 242_193_529),
+    ]);
+    let aliases = ContigAliases::new();
+
+    assert_eq!(
+        alignment_reference_compatibility(&alignment, &matching, &aliases),
+        AlignmentReferenceCompatibility::Compatible
+    );
+    assert_eq!(
+        compatible_reference_contig_name(&alignment, &matching, &aliases, "1").unwrap(),
+        "chr1"
+    );
+    let AlignmentReferenceCompatibility::Incompatible(reason) =
+        alignment_reference_compatibility(&alignment, &grch38, &aliases)
+    else {
+        panic!("GRCh37 alignment lengths must not accept a GRCh38 FASTA")
+    };
+    assert!(reason.contains("249250621") || reason.contains("249,250,621"));
+    assert!(reason.contains("248956422") || reason.contains("248,956,422"));
+}
+
+#[test]
 fn fasta_completion_must_match_the_open_revision_and_exact_requested_horizon() {
     let current = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
     let stale = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 10));

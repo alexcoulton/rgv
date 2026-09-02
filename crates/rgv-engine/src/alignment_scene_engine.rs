@@ -2478,6 +2478,7 @@ mod tests {
             record_contract,
             contig,
             contig_length,
+            complete_read_limit: NonZeroUsize::new(1_000).unwrap(),
             payload: PayloadContract::new(
                 CapabilityRequirement::NotRequired,
                 CapabilityRequirement::NotRequired,

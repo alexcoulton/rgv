@@ -1495,7 +1495,10 @@ impl Viewer {
                 .all
                 .iter()
                 .any(AlignmentViewPredicate::requires_reference)
-                && self.reference_revision.is_none();
+                && track.dictionary.as_ref().is_none_or(|dictionary| {
+                    self.compatible_alignment_reference_revision(dictionary)
+                        .is_none()
+                });
             let filter_status = if filter_count == 0 {
                 String::new()
             } else if filter_requires_missing_reference {

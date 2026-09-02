@@ -61,7 +61,12 @@ pub struct AlignmentSourceIntentSpec {
     source_revision: AlignmentSourceRevision,
     record_contract: ContractFingerprint,
     payload: PayloadContract,
+    /// Physical interval acquired into the canonical evidence cache.
     target: GenomicInterval,
+    /// Exact population whose size is governed by the user-visible Complete read limit.
+    /// Foreground read-ahead may acquire a tiled superset while admission remains camera-exact;
+    /// speculative margin requests use their own target here and can be refused independently.
+    admission_target: GenomicInterval,
 }
 
 impl AlignmentSourceIntentSpec {
@@ -77,7 +82,17 @@ impl AlignmentSourceIntentSpec {
             record_contract,
             payload,
             target,
+            admission_target: target,
         }
+    }
+
+    /// Uses a contained camera interval for Complete-read admission while retaining a broader
+    /// physical acquisition target. Callers construct both intervals from one validated contig.
+    #[must_use]
+    pub fn with_admission_target(mut self, admission_target: GenomicInterval) -> Self {
+        debug_assert!(self.target.contains_interval(admission_target));
+        self.admission_target = admission_target;
+        self
     }
 
     #[must_use]
@@ -98,6 +113,11 @@ impl AlignmentSourceIntentSpec {
     #[must_use]
     pub const fn target(&self) -> GenomicInterval {
         self.target
+    }
+
+    #[must_use]
+    pub const fn admission_target(&self) -> GenomicInterval {
+        self.admission_target
     }
 }
 
@@ -225,6 +245,9 @@ pub enum CanonicalDecodeCheckpoint {
     Refused {
         coverage: CompleteCoverage,
         complete_read_limit: usize,
+        /// Exact eligible population in the intent's admission target, which may be narrower
+        /// than the physical acquisition interval represented by `coverage`.
+        eligible_records: usize,
     },
 }
 
@@ -300,6 +323,7 @@ pub enum AlignmentSourceActorEvent {
         work: SourceWork,
         coverage: CompleteCoverage,
         complete_read_limit: usize,
+        eligible_records: usize,
         publish: Option<SourceIntentSequence>,
     },
 }
@@ -598,6 +622,7 @@ where
             CanonicalDecodeCheckpoint::Refused {
                 coverage,
                 complete_read_limit,
+                eligible_records,
             } => {
                 self.transaction_chunks.clear();
                 let completed = self.schedule.finish_active()?;
@@ -605,6 +630,7 @@ where
                     work: completed.work,
                     coverage,
                     complete_read_limit,
+                    eligible_records,
                     publish: completed.publish,
                 }))
             }
@@ -1087,6 +1113,15 @@ impl<C> AlignmentSourceActorSchedule<C> {
         self.desired_speculation.as_ref()
     }
 
+    /// Whether the exact latest speculative intent belongs to `owner` and is still queued or
+    /// actively decoding. A retained desired slot may instead describe already-settled work.
+    #[must_use]
+    pub fn speculation_pending_for(&self, owner: SourceOwnerId) -> bool {
+        self.desired_speculation.as_ref().is_some_and(|intent| {
+            intent.owner == owner && Some(intent.sequence) != self.satisfied_speculation
+        })
+    }
+
     #[must_use]
     pub fn pending_slots(&self) -> usize {
         self.controls
@@ -1127,7 +1162,7 @@ impl<C> AlignmentSourceActorSchedule<C> {
     fn speculation_pending(&self) -> bool {
         self.desired_speculation
             .as_ref()
-            .is_some_and(|intent| Some(intent.sequence) != self.satisfied_speculation)
+            .is_some_and(|intent| self.speculation_pending_for(intent.owner))
     }
 }
 

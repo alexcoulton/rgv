@@ -1075,7 +1075,13 @@ impl Viewer {
         } else {
             "Ctrl"
         };
-        let reference_configured = self.reference_revision.is_some();
+        let reference_configured = self.primary_alignment_dictionary().map_or_else(
+            || self.reference_revision.is_some(),
+            |dictionary| {
+                self.compatible_alignment_reference_revision(dictionary)
+                    .is_some()
+            },
+        );
         let mut alignment_context_menu = self.alignment_context_menu.clone();
         let alignment_context_menu_view = alignment_context_menu.as_ref().and_then(|menu| {
             let track = self
@@ -1120,7 +1126,9 @@ impl Viewer {
                 sequence_available,
                 eligible_records: view_filter.map(|filter| filter.eligible_records()),
                 matching_records: view_filter.map(|filter| filter.matching_records()),
-                reference_configured: self.reference_revision.is_some(),
+                reference_configured: self
+                    .compatible_alignment_reference_revision(track.dictionary.as_ref()?)
+                    .is_some(),
             })
         });
         let mut alignment_context_action = None;
