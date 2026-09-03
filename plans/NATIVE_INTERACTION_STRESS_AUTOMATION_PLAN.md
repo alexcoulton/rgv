@@ -1,829 +1,958 @@
-# Native interaction stress automation plan
+# RGV macOS interaction stress-testing framework plan
 
-Status: proposed; implementation has not started
+Status: proposed; revised after product-intent review on 2026-09-03; implementation has not
+started
 
-Plan date: 2026-09-01
+This plan supersedes the earlier, broader native-interaction automation proposal. It reflects the
+following decisions:
 
-Initial evidence and client:
-
-- `rgv-manual-diagnostic-trace-9e8a3e20-b2d6-4e14-b3eb-5bb068f7dccd.json`;
-- retained trace interval: 61.437–236.813 seconds;
-- 100,000 retained events and 54,494 overwritten earlier events; and
-- the BAP1→ACTB cache-liveness and vertical-scroll failure.
+- extend RGV's existing automation and validation spine rather than create a parallel framework;
+- build the generic stress infrastructure before tailoring it to the BAP1→ACTB defect;
+- make recorded manual use and seeded scenario generation the two primary sources of tests;
+- qualify semantic behavior, liveness, and actual macOS event routing;
+- run against a visible local RGV application on macOS;
+- make no cross-platform native-driver commitment; and
+- exclude automatic or human visual-quality certification from this framework.
 
 Related plans:
 
 - [Alignment cache liveness and vertical navigation](ALIGNMENT_CACHE_LIVENESS_AND_VERTICAL_NAVIGATION_PLAN.md)
-- [Unified alignment-scene implementation](UNIFIED_ALIGNMENT_SCENE_IMPLEMENTATION_PLAN.md)
+- [Alignment cache thrash and scroll-materialization recovery](ALIGNMENT_CACHE_THRASH_AND_SCROLL_MATERIALIZATION_RECOVERY_PLAN.md)
 - [Manual fixture suite](MANUAL_FIXTURE_SUITE_PLAN.md)
 - [RGV MCP implementation](RGV_MCP_IMPLEMENTATION_PLAN.md)
 
-This plan owns automated gesture reproduction, native GUI stress, trace and action capture,
-watchdogs, seeded scenario generation, failure reduction, and qualification artifacts. It does not
-prescribe alignment cache policy, eviction algorithms, vertical-residency architecture, or the fix
-for the motivating ACTB defect. The cache-liveness plan consumes this framework as its first major
-client.
-
 ## 1. Outcome
 
-RGV should be testable through repeatable interaction sequences that resemble actual browsing:
-held drags, fast reversals, scrolling, zooming before settlement, switching loci, focus loss,
-resizing, and overlapping operations. A failed run should produce enough evidence to explain the
-failure and a compact script capable of reproducing it.
+RGV gains a local macOS framework that can stress the real desktop application in two ways:
+
+1. record a sequence of native use, turn it into a stable scenario, and replay it; and
+2. generate new, state-aware native interaction sequences from a reproducible seed.
+
+Both paths use the same scenario, target, timing, assertion, failure, and artifact vocabulary. The
+controller uses RGV's existing authenticated automation service for semantic setup and observation,
+but gestures are delivered as macOS events to the selected RGV process. A passing native run must
+show that the driver posted the events, RGV received them through its normal AppKit/winit path, the
+intended interaction lifecycle ran, and the resulting semantic/liveness assertions passed.
 
 The completed framework provides:
 
-- a compact, complete, resolution-independent journal of meaningful user actions;
-- one versioned gesture-script format shared by deterministic and native drivers;
-- deterministic replay through the same post-egui viewer-input decisions as the real application;
-- trace start, status, freeze, save, and composed-frame capture through typed automation;
-- an external heartbeat and progress watchdog capable of distinguishing UI and worker stalls;
-- a packaged-app XCUITest driver for real macOS accessibility and pointer routing;
-- a PID-targeted Core Graphics driver for high-rate native stress;
-- seeded state-aware scenario generation and automatic failure minimisation;
-- semantic, liveness, performance, and bounded visual oracles; and
-- a clear human visual gate for behavior automation cannot judge reliably.
+- opt-in, streaming capture of replay-relevant native input;
+- conversion of recordings into inspectable, resolution-independent scenarios;
+- PID-targeted native pointer, scroll, modifier, keyboard, focus, and resize driving on macOS;
+- stable targeting of panels, tracks, canvases, scrollbars, and supported controls;
+- recorded, accelerated, maximum-rate, and seeded-jitter timing modes;
+- a state-aware scenario generator that persists every generated action before executing it;
+- semantic, interaction-lifecycle, native-routing, invariant, and liveness oracles;
+- external watchdogs that remain useful when the UI thread is blocked;
+- complete and partial run artifacts suitable for diagnosis and replay; and
+- failure-signature-preserving reduction of recorded or generated scenarios.
 
-The framework is reusable across tracks, panels, properties, annotation, navigation, selection,
-context menus, exports, and future native interaction work. It is not an ACTB-only test script.
+This is an interaction stress-testing extension to RGV automation. It is not a replacement for
+unit tests, engine/property tests, format validation, fixture generation, performance benchmarks,
+MCP, or manual visual review.
 
-## 2. Why the existing automation is insufficient
+## 2. Scope and confidence boundary
 
-### 2.1 High-level commands bypass the failure path
+### 2.1 In scope
 
-The current `ChangeViewport` automation computes and assigns a genomic viewport directly. It is
-valuable for setup and semantic operations, but it bypasses:
+- A visible RGV application launched locally on macOS.
+- Development and release builds, provided they explicitly enable authenticated local control and
+  interaction recording.
+- Manual recording and native replay of accepted pointer, wheel, keyboard, focus, and window
+  interactions.
+- Generated scenarios designed to provoke races, stale work, stuck interactions, excess work,
+  crashes, and invariant violations.
+- Semantic setup through existing `AutomationCommand` operations when setup itself is not under
+  test.
+- Semantic and liveness inspection through existing automation snapshots and targeted additions.
+- Capturing diagnostic traces and screenshots as failure evidence.
+- The BAP1→ACTB workload as an early consumer after the generic record/replay/generate path works.
 
-- OS-to-winit event conversion;
-- egui consumption decisions;
-- cursor movement and physical/logical coordinate conversion;
-- press, held movement, raw motion, and release ordering;
-- pointer capture and focus cancellation;
-- scroll units, phases, and momentum;
-- the vertical scrollbar's drag lifecycle; and
-- redraw behavior while an input remains held.
+### 2.2 Out of scope
 
-Those are precisely the paths involved in the panning, white-space, flicker, scrollbar, and
-interaction regressions found during manual testing. Direct camera mutation cannot qualify them.
+- Cross-platform native driving or a portable promise for the controller.
+- Headless end-to-end interaction qualification.
+- XCUITest, an Xcode test project, or XCTest result-bundle integration.
+- A second application-control protocol alongside the existing authenticated loopback service.
+- Internal replay that calls camera, scrollbar, workspace, or gesture state directly.
+- Claiming that a Core Graphics event is identical to physical mouse or trackpad hardware input.
+- Screenshot comparison, aesthetic assertions, flicker certification, or a human visual gate.
+- Exhaustively exposing the RGV UI as accessibility nodes solely for test automation.
+- Cache policy, rendering policy, biological truth, or the fix for any consuming defect.
+- Generic fuzzing of arbitrary bytes or invalid JSON. Existing unit/fuzz targets own those inputs.
 
-### 2.2 The current trace cannot be replayed completely
+### 2.3 What a passing run proves
 
-The verbose diagnostic recorder is a bounded in-memory ring. The motivating 236-second session
-retained 100,000 events but overwrote its first 54,494 events. Raw frame and pointer diagnostics are
-too verbose to serve as the sole replay record.
+A successful native stress run proves, for the declared scenario and environment, that:
 
-The trace also records worker state mainly when existing events are emitted. In the final ACTB
-stall, a request remained `Running` for more than 43 seconds but produced no first work checkpoint.
-The trace could not identify which call or phase occupied the worker.
+1. the controller targeted the expected live RGV instance and window;
+2. the macOS driver posted the compiled event sequence to that process;
+3. RGV observed the required native event structure through its normal runtime path;
+4. the intended target acquired, advanced, and released or cancelled its interaction correctly;
+5. declared semantic outcomes and invariants held; and
+6. UI and pipeline progress satisfied the declared liveness predicates.
 
-### 2.3 Automatic visual claims have been unreliable
+It does not prove identical event coalescing on another run, physical-device fidelity, visual
+quality, or behavior on another operating system.
 
-Headless state assertions and screenshots have repeatedly failed to predict what the user sees
-during continuous native interaction. The new framework must distinguish:
+## 3. Existing foundation: extend, do not duplicate
 
-- semantic correctness;
-- liveness and ownership correctness;
-- performance and work-amplification evidence;
-- bounded machine-checkable visual symptoms; and
-- subjective visual quality requiring user assessment.
+The repository already contains most of the semantic control plane:
 
-It may detect a fully blank read-region capture. It may not declare motion, flicker, labels,
-chevrons, substitutions, or Sashimi aesthetically correct without user review.
+| Existing capability | Current location | Required extension |
+| --- | --- | --- |
+| Versioned, validated command batches | `crates/rgv-core/src/automation.rs` | Reuse commands for setup/inspection; add recording and trace-control commands only. |
+| UI-loop automation execution | `apps/rgv-desktop/src/automation/commands.rs` and `runner.rs` | Keep it authoritative; submit short batches between native gesture steps. |
+| Authenticated loopback control | `apps/rgv-desktop/src/control_service.rs` | Add an authenticated, non-UI-dependent health read. Do not add a second server. |
+| MCP control client | `apps/rgv-mcp/src/control_client.rs` | Extract the reusable transport into a shared client crate rather than copy it. |
+| Semantic workspace/layout snapshots | `AutomationWorkspaceSnapshot` in `rgv-core` | Add missing stable target identities or rectangles only when a scenario needs them. |
+| Native composed-window capture | `AutomationSnapshotScope::NativeWindow` | Use on failure for evidence; do not turn it into a visual oracle. |
+| Run, frame, GPU, and navigation telemetry | `AutomationRunReport` | Reuse per control batch and aggregate it in one stress-run manifest. |
+| Manual diagnostic trace | `manual_diagnostic_trace.rs` | Correlate it with stress runs; retain it as bounded forensic detail. |
+| Short gesture/render trace | `interaction_trace.rs` | Reuse it for focused latency evidence; do not treat it as the replay journal. |
+| Native event handling | `apps/rgv-desktop/src/runtime.rs` | Extract observable input handling so recording can capture pre/post decision data. |
 
-## 3. Governing principles
+There are three deliberately separate evidence streams:
 
-1. **One scenario vocabulary, multiple fidelity levels.** Deterministic replay, XCUITest, and
-   Core Graphics stress share scripts and assertions but clearly label what each driver proves.
-2. **Drive real decisions.** Gesture tests enter through the same normalized viewer-input dispatcher
-   as native events; they do not assign camera or scrollbar state directly.
-3. **Semantic targets over desktop pixels.** Scripts address panels, tracks, canvases, and controls
-   using stable identities and normalized coordinates.
-4. **Record intent compactly.** Preserve gesture starts, paths, reversals, phases, checkpoints, and
-   releases independently of verbose diagnostic retention.
-5. **Progress over arbitrary waiting.** Barriers observe generations, owners, and progress. Fixed
-   sleeps are permitted only as intentional parts of an input cadence, not as settlement logic.
-6. **Artifacts are first-class.** Every run has a manifest linking build, data, script, trace,
-   screenshots, state, timing, and failure signature.
-7. **Failures must shrink.** A long stress failure is not fully actionable until the runner has
-   attempted to reduce it to a smaller preserving script.
-8. **Automation cannot self-certify aesthetics.** Human visual assessment remains an explicit gate.
-9. **Opt-in and authenticated.** Replay and process control are available only when explicitly
-   enabled at launch and use the existing authenticated local-control model.
-10. **No production behavior fork.** The instrumented/replayable release application uses the same
-    renderer, source, workers, and input reducers as ordinary use.
+1. **Interaction recording:** compact, streaming, replay-complete input and target evidence.
+2. **Diagnostic trace:** bounded, verbose causal evidence for debugging.
+3. **Stress-run telemetry:** controller, health, assertions, timing, and final classification.
 
-## 4. Run artifact and identity model
+They share a run ID, step IDs, interaction IDs, and monotonic sequence numbers. They must not be
+collapsed into one unbounded trace or reimplemented as unrelated schemas.
 
-Every run receives a stable run ID and artifact directory containing:
+## 4. User workflows
+
+### 4.1 Record and replay
+
+The intended local workflow is:
 
 ```text
-run-manifest.json
-gesture-script.json
-action-journal.jsonl
-diagnostic-trace.json
-initial-state.json
-final-state.json
-heartbeats.jsonl
-captures/
-  before.png
-  held-*.png
-  after.png
-native/
-  screenshot-*.png
-  process-sample.txt
-  controller.log
-  optional-profile-export/
+launch or attach to an explicitly controlled RGV instance
+        ↓
+start interaction recording through authenticated control
+        ↓
+use RGV normally in the visible window
+        ↓
+stop recording; retain a complete or explicitly incomplete journal
+        ↓
+convert native events and resolved targets into a scenario
+        ↓
+review or edit the inspectable scenario
+        ↓
+replay it through the macOS driver and evaluate the run
 ```
 
-The manifest records:
-
-- application version, commit, branch, dirty-state fingerprint, and build profile;
-- operating system, hardware, GPU, memory, scale factor, and window geometry;
-- source/session/reference fingerprints without copying private data;
-- settings, panels, tracks, filters, and starting loci;
-- gesture schema version, seed, driver, and timing mode;
-- trace schema and artifact checksums;
-- assertion results and failure signature;
-- controller and application exit status; and
-- whether user visual review is required, accepted, rejected, or not run.
-
-Artifact writes use atomic finalisation where practical. Partial runs retain an explicit incomplete
-manifest rather than masquerading as successful evidence.
-
-## 5. Compact action journal
-
-Add a compact user-level journal independent of the verbose frame trace.
-
-Journal entries include:
-
-- locus editor submission and history navigation;
-- panel/track activation;
-- pointer press, normalized movement path, held duration, release, and cancellation;
-- vertical wheel or scrollbar fractions, cadence, interaction ID, and target identity;
-- wheel delta, unit, touch phase, momentum phase, anchor, and modifiers;
-- horizontal pan and overview gestures;
-- zoom factor/path and anchor;
-- focus loss/gain, resize, scale change, and window occlusion where observable;
-- relevant settings and context-menu actions;
-- explicit wait/barrier and capture requests; and
-- semantic outcome or error associated with the action.
-
-Repeated movement samples may be delta/time encoded. The following may never be discarded:
-
-- gesture start;
-- changes in direction or phase;
-- held-state capture points;
-- focus/capture transitions;
-- final accepted target; and
-- release/cancel.
-
-Write the journal asynchronously to a temporary artifact throughout the run. The writer must not
-block the UI and must preserve ordering by sequence number. If journal pressure occurs, coalesce
-only redundant intermediate motion while retaining the structural events above.
-
-The journal serves three purposes:
-
-1. turn manual runs into candidate replay scripts;
-2. preserve the complete user sequence when the verbose trace ring overwrites old events; and
-3. correlate user intent with worker, scene, GPU, and frame diagnostics.
-
-## 6. Shared normalized viewer-input dispatcher
-
-Extract post-egui native input decisions from the runtime event handler into a typed `ViewerInput`
-dispatcher. Real winit handlers and deterministic replay both call it.
-
-Representative events include:
-
-- cursor movement with physical position, scale, and consumed state;
-- primary/secondary button down and up;
-- raw mouse motion;
-- wheel delta with pixel/line units, phase, momentum, anchor, and modifiers;
-- focus lost/gained;
-- resize and scale-factor change;
-- redraw request/tick needed by a held gesture; and
-- explicit cancellation caused by window or control state.
-
-The dispatcher preserves:
-
-- egui-consumed versus viewer-consumed decisions;
-- physical-to-logical conversion;
-- press/move/release ordering;
-- pointer capture ownership;
-- active panel and control targeting;
-- the same workspace actions and invalidation path as native input; and
-- manual diagnostic correlation IDs.
-
-### 6.1 Required separation
-
-Use two layers:
-
-1. **Native adapter:** translates winit/AppKit-facing events and egui consumption into
-   `ViewerInput`.
-2. **Viewer reducer:** applies `ViewerInput` to viewer interaction state and workspace actions.
-
-Deterministic replay enters at the second layer. It proves reducer, action, scheduling, scene, and
-render behavior but does not claim to prove AppKit/winit conversion or OS coalescing. Native drivers
-exercise both layers.
-
-### 6.2 Event-loop marshalling
-
-Replay must run on the real application event loop. Use a custom application user event or bounded
-controller mailbox to deliver scheduled replay input; do not attempt to fabricate native
-`WindowEvent` values and claim OS fidelity.
-
-The event loop remains free to process worker replies, redraws, and native events between scripted
-inputs. A replay controller owns scheduling, barriers, cancellation, and artifact completion, but it
-cannot mutate viewer state from its own thread.
-
-## 7. Gesture script schema
-
-Use a versioned, inspectable JSON format. A script contains:
-
-- schema version and deterministic seed;
-- required source/session fingerprints and launch configuration;
-- window size, scale, cache settings, panels, tracks, and initial locus;
-- semantic targets such as `genomic_canvas(panel)`, `read_canvas(panel, track)`,
-  `read_scrollbar(panel, track)`, `overview(panel)`, and `locus_editor`;
-- normalized target coordinates;
-- timestamped events or duration/cadence curves;
-- semantic setup commands;
-- no-wait overlap groups;
-- settlement/progress barriers;
-- state, liveness, performance, and visual-region assertions;
-- capture points before, during, and after held gestures; and
-- an expected failure signature for preserved pre-fix regressions.
-
-### 7.1 Step types
-
-Initial typed steps should include:
-
-- `goto`;
-- `activate_panel` / `activate_track`;
-- `press`, `move`, `release`, and `cancel`;
-- `drag_path` with normalized control points and timing curve;
-- `wheel_sequence` with units and phases;
-- `horizontal_pan` and `vertical_scrollbar_drag` convenience expansions;
-- `zoom_sequence`;
-- `resize` and `focus_change`;
-- `set_option` / `configure`;
-- `wait_for` a typed semantic or progress predicate;
-- `capture`;
-- `assert`;
-- `start_trace`, `freeze_trace`, and `save_trace`; and
-- `repeat` or seeded generated block with an explicit expansion in the final artifact.
-
-Convenience steps compile to primitive viewer inputs before execution. The artifact stores the
-compiled sequence so the exact delivered inputs remain reviewable.
-
-### 7.2 Timing modes
-
-Support:
-
-- **deterministic cadence:** fixed script timestamps and a virtual scheduling clock;
-- **native cadence:** the OS controls event timing while the controller records actual delivery;
-- **maximum-rate stress:** deliver the next event whenever the event loop accepts it; and
-- **recorded cadence:** replay observed inter-event timing from a manual action journal.
-
-Real worker execution remains asynchronous in every mode. Timing mode changes input delivery, not
-source or renderer implementation.
-
-## 8. Driver A: deterministic in-app replay
-
-This is the primary development loop.
-
-The release application launches with explicit replay/control enabled. The controller:
-
-1. validates build, fixture, source, settings, and window prerequisites;
-2. starts tracing and the action journal;
-3. compiles semantic gesture targets against the live workspace layout;
-4. marshals normalized viewer inputs onto the event loop;
-5. evaluates typed barriers and assertions against live semantic state;
-6. captures the composed GPU frame, including frames while a pointer remains held;
-7. freezes artifacts on failure; and
-8. finalises the run manifest.
-
-Use the existing semantic settlement and alignment diagnostics rather than duplicating application
-state in the controller. Extend them only where an assertion cannot identify the current owner,
-generation, or product state.
-
-This driver proves:
-
-- the viewer input reducer and gesture lifecycle;
-- workspace action/cancellation behavior;
-- source, scene, GPU, and display responses;
-- deterministic script reproduction;
-- semantic and liveness assertions; and
-- composed-frame symptoms.
-
-It does not prove:
-
-- native AppKit event translation;
-- OS pointer coalescing;
-- system Accessibility routing;
-- true native focus/capture behavior; or
-- subjective visual smoothness.
-
-## 9. Driver B: packaged macOS XCUITest
-
-Add a small independent XCUITest project that launches the staged `org.rgv.viewer` bundle using
-`XCUIApplication(bundleIdentifier:)` and passes fixture/control/trace launch arguments.
-
-Required RGV accessibility work:
-
-- give genomic canvases, read canvases, overview controls, locus editor, panels, and read
-  scrollbars stable AccessKit author identifiers;
-- incorporate panel and track identity in split-workspace selectors;
-- expose meaningful controls and regions, not millions of individual read nodes;
-- expose current value/range for scrollbar and zoom controls where semantically valid; and
-- add accessibility-tree tests preventing duplicate or unstable identifiers.
-
-The XCUITest driver resolves an element, derives element-relative coordinates, and performs click,
-held drag, hover, keyboard, and scroll operations. It attaches native screenshots and the internal
-run artifact to failures.
-
-This driver proves packaged-app launch, accessibility discovery, AppKit event routing, native focus,
-and ordinary OS-paced gestures. It is not the sole high-rate stress driver because macOS controls
-event cadence and coalescing.
-
-Full Xcode is a prerequisite. The current development host has Command Line Tools but not the full
-XCUITest/xctrace toolchain. The XCUITest project can remain separate from the Rust app build and
-launch the staged external bundle by bundle identifier.
-
-## 10. Driver C: PID-targeted native stress
-
-Add a small Swift helper that uses Accessibility only to discover the RGV process, window, and
-target bounds, then posts Core Graphics mouse and scroll events to that PID.
-
-It covers:
-
-- rapid horizontal reversals;
-- extremely fast vertical thumb movement;
-- pixel, line, continuous, and momentum scroll phases;
-- drag outside the original control;
-- focus loss/cancellation mid-drag;
-- overlapping zoom and pan bursts;
-- long native soak runs; and
-- abusive event cadence unsuitable for XCUITest.
-
-Requirements:
-
-- explicit target PID and bundle verification;
-- stable semantic target lookup through accessibility identifiers;
-- no global untargeted input;
-- pre-authorised Accessibility permission;
-- an interactive dedicated macOS session;
-- emergency cancellation and maximum run duration; and
-- actual delivery timestamps recorded in the artifact.
-
-This driver belongs in dedicated local/nightly qualification, not generic headless CI.
-
-## 11. Diagnostic tracing
-
-### 11.1 Worker phase spans
-
-Add begin/end/cancel spans with stable correlation identifiers for:
-
-- mailbox enqueue/dequeue and displaced input;
-- inactive eviction and maintenance;
-- source `begin_work` entry and return;
-- indexed fetch open/seek/query setup;
-- decode batches and record/byte progress;
-- filter and evidence-root construction;
-- exact summary construction;
-- row-atlas construction;
-- semantic page construction;
-- GPU preparation and admission;
-- publication and retirement; and
-- cancellation observation latency.
-
-Record target revision, owner, work/request ID, interval, row range, source/filter fingerprint,
-charged/pinned bytes, elapsed time, and relevant operation counts. Emit entry before calling a
-potentially blocking backend so a missing exit identifies the blocked call.
-
-Instrumentation must be useful across alignment fixes. It reports what occurred and where; it does
-not embed cache-policy decisions or declare an operation wrong merely because it is expensive.
-
-### 11.2 Typed trace control
-
-Extend automation/control with commands to:
-
-- start tracing;
-- describe recorder state and artifact path;
-- freeze on an invariant or liveness failure;
-- save/export without stopping the app;
-- stop tracing without discarding the artifact; and
-- request a composed native-frame capture.
-
-Support trace-on-launch for stress runs. Automated and manually saved traces use the same schema and
-viewer diagnostics.
-
-### 11.3 Trace retention
-
-Keep the bounded verbose ring for low-overhead detailed history, but add:
-
-- the compact streaming action journal;
-- periodic compact state checkpoints;
-- overwrite counters and retained time range in every export;
-- configurable diagnostic capacity for dedicated stress runs; and
-- optional chunked asynchronous trace persistence only if measurement proves it does not perturb
-  interaction materially.
-
-Never imply that an in-memory trace can be recovered after a completely blocked or terminated
-process unless it was already persisted externally.
-
-## 12. Heartbeat and progress watchdog
-
-Expose an atomic status snapshot readable by the controller without waiting for the UI event loop.
-It includes:
-
-- UI heartbeat/frame sequence and last-frame time;
-- desired and committed workspace/scene generations;
-- active navigation owner and phase;
-- last source, semantic, GPU, and publication progress sequence/time;
-- pending resource/reclaim identity;
-- current charged, pinned, and budget bytes;
-- active pointer/scroll interaction;
-- trace/journal writer state; and
-- latest terminal or invariant failure.
-
-Classify at least:
-
-1. **UI stall:** heartbeat stops.
-2. **Pipeline stall:** heartbeat advances, but the current worker owner makes no progress and does
-   not settle, yield, or fail.
-3. **Interaction lock:** native/viewer input arrives, but the intended control state cannot advance
-   despite valid authority.
-4. **Progress churn:** progress counters advance but the latest desired generation cannot commit
-   because obsolete work repeatedly wins resources.
-
-Progress-based detection is primary. A generous wall-clock deadline still protects the runner, but
-product performance qualification uses fresh/carry-over baselines and structural work bounds rather
-than arbitrary sleeps.
+Illustrative commands, to be finalised with the implementation:
+
+```sh
+rgv-interaction-stress record --attach control.json --output validation/interaction-stress/recordings/run.jsonl
+rgv-interaction-stress convert validation/interaction-stress/recordings/run.jsonl --output scenario.json
+rgv-interaction-stress replay scenario.json --attach control.json
+```
+
+Stopping the recorder may be initiated from the controller terminal, so the stop action does not
+need to contaminate the RGV input sequence.
+
+### 4.2 Generate and stress
+
+The generated workflow is:
+
+```text
+attach and validate prerequisites
+        ↓
+query current semantic state and valid targets
+        ↓
+select a valid action from a seeded weighted grammar
+        ↓
+durably append the expanded action to a partial JSONL expansion before delivery
+        ↓
+post native events, observe receipt and outcome
+        ↓
+either continue immediately to create overlap or cross a progress barrier
+        ↓
+classify, preserve, and attempt to reduce any failure
+```
+
+Illustrative command:
+
+```sh
+rgv-interaction-stress generate --attach control.json --seed 184467 --actions 500 --profile aggressive
+```
+
+On clean completion, the expansion journal is compiled atomically into `scenario.expanded.json`.
+The expanded scenario, not the seed alone, is the replay authority. Runtime state and OS scheduling
+can influence which state-aware action is selected even when pseudorandom generation is stable.
+
+## 5. Architecture
+
+### 5.1 Components
+
+The framework consists of four cooperating components:
+
+1. **Rust stress controller**
+   - parses scenarios and recordings;
+   - submits existing `AutomationBatch` values for setup and observation;
+   - queries semantic targets and health;
+   - schedules native gestures;
+   - generates scenarios, evaluates assertions, writes artifacts, and reduces failures.
+
+2. **Small Swift macOS input driver**
+   - accepts a narrow versioned stream of compiled native event instructions;
+   - verifies the target PID and window;
+   - posts Core Graphics events to that PID;
+   - performs explicit Accessibility operations only for window discovery, focus, and resize;
+   - reports attempted post time, result, and safety state for every instruction.
+
+3. **RGV input observer/recorder**
+   - observes real `WindowEvent` and relevant `DeviceEvent` values around the existing input
+     decisions in `runtime.rs`;
+   - resolves semantic targets against the authoritative workspace layout;
+   - records egui consumption, viewer acceptance, interaction transitions, and semantic outcome;
+   - never accepts synthetic replay by directly mutating viewer state.
+
+4. **Existing RGV automation/control service**
+   - owns setup commands, workspace snapshots, captures, trace control, and semantic state;
+   - exposes a minimal atomic health snapshot independently of UI command execution;
+   - remains opt-in, loopback-only, authenticated, and rooted to an allowed artifact directory.
+
+The Swift helper avoids introducing unsafe macOS FFI into Rust crates, whose workspace policy
+forbids unsafe code. It builds with Swift Package Manager and Command Line Tools; full Xcode is not
+required. The development host currently has Swift 6.1.2 Command Line Tools but no full Xcode,
+which is another reason not to make XCUITest part of this plan.
+
+### 5.2 Native execution sequence
+
+For each gesture step, the controller:
+
+1. verifies the application instance ID and PID through local control;
+2. requests a fresh workspace layout and checks required state;
+3. asks the macOS driver for the selected process window's current global bounds;
+4. resolves the semantic target into global coordinates and records the layout revision;
+5. opens an RGV observation scope carrying the run ID and step ID;
+6. sends the compiled primitive event schedule to the driver;
+7. receives driver acknowledgements while polling external health;
+8. closes the observation scope and obtains RGV's native receipt/lifecycle summary;
+9. checks routing, target, semantic, invariant, and liveness assertions; and
+10. writes the step result before proceeding.
+
+Target or window geometry is refreshed at every gesture boundary. If it changes during a gesture
+when the step did not request a resize, the run aborts that gesture with a typed
+`target_geometry_changed` result rather than posting to an uncertain location.
+
+### 5.3 No in-app replay driver
+
+The earlier proposal routed replay into a post-egui viewer reducer. That would provide a fast test
+level, but it would not meet the selected goal of exercising actual macOS routing and would require
+a large production input refactor before the framework found its first bug.
+
+This plan therefore performs end-to-end replay only through the external native driver. Small pure
+functions extracted while making input decisions observable receive ordinary unit tests, but they
+are not presented as an alternative qualification driver.
+
+## 6. Scenario and recording schemas
+
+### 6.1 One orchestration layer over existing commands
+
+Add a versioned `InteractionStressScenario` type in `rgv-core`. It is a thin orchestration document,
+not a replacement for `AutomationBatch`:
+
+- semantic setup and inspection steps contain existing `AutomationCommand` values;
+- native steps contain semantic targets and primitive event schedules;
+- barriers and assertions operate on existing automation snapshots plus the new health/input
+  observation records; and
+- generated blocks are expanded into ordinary steps before or during execution.
+
+The controller submits only the embedded command portions to the current `/v1/batches` endpoint.
+The RGV process never receives an instruction to fabricate a native event.
+
+Representative shape:
+
+```json
+{
+  "schema": "rgv.interaction_stress",
+  "schema_version": 1,
+  "name": "vertical-scroll-reversal",
+  "requirements": {
+    "fixture": "mf-01-core-alignments",
+    "window_logical_size": [1280, 800]
+  },
+  "steps": [
+    {
+      "type": "control",
+      "commands": [
+        { "command": "goto", "loci": ["chr1:900001-920000"] },
+        { "command": "wait_until_settled", "timeout_millis": 120000 }
+      ]
+    },
+    {
+      "type": "gesture",
+      "id": "scroll-1",
+      "target": {
+        "kind": "read_scrollbar",
+        "panel_id": 1,
+        "track_id": 1
+      },
+      "timing": { "mode": "recorded" },
+      "events": [
+        { "at_micros": 0, "event": "move", "x": 0.5, "y": 0.1 },
+        { "at_micros": 1000, "event": "primary_down" },
+        { "at_micros": 180000, "event": "drag", "x": 0.5, "y": 0.9 },
+        { "at_micros": 260000, "event": "drag", "x": 0.5, "y": 0.2 },
+        { "at_micros": 270000, "event": "primary_up" }
+      ]
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "gesture_terminated", "step_id": "scroll-1" }
+    }
+  ],
+  "limits": {
+    "maximum_duration_millis": 300000,
+    "maximum_native_events": 100000
+  }
+}
+```
+
+The exact Rust representation must use bounded typed enums rather than accepting arbitrary event
+or assertion objects.
+
+### 6.2 Step types
+
+The initial schema supports:
+
+- `control`: one short existing automation batch;
+- `gesture`: target plus compiled pointer/scroll/key primitives;
+- `barrier`: a typed semantic or progress predicate with an outer deadline;
+- `assert`: an immediate typed predicate;
+- `checkpoint`: persist state, health, recording position, and optional diagnostic capture;
+- `generated`: a bounded generator specification; and
+- `repeat`: a bounded repetition expanded into explicit steps in the run artifact.
+
+No-wait behavior is expressed explicitly: a gesture may proceed directly into the next step while
+source/render work remains active. A barrier is inserted only when the scenario requires a
+particular state or authority.
+
+### 6.3 Semantic targets
+
+Initial target kinds are:
+
+- RGV window;
+- genomic canvas by panel;
+- read canvas by panel and track;
+- read scrollbar by panel and track;
+- track gutter/header by track;
+- overview and ruler by panel;
+- pane content/header by stable pane identity; and
+- a supported control by stable accessibility identifier.
+
+Coordinates are target-relative fractions. Values outside `[0, 1]` are allowed only for an
+explicit bounded `drag_outside` path. The recording retains original physical and logical
+coordinates as evidence, but converted scenarios prefer target-relative coordinates.
+
+When no stable semantic or accessibility target exists, conversion may emit a normalized window
+coordinate with a required window size and mark the step `fragile_target`. Generated scenarios may
+not choose fragile targets.
+
+### 6.4 Timing and reproducibility
+
+Supported delivery modes are:
+
+- `recorded`: preserve observed inter-event cadence;
+- `scaled`: multiply recorded cadence by a bounded factor;
+- `maximum_rate`: post the next event as soon as the driver accepts it; and
+- `seeded_jitter`: perturb a base cadence with fully recorded seeded choices.
+
+Reproducibility means:
+
+- a saved expanded scenario contains the exact event intent and chosen timing;
+- the driver log contains actual post timestamps;
+- the RGV journal contains actual receipt timestamps and accepted event structure; and
+- all differences between requested, posted, received, and applied input are visible.
+
+It does not mean macOS will coalesce or schedule events identically on every run.
+
+## 7. Native interaction recording
+
+### 7.1 Recorded evidence
+
+Recording starts only through an explicit authenticated command and captures:
+
+- run/session ID, application instance ID, process ID, build, scale, and window geometry;
+- initial workspace state and source/session/fixture fingerprints;
+- monotonic sequence number and receipt time;
+- native event class and supported payload;
+- physical and logical pointer positions;
+- button, modifiers, wheel units/deltas/phases, and raw motion where delivered;
+- current layout revision and resolved semantic target;
+- egui-consumed and viewer-accepted decisions;
+- interaction begin/advance/release/cancel transitions and correlation ID;
+- focus, resize, and scale changes;
+- semantic state checkpoints at gesture boundaries; and
+- unsupported/non-convertible events with an explicit reason.
+
+Sensitive source paths and credentials follow the existing automation redaction rules. A local
+recording may refer to an explicit fixture ID; a checked-in scenario may not depend on a private
+absolute path. Keyboard input is persisted only for recognized, non-sensitive RGV controls by
+default. Text sent to an unknown or sensitive field is recorded as redacted and non-convertible
+unless the user explicitly enables text capture for that recording.
+
+### 7.2 Runtime integration
+
+Refactor the large native-input match in `runtime.rs` only enough to make decisions observable:
+
+- capture immutable pre-event context;
+- execute the existing native handler exactly once;
+- return a bounded `NativeInputObservation` describing target and outcome; and
+- send that observation to the recorder when enabled.
+
+The refactor must not introduce a second mutation path or change event ordering. Native behavior
+before and after extraction is covered by focused unit/state-machine tests.
+
+### 7.3 Streaming and completeness
+
+The existing diagnostic ring cannot be the replay source because it overwrites old events.
+Interaction recording therefore writes ordered JSON Lines through a bounded background writer to
+`*.partial.jsonl` and atomically finalises it on clean stop.
+
+Rules under pressure:
+
+- press, release, cancellation, focus changes, phase transitions, direction reversals, target
+  changes, and checkpoints are structural and may never be silently discarded;
+- redundant adjacent motion may be coalesced only when target, held state, direction, and semantic
+  outcome are unchanged;
+- if the writer cannot preserve a structural record without blocking the UI, mark the recording
+  incomplete and stop accepting further replay claims; and
+- a crash or stall retains the partial file and its last durable sequence number.
+
+### 7.4 Conversion
+
+The converter groups events into interaction lifecycles, maps physical coordinates to semantic
+targets, normalises paths, and emits a scenario plus a conversion report. It rejects or flags:
+
+- missing press/release or focus-cancel structure;
+- unexplained sequence gaps;
+- unsupported event classes;
+- target identity changes that cannot be represented safely;
+- source/session prerequisites without a portable fixture mapping; and
+- recordings already marked incomplete.
+
+Conversion never silently repairs an invalid recording. A user may explicitly accept a
+`fragile_target` or edit a generated scenario before replay.
+
+## 8. macOS native input driver
+
+### 8.1 Process and window targeting
+
+The driver accepts only an explicit PID supplied by the authenticated controller. Before input it
+validates:
+
+- the PID is still alive;
+- the control service reports the same application instance ID and PID;
+- the process is RGV, with bundle identity checked when running a packaged build;
+- exactly one selected RGV window matches the expected bounds; and
+- Accessibility/event-posting permissions are available.
+
+The driver discovers the target window and translates target-local coordinates to global desktop
+coordinates immediately before each gesture. It does not use absolute coordinates stored in the
+scenario as the primary target.
+
+### 8.2 Event coverage
+
+The first complete driver supports:
+
+- pointer move;
+- primary and secondary down/drag/up;
+- held drags with reversals and out-of-target motion;
+- line and pixel scroll events;
+- continuous scroll, scroll phase, and momentum-phase fields supported by Core Graphics;
+- modifiers and bounded keyboard sequences;
+- RGV focus loss/gain through a driver-owned focus-sentinel window and explicit process
+  reactivation; and
+- explicit window resize through the selected Accessibility window.
+
+Core Graphics provides
+[`CGEventPostToPid`](https://developer.apple.com/documentation/coregraphics/cgevent/posttopid%28_%3A%29)
+and typed [scroll phase and continuity fields](https://developer.apple.com/documentation/coregraphics/cgeventfield),
+so one small native driver is sufficient for the selected local stress scope. XCUITest would add a
+second orchestration stack without adding a required confidence claim.
+
+### 8.3 Safety
+
+- Never post an event without a validated PID, application instance, window, run ID, and step ID.
+- Use PID-targeted posting; do not post globally as a fallback.
+- Require exclusive interaction with the selected RGV window during replay; abort on native input
+  that cannot be matched structurally to the active driver step.
+- Bound every run by event count, wall-clock duration, coordinate extent, and held-button duration.
+- On controller cancellation or driver error, attempt the matching button/key releases before
+  exit and record whether cleanup succeeded.
+- Provide immediate terminal cancellation independent of the RGV UI thread.
+- Pause if the selected window moves, resizes, disappears, or loses the required identity.
+- Restore the pointer position when practical and record whether it was restored.
+- Refuse to run without the required macOS permissions; never attempt to bypass them.
+
+The driver protocol is intentionally narrow and versioned. The Rust controller remains responsible
+for scenario semantics; Swift receives only validated primitive event instructions and returns
+delivery acknowledgements.
+
+## 9. State-aware scenario generation
+
+### 9.1 Generator model
+
+The generator selects only actions valid for the current `AutomationWorkspaceSnapshot` and current
+interaction state. Its model includes:
+
+- available panels, tracks, panes, canvases, scrollbars, and supported controls;
+- active panel/track and current loci;
+- settled versus pending generations;
+- active pointer/scroll capture;
+- track visibility and scrollability;
+- current focus and window geometry; and
+- configured run limits and already exercised transition classes.
+
+Every choice derives from an explicit seed and is appended durably to a partial JSONL expansion
+journal before its events are posted. Hidden randomness in either RGV or the controller is not a
+reproducibility mechanism.
+
+### 9.2 Initial action grammar
+
+- canvas pan, hold, slow drag, fast drag, and rapid reversal;
+- vertical scrollbar top/middle/bottom traversal and reversal;
+- vertical wheel/trackpad-like scrolling over valid targets;
+- zoom bursts and zoom-direction reversal;
+- a new gesture while source or render work remains pending;
+- locus changes interleaved with unresolved gestures or work;
+- release outside the original target;
+- focus loss during a held interaction;
+- resize between or during bounded interaction sequences;
+- switching active panels and tracks;
+- right-click/open/dismiss on supported targets; and
+- bounded repetitions and pairwise action combinations.
+
+Semantic automation commands may establish a complex starting workspace efficiently. Generated
+actions intended to test interaction routing must still use native events.
+
+### 9.3 Profiles and coverage
+
+Initial profiles are:
+
+- `smoke`: short, conservative cadence and one action from each available class;
+- `recording_mutation`: mutate paths, timing, repetitions, and interleavings from a recording;
+- `aggressive`: reversals, maximum-rate bursts, focus/resize disruption, and no-wait overlap; and
+- `soak`: bounded long duration with weighted state transitions and periodic checkpoints.
+
+The run reports action classes, targets, transition pairs, overlap depth, event rates, pending-work
+states, and failure-free iterations. Early generation is state- and coverage-aware, not code
+coverage-guided. A future corpus-guided mutator is permitted only after the basic generator yields
+actionable failures.
+
+## 10. Oracles and watchdogs
+
+### 10.1 Native-routing oracle
+
+For every gesture the run correlates:
+
+- controller instruction sequence;
+- Swift driver post acknowledgements;
+- RGV native event receipts;
+- resolved target and consumption decision; and
+- interaction state transitions.
+
+Mouse-move coalescing may reduce one-to-one receipt counts, so the oracle compares required
+structure rather than exact counts: down precedes held motion, required reversals are observed,
+phase boundaries are preserved where supported, and every held input terminates. Missing required
+structure is `native_event_missing` or `native_event_shape_mismatch`, not a semantic application
+failure.
+
+### 10.2 Semantic and interaction oracles
+
+Initial typed predicates include:
+
+- expected panel, track, target, locus, viewport relation, or scroll relation;
+- accepted input changed the intended control state when authority permitted;
+- current desired generations eventually committed or reached a typed terminal state;
+- no stale generation published as current;
+- pointer, scroll, menu, or focus capture ended correctly;
+- no active interaction survived release, cancellation, focus loss, or target destruction;
+- no critical/invariant failure occurred; and
+- a step declared as intentionally overlapping work did not accidentally wait for settlement.
+
+Feature plans may add typed predicates over existing automation snapshots. They must not put cache,
+renderer, or biological policy into the generic generator.
+
+### 10.3 Health channel
+
+Add an authenticated health endpoint served by the existing control-service thread without waiting
+for an automation batch or the UI event loop. Its bounded atomic snapshot contains at least:
+
+- process and application instance identity;
+- UI/event-loop heartbeat sequence and last monotonic update;
+- native input receipt sequence;
+- frame/presentation sequence;
+- desired and committed workspace/scene generation counters;
+- source/worker progress sequence and last update;
+- active interaction ID and state code;
+- latest terminal/invariant failure code; and
+- recording writer state and last durable sequence.
+
+The endpoint may return a slightly stale but internally versioned snapshot. It must never acquire a
+lock owned by the UI or a source/render worker.
+
+The source/worker progress sequence advances at bounded phase boundaries: request dequeue, source
+work entry/return, fetch/decode progress, scene preparation, GPU preparation, and publication or
+terminal cancellation/failure. Corresponding diagnostic begin/end events carry the current owner
+and generation. This is enough to distinguish no progress from expensive progress without putting
+unbounded worker detail in the health endpoint.
+
+### 10.4 Failure classification
+
+The external watchdog distinguishes:
+
+- `process_exit`: the target process ended;
+- `ui_stall`: control health responds but UI heartbeat stops;
+- `pipeline_stall`: UI advances while current desired work makes no source/render/publication
+  progress and neither settles nor fails;
+- `progress_churn`: counters advance but current desired authority cannot commit;
+- `native_event_missing` or `native_event_shape_mismatch`;
+- `extraneous_native_input` when replay cannot distinguish the expected stream from concurrent
+  interaction;
+- `interaction_lock`: input arrives but the intended interaction cannot advance or terminate;
+- `semantic_mismatch`;
+- `critical_invariant`;
+- `target_geometry_changed`;
+- `recording_incomplete`; and
+- `driver_failure` or `permission_failure`.
+
+Progress predicates are primary. Every wait still has a generous outer deadline so a defective run
+cannot continue indefinitely.
+
+## 11. Run artifacts and diagnostic capture
+
+Each run writes one directory:
+
+```text
+stress-run.json
+scenario.input.json
+scenario.expanded.json
+scenario-expansion.partial.jsonl   # retained after interruption during online generation
+controller-events.jsonl
+driver-events.jsonl
+app-input-events.jsonl
+health.jsonl
+automation/
+  batch-*.json
+  report-*.json
+recording/
+  source.jsonl                 # when the run originated from recording
+diagnostics/
+  trace.json                   # when available
+  process-sample.txt           # on a detected stall
+  failure-window.png           # evidence only
+reduction/
+  candidate-*.json
+  minimized.json
+```
+
+`stress-run.json` is a thin aggregate manifest. It references, rather than duplicates, existing
+automation reports and contains:
+
+- run ID, scenario schema, seed, profile, and source recording ID;
+- application build/commit/dirty fingerprint and controller/driver versions;
+- macOS, hardware, display scale, window geometry, and requested limits;
+- source/session/fixture fingerprints with existing redaction rules;
+- requested, posted, received, applied, coalesced, and rejected event counts;
+- assertion results and typed failure signature;
+- process, controller, driver, and recorder exit states; and
+- checksums and completeness state for every referenced artifact.
+
+The manifest is created as `running` before the first mutation. It is atomically finalised as
+`passed`, `failed`, `cancelled`, or `incomplete`. A crash must not make a partial run look passed.
 
 On failure:
 
-- if the UI responds, freeze/export trace and capture the composed frame;
-- if the control service responds but UI does not, record heartbeat, process sample, RSS, and logs;
-- if the process exits, preserve its partial manifest, journal, controller log, and exit status; and
-- never wait indefinitely for the application to serialize an artifact after a proven UI stall.
+- stop native delivery and release held state;
+- freeze and save the existing diagnostic trace if the UI/control path responds;
+- request the existing native-window snapshot as diagnostic evidence, not an oracle;
+- sample the process externally when the UI is stalled;
+- preserve journal, driver, controller, health, and partial manifest without waiting for the UI;
+  and
+- begin reduction only after the original artifacts are durable.
 
-## 13. Oracles and assertions
+## 12. Failure reduction
 
-### 13.1 Semantic oracles
+Reduction operates on the fully expanded scenario, not on a seed or unexpanded generator block. It
+attempts, in order:
 
-- desired and committed generations agree after settlement;
-- every current request has an owner or typed terminal state;
-- expected tracks/panels/loci and exact data products are present;
-- selection, history, settings, and interaction state match the scenario;
-- no stale generation publishes; and
-- no critical or invariant failure occurs.
+1. remove action ranges while preserving prerequisites;
+2. remove individual actions;
+3. shorten repetitions and gesture paths;
+4. remove intermediate motion samples while preserving reversals and phases;
+5. simplify timing, overlap, and jitter;
+6. remove irrelevant panels, tracks, options, and setup commands; and
+7. reduce generated parameter choices.
 
-Feature-specific plans provide domain assertions such as exact read count, cache headroom, row
-authority, variant truth, or annotation selection. The automation framework carries and reports
-these assertions without hard-coding their policy.
+A candidate preserves a failure only when its typed signature matches the original class and
+required target/owner identity. Because native scheduling is statistical, the controller records
+attempts and successes and uses a configurable reproduction threshold. It never labels a
+non-reproducing candidate as minimized merely because one attempt timed out differently.
 
-### 13.2 Liveness oracles
+The original failure remains authoritative even if automatic reduction finds no smaller stable
+case.
 
-- UI heartbeat advances during active work;
-- a current owner advances phase/progress, yields, settles, cancels, or fails truthfully;
-- accepted input changes its intended camera/control state when authority permits;
-- pointer capture terminates on release, cancellation, focus loss, or target destruction;
-- no orphan navigation/reclaim/publication transaction remains; and
-- `Updating view…` cannot persist without an identifiable current owner and progress.
-
-### 13.3 Performance evidence
-
-Record distributions rather than a single elapsed time:
-
-- input-to-camera and input-to-visible-update latency;
-- worker phase durations;
-- stale cancellation latency;
-- preparations, replacements, publications, and retries per gesture;
-- frame work and hitch distribution;
-- cache/ledger charge and process RSS; and
-- fresh-versus-carry-over comparisons on the same build and hardware.
-
-Plans consuming the framework define their structural and relative thresholds. The framework must
-not silently invent universal product latency figures.
-
-### 13.4 Bounded visual oracles
-
-Use internal composed-frame captures at before, held, and after points. Machine checks may include:
-
-- unexpected full-region blank/white ratio;
-- disappearance of a lane expected to remain committed;
-- stale pixels outside a permitted transition region;
-- missing accessibility controls; and
-- gross geometry or clipping violations.
-
-Use region masks and tolerances, not exact whole-screen hashes across fonts, DPI, and GPU drivers.
-XCUITest screenshots support native chrome and routing evidence. They do not replace internal GPU
-captures or user visual assessment.
-
-## 14. Trace-derived initial scenario
-
-The first checked-in scenario reproduces the motivating alignment workload without embedding a
-cache fix in the harness.
-
-### 14.1 Setup
-
-1. Launch the release application with the recorded 4 GiB total cache and 400% browsing-buffer
-   settings.
-2. Load the local RNA BAM and matching reference/annotation session by fingerprint.
-3. Navigate to BAP1 `chr3:52253682-52257430` and execute the preserved browsing setup.
-4. Navigate to ACTB `chr7:5527146-5530709` and wait for exact row authority.
-
-### 14.2 Recorded ACTB interaction
-
-Replay normalized vertical thumb paths using the recorded timing curves:
-
-1. 0% → 46.5% over 2.334 s;
-2. 46.5% → 75.6% over 1.295 s;
-3. 75.4% → 100% → 19.7% over 5.153 s;
-4. 19.7% → 0% over 1.499 s;
-5. 0% → 27.9% → 0% over 2.269 s;
-6. 0% → 100% over 2.569 s;
-7. 100% → 0% over 3.487 s; and
-8. 0% → 69.9% → 0% over 3.886 s.
-
-Then perform two horizontal overview gestures expanding the viewport to approximately
-`chr7:5395882-5699754`.
-
-### 14.3 Pre-fix preservation
-
-Before the cache remediation, preserve reports showing the observed cache pressure, replacement
-amplification, no-progress signature, or other reproduced failure. The exact 43-second stall may be
-scheduling-sensitive. Classify by semantic signature rather than requiring identical wall time and
-retain every seed and run outcome.
-
-### 14.4 Framework assertions
-
-The scenario asserts only framework-level facts directly:
-
-- delivered interaction matches the compiled gesture sequence;
-- the intended control receives and terminates each gesture;
-- trace, journal, heartbeat, captures, and state artifacts are complete;
-- a stall or critical failure is detected and classified; and
-- a completed run reaches the final requested viewport or reports its typed outcome.
-
-Cache, residency, and vertical-navigation correctness criteria belong to the separate cache-liveness
-plan and are referenced by scenario assertion IDs.
-
-## 15. Seeded stress and failure reduction
-
-Build a state-aware generator over valid interaction states. Initial actions include:
-
-- locus and contig navigation;
-- vertical top/middle/bottom reversals;
-- horizontal pan reversals;
-- zoom before settlement;
-- release while work is pending;
-- focus loss/cancel during a drag;
-- resize and scale changes;
-- filter, sort, grouping, and appearance changes;
-- multi-panel and multi-track activation;
-- context-menu and mate-navigation operations; and
-- configurable data/settings matrices supplied by consuming plans.
-
-The generator records its expanded script. It cannot depend on hidden randomness inside the app.
-
-On failure, delta-debug:
-
-- action list;
-- gesture paths and control points;
-- repetition counts;
-- durations, pauses, and cadence;
-- setup operations;
-- panels/tracks; and
-- parameter matrices.
-
-Reduction preserves a typed failure signature such as current-owner no-progress, scrollbar input
-lock, stale publication, critical invariant, blank committed region, or process exit. Re-run the
-minimized scenario deterministically, then several times with native drivers because OS scheduling
-remains statistical.
-
-## 16. Repository structure
-
-Suggested structure:
+## 13. Proposed repository structure
 
 ```text
-validation/interaction-stress/
-  README.md
-  scenarios/
-  expected/
-  reports/
-
-tools/interaction-stress/
-  controller/
-  macos-xcuitest/
-  macos-cgevent-driver/
-
-apps/rgv-desktop/src/automation/
-  gesture_script.rs
-  gesture_runner.rs
-  artifact_writer.rs
-
+crates/rgv-control-client/
+  src/lib.rs                         # shared authenticated client used by MCP and stress controller
 crates/rgv-core/src/
-  automation.rs
-  viewer_input.rs
+  interaction_stress.rs             # scenario, recording, predicate, failure, and manifest types
+apps/rgv-desktop/src/
+  input_dispatch.rs                 # observable native input decisions; no synthetic injection
+  interaction_recording.rs          # compact streaming recorder
+  stress_health.rs                  # lock-independent health publication
+tools/interaction-stress/
+  Cargo.toml
+  src/                              # Rust controller, converter, generator, oracle, reducer
+  macos-driver/
+    Package.swift
+    Sources/                        # narrow Swift Core Graphics/Accessibility driver
+    Tests/
+validation/interaction-stress/
+  scenarios/
+  recordings/
+  expected-failures/
+  README.md
+docs/
+  INTERACTION_STRESS.md
 ```
 
-Exact placement may follow existing module conventions. Shared schemas belong in a non-UI crate.
-Native macOS drivers remain tools and cannot become production runtime dependencies.
+Exact module names may follow the modularisation work, but ownership does not change:
 
-## 17. Implementation phases and gates
+- portable serializable types live in `rgv-core`;
+- authenticated HTTP client behavior is shared rather than copied from `rgv-mcp`;
+- native event decisions and observations stay in `rgv-desktop`;
+- macOS APIs stay in the development-only driver; and
+- scenarios and retained failure cases live under validation.
 
-### Phase 0 — Preserve evidence and define schemas
+## 14. Implementation phases and gates
 
-Deliverables:
-
-- checked-in trace analysis and failure signatures;
-- run-artifact manifest schema;
-- compact action-journal schema;
-- gesture-script schema;
-- heartbeat/progress schema; and
-- the initial trace-derived scenario specification.
-
-Gate: schemas distinguish input, semantic state, liveness, performance evidence, visual artifacts,
-and human review without embedding the motivating cache solution.
-
-### Phase 1 — Complete observability
+### Phase 0 — Contracts and controller skeleton
 
 Deliverables:
 
-- compact asynchronous action journal;
-- worker phase spans;
-- typed trace-control commands;
-- atomic heartbeat/progress status;
-- watchdog capture and partial-run recovery; and
-- overhead/correlation tests.
+- `InteractionStressScenario`, recording, target, assertion, health, failure, and manifest schemas;
+- explicit bounds and backward-compatibility tests for every schema;
+- shared extraction of the current MCP/control client transport;
+- Rust controller CLI with attach, identity validation, run directory, and short control batches;
+- Swift Package skeleton with permission preflight and PID/window verification; and
+- documentation of the requested/posted/received/applied evidence model.
 
-Gate: a manual repeat produces a complete action journal and identifies any long-running worker
-phase without materially changing interaction behavior.
+Gate: a controller attaches to one visible RGV instance, validates identity, queries the current
+control status and workspace state, and creates a truthful empty run artifact without a second
+control protocol.
 
-### Phase 2 — Deterministic viewer-input replay
-
-Deliverables:
-
-- typed `ViewerInput` dispatcher;
-- native adapter and shared viewer reducer;
-- gesture compiler and event-loop runner;
-- semantic barriers/assertions;
-- composed held-frame capture; and
-- reproducible run artifacts.
-
-Gate: the trace-derived sequence runs through the same viewer reducer as native input without direct
-camera mutation.
-
-### Phase 3 — Scenario conversion and reduction
+### Phase 1 — Complete native recording
 
 Deliverables:
 
-- journal-to-script converter;
-- seeded state-aware generator;
-- typed failure signatures;
-- deterministic delta-debugger; and
-- regression scenario catalog.
+- observable native input handling around the existing runtime decisions;
+- compact asynchronous JSONL recording with explicit completeness state;
+- recording start/status/stop commands on the existing automation schema;
+- target resolution and gesture lifecycle correlation;
+- initial-state and gesture-boundary semantic checkpoints; and
+- recording-to-scenario conversion with fragile/unsupported diagnostics.
 
-Gate: a long failing run can be converted and reduced while preserving its semantic failure class.
+Gate: an ordinary manual session containing a canvas drag, scrollbar reversal, scroll/zoom, focus
+change, and resize produces a complete journal and an inspectable scenario without relying on the
+bounded diagnostic ring.
 
-### Phase 4 — Packaged macOS XCUITest
-
-Deliverables:
-
-- stable AccessKit identifiers;
-- accessibility-tree regression tests;
-- independent XCUITest project;
-- staged-app launch configuration;
-- element-relative native gesture execution; and
-- native screenshot/artifact attachment.
-
-Gate: core scenarios run against the packaged app and prove ordinary accessibility/AppKit/winit
-routing. Full Xcode availability is required for this phase.
-
-### Phase 5 — High-rate native stress
+### Phase 2 — Native replay and routing proof
 
 Deliverables:
 
-- PID-targeted Core Graphics driver;
-- Accessibility target discovery;
-- momentum, reversal, focus, and held-drag sequences;
-- dedicated-host permission/setup documentation;
-- emergency cancellation; and
-- repeated native-run classification.
+- Swift Core Graphics pointer, scroll, modifier, and key delivery;
+- Accessibility window discovery, focus, and resize;
+- semantic-to-global coordinate resolution refreshed per gesture;
+- driver/app correlation and native-routing assertions;
+- atomic authenticated health publication plus process/UI/native-input watchdogs;
+- recorded, scaled, maximum-rate, and seeded-jitter timing;
+- emergency release/cancellation and all safety bounds; and
+- aggregate artifacts plus failure-time trace/capture/process sampling.
 
-Gate: minimized scenarios can be stressed at controlled high cadence without global untargeted
-input or an unbounded run.
+Gate: the Phase 1 scenario replays into a visible RGV process through macOS, RGV confirms the
+required native event structure and lifecycle, and basic semantic/liveness assertions pass.
 
-### Phase 6 — Qualification integration
+### Phase 3 — State-aware generation
 
 Deliverables:
 
-- reusable assertion plug-in/schema for feature plans;
-- release-run matrix support;
-- artifact summarisation and comparison;
-- CI/local/nightly execution profiles;
-- documented manual visual handoff; and
-- the cache-liveness scenario fully integrated as the first consuming plan.
+- live generator state model;
+- initial action grammar and smoke/aggressive/soak profiles;
+- durable online expansion before event delivery;
+- no-wait overlap and progress barriers;
+- action/target/transition coverage reporting; and
+- mutation of recorded scenarios.
 
-Gate: a consuming plan can declare its scenarios and semantic assertions without adding a new GUI
-driver or bespoke artifact format.
+Gate: identical saved expanded scenarios replay identically at the intent level, different seeds
+exercise meaningfully different valid action sequences, and a bounded generated run completes or
+fails with a typed, actionable classification.
 
-## 18. Qualification matrix
+### Phase 4 — Watchdogs and reduction
 
-### 18.1 Mechanical tests
+Deliverables:
 
-- schema validation and backward compatibility;
-- action-journal ordering and coalescing;
-- identical native/replay viewer-reducer decisions;
-- press/move/reversal/release/focus-cancel state machines;
-- event-loop scheduling and cancellation;
-- trace/journal/status correlation;
-- heartbeat classification;
-- artifact atomicity and partial-run preservation;
-- semantic target resolution after resize/split panels;
-- driver capability labelling; and
-- deterministic generation and reduction.
+- deeper pipeline, churn, routing, and interaction classifiers using the Phase 2 health stream;
+- bounded source/worker phase progress instrumentation and correlated diagnostic spans;
+- controller-side deadline and cancellation handling independent of the UI;
+- failure-signature-preserving reducer with repeated native trials; and
+- recovery tests for blocked, crashed, cancelled, and partially written runs.
 
-### 18.2 Release integration
+Gate: controlled test doubles for each failure class are classified correctly, their partial
+artifacts remain readable, and at least one deliberately verbose failing scenario is reduced while
+preserving its signature.
 
-- held canvas pan with capture before, during, and after release;
-- wheel zoom burst and reversal;
-- fast read-scrollbar drag then pause;
-- vertical wheel scrolling;
-- locus and contig switching;
-- resize/focus loss while work is pending;
-- multi-panel and multi-track interaction;
-- context-menu selection and dismissal;
-- mate navigation and history; and
-- feature-specific scenarios registered by other plans.
+### Phase 5 — Scenario corpus and first real consumers
 
-### 18.3 Native qualification
+Deliverables:
 
-- packaged-app XCUITest on the supported macOS configuration;
-- high-rate Core Graphics stress on a dedicated interactive host;
-- repeated minimized failures;
-- long seeded soak runs;
-- process sample/profile capture for detected stalls; and
-- user visual review after automated semantic/liveness gates pass.
+- generic record/replay round-trip scenario;
+- generated pan/zoom/scroll/focus/resize stress scenario;
+- documented local smoke and soak commands;
+- conversion of the retained BAP1→ACTB interaction into the generic schema;
+- cache-liveness assertions supplied by the consuming cache plan; and
+- retained minimized regressions discovered by subsequent stress runs.
 
-## 19. Human visual gate
+Gate: the framework works without knowledge of ACTB, then runs the BAP1→ACTB workload as a normal
+consumer and preserves any observed failure in the same artifact and reduction pipeline.
 
-The framework must explicitly prompt the user when a consuming plan reaches visual qualification.
-Provide:
+## 15. Verification strategy
 
-- the build and session to launch;
-- the scenario and expected behavior;
-- the automated results already passed;
-- controls/actions the user should perform if free browsing is required;
-- the artifact location; and
-- a short list of perceptual questions.
+### 15.1 Mechanical tests
 
-Do not automate mouse control and then infer that a brief screenshot proves continuous behavior.
-Human assessment remains required for flicker, motion continuity, read legibility, substitutions,
-chevrons, insertion rendering, Sashimi, hover, selection, and overall browsing feel.
+- scenario/recording/manifest schema validation, size limits, and version compatibility;
+- automation command embedding without a duplicate command representation;
+- recording sequence ordering, structural-event preservation, coalescing, and incomplete status;
+- target resolution across panel/track changes, window scale, and resize;
+- coordinate conversion between RGV logical, physical window, and global macOS spaces;
+- native input decision equivalence before and after runtime extraction;
+- press/held/reversal/release/cancel state machines;
+- generator determinism, validity, bounds, and durable expansion;
+- assertion and failure classifier tables;
+- watchdog behavior over synthetic health streams;
+- manifest atomicity and partial-run recovery;
+- reduction dependency preservation; and
+- Swift driver protocol parsing, limits, validation, and emergency-release behavior.
 
-## 20. Definition of done
+### 15.2 Local native integration
 
-This plan is complete only when all of the following are true:
+- attach only to the intended RGV instance;
+- refuse stale PID/instance/window combinations;
+- record and replay canvas pan with multiple reversals;
+- record and replay fast read-scrollbar travel;
+- scroll and zoom with line, pixel, continuous, and phase metadata;
+- release outside a target;
+- lose focus during a held interaction;
+- resize between and during scheduled work;
+- overlap a new gesture with unresolved source/render work;
+- cancel a run while a button is held;
+- preserve artifacts after application exit or UI stall; and
+- verify driver-post versus RGV-receipt evidence for every supported primitive.
 
-1. Manual native interaction produces a complete compact action journal.
-2. A journal can be converted into an inspectable resolution-independent gesture script.
-3. Deterministic replay uses the same viewer-input reducer as native events.
-4. Replay can hold, move, reverse, capture, release, cancel, resize, and change focus.
-5. A controller can start RGV, start tracing, replay gestures, detect stalls, save artifacts, and
-   exit without manual intervention.
-6. Worker phase spans make every long-running current request attributable.
-7. The compact action journal survives verbose trace-ring overwrite.
-8. Heartbeat and watchdog distinguish UI stall, pipeline stall, input lock, and progress churn.
-9. Failures preserve partial artifacts and a typed signature.
-10. Seeded stress runs are reproducible and automatically reduced.
-11. Stable accessibility identifiers support split panels and tracks without exposing reads as
-    millions of accessibility nodes.
-12. XCUITest drives the staged packaged app through ordinary native interactions.
-13. The PID-targeted driver performs bounded high-rate stress on an authorised test host.
-14. Deterministic and native drivers use the same script and artifact vocabularies while reporting
-    their different fidelity.
-15. The trace-derived BAP1→ACTB scenario runs end to end and supplies evidence to its consuming
-    cache-liveness plan.
-16. Other feature plans can register scenarios and assertions without bespoke GUI automation.
-17. Automated captures are treated as supporting evidence, not automatic visual acceptance.
-18. The user is prompted for and completes the required final visual reviews.
+These end-to-end tests require an interactive local macOS session and pre-authorised permissions.
+They are not silently added to generic CI.
 
-## 21. Explicit non-solutions
+### 15.3 Framework overhead
+
+Measure native interaction with recording disabled and enabled. The acceptance report includes:
+
+- UI time spent constructing observations;
+- recorder queue high-water mark and coalesced motion count;
+- event-to-visible-update latency distribution;
+- frame-time distribution; and
+- output bytes per input event and per minute.
+
+No universal product latency threshold is invented here. The gate is that recording does not cause
+the interaction failure it is intended to observe, does not block the UI, and reports any evidence
+loss truthfully.
+
+## 16. Initial scenario corpus
+
+The framework is implemented generically before the motivating defect. The first corpus contains:
+
+1. **Record/replay round trip:** manually record and natively replay representative pan, zoom,
+   vertical scroll, focus, and resize interactions on a deterministic manual fixture.
+2. **Generated overlap smoke:** issue valid gestures with and without settlement to exercise input,
+   source, scene, GPU, and publication overlap.
+3. **Generated aggressive reversals:** stress canvas and scrollbar capture with rapid reversals,
+   out-of-target release, and cadence mutation.
+4. **BAP1→ACTB consumer:** convert the retained sequence after the generic schema and driver gates
+   pass. Its cache-specific expectations remain in the cache-liveness plan.
+
+The BAP1→ACTB scenario may supply useful path/timing data while the framework is built, but no core
+type, target, oracle, or failure class may be named for that defect.
+
+## 17. Risks and controls
+
+| Risk | Control |
+| --- | --- |
+| macOS coalesces native movement differently between runs | Store requested, posted, and received streams; assert structural events and use repeated trials for scheduling-sensitive failures. |
+| Recording perturbs the bug | Keep UI work bounded, stream asynchronously, benchmark overhead, and fail visibly on evidence pressure. |
+| Semantic geometry goes stale | Resolve immediately before each gesture and abort on unexpected revision/window changes. |
+| A generated event affects another application | Require PID, instance, process, and window validation; use PID-targeted posting only. |
+| Concurrent human input corrupts routing evidence | Declare replay exclusive, recognise expected event structure, and abort with `extraneous_native_input`. |
+| Controller loses contact while input is held | Enforce driver-local duration bounds and emergency release independent of RGV. |
+| Existing synchronous batch request blocks on a UI stall | Use short batches and a separate authenticated atomic health read served outside the UI queue. |
+| Recording cannot map an ordinary control stably | Add a stable identifier only for needed controls; otherwise emit an explicit fragile or unsupported conversion. |
+| Recording captures sensitive typed text | Capture text only in recognized non-sensitive controls by default; redact and reject unknown text input during conversion. |
+| Seed does not reproduce online state-aware choices | Persist every expanded action before delivery; replay the expansion, not the seed alone. |
+| Reducer mistakes a different timeout for the original bug | Match typed signature and target/owner fields across repeated trials. |
+| Stress schema becomes a second automation API | Embed existing commands and snapshots; keep the new layer limited to native orchestration. |
+
+## 18. Definition of done
+
+The plan is complete when all of the following are true:
+
+1. A controller can attach safely to one visible, explicitly controlled RGV process on macOS.
+2. Manual native use streams to a complete journal that survives verbose trace overwrite.
+3. A stopped or crashed recording is unambiguously complete or incomplete.
+4. A complete recording converts into an inspectable target-relative scenario.
+5. The scenario replays through PID-targeted macOS events, not direct RGV state mutation.
+6. Driver post evidence correlates with native events received by RGV.
+7. Each gesture proves target acquisition, accepted transitions, and release/cancellation.
+8. Existing automation commands and snapshots perform setup and semantic observation without a
+   parallel control protocol.
+9. Semantic and liveness predicates produce typed, reviewable results.
+10. The health/watchdog path distinguishes process exit, UI stall, pipeline stall, progress churn,
+    routing failure, interaction lock, and semantic/invariant failure.
+11. A state-aware generator produces bounded scenarios, durably stores their expansion, and
+    reports action/transition coverage.
+12. Recorded scenarios can be mutated by timing, path, repetition, and interleaving while retaining
+    their prerequisites.
+13. Failures preserve complete controller/driver/app evidence even when RGV cannot answer a final
+    command.
+14. The reducer attempts to produce a smaller reproducer matching the original typed signature.
+15. Local smoke, aggressive, and soak workflows are documented and have explicit cancellation and
+    safety bounds.
+16. The generic round-trip and generated scenarios pass before BAP1→ACTB is added as a consumer.
+17. BAP1→ACTB uses the same schema, driver, artifacts, and failure model without framework changes.
+18. The framework makes no visual-quality, physical-device, cross-platform, or headless confidence
+    claim.
+
+## 19. Explicit non-solutions
 
 Do not implement this framework by:
 
-- relying on AppleScript or absolute desktop coordinates as the primary driver;
-- using high-level camera assignment to claim native gesture coverage;
-- fabricating winit `WindowEvent` values and claiming they traversed the OS path;
-- coupling replay to private mutable viewer fields;
-- exposing every read as an accessibility node;
-- depending on one driver for deterministic, packaged-native, and high-rate guarantees;
-- using fixed sleeps as settlement or liveness assertions;
-- treating exact whole-screen pixel hashes as the sole visual oracle;
-- discarding failure artifacts when the application exits or blocks;
-- adding unbounded trace logging that materially changes the behavior under test;
-- letting an automation controller mutate viewer state off the UI thread;
-- embedding cache, renderer, or biological correctness policy inside the generic harness; or
-- claiming subjective visual correctness without user assessment.
+- creating a new local-control server or duplicating `AutomationCommand`;
+- turning MCP into the stress runner;
+- assigning viewport, scrollbar, pointer-capture, or gesture fields directly for replay;
+- claiming an internal reducer test proves native routing;
+- using AppleScript or untargeted global input as the primary driver;
+- depending on absolute desktop pixels when a semantic target is available;
+- requiring XCUITest or full Xcode for this local framework;
+- treating the bounded diagnostic trace as a complete replay journal;
+- silently dropping structural recording events;
+- treating a random seed as sufficient without saving the expanded scenario;
+- waiting indefinitely for settlement or artifact export;
+- using screenshots as pass/fail evidence for semantic, liveness, or visual correctness;
+- building cross-platform abstractions that the selected macOS-only scope does not need; or
+- embedding a particular cache, renderer, or feature fix in the generic harness.
