@@ -1,4 +1,10 @@
-use std::{cmp::Reverse, collections::HashMap, mem::size_of, num::NonZeroU64, sync::Arc};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    mem::size_of,
+    num::NonZeroU64,
+    sync::Arc,
+};
 
 use rgv_core::GenomicInterval;
 use thiserror::Error;
@@ -1314,6 +1320,118 @@ impl EvidenceStore {
         demoted
     }
 
+    /// Demotes only exact summary tiles outside the live source horizons. This narrower operation
+    /// is used when a zoom or overlapping pan contracts the derived working set: decoded source
+    /// evidence remains a useful browsing buffer, while dense per-base summary variants outside
+    /// that buffer should yield first during a foreground replacement.
+    pub fn demote_exact_summary_cache_outside(&mut self, active: &[GenomicInterval]) -> usize {
+        let mut demoted = 0_usize;
+        macro_rules! demote {
+            ($entries:expr) => {
+                for cached in $entries {
+                    if !active
+                        .iter()
+                        .any(|target| cached.summary.tile().overlaps(*target))
+                        && cached.residency != AlignmentCacheResidencyClass::RecentLocusReturnCache
+                    {
+                        cached.residency = AlignmentCacheResidencyClass::RecentLocusReturnCache;
+                        demoted = demoted.saturating_add(1);
+                    }
+                }
+            };
+        }
+        demote!(&mut self.depth_summaries);
+        demote!(&mut self.allele_summaries);
+        demote!(&mut self.junction_summaries);
+        demote!(&mut self.pair_summaries);
+        demote!(&mut self.filter_summaries);
+        demote!(&mut self.modification_summaries);
+        if demoted > 0 {
+            self.eviction_order_dirty = true;
+        }
+        demoted
+    }
+
+    /// Reclassifies exact-summary lookup ownership from the immutable roots currently prepared
+    /// for presentation. Contract variants from an earlier zoom, filter, or display mode are
+    /// reproducible derivatives: they may remain useful as cold/return cache, but must not retain
+    /// active-near priority merely because their canonical tile overlaps the current locus.
+    ///
+    /// Published snapshots keep independent pins, so lowering cache priority cannot invalidate
+    /// visible data. It only lets cooperative reclaim relinquish obsolete summary ownership
+    /// before decoded BAM evidence when the shared budget next needs headroom.
+    pub fn reclassify_exact_summary_cache(
+        &mut self,
+        active: &[GenomicInterval],
+        prepared: &[Arc<ExactSummaryRoot>],
+    ) -> usize {
+        let mut demanded = HashSet::<AllocationId>::new();
+        for root in prepared {
+            demanded.extend(root.depth_tiles().iter().map(|tile| tile.allocation().id()));
+            demanded.extend(
+                root.allele_tiles()
+                    .iter()
+                    .map(|tile| tile.allocation().id()),
+            );
+            demanded.extend(
+                root.junction_tiles()
+                    .iter()
+                    .map(|tile| tile.allocation().id()),
+            );
+            demanded.extend(root.pair_tiles().iter().map(|tile| tile.allocation().id()));
+            demanded.extend(
+                root.filter_tiles()
+                    .iter()
+                    .map(|tile| tile.allocation().id()),
+            );
+            demanded.extend(
+                root.modification_tiles()
+                    .iter()
+                    .map(|tile| tile.allocation().id()),
+            );
+        }
+
+        let classify = |current: AlignmentCacheResidencyClass,
+                        allocation: AllocationId,
+                        tile: CanonicalGenomicTile| {
+            if demanded.contains(&allocation) {
+                AlignmentCacheResidencyClass::ActiveNearBuffer
+            } else if current == AlignmentCacheResidencyClass::DisposableSpeculation {
+                current
+            } else if active.iter().any(|interval| tile.overlaps(*interval)) {
+                AlignmentCacheResidencyClass::ActiveLocusCold
+            } else {
+                AlignmentCacheResidencyClass::RecentLocusReturnCache
+            }
+        };
+        let mut changed = 0_usize;
+        macro_rules! reclassify {
+            ($entries:expr) => {
+                for cached in $entries {
+                    let next = classify(
+                        cached.residency,
+                        cached.summary.allocation().id(),
+                        cached.summary.tile(),
+                    );
+                    if next != cached.residency {
+                        cached.residency = next;
+                        changed = changed.saturating_add(1);
+                    }
+                }
+            };
+        }
+        reclassify!(&mut self.depth_summaries);
+        reclassify!(&mut self.allele_summaries);
+        reclassify!(&mut self.junction_summaries);
+        reclassify!(&mut self.pair_summaries);
+        reclassify!(&mut self.filter_summaries);
+        reclassify!(&mut self.modification_summaries);
+        if changed > 0 {
+            self.eviction_order_dirty = true;
+        }
+        changed
+    }
+
     /// Applies a smaller budget and releases derived summaries before oldest source acquisitions.
     /// Pinned current evidence is never destroyed and remains visible as explicit pinned overage.
     pub fn reduce_budget(&mut self, budget: usize) -> Result<StorePressure, EvidenceStoreError> {
@@ -2610,6 +2728,66 @@ mod tests {
         assert_eq!(store.depth_summary_count(), 0);
         assert_eq!(store.acquisition_count(), 1);
         assert!(pressure.charged <= NonZeroUsize::new(target_budget).unwrap().get());
+    }
+
+    #[test]
+    fn exact_summary_cache_priority_follows_the_prepared_root_not_locus_overlap_alone() {
+        let ledger = AllocationLedger::new(4 << 20, 1 << 20);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        let old = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let active = GenomicInterval::new(ContigId::new(0), 1_000, 1_100).unwrap();
+        store
+            .admit(empty_acquisition(old.start(), old.end()))
+            .unwrap();
+        store
+            .admit(empty_acquisition(active.start(), active.end()))
+            .unwrap();
+
+        let old_evidence = store
+            .prepare(old, junction_payload(), ReservationKind::Normal)
+            .unwrap();
+        let old_summaries = store
+            .prepare_exact_summaries(
+                old_evidence.root(),
+                old,
+                NonZeroU64::new(100).unwrap(),
+                2_000,
+                summary_contract(),
+                None,
+                ReservationKind::Transition,
+            )
+            .unwrap();
+        let active_evidence = store
+            .prepare(active, junction_payload(), ReservationKind::Normal)
+            .unwrap();
+        let active_summaries = store
+            .prepare_exact_summaries(
+                active_evidence.root(),
+                active,
+                NonZeroU64::new(100).unwrap(),
+                2_000,
+                summary_contract(),
+                None,
+                ReservationKind::Transition,
+            )
+            .unwrap();
+
+        let changed =
+            store.reclassify_exact_summary_cache(&[active], &[Arc::clone(active_summaries.root())]);
+        let inventory = store.cache_residency_inventory().unwrap();
+
+        assert_eq!(changed, 4);
+        assert_eq!(store.exact_summary_count(), 8);
+        assert_eq!(inventory.active_near_buffer_entries, 6); // four active summaries + two sources
+        assert_eq!(inventory.recent_locus_return_cache_entries, 4);
+        assert_eq!(inventory.active_locus_cold_entries, 0);
+        assert!(inventory.active_near_buffer_bytes > 0);
+        assert!(inventory.recent_locus_return_cache_bytes > 0);
+        drop(old_summaries);
     }
 
     #[test]

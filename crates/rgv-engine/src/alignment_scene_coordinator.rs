@@ -1007,7 +1007,12 @@ where
         self.actor.cancel_speculation_for(owner);
         self.presentation.remove_owner(presentation_owner(owner));
         self.last_measured_scene_by_owner.remove(&owner);
-        self.lanes.remove(&owner).is_some()
+        let removed = self.lanes.remove(&owner).is_some();
+        if removed {
+            self.reclassify_presentation_cache(true);
+            self.reclassify_exact_summary_cache();
+        }
+        removed
     }
 
     pub fn set_optional_work_paused(
@@ -1064,6 +1069,7 @@ where
         };
         let entered_disjoint_island =
             previous_horizon.is_some_and(|previous| !previous.overlaps(current_horizon));
+        let working_set_changed = previous_horizon != Some(current_horizon);
         if entered_disjoint_island && update_result.is_err() {
             // A failed disjoint candidate must not leave the worker's obsolete private scene in
             // the presentation store's protected-key set. The desktop's committed epoch keeps
@@ -1072,16 +1078,29 @@ where
             self.presentation.remove_owner(presentation_owner(owner));
         }
         let active = self.active_source_horizons();
-        if entered_disjoint_island {
-            let semantic = self.presentation.demote_cache_outside(&active).total();
-            let evidence = self.actor.store_mut().demote_cache_outside(&active);
+        let demoted = if entered_disjoint_island {
+            self.presentation
+                .demote_cache_outside(&active)
+                .total()
+                .saturating_add(self.actor.store_mut().demote_cache_outside(&active))
+        } else if working_set_changed {
+            // A same-island zoom or pan can substantially contract a formerly retained summary
+            // horizon. Keep decoded BAM evidence reusable, but immediately lower the priority of
+            // exact derived tiles which no longer intersect any live source buffer.
+            self.actor
+                .store_mut()
+                .demote_exact_summary_cache_outside(&active)
+        } else {
+            0
+        };
+        if demoted > 0 {
             if let Some(lane) = self.lanes.get_mut(&owner) {
                 lane.telemetry.return_cache_demotions =
                     lane.telemetry.return_cache_demotions.saturating_add(1);
                 lane.telemetry.return_cache_entries_demoted = lane
                     .telemetry
                     .return_cache_entries_demoted
-                    .saturating_add(usize_as_u64(semantic.saturating_add(evidence)));
+                    .saturating_add(usize_as_u64(demoted));
             }
         }
         let published_scene = update_result
@@ -1092,6 +1111,7 @@ where
             self.reclassify_presentation_cache(entered_disjoint_island);
         }
         if published_scene.is_some() {
+            self.reclassify_exact_summary_cache();
             self.observe_prepared_foreground_working_sets()?;
         }
         let capacity_plan = entered_disjoint_island
@@ -1129,6 +1149,19 @@ where
             .collect::<Vec<_>>();
         self.presentation
             .reclassify_for_demands(&active, &demands, reclassify_unowned);
+    }
+
+    fn reclassify_exact_summary_cache(&mut self) {
+        let active = self.active_source_horizons();
+        let prepared = self
+            .lanes
+            .keys()
+            .filter_map(|owner| self.presentation.prepared_for(presentation_owner(*owner)))
+            .map(|scene| Arc::clone(scene.summaries()))
+            .collect::<Vec<_>>();
+        self.actor
+            .store_mut()
+            .reclassify_exact_summary_cache(&active, &prepared);
     }
 
     fn observe_prepared_foreground_working_sets(
@@ -1275,24 +1308,64 @@ where
     ) -> Result<Option<AlignmentCoordinatorUpdate>, AlignmentSceneCoordinatorError<B::Error>> {
         let lane = self
             .lanes
-            .get_mut(&owner)
+            .get(&owner)
             .ok_or(AlignmentSceneCoordinatorError::UnknownOwner(owner))?;
         policy.validate()?;
-        lane.policy = policy;
-        lane.vertical_residency_budget_limited = false;
-        lane.vertical_residency_failed = false;
         let Some(camera) = lane.desired.as_ref().map(|desired| desired.camera) else {
+            self.lanes
+                .get_mut(&owner)
+                .expect("the validated owner remains installed")
+                .policy = policy;
             return Ok(None);
         };
-        lane.previous_exact_start = None;
-        lane.update_camera(
-            owner,
-            &mut self.actor,
-            &mut self.presentation,
-            camera,
-            false,
-        )
-        .map(Some)
+        let replacement_prepared =
+            prepared_interval(camera, CameraDirection::Stationary, policy, &lane.contract)?;
+        let replacement_horizon = source_horizon(replacement_prepared, &lane.contract)?;
+        let mut active_horizons = self
+            .lanes
+            .iter()
+            .filter(|(candidate, _)| **candidate != owner)
+            .filter_map(|(_, lane)| lane.desired.as_ref().map(|desired| desired.source_horizon))
+            .collect::<Vec<_>>();
+        active_horizons.push(replacement_horizon);
+        let demoted = self
+            .actor
+            .store_mut()
+            .demote_exact_summary_cache_outside(&active_horizons);
+        let result = {
+            let lane = self
+                .lanes
+                .get_mut(&owner)
+                .expect("the validated owner remains installed");
+            lane.policy = policy;
+            lane.vertical_residency_budget_limited = false;
+            lane.vertical_residency_failed = false;
+            lane.previous_exact_start = None;
+            if demoted > 0 {
+                lane.telemetry.return_cache_demotions =
+                    lane.telemetry.return_cache_demotions.saturating_add(1);
+                lane.telemetry.return_cache_entries_demoted = lane
+                    .telemetry
+                    .return_cache_entries_demoted
+                    .saturating_add(usize_as_u64(demoted));
+            }
+            lane.update_camera(
+                owner,
+                &mut self.actor,
+                &mut self.presentation,
+                camera,
+                false,
+            )
+        };
+        if result
+            .as_ref()
+            .is_ok_and(|update| update.published_scene.is_some())
+        {
+            self.reclassify_presentation_cache(false);
+            self.reclassify_exact_summary_cache();
+            self.observe_prepared_foreground_working_sets()?;
+        }
+        result.map(Some)
     }
 
     pub fn replace_contract(
@@ -1300,11 +1373,34 @@ where
         owner: SourceOwnerId,
         contract: AlignmentSceneBuildContract,
     ) -> Result<AlignmentCoordinatorUpdate, AlignmentSceneCoordinatorError<B::Error>> {
-        let lane = self
+        let other_active_horizons = self
             .lanes
-            .get_mut(&owner)
-            .ok_or(AlignmentSceneCoordinatorError::UnknownOwner(owner))?;
-        lane.replace_contract(owner, &mut self.actor, &mut self.presentation, contract)
+            .iter()
+            .filter(|(candidate, _)| **candidate != owner)
+            .filter_map(|(_, lane)| lane.desired.as_ref().map(|desired| desired.source_horizon))
+            .collect::<Vec<_>>();
+        let result = {
+            let lane = self
+                .lanes
+                .get_mut(&owner)
+                .ok_or(AlignmentSceneCoordinatorError::UnknownOwner(owner))?;
+            lane.replace_contract(
+                owner,
+                &mut self.actor,
+                &mut self.presentation,
+                &other_active_horizons,
+                contract,
+            )
+        };
+        if result
+            .as_ref()
+            .is_ok_and(|update| update.published_scene.is_some())
+        {
+            self.reclassify_presentation_cache(false);
+            self.reclassify_exact_summary_cache();
+            self.observe_prepared_foreground_working_sets()?;
+        }
+        result
     }
 
     pub fn prewarm_presentation(
@@ -1469,6 +1565,7 @@ where
         }
         if !publications.is_empty() {
             self.reclassify_presentation_cache(false);
+            self.reclassify_exact_summary_cache();
             self.observe_prepared_foreground_working_sets()?;
         }
         Ok(AlignmentSceneSourcePump {
@@ -1639,6 +1736,7 @@ where
             };
             if outcome.published_scene.is_some() {
                 self.reclassify_presentation_cache(false);
+                self.reclassify_exact_summary_cache();
                 self.observe_prepared_foreground_working_sets()?;
             }
             return Ok(Some(outcome));
@@ -1775,6 +1873,7 @@ where
         }
         if published.is_some() {
             self.reclassify_presentation_cache(false);
+            self.reclassify_exact_summary_cache();
             self.observe_prepared_foreground_working_sets()?;
         }
         update.capacity_plan = Some(self.foreground_capacity_plan(owner, 0)?);
@@ -2150,6 +2249,7 @@ impl AlignmentSceneSourceLane {
         owner: SourceOwnerId,
         actor: &mut AlignmentSourceActor<B>,
         presentation: &mut AlignmentPresentationStore,
+        other_active_horizons: &[GenomicInterval],
         contract: AlignmentSceneBuildContract,
     ) -> Result<AlignmentCoordinatorUpdate, AlignmentSceneCoordinatorError<B::Error>>
     where
@@ -2195,14 +2295,34 @@ impl AlignmentSceneSourceLane {
         self.contract = contract;
         self.vertical_residency_budget_limited = false;
         self.vertical_residency_failed = false;
-        // A filter replacement is a new derived-view authority, not a vertical-camera update.
-        // Reusing the previous prepared interval here can inherit a much wider scene retained
-        // from an earlier zoom level. A reference-backed filter would then synchronously require
-        // FASTA bases for that entire stale buffer before it could publish the small live view.
-        // Rebase only the derived preparation target onto the current camera policy; canonical
-        // BAM acquisitions remain cached and `prepare` can project the bounded target from them
-        // without source I/O.
-        self.update_camera(owner, actor, presentation, camera, !filter_contract_changed)
+        // Every contract replacement creates a new derived authority. Reusing a prepared interval
+        // retained from an earlier, much wider zoom can make a fine-detail contract materialise
+        // per-base summaries or reference semantics across millions of offscreen bases. Rebase
+        // the derived preparation target onto the current camera policy for all contract changes;
+        // canonical BAM acquisitions remain cached and `prepare` can project the bounded target
+        // from them without source I/O.
+        let replacement_prepared = prepared_interval(
+            camera,
+            CameraDirection::Stationary,
+            self.policy,
+            &self.contract,
+        )?;
+        let replacement_horizon = source_horizon(replacement_prepared, &self.contract)?;
+        let mut active_horizons = Vec::with_capacity(other_active_horizons.len().saturating_add(1));
+        active_horizons.extend_from_slice(other_active_horizons);
+        active_horizons.push(replacement_horizon);
+        let demoted = actor
+            .store_mut()
+            .demote_exact_summary_cache_outside(&active_horizons);
+        if demoted > 0 {
+            self.telemetry.return_cache_demotions =
+                self.telemetry.return_cache_demotions.saturating_add(1);
+            self.telemetry.return_cache_entries_demoted = self
+                .telemetry
+                .return_cache_entries_demoted
+                .saturating_add(usize_as_u64(demoted));
+        }
+        self.update_camera(owner, actor, presentation, camera, false)
     }
 
     fn install_reference_authority<B>(
@@ -4821,6 +4941,66 @@ mod tests {
         let after = coordinator.telemetry();
         assert_eq!(after.source_work_started, before.source_work_started);
         assert_eq!(after.source_acquisitions, before.source_acquisitions);
+    }
+
+    #[test]
+    fn enabling_per_base_summaries_rebases_a_retained_wide_scene() {
+        let (mut coordinator, narrow_camera) = test_coordinator_with_contract(|contract| {
+            contract.payload = PayloadContract::new(
+                CapabilityRequirement::Required,
+                CapabilityRequirement::Required,
+                [*b"XS"],
+                None,
+            );
+        });
+        let broad_camera = AlignmentCamera::new(
+            GenomicInterval::new(narrow_camera.interval().contig(), 9_000, 11_000).unwrap(),
+            0.0,
+            narrow_camera.row_height(),
+            narrow_camera.read_height(),
+            narrow_camera.clip(),
+        )
+        .unwrap();
+        coordinator.update_camera(broad_camera).unwrap();
+        pump_until_publication(&mut coordinator);
+        let broad_prepared = coordinator.desired_prepared_interval().unwrap();
+
+        let zoom_update = coordinator.update_camera(narrow_camera).unwrap();
+        assert!(zoom_update.reused_current_scene);
+        assert_eq!(
+            coordinator.desired_prepared_interval(),
+            Some(broad_prepared)
+        );
+        let source_acquisitions = coordinator.telemetry().source_acquisitions;
+
+        let mut detailed = coordinator.contract().clone();
+        detailed.summaries.allele_detail = AlleleSummaryDetail::Counts;
+        let update = coordinator.replace_contract(detailed).unwrap();
+        let rebased = coordinator.desired_prepared_interval().unwrap();
+
+        assert_eq!(
+            rebased,
+            GenomicInterval::new(narrow_camera.interval().contig(), 9_997, 10_003).unwrap()
+        );
+        assert!(rebased.len() < broad_prepared.len());
+        if update.published_scene.is_none() {
+            pump_until_publication(&mut coordinator);
+        }
+        let scene = coordinator.frame().unwrap().snapshot.unwrap();
+        assert_eq!(
+            scene.summaries().contract().allele_detail,
+            AlleleSummaryDetail::Counts
+        );
+        assert_eq!(scene.prepared_interval(), rebased);
+        assert_eq!(
+            coordinator.telemetry().source_acquisitions,
+            source_acquisitions,
+            "rebasing fine summaries must reuse already cached BAM evidence"
+        );
+        assert!(
+            coordinator.telemetry().return_cache_entries_demoted > 0,
+            "off-buffer summary tiles from the retained broad contract must yield before source evidence"
+        );
     }
 
     #[test]

@@ -279,7 +279,7 @@ pub struct CpuAlignmentLabelFrame {
     /// Immutable page-local anchors examined for this camera. This is deliberately bounded by
     /// intersecting genomic tiles and row blocks rather than the complete retained scene.
     pub anchors_examined: usize,
-    /// Base-cell anchors examined before applying the eight-point width/height legibility gate.
+    /// Base-cell anchors examined before applying the base-glyph legibility gate.
     /// This lets diagnostics distinguish "no base evidence" from "base evidence was present but
     /// deliberately too small to label" without inspecting sequence or rebuilding geometry.
     pub base_anchors_examined: usize,
@@ -789,6 +789,7 @@ fn reconcile_labels(
     clip: CpuClipRect,
 ) {
     const MIN_TEXT_HEIGHT: f64 = 5.0;
+    const MINIMUM_BASE_GLYPH_WIDTH: f64 = 7.0;
     const HORIZONTAL_PADDING: f64 = 2.0;
     const COLLISION_GAP: f64 = 2.0;
     const GLYPH_ASPECT_RATIO: f64 = 0.56;
@@ -799,10 +800,11 @@ fn reconcile_labels(
         .filter_map(|mut label| {
             let text = label.text.as_deref()?;
             if matches!(label.component, AlignmentComponent::Base { .. }) {
-                // Match IGV's legibility boundary: a glyph requires an eight-point cell in both
-                // dimensions. Keep the anchor itself so adjacent bases do not incorrectly collide
-                // in the generic label sweep.
-                if label.width >= 8.0 && label.height >= 8.0 {
+                // Match the accepted reference/read presentation boundary: seven horizontal
+                // points make one nucleotide distinguishable, while the normal five-point read
+                // body is already tall enough for its compact glyph. Requiring an eight-point
+                // square made base letters impossible at the default read density.
+                if label.width >= MINIMUM_BASE_GLYPH_WIDTH && label.height >= MIN_TEXT_HEIGHT {
                     base_labels.push(label);
                 }
                 return None;

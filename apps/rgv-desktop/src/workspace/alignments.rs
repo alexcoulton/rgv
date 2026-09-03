@@ -1760,12 +1760,7 @@ pub(crate) fn alignment_scene_build_contract(
     ) {
         *slot = Some(code);
     }
-    let geometry_lod = match detail {
-        DetailLevel::Overview => GeometryLod::Overview,
-        DetailLevel::Regional => GeometryLod::Span,
-        DetailLevel::Reads => GeometryLod::Read,
-        DetailLevel::Bases => GeometryLod::Base,
-    };
+    let geometry_lod = alignment_scene_geometry_lod(detail, viewport.bases_per_pixel());
     let requested_view_filter =
         alignment_view_filter_contract(filters, active_filters, &metadata.dictionary);
     let requested_highlight_filter =
@@ -1870,6 +1865,30 @@ pub(crate) fn alignment_scene_build_contract(
         normalization_mapped_records: metadata.normalization_mapped_records,
         reference: None,
         annotation: None,
+    }
+}
+
+/// Chooses semantic read geometry independently from the tighter text-legibility LOD.
+///
+/// A single base is already a meaningful coloured mark once it occupies one screen pixel. Base
+/// letters remain camera-projected and are independently suppressed until their cells are wide
+/// and tall enough to read. Using `DetailLevel::Bases` as the sole boundary would incorrectly
+/// hide the colour-only substitution tier between one and eight pixels per base.
+pub(crate) const fn alignment_scene_geometry_lod(
+    detail: DetailLevel,
+    bases_per_pixel: f64,
+) -> GeometryLod {
+    if bases_per_pixel <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL {
+        GeometryLod::Base
+    } else {
+        match detail {
+            DetailLevel::Overview => GeometryLod::Overview,
+            DetailLevel::Regional => GeometryLod::Span,
+            DetailLevel::Reads => GeometryLod::Read,
+            // A caller-provided `Bases` detail remains authoritative even if its floating-point
+            // scale has crossed the nominal boundary by a rounding epsilon.
+            DetailLevel::Bases => GeometryLod::Base,
+        }
     }
 }
 

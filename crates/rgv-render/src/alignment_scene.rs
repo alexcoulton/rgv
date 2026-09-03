@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     mem::size_of,
     num::{NonZeroU64, NonZeroUsize},
-    ops::Range,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
@@ -32,11 +31,6 @@ const SHADER: &str = include_str!("alignment_scene.wgsl");
 /// other. A third concurrently retained candidate is a coordinator bug/back-pressure condition,
 /// not a reason to grow the shared GPU ledger during interaction.
 const ALIGNMENT_CAMERA_FRAME_SLOT_COUNT: usize = 2;
-/// Hover, selected read, and the other member of a paired/template selection chain. A larger
-/// application interaction set remains valid but requires a content replacement to certify a
-/// larger overlay slot rather than pessimistically charging every primitive in a large horizon.
-const ORDINARY_INTERACTION_HANDLES: usize = 3;
-
 /// Persistent GPU representation of one non-text semantic primitive. Coordinates remain a
 /// double-single page-local value; camera and page origins are supplied independently.
 #[repr(C)]
@@ -47,6 +41,26 @@ pub struct AlignmentGpuInstance {
     pub row_offset: u32,
     pub shape: u32,
     pub color: [f32; 4],
+}
+
+/// Camera-frame-local interaction state for one immutable alignment primitive. Geometry stays in
+/// its canonical page buffer; this four-byte companion tells the interactive shader how to tint
+/// that instance without copying its forty-byte geometry into a second global overlay buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
+struct AlignmentGpuInteractionInstance {
+    flags: u32,
+}
+
+impl AlignmentGpuInteractionInstance {
+    fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
+        const ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![5 => Uint32];
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &ATTRIBUTES,
+        }
+    }
 }
 
 impl AlignmentGpuInstance {
@@ -143,7 +157,7 @@ impl PackedAlignmentPage {
     pub fn from_semantic(
         page: &AlignmentSemanticPage,
     ) -> Result<Self, AlignmentGpuPageAdmissionError> {
-        pack_page(page, None)
+        pack_page(page)
     }
 }
 
@@ -204,6 +218,8 @@ pub struct AlignmentGpuPrepareStats {
     pub scenes: usize,
     pub mandatory_pages: usize,
     pub base_instances: usize,
+    /// Primitive interaction flags which are non-zero. The field retains its historical name for
+    /// diagnostic/API compatibility; no duplicate geometry overlay is constructed.
     pub overlay_instances: usize,
     pub text_labels: usize,
     pub label_anchors_examined: usize,
@@ -374,7 +390,7 @@ struct PreparedAlignmentDraw {
     page: AlignmentPageKey,
     uniform_offset: u32,
     scissor: AlignmentGpuScissor,
-    overlay_range: Range<u32>,
+    interaction_buffer_index: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -385,7 +401,7 @@ struct PendingAlignmentDraw {
     scissor: AlignmentGpuScissor,
     page_start: u64,
     page_row_start: u32,
-    overlay_range: Range<u32>,
+    interaction_buffer_index: Option<u32>,
     base_instance_count: u32,
 }
 
@@ -525,7 +541,7 @@ impl AlignmentGpuFrame {
     }
 }
 
-/// Reusable immutable-for-the-duration-of-a-frame camera/overlay slot. The renderer keeps one
+/// Reusable immutable-for-the-duration-of-a-frame camera/interaction slot. The renderer keeps one
 /// cache lease, while every prepared frame keeps an `Arc` and pins the charged GPU capacity. A
 /// slot is writable only when the renderer is its sole owner, so preparing a replacement frame
 /// can never overwrite buffers still referenced by an in-flight submission.
@@ -535,9 +551,11 @@ struct GpuAlignmentFrameBuffers {
     camera_bind_group: Option<wgpu::BindGroup>,
     camera_allocation: Option<AllocationLease>,
     camera_capacity: usize,
-    overlay_buffer: Option<wgpu::Buffer>,
-    overlay_allocation: Option<AllocationLease>,
-    overlay_capacity: usize,
+    /// One compact interaction buffer per possible visible canonical page. Physical buffers stay
+    /// page-sized, so no predicate can create a monolithic allocation above the device limit.
+    interaction_buffers: Vec<wgpu::Buffer>,
+    interaction_allocation: Option<AllocationLease>,
+    interaction_capacity: usize,
     /// Retained CPU-frame capacity charged with this physical camera slot. The renderer owns the
     /// lease and each in-flight frame pins it, exactly like the GPU buffers above.
     frame_allocation: AllocationLease,
@@ -548,7 +566,7 @@ struct GpuAlignmentFrameBuffers {
 #[derive(Clone, Copy, Debug)]
 struct PlannedAlignmentFrameSlot {
     camera_slot: Option<AllocationBundleSlot>,
-    overlay_slot: Option<AllocationBundleSlot>,
+    interaction_slot: Option<AllocationBundleSlot>,
     frame_slot: AllocationBundleSlot,
 }
 
@@ -580,13 +598,15 @@ pub struct AlignmentGpuReplacementPlan {
     page_table_maximum_bytes: usize,
     camera_capacity: usize,
     camera_bytes: usize,
-    overlay_capacity: usize,
-    overlay_bytes: usize,
+    interaction_capacity: usize,
+    interaction_buffer_bytes: usize,
+    interaction_buffer_count: usize,
+    interaction_total_bytes: usize,
     frame_slots: [PlannedAlignmentFrameSlot; ALIGNMENT_CAMERA_FRAME_SLOT_COUNT],
     maximum_frame_bytes: usize,
     request_count: usize,
     mandatory_draws: usize,
-    maximum_overlays: usize,
+    maximum_interactions: usize,
     page_cache_hits: usize,
     page_cache_misses: usize,
 }
@@ -663,9 +683,9 @@ struct StagedAlignmentFrameBuffers {
     camera_bind_group: Option<wgpu::BindGroup>,
     camera_slot: Option<AllocationBundleSlot>,
     camera_capacity: usize,
-    overlay_buffer: Option<wgpu::Buffer>,
-    overlay_slot: Option<AllocationBundleSlot>,
-    overlay_capacity: usize,
+    interaction_buffers: Vec<wgpu::Buffer>,
+    interaction_slot: Option<AllocationBundleSlot>,
+    interaction_capacity: usize,
     frame_slot: AllocationBundleSlot,
 }
 
@@ -736,9 +756,10 @@ pub struct AlignmentGpuPublishableReplacement {
 
 /// Dedicated persistent renderer for immutable alignment semantic pages. Base geometry is
 /// uploaded once per page key. Pan/scroll/compatible zoom update only camera uniforms and a small
-/// stable-handle overlay buffer.
+/// bounded set of page-local stable-handle interaction buffers.
 pub struct AlignmentGpuRenderer {
     pipeline: wgpu::RenderPipeline,
+    interaction_pipeline: wgpu::RenderPipeline,
     camera_layout: wgpu::BindGroupLayout,
     camera_stride: usize,
     frame_buffers: Vec<Arc<GpuAlignmentFrameBuffers>>,
@@ -810,8 +831,37 @@ impl AlignmentGpuRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let interaction_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("RGV interactive alignment semantic pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("interaction_vertex_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[
+                    AlignmentGpuInstance::vertex_buffer_layout(),
+                    AlignmentGpuInteractionInstance::vertex_buffer_layout(),
+                ],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         Self {
             pipeline,
+            interaction_pipeline,
             camera_layout,
             camera_stride: aligned_uniform_stride(device),
             frame_buffers: Vec::new(),
@@ -876,7 +926,7 @@ impl AlignmentGpuRenderer {
             .collect::<Vec<_>>()
             .into();
         let mut mandatory_draws = 0_usize;
-        let mut maximum_overlays = 0_usize;
+        let mut maximum_interactions = 0_usize;
         let mut page_cache_hits = 0_usize;
         let mut page_cache_misses = 0_usize;
         for request in requests {
@@ -895,20 +945,20 @@ impl AlignmentGpuRenderer {
                     page_cache_misses = page_cache_misses.saturating_add(1);
                 }
                 if !request.interaction.is_empty() {
-                    maximum_overlays = maximum_overlays.saturating_add(
+                    maximum_interactions = maximum_interactions.saturating_add(
                         page.primitives()
                             .iter()
                             .filter(|primitive| {
                                 let token = request.interaction.token(primitive.handle);
                                 !matches!(primitive.component, AlignmentComponent::Label { .. })
-                                    && interaction_token_requires_overlay(token)
+                                    && interaction_token_is_active(token)
                             })
                             .count(),
                     );
                 }
             }
         }
-        u32::try_from(maximum_overlays)
+        u32::try_from(maximum_interactions)
             .map_err(|_| AlignmentGpuPrepareError::TooManyOverlayPrimitives)?;
         if mandatory_draws > 0 {
             u32::try_from((mandatory_draws - 1).saturating_mul(self.camera_stride))
@@ -963,60 +1013,47 @@ impl AlignmentGpuRenderer {
         // uniforms for pages one compatible camera can expose, including tile/block boundary
         // crossings. This keeps camera capture stable without sizing every slot as if the entire
         // vertical scene were visible simultaneously.
-        let (camera_envelope_draws, overlay_envelope_instances) = requests.iter().fold(
-            (0_usize, 0_usize),
-            |(draw_total, overlay_total), request| {
-                let visible_rows = request.camera.visible_rows();
-                // Content authority remains compatible for every camera inside the prepared
-                // genomic horizon. Precharge that complete horizontal envelope so an ordinary
-                // zoom-out never needs a second retained bundle. Vertical capacity remains
-                // bounded by one physical viewport (including block-boundary crossing), not by
-                // the complete prepared read stack.
-                let camera_pages = request.scene.camera_page_envelope(
-                    request.scene.prepared_interval().len(),
-                    visible_rows.end.saturating_sub(visible_rows.start),
-                );
-                let ordinary_overlays = camera_pages
-                    .saturating_mul(request.scene.maximum_handle_primitives_per_page())
-                    .saturating_mul(ORDINARY_INTERACTION_HANDLES);
-                // Unlike hover and selection, a predicate highlight can legitimately match every
-                // read in the viewport. Provision for a completely highlighted camera envelope,
-                // but never for duplicated geometry across the whole prepared scene.
-                let highlight_overlays = (!request.interaction.highlighted().is_empty())
-                    .then(|| {
-                        camera_pages
-                            .saturating_mul(request.scene.maximum_non_label_primitives_per_page())
-                    })
-                    .unwrap_or(0);
-                let current_overlays = request
-                    .scene
-                    .interaction_overlay_instances(request.interaction);
-                (
-                    draw_total.saturating_add(camera_pages),
-                    overlay_total.saturating_add(
-                        ordinary_overlays
-                            .max(highlight_overlays)
-                            .max(current_overlays),
-                    ),
-                )
-            },
-        );
+        let (camera_envelope_draws, maximum_page_interaction_instances) =
+            requests
+                .iter()
+                .fold((0_usize, 0_usize), |(draw_total, page_maximum), request| {
+                    let visible_rows = request.camera.visible_rows();
+                    // Capacity follows the largest number of canonical pages that one camera at this
+                    // scale can expose anywhere inside the prepared horizon. Passing the horizon's
+                    // own length here would multiply a viewport requirement by every prefetched tile
+                    // and recreate the former unbounded predicate-highlight buffer.
+                    let camera_pages = request.scene.camera_page_envelope(
+                        request.camera.interval().len(),
+                        visible_rows.end.saturating_sub(visible_rows.start),
+                    );
+                    (
+                        draw_total.saturating_add(camera_pages),
+                        page_maximum.max(request.scene.maximum_non_label_primitives_per_page()),
+                    )
+                });
         if camera_envelope_draws > 0 {
             u32::try_from((camera_envelope_draws - 1).saturating_mul(self.camera_stride))
                 .map_err(|_| AlignmentGpuPrepareError::DynamicUniformAddressSpace)?;
         }
-        u32::try_from(overlay_envelope_instances)
+        u32::try_from(maximum_page_interaction_instances)
             .map_err(|_| AlignmentGpuPrepareError::TooManyOverlayPrimitives)?;
         let camera_capacity = (camera_envelope_draws > 0)
             .then(|| next_capacity(camera_envelope_draws))
             .transpose()?
             .unwrap_or(0);
         let camera_bytes = camera_capacity.saturating_mul(self.camera_stride);
-        let overlay_capacity = (overlay_envelope_instances > 0)
-            .then(|| next_capacity(overlay_envelope_instances))
+        let interaction_capacity = (maximum_page_interaction_instances > 0)
+            .then(|| next_capacity(maximum_page_interaction_instances))
             .transpose()?
             .unwrap_or(0);
-        let overlay_bytes = overlay_capacity.saturating_mul(size_of::<AlignmentGpuInstance>());
+        let interaction_buffer_bytes = interaction_capacity
+            .checked_mul(size_of::<AlignmentGpuInteractionInstance>())
+            .ok_or(AlignmentGpuPageAdmissionError::CapacityOverflow)?;
+        let interaction_buffer_count =
+            usize::from(interaction_buffer_bytes > 0).saturating_mul(camera_envelope_draws);
+        let interaction_total_bytes = interaction_buffer_bytes
+            .checked_mul(interaction_buffer_count)
+            .ok_or(AlignmentGpuPageAdmissionError::CapacityOverflow)?;
         let maximum_frame_bytes = alignment_gpu_frame_bytes(
             requests.len(),
             prepared_page_keys.len(),
@@ -1038,12 +1075,12 @@ impl AlignmentGpuRenderer {
             } else {
                 None
             };
-            let overlay_slot = if overlay_bytes > 0 {
+            let interaction_slot = if interaction_total_bytes > 0 {
                 let slot = take_bundle_slot(&mut next_slot)?;
                 demands.push(AllocationBundleDemand::new(
                     slot,
                     AllocationClass::GpuPage,
-                    overlay_bytes,
+                    interaction_total_bytes,
                 ));
                 Some(slot)
             } else {
@@ -1057,7 +1094,7 @@ impl AlignmentGpuRenderer {
             ));
             frame_slots.push(PlannedAlignmentFrameSlot {
                 camera_slot,
-                overlay_slot,
+                interaction_slot,
                 frame_slot,
             });
         }
@@ -1084,13 +1121,15 @@ impl AlignmentGpuRenderer {
             page_table_maximum_bytes,
             camera_capacity,
             camera_bytes,
-            overlay_capacity,
-            overlay_bytes,
+            interaction_capacity,
+            interaction_buffer_bytes,
+            interaction_buffer_count,
+            interaction_total_bytes,
             frame_slots,
             maximum_frame_bytes,
             request_count: requests.len(),
             mandatory_draws,
-            maximum_overlays,
+            maximum_interactions,
             page_cache_hits,
             page_cache_misses,
         })
@@ -1182,7 +1221,7 @@ impl AlignmentGpuRenderer {
             }
             let allocations = [
                 buffers.camera_allocation.as_ref(),
-                buffers.overlay_allocation.as_ref(),
+                buffers.interaction_allocation.as_ref(),
                 Some(&buffers.frame_allocation),
             ];
             let mut exact = true;
@@ -1231,7 +1270,7 @@ impl AlignmentGpuRenderer {
             if let Some(allocation) = &buffers.camera_allocation {
                 builder.include_lease(allocation)?;
             }
-            if let Some(allocation) = &buffers.overlay_allocation {
+            if let Some(allocation) = &buffers.interaction_allocation {
                 builder.include_lease(allocation)?;
             }
             builder.include_lease(&buffers.frame_allocation)?;
@@ -1384,16 +1423,33 @@ impl AlignmentGpuRenderer {
             validate_device_buffer_size(device, page.maximum_bytes)?;
         }
         validate_device_buffer_size(device, plan.camera_bytes)?;
-        validate_device_buffer_size(device, plan.overlay_bytes)?;
+        // Interaction state is physically page-local. Validate one page-sized buffer rather than
+        // rejecting the aggregate capacity retained by the complete camera ring.
+        validate_device_buffer_size(device, plan.interaction_buffer_bytes)?;
 
         let missing_instances = plan.missing_pages.iter().fold(0_usize, |total, page| {
             total.saturating_add(page.instance_count as usize)
         });
         let uniform_bytes = plan.mandatory_draws.saturating_mul(self.camera_stride);
+        let interaction_payload_instances = requests
+            .iter()
+            .filter(|request| !request.interaction.is_empty())
+            .flat_map(|request| {
+                request
+                    .scene
+                    .visible_pages(request.camera.interval(), request.camera.visible_rows())
+            })
+            .filter(|page| alignment_page_has_gpu_geometry(page))
+            .fold(0_usize, |total, page| {
+                total.saturating_add(non_text_primitive_count(page))
+            });
         let _scratch = ledger.reserve_transient(
             TransientResourceClass::GpuUpload,
             uniform_bytes
-                .saturating_add(plan.overlay_bytes.saturating_mul(2))
+                .saturating_add(
+                    interaction_payload_instances
+                        .saturating_mul(size_of::<AlignmentGpuInteractionInstance>()),
+                )
                 .saturating_add(missing_instances.saturating_mul(size_of::<AlignmentGpuInstance>()))
                 .saturating_add(
                     plan.missing_pages
@@ -1414,7 +1470,7 @@ impl AlignmentGpuRenderer {
         let mut staged_pages = Vec::with_capacity(plan.missing_pages.len());
         let mut geometry_uploaded_bytes = 0_usize;
         for planned in &plan.missing_pages {
-            let packed = pack_page(&planned.page, None)?;
+            let packed = pack_page(&planned.page)?;
             debug_assert_eq!(packed.instances.len(), planned.instance_count as usize);
             debug_assert!(planned.maximum_bytes > 0);
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1475,22 +1531,24 @@ impl AlignmentGpuRenderer {
             let camera_bind_group = camera_buffer
                 .as_ref()
                 .map(|buffer| create_camera_bind_group(device, &self.camera_layout, buffer));
-            let overlay_buffer = (plan.overlay_bytes > 0).then(|| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("RGV staged alignment overlay frame slot"),
-                    size: plan.overlay_bytes as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
+            let interaction_buffers = (0..plan.interaction_buffer_count)
+                .map(|_| {
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("RGV staged page-local alignment interaction slot"),
+                        size: plan.interaction_buffer_bytes as u64,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
                 })
-            });
+                .collect();
             staged_buffers.push(StagedAlignmentFrameBuffers {
                 camera_buffer,
                 camera_bind_group,
                 camera_slot: slot.camera_slot,
                 camera_capacity: plan.camera_capacity,
-                overlay_buffer,
-                overlay_slot: slot.overlay_slot,
-                overlay_capacity: plan.overlay_capacity,
+                interaction_buffers,
+                interaction_slot: slot.interaction_slot,
+                interaction_capacity: plan.interaction_capacity,
                 frame_slot: slot.frame_slot,
             });
         }
@@ -1505,7 +1563,9 @@ impl AlignmentGpuRenderer {
             )?);
         }
         let mut page_requests = Vec::with_capacity(plan.mandatory_draws);
-        let mut overlay_instances = Vec::with_capacity(plan.maximum_overlays);
+        let mut interaction_pages =
+            Vec::<Vec<AlignmentGpuInteractionInstance>>::with_capacity(plan.mandatory_draws);
+        let mut interaction_instances = 0_usize;
         let scene_revisions = plan.scene_revisions.to_vec();
         let scene_allocations = plan.scene_allocations.to_vec();
         let mut camera_sequences = Vec::with_capacity(requests.len());
@@ -1529,24 +1589,23 @@ impl AlignmentGpuRenderer {
                             .map(|candidate| candidate.instance_count)
                     })
                     .ok_or(AlignmentGpuReplacementError::RequestChangedAfterPlan)?;
-                let overlay_start = u32::try_from(overlay_instances.len())
-                    .expect("overlay address space was proven by the replacement plan");
-                if !request.interaction.is_empty() {
-                    for primitive in page.primitives() {
-                        let token = request.interaction.token(primitive.handle);
-                        if !interaction_token_requires_overlay(token) {
-                            continue;
-                        }
-                        if let Some(instance) = pack_primitive(
-                            *primitive,
-                            Some(interaction_color(color_for(*primitive), token)),
-                        )? {
-                            overlay_instances.push(instance);
-                        }
+                let interaction_buffer_index = if request.interaction.is_empty() {
+                    None
+                } else {
+                    let flags = interaction_page_instances(page, request.interaction);
+                    if flags.len() != instance_count as usize
+                        || flags.len() > plan.interaction_capacity
+                    {
+                        return Err(AlignmentGpuReplacementError::RequestChangedAfterPlan);
                     }
-                }
-                let overlay_end = u32::try_from(overlay_instances.len())
-                    .expect("overlay address space was proven by the replacement plan");
+                    interaction_instances = interaction_instances.saturating_add(
+                        flags.iter().filter(|instance| instance.flags != 0).count(),
+                    );
+                    let index = u32::try_from(interaction_pages.len())
+                        .map_err(|_| AlignmentGpuPrepareError::TooManyOverlayPrimitives)?;
+                    interaction_pages.push(flags);
+                    Some(index)
+                };
                 page_requests.push(PendingAlignmentDraw {
                     page: page.key(),
                     camera: request.camera,
@@ -1554,13 +1613,13 @@ impl AlignmentGpuRenderer {
                     scissor: request.scissor,
                     page_start: page.interval().start(),
                     page_row_start: page.row_range().start,
-                    overlay_range: overlay_start..overlay_end,
+                    interaction_buffer_index,
                     base_instance_count: instance_count,
                 });
             }
         }
         if page_requests.len() != plan.mandatory_draws
-            || overlay_instances.len() > plan.maximum_overlays
+            || interaction_instances != plan.maximum_interactions
         {
             return Err(AlignmentGpuReplacementError::RequestChangedAfterPlan);
         }
@@ -1582,7 +1641,7 @@ impl AlignmentGpuRenderer {
                 uniform_offset: u32::try_from(offset)
                     .map_err(|_| AlignmentGpuPrepareError::DynamicUniformAddressSpace)?,
                 scissor: request.scissor,
-                overlay_range: request.overlay_range.clone(),
+                interaction_buffer_index: request.interaction_buffer_index,
             });
         }
         let initial_buffers = staged_buffers
@@ -1593,10 +1652,14 @@ impl AlignmentGpuRenderer {
         {
             queue.write_buffer(buffer, 0, &uniforms);
         }
-        if let Some(buffer) = &initial_buffers.overlay_buffer
-            && !overlay_instances.is_empty()
-        {
-            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&overlay_instances));
+        for (index, instances) in interaction_pages.iter().enumerate() {
+            let buffer = initial_buffers
+                .interaction_buffers
+                .get(index)
+                .ok_or(AlignmentGpuReplacementError::RequestChangedAfterPlan)?;
+            if !instances.is_empty() {
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(instances));
+            }
         }
 
         let next_revision = plan.renderer_revision.saturating_add(1);
@@ -1609,7 +1672,7 @@ impl AlignmentGpuRenderer {
             .count();
         let actual_pin_count = page_pin_count
             .saturating_add(usize::from(plan.frame_slots[0].camera_slot.is_some()))
-            .saturating_add(usize::from(plan.frame_slots[0].overlay_slot.is_some()))
+            .saturating_add(usize::from(plan.frame_slots[0].interaction_slot.is_some()))
             .saturating_add(usize::from(
                 plan.page_table_slot.is_some() || self.page_table_allocation.is_some(),
             ))
@@ -1654,10 +1717,10 @@ impl AlignmentGpuRenderer {
                     next_revision,
                 ));
             }
-            if let Some(overlay_slot) = slot.overlay_slot {
+            if let Some(interaction_slot) = slot.interaction_slot {
                 actuals.push(AllocationBundleActual::new(
-                    overlay_slot,
-                    plan.overlay_bytes,
+                    interaction_slot,
+                    plan.interaction_total_bytes,
                     next_revision,
                 ));
             }
@@ -1812,10 +1875,10 @@ impl AlignmentGpuRenderer {
                     .remove(&slot)
                     .expect("settled alignment camera slot was prevalidated")
             });
-            let overlay_allocation = buffers.overlay_slot.map(|slot| {
+            let interaction_allocation = buffers.interaction_slot.map(|slot| {
                 allocations
                     .remove(&slot)
-                    .expect("settled alignment overlay slot was prevalidated")
+                    .expect("settled alignment interaction slot was prevalidated")
             });
             let frame_allocation = allocations
                 .remove(&buffers.frame_slot)
@@ -1825,9 +1888,9 @@ impl AlignmentGpuRenderer {
                 camera_bind_group: buffers.camera_bind_group,
                 camera_allocation,
                 camera_capacity: buffers.camera_capacity,
-                overlay_buffer: buffers.overlay_buffer,
-                overlay_allocation,
-                overlay_capacity: buffers.overlay_capacity,
+                interaction_buffers: buffers.interaction_buffers,
+                interaction_allocation,
+                interaction_capacity: buffers.interaction_capacity,
                 frame_allocation,
                 frame_capacity: staged.plan.maximum_frame_bytes,
                 capture_ring: true,
@@ -1864,11 +1927,11 @@ impl AlignmentGpuRenderer {
                     .expect("newly settled alignment camera ring must remain pinnable"),
             );
         }
-        if let Some(allocation) = &initial_frame_buffers.overlay_allocation {
+        if let Some(allocation) = &initial_frame_buffers.interaction_allocation {
             existing_pins.push(
                 allocation
                     .pin()
-                    .expect("newly settled alignment overlay ring must remain pinnable"),
+                    .expect("newly settled alignment interaction ring must remain pinnable"),
             );
         }
         if let Some(allocation) = &page_table_allocation {
@@ -1969,7 +2032,7 @@ impl AlignmentGpuRenderer {
             scenes: publishable.plan.request_count,
             mandatory_pages: publishable.plan.mandatory_draws,
             base_instances: publishable.base_instances,
-            overlay_instances: publishable.plan.maximum_overlays,
+            overlay_instances: publishable.plan.maximum_interactions,
             text_labels: publishable.text_labels,
             label_anchors_examined: publishable.label_anchors_examined,
             page_pin_acquisitions: publishable.plan.mandatory_draws,
@@ -2157,7 +2220,7 @@ impl AlignmentGpuRenderer {
                 continue;
             }
             let instance_count = non_text_primitive_count(page);
-            let packed = pack_page(page, None)?;
+            let packed = pack_page(page)?;
             debug_assert_eq!(packed.instances.len(), instance_count);
             pending.push(PendingGpuPageAdmission {
                 key: page.key(),
@@ -2284,7 +2347,8 @@ impl AlignmentGpuRenderer {
             })
             .collect::<Result<Vec<_>, AlignmentGpuPrepareError>>()?;
         let mut mandatory_pages = 0_usize;
-        let mut maximum_overlays = 0_usize;
+        let mut maximum_interactions = 0_usize;
+        let mut maximum_page_instances = 0_usize;
         let mut page_cache_hits = 0_usize;
         let mut page_cache_misses = 0_usize;
         for (request, pages) in requests.iter().zip(&visible_pages) {
@@ -2295,14 +2359,15 @@ impl AlignmentGpuRenderer {
                     continue;
                 }
                 page_cache_hits = page_cache_hits.saturating_add(1);
+                maximum_page_instances = maximum_page_instances.max(non_text_primitive_count(page));
                 if !request.interaction.is_empty() {
-                    maximum_overlays = maximum_overlays.saturating_add(
+                    maximum_interactions = maximum_interactions.saturating_add(
                         page.primitives()
                             .iter()
                             .filter(|primitive| {
                                 let token = request.interaction.token(primitive.handle);
                                 !matches!(primitive.component, AlignmentComponent::Label { .. })
-                                    && interaction_token_requires_overlay(token)
+                                    && interaction_token_is_active(token)
                             })
                             .count(),
                     );
@@ -2314,16 +2379,24 @@ impl AlignmentGpuRenderer {
                 missing: page_cache_misses,
             });
         }
-        u32::try_from(maximum_overlays)
+        u32::try_from(maximum_interactions)
             .map_err(|_| AlignmentGpuPrepareError::TooManyOverlayPrimitives)?;
         let uniform_bytes = mandatory_pages.saturating_mul(self.camera_stride);
         if mandatory_pages > 0 {
             u32::try_from((mandatory_pages - 1).saturating_mul(self.camera_stride))
                 .map_err(|_| AlignmentGpuPrepareError::DynamicUniformAddressSpace)?;
         }
-        let overlay_bytes = maximum_overlays.saturating_mul(size_of::<AlignmentGpuInstance>());
+        let interaction_payload_bytes = visible_pages
+            .iter()
+            .zip(requests)
+            .filter(|(_, request)| !request.interaction.is_empty())
+            .flat_map(|(pages, _)| pages.iter())
+            .fold(0_usize, |total, page| {
+                total.saturating_add(non_text_primitive_count(page))
+            })
+            .saturating_mul(size_of::<AlignmentGpuInteractionInstance>());
         let scratch_bytes = uniform_bytes
-            .saturating_add(overlay_bytes.saturating_mul(2))
+            .saturating_add(interaction_payload_bytes)
             .saturating_add(mandatory_pages.saturating_mul(size_of::<PreparedAlignmentDraw>()))
             .saturating_add(mandatory_pages.saturating_mul(size_of::<PendingAlignmentDraw>()))
             .saturating_add(
@@ -2354,24 +2427,42 @@ impl AlignmentGpuRenderer {
                 request.interaction,
             )?);
         }
+        let (interaction_buffer_count, interaction_buffer_capacity) = if allow_slot_growth {
+            let envelope_pages = requests.iter().fold(0_usize, |total, request| {
+                let rows = request.camera.visible_rows();
+                total.saturating_add(request.scene.camera_page_envelope(
+                    request.camera.interval().len(),
+                    rows.end.saturating_sub(rows.start),
+                ))
+            });
+            let envelope_page_instances = requests.iter().fold(0_usize, |maximum, request| {
+                maximum.max(request.scene.maximum_non_label_primitives_per_page())
+            });
+            (envelope_pages, envelope_page_instances)
+        } else {
+            (mandatory_pages, maximum_page_instances)
+        };
         let frame_buffers = if allow_slot_growth {
             self.acquire_frame_buffers(
                 device,
                 ledger,
                 mandatory_pages,
-                maximum_overlays,
+                interaction_buffer_count,
+                interaction_buffer_capacity,
                 maximum_frame_bytes,
             )?
         } else {
             self.acquire_existing_frame_buffers(
                 mandatory_pages,
-                maximum_overlays,
+                interaction_buffer_count,
+                interaction_buffer_capacity,
                 maximum_frame_bytes,
             )?
         };
 
         let mut page_requests = Vec::with_capacity(mandatory_pages);
-        let mut overlay_instances = Vec::with_capacity(maximum_overlays);
+        let mut interaction_pages = Vec::<Vec<AlignmentGpuInteractionInstance>>::new();
+        let mut interaction_instances = 0_usize;
         let mut scene_revisions = Vec::with_capacity(requests.len());
         let mut camera_sequences = Vec::with_capacity(requests.len());
         for (request, pages) in requests.iter().zip(&visible_pages) {
@@ -2381,24 +2472,21 @@ impl AlignmentGpuRenderer {
                 let resident = self
                     .page(page.key())
                     .expect("mandatory page presence was proven in the allocation-free pass");
-                let overlay_start = u32::try_from(overlay_instances.len())
-                    .expect("overlay address space was proven before allocation");
-                if !request.interaction.is_empty() {
-                    for primitive in page.primitives() {
-                        let token = request.interaction.token(primitive.handle);
-                        if !interaction_token_requires_overlay(token) {
-                            continue;
-                        }
-                        if let Some(instance) = pack_primitive(
-                            *primitive,
-                            Some(interaction_color(color_for(*primitive), token)),
-                        )? {
-                            overlay_instances.push(instance);
-                        }
+                let interaction_buffer_index = if request.interaction.is_empty() {
+                    None
+                } else {
+                    let flags = interaction_page_instances(page, request.interaction);
+                    if flags.len() != resident.instance_count as usize {
+                        return Err(AlignmentGpuPrepareError::InvalidFrameGeometry);
                     }
-                }
-                let overlay_end = u32::try_from(overlay_instances.len())
-                    .expect("overlay address space was proven before allocation");
+                    interaction_instances = interaction_instances.saturating_add(
+                        flags.iter().filter(|instance| instance.flags != 0).count(),
+                    );
+                    let index = u32::try_from(interaction_pages.len())
+                        .map_err(|_| AlignmentGpuPrepareError::TooManyOverlayPrimitives)?;
+                    interaction_pages.push(flags);
+                    Some(index)
+                };
                 page_requests.push(PendingAlignmentDraw {
                     page: page.key(),
                     camera: request.camera,
@@ -2406,13 +2494,13 @@ impl AlignmentGpuRenderer {
                     scissor: request.scissor,
                     page_start: page.interval().start(),
                     page_row_start: page.row_range().start,
-                    overlay_range: overlay_start..overlay_end,
+                    interaction_buffer_index,
                     base_instance_count: resident.instance_count,
                 });
             }
         }
         debug_assert_eq!(page_requests.len(), mandatory_pages);
-        debug_assert_eq!(overlay_instances.len(), maximum_overlays);
+        debug_assert_eq!(interaction_instances, maximum_interactions);
 
         let mut uniforms = vec![0_u8; uniform_bytes];
         let mut draws = Vec::with_capacity(mandatory_pages);
@@ -2450,13 +2538,13 @@ impl AlignmentGpuRenderer {
                 page: request.page,
                 uniform_offset: offset_u32,
                 scissor: request.scissor,
-                overlay_range: request.overlay_range.clone(),
+                interaction_buffer_index: request.interaction_buffer_index,
             });
         }
         if let Some(allocation) = &frame_buffers.camera_allocation {
             pins.push(allocation.pin()?);
         }
-        if let Some(allocation) = &frame_buffers.overlay_allocation {
+        if let Some(allocation) = &frame_buffers.interaction_allocation {
             pins.push(allocation.pin()?);
         }
         if let Some(allocation) = &self.page_table_allocation {
@@ -2472,15 +2560,16 @@ impl AlignmentGpuRenderer {
                 &uniforms,
             );
         }
-        if !overlay_instances.is_empty() {
-            queue.write_buffer(
-                frame_buffers
-                    .overlay_buffer
-                    .as_ref()
-                    .expect("non-empty overlays require an overlay buffer"),
-                0,
-                bytemuck::cast_slice(&overlay_instances),
-            );
+        for (index, instances) in interaction_pages.iter().enumerate() {
+            let buffer = frame_buffers.interaction_buffers.get(index).ok_or(
+                AlignmentGpuPrepareError::FrameSlotCapacity {
+                    required: interaction_pages.len(),
+                    available: frame_buffers.interaction_buffers.len(),
+                },
+            )?;
+            if !instances.is_empty() {
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(instances));
+            }
         }
         self.revision = next_revision;
         let retained_frame_bytes = alignment_gpu_frame_bytes(
@@ -2519,7 +2608,7 @@ impl AlignmentGpuRenderer {
             base_instances: page_requests.iter().fold(0_usize, |total, request| {
                 total.saturating_add(request.base_instance_count as usize)
             }),
-            overlay_instances: overlay_instances.len(),
+            overlay_instances: interaction_instances,
             text_labels: frame
                 .label_frames
                 .iter()
@@ -2544,7 +2633,7 @@ impl AlignmentGpuRenderer {
     /// Captures a new camera/scroll/interaction presentation over unchanged resident content.
     ///
     /// This is the no-bundle foreground path. It validates the replacement frame's immutable
-    /// authority before touching presentation state, then reuses the bounded camera/overlay ring
+    /// authority before touching presentation state, then reuses the bounded camera/interaction ring
     /// used by [`Self::prepare`]. It never admits or retires a semantic page, rebuilds the page
     /// table, reserves a replacement bundle, or uploads base geometry. A typed
     /// [`AlignmentGpuCameraCaptureError::ContentReplacementRequired`] tells the coordinator to use
@@ -2955,7 +3044,6 @@ impl AlignmentGpuRenderer {
             .camera_bind_group
             .as_ref()
             .ok_or(AlignmentGpuRenderError::MissingCameraBuffer)?;
-        pass.set_pipeline(&self.pipeline);
         for draw in frame.draws.iter() {
             let page = self
                 .page(draw.page)
@@ -2969,16 +3057,18 @@ impl AlignmentGpuRenderer {
             pass.set_bind_group(0, bind_group, &[draw.uniform_offset]);
             debug_assert!(page.instance_count > 0);
             pass.set_vertex_buffer(0, page.buffer.slice(..));
-            pass.draw(0..6, 0..page.instance_count);
-            if !draw.overlay_range.is_empty() {
-                let overlay = frame
+            if let Some(index) = draw.interaction_buffer_index {
+                let interaction = frame
                     .buffers
-                    .overlay_buffer
-                    .as_ref()
+                    .interaction_buffers
+                    .get(index as usize)
                     .ok_or(AlignmentGpuRenderError::MissingOverlayBuffer)?;
-                pass.set_vertex_buffer(0, overlay.slice(..));
-                pass.draw(0..6, draw.overlay_range.clone());
+                pass.set_pipeline(&self.interaction_pipeline);
+                pass.set_vertex_buffer(1, interaction.slice(..));
+            } else {
+                pass.set_pipeline(&self.pipeline);
             }
+            pass.draw(0..6, 0..page.instance_count);
         }
         Ok(())
     }
@@ -3117,7 +3207,7 @@ impl AlignmentGpuRenderer {
             if let Some(allocation) = &slot.camera_allocation {
                 total = total.saturating_add(allocation.snapshot()?.charged_capacity);
             }
-            if let Some(allocation) = &slot.overlay_allocation {
+            if let Some(allocation) = &slot.interaction_allocation {
                 total = total.saturating_add(allocation.snapshot()?.charged_capacity);
             }
         }
@@ -3197,7 +3287,8 @@ impl AlignmentGpuRenderer {
         device: &wgpu::Device,
         ledger: &AllocationLedger,
         uniforms: usize,
-        overlays: usize,
+        interaction_buffer_count: usize,
+        interaction_page_instances: usize,
         frame_bytes: usize,
     ) -> Result<Arc<GpuAlignmentFrameBuffers>, AlignmentGpuPrepareError> {
         if let Some(index) = self
@@ -3207,10 +3298,17 @@ impl AlignmentGpuRenderer {
             .filter(|(_, slot)| Arc::strong_count(slot) == 1)
             .filter(|(_, slot)| {
                 slot.camera_capacity >= uniforms
-                    && slot.overlay_capacity >= overlays
+                    && slot.interaction_buffers.len() >= interaction_buffer_count
+                    && slot.interaction_capacity >= interaction_page_instances
                     && slot.frame_capacity >= frame_bytes
             })
-            .min_by_key(|(_, slot)| (slot.camera_capacity, slot.overlay_capacity))
+            .min_by_key(|(_, slot)| {
+                (
+                    slot.camera_capacity,
+                    slot.interaction_buffers.len(),
+                    slot.interaction_capacity,
+                )
+            })
             .map(|(index, _)| index)
         {
             let slot = Arc::clone(&self.frame_buffers[index]);
@@ -3226,14 +3324,21 @@ impl AlignmentGpuRenderer {
             .then(|| next_capacity(uniforms))
             .transpose()?
             .unwrap_or(0);
-        let overlay_capacity = (overlays > 0)
-            .then(|| next_capacity(overlays))
+        let interaction_capacity = (interaction_page_instances > 0)
+            .then(|| next_capacity(interaction_page_instances))
             .transpose()?
             .unwrap_or(0);
         let camera_bytes = camera_capacity.saturating_mul(self.camera_stride);
-        let overlay_bytes = overlay_capacity.saturating_mul(size_of::<AlignmentGpuInstance>());
+        let interaction_buffer_bytes = interaction_capacity
+            .checked_mul(size_of::<AlignmentGpuInteractionInstance>())
+            .ok_or(AlignmentGpuPageAdmissionError::CapacityOverflow)?;
+        let interaction_buffer_count =
+            usize::from(interaction_buffer_bytes > 0).saturating_mul(interaction_buffer_count);
+        let interaction_total_bytes = interaction_buffer_bytes
+            .checked_mul(interaction_buffer_count)
+            .ok_or(AlignmentGpuPageAdmissionError::CapacityOverflow)?;
         validate_device_buffer_size(device, camera_bytes)?;
-        validate_device_buffer_size(device, overlay_bytes)?;
+        validate_device_buffer_size(device, interaction_buffer_bytes)?;
 
         let mut camera_reservation = (camera_bytes > 0)
             .then(|| {
@@ -3244,11 +3349,11 @@ impl AlignmentGpuRenderer {
                 )
             })
             .transpose()?;
-        let mut overlay_reservation = (overlay_bytes > 0)
+        let mut interaction_reservation = (interaction_total_bytes > 0)
             .then(|| {
                 ledger.reserve(
                     AllocationClass::GpuPage,
-                    overlay_bytes,
+                    interaction_total_bytes,
                     ReservationKind::Transition,
                 )
             })
@@ -3268,22 +3373,23 @@ impl AlignmentGpuRenderer {
             let bind_group = create_camera_bind_group(device, &self.camera_layout, &buffer);
             (buffer, bind_group)
         });
-        let overlay_candidate = (overlay_bytes > 0).then(|| {
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("RGV alignment stable-handle overlay buffer"),
-                size: overlay_bytes as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            buffer
-        });
+        let interaction_buffers = (0..interaction_buffer_count)
+            .map(|_| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("RGV page-local alignment interaction buffer"),
+                    size: interaction_buffer_bytes as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
         let camera_allocation = camera_reservation
             .as_mut()
             .map(|reservation| reservation.register(camera_bytes, self.revision))
             .transpose()?;
-        let overlay_allocation = overlay_reservation
+        let interaction_allocation = interaction_reservation
             .as_mut()
-            .map(|reservation| reservation.register(overlay_bytes, self.revision))
+            .map(|reservation| reservation.register(interaction_total_bytes, self.revision))
             .transpose()?;
         let frame_allocation = frame_reservation.register(frame_bytes, self.revision)?;
         let (camera_buffer, camera_bind_group) = camera_candidate
@@ -3295,9 +3401,9 @@ impl AlignmentGpuRenderer {
             camera_bind_group,
             camera_allocation,
             camera_capacity,
-            overlay_buffer: overlay_candidate,
-            overlay_allocation,
-            overlay_capacity,
+            interaction_buffers,
+            interaction_allocation,
+            interaction_capacity,
             frame_allocation,
             frame_capacity: frame_bytes,
             capture_ring: false,
@@ -3312,7 +3418,8 @@ impl AlignmentGpuRenderer {
     fn acquire_existing_frame_buffers(
         &self,
         uniforms: usize,
-        overlays: usize,
+        interaction_buffer_count: usize,
+        interaction_page_instances: usize,
         frame_bytes: usize,
     ) -> Result<Arc<GpuAlignmentFrameBuffers>, AlignmentGpuPrepareError> {
         let mut adequate_slots = 0_usize;
@@ -3320,7 +3427,8 @@ impl AlignmentGpuRenderer {
         for slot in &self.frame_buffers {
             available = available.max(slot.frame_capacity);
             if slot.camera_capacity < uniforms
-                || slot.overlay_capacity < overlays
+                || slot.interaction_buffers.len() < interaction_buffer_count
+                || slot.interaction_capacity < interaction_page_instances
                 || slot.frame_capacity < frame_bytes
             {
                 continue;
@@ -3626,7 +3734,6 @@ fn alignment_gpu_frame_bytes(
 
 fn pack_page(
     page: &AlignmentSemanticPage,
-    interaction: Option<&AlignmentInteractionState>,
 ) -> Result<PackedAlignmentPage, AlignmentGpuPageAdmissionError> {
     let maximum = page.primitives().len();
     let mut instances = Vec::with_capacity(maximum);
@@ -3637,9 +3744,7 @@ fn pack_page(
             text_primitive_count = text_primitive_count.saturating_add(1);
             continue;
         }
-        let color = interaction
-            .map(|state| interaction_color(color_for(primitive), state.token(primitive.handle)));
-        if let Some(instance) = pack_primitive(primitive, color)? {
+        if let Some(instance) = pack_primitive(primitive)? {
             instances.push(instance);
             semantic_indices.push(
                 u32::try_from(index)
@@ -3662,7 +3767,6 @@ fn non_text_primitive_count(page: &AlignmentSemanticPage) -> usize {
 
 fn pack_primitive(
     primitive: AlignmentSemanticPrimitive,
-    color: Option<[f32; 4]>,
 ) -> Result<Option<AlignmentGpuInstance>, AlignmentGpuPageAdmissionError> {
     if matches!(primitive.component, AlignmentComponent::Label { .. }) {
         return Ok(None);
@@ -3678,7 +3782,7 @@ fn pack_primitive(
         end_offset: split_f64(primitive.end_offset as f64),
         row_offset: primitive.row_offset,
         shape: shape_for(primitive.geometry) as u32,
-        color: color.unwrap_or_else(|| color_for(primitive)),
+        color: color_for(primitive),
     }))
 }
 
@@ -3764,13 +3868,34 @@ fn style_color(style: AlignmentStyleToken) -> [f32; 4] {
     }
 }
 
-const fn interaction_token_requires_overlay(
+const fn interaction_token_is_active(
     token: rgv_alignment_scene::AlignmentInteractionToken,
 ) -> bool {
     token.hovered || token.selected || token.selected_chain || token.highlighted
 }
 
-fn interaction_color(
+fn interaction_flags(token: rgv_alignment_scene::AlignmentInteractionToken) -> u32 {
+    u32::from(token.hovered)
+        | (u32::from(token.selected) << 1)
+        | (u32::from(token.selected_chain) << 2)
+        | (u32::from(token.highlighted) << 3)
+}
+
+fn interaction_page_instances(
+    page: &AlignmentSemanticPage,
+    interaction: &AlignmentInteractionState,
+) -> Vec<AlignmentGpuInteractionInstance> {
+    page.primitives()
+        .iter()
+        .filter(|primitive| !matches!(primitive.component, AlignmentComponent::Label { .. }))
+        .map(|primitive| AlignmentGpuInteractionInstance {
+            flags: interaction_flags(interaction.token(primitive.handle)),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn reference_interaction_color(
     mut color: [f32; 4],
     token: rgv_alignment_scene::AlignmentInteractionToken,
 ) -> [f32; 4] {
@@ -4151,7 +4276,7 @@ pub enum AlignmentGpuPrepareError {
     InvalidFrameGeometry,
     #[error("{missing} mandatory alignment GPU pages are not resident")]
     MissingMandatoryPages { missing: usize },
-    #[error("alignment overlay count exceeds the u32 draw address space")]
+    #[error("alignment interaction count exceeds the u32 draw address space")]
     TooManyOverlayPrimitives,
     #[error("alignment dynamic-uniform offset exceeds the u32 address space")]
     DynamicUniformAddressSpace,
@@ -4223,7 +4348,7 @@ pub enum AlignmentGpuRenderError {
     DeviceGenerationMismatch { frame: u64, renderer: u64 },
     #[error("GPU alignment frame has no camera buffer")]
     MissingCameraBuffer,
-    #[error("GPU alignment frame has no overlay buffer")]
+    #[error("GPU alignment frame has no interaction buffer")]
     MissingOverlayBuffer,
     #[error("a pinned GPU alignment page disappeared before render: {0:?}")]
     MissingPinnedPage(AlignmentPageKey),
@@ -4666,7 +4791,7 @@ mod tests {
 
     #[test]
     fn page_local_coordinates_survive_beyond_single_f32_integer_precision() {
-        let instance = pack_primitive(primitive(AlignmentComponent::ReadSpan), None)
+        let instance = pack_primitive(primitive(AlignmentComponent::ReadSpan))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4682,68 +4807,51 @@ mod tests {
     #[test]
     fn semantic_component_families_map_to_stable_gpu_shapes_without_labels() {
         assert_eq!(
-            pack_primitive(
-                primitive(AlignmentComponent::Deletion { cigar_index: 1 }),
-                None
-            )
-            .unwrap()
-            .unwrap()
-            .shape,
+            pack_primitive(primitive(AlignmentComponent::Deletion { cigar_index: 1 }))
+                .unwrap()
+                .unwrap()
+                .shape,
             AlignmentGpuShape::EventLine as u32
         );
         assert_eq!(
-            pack_primitive(
-                primitive(AlignmentComponent::Insertion {
-                    cigar_index: 1,
-                    read_start: 2,
-                    length: 3,
-                }),
-                None
-            )
+            pack_primitive(primitive(AlignmentComponent::Insertion {
+                cigar_index: 1,
+                read_start: 2,
+                length: 3,
+            }))
             .unwrap()
             .unwrap()
             .shape,
             AlignmentGpuShape::PointMarker as u32
         );
         assert_eq!(
-            pack_primitive(primitive(AlignmentComponent::DirectionTerminal), None)
+            pack_primitive(primitive(AlignmentComponent::DirectionTerminal))
                 .unwrap()
                 .unwrap()
                 .shape,
             AlignmentGpuShape::DirectionTerminalRight as u32
         );
         assert!(
-            pack_primitive(
-                primitive(AlignmentComponent::Label {
-                    kind: rgv_alignment_scene::AlignmentLabelKind::ReadName,
-                    id: ContractFingerprint::new(7),
-                }),
-                None
-            )
+            pack_primitive(primitive(AlignmentComponent::Label {
+                kind: rgv_alignment_scene::AlignmentLabelKind::ReadName,
+                id: ContractFingerprint::new(7),
+            }))
             .unwrap()
             .is_none()
         );
     }
 
     #[test]
-    fn stable_handle_interaction_changes_only_overlay_color_not_base_geometry() {
+    fn stable_handle_interaction_is_separate_from_immutable_base_geometry() {
         let semantic = primitive(AlignmentComponent::ReadSpan);
-        let base = pack_primitive(semantic, None).unwrap().unwrap();
+        let base = pack_primitive(semantic).unwrap().unwrap();
         let interaction = AlignmentInteractionState::new(Some(handle()), Some(handle()), []);
-        let overlay = pack_primitive(
-            semantic,
-            Some(interaction_color(
-                color_for(semantic),
-                interaction.token(handle()),
-            )),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(base.start_offset, overlay.start_offset);
-        assert_eq!(base.end_offset, overlay.end_offset);
-        assert_eq!(base.row_offset, overlay.row_offset);
-        assert_eq!(base.shape, overlay.shape);
-        assert_ne!(base.color, overlay.color);
+        let token = interaction.token(handle());
+        let flags = interaction_flags(token);
+
+        assert_eq!(base, pack_primitive(semantic).unwrap().unwrap());
+        assert_ne!(flags, 0);
+        assert_ne!(base.color, reference_interaction_color(base.color, token));
     }
 
     #[test]
@@ -4752,21 +4860,21 @@ mod tests {
         semantic.style.body = AlignmentBodyColorToken::Neutral;
         let neutral = style_color(semantic.style);
         assert_eq!(neutral, [0.73, 0.73, 0.73, 1.0]);
-        let hovered = interaction_color(
+        let hovered = reference_interaction_color(
             neutral,
             rgv_alignment_scene::AlignmentInteractionToken {
                 hovered: true,
                 ..rgv_alignment_scene::AlignmentInteractionToken::default()
             },
         );
-        let selected = interaction_color(
+        let selected = reference_interaction_color(
             neutral,
             rgv_alignment_scene::AlignmentInteractionToken {
                 selected: true,
                 ..rgv_alignment_scene::AlignmentInteractionToken::default()
             },
         );
-        let highlighted = interaction_color(
+        let highlighted = reference_interaction_color(
             neutral,
             rgv_alignment_scene::AlignmentInteractionToken {
                 highlighted: true,
@@ -5891,7 +5999,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_highlight_generates_a_real_gpu_overlay_frame() {
+    fn predicate_highlight_uses_page_local_interaction_buffers() {
         let Some((device, queue)) = headless_device() else {
             return;
         };
@@ -5909,7 +6017,7 @@ mod tests {
             .filter(|primitive| !matches!(primitive.component, AlignmentComponent::Label { .. }))
             .map(|primitive| primitive.handle)
             .collect::<BTreeSet<_>>();
-        assert!(highlighted_handles.len() > ORDINARY_INTERACTION_HANDLES);
+        assert!(highlighted_handles.len() > 3);
         let interaction = AlignmentInteractionState::default()
             .with_highlighted(highlighted_handles.iter().copied());
         let clip = rgv_alignment_scene::CpuClipRect {
@@ -5949,21 +6057,22 @@ mod tests {
             frame
                 .draws
                 .iter()
-                .any(|draw| !draw.overlay_range.is_empty())
+                .any(|draw| draw.interaction_buffer_index.is_some())
         );
         let visible_rows = camera.visible_rows();
-        let full_highlight_envelope = scene
-            .camera_page_envelope(
-                scene.prepared_interval().len(),
-                visible_rows.end.saturating_sub(visible_rows.start),
-            )
-            .saturating_mul(scene.maximum_non_label_primitives_per_page());
-        assert!(
-            renderer
-                .frame_buffers
-                .iter()
-                .all(|slot| slot.overlay_capacity >= full_highlight_envelope)
+        let camera_page_envelope = scene.camera_page_envelope(
+            camera.interval().len(),
+            visible_rows.end.saturating_sub(visible_rows.start),
         );
+        assert!(renderer.frame_buffers.iter().all(|slot| {
+            slot.interaction_buffers.len() >= camera_page_envelope
+                && slot.interaction_capacity >= scene.maximum_non_label_primitives_per_page()
+        }));
+        assert!(renderer.frame_buffers.iter().all(|slot| {
+            slot.interaction_capacity
+                .saturating_mul(size_of::<AlignmentGpuInteractionInstance>())
+                <= device.limits().max_buffer_size as usize
+        }));
         render_test_frame(&device, &queue, &renderer, &frame).unwrap();
     }
 
@@ -6028,7 +6137,9 @@ mod tests {
             .map(|slot| {
                 (
                     slot.camera_allocation.as_ref().map(AllocationLease::id),
-                    slot.overlay_allocation.as_ref().map(AllocationLease::id),
+                    slot.interaction_allocation
+                        .as_ref()
+                        .map(AllocationLease::id),
                     slot.frame_allocation.id(),
                 )
             })
@@ -6108,7 +6219,9 @@ mod tests {
                 .iter()
                 .map(|slot| (
                     slot.camera_allocation.as_ref().map(AllocationLease::id),
-                    slot.overlay_allocation.as_ref().map(AllocationLease::id),
+                    slot.interaction_allocation
+                        .as_ref()
+                        .map(AllocationLease::id),
                     slot.frame_allocation.id(),
                 ))
                 .collect::<Vec<_>>(),
@@ -6120,7 +6233,7 @@ mod tests {
     }
 
     #[test]
-    fn large_read_horizon_overlay_slots_scale_with_interaction_not_geometry() {
+    fn large_read_horizon_interaction_slots_scale_with_the_viewport_not_the_horizon() {
         let Some((device, _queue)) = headless_device() else {
             return;
         };
@@ -6145,7 +6258,15 @@ mod tests {
             },
         )
         .unwrap();
-        let neutral = AlignmentInteractionState::default();
+        let highlighted = scene
+            .pages()
+            .iter()
+            .flat_map(|page| page.primitives())
+            .filter(|primitive| !matches!(primitive.component, AlignmentComponent::Label { .. }))
+            .map(|primitive| primitive.handle)
+            .collect::<BTreeSet<_>>();
+        let interaction =
+            AlignmentInteractionState::default().with_highlighted(highlighted.iter().copied());
         let requests = [AlignmentGpuSceneRequest {
             scene: &scene,
             camera_sequence: 1,
@@ -6157,7 +6278,7 @@ mod tests {
                 width: 512,
                 height: 256,
             },
-            interaction: &neutral,
+            interaction: &interaction,
         }];
         let plan = renderer
             .plan_replacement(
@@ -6175,20 +6296,32 @@ mod tests {
         assert!(full_non_label_geometry > 2_000);
         let visible_rows = camera.visible_rows();
         let camera_envelope = scene.camera_page_envelope(
-            scene.prepared_interval().len(),
+            camera.interval().len(),
             visible_rows.end.saturating_sub(visible_rows.start),
         );
         assert_eq!(plan.camera_capacity, camera_envelope.next_power_of_two());
         assert!(plan.camera_capacity < scene.drawable_page_keys().len());
-        assert!(plan.overlay_capacity > 0);
-        let ordinary_overlay_envelope = camera_envelope
-            .saturating_mul(scene.maximum_handle_primitives_per_page())
-            .saturating_mul(3);
+        assert!(plan.interaction_capacity > 0);
+        assert_eq!(plan.interaction_buffer_count, camera_envelope);
         assert_eq!(
-            plan.overlay_capacity,
-            ordinary_overlay_envelope.next_power_of_two()
+            plan.interaction_capacity,
+            scene
+                .maximum_non_label_primitives_per_page()
+                .next_power_of_two()
         );
-        assert!(plan.overlay_capacity < full_non_label_geometry);
+        assert!(plan.interaction_capacity < full_non_label_geometry);
+        assert_eq!(
+            plan.interaction_buffer_bytes,
+            plan.interaction_capacity
+                .saturating_mul(size_of::<AlignmentGpuInteractionInstance>())
+        );
+        assert!(plan.interaction_buffer_bytes <= device.limits().max_buffer_size as usize);
+        assert!(plan.maximum_interactions > 0);
+        assert!(
+            plan.interaction_total_bytes
+                < full_non_label_geometry.saturating_mul(size_of::<AlignmentGpuInstance>()),
+            "interaction capacity must remain smaller than the former full-horizon geometry copy"
+        );
         assert_eq!(plan.frame_slots.len(), ALIGNMENT_CAMERA_FRAME_SLOT_COUNT);
     }
 
@@ -6828,9 +6961,13 @@ mod tests {
                 (
                     Arc::as_ptr(buffers),
                     buffers.camera_allocation.as_ref().map(AllocationLease::id),
-                    buffers.overlay_allocation.as_ref().map(AllocationLease::id),
+                    buffers
+                        .interaction_allocation
+                        .as_ref()
+                        .map(AllocationLease::id),
                     buffers.camera_capacity,
-                    buffers.overlay_capacity,
+                    buffers.interaction_buffers.len(),
+                    buffers.interaction_capacity,
                 )
             })
             .collect::<Vec<_>>();
@@ -6920,9 +7057,13 @@ mod tests {
                     (
                         Arc::as_ptr(buffers),
                         buffers.camera_allocation.as_ref().map(AllocationLease::id),
-                        buffers.overlay_allocation.as_ref().map(AllocationLease::id),
+                        buffers
+                            .interaction_allocation
+                            .as_ref()
+                            .map(AllocationLease::id),
                         buffers.camera_capacity,
-                        buffers.overlay_capacity,
+                        buffers.interaction_buffers.len(),
+                        buffers.interaction_capacity,
                     )
                 })
                 .collect::<Vec<_>>(),

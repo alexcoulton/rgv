@@ -21,6 +21,16 @@ struct VertexInput {
     @location(4) color: vec4<f32>,
 };
 
+struct InteractiveVertexInput {
+    @builtin(vertex_index) vertex_index: u32,
+    @location(0) start_offset: vec2<f32>,
+    @location(1) end_offset: vec2<f32>,
+    @location(2) row_offset: u32,
+    @location(3) shape: u32,
+    @location(4) color: vec4<f32>,
+    @location(5) interaction_flags: u32,
+};
+
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
@@ -60,8 +70,33 @@ fn project_x(page_offset: vec2<f32>) -> f32 {
     return camera.clip_origin.x + projected.x + projected.y;
 }
 
-@vertex
-fn vertex_main(input: VertexInput) -> VertexOutput {
+fn interaction_color(color: vec4<f32>, flags: u32) -> vec4<f32> {
+    var target_color = color.rgb;
+    var amount = 0.0;
+    if (flags & 2u) != 0u {
+        target_color = vec3<f32>(0.16, 0.42, 0.92);
+        amount = 0.58;
+    } else if (flags & 1u) != 0u {
+        target_color = vec3<f32>(0.28, 0.52, 0.94);
+        amount = 0.32;
+    } else if (flags & 4u) != 0u {
+        target_color = vec3<f32>(0.90, 0.62, 0.16);
+        amount = 0.38;
+    } else if (flags & 8u) != 0u {
+        target_color = vec3<f32>(0.96, 0.70, 0.12);
+        amount = 0.46;
+    }
+    return vec4<f32>(mix(color.rgb, target_color, amount), 1.0);
+}
+
+fn project_instance(
+    vertex_index: u32,
+    start_offset: vec2<f32>,
+    end_offset: vec2<f32>,
+    row_offset: u32,
+    shape: u32,
+    color: vec4<f32>,
+) -> VertexOutput {
     let corners = array<vec2<f32>, 6>(
         vec2<f32>(0.0, 0.0),
         vec2<f32>(1.0, 0.0),
@@ -70,25 +105,25 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
         vec2<f32>(1.0, 0.0),
         vec2<f32>(1.0, 1.0),
     );
-    let corner = corners[input.vertex_index];
-    var left = project_x(input.start_offset);
-    var right = project_x(input.end_offset);
-    let row = f32(camera.page_row_start + input.row_offset);
+    let corner = corners[vertex_index];
+    var left = project_x(start_offset);
+    var right = project_x(end_offset);
+    let row = f32(camera.page_row_start + row_offset);
     let row_top = camera.clip_origin.y
         + (row - camera.row_scroll) * camera.row_height
         + (camera.row_height - camera.read_height) * 0.5;
     var top = row_top;
     var height = camera.read_height;
 
-    if input.shape == 1u {
+    if shape == 1u {
         top = row_top + camera.read_height * 0.45;
         height = max(camera.read_height * 0.10, 1.0);
-    } else if input.shape == 2u {
+    } else if shape == 2u {
         let original_width = right - left;
         let marker_width = max(original_width, 1.5);
         left -= (marker_width - original_width) * 0.5;
         right = left + marker_width;
-    } else if input.shape == 3u || input.shape == 4u {
+    } else if shape == 3u || shape == 4u {
         right = max(right, left + 1.0);
     }
 
@@ -104,11 +139,35 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
         0.0,
         1.0,
     );
-    output.color = input.color;
+    output.color = color;
     output.local_point = corner * vec2<f32>(right - left, height);
     output.size = vec2<f32>(right - left, height);
-    output.shape = input.shape;
+    output.shape = shape;
     return output;
+}
+
+@vertex
+fn vertex_main(input: VertexInput) -> VertexOutput {
+    return project_instance(
+        input.vertex_index,
+        input.start_offset,
+        input.end_offset,
+        input.row_offset,
+        input.shape,
+        input.color,
+    );
+}
+
+@vertex
+fn interaction_vertex_main(input: InteractiveVertexInput) -> VertexOutput {
+    return project_instance(
+        input.vertex_index,
+        input.start_offset,
+        input.end_offset,
+        input.row_offset,
+        input.shape,
+        interaction_color(input.color, input.interaction_flags),
+    );
 }
 
 @fragment

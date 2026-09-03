@@ -1525,6 +1525,29 @@ fn reference_aware_read_modes_request_context_before_base_detail() {
 }
 
 #[test]
+fn read_substitution_cells_begin_before_base_letters_are_legible() {
+    assert_eq!(
+        alignment_scene_geometry_lod(DetailLevel::Reads, MAXIMUM_BASE_MARK_BASES_PER_PIXEL),
+        GeometryLod::Base,
+        "one-pixel bases must retain coloured substitution cells",
+    );
+    assert_eq!(
+        alignment_scene_geometry_lod(DetailLevel::Reads, MAXIMUM_BASE_MARK_BASES_PER_PIXEL + 0.01),
+        GeometryLod::Read,
+        "sub-pixel observations must remain ordinary read geometry",
+    );
+    assert_eq!(
+        alignment_scene_geometry_lod(DetailLevel::Bases, 0.125),
+        GeometryLod::Base,
+        "the letter-legible detail tier remains base geometry",
+    );
+    assert_eq!(
+        alignment_scene_geometry_lod(DetailLevel::Regional, 10.0),
+        GeometryLod::Span,
+    );
+}
+
+#[test]
 fn only_base_scene_geometry_depends_on_the_current_fasta_revision() {
     let revision = ReferenceRevision::new(rgv_alignment_scene::RevisionFingerprint::new(7, 11));
 

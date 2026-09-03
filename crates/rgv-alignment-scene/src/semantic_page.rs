@@ -4234,7 +4234,7 @@ mod tests {
     }
 
     #[test]
-    fn base_glyphs_cross_only_the_eight_pixel_width_and_height_threshold() {
+    fn base_cells_precede_glyphs_and_default_height_can_show_letters() {
         let ledger = AllocationLedger::new(8 << 20, 0);
         let (evidence, atlas) = evidence_and_atlas(&ledger);
         let reference = ReferenceSlice {
@@ -4296,8 +4296,26 @@ mod tests {
             )
             .unwrap()
         };
+        let colour_only_camera = camera(100.0, 5.0);
+        let colour_only =
+            crate::CpuAlignmentProjector::project(&scene, 0, colour_only_camera).unwrap();
+        assert!(colour_only.primitives.iter().any(|primitive| {
+            matches!(
+                primitive.component,
+                AlignmentComponent::Base {
+                    classification: AlignedBaseClassification::Substitution
+                        | AlignedBaseClassification::DeclaredSubstitution,
+                    ..
+                }
+            ) && primitive.shape == crate::CpuPrimitiveShape::BaseCell
+        }));
+        let colour_only_labels =
+            crate::CpuAlignmentProjector::project_labels(&scene, 0, colour_only_camera).unwrap();
+        assert!(colour_only_labels.base_anchors_examined > 0);
+        assert_eq!(colour_only_labels.base_labels_projected, 0);
+
         let legible =
-            crate::CpuAlignmentProjector::project_labels(&scene, 1, camera(800.0, 8.0)).unwrap();
+            crate::CpuAlignmentProjector::project_labels(&scene, 1, camera(700.0, 5.0)).unwrap();
         assert!(legible.base_anchors_examined > 0);
         assert!(legible.base_labels_projected > 0);
         assert!(legible.labels.iter().any(|label| {
@@ -4308,7 +4326,7 @@ mod tests {
                     .is_some_and(|text| matches!(text, "A" | "C" | "G" | "T" | "N"))
         }));
         let too_narrow =
-            crate::CpuAlignmentProjector::project_labels(&scene, 2, camera(799.0, 8.0)).unwrap();
+            crate::CpuAlignmentProjector::project_labels(&scene, 2, camera(699.0, 5.0)).unwrap();
         assert_eq!(
             too_narrow.base_anchors_examined,
             legible.base_anchors_examined
@@ -4321,7 +4339,7 @@ mod tests {
                 .all(|label| !matches!(label.component, AlignmentComponent::Base { .. }))
         );
         let too_short =
-            crate::CpuAlignmentProjector::project_labels(&scene, 3, camera(800.0, 7.9)).unwrap();
+            crate::CpuAlignmentProjector::project_labels(&scene, 3, camera(700.0, 4.9)).unwrap();
         assert_eq!(
             too_short.base_anchors_examined,
             legible.base_anchors_examined

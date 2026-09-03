@@ -41,7 +41,6 @@ pub struct AlignmentPresentationScene {
     page_index: HashMap<AlignmentPageSpatialKey, usize>,
     page_tile_bases: NonZeroU64,
     page_row_block_rows: NonZeroU32,
-    maximum_handle_primitives_per_page: usize,
     maximum_non_label_primitives_per_page: usize,
     metadata_allocation: AllocationLease,
     _pins: AlignmentPresentationScenePins,
@@ -120,11 +119,6 @@ impl AlignmentPresentationScene {
         drawable_page_keys.sort_unstable_by_key(warm_order);
         let page_keys = page_keys.into();
         let drawable_page_keys: Arc<[AlignmentPageKey]> = drawable_page_keys.into();
-        let maximum_handle_primitives_per_page = pages
-            .iter()
-            .map(|page| page_maximum_handle_primitives(page))
-            .max()
-            .unwrap_or(0);
         let maximum_non_label_primitives_per_page = pages
             .iter()
             .map(|page| {
@@ -166,7 +160,6 @@ impl AlignmentPresentationScene {
             page_index,
             page_tile_bases,
             page_row_block_rows,
-            maximum_handle_primitives_per_page,
             maximum_non_label_primitives_per_page,
             metadata_allocation,
             _pins: AlignmentPresentationScenePins {
@@ -229,14 +222,6 @@ impl AlignmentPresentationScene {
         &self.drawable_page_keys
     }
 
-    /// Largest non-label primitive count owned by one stable handle in one canonical page. The
-    /// renderer combines this worker-built scalar with its exact camera-page envelope, avoiding a
-    /// complete primitive scan and avoiding buffers sized for pages that cannot be visible at once.
-    #[must_use]
-    pub const fn maximum_handle_primitives_per_page(&self) -> usize {
-        self.maximum_handle_primitives_per_page
-    }
-
     /// Largest drawable primitive population in one canonical page. A highlight predicate may
     /// match every handle visible to a camera, so the renderer uses this worker-built bound to
     /// provision a viewport-sized overlay ring without scanning or retaining the whole scene as
@@ -284,45 +269,6 @@ impl AlignmentPresentationScene {
             .saturating_mul(usize::try_from(camera_blocks).unwrap_or(usize::MAX))
             .saturating_mul(self.presentation.required_page_families().len())
             .min(self.pages.len())
-    }
-
-    /// Exact primitive count for the current stable-handle interaction set. A supplementary chain
-    /// may contain more than three handles, so replacement planning takes the maximum of this
-    /// indexed result and the baseline envelope. Cost is proportional to selected handles and
-    /// the canonical pages those handles occupy, never the complete scene.
-    #[must_use]
-    pub fn interaction_overlay_instances(
-        &self,
-        interaction: &crate::AlignmentInteractionState,
-    ) -> usize {
-        let mut handles =
-            HashSet::with_capacity(interaction.selected_chain().len().saturating_add(2));
-        handles.extend(interaction.hovered());
-        handles.extend(interaction.selected());
-        handles.extend(interaction.selected_chain().iter().copied());
-        handles.into_iter().fold(0_usize, |total, handle| {
-            let Some(hit) = self.atlas.record(handle) else {
-                return total;
-            };
-            let record = hit.record;
-            let Ok(interval) = GenomicInterval::new(
-                self.prepared_interval.contig(),
-                record.start(),
-                record.end().max(record.start().saturating_add(1)),
-            ) else {
-                return total;
-            };
-            let count = self
-                .visible_pages(interval, record.row()..record.row().saturating_add(1))
-                .into_iter()
-                .flat_map(|page| page.primitives())
-                .filter(|primitive| {
-                    primitive.handle == handle
-                        && !matches!(primitive.component, crate::AlignmentComponent::Label { .. })
-                })
-                .count();
-            total.saturating_add(count)
-        })
     }
 
     /// Resolves one immutable semantic page by its complete content identity. Scene construction
@@ -850,18 +796,6 @@ const fn scene_metadata_bytes(
                 .saturating_mul(size_of::<(AlignmentPageSpatialKey, usize)>())
                 .saturating_mul(2),
         )
-}
-
-fn page_maximum_handle_primitives(page: &AlignmentSemanticPage) -> usize {
-    let mut by_handle = HashMap::<AlignmentHandle, usize>::new();
-    for primitive in page
-        .primitives()
-        .iter()
-        .filter(|primitive| !matches!(primitive.component, crate::AlignmentComponent::Label { .. }))
-    {
-        *by_handle.entry(primitive.handle).or_default() += 1;
-    }
-    by_handle.into_values().max().unwrap_or(0)
 }
 
 #[derive(Debug, Error)]
