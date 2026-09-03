@@ -606,6 +606,12 @@ impl Viewer {
                 )));
             }
             action => {
+                let highlight_action = matches!(
+                    action,
+                    AlignmentContextAction::AddHighlight(_)
+                        | AlignmentContextAction::RemoveHighlight(_)
+                        | AlignmentContextAction::ClearHighlights
+                );
                 let target_contig = self
                     .panels
                     .get(target.panel_id)
@@ -756,11 +762,10 @@ impl Viewer {
                         | AlignmentContextAction::ClearHighlights
                 ) && !highlight_reference_before
                     && !highlight_reference_after;
+                if highlight_action {
+                    self.refresh_alignment_highlight_interactions(&[target.track_id]);
+                }
                 if interaction_only_highlight {
-                    for projection in track.projections.values_mut() {
-                        projection.scene_highlight_key = None;
-                        projection.scene_highlight_status = None;
-                    }
                     self.remember_current_locus();
                     self.bump_workspace_revision();
                     let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();

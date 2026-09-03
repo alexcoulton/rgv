@@ -3441,6 +3441,65 @@ fn scene_contract_equivalence_includes_view_and_highlight_filter_authority() {
 }
 
 #[test]
+fn highlight_cache_authority_changes_with_scene_target_and_reference_slice() {
+    let contig = ContigId::new(6);
+    let narrow_target = GenomicInterval::new(contig, 100, 200).unwrap();
+    let wide_target = GenomicInterval::new(contig, 50, 250).unwrap();
+    let narrow_reference = GenomicInterval::new(contig, 90, 210).unwrap();
+    let wide_reference = GenomicInterval::new(contig, 40, 260).unwrap();
+    let evidence_revision =
+        rgv_alignment_scene::EvidenceRevision::new(RevisionFingerprint::new(21, 22));
+    let reference_revision = ReferenceRevision::new(RevisionFingerprint::new(23, 24));
+    let baseline = AlignmentHighlightCacheKey {
+        evidence_revision,
+        target: narrow_target,
+        filter: ContractFingerprint::new(25),
+        reference: Some((reference_revision, narrow_reference)),
+    };
+
+    assert_ne!(
+        baseline,
+        AlignmentHighlightCacheKey {
+            target: wide_target,
+            ..baseline
+        },
+        "one retained evidence root must not reuse highlights evaluated for a narrower scene"
+    );
+    assert_ne!(
+        baseline,
+        AlignmentHighlightCacheKey {
+            reference: Some((reference_revision, wide_reference)),
+            ..baseline
+        },
+        "a widened FASTA slice must retry a formerly incomplete reference-backed highlight"
+    );
+}
+
+#[test]
+fn invalidating_a_highlight_projection_clears_cached_result_and_status() {
+    let contig = ContigId::new(6);
+    let target = GenomicInterval::new(contig, 100, 200).unwrap();
+    let mut projection = AlignmentPanelProjection {
+        scene_highlight_key: Some(AlignmentHighlightCacheKey {
+            evidence_revision: rgv_alignment_scene::EvidenceRevision::new(
+                RevisionFingerprint::new(31, 32),
+            ),
+            target,
+            filter: ContractFingerprint::new(33),
+            reference: None,
+        }),
+        scene_highlight_status: Some("stale highlight".to_owned()),
+        ..AlignmentPanelProjection::default()
+    };
+
+    projection.invalidate_scene_highlight();
+
+    assert!(projection.scene_highlight_key.is_none());
+    assert!(projection.scene_highlighted.is_empty());
+    assert!(projection.scene_highlight_status.is_none());
+}
+
+#[test]
 fn full_settings_update_changes_only_the_target_alignment_config() {
     let source = TrackSource::Local {
         path: "normal.bam".to_owned(),

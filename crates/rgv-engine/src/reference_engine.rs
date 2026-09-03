@@ -19,6 +19,11 @@ use crate::{
     mailbox::{CoalescingReceiver, CoalescingSender, bounded_coalescing},
 };
 
+/// Maximum number of bases fetched by one underlying FASTA operation.
+///
+/// A logical scene authority may be wider. The reference actor assembles it from bounded chunks
+/// and checks cancellation between them, so consumers still receive one atomic slice without a
+/// broad horizon becoming one uninterruptible local or remote source operation.
 pub const MAX_REFERENCE_QUERY_BASES: u64 = 1_000_000;
 
 /// Complete identity of one reference query. Panel generation alone is not sufficient because
@@ -229,49 +234,128 @@ fn worker_loop(
                 if query.revision != *revision {
                     continue;
                 }
-                let interval = query.interval;
-                if interval.len() > MAX_REFERENCE_QUERY_BASES {
-                    ReferenceEngineEvent::Error {
-                        query: Some(query),
-                        message: format!(
-                            "reference query exceeds the {MAX_REFERENCE_QUERY_BASES}-base limit"
-                        ),
+                let query_clock = clock.clone();
+                let generation = query.request.generation();
+                let cancellation: RemoteCancellation =
+                    Arc::new(move || query_clock.is_current(generation));
+                reference.set_remote_cancellation(Some(cancellation));
+                match fetch_reference_query(reference, &contig_name, query.interval, &clock, query)
+                {
+                    ReferenceQueryFetch::Completed(slice)
+                        if clock.is_current(query.request.generation()) =>
+                    {
+                        ReferenceEngineEvent::QueryCompleted {
+                            query,
+                            slice: Arc::new(slice),
+                            remote_io_stats: reference.remote_io_stats(),
+                        }
                     }
-                } else {
-                    let query_clock = clock.clone();
-                    let generation = query.request.generation();
-                    let cancellation: RemoteCancellation =
-                        Arc::new(move || query_clock.is_current(generation));
-                    reference.set_remote_cancellation(Some(cancellation));
-                    match reference.fetch_slice_by_name(&contig_name, interval) {
-                        Ok(Some(slice)) if clock.is_current(query.request.generation()) => {
-                            ReferenceEngineEvent::QueryCompleted {
-                                query,
-                                slice: Arc::new(slice),
-                                remote_io_stats: reference.remote_io_stats(),
-                            }
+                    ReferenceQueryFetch::MissingContig
+                        if clock.is_current(query.request.generation()) =>
+                    {
+                        ReferenceEngineEvent::Error {
+                            query: Some(query),
+                            message: format!(
+                                "reference FASTA does not contain contig {contig_name}"
+                            ),
                         }
-                        Ok(None) if clock.is_current(query.request.generation()) => {
-                            ReferenceEngineEvent::Error {
-                                query: Some(query),
-                                message: format!(
-                                    "reference FASTA does not contain contig {contig_name}"
-                                ),
-                            }
-                        }
-                        Err(error) if clock.is_current(query.request.generation()) => {
-                            ReferenceEngineEvent::Error {
-                                query: Some(query),
-                                message: error.to_string(),
-                            }
-                        }
-                        Ok(_) | Err(_) => continue,
                     }
+                    ReferenceQueryFetch::Failed(message)
+                        if clock.is_current(query.request.generation()) =>
+                    {
+                        ReferenceEngineEvent::Error {
+                            query: Some(query),
+                            message,
+                        }
+                    }
+                    ReferenceQueryFetch::Completed(_)
+                    | ReferenceQueryFetch::MissingContig
+                    | ReferenceQueryFetch::Cancelled
+                    | ReferenceQueryFetch::Failed(_) => continue,
                 }
             }
         };
         send_event(output, event);
     }
+}
+
+enum ReferenceQueryFetch {
+    Completed(ReferenceSlice),
+    MissingContig,
+    Cancelled,
+    Failed(String),
+}
+
+fn fetch_reference_query(
+    reference: &FastaReference,
+    contig_name: &str,
+    interval: GenomicInterval,
+    clock: &GenerationClock,
+    query: ReferenceQueryIdentity,
+) -> ReferenceQueryFetch {
+    let expected_bases = match usize::try_from(interval.len()) {
+        Ok(expected) => expected,
+        Err(_) => {
+            return ReferenceQueryFetch::Failed(
+                "reference query length exceeds addressable memory".to_owned(),
+            );
+        }
+    };
+    let mut bases = Vec::new();
+    if let Err(error) = bases.try_reserve_exact(expected_bases) {
+        return ReferenceQueryFetch::Failed(format!(
+            "could not reserve memory for reference query: {error}"
+        ));
+    }
+
+    let mut start = interval.start();
+    while start < interval.end() {
+        if !clock.is_current(query.request.generation()) {
+            return ReferenceQueryFetch::Cancelled;
+        }
+        let end = start
+            .saturating_add(MAX_REFERENCE_QUERY_BASES)
+            .min(interval.end());
+        let chunk = GenomicInterval::new(interval.contig(), start, end)
+            .expect("a bounded reference-query chunk is non-empty");
+        let slice = match reference.fetch_slice_by_name(contig_name, chunk) {
+            Ok(Some(slice)) => slice,
+            Ok(None) => return ReferenceQueryFetch::MissingContig,
+            Err(_) if !clock.is_current(query.request.generation()) => {
+                return ReferenceQueryFetch::Cancelled;
+            }
+            Err(error) => return ReferenceQueryFetch::Failed(error.to_string()),
+        };
+        let expected_chunk_bases = match usize::try_from(chunk.len()) {
+            Ok(expected) => expected,
+            Err(_) => {
+                return ReferenceQueryFetch::Failed(
+                    "reference query chunk length exceeds addressable memory".to_owned(),
+                );
+            }
+        };
+        if slice.interval != chunk || slice.bases.len() != expected_chunk_bases {
+            return ReferenceQueryFetch::Failed(format!(
+                "reference source returned {} bases for a {}-base query chunk",
+                slice.bases.len(),
+                chunk.len()
+            ));
+        }
+        bases.extend_from_slice(&slice.bases);
+        start = end;
+    }
+
+    if !clock.is_current(query.request.generation()) {
+        return ReferenceQueryFetch::Cancelled;
+    }
+    if bases.len() != expected_bases {
+        return ReferenceQueryFetch::Failed(format!(
+            "reference source returned {} bases for a {}-base logical query",
+            bases.len(),
+            interval.len()
+        ));
+    }
+    ReferenceQueryFetch::Completed(ReferenceSlice { interval, bases })
 }
 
 fn next_reference_open_instance_revision() -> Option<ReferenceRevision> {
@@ -544,16 +628,16 @@ mod tests {
             }
         };
 
-        let request = PanelGeneration::new(PanelId::new(31), ViewportGeneration::new(7));
+        let request = PanelGeneration::new(PanelId::new(31), ViewportGeneration::new(0));
         let first = ReferenceQueryIdentity::new(
             request,
             revision,
-            GenomicInterval::new(ContigId::new(0), 0, MAX_REFERENCE_QUERY_BASES + 1).unwrap(),
+            GenomicInterval::new(ContigId::new(0), 0, 9).unwrap(),
         );
         let second = ReferenceQueryIdentity::new(
             request,
             revision,
-            GenomicInterval::new(ContigId::new(0), 1, MAX_REFERENCE_QUERY_BASES + 2).unwrap(),
+            GenomicInterval::new(ContigId::new(0), 1, 10).unwrap(),
         );
         let clock = GenerationClock::default();
         engine
@@ -579,6 +663,71 @@ mod tests {
                 } if query == expected
             ));
         }
+    }
+
+    #[test]
+    fn logical_query_larger_than_one_fetch_chunk_completes_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genome.fa");
+        let sequence_len = usize::try_from(MAX_REFERENCE_QUERY_BASES + 2).unwrap();
+        let mut fasta = Vec::with_capacity(sequence_len + 7);
+        fasta.extend_from_slice(b">chr1\n");
+        fasta.resize(fasta.len() + sequence_len, b'A');
+        fasta.push(b'\n');
+        fs::write(&path, fasta).unwrap();
+        fs::write(
+            path.with_extension("fa.fai"),
+            format!(
+                "chr1\t{sequence_len}\t6\t{sequence_len}\t{}\n",
+                sequence_len + 1
+            ),
+        )
+        .unwrap();
+        let engine = ReferenceEngine::spawn(4);
+        engine.try_open(path).unwrap();
+        let revision = loop {
+            if let Some(ReferenceEngineEvent::Opened { revision, .. }) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break revision;
+            }
+        };
+
+        let interval =
+            GenomicInterval::new(ContigId::new(0), 0, u64::try_from(sequence_len).unwrap())
+                .unwrap();
+        let query = ReferenceQueryIdentity::new(
+            PanelGeneration::new(PanelId::new(32), ViewportGeneration::new(0)),
+            revision,
+            interval,
+        );
+        engine
+            .try_query(query, GenerationClock::default(), "chr1".to_owned())
+            .unwrap();
+
+        let event = loop {
+            if let Some(event) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break event;
+            }
+        };
+        let ReferenceEngineEvent::QueryCompleted {
+            query: completed_query,
+            slice,
+            ..
+        } = event
+        else {
+            panic!("chunked logical reference query did not complete");
+        };
+        assert_eq!(completed_query, query);
+        assert_eq!(slice.interval, interval);
+        assert_eq!(slice.bases.len(), sequence_len);
+        assert!(slice.bases.iter().all(|base| *base == b'A'));
     }
 
     #[test]

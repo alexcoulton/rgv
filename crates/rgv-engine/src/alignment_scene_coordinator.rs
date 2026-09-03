@@ -2185,16 +2185,24 @@ impl AlignmentSceneSourceLane {
             .as_ref()
             .map(|desired| desired.camera)
             .ok_or(AlignmentSceneCoordinatorError::MissingCamera)?;
-        if self.contract.view_filter.fingerprint() != contract.view_filter.fingerprint()
+        let filter_contract_changed = self.contract.view_filter.fingerprint()
+            != contract.view_filter.fingerprint()
             || self.contract.highlight_filter.fingerprint()
-                != contract.highlight_filter.fingerprint()
-        {
+                != contract.highlight_filter.fingerprint();
+        if filter_contract_changed {
             self.filter_reference_horizon = None;
         }
         self.contract = contract;
         self.vertical_residency_budget_limited = false;
         self.vertical_residency_failed = false;
-        self.update_camera(owner, actor, presentation, camera, true)
+        // A filter replacement is a new derived-view authority, not a vertical-camera update.
+        // Reusing the previous prepared interval here can inherit a much wider scene retained
+        // from an earlier zoom level. A reference-backed filter would then synchronously require
+        // FASTA bases for that entire stale buffer before it could publish the small live view.
+        // Rebase only the derived preparation target onto the current camera policy; canonical
+        // BAM acquisitions remain cached and `prepare` can project the bounded target from them
+        // without source I/O.
+        self.update_camera(owner, actor, presentation, camera, !filter_contract_changed)
     }
 
     fn install_reference_authority<B>(
@@ -4743,6 +4751,76 @@ mod tests {
             evidence.view_filter().matching_records(),
             evidence.record_count()
         );
+    }
+
+    #[test]
+    fn reference_backed_filter_rebases_a_retained_wide_scene_to_the_live_camera() {
+        let revision = test_reference_revision(153);
+        let (mut coordinator, narrow_camera) = test_coordinator_with_contract(|contract| {
+            contract.payload = PayloadContract::new(
+                CapabilityRequirement::Required,
+                CapabilityRequirement::Required,
+                [*b"XS"],
+                None,
+            );
+        });
+        let broad_camera = AlignmentCamera::new(
+            GenomicInterval::new(narrow_camera.interval().contig(), 9_000, 11_000).unwrap(),
+            0.0,
+            narrow_camera.row_height(),
+            narrow_camera.read_height(),
+            narrow_camera.clip(),
+        )
+        .unwrap();
+        coordinator.update_camera(broad_camera).unwrap();
+        pump_until_publication(&mut coordinator);
+        let broad_prepared = coordinator.desired_prepared_interval().unwrap();
+
+        let zoom_update = coordinator.update_camera(narrow_camera).unwrap();
+        assert!(zoom_update.reused_current_scene);
+        assert_eq!(
+            coordinator.desired_prepared_interval(),
+            Some(broad_prepared),
+            "an ordinary zoom may safely retain the already prepared broad scene"
+        );
+        let before = coordinator.telemetry();
+
+        let mut filtered = coordinator.contract().clone();
+        filtered.view_filter = AlignmentViewFilterContract::new(
+            1,
+            [AlignmentFilterPredicate::Substitution {
+                scope: AlignmentFilterScope::Anywhere,
+                observed_base: None,
+                minimum_count: Some(1),
+                maximum_count: None,
+            }],
+        );
+        filtered.presentation.reference = Some(revision);
+        filtered.reference = None;
+        let update = coordinator.replace_contract(filtered).unwrap();
+
+        let rebased_prepared = coordinator.desired_prepared_interval().unwrap();
+        assert_eq!(
+            rebased_prepared,
+            GenomicInterval::new(narrow_camera.interval().contig(), 9_997, 10_003).unwrap()
+        );
+        assert!(rebased_prepared.len() < broad_prepared.len());
+        assert!(update.foreground_submitted.is_none());
+        let reference_horizon = match coordinator.frame().unwrap().reference_requirement {
+            AlignmentReferenceRequirement::Pending {
+                revision: pending_revision,
+                horizon,
+            } => {
+                assert_eq!(pending_revision, revision);
+                horizon
+            }
+            other => panic!("expected a bounded pending filter reference, got {other:?}"),
+        };
+        assert!(reference_horizon.contains_interval(rebased_prepared));
+        assert!(reference_horizon.len() < broad_prepared.len());
+        let after = coordinator.telemetry();
+        assert_eq!(after.source_work_started, before.source_work_started);
+        assert_eq!(after.source_acquisitions, before.source_acquisitions);
     }
 
     #[test]

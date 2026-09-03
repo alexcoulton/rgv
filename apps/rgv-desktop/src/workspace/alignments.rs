@@ -973,6 +973,20 @@ mod alignment_scene_budget_retry_tests {
     }
 }
 
+/// Exact authority for one cached non-destructive highlight selection.
+///
+/// Evidence revision alone is insufficient: the same retained evidence root can back several
+/// successively wider prepared scenes. The evaluation target therefore participates directly in
+/// identity. Reference-backed predicates also name the exact immutable FASTA slice which was
+/// available during evaluation, so a later, wider slice retries a formerly incomplete result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AlignmentHighlightCacheKey {
+    pub(crate) evidence_revision: rgv_alignment_scene::EvidenceRevision,
+    pub(crate) target: GenomicInterval,
+    pub(crate) filter: ContractFingerprint,
+    pub(crate) reference: Option<(ReferenceRevision, GenomicInterval)>,
+}
+
 #[derive(Default)]
 pub(crate) struct AlignmentPanelProjection {
     pub(crate) clock: GenerationClock,
@@ -1004,16 +1018,18 @@ pub(crate) struct AlignmentPanelProjection {
     pub(crate) scene_frame_request_token: Option<AlignmentSceneRequestToken>,
     pub(crate) scene_telemetry: AlignmentSceneCoordinatorTelemetry,
     pub(crate) scene_interaction: AlignmentInteractionState,
-    pub(crate) scene_highlight_key: Option<(
-        rgv_alignment_scene::EvidenceRevision,
-        ContractFingerprint,
-        Option<ReferenceRevision>,
-    )>,
+    pub(crate) scene_highlight_key: Option<AlignmentHighlightCacheKey>,
     pub(crate) scene_highlighted: Arc<[AlignmentHandle]>,
     pub(crate) scene_highlight_status: Option<String>,
 }
 
 impl AlignmentPanelProjection {
+    pub(crate) fn invalidate_scene_highlight(&mut self) {
+        self.scene_highlight_key = None;
+        self.scene_highlighted = Arc::from([]);
+        self.scene_highlight_status = None;
+    }
+
     pub(crate) fn settle_failed(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.navigation.transition(

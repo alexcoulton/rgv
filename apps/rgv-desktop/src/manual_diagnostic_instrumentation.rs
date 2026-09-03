@@ -1419,11 +1419,26 @@ impl Viewer {
             });
         let highlight = projection.map_or(serde_json::Value::Null, |projection| {
             serde_json::json!({
-                "cache_key": projection.scene_highlight_key.map(|(evidence, filter, reference)| {
+                "cache_key": projection.scene_highlight_key.map(|key| {
                     serde_json::json!({
-                        "evidence_revision": diagnostic_revision_fingerprint(evidence.fingerprint()),
-                        "filter_evaluation_fingerprint": filter.get(),
-                        "reference_revision": diagnostic_optional_reference_revision(reference),
+                        "evidence_revision": diagnostic_revision_fingerprint(key.evidence_revision.fingerprint()),
+                        "target": {
+                            "contig": key.target.contig().get(),
+                            "start": key.target.start(),
+                            "end": key.target.end(),
+                        },
+                        "filter_contract_fingerprint": key.filter.get(),
+                        // Retained for schema-v2 trace consumers; historically this field named
+                        // the contract component while reference revision was reported beside it.
+                        "filter_evaluation_fingerprint": key.filter.get(),
+                        "reference_revision": diagnostic_optional_reference_revision(
+                            key.reference.map(|(revision, _)| revision),
+                        ),
+                        "reference_interval": key.reference.map(|(_, interval)| serde_json::json!({
+                            "contig": interval.contig().get(),
+                            "start": interval.start(),
+                            "end": interval.end(),
+                        })),
                     })
                 }),
                 "matching_handles": projection.scene_highlighted.len(),

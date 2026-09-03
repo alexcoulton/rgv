@@ -3582,11 +3582,8 @@ impl Viewer {
                     .filter(|track| track_ids.contains(&track.config.id))
                 {
                     track.config.filters.alignment_highlight_filter = value.clone();
-                    for projection in track.projections.values_mut() {
-                        projection.scene_highlight_key = None;
-                        projection.scene_highlight_status = None;
-                    }
                 }
+                self.refresh_alignment_highlight_interactions(track_ids);
                 self.invalidate_automation_alignment_layouts(Some(track_ids), false);
                 self.rebuild_all_panel_displays();
             }

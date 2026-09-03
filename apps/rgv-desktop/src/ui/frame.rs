@@ -478,6 +478,7 @@ impl Viewer {
         let filter_error = settings_filter_editor.error.clone();
         let mut apply_filter = false;
         let mut typed_alignment_predicates_changed = false;
+        let mut alignment_highlight_predicates_changed = false;
         let (bulk_alignment_ids, bulk_alignment_pane) = editing_alignment_id.map_or_else(
             || (Vec::new(), None),
             |id| {
@@ -2881,6 +2882,7 @@ impl Viewer {
                                 if let Some(index) = remove {
                                     settings_filters.alignment_highlight_filter.all.remove(index);
                                     typed_alignment_predicates_changed = true;
+                                    alignment_highlight_predicates_changed = true;
                                 }
                             }
                             ui.horizontal(|ui| {
@@ -4280,6 +4282,9 @@ impl Viewer {
                 settings_filters.alignment_view_filter.clone();
             self.primary_alignment_filters_mut()
                 .alignment_highlight_filter = settings_filters.alignment_highlight_filter.clone();
+            if alignment_highlight_predicates_changed {
+                self.refresh_alignment_highlight_interactions(&[settings_alignment_id]);
+            }
             self.query_options_changed();
         }
         if editing_primary_settings {

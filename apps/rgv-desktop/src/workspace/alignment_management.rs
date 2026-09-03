@@ -4597,6 +4597,30 @@ impl Viewer {
         }
     }
 
+    /// Invalidates only the derived highlight selection, then immediately rebinds every affected
+    /// panel's interaction overlay from its currently available scene/reference authority.
+    /// Highlighting never changes evidence membership, row assignment, or summaries.
+    pub(crate) fn refresh_alignment_highlight_interactions(&mut self, track_ids: &[TrackId]) {
+        let panel_ids = self
+            .alignment_tracks
+            .iter()
+            .filter(|track| track_ids.contains(&track.config.id))
+            .flat_map(|track| track.projections.keys().copied())
+            .collect::<BTreeSet<_>>();
+        for track in self
+            .alignment_tracks
+            .iter_mut()
+            .filter(|track| track_ids.contains(&track.config.id))
+        {
+            for projection in track.projections.values_mut() {
+                projection.invalidate_scene_highlight();
+            }
+        }
+        for panel_id in panel_ids {
+            self.synchronize_alignment_scene_interactions(panel_id);
+        }
+    }
+
     fn alignment_highlight_handles(
         &mut self,
         panel_id: PanelId,
@@ -4618,9 +4642,7 @@ impl Viewer {
         );
         if contract.is_empty() {
             let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
-            projection.scene_highlight_key = None;
-            projection.scene_highlighted = Arc::from([]);
-            projection.scene_highlight_status = None;
+            projection.invalidate_scene_highlight();
             return Arc::clone(&projection.scene_highlighted);
         }
         let Some(snapshot) = self.alignment_tracks[track_index]
@@ -4633,35 +4655,31 @@ impl Viewer {
         };
         let compatible_revision =
             self.compatible_alignment_reference_revision(&metadata.dictionary);
-        let reference_revision = self.panels.get(panel_id).and_then(|panel| {
-            (panel.reference_slice_revision == compatible_revision)
-                .then_some(panel.reference_slice_revision)
-                .flatten()
+        let target = snapshot.prepared_interval();
+        let reference = self.panels.get(panel_id).and_then(|panel| {
+            let revision = panel.reference_slice_revision?;
+            let slice = panel.reference_slice.as_deref()?;
+            (Some(revision) == compatible_revision).then_some((revision, slice))
         });
-        let key = (
-            snapshot.reads().evidence().revision(),
-            contract.fingerprint(),
-            reference_revision,
-        );
+        let key = AlignmentHighlightCacheKey {
+            evidence_revision: snapshot.reads().evidence().revision(),
+            target,
+            filter: contract.fingerprint(),
+            reference: contract
+                .requires_reference()
+                .then(|| reference.map(|(revision, slice)| (revision, slice.interval)))
+                .flatten(),
+        };
         if let Some(projection) = self.alignment_tracks[track_index].projection(panel_id)
             && projection.scene_highlight_key == Some(key)
         {
             return Arc::clone(&projection.scene_highlighted);
         }
-        let reference = self.panels.get(panel_id).and_then(|panel| {
-            panel.reference_slice.as_deref().filter(|slice| {
-                panel.reference_slice_revision == reference_revision
-                    && slice
-                        .interval
-                        .contains_interval(snapshot.prepared_interval())
-            })
-        });
-        let evaluation = evaluate_alignment_filter(
-            snapshot.reads().evidence(),
-            snapshot.prepared_interval(),
-            &contract,
-            reference,
-        );
+        let reference = reference
+            .map(|(_, slice)| slice)
+            .filter(|slice| slice.interval.contains_interval(target));
+        let evaluation =
+            evaluate_alignment_filter(snapshot.reads().evidence(), target, &contract, reference);
         let (highlighted, status): (Arc<[AlignmentHandle]>, Option<String>) = match evaluation {
             Ok(evaluation) => (evaluation.into_matching_handles().into(), None),
             Err(error) => (
@@ -4669,10 +4687,41 @@ impl Viewer {
                 Some(format!("Highlights unavailable: {error}")),
             ),
         };
+        let matching_handles = highlighted.len();
+        let diagnostic_status = status.clone();
         let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
         projection.scene_highlight_key = Some(key);
         projection.scene_highlighted = Arc::clone(&highlighted);
         projection.scene_highlight_status = status;
+        self.record_manual_diagnostic_event(
+            "alignment_filter",
+            "highlight_evaluated",
+            serde_json::json!({
+                "panel_id": panel_id.get(),
+                "track_id": track_id.get(),
+                "evidence_revision": {
+                    "high": key.evidence_revision.fingerprint().high(),
+                    "low": key.evidence_revision.fingerprint().low(),
+                },
+                "target": {
+                    "contig": key.target.contig().get(),
+                    "start": key.target.start(),
+                    "end": key.target.end(),
+                },
+                "filter_contract_fingerprint": key.filter.get(),
+                "reference_revision": key.reference.map(|(revision, _)| serde_json::json!({
+                    "high": revision.fingerprint().high(),
+                    "low": revision.fingerprint().low(),
+                })),
+                "reference_interval": key.reference.map(|(_, interval)| serde_json::json!({
+                    "contig": interval.contig().get(),
+                    "start": interval.start(),
+                    "end": interval.end(),
+                })),
+                "matching_handles": matching_handles,
+                "status": diagnostic_status,
+            }),
+        );
         highlighted
     }
 

@@ -1387,6 +1387,7 @@ impl Viewer {
         }
         let active_panel_id = self.panels.active().id;
         let mut reference_panels_to_retry = BTreeSet::new();
+        let mut highlight_panels_to_synchronize = BTreeSet::new();
         for event in events {
             match event {
                 ReferenceEngineEvent::Opened {
@@ -1426,6 +1427,8 @@ impl Viewer {
                         panel.reference_query_error_generation = None;
                         panel.pending_queries.reference = false;
                     }
+                    highlight_panels_to_synchronize
+                        .extend(self.panels.iter().map(|panel| panel.id));
                     if self.primary_alignment_dictionary().is_none() {
                         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
                         for id in ids {
@@ -1532,6 +1535,7 @@ impl Viewer {
                         }
                     }
                     if accepted {
+                        highlight_panels_to_synchronize.insert(request.panel_id());
                         let installed = self.install_reference_authority_for_panel(
                             request.panel_id(),
                             revision,
@@ -1711,6 +1715,13 @@ impl Viewer {
             }
             self.panels.activate(restore);
         }
+        if !highlight_panels_to_synchronize.is_empty() {
+            for panel_id in highlight_panels_to_synchronize {
+                self.synchronize_alignment_scene_interactions(panel_id);
+            }
+            self.rebuild_all_panel_displays();
+            self.prepare_alignment_scene_frame();
+        }
         self.window.request_redraw();
     }
 
@@ -1747,6 +1758,7 @@ impl Viewer {
         let mut rebuild_display = false;
         let mut prepare_frame = false;
         let mut reference_panels_to_request = BTreeSet::new();
+        let mut highlight_panels_to_synchronize = BTreeSet::new();
         let mut ownerless_progress_frames = Vec::new();
         for (track_id, event) in events {
             let Some(track_index) = self
@@ -1860,6 +1872,27 @@ impl Viewer {
                         .as_ref()
                         .and_then(|current| current.row_activity.as_deref())
                         != frame.row_activity.as_deref();
+                    let previous_highlight_authority = projection
+                        .scene_frame
+                        .as_ref()
+                        .and_then(|current| current.snapshot.as_ref())
+                        .map(|snapshot| {
+                            (
+                                snapshot.reads().evidence().revision(),
+                                snapshot.prepared_interval(),
+                            )
+                        });
+                    let next_highlight_authority = frame.snapshot.as_ref().map(|snapshot| {
+                        (
+                            snapshot.reads().evidence().revision(),
+                            snapshot.prepared_interval(),
+                        )
+                    });
+                    if previous_highlight_authority != next_highlight_authority {
+                        highlight_panels_to_synchronize.insert(panel_id);
+                        rebuild_display = true;
+                        prepare_frame = true;
+                    }
                     let camera_refusal_is_terminal = frame.individual_reads_refused_for_camera();
                     projection.scene_frame = Some(frame.clone());
                     projection.scene_frame_request_token = Some(request_token);
@@ -2678,6 +2711,9 @@ impl Viewer {
             self.request_all_panel_queries();
             rebuild_display = false;
             prepare_frame = true;
+        }
+        for panel_id in highlight_panels_to_synchronize {
+            self.synchronize_alignment_scene_interactions(panel_id);
         }
         if rebuild_display {
             self.rebuild_all_panel_displays();
