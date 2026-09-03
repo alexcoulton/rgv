@@ -57,7 +57,7 @@ pub use genome::{
     GENOME_CONFIGURATION_SCHEMA_VERSION, GeneticCode, GenomeAnnotation, GenomeAssembly,
     GenomeAssemblyIdentity, GenomeAssetProvenance, GenomeConfiguration, GenomeConfigurationError,
     MAXIMUM_DEFAULT_ANNOTATIONS, MAXIMUM_GENOME_ASSET_PROVENANCE, ReferenceTranslationFrame,
-    parse_ucsc_cytobands,
+    parse_ucsc_cytobands, parse_ucsc_cytobands_with_aliases,
 };
 pub use landmarks::{
     AssemblyMatchEvidence, AssemblyResolution, AssemblyResolutionInput, AssemblyResolutionStatus,

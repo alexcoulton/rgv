@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::{
     ContigAliases, ContigId, GenomicInterval, ReferenceDictionary, TrackFormat, TrackKind,
-    TrackSource,
+    TrackSource, resolve_contig_alias,
 };
 
 pub const GENOME_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
@@ -324,6 +324,21 @@ pub fn parse_ucsc_cytobands(
     text: &str,
     dictionary: &ReferenceDictionary,
 ) -> Result<Vec<Cytoband>, CytobandParseError> {
+    parse_ucsc_cytobands_with_aliases(text, dictionary, &ContigAliases::new())
+}
+
+/// Parses UCSC cytobands while resolving source contig spellings onto the
+/// canonical names in `dictionary`.
+///
+/// Landmark bundles conventionally use UCSC names (`chr1`) even when the
+/// loaded reference uses an equivalent assembly spelling (`1`). Keeping this
+/// translation explicit prevents a bundle from silently publishing bands onto
+/// a different sequence with a coincidentally similar name.
+pub fn parse_ucsc_cytobands_with_aliases(
+    text: &str,
+    dictionary: &ReferenceDictionary,
+    aliases: &ContigAliases,
+) -> Result<Vec<Cytoband>, CytobandParseError> {
     let mut bands = Vec::new();
     for (line_index, raw_line) in text.lines().enumerate() {
         let line_number = line_index + 1;
@@ -341,7 +356,14 @@ pub fn parse_ucsc_cytobands(
         if fields.len() < 5 {
             return Err(CytobandParseError::FieldCount { line: line_number });
         }
-        let Some(contig) = dictionary.id_by_name(fields[0]) else {
+        let Some(contig) =
+            resolve_contig_alias(dictionary, aliases, fields[0]).map_err(|error| {
+                CytobandParseError::ContigAlias {
+                    line: line_number,
+                    message: error.to_string(),
+                }
+            })?
+        else {
             continue;
         };
         let start = fields[1]
@@ -393,6 +415,8 @@ pub enum CytobandParseError {
     Coordinate { line: usize },
     #[error("cytoband line {line} has unsupported stain {stain}")]
     Stain { line: usize, stain: String },
+    #[error("cytoband line {line} has an invalid contig alias: {message}")]
+    ContigAlias { line: usize, message: String },
 }
 
 #[cfg(test)]
@@ -431,6 +455,22 @@ mod tests {
         assert_eq!(bands.len(), 3);
         assert_eq!(bands[1].stain, CytobandStain::Centromere);
         assert!(bands[2].name.is_empty());
+    }
+
+    #[test]
+    fn parses_ucsc_cytobands_through_an_explicit_source_alias() {
+        let dictionary = ReferenceDictionary::from_contigs([("1".to_owned(), 1_000)]);
+        let aliases = ContigAliases::from([("chr1".to_owned(), "1".to_owned())]);
+        let bands = parse_ucsc_cytobands_with_aliases(
+            "chr1\t0\t400\tp11\tgneg\nchr1\t400\t500\tp12\tacen",
+            &dictionary,
+            &aliases,
+        )
+        .unwrap();
+
+        assert_eq!(bands.len(), 2);
+        assert_eq!(bands[0].interval.contig(), ContigId::new(0));
+        assert_eq!(bands[1].stain, CytobandStain::Centromere);
     }
 
     #[test]

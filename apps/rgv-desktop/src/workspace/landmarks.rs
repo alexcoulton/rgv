@@ -327,19 +327,15 @@ impl Viewer {
         let alias_text = std::fs::read_to_string(&aliases_path)
             .with_context(|| format!("failed to read {}", aliases_path.display()))?;
         let parsed_aliases = rgv_core::parse_landmark_aliases(&alias_text)?;
-        let aliases =
-            parsed_aliases
-                .into_iter()
-                .filter(|(alias, canonical)| {
-                    self.assembly.dictionary.id_by_name(canonical).is_some()
-                        && self.assembly.dictionary.id_by_name(alias).is_none_or(|id| {
-                            self.assembly.dictionary.id_by_name(canonical) == Some(id)
-                        })
-                })
-                .collect::<ContigAliases>();
+        let contig_bindings =
+            landmark_contig_bindings(&bundle, &self.assembly.dictionary, &parsed_aliases)?;
         let cytoband_text = std::fs::read_to_string(&cytobands_path)
             .with_context(|| format!("failed to read {}", cytobands_path.display()))?;
-        let cytobands = parse_ucsc_cytobands(&cytoband_text, &self.assembly.dictionary)?;
+        let cytobands = rgv_core::parse_ucsc_cytobands_with_aliases(
+            &cytoband_text,
+            &self.assembly.dictionary,
+            &contig_bindings.workspace_aliases,
+        )?;
 
         let search_index = match catalogue.verify_asset(
             &root,
@@ -372,6 +368,19 @@ impl Viewer {
             .iter()
             .any(|track| track.kind == TrackKind::GeneModel && track.built_in.is_none());
         let suppressed = self.suppressed_builtin_gene_bundles.contains(bundle_id);
+        if let Some(engine) = &self.track_engine {
+            for track in self.tracks.tracks().iter().filter(|track| {
+                track
+                    .built_in
+                    .as_ref()
+                    .is_some_and(|identity| identity.bundle_id == bundle.id)
+            }) {
+                engine.try_set_query_contig_aliases(
+                    track.id,
+                    contig_bindings.query_contig_aliases.clone(),
+                )?;
+            }
+        }
         let mut added_track = None;
         if !has_equivalent && !has_explicit_gene_track && !suppressed {
             let asset = bundle
@@ -408,7 +417,12 @@ impl Viewer {
             // adaptive label band; the all-transcript lane remains squished.
             config.feature.display_mode = FeatureDisplayMode::Expanded;
             config.height = 48.0;
-            self.add_preconfigured_track_source(&genes_path, TrackSpecKind::GenePred, config)?;
+            self.add_preconfigured_track_source_with_query_contig_aliases(
+                &genes_path,
+                TrackSpecKind::GenePred,
+                config,
+                contig_bindings.query_contig_aliases.clone(),
+            )?;
             self.automation_auxiliary_open_state
                 .insert(next_id, AutomationAuxiliaryOpenState::Pending);
             added_track = Some(next_id);
@@ -417,7 +431,7 @@ impl Viewer {
         // Publish the already-verified compact context only after any required
         // track-engine insertion succeeds, so a frame cannot observe a partial
         // bundle installation.
-        self.contig_aliases = aliases;
+        self.contig_aliases = contig_bindings.workspace_aliases;
         self.assembly.cytobands = cytobands;
         self.cytoband_path = Some(cytobands_path);
         self.assembly.default_annotation_count = 1;
@@ -558,6 +572,13 @@ impl Viewer {
             .context("detailed transcript asset is absent")?;
         let path =
             catalogue.verify_asset(&root, bundle_id, LandmarkAssetRole::DetailedTranscripts)?;
+        let aliases_path =
+            catalogue.verify_asset(&root, bundle_id, LandmarkAssetRole::ContigAliases)?;
+        let alias_text = std::fs::read_to_string(&aliases_path)
+            .with_context(|| format!("failed to read {}", aliases_path.display()))?;
+        let parsed_aliases = rgv_core::parse_landmark_aliases(&alias_text)?;
+        let contig_bindings =
+            landmark_contig_bindings(&bundle, &self.assembly.dictionary, &parsed_aliases)?;
         let (spec_kind, format) = match asset.format {
             rgv_core::LandmarkAssetFormat::BigGenePred => {
                 (TrackSpecKind::BigGenePred, Some(TrackFormat::BigGenePred))
@@ -593,7 +614,12 @@ impl Viewer {
         });
         config.format = format;
         config.feature.display_mode = FeatureDisplayMode::Squished;
-        self.add_preconfigured_track_source(&path, spec_kind, config)?;
+        self.add_preconfigured_track_source_with_query_contig_aliases(
+            &path,
+            spec_kind,
+            config,
+            contig_bindings.query_contig_aliases,
+        )?;
         self.automation_auxiliary_open_state
             .insert(next_id, AutomationAuxiliaryOpenState::Pending);
         self.data_status = "Opening all transcripts…".to_owned();
@@ -632,6 +658,138 @@ impl Viewer {
         self.data_status = format!("Opened landmark resources at {}", root.display());
         Ok(())
     }
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct LandmarkContigBindings {
+    /// Source spellings and their synonyms resolved onto the workspace's
+    /// canonical dictionary names. This drives search/navigation/cytobands.
+    workspace_aliases: ContigAliases,
+    /// Workspace canonical names translated back into the exact vocabulary
+    /// used by the bundled annotation source. This drives track queries.
+    query_contig_aliases: BTreeMap<String, String>,
+}
+
+fn landmark_contig_bindings(
+    bundle: &rgv_core::GenomeLandmarkBundle,
+    dictionary: &ReferenceDictionary,
+    bundled_aliases: &ContigAliases,
+) -> Result<LandmarkContigBindings> {
+    let mut source_to_workspace = BTreeMap::new();
+    let mut missing_nuclear_primary = Vec::new();
+
+    for source_contig in &bundle.assembly.contigs {
+        let exact = dictionary
+            .id_by_name(&source_contig.name)
+            .and_then(|id| dictionary.get(id))
+            .filter(|contig| contig.length() == source_contig.length)
+            .map(|contig| contig.name().to_owned());
+        let workspace_contig = if let Some(exact) = exact {
+            Some(exact)
+        } else {
+            let mut candidates = bundled_aliases
+                .iter()
+                .filter(|(_, canonical)| *canonical == &source_contig.name)
+                .filter_map(|(alias, _)| {
+                    dictionary
+                        .id_by_name(alias)
+                        .and_then(|id| dictionary.get(id))
+                        .filter(|contig| contig.length() == source_contig.length)
+                        .map(|contig| contig.name().to_owned())
+                })
+                .collect::<Vec<_>>();
+            candidates.sort();
+            candidates.dedup();
+            anyhow::ensure!(
+                candidates.len() <= 1,
+                "landmark contig {} maps to multiple workspace sequences: {}",
+                source_contig.name,
+                candidates.join(", ")
+            );
+            candidates.pop()
+        };
+
+        let Some(workspace_contig) = workspace_contig else {
+            if source_contig.primary && !is_mitochondrial_contig(&source_contig.name) {
+                missing_nuclear_primary.push(source_contig.name.clone());
+            }
+            continue;
+        };
+        source_to_workspace.insert(source_contig.name.clone(), workspace_contig);
+    }
+
+    anyhow::ensure!(
+        missing_nuclear_primary.is_empty(),
+        "landmark bundle {} is missing compatible nuclear contigs: {}",
+        bundle.id,
+        missing_nuclear_primary.join(", ")
+    );
+
+    let mut bindings = LandmarkContigBindings::default();
+    for (source, workspace) in &source_to_workspace {
+        if source != workspace {
+            insert_unique_contig_binding(
+                &mut bindings.workspace_aliases,
+                source,
+                workspace,
+                "workspace alias",
+            )?;
+            insert_unique_contig_binding(
+                &mut bindings.query_contig_aliases,
+                workspace,
+                source,
+                "track query alias",
+            )?;
+        }
+    }
+    for (alias, source) in bundled_aliases {
+        let Some(workspace) = source_to_workspace.get(source) else {
+            continue;
+        };
+        if alias == workspace {
+            continue;
+        }
+        if let Some(id) = dictionary.id_by_name(alias) {
+            let workspace_id = dictionary
+                .id_by_name(workspace)
+                .expect("a bound workspace contig came from the dictionary");
+            if id != workspace_id {
+                continue;
+            }
+        }
+        insert_unique_contig_binding(
+            &mut bindings.workspace_aliases,
+            alias,
+            workspace,
+            "workspace alias",
+        )?;
+    }
+    Ok(bindings)
+}
+
+fn insert_unique_contig_binding(
+    bindings: &mut BTreeMap<String, String>,
+    alias: &str,
+    target: &str,
+    label: &str,
+) -> Result<()> {
+    if let Some(previous) = bindings.insert(alias.to_owned(), target.to_owned()) {
+        anyhow::ensure!(
+            previous == target,
+            "{label} {alias} targets both {previous} and {target}"
+        );
+    }
+    Ok(())
+}
+
+fn is_mitochondrial_contig(name: &str) -> bool {
+    matches!(
+        name.strip_prefix("chr")
+            .unwrap_or(name)
+            .to_ascii_uppercase()
+            .as_str(),
+        "M" | "MT"
+    )
 }
 
 fn insert_feature_attribute(record: &mut rgv_hts::FeatureRecord, key: &str, value: &str) {
@@ -845,5 +1003,83 @@ mod tests {
         hit.matched_term = "ensg000001".to_owned();
         assert_eq!(annotation_search_rank(&hit, "ensg000001"), 4);
         assert_eq!(annotation_search_rank(&hit, "ensg"), 5);
+    }
+
+    #[test]
+    fn landmark_contigs_bind_ucsc_sources_to_b37_workspace_names() {
+        let bundle = rgv_core::GenomeLandmarkBundle {
+            id: "hg19".to_owned(),
+            version: "1".to_owned(),
+            display_name: "Genes".to_owned(),
+            provider: "fixture".to_owned(),
+            release: "fixture".to_owned(),
+            selection_policy: "fixture".to_owned(),
+            assembly: rgv_core::LandmarkAssemblyIdentity {
+                stable_id: "GRCh37.p13".to_owned(),
+                display_name: "GRCh37".to_owned(),
+                compatible_ids: vec!["GRCh37".to_owned()],
+                primary_contig_count: 3,
+                dictionary_sha256: "a".repeat(64),
+                compatible_dictionary_sha256: Vec::new(),
+                contigs: vec![
+                    rgv_core::LandmarkContigFingerprint {
+                        name: "chr1".to_owned(),
+                        length: 100,
+                        md5: None,
+                        primary: true,
+                    },
+                    rgv_core::LandmarkContigFingerprint {
+                        name: "chr2".to_owned(),
+                        length: 200,
+                        md5: None,
+                        primary: true,
+                    },
+                    rgv_core::LandmarkContigFingerprint {
+                        name: "chrM".to_owned(),
+                        length: 50,
+                        md5: None,
+                        primary: true,
+                    },
+                ],
+            },
+            assets: Vec::new(),
+        };
+        let dictionary = ReferenceDictionary::from_contigs([
+            ("1".to_owned(), 100),
+            ("2".to_owned(), 200),
+            // The b37 and UCSC mitochondrial sequences are known variants;
+            // an unequal sequence must not receive a coordinate alias.
+            ("MT".to_owned(), 49),
+            ("decoy".to_owned(), 1_000),
+        ]);
+        let aliases = ContigAliases::from([
+            ("1".to_owned(), "chr1".to_owned()),
+            ("CM000001.1".to_owned(), "chr1".to_owned()),
+            ("2".to_owned(), "chr2".to_owned()),
+            ("MT".to_owned(), "chrM".to_owned()),
+        ]);
+
+        let bindings = landmark_contig_bindings(&bundle, &dictionary, &aliases).unwrap();
+
+        assert_eq!(
+            bindings.query_contig_aliases,
+            BTreeMap::from([
+                ("1".to_owned(), "chr1".to_owned()),
+                ("2".to_owned(), "chr2".to_owned()),
+            ])
+        );
+        assert_eq!(
+            bindings.workspace_aliases.get("chr1").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            bindings
+                .workspace_aliases
+                .get("CM000001.1")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(!bindings.workspace_aliases.contains_key("chrM"));
+        assert!(!bindings.query_contig_aliases.contains_key("MT"));
     }
 }

@@ -84,6 +84,12 @@ BUILD_SPECS = {
         assembly_display_name="GRCh37 / hg19",
         compatible_ids=("GRCh37", "hg19"),
         release="RefSeq Select snapshot used by IGV hg19",
+        # 1000 Genomes b37 plus hs37d5, with Ensembl-style primary names and
+        # the 16,569-base mitochondrial sequence. Its nuclear coordinates are
+        # exactly GRCh37; source-contig aliases are bound separately at runtime.
+        compatible_dictionary_sha256=(
+            "d74373ee19d2e0f8378f17ea869b31f242189d381b2e04be48f6fbd76fb7028b",
+        ),
     ),
     "mm10": BuildSpec(
         "mm10",

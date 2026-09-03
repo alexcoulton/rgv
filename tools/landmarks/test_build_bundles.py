@@ -19,6 +19,12 @@ class LandmarkBundleTests(unittest.TestCase):
         self.assertEqual(fields[11], "GENE")
         self.assertEqual(build_bundles.validate_refgene(fields, {"chr1": 100}), (2, 30))
 
+    def test_hg19_qualifies_the_1000_genomes_b37_decoy_dictionary(self):
+        self.assertIn(
+            "d74373ee19d2e0f8378f17ea869b31f242189d381b2e04be48f6fbd76fb7028b",
+            build_bundles.BUILD_SPECS["hg19"].compatible_dictionary_sha256,
+        )
+
     def test_curator_selects_one_stable_representative_per_gene(self):
         rows = [
             "0\tNR_1\tchr1\t+\t0\t90\t90\t90\t1\t0,\t90,\t0\tA\tnone\tnone\t-1,\n",

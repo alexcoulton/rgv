@@ -87,6 +87,21 @@ impl Viewer {
         kind: TrackSpecKind,
         config: TrackConfig,
     ) -> Result<TrackId> {
+        self.add_preconfigured_track_source_with_query_contig_aliases(
+            path,
+            kind,
+            config,
+            BTreeMap::new(),
+        )
+    }
+
+    pub(crate) fn add_preconfigured_track_source_with_query_contig_aliases(
+        &mut self,
+        path: &Path,
+        kind: TrackSpecKind,
+        config: TrackConfig,
+        query_contig_aliases: BTreeMap<String, String>,
+    ) -> Result<TrackId> {
         let id = config.id;
         let specification = TrackSpec {
             id,
@@ -95,9 +110,18 @@ impl Viewer {
             kind,
         };
         if let Some(engine) = &self.track_engine {
-            engine.try_add(specification)?;
-        } else {
+            if query_contig_aliases.is_empty() {
+                engine.try_add(specification)?;
+            } else {
+                engine.try_add_with_query_contig_aliases(specification, query_contig_aliases)?;
+            }
+        } else if query_contig_aliases.is_empty() {
             self.track_engine = Some(TrackEngine::spawn(vec![specification], 8));
+        } else {
+            self.track_engine = Some(TrackEngine::spawn_with_query_contig_aliases(
+                vec![(specification, query_contig_aliases)],
+                8,
+            ));
         }
         let source_label = config.source.redacted_label();
         self.tracks.push(config);

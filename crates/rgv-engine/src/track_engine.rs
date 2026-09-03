@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -143,8 +143,15 @@ pub enum TrackEngineEvent {
 }
 
 enum TrackEngineRequest {
-    Add(TrackSpec),
+    Add {
+        specification: TrackSpec,
+        query_contig_aliases: BTreeMap<String, String>,
+    },
     AddMany(Vec<TrackSpec>),
+    SetQueryContigAliases {
+        id: TrackId,
+        query_contig_aliases: BTreeMap<String, String>,
+    },
     Remove(Vec<TrackId>),
     Query {
         request: PanelGeneration,
@@ -249,6 +256,19 @@ pub struct TrackEngine {
 
 impl TrackEngine {
     pub fn spawn(specifications: Vec<TrackSpec>, capacity: usize) -> Self {
+        Self::spawn_with_query_contig_aliases(
+            specifications
+                .into_iter()
+                .map(|specification| (specification, BTreeMap::new()))
+                .collect(),
+            capacity,
+        )
+    }
+
+    pub fn spawn_with_query_contig_aliases(
+        specifications: Vec<(TrackSpec, BTreeMap<String, String>)>,
+        capacity: usize,
+    ) -> Self {
         let (input_tx, input_rx) = bounded(capacity.max(1));
         let (output_tx, output_rx) = bounded_coalescing(capacity.max(1));
         let worker = thread::Builder::new()
@@ -376,11 +396,25 @@ impl TrackEngine {
     }
 
     pub fn try_add(&self, specification: TrackSpec) -> Result<(), EngineQueueError> {
+        self.try_add_with_query_contig_aliases(specification, BTreeMap::new())
+    }
+
+    /// Adds a track whose source uses different contig spellings from the
+    /// workspace dictionary. Keys are workspace contigs and values are exact
+    /// names understood by the source (for example `1 -> chr1`).
+    pub fn try_add_with_query_contig_aliases(
+        &self,
+        specification: TrackSpec,
+        query_contig_aliases: BTreeMap<String, String>,
+    ) -> Result<(), EngineQueueError> {
         let Some(input) = &self.input else {
             return Err(EngineQueueError::Disconnected);
         };
         input
-            .try_send(TrackEngineRequest::Add(specification))
+            .try_send(TrackEngineRequest::Add {
+                specification,
+                query_contig_aliases,
+            })
             .map_err(map_send_error)
     }
 
@@ -390,6 +424,22 @@ impl TrackEngine {
         };
         input
             .try_send(TrackEngineRequest::AddMany(specifications))
+            .map_err(map_send_error)
+    }
+
+    pub fn try_set_query_contig_aliases(
+        &self,
+        id: TrackId,
+        query_contig_aliases: BTreeMap<String, String>,
+    ) -> Result<(), EngineQueueError> {
+        let Some(input) = &self.input else {
+            return Err(EngineQueueError::Disconnected);
+        };
+        input
+            .try_send(TrackEngineRequest::SetQueryContigAliases {
+                id,
+                query_contig_aliases,
+            })
             .map_err(map_send_error)
     }
 
@@ -465,16 +515,21 @@ impl Drop for TrackEngine {
 }
 
 fn worker_loop(
-    specifications: Vec<TrackSpec>,
+    specifications: Vec<(TrackSpec, BTreeMap<String, String>)>,
     input: &Receiver<TrackEngineRequest>,
     output: &CoalescingSender<TrackEngineEvent>,
 ) {
     let mut tracks = Vec::new();
     let mut tdf_sources = HashMap::new();
+    let mut query_contig_aliases = HashMap::new();
     let mut failed = 0;
-    for specification in specifications {
+    for (specification, aliases) in specifications {
         match open_and_push_track(&specification, &mut tracks, &mut tdf_sources, output) {
-            Ok(_) => {}
+            Ok(id) => {
+                if !aliases.is_empty() {
+                    query_contig_aliases.insert(id, aliases);
+                }
+            }
             Err(message) => {
                 failed += 1;
                 send_track_open_error(output, &specification, &message);
@@ -490,12 +545,18 @@ fn worker_loop(
     );
     while let Ok(request) = input.recv() {
         match request {
-            TrackEngineRequest::Add(specification) => {
-                match open_and_push_track(&specification, &mut tracks, &mut tdf_sources, output) {
-                    Ok(id) => send_event(output, TrackEngineEvent::TrackAdded { id }),
-                    Err(message) => send_track_open_error(output, &specification, &message),
+            TrackEngineRequest::Add {
+                specification,
+                query_contig_aliases: aliases,
+            } => match open_and_push_track(&specification, &mut tracks, &mut tdf_sources, output) {
+                Ok(id) => {
+                    if !aliases.is_empty() {
+                        query_contig_aliases.insert(id, aliases);
+                    }
+                    send_event(output, TrackEngineEvent::TrackAdded { id });
                 }
-            }
+                Err(message) => send_track_open_error(output, &specification, &message),
+            },
             TrackEngineRequest::AddMany(specifications) => {
                 let added =
                     open_and_push_tracks(specifications, &mut tracks, &mut tdf_sources, output);
@@ -503,8 +564,25 @@ fn worker_loop(
                     send_event(output, TrackEngineEvent::TracksAdded { ids: added });
                 }
             }
+            TrackEngineRequest::SetQueryContigAliases {
+                id,
+                query_contig_aliases: aliases,
+            } => {
+                if tracks.iter().any(|track| track.id() == id) {
+                    if aliases.is_empty() {
+                        query_contig_aliases.remove(&id);
+                    } else {
+                        query_contig_aliases.insert(id, aliases);
+                    }
+                }
+            }
             TrackEngineRequest::Remove(ids) => {
-                let removed = remove_tracks(&mut tracks, &mut tdf_sources, ids);
+                let removed = remove_tracks(
+                    &mut tracks,
+                    &mut tdf_sources,
+                    &mut query_contig_aliases,
+                    ids,
+                );
                 if !removed.is_empty() {
                     send_event(output, TrackEngineEvent::TracksRemoved { ids: removed });
                 }
@@ -520,6 +598,7 @@ fn worker_loop(
                 copy_number_settings,
             } => query_tracks(
                 &mut tracks,
+                &query_contig_aliases,
                 output,
                 &clock,
                 request,
@@ -551,7 +630,14 @@ fn worker_loop(
                 output,
                 TrackEngineEvent::AdjacentFeatureCompleted {
                     generation,
-                    hit: adjacent_feature(&mut tracks, &contig, position, forward).map(Box::new),
+                    hit: adjacent_feature(
+                        &mut tracks,
+                        &query_contig_aliases,
+                        &contig,
+                        position,
+                        forward,
+                    )
+                    .map(Box::new),
                 },
             ),
         }
@@ -605,6 +691,7 @@ fn send_track_open_error(
 fn remove_tracks(
     tracks: &mut Vec<OpenTrack>,
     tdf_sources: &mut TdfSourceCache,
+    query_contig_aliases: &mut HashMap<TrackId, BTreeMap<String, String>>,
     ids: Vec<TrackId>,
 ) -> Vec<TrackId> {
     let requested = ids.into_iter().collect::<HashSet<_>>();
@@ -620,6 +707,7 @@ fn remove_tracks(
     }
     let removed_set = removed.iter().copied().collect::<HashSet<_>>();
     tracks.retain(|track| !removed_set.contains(&track.id()));
+    query_contig_aliases.retain(|id, _| !removed_set.contains(id));
     tdf_sources.retain(|_, source| Rc::strong_count(source) > 1);
     removed
 }
@@ -652,6 +740,7 @@ fn send_tdf_discovery(
 
 fn adjacent_feature(
     tracks: &mut [OpenTrack],
+    query_contig_aliases: &HashMap<TrackId, BTreeMap<String, String>>,
     contig: &str,
     position: u64,
     forward: bool,
@@ -659,12 +748,13 @@ fn adjacent_feature(
     let mut hits = tracks
         .iter_mut()
         .filter_map(|track| {
+            let query_contig = track_query_contig(query_contig_aliases, track.id(), contig);
             let (id, name, record) = match track {
                 OpenTrack::Text { id, name, source } => {
-                    (*id, name.clone(), source.adjacent_feature(contig, position, forward)?)
+                    (*id, name.clone(), source.adjacent_feature(query_contig, position, forward)?)
                 }
                 OpenTrack::BigBed { id, name, source } => match source
-                    .adjacent_feature(contig, position, forward)
+                    .adjacent_feature(query_contig, position, forward)
                 {
                     Ok(Some(record)) => (*id, name.clone(), record),
                     Ok(None) => return None,
@@ -674,7 +764,8 @@ fn adjacent_feature(
                     }
                 },
                 OpenTrack::Gwas { id, name, source } => {
-                    let association = source.adjacent_association(contig, position, forward)?;
+                    let association =
+                        source.adjacent_association(query_contig, position, forward)?;
                     (*id, name.clone(), gwas_feature_record(association))
                 }
                 OpenTrack::Variants { .. }
@@ -843,6 +934,7 @@ fn gwas_feature_record(record: rgv_hts::GwasRecord) -> FeatureRecord {
 #[allow(clippy::too_many_arguments)]
 fn query_tracks(
     tracks: &mut [OpenTrack],
+    query_contig_aliases: &HashMap<TrackId, BTreeMap<String, String>>,
     output: &CoalescingSender<TrackEngineEvent>,
     clock: &GenerationClock,
     request: PanelGeneration,
@@ -868,9 +960,10 @@ fn query_tracks(
         {
             continue;
         }
+        let query_contig = track_query_contig(query_contig_aliases, track.id(), contig);
         match query_track(
             track,
-            contig,
+            query_contig,
             interval.start(),
             interval.end(),
             variant_settings,
@@ -908,6 +1001,17 @@ fn query_tracks(
             },
         );
     }
+}
+
+fn track_query_contig<'a>(
+    aliases: &'a HashMap<TrackId, BTreeMap<String, String>>,
+    track_id: TrackId,
+    workspace_contig: &'a str,
+) -> &'a str {
+    aliases
+        .get(&track_id)
+        .and_then(|aliases| aliases.get(workspace_contig))
+        .map_or(workspace_contig, String::as_str)
 }
 
 type TdfSourceCache = HashMap<PathBuf, Rc<RefCell<TdfSource>>>;
@@ -1385,7 +1489,8 @@ mod tests {
         assert_eq!(results.hits[0].record.name.as_deref(), Some("BRCA"));
         assert_eq!(results.hits[1].record.name.as_deref(), Some("BRCA2"));
         assert_eq!(
-            adjacent_feature(&mut tracks, "chr2", 0, true).and_then(|hit| hit.record.name),
+            adjacent_feature(&mut tracks, &HashMap::new(), "chr2", 0, true)
+                .and_then(|hit| hit.record.name),
             Some("BRCA2".to_owned())
         );
     }
@@ -1459,6 +1564,92 @@ mod tests {
     }
 
     #[test]
+    fn dynamically_added_landmark_track_queries_its_source_contig_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let gene_path = directory.path().join("genes.genePred");
+        std::fs::write(
+            &gene_path,
+            "tx1\tchr1\t+\t100\t400\t150\t350\t2\t100,300,\t200,400,\n",
+        )
+        .unwrap();
+        let track_id = TrackId::new(10);
+        let engine = TrackEngine::spawn(Vec::new(), 8);
+        engine
+            .try_add_with_query_contig_aliases(
+                TrackSpec {
+                    id: track_id,
+                    name: "Genes".to_owned(),
+                    path: gene_path,
+                    kind: TrackSpecKind::GenePred,
+                },
+                BTreeMap::from([("1".to_owned(), "chr1".to_owned())]),
+            )
+            .unwrap();
+        let clock = GenerationClock::default();
+        let request = PanelGeneration::new(PanelId::new(1), clock.current());
+        engine
+            .try_query(
+                request,
+                clock,
+                "1".to_owned(),
+                GenomicInterval::new(ContigId::new(0), 180, 181).unwrap(),
+            )
+            .unwrap();
+
+        let snapshots = receive_query(&engine, "mapped landmark actor query timed out");
+        assert_eq!(snapshots.len(), 1);
+        let TrackSnapshotData::Features(genes) = &snapshots[0].data else {
+            panic!("landmark genePred source returned the wrong snapshot type");
+        };
+        assert_eq!(genes.len(), 1);
+        assert_eq!(genes[0].contig, "chr1");
+    }
+
+    #[test]
+    fn restored_landmark_track_can_rebind_its_query_contig_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let gene_path = directory.path().join("genes.genePred");
+        std::fs::write(
+            &gene_path,
+            "tx1\tchr1\t+\t100\t400\t150\t350\t2\t100,300,\t200,400,\n",
+        )
+        .unwrap();
+        let track_id = TrackId::new(10);
+        let engine = TrackEngine::spawn(
+            vec![TrackSpec {
+                id: track_id,
+                name: "Genes".to_owned(),
+                path: gene_path,
+                kind: TrackSpecKind::GenePred,
+            }],
+            8,
+        );
+        engine
+            .try_set_query_contig_aliases(
+                track_id,
+                BTreeMap::from([("1".to_owned(), "chr1".to_owned())]),
+            )
+            .unwrap();
+        let clock = GenerationClock::default();
+        let request = PanelGeneration::new(PanelId::new(1), clock.current());
+        engine
+            .try_query(
+                request,
+                clock,
+                "1".to_owned(),
+                GenomicInterval::new(ContigId::new(0), 180, 181).unwrap(),
+            )
+            .unwrap();
+
+        let snapshots = receive_query(&engine, "rebound landmark actor query timed out");
+        assert_eq!(snapshots.len(), 1);
+        let TrackSnapshotData::Features(genes) = &snapshots[0].data else {
+            panic!("landmark genePred source returned the wrong snapshot type");
+        };
+        assert_eq!(genes.len(), 1);
+    }
+
+    #[test]
     fn broad_peak_and_psl_query_search_and_navigate_through_the_engine_boundary() {
         let directory = tempfile::tempdir().unwrap();
         let broad_path = directory.path().join("signal.broadPeak");
@@ -1503,7 +1694,7 @@ mod tests {
         let search = search_tracks(&mut tracks, "query-1".to_owned(), 10, false);
         assert_eq!(search.hits[0].track_id, TrackId::new(13));
         assert_eq!(
-            adjacent_feature(&mut tracks, "chr1", 0, true)
+            adjacent_feature(&mut tracks, &HashMap::new(), "chr1", 0, true)
                 .unwrap()
                 .record
                 .start,
@@ -1539,7 +1730,7 @@ mod tests {
         assert_eq!(search.hits.len(), 1);
         assert_eq!(search.hits[0].record.name.as_deref(), Some("rs-first"));
         assert_eq!(search.hits[0].record.start, 100);
-        let adjacent = adjacent_feature(&mut tracks, "chr6", 101, true).unwrap();
+        let adjacent = adjacent_feature(&mut tracks, &HashMap::new(), "chr6", 101, true).unwrap();
         assert_eq!(adjacent.record.name.as_deref(), Some("rs-second"));
     }
 
@@ -1633,6 +1824,7 @@ mod tests {
         let path = directory.path().join("archive.tdf");
         std::fs::write(&path, tdf_fixture()).unwrap();
         let mut cache = TdfSourceCache::new();
+        let mut query_contig_aliases = HashMap::new();
         let mut tracks = vec![
             open_track_cached(
                 &TrackSpec {
@@ -1661,6 +1853,7 @@ mod tests {
             remove_tracks(
                 &mut tracks,
                 &mut cache,
+                &mut query_contig_aliases,
                 vec![TrackId::new(20), TrackId::new(20), TrackId::new(999)],
             ),
             [TrackId::new(20)]
@@ -1670,7 +1863,12 @@ mod tests {
         assert_eq!(cache.len(), 1);
 
         assert_eq!(
-            remove_tracks(&mut tracks, &mut cache, vec![TrackId::new(21)]),
+            remove_tracks(
+                &mut tracks,
+                &mut cache,
+                &mut query_contig_aliases,
+                vec![TrackId::new(21)],
+            ),
             [TrackId::new(21)]
         );
         assert!(tracks.is_empty());
