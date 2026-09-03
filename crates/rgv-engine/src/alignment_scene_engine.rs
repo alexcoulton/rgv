@@ -161,6 +161,9 @@ pub enum AlignmentSceneFrameCause {
     SourceControlRetry,
     ResourcePressureRetry,
     SourcePublication,
+    /// A source transaction completed without publishing a scene, but changed the lane's
+    /// externally visible dependency or liveness state.
+    SourceSettlement,
     /// Latest-wins publication for a vertical row-camera change; source and atlas authority are
     /// unchanged.
     RowCamera,
@@ -1056,6 +1059,19 @@ fn scene_worker_loop<B>(
                             )
                             .is_err()
                         {
+                            return;
+                        }
+                    }
+                    for owner in pump.source_settlements {
+                        if !send_frame(
+                            &coordinator,
+                            output,
+                            owner,
+                            current_request_token(&request_tokens, owner),
+                            AlignmentSceneFrameCause::SourceSettlement,
+                            None,
+                            None,
+                        ) {
                             return;
                         }
                     }
@@ -1992,25 +2008,27 @@ mod tests {
         path::Path,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread::ThreadId,
         time::Instant,
     };
 
     use rgv_alignment_scene::{
-        AlignmentCamera, AlignmentStyleContract, AlleleSummaryDetail, AllocationBundleActual,
+        AlignmentCamera, AlignmentFilterPredicate, AlignmentFilterScope, AlignmentStyleContract,
+        AlignmentViewFilterContract, AlleleSummaryDetail, AllocationBundleActual,
         AllocationBundleDemand, AllocationBundleSlot, AllocationBundleSpec, AllocationClass,
         AllocationLedger, AllocationRetirementClaimSet, AllocationRetirementToken,
         CapabilityRequirement, EvidenceStore, GeometryLod, LayoutContract, PayloadContract,
-        PresentationContract, RevisionFingerprint, SourceFingerprint, SummaryContract,
+        PresentationContract, ReferenceRevision, RevisionFingerprint, SourceFingerprint,
+        SummaryContract,
     };
     use rgv_core::{
         AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigId, GenomicInterval,
         OverlappingMatePolicy, ReadStackingMode,
     };
     use rgv_hts::{
-        AlignmentOpenOptions, AlignmentSource, LocalAlignmentSource, QueryOptions,
+        AlignmentOpenOptions, AlignmentSource, LocalAlignmentSource, QueryOptions, ReferenceSlice,
         TemplateLengthBounds,
     };
 
@@ -2382,6 +2400,8 @@ mod tests {
     struct ThreadRecordingBackend {
         inner: LocalBamCanonicalBackend,
         threads: Arc<Mutex<Vec<ThreadId>>>,
+        completion_gate: Option<Arc<AtomicBool>>,
+        pending_completion: Option<CanonicalDecodeCheckpoint>,
     }
 
     impl ThreadRecordingBackend {
@@ -2425,7 +2445,32 @@ mod tests {
             ledger: &AllocationLedger,
         ) -> Result<CanonicalDecodeCheckpoint, Self::Error> {
             self.record_thread();
-            self.inner.next_checkpoint(work, ledger)
+            if let Some(completion) = self.pending_completion.take() {
+                if self
+                    .completion_gate
+                    .as_ref()
+                    .is_none_or(|gate| gate.load(Ordering::SeqCst))
+                {
+                    return Ok(completion);
+                }
+                self.pending_completion = Some(completion);
+                return Ok(CanonicalDecodeCheckpoint::Progress {
+                    genomic_span: work.intent().spec().target(),
+                });
+            }
+            let checkpoint = self.inner.next_checkpoint(work, ledger)?;
+            if matches!(&checkpoint, CanonicalDecodeCheckpoint::Complete(_))
+                && self
+                    .completion_gate
+                    .as_ref()
+                    .is_some_and(|gate| !gate.load(Ordering::SeqCst))
+            {
+                self.pending_completion = Some(checkpoint);
+                return Ok(CanonicalDecodeCheckpoint::Progress {
+                    genomic_span: work.intent().spec().target(),
+                });
+            }
+            Ok(checkpoint)
         }
 
         fn retarget(&mut self, work: &SourceWork) -> Result<(), Self::Error> {
@@ -2439,7 +2484,9 @@ mod tests {
         }
     }
 
-    fn test_engine() -> (
+    fn test_engine_with_completion_gate(
+        completion_gate: Option<Arc<AtomicBool>>,
+    ) -> (
         AlignmentSceneEngine<ThreadRecordingBackend>,
         AlignmentSceneBuildContract,
         AlignmentScenePreparationPolicy,
@@ -2464,6 +2511,8 @@ mod tests {
         let backend = ThreadRecordingBackend {
             inner: backend,
             threads: Arc::clone(&threads),
+            completion_gate,
+            pending_completion: None,
         };
         let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 32 << 20, 64 << 20);
         let store = EvidenceStore::new(source_revision, record_contract, ledger);
@@ -2544,6 +2593,16 @@ mod tests {
         )
     }
 
+    fn test_engine() -> (
+        AlignmentSceneEngine<ThreadRecordingBackend>,
+        AlignmentSceneBuildContract,
+        AlignmentScenePreparationPolicy,
+        AlignmentCamera,
+        Arc<Mutex<Vec<ThreadId>>>,
+    ) {
+        test_engine_with_completion_gate(None)
+    }
+
     #[test]
     fn worker_publishes_immutable_frames_without_decoding_on_the_caller_thread() {
         let caller = thread::current().id();
@@ -2583,6 +2642,132 @@ mod tests {
             .clone();
         assert!(!observed.is_empty());
         assert!(observed.into_iter().all(|worker| worker != caller));
+    }
+
+    #[test]
+    fn worker_publishes_reference_handoff_when_source_settles_without_a_scene() {
+        let completion_gate = Arc::new(AtomicBool::new(false));
+        let (engine, mut contract, policy, camera, _) =
+            test_engine_with_completion_gate(Some(Arc::clone(&completion_gate)));
+        let revision = ReferenceRevision::new(RevisionFingerprint::new(
+            0x5245_4645_5245_4e43,
+            0x4841_4e44_4f46_46,
+        ));
+        contract.payload = PayloadContract::new(
+            CapabilityRequirement::Required,
+            CapabilityRequirement::Required,
+            [*b"XS"],
+            None,
+        );
+        contract.view_filter = AlignmentViewFilterContract::new(
+            1,
+            [AlignmentFilterPredicate::Substitution {
+                scope: AlignmentFilterScope::Anywhere,
+                observed_base: None,
+                minimum_count: Some(1),
+                maximum_count: None,
+            }],
+        );
+        contract.presentation.reference = Some(revision);
+        let owner = SourceOwnerId::new(44);
+        let request_token = AlignmentSceneRequestToken::new(700);
+        engine
+            .try_insert_lane_for_request(owner, request_token, contract, policy)
+            .unwrap();
+        let _ = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::LaneInserted { owner: seen } if *seen == owner
+            )
+        });
+        engine
+            .try_update_camera_for_request(owner, request_token, camera)
+            .unwrap();
+        let initial_frame = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    cause: AlignmentSceneFrameCause::Camera,
+                    ..
+                } if *seen == owner
+            )
+        });
+        let AlignmentSceneEngineEvent::FrameUpdated { frame, work, .. } = initial_frame else {
+            unreachable!("matching event has the asserted frame shape")
+        };
+        let initial = match frame.reference_requirement {
+            crate::AlignmentReferenceRequirement::Pending { horizon, .. } => horizon,
+            other => panic!("expected pending reference requirement, got {other:?}"),
+        };
+        assert!(work.source_pending);
+
+        let bases = vec![b'A'; usize::try_from(initial.len()).unwrap()];
+        engine
+            .try_install_reference_authority(
+                owner,
+                AlignmentReferenceAuthority::new(
+                    revision,
+                    Arc::new(ReferenceSlice {
+                        interval: initial,
+                        bases,
+                    }),
+                ),
+            )
+            .unwrap();
+        let ready = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    cause: AlignmentSceneFrameCause::ReferenceAuthority,
+                    ..
+                } if *seen == owner
+            )
+        });
+        let AlignmentSceneEngineEvent::FrameUpdated { frame, work, .. } = ready else {
+            unreachable!("matching event has the asserted frame shape")
+        };
+        assert_eq!(
+            frame.reference_requirement,
+            crate::AlignmentReferenceRequirement::Ready {
+                revision,
+                horizon: initial,
+            }
+        );
+        assert!(work.source_pending);
+
+        completion_gate.store(true, Ordering::SeqCst);
+        let handoff = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    cause: AlignmentSceneFrameCause::SourceSettlement,
+                    ..
+                } if *seen == owner
+            )
+        });
+        let AlignmentSceneEngineEvent::FrameUpdated {
+            frame,
+            work,
+            published_scene,
+            request_token: seen_token,
+            ..
+        } = handoff
+        else {
+            unreachable!("matching event has the asserted frame shape")
+        };
+        let expanded = match frame.reference_requirement {
+            crate::AlignmentReferenceRequirement::Pending { horizon, .. } => horizon,
+            other => panic!("expected expanded pending reference requirement, got {other:?}"),
+        };
+        assert_eq!(seen_token, request_token);
+        assert!(expanded.contains_interval(initial));
+        assert_ne!(expanded, initial);
+        assert!(published_scene.is_none());
+        assert!(!work.source_pending);
+        assert!(!work.presentation_pending);
     }
 
     #[test]

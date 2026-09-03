@@ -621,6 +621,7 @@ where
         let AlignmentSceneSourcePump {
             source_event,
             publications,
+            source_settlements: _,
             refusals,
             pressures,
             foreground_submitted,
@@ -756,6 +757,12 @@ where
 pub struct AlignmentSceneSourcePump {
     pub source_event: Option<AlignmentSourceActorEvent>,
     pub publications: Vec<AlignmentSceneOwnerPublication>,
+    /// Owners whose successful source transaction reached a terminal reconciliation checkpoint
+    /// without publishing a new scene. Their externally visible frame may nevertheless have
+    /// changed—for example, reference-backed filtering can discover its exact FASTA horizon only
+    /// after all overlapping read spans are known. Threaded drivers must republish these frames
+    /// so liveness ownership can transfer away from an idle source worker.
+    pub source_settlements: Vec<SourceOwnerId>,
     pub refusals: Vec<AlignmentSceneOwnerRefusal>,
     pub pressures: Vec<AlignmentSceneOwnerPressure>,
     pub foreground_submitted: Option<SourceIntentSequence>,
@@ -1436,6 +1443,7 @@ where
         let event = self.actor.pump_once()?;
         let event_owner = event.as_ref().and_then(source_event_owner);
         let mut publications = Vec::new();
+        let mut source_settlements = Vec::new();
         let mut refusals = Vec::new();
         let mut pressures = Vec::new();
         let mut foreground_submitted = None;
@@ -1514,7 +1522,15 @@ where
                         Ok(Some(revision)) => {
                             publications.push(AlignmentSceneOwnerPublication { owner, revision });
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            // Completing canonical evidence can change a frame even when the
+                            // semantic scene cannot publish yet. Reference-backed filters are the
+                            // important case: exact eligible read spans can expand the required
+                            // FASTA horizon at this point. Preserve that terminal edge for the
+                            // threaded engine instead of letting it go idle with the UI still
+                            // assigning liveness to the source worker.
+                            source_settlements.push(owner);
+                        }
                         Err(error) => {
                             let Some(pressure) = coordinator_budget_pressure(&error) else {
                                 return Err(error);
@@ -1571,6 +1587,7 @@ where
         Ok(AlignmentSceneSourcePump {
             source_event: event,
             publications,
+            source_settlements,
             refusals,
             pressures,
             foreground_submitted,
@@ -4870,6 +4887,69 @@ mod tests {
         assert_eq!(
             evidence.view_filter().matching_records(),
             evidence.record_count()
+        );
+    }
+
+    #[test]
+    fn source_completion_reports_reference_dependency_settlement_without_publication() {
+        let revision = test_reference_revision(152);
+        let (mut source, mut contract, policy, camera) = test_source_coordinator();
+        contract.payload = PayloadContract::new(
+            CapabilityRequirement::Required,
+            CapabilityRequirement::Required,
+            [*b"XS"],
+            None,
+        );
+        contract.view_filter = AlignmentViewFilterContract::new(
+            1,
+            [AlignmentFilterPredicate::Substitution {
+                scope: AlignmentFilterScope::Anywhere,
+                observed_base: None,
+                minimum_count: Some(1),
+                maximum_count: None,
+            }],
+        );
+        contract.presentation.reference = Some(revision);
+        let owner = SourceOwnerId::new(7);
+        source.insert_lane(owner, contract, policy).unwrap();
+        source.update_camera(owner, camera).unwrap();
+        let initial = match source.frame(owner).unwrap().unwrap().reference_requirement {
+            AlignmentReferenceRequirement::Pending { horizon, .. } => horizon,
+            other => panic!("expected pending reference requirement, got {other:?}"),
+        };
+        assert!(
+            source
+                .install_reference_authority(owner, reference_authority(revision, initial))
+                .unwrap()
+                .installed
+        );
+
+        let completion = (0..256)
+            .find_map(|_| {
+                let pump = source.pump_once().unwrap();
+                matches!(
+                    pump.source_event,
+                    Some(AlignmentSourceActorEvent::AcquisitionCompleted { .. })
+                )
+                .then_some(pump)
+            })
+            .expect("bounded local fixture did not complete source acquisition");
+
+        assert!(completion.publications.is_empty());
+        assert_eq!(completion.source_settlements, vec![owner]);
+        let frame = source.frame(owner).unwrap().unwrap();
+        let expanded = match frame.reference_requirement {
+            AlignmentReferenceRequirement::Pending { horizon, .. } => horizon,
+            other => panic!("expected expanded pending reference requirement, got {other:?}"),
+        };
+        assert!(expanded.contains_interval(initial));
+        assert_ne!(expanded, initial);
+        assert_eq!(
+            source.owner_work_state(owner).unwrap(),
+            AlignmentSceneOwnerWorkState {
+                source_pending: false,
+                presentation_pending: false,
+            }
         );
     }
 

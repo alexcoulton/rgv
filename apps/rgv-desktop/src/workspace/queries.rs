@@ -1818,6 +1818,29 @@ impl Viewer {
                         continue;
                     };
                     if self.manual_diagnostic_trace_is_recording()
+                        && cause == AlignmentSceneFrameCause::SourceSettlement
+                    {
+                        self.record_manual_diagnostic_event(
+                            "alignment_worker",
+                            "source_settlement_without_scene_publication",
+                            serde_json::json!({
+                                "track_id": track_id.get(),
+                                "panel_id": panel_id.get(),
+                                "owner": owner.get(),
+                                "request_token": request_token.get(),
+                                "camera_sequence": frame.camera_sequence,
+                                "camera": format!("{:?}", frame.camera.interval()),
+                                "reference_requirement": format!("{:?}", frame.reference_requirement),
+                                "individual_reads": format!("{:?}", frame.individual_reads),
+                                "visible_complete": frame.visible_complete(),
+                                "scene_contracts_current": frame.scene_contracts_current,
+                                "reference_products_current": frame.reference_products_current,
+                                "source_pending": work.source_pending,
+                                "presentation_pending": work.presentation_pending,
+                            }),
+                        );
+                    }
+                    if self.manual_diagnostic_trace_is_recording()
                         && let Some(capacity) = update.and_then(|update| update.capacity_plan)
                     {
                         self.record_manual_diagnostic_event(
