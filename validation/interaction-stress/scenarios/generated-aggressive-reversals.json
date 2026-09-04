@@ -1,0 +1,35 @@
+{
+  "schema": "rgv.interaction_stress",
+  "schema_version": 1,
+  "name": "state-aware aggressive reversals",
+  "seed": 9021001,
+  "requirements": {},
+  "steps": [
+    {
+      "type": "generated",
+      "specification": {
+        "seed": 9021001,
+        "actions": 500,
+        "profile": "aggressive",
+        "allowed_actions": [
+          "canvas_pan",
+          "canvas_pan_reversal",
+          "read_scrollbar_drag",
+          "read_scrollbar_reversal",
+          "vertical_scroll",
+          "zoom",
+          "zoom_reversal",
+          "secondary_click",
+          "focus_cycle",
+          "resize"
+        ],
+        "maximum_no_wait_actions": 8
+      }
+    }
+  ],
+  "limits": {
+    "maximum_duration_millis": 7200000,
+    "maximum_native_events": 100000,
+    "maximum_held_millis": 30000
+  }
+}

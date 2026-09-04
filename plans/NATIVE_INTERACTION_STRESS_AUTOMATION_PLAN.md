@@ -1,7 +1,14 @@
 # RGV macOS interaction stress-testing framework plan
 
-Status: proposed; revised after product-intent review on 2026-09-03; implementation has not
-started
+Status: initial implementation complete; mechanical tests, checked-in scenario validation, and
+local native acceptance of both the round-trip smoke scenario and a generated 12-action scenario
+passed on 2026-09-04. Recording-overhead characterization and longer aggressive/soak trials remain
+operator-run macOS validation because they require a visible session and pre-authorised OS input
+permissions.
+
+The implementation and operating instructions are documented in
+[`docs/INTERACTION_STRESS.md`](../docs/INTERACTION_STRESS.md). The plan below remains the design and
+acceptance record; its local native gates are intentionally not claimed by non-interactive CI.
 
 This plan supersedes the earlier, broader native-interaction automation proposal. It reflects the
 following decisions:
@@ -38,7 +45,8 @@ The completed framework provides:
 
 - opt-in, streaming capture of replay-relevant native input;
 - conversion of recordings into inspectable, resolution-independent scenarios;
-- PID-targeted native pointer, scroll, modifier, keyboard, focus, and resize driving on macOS;
+- guarded native pointer/scroll delivery, PID-targeted keyboard delivery, and PID/window-bound
+  focus and resize driving on macOS;
 - stable targeting of panels, tracks, canvases, scrollbars, and supported controls;
 - recorded, accelerated, maximum-rate, and seeded-jitter timing modes;
 - a state-aware scenario generator that persists every generated action before executing it;
@@ -86,7 +94,8 @@ MCP, or manual visual review.
 A successful native stress run proves, for the declared scenario and environment, that:
 
 1. the controller targeted the expected live RGV instance and window;
-2. the macOS driver posted the compiled event sequence to that process;
+2. the macOS driver posted the compiled event sequence only while the selected process and window
+   passed the delivery guard;
 3. RGV observed the required native event structure through its normal runtime path;
 4. the intended target acquired, advanced, and released or cancelled its interaction correctly;
 5. declared semantic outcomes and invariants held; and
@@ -200,7 +209,7 @@ The framework consists of four cooperating components:
 2. **Small Swift macOS input driver**
    - accepts a narrow versioned stream of compiled native event instructions;
    - verifies the target PID and window;
-   - posts Core Graphics events to that PID;
+   - posts keyboard events to that PID and pointer/scroll events through a guarded HID event tap;
    - performs explicit Accessibility operations only for window discovery, focus, and resize;
    - reports attempted post time, result, and safety state for every instruction.
 
@@ -471,16 +480,21 @@ The first complete driver supports:
   reactivation; and
 - explicit window resize through the selected Accessibility window.
 
-Core Graphics provides
-[`CGEventPostToPid`](https://developer.apple.com/documentation/coregraphics/cgevent/posttopid%28_%3A%29)
-and typed [scroll phase and continuity fields](https://developer.apple.com/documentation/coregraphics/cgeventfield),
-so one small native driver is sufficient for the selected local stress scope. XCUITest would add a
-second orchestration stack without adding a required confidence claim.
+Core Graphics provides PID-targeted keyboard posting, HID-session event posting, and typed
+[scroll phase and continuity fields](https://developer.apple.com/documentation/coregraphics/cgeventfield).
+On the supported macOS host, direct PID posting delivered pointer movement but did not reliably
+deliver mouse-button transitions. Pointer and scroll events therefore use the HID event tap only
+after the driver validates the exact frontmost RGV process, WindowServer window number and bounds,
+topmost normal-window hit, and content-relative point. XCUITest would add a second orchestration
+stack without adding a required confidence claim.
 
 ### 8.3 Safety
 
 - Never post an event without a validated PID, application instance, window, run ID, and step ID.
-- Use PID-targeted posting; do not post globally as a fallback.
+- Keep keyboard events PID-targeted. Before every globally routed pointer or scroll event, require
+  the exact RGV PID to be frontmost, the selected layer-zero WindowServer window to own the target
+  point, unchanged window bounds, and a point inside the validated content area; abort before
+  posting if any check fails.
 - Require exclusive interaction with the selected RGV window during replay; abort on native input
   that cannot be matched structurally to the active driver step.
 - Bound every run by event count, wall-clock duration, coordinate extent, and held-button duration.
@@ -898,7 +912,7 @@ type, target, oracle, or failure class may be named for that defect.
 | macOS coalesces native movement differently between runs | Store requested, posted, and received streams; assert structural events and use repeated trials for scheduling-sensitive failures. |
 | Recording perturbs the bug | Keep UI work bounded, stream asynchronously, benchmark overhead, and fail visibly on evidence pressure. |
 | Semantic geometry goes stale | Resolve immediately before each gesture and abort on unexpected revision/window changes. |
-| A generated event affects another application | Require PID, instance, process, and window validation; use PID-targeted posting only. |
+| A generated event affects another application | Require PID and instance validation plus a per-event frontmost-process, exact-window-ID, unchanged-bounds, layer-zero hit, and content-bounds guard before globally routed pointer/scroll delivery. |
 | Concurrent human input corrupts routing evidence | Declare replay exclusive, recognise expected event structure, and abort with `extraneous_native_input`. |
 | Controller loses contact while input is held | Enforce driver-local duration bounds and emergency release independent of RGV. |
 | Existing synchronous batch request blocks on a UI stall | Use short batches and a separate authenticated atomic health read served outside the UI queue. |
@@ -916,7 +930,7 @@ The plan is complete when all of the following are true:
 2. Manual native use streams to a complete journal that survives verbose trace overwrite.
 3. A stopped or crashed recording is unambiguously complete or incomplete.
 4. A complete recording converts into an inspectable target-relative scenario.
-5. The scenario replays through PID-targeted macOS events, not direct RGV state mutation.
+5. The scenario replays through guarded native macOS events, not direct RGV state mutation.
 6. Driver post evidence correlates with native events received by RGV.
 7. Each gesture proves target acquisition, accepted transitions, and release/cancellation.
 8. Existing automation commands and snapshots perform setup and semantic observation without a
@@ -946,7 +960,7 @@ Do not implement this framework by:
 - turning MCP into the stress runner;
 - assigning viewport, scrollbar, pointer-capture, or gesture fields directly for replay;
 - claiming an internal reducer test proves native routing;
-- using AppleScript or untargeted global input as the primary driver;
+- using AppleScript or unguarded global input as the primary driver;
 - depending on absolute desktop pixels when a semantic target is available;
 - requiring XCUITest or full Xcode for this local framework;
 - treating the bounded diagnostic trace as a complete replay journal;

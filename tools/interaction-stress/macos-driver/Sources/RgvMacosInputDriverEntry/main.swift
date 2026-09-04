@@ -1,0 +1,3 @@
+import RgvMacosInputDriverCore
+
+runDriverMain()

@@ -468,6 +468,7 @@ impl Viewer {
                 automation_environment,
             )
         });
+        let stress_health = Arc::new(StressHealthPublisher::new(application_instance_id.clone()));
         let control_service = if let Some(port) = options.control_port {
             let root = options
                 .control_root
@@ -487,6 +488,7 @@ impl Viewer {
                     surface_width_pixels: surface_config.width,
                     surface_height_pixels: surface_config.height,
                     scale_factor: window.scale_factor(),
+                    stress_health: Arc::clone(&stress_health),
                 },
             )
             .map_err(anyhow::Error::msg)?;
@@ -519,6 +521,7 @@ impl Viewer {
         let start_diagnostic_trace = options.start_diagnostic_trace;
         let mut viewer = Self {
             application_instance_id,
+            stress_health,
             workspace_revision: 1,
             last_saved_workspace_revision: 1,
             next_evidence_revision: 1,
@@ -672,6 +675,7 @@ impl Viewer {
             open_panel: initial_open_panel,
             remote_source_editor: RemoteSourceEditor::default(),
             diagnostics_open: false,
+            interaction_recording: InteractionRecorder::default(),
             interaction_trace: InteractionTraceRecorder::default(),
             manual_diagnostic_trace: ManualDiagnosticTraceRecorder::new(),
             manual_diagnostic_trace_runtime: ManualDiagnosticTraceRuntime::new(
@@ -725,7 +729,7 @@ impl Viewer {
         };
         if start_diagnostic_trace && (viewer.synthetic || viewer.alignment_tracks.is_empty()) {
             viewer.manual_diagnostic_trace_autostart_pending = false;
-            viewer.start_manual_diagnostic_trace("launch option");
+            viewer.start_manual_diagnostic_trace("launch option", true);
         }
         Ok(viewer)
     }
@@ -736,6 +740,9 @@ impl Viewer {
         }
         self.surface_config.width = size.width;
         self.surface_config.height = size.height;
+        if let Some(service) = &self.control_service {
+            service.update_window_metrics(size.width, size.height, self.window.scale_factor());
+        }
         self.reconfigure_surface();
         // The next egui frame owns the final shell rectangle, including its
         // persisted Properties width. Keep the currently displayed geometry

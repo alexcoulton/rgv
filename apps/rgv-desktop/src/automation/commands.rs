@@ -3,6 +3,16 @@ use crate::workspace::queries::reference_dependency_is_settled;
 
 const MAXIMUM_AUTOMATION_SUPPLEMENTARY_SEGMENTS: usize = 64;
 
+fn automation_source_fingerprint(source: &TrackSource) -> Option<String> {
+    let redacted = source.redacted_for_persistence();
+    let encoded = serde_json::to_vec(&redacted).ok()?;
+    let mut fingerprint = String::from("sha256:");
+    for byte in Sha256::digest(encoded) {
+        write!(&mut fingerprint, "{byte:02x}").ok()?;
+    }
+    Some(fingerprint)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AutomationReadPresentationFields {
     pub(crate) state: AutomationReadPresentationState,
@@ -927,6 +937,112 @@ impl Viewer {
                         data,
                     },
                     Err(error) => automation_failure(AutomationErrorCode::Internal, error),
+                }
+            }
+            AutomationCommand::DescribeInteractionRecording => {
+                let status = self.interaction_recording_status();
+                match serde_json::to_value(status) {
+                    Ok(data) => AutomationExecution::Complete {
+                        message: "Described the interaction recording".to_owned(),
+                        data,
+                    },
+                    Err(error) => automation_failure(AutomationErrorCode::Internal, error),
+                }
+            }
+            AutomationCommand::StartInteractionRecording {
+                path,
+                fixture,
+                record_text,
+            } => {
+                match self.start_interaction_recording(PathBuf::from(path), fixture, record_text) {
+                    Ok(status) => match serde_json::to_value(status) {
+                        Ok(data) => AutomationExecution::Complete {
+                            message: "Started the interaction recording".to_owned(),
+                            data,
+                        },
+                        Err(error) => automation_failure(AutomationErrorCode::Internal, error),
+                    },
+                    Err(error) => automation_failure(AutomationErrorCode::InvalidState, error),
+                }
+            }
+            AutomationCommand::StopInteractionRecording => {
+                match self.stop_interaction_recording() {
+                    Ok(status) => match serde_json::to_value(status) {
+                        Ok(data) => AutomationExecution::Complete {
+                            message: "Stopped and finalised the interaction recording".to_owned(),
+                            data,
+                        },
+                        Err(error) => automation_failure(AutomationErrorCode::Internal, error),
+                    },
+                    Err(error) => automation_failure(AutomationErrorCode::InvalidState, error),
+                }
+            }
+            AutomationCommand::BeginNativeObservation {
+                run_id,
+                step_id,
+                expected_target,
+            } => {
+                match self
+                    .interaction_recording
+                    .begin_observation(run_id, step_id, expected_target)
+                {
+                    Ok(summary) => match serde_json::to_value(summary) {
+                        Ok(data) => AutomationExecution::Complete {
+                            message: "Opened the native-input observation scope".to_owned(),
+                            data,
+                        },
+                        Err(error) => automation_failure(AutomationErrorCode::Internal, error),
+                    },
+                    Err(error) => automation_failure(AutomationErrorCode::InvalidState, error),
+                }
+            }
+            AutomationCommand::EndNativeObservation => {
+                match self.interaction_recording.end_observation() {
+                    Ok(summary) => match serde_json::to_value(summary) {
+                        Ok(data) => AutomationExecution::Complete {
+                            message: "Closed the native-input observation scope".to_owned(),
+                            data,
+                        },
+                        Err(error) => automation_failure(AutomationErrorCode::Internal, error),
+                    },
+                    Err(error) => automation_failure(AutomationErrorCode::InvalidState, error),
+                }
+            }
+            AutomationCommand::CheckpointInteractionRecording { label } => {
+                let snapshot = self.automation_workspace_snapshot();
+                match self.interaction_recording.checkpoint(label, snapshot) {
+                    Ok(status) => {
+                        self.stress_health.publish_recording(&status);
+                        match serde_json::to_value(status) {
+                            Ok(data) => AutomationExecution::Complete {
+                                message: "Recorded an interaction checkpoint".to_owned(),
+                                data,
+                            },
+                            Err(error) => automation_failure(AutomationErrorCode::Internal, error),
+                        }
+                    }
+                    Err(error) => automation_failure(AutomationErrorCode::InvalidState, error),
+                }
+            }
+            AutomationCommand::StartDiagnosticTrace => {
+                self.start_manual_diagnostic_trace("interaction stress controller", false);
+                AutomationExecution::Complete {
+                    message: "Started the diagnostic trace".to_owned(),
+                    data: serde_json::json!({"recording": true}),
+                }
+            }
+            AutomationCommand::StopDiagnosticTrace => {
+                self.stop_and_save_manual_diagnostic_trace();
+                let snapshot = self.manual_diagnostic_trace_snapshot();
+                AutomationExecution::Complete {
+                    message: "Stopped and saved the diagnostic trace".to_owned(),
+                    data: serde_json::json!({
+                        "recording": false,
+                        "event_count": snapshot.event_count,
+                        "dropped_event_count": snapshot.dropped_event_count,
+                        "saved_path": snapshot.saved_path,
+                        "failure": snapshot.failure,
+                    }),
                 }
             }
             AutomationCommand::ClearSelection => {
@@ -2121,6 +2237,7 @@ impl Viewer {
                     id: track.config.id,
                     name: track.config.name.clone(),
                     kind: TrackKind::Alignment,
+                    source_fingerprint: automation_source_fingerprint(&track.config.source),
                     visible: annotation_visible,
                     collapsed: !annotation_visible,
                     height: annotation
@@ -2285,6 +2402,7 @@ impl Viewer {
                 id: track.id,
                 name: track.name.clone(),
                 kind: track.kind,
+                source_fingerprint: automation_source_fingerprint(&track.source),
                 visible: annotation_visible,
                 collapsed: !annotation_visible,
                 height: annotation

@@ -12,6 +12,7 @@ base64.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 rgv-core = { version = "0.1.0", path = "../../crates/rgv-core" }
+rgv-control-client = { version = "0.1.0", path = "../../crates/rgv-control-client" }
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true

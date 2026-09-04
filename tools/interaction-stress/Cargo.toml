@@ -1,0 +1,26 @@
+[package]
+name = "rgv-interaction-stress"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rgv-control-client = { version = "0.1.0", path = "../../crates/rgv-control-client" }
+rgv-core = { version = "0.1.0", path = "../../crates/rgv-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal", "time"] }
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

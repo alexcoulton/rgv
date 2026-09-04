@@ -1,0 +1,86 @@
+{
+  "schema": "rgv.interaction_stress",
+  "schema_version": 1,
+  "name": "ENCFF686MTA BAP1 to ACTB carry-over consumer",
+  "requirements": {
+    "fixture": "ENCFF686MTA-rna-grch38"
+  },
+  "steps": [
+    {
+      "type": "control",
+      "commands": [
+        { "command": "goto", "loci": ["chr3:52400000-52411500"] },
+        { "command": "wait_until_settled", "timeout_millis": 180000 }
+      ]
+    },
+    {
+      "type": "gesture",
+      "id": "bap1-deep-scroll-reversal",
+      "target": { "kind": "genomic_canvas", "panel_id": 1 },
+      "timing": { "mode": "maximum_rate" },
+      "events": [
+        { "event": "move", "at_micros": 0, "position": { "x": 0.5, "y": 0.65 } },
+        { "event": "scroll", "at_micros": 1000, "delta_x": 0.0, "delta_y": -600.0, "unit": "pixel", "phase": "began", "continuous": true, "modifiers": { "shift": true } },
+        { "event": "scroll", "at_micros": 3000, "delta_x": 0.0, "delta_y": -2400.0, "unit": "pixel", "phase": "changed", "continuous": true, "modifiers": { "shift": true } },
+        { "event": "scroll", "at_micros": 5000, "delta_x": 0.0, "delta_y": 900.0, "unit": "pixel", "phase": "changed", "continuous": true, "modifiers": { "shift": true } },
+        { "event": "scroll", "at_micros": 7000, "delta_x": 0.0, "delta_y": -1800.0, "unit": "pixel", "phase": "changed", "continuous": true, "modifiers": { "shift": true } },
+        { "event": "scroll", "at_micros": 9000, "delta_x": 0.0, "delta_y": 0.0, "unit": "pixel", "phase": "ended", "continuous": true, "modifiers": { "shift": true } }
+      ]
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "native_routing_complete", "step_id": "bap1-deep-scroll-reversal" }
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "gesture_terminated", "step_id": "bap1-deep-scroll-reversal" }
+    },
+    {
+      "type": "control",
+      "commands": [
+        { "command": "goto", "loci": ["chr7:5521086-5641915"] }
+      ]
+    },
+    {
+      "type": "gesture",
+      "id": "actb-overlap-pan-reversal",
+      "target": { "kind": "genomic_canvas", "panel_id": 1 },
+      "timing": { "mode": "maximum_rate" },
+      "events": [
+        { "event": "move", "at_micros": 0, "position": { "x": 0.25, "y": 0.45 } },
+        { "event": "primary_down", "at_micros": 1000 },
+        { "event": "primary_drag", "at_micros": 4000, "position": { "x": 0.8, "y": 0.45 } },
+        { "event": "primary_drag", "at_micros": 7000, "position": { "x": 0.3, "y": 0.45 } },
+        { "event": "primary_drag", "at_micros": 10000, "position": { "x": 0.75, "y": 0.45 } },
+        { "event": "primary_up", "at_micros": 12000 }
+      ]
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "native_routing_complete", "step_id": "actb-overlap-pan-reversal" }
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "gesture_terminated", "step_id": "actb-overlap-pan-reversal" }
+    },
+    {
+      "type": "barrier",
+      "predicate": { "kind": "workspace_settled" },
+      "timeout_millis": 300000
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "no_critical_failure" }
+    },
+    {
+      "type": "checkpoint",
+      "label": "bap1-to-actb-complete",
+      "capture_native_window": true
+    }
+  ],
+  "limits": {
+    "maximum_duration_millis": 1200000,
+    "maximum_native_events": 10000,
+    "maximum_held_millis": 30000
+  }
+}

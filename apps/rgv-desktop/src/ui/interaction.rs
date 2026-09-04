@@ -18,8 +18,8 @@ impl Viewer {
 
     pub(crate) fn cursor_moved(&mut self, position: PhysicalPosition<f64>, consumed: bool) {
         self.cursor = position;
-        if self.dragging && !consumed {
-            if let Some(previous) = self.last_cursor {
+        if self.dragging {
+            if !consumed && let Some(previous) = self.last_cursor {
                 let scale = self.window.scale_factor();
                 let delta_points = (position.x - previous.x) / scale;
                 if let Ok(viewport) = self
@@ -32,8 +32,10 @@ impl Viewer {
                     self.viewport_gesture_changed();
                 }
             }
+            // A consumed movement must not pan, but it still establishes the next delta's
+            // baseline. Otherwise the first unconsumed movement after egui capture is lost.
             self.last_cursor = Some(position);
-        } else if !self.dragging {
+        } else {
             self.last_cursor = None;
         }
         let hovered_scene = (!consumed && !self.dragging && self.cursor_in_genomic_canvas())

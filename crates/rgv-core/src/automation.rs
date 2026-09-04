@@ -105,6 +105,27 @@ pub enum AutomationCommand {
     DescribeWorkspace,
     DescribeSelection,
     DescribeInteractionTrace,
+    DescribeInteractionRecording,
+    StartInteractionRecording {
+        path: String,
+        #[serde(default)]
+        fixture: Option<String>,
+        #[serde(default)]
+        record_text: bool,
+    },
+    StopInteractionRecording,
+    BeginNativeObservation {
+        run_id: String,
+        step_id: String,
+        #[serde(default)]
+        expected_target: Option<crate::interaction_stress::StressTarget>,
+    },
+    EndNativeObservation,
+    CheckpointInteractionRecording {
+        label: String,
+    },
+    StartDiagnosticTrace,
+    StopDiagnosticTrace,
     ClearSelection,
     RefreshSelection,
     DescribeReviewQueue,
@@ -243,6 +264,14 @@ impl AutomationCommand {
             Self::DescribeWorkspace => "describe_workspace",
             Self::DescribeSelection => "describe_selection",
             Self::DescribeInteractionTrace => "describe_interaction_trace",
+            Self::DescribeInteractionRecording => "describe_interaction_recording",
+            Self::StartInteractionRecording { .. } => "start_interaction_recording",
+            Self::StopInteractionRecording => "stop_interaction_recording",
+            Self::BeginNativeObservation { .. } => "begin_native_observation",
+            Self::EndNativeObservation => "end_native_observation",
+            Self::CheckpointInteractionRecording { .. } => "checkpoint_interaction_recording",
+            Self::StartDiagnosticTrace => "start_diagnostic_trace",
+            Self::StopDiagnosticTrace => "stop_diagnostic_trace",
             Self::ClearSelection => "clear_selection",
             Self::RefreshSelection => "refresh_selection",
             Self::DescribeReviewQueue => "describe_review_queue",
@@ -282,12 +311,36 @@ impl AutomationCommand {
             Self::DescribeWorkspace
             | Self::DescribeSelection
             | Self::DescribeInteractionTrace
+            | Self::DescribeInteractionRecording
+            | Self::StopInteractionRecording
+            | Self::EndNativeObservation
+            | Self::StartDiagnosticTrace
+            | Self::StopDiagnosticTrace
             | Self::ClearSelection
             | Self::RefreshSelection
             | Self::DescribeReviewQueue
             | Self::DescribeRelatedAlignments
             | Self::NewWorkspace
             | Self::Exit => Ok(()),
+            Self::StartInteractionRecording { path, fixture, .. } => {
+                validate_string(path, "interaction recording path")?;
+                validate_optional_string(fixture.as_deref(), "fixture")
+            }
+            Self::BeginNativeObservation {
+                run_id,
+                step_id,
+                expected_target,
+            } => {
+                validate_string(run_id, "run_id")?;
+                validate_string(step_id, "step_id")?;
+                if let Some(target) = expected_target {
+                    target.validate().map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            }
+            Self::CheckpointInteractionRecording { label } => {
+                validate_string(label, "recording checkpoint label")
+            }
             Self::DescribeNavigationHistory { panel_id }
             | Self::NavigateHistory { panel_id, .. } => validate_panel_id(*panel_id),
             Self::OpenWorkspace {
@@ -460,6 +513,7 @@ impl AutomationCommand {
                 }
             }
             Self::OpenWorkspace { path, .. }
+            | Self::StartInteractionRecording { path, .. }
             | Self::Snapshot { path, .. }
             | Self::Export { path, .. }
             | Self::Save { path } => {
@@ -498,6 +552,7 @@ impl AutomationCommand {
                 }
             }
             Self::OpenWorkspace { path, .. }
+            | Self::StartInteractionRecording { path, .. }
             | Self::Snapshot { path, .. }
             | Self::Export { path, .. }
             | Self::Save { path } => {
@@ -1557,6 +1612,10 @@ pub struct AutomationTrackSnapshot {
     pub id: TrackId,
     pub name: String,
     pub kind: TrackKind,
+    /// SHA-256 of the redacted persisted source identity. This permits prerequisite checks
+    /// without exposing a local path, URL credential, or signed query string.
+    #[serde(default)]
+    pub source_fingerprint: Option<String>,
     pub visible: bool,
     pub collapsed: bool,
     pub height: f32,

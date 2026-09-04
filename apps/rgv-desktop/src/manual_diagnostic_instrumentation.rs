@@ -654,11 +654,11 @@ impl Viewer {
             || self.panels.active().contig_name != "chrSynthetic";
         if source_is_ready && bootstrap_locus_is_resolved {
             self.manual_diagnostic_trace_autostart_pending = false;
-            self.start_manual_diagnostic_trace("launch option");
+            self.start_manual_diagnostic_trace("launch option", true);
         }
     }
 
-    pub(crate) fn start_manual_diagnostic_trace(&mut self, trigger: &str) {
+    pub(crate) fn start_manual_diagnostic_trace(&mut self, trigger: &str, show_diagnostics: bool) {
         self.manual_diagnostic_trace_runtime
             .reset_for_recording(&self.data_status);
         let panel = self.panels.active();
@@ -721,7 +721,9 @@ impl Viewer {
             output_directory = %self.manual_diagnostic_trace_runtime.output_directory.display(),
             "manual diagnostic trace started"
         );
-        self.diagnostics_open = true;
+        if show_diagnostics {
+            self.diagnostics_open = true;
+        }
         self.window.request_redraw();
     }
 
@@ -781,11 +783,21 @@ impl Viewer {
         }
         self.finish_idle_manual_wheel_interaction();
         let pointer = || {
+            let scale = self.window.scale_factor();
+            let logical = egui::pos2(
+                (self.cursor.x / scale) as f32,
+                (self.cursor.y / scale) as f32,
+            );
             serde_json::json!({
                 "x_physical": self.cursor.x,
                 "y_physical": self.cursor.y,
-                "scale_factor": self.window.scale_factor(),
+                "scale_factor": scale,
                 "egui_consumed": consumed,
+                "genomic_canvas_layer": self.genomic_canvas_layer_id
+                    .map(|layer| layer.short_debug_format()),
+                "layer_under_pointer": self.egui_context
+                    .layer_id_at(logical)
+                    .map(|layer| layer.short_debug_format()),
             })
         };
         match event {
@@ -1253,6 +1265,8 @@ impl Viewer {
         message: &str,
         fields: ManualDiagnosticTraceFields,
     ) {
+        self.stress_health
+            .set_terminal_failure(Some("critical_invariant"));
         if !self.manual_diagnostic_trace_is_recording() {
             return;
         }
@@ -2167,6 +2181,10 @@ impl Viewer {
     }
 
     fn record_manual_data_status_change(&mut self) {
+        if manual_trace_status_is_critical(&self.data_status) {
+            self.stress_health
+                .set_terminal_failure(Some("critical_invariant"));
+        }
         if !self.manual_diagnostic_trace_is_recording()
             || self
                 .manual_diagnostic_trace_runtime

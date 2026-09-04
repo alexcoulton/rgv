@@ -57,25 +57,37 @@ impl ApplicationHandler for Application {
             return;
         }
 
+        viewer.stress_health.note_ui_heartbeat();
+        observe_stress_input_health(viewer, &event);
+
         let egui_response = viewer.egui_state.on_window_event(&viewer.window, &event);
         viewer.record_manual_window_event(&event, egui_response.consumed);
+        let mut recording_observation =
+            viewer.prepare_native_input_observation(&event, egui_response.consumed);
         // egui-winit reports `repaint: true` for `RedrawRequested`. Honouring
         // that response after rendering this same event creates an endless
         // RedrawRequested -> request_redraw feedback loop.
         let request_egui_redraw = should_request_egui_redraw(&event, egui_response.repaint);
         match event {
             WindowEvent::CloseRequested => {
+                viewer.finish_native_input_observation(recording_observation.take());
+                viewer.abort_interaction_recording_before_exit();
                 viewer.save_recording_manual_diagnostic_trace_before_exit();
                 event_loop.exit();
+                return;
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && !event.repeat
                     && is_exit_shortcut(&event.logical_key, viewer.modifiers) =>
             {
+                Viewer::mark_native_input_handled(&mut recording_observation);
                 if confirm_or_exit(&mut viewer.exit_confirmation_open) {
+                    viewer.finish_native_input_observation(recording_observation.take());
+                    viewer.abort_interaction_recording_before_exit();
                     viewer.save_recording_manual_diagnostic_trace_before_exit();
                     event_loop.exit();
+                    return;
                 } else {
                     viewer.window.request_redraw();
                 }
@@ -84,6 +96,7 @@ impl ApplicationHandler for Application {
                 if event.state == ElementState::Pressed
                     && event.logical_key == Key::Named(NamedKey::Escape) =>
             {
+                Viewer::mark_native_input_handled(&mut recording_observation);
                 if viewer.close_alignment_context_menu("escape") {
                     viewer.window.request_redraw();
                 } else if viewer.exit_confirmation_open {
@@ -93,8 +106,11 @@ impl ApplicationHandler for Application {
                     viewer.command_search.clear();
                     viewer.window.request_redraw();
                 } else {
+                    viewer.finish_native_input_observation(recording_observation.take());
+                    viewer.abort_interaction_recording_before_exit();
                     viewer.save_recording_manual_diagnostic_trace_before_exit();
                     event_loop.exit();
+                    return;
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -104,19 +120,28 @@ impl ApplicationHandler for Application {
                         || (event.logical_key == Key::Named(NamedKey::F10)
                             && viewer.modifiers.shift_key())) =>
             {
+                Viewer::mark_native_input_handled(&mut recording_observation);
                 viewer.open_alignment_context_menu_at_cursor("keyboard");
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !egui_response.consumed =>
             {
+                Viewer::mark_native_input_handled(&mut recording_observation);
                 viewer.keyboard_input(&event.logical_key);
             }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                Viewer::mark_native_input_handled(&mut recording_observation);
+            }
             WindowEvent::ModifiersChanged(modifiers) => viewer.modifiers = modifiers.state(),
-            WindowEvent::Resized(size) => viewer.resize(size),
+            WindowEvent::Resized(size) => {
+                Viewer::mark_native_input_handled(&mut recording_observation);
+                viewer.resize(size);
+            }
             WindowEvent::ScaleFactorChanged { .. } => {
                 viewer.resize(viewer.window.inner_size());
             }
             WindowEvent::CursorMoved { position, .. } => {
+                Viewer::mark_native_input_handled(&mut recording_observation);
                 viewer.update_vertical_scrollbar_drag(position);
                 viewer.cursor_moved(position, egui_response.consumed);
             }
@@ -147,6 +172,7 @@ impl ApplicationHandler for Application {
                 }
             }
             WindowEvent::Focused(false) => {
+                Viewer::mark_native_input_handled(&mut recording_observation);
                 viewer.finish_overview_capture();
                 viewer.finish_vertical_scrollbar_drag();
                 let was_canvas_dragging = viewer.dragging;
@@ -189,11 +215,15 @@ impl ApplicationHandler for Application {
                     viewer.finish_navigation_gesture();
                 }
             }
+            WindowEvent::Focused(true) => {
+                Viewer::mark_native_input_handled(&mut recording_observation);
+            }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
             } => {
+                Viewer::mark_native_input_handled(&mut recording_observation);
                 if state == ElementState::Pressed
                     && viewer.modifiers.control_key()
                     && viewer.open_alignment_context_menu_at_cursor("control_click")
@@ -201,6 +231,7 @@ impl ApplicationHandler for Application {
                     viewer.dragging = false;
                     viewer.press_cursor = None;
                     viewer.last_cursor = None;
+                    viewer.finish_native_input_observation(recording_observation.take());
                     return;
                 }
                 if state == ElementState::Pressed {
@@ -260,11 +291,21 @@ impl ApplicationHandler for Application {
                 button: MouseButton::Right,
                 ..
             } => {
-                viewer.open_alignment_context_menu_at_cursor("secondary_click");
+                if viewer.open_alignment_context_menu_at_cursor("secondary_click") {
+                    Viewer::mark_native_input_handled(&mut recording_observation);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Right,
+                ..
+            } => {
+                Viewer::mark_native_input_handled(&mut recording_observation);
             }
             WindowEvent::MouseWheel { delta, phase, .. }
                 if viewer.cursor_over_unobstructed_track_viewport() =>
             {
+                Viewer::mark_native_input_handled(&mut recording_observation);
                 // The central panel is painted by egui, which may mark wheel input as
                 // consumed even though the genomic canvas itself is GPU rendered. Use
                 // the painted layer under the pointer instead: floating windows and
@@ -285,9 +326,14 @@ impl ApplicationHandler for Application {
                 }
             }
             WindowEvent::DroppedFile(path) => viewer.handle_dropped_file(&path),
-            WindowEvent::RedrawRequested => viewer.render(),
+            WindowEvent::RedrawRequested => {
+                viewer.render();
+                viewer.stress_health.note_frame_presented();
+            }
             _ => {}
         }
+
+        viewer.finish_native_input_observation(recording_observation);
 
         if request_egui_redraw {
             viewer.window.request_redraw();
@@ -303,19 +349,23 @@ impl ApplicationHandler for Application {
         let Some(viewer) = self.viewer.as_mut() else {
             return;
         };
+        viewer.stress_health.note_ui_heartbeat();
         viewer.record_manual_device_event(&event);
         if let DeviceEvent::MouseMotion { delta } = event {
+            viewer.stress_health.note_native_input();
             viewer.capture_mouse_motion(delta);
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(viewer) = &mut self.viewer {
+            viewer.stress_health.note_ui_heartbeat();
             viewer.poll_background_work();
             let now = Instant::now();
             viewer.maybe_start_autosave(now);
             viewer.advance_automation(now);
             if viewer.automation_exit_requested || viewer.user_exit_requested {
+                viewer.abort_interaction_recording_before_exit();
                 viewer.save_recording_manual_diagnostic_trace_before_exit();
                 event_loop.exit();
                 return;
@@ -373,6 +423,46 @@ impl ApplicationHandler for Application {
             }
             viewer.persist_settings();
         }
+    }
+}
+
+fn observe_stress_input_health(viewer: &Viewer, event: &WindowEvent) {
+    let is_native_input = matches!(
+        event,
+        WindowEvent::CursorMoved { .. }
+            | WindowEvent::CursorLeft { .. }
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. }
+            | WindowEvent::KeyboardInput { .. }
+            | WindowEvent::ModifiersChanged(_)
+            | WindowEvent::Focused(_)
+            | WindowEvent::Resized(_)
+            | WindowEvent::ScaleFactorChanged { .. }
+    );
+    if is_native_input {
+        viewer.stress_health.note_native_input();
+    }
+    match event {
+        WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            ..
+        } => {
+            viewer.stress_health.begin_pointer_interaction();
+        }
+        WindowEvent::MouseInput {
+            state: ElementState::Released,
+            ..
+        } => viewer.stress_health.finish_interaction(),
+        WindowEvent::MouseWheel { phase, .. } => match phase {
+            winit::event::TouchPhase::Started | winit::event::TouchPhase::Moved => {
+                viewer.stress_health.begin_scroll_interaction();
+            }
+            winit::event::TouchPhase::Ended => viewer.stress_health.finish_interaction(),
+            winit::event::TouchPhase::Cancelled => viewer.stress_health.cancel_interaction(),
+        },
+        WindowEvent::Focused(false) => viewer.stress_health.cancel_interaction(),
+        WindowEvent::Focused(true) => viewer.stress_health.clear_cancelled_interaction(),
+        _ => {}
     }
 }
 

@@ -1,0 +1,136 @@
+{
+  "schema": "rgv.interaction_stress",
+  "schema_version": 1,
+  "name": "ENCFF686MTA multi-panel navigation and native-input pressure",
+  "seed": 2026090401,
+  "requirements": {
+    "fixture": "ENCFF686MTA-rna-grch38"
+  },
+  "steps": [
+    {
+      "type": "control",
+      "commands": [
+        {
+          "command": "goto",
+          "loci": [
+            "chr3:52400000-52411500",
+            "chr7:5526400-5530600",
+            "chr12:6534000-6540000"
+          ]
+        },
+        { "command": "wait_until_settled", "timeout_millis": 300000 }
+      ]
+    },
+    {
+      "type": "generated",
+      "specification": {
+        "seed": 2026090402,
+        "actions": 24,
+        "profile": "recording_mutation",
+        "allowed_actions": [
+          "canvas_pan",
+          "canvas_pan_reversal",
+          "read_scrollbar_drag",
+          "read_scrollbar_reversal",
+          "vertical_scroll",
+          "zoom",
+          "zoom_reversal"
+        ],
+        "maximum_no_wait_actions": 8
+      }
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "no_critical_failure" }
+    },
+    {
+      "type": "control",
+      "commands": [
+        {
+          "command": "goto",
+          "loci": [
+            "chr1:155180000-155260000",
+            "chr17:43044000-43126000",
+            "chrX:73820000-73880000"
+          ]
+        },
+        {
+          "command": "goto",
+          "loci": [
+            "chr7:5521086-5641915",
+            "chr3:52370000-52440000",
+            "chr12:6500000-6570000"
+          ]
+        }
+      ]
+    },
+    {
+      "type": "generated",
+      "specification": {
+        "seed": 2026090403,
+        "actions": 32,
+        "profile": "recording_mutation",
+        "allowed_actions": [
+          "canvas_pan",
+          "canvas_pan_reversal",
+          "read_scrollbar_drag",
+          "read_scrollbar_reversal",
+          "vertical_scroll",
+          "zoom",
+          "zoom_reversal",
+          "secondary_click",
+          "focus_cycle",
+          "resize"
+        ],
+        "maximum_no_wait_actions": 8
+      }
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "no_critical_failure" }
+    },
+    {
+      "type": "control",
+      "commands": [
+        { "command": "goto", "loci": ["chr7:5526400-5530600"] },
+        { "command": "wait_until_settled", "timeout_millis": 300000 }
+      ]
+    },
+    {
+      "type": "generated",
+      "specification": {
+        "seed": 2026090404,
+        "actions": 16,
+        "profile": "recording_mutation",
+        "allowed_actions": [
+          "canvas_pan_reversal",
+          "read_scrollbar_drag",
+          "read_scrollbar_reversal",
+          "vertical_scroll",
+          "zoom_reversal",
+          "secondary_click"
+        ],
+        "maximum_no_wait_actions": 4
+      }
+    },
+    {
+      "type": "barrier",
+      "predicate": { "kind": "workspace_settled" },
+      "timeout_millis": 300000
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "no_critical_failure" }
+    },
+    {
+      "type": "checkpoint",
+      "label": "large-bam-navigation-pressure-complete",
+      "capture_native_window": true
+    }
+  ],
+  "limits": {
+    "maximum_duration_millis": 1800000,
+    "maximum_native_events": 20000,
+    "maximum_held_millis": 30000
+  }
+}

@@ -4,6 +4,7 @@ mod automation;
 mod coordinates;
 mod generation;
 mod genome;
+mod interaction_stress;
 mod landmarks;
 mod lod;
 mod navigation;
@@ -58,6 +59,23 @@ pub use genome::{
     GenomeAssemblyIdentity, GenomeAssetProvenance, GenomeConfiguration, GenomeConfigurationError,
     MAXIMUM_DEFAULT_ANNOTATIONS, MAXIMUM_GENOME_ASSET_PROVENANCE, ReferenceTranslationFrame,
     parse_ucsc_cytobands, parse_ucsc_cytobands_with_aliases,
+};
+pub use interaction_stress::{
+    INTERACTION_RECORDING_SCHEMA_NAME, INTERACTION_RECORDING_SCHEMA_VERSION,
+    INTERACTION_STRESS_SCHEMA_NAME, INTERACTION_STRESS_SCHEMA_VERSION, InteractionLifecycle,
+    InteractionRecordingCheckpoint, InteractionRecordingEntry, InteractionRecordingFooter,
+    InteractionRecordingHeader, InteractionRecordingState, InteractionRecordingStatus,
+    InteractionStressError, InteractionStressRunManifest, InteractionStressScenario,
+    InteractionStressStep, MAXIMUM_INTERACTION_STRESS_DOCUMENT_BYTES,
+    MAXIMUM_STRESS_COORDINATE_FRACTION, MAXIMUM_STRESS_NATIVE_EVENTS, MAXIMUM_STRESS_NESTING,
+    MAXIMUM_STRESS_REPEAT_COUNT, MAXIMUM_STRESS_RUN_MILLIS, MAXIMUM_STRESS_STEPS,
+    MAXIMUM_STRESS_STRING_BYTES, MAXIMUM_STRESS_TIMING_SCALE, NativeEventShape,
+    NativeInputObservation, NativeObservationSummary, RecordedReadScroll,
+    STRESS_HEALTH_SCHEMA_VERSION, StressActionKind, StressArtifactReference, StressFailureClass,
+    StressFailureSignature, StressGeneratorProfile, StressGeneratorSpecification,
+    StressHealthSnapshot, StressInteractionState, StressModifiers, StressNativeEvent, StressPoint,
+    StressPredicate, StressRequirements, StressRunEnvironment, StressRunLimits, StressRunState,
+    StressScrollUnit, StressStepResult, StressTarget, StressTiming, StressTouchPhase,
 };
 pub use landmarks::{
     AssemblyMatchEvidence, AssemblyResolution, AssemblyResolutionInput, AssemblyResolutionStatus,

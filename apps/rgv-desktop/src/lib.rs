@@ -17,12 +17,14 @@ mod automation;
 mod control_service;
 mod display;
 mod inspection;
+mod interaction_recording;
 mod interaction_trace;
 mod launch;
 mod manual_diagnostic_instrumentation;
 mod manual_diagnostic_trace;
 mod runtime;
 mod sources;
+mod stress_health;
 mod ui;
 mod workspace;
 mod workspace_lists;
@@ -41,6 +43,7 @@ use display::{
 };
 use egui_wgpu::{RendererOptions, ScreenDescriptor};
 use inspection::{auxiliary::*, document::*, model::*, read::*, rna::*, variant::*};
+use interaction_recording::InteractionRecorder;
 use interaction_trace::{InteractionTraceRecorder, InteractionTraceStage};
 use launch::*;
 use manual_diagnostic_instrumentation::{
@@ -184,6 +187,7 @@ use rgv_render::{
 use runtime::*;
 use sha2::{Digest as _, Sha256};
 use sources::*;
+use stress_health::StressHealthPublisher;
 use ui::{
     AlignmentSubtrack, CytobandAvailability, GenomeContextMetrics, MENU_HEIGHT, NAVIGATION_HEIGHT,
     SEARCHABLE_COMMANDS, STATUS_HEIGHT, TrackFrame, TrackFrameKey, TrackSubtrack, TrackUiAction,
@@ -1362,6 +1366,7 @@ struct CachedGenomeOverview {
 #[allow(clippy::struct_excessive_bools)]
 struct Viewer {
     application_instance_id: String,
+    stress_health: Arc<StressHealthPublisher>,
     workspace_revision: u64,
     last_saved_workspace_revision: u64,
     next_evidence_revision: u64,
@@ -1487,6 +1492,7 @@ struct Viewer {
     open_panel: Option<UiPanel>,
     remote_source_editor: RemoteSourceEditor,
     diagnostics_open: bool,
+    interaction_recording: InteractionRecorder,
     interaction_trace: InteractionTraceRecorder,
     manual_diagnostic_trace: ManualDiagnosticTraceRecorder,
     manual_diagnostic_trace_runtime: ManualDiagnosticTraceRuntime,

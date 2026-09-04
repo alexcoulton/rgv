@@ -3277,7 +3277,7 @@ impl Viewer {
         self.diagnostics_open = diagnostics_open;
         match manual_trace_action {
             Some(ui::ManualInteractionTraceAction::Start) => {
-                self.start_manual_diagnostic_trace("Diagnostics window");
+                self.start_manual_diagnostic_trace("Diagnostics window", true);
             }
             Some(ui::ManualInteractionTraceAction::StopAndSave) => {
                 self.stop_and_save_manual_diagnostic_trace();

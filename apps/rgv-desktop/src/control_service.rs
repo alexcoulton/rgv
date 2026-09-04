@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread::JoinHandle,
@@ -13,6 +13,8 @@ use std::{
 
 use rgv_core::{AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationError, AutomationRunReport};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
+
+use crate::stress_health::StressHealthPublisher;
 
 const MAX_CONTROL_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONTROL_SECRET_BYTES: usize = 1_024;
@@ -27,8 +29,35 @@ pub(crate) struct ControlRequest {
 pub(crate) struct ControlService {
     address: SocketAddr,
     requests: Receiver<ControlRequest>,
+    window_metrics: Arc<ControlWindowMetrics>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    batch_worker: Option<JoinHandle<()>>,
+}
+
+struct ControlWindowMetrics {
+    surface_width_pixels: AtomicU32,
+    surface_height_pixels: AtomicU32,
+    scale_factor_bits: AtomicU64,
+}
+
+impl ControlWindowMetrics {
+    fn new(surface_width_pixels: u32, surface_height_pixels: u32, scale_factor: f64) -> Self {
+        Self {
+            surface_width_pixels: AtomicU32::new(surface_width_pixels),
+            surface_height_pixels: AtomicU32::new(surface_height_pixels),
+            scale_factor_bits: AtomicU64::new(scale_factor.to_bits()),
+        }
+    }
+
+    fn update(&self, surface_width_pixels: u32, surface_height_pixels: u32, scale_factor: f64) {
+        self.surface_width_pixels
+            .store(surface_width_pixels, Ordering::Release);
+        self.surface_height_pixels
+            .store(surface_height_pixels, Ordering::Release);
+        self.scale_factor_bits
+            .store(scale_factor.to_bits(), Ordering::Release);
+    }
 }
 
 #[derive(Clone)]
@@ -38,6 +67,7 @@ pub(crate) struct ControlStatusMetadata {
     pub(crate) surface_width_pixels: u32,
     pub(crate) surface_height_pixels: u32,
     pub(crate) scale_factor: f64,
+    pub(crate) stress_health: Arc<StressHealthPublisher>,
 }
 
 impl ControlService {
@@ -58,8 +88,37 @@ impl ControlService {
         let server = tiny_http::Server::from_listener(listener, None)
             .map_err(|error| format!("could not start the loopback control service: {error}"))?;
         let (request_sender, requests) = sync_channel(1);
+        let window_metrics = Arc::new(ControlWindowMetrics::new(
+            status.surface_width_pixels,
+            status.surface_height_pixels,
+            status.scale_factor,
+        ));
+        let worker_window_metrics = Arc::clone(&window_metrics);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let (batch_requests_sender, batch_requests) = sync_channel(1);
+        let batch_request_sender = request_sender.clone();
+        let batch_root = root.clone();
+        let batch_secret = secret.clone();
+        let batch_status = status.clone();
+        let batch_window_metrics = Arc::clone(&window_metrics);
+        let batch_stop = Arc::clone(&stop);
+        let batch_worker = std::thread::Builder::new()
+            .name("rgv-local-control-batches".to_owned())
+            .spawn(move || {
+                control_batch_server_loop(
+                    &batch_requests,
+                    &batch_request_sender,
+                    &batch_root,
+                    &batch_secret,
+                    &batch_status,
+                    &batch_window_metrics,
+                    &batch_stop,
+                );
+            })
+            .map_err(|error| {
+                format!("could not start the control-service batch worker: {error}")
+            })?;
         let worker = std::thread::Builder::new()
             .name("rgv-local-control".to_owned())
             .spawn(move || {
@@ -69,6 +128,8 @@ impl ControlService {
                     &root,
                     &secret,
                     &status,
+                    &worker_window_metrics,
+                    &batch_requests_sender,
                     &worker_stop,
                 );
             })
@@ -76,8 +137,10 @@ impl ControlService {
         Ok(Self {
             address,
             requests,
+            window_metrics,
             stop,
             worker: Some(worker),
+            batch_worker: Some(batch_worker),
         })
     }
 
@@ -89,12 +152,27 @@ impl ControlService {
         self.requests.try_recv().ok()
     }
 
+    pub(crate) fn update_window_metrics(
+        &self,
+        surface_width_pixels: u32,
+        surface_height_pixels: u32,
+        scale_factor: f64,
+    ) {
+        self.window_metrics
+            .update(surface_width_pixels, surface_height_pixels, scale_factor);
+    }
+
     pub(crate) fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {
             tracing::warn!("local control-service worker panicked during shutdown");
+        }
+        if let Some(worker) = self.batch_worker.take()
+            && worker.join().is_err()
+        {
+            tracing::warn!("local control-service batch worker panicked during shutdown");
         }
     }
 }
@@ -148,17 +226,80 @@ fn control_server_loop(
     root: &Path,
     secret: &str,
     status: &ControlStatusMetadata,
+    window_metrics: &ControlWindowMetrics,
+    batch_requests: &SyncSender<Request>,
     stop: &AtomicBool,
 ) {
     while !stop.load(Ordering::Acquire) {
         match server.recv_timeout(Duration::from_millis(100)) {
             Ok(Some(request)) => {
-                handle_control_request(request, request_sender, root, secret, status, stop);
+                if request.method() == &Method::Post && request.url() == "/v1/batches" {
+                    if !request_is_authorized(&request, secret) {
+                        respond_error(
+                            request,
+                            401,
+                            "unauthorized",
+                            "The request was not authorized",
+                        );
+                        continue;
+                    }
+                    match batch_requests.try_send(request) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(request)) => respond_error(
+                            request,
+                            429,
+                            "busy",
+                            "Another control batch is already waiting",
+                        ),
+                        Err(TrySendError::Disconnected(request)) => respond_error(
+                            request,
+                            503,
+                            "unavailable",
+                            "The RGV batch service is unavailable",
+                        ),
+                    }
+                    continue;
+                }
+                handle_control_request(
+                    request,
+                    request_sender,
+                    root,
+                    secret,
+                    status,
+                    window_metrics,
+                    stop,
+                );
             }
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(%error, "local control-service receive failed");
             }
+        }
+    }
+}
+
+fn control_batch_server_loop(
+    requests: &Receiver<Request>,
+    request_sender: &SyncSender<ControlRequest>,
+    root: &Path,
+    secret: &str,
+    status: &ControlStatusMetadata,
+    window_metrics: &ControlWindowMetrics,
+    stop: &AtomicBool,
+) {
+    while !stop.load(Ordering::Acquire) {
+        match requests.recv_timeout(Duration::from_millis(100)) {
+            Ok(request) => handle_control_request(
+                request,
+                request_sender,
+                root,
+                secret,
+                status,
+                window_metrics,
+                stop,
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -170,6 +311,7 @@ fn handle_control_request(
     root: &Path,
     secret: &str,
     status: &ControlStatusMetadata,
+    window_metrics: &ControlWindowMetrics,
     stop: &AtomicBool,
 ) {
     if request
@@ -185,6 +327,9 @@ fn handle_control_request(
         return;
     }
     if request.method() == &Method::Get && request.url() == "/v1/status" {
+        let surface_width_pixels = window_metrics.surface_width_pixels.load(Ordering::Acquire);
+        let surface_height_pixels = window_metrics.surface_height_pixels.load(Ordering::Acquire);
+        let scale_factor = f64::from_bits(window_metrics.scale_factor_bits.load(Ordering::Acquire));
         respond_json(
             request,
             200,
@@ -197,9 +342,9 @@ fn handle_control_request(
                 "window_count": 1,
                 "active_window_ordinal": 1,
                 "renderer_backend": status.renderer_backend,
-                "surface_width_pixels": status.surface_width_pixels,
-                "surface_height_pixels": status.surface_height_pixels,
-                "scale_factor": status.scale_factor,
+                "surface_width_pixels": surface_width_pixels,
+                "surface_height_pixels": surface_height_pixels,
+                "scale_factor": scale_factor,
                 "service": "rgv-local-control",
                 "authentication": "bearer",
                 "capabilities": [
@@ -212,10 +357,33 @@ fn handle_control_request(
                     ,"alignment_discovery"
                     ,"workspace_open"
                     ,"interaction_trace"
+                    ,"interaction_recording"
+                    ,"stress_health"
                 ]
             })
             .to_string(),
         );
+        return;
+    }
+    if request.method() == &Method::Get && request.url() == "/v1/stress/health" {
+        if !request_is_authorized(&request, secret) {
+            respond_error(
+                request,
+                401,
+                "unauthorized",
+                "The request was not authorized",
+            );
+            return;
+        }
+        match serde_json::to_string(&status.stress_health.snapshot()) {
+            Ok(json) => respond_json(request, 200, &json),
+            Err(error) => respond_error(
+                request,
+                500,
+                "internal",
+                &format!("Could not serialize stress health: {error}"),
+            ),
+        }
         return;
     }
     if request.method() != &Method::Post || request.url() != "/v1/batches" {
@@ -227,14 +395,7 @@ fn handle_control_request(
         );
         return;
     }
-    let authorization = request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("Authorization"))
-        .map(|header| header.value.as_str())
-        .unwrap_or_default();
-    let expected = format!("Bearer {secret}");
-    if !constant_time_equal(authorization.as_bytes(), expected.as_bytes()) {
+    if !request_is_authorized(&request, secret) {
         respond_error(
             request,
             401,
@@ -377,6 +538,17 @@ fn handle_control_request(
     }
 }
 
+fn request_is_authorized(request: &Request, secret: &str) -> bool {
+    let authorization = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Authorization"))
+        .map(|header| header.value.as_str())
+        .unwrap_or_default();
+    let expected = format!("Bearer {secret}");
+    constant_time_equal(authorization.as_bytes(), expected.as_bytes())
+}
+
 fn respond_error(request: Request, status: u16, code: &str, message: &str) {
     respond_json(
         request,
@@ -433,6 +605,7 @@ mod tests {
             surface_width_pixels: 800,
             surface_height_pixels: 600,
             scale_factor: 1.0,
+            stress_health: Arc::new(StressHealthPublisher::new("test-instance".to_owned())),
         }
     }
 
@@ -442,6 +615,9 @@ mod tests {
 
     fn send_request(address: SocketAddr, request: &str) -> String {
         let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         stream.write_all(request.as_bytes()).unwrap();
         stream.shutdown(Shutdown::Write).unwrap();
         let mut response = String::new();
@@ -469,6 +645,7 @@ mod tests {
             test_status(),
         )
         .unwrap();
+        service.update_window_metrics(1_024, 768, 2.0);
         let response = send_request(
             service.address(),
             "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
@@ -477,6 +654,9 @@ mod tests {
         assert!(response.contains("workspace_state"));
         assert!(response.contains("selection_state"));
         assert!(response.contains("relative_viewport"));
+        assert!(response.contains("\"surface_width_pixels\":1024"));
+        assert!(response.contains("\"surface_height_pixels\":768"));
+        assert!(response.contains("\"scale_factor\":2.0"));
         assert!(!response.contains(TEST_SECRET));
         assert!(!response.contains(root.path().to_string_lossy().as_ref()));
         service.shutdown();
@@ -547,6 +727,87 @@ mod tests {
         let response = batch_request(service.address(), "wrong", body);
         assert!(response.starts_with("HTTP/1.1 401"));
         assert!(service.try_request().is_none());
+        service.shutdown();
+    }
+
+    #[test]
+    fn stress_health_is_authenticated_and_does_not_enter_the_ui_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let status = test_status();
+        status.stress_health.note_ui_heartbeat();
+        status.stress_health.note_native_input();
+        let mut service =
+            ControlService::start(0, root.path().to_owned(), TEST_SECRET.to_owned(), status)
+                .unwrap();
+
+        let denied = send_request(
+            service.address(),
+            "GET /v1/stress/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(denied.starts_with("HTTP/1.1 401"));
+        let accepted = send_request(
+            service.address(),
+            &format!(
+                "GET /v1/stress/health HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TEST_SECRET}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(accepted.starts_with("HTTP/1.1 200"));
+        assert!(accepted.contains("\"ui_heartbeat_sequence\":1"));
+        assert!(accepted.contains("\"native_input_sequence\":1"));
+        assert!(service.try_request().is_none());
+        service.shutdown();
+    }
+
+    #[test]
+    fn stress_health_remains_available_while_a_batch_waits_for_the_ui() {
+        let root = tempfile::tempdir().unwrap();
+        let mut service = ControlService::start(
+            0,
+            root.path().to_owned(),
+            TEST_SECRET.to_owned(),
+            test_status(),
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "commands": [{"command": "wait_until_settled", "timeout_millis": 30_000}]
+        })
+        .to_string();
+        let address = service.address();
+        let batch_client = std::thread::spawn(move || batch_request(address, TEST_SECRET, &body));
+        let pending = loop {
+            if let Some(request) = service.try_request() {
+                break request;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        let health = send_request(
+            service.address(),
+            &format!(
+                "GET /v1/stress/health HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TEST_SECRET}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(health.starts_with("HTTP/1.1 200"));
+
+        pending
+            .reply
+            .send(AutomationRunReport {
+                schema_version: AUTOMATION_SCHEMA_VERSION,
+                succeeded: true,
+                results: vec![AutomationCommandResult {
+                    command_index: 0,
+                    command: "wait_until_settled".to_owned(),
+                    status: AutomationCommandStatus::Succeeded,
+                    error_code: None,
+                    message: "Settled".to_owned(),
+                    data: serde_json::json!({"settled": true}),
+                    elapsed_ms: 0.0,
+                }],
+                telemetry: AutomationRunTelemetry::default(),
+            })
+            .unwrap();
+        assert!(batch_client.join().unwrap().starts_with("HTTP/1.1 200"));
         service.shutdown();
     }
 

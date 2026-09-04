@@ -1,0 +1,100 @@
+{
+  "schema": "rgv.interaction_stress",
+  "schema_version": 1,
+  "name": "generic native round-trip smoke",
+  "requirements": {},
+  "steps": [
+    {
+      "type": "gesture",
+      "id": "canvas-pan-reversal",
+      "target": { "kind": "genomic_canvas", "panel_id": 1 },
+      "timing": { "mode": "recorded" },
+      "events": [
+        { "event": "move", "at_micros": 0, "position": { "x": 0.25, "y": 0.02 } },
+        { "event": "primary_down", "at_micros": 10000 },
+        { "event": "primary_drag", "at_micros": 60000, "position": { "x": 0.75, "y": 0.02 } },
+        { "event": "primary_drag", "at_micros": 120000, "position": { "x": 0.35, "y": 0.02 } },
+        { "event": "primary_up", "at_micros": 150000 }
+      ]
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "native_routing_complete", "step_id": "canvas-pan-reversal" }
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "gesture_terminated", "step_id": "canvas-pan-reversal" }
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "panel_viewport_changed", "panel_id": 1 }
+    },
+    {
+      "type": "gesture",
+      "id": "zoom-reversal",
+      "target": { "kind": "genomic_canvas", "panel_id": 1 },
+      "timing": { "mode": "seeded_jitter", "seed": 731, "maximum_jitter_micros": 500 },
+      "events": [
+        { "event": "move", "at_micros": 0, "position": { "x": 0.5, "y": 0.02 } },
+        { "event": "scroll", "at_micros": 1000, "delta_x": 0.0, "delta_y": 180.0, "unit": "pixel", "phase": "began", "continuous": true },
+        { "event": "scroll", "at_micros": 5000, "delta_x": 0.0, "delta_y": 180.0, "unit": "pixel", "phase": "changed", "continuous": true },
+        { "event": "scroll", "at_micros": 9000, "delta_x": 0.0, "delta_y": -180.0, "unit": "pixel", "phase": "changed", "continuous": true },
+        { "event": "scroll", "at_micros": 12000, "delta_x": 0.0, "delta_y": 0.0, "unit": "pixel", "phase": "ended", "continuous": true }
+      ]
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "native_routing_complete", "step_id": "zoom-reversal" }
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "gesture_terminated", "step_id": "zoom-reversal" }
+    },
+    {
+      "type": "barrier",
+      "predicate": { "kind": "workspace_settled" },
+      "timeout_millis": 120000
+    },
+    {
+      "type": "gesture",
+      "id": "focus-cycle",
+      "target": { "kind": "window" },
+      "timing": { "mode": "recorded" },
+      "events": [
+        { "event": "focus", "at_micros": 0, "focused": false },
+        { "event": "focus", "at_micros": 50000, "focused": true }
+      ]
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "native_routing_complete", "step_id": "focus-cycle" }
+    },
+    {
+      "type": "gesture",
+      "id": "bounded-resize",
+      "target": { "kind": "window" },
+      "timing": { "mode": "recorded" },
+      "events": [
+        { "event": "resize_window", "at_micros": 0, "logical_size": [1180, 740] }
+      ]
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "native_routing_complete", "step_id": "bounded-resize" }
+    },
+    {
+      "type": "assert",
+      "predicate": { "kind": "no_critical_failure" }
+    },
+    {
+      "type": "checkpoint",
+      "label": "generic-smoke-complete",
+      "capture_native_window": true
+    }
+  ],
+  "limits": {
+    "maximum_duration_millis": 600000,
+    "maximum_native_events": 1000,
+    "maximum_held_millis": 30000
+  }
+}

@@ -1242,6 +1242,9 @@ impl Viewer {
         self.poll_reference_events();
         self.poll_alignment_events();
         let ledger_progressed = self.alignment_ledger_progress.take_pending();
+        if ledger_progressed {
+            self.stress_health.note_worker_progress();
+        }
         let immediate_budget_retry = self.alignment_tracks.iter().any(|track| {
             track
                 .scene_budget_retry
@@ -1278,6 +1281,19 @@ impl Viewer {
             self.window.request_redraw();
         }
         self.maybe_start_pending_manual_diagnostic_trace();
+        let desired_generation = self
+            .panels
+            .iter()
+            .map(|panel| panel.generation_clock.current().get())
+            .max()
+            .unwrap_or_default();
+        let committed_generation = if self.automation_is_settled() {
+            desired_generation
+        } else {
+            desired_generation.saturating_sub(1)
+        };
+        self.stress_health
+            .observe_generations(desired_generation, committed_generation);
     }
 
     fn synchronize_alignment_contextual_product_states(&mut self) {

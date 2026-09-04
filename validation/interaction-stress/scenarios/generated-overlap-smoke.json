@@ -1,0 +1,23 @@
+{
+  "schema": "rgv.interaction_stress",
+  "schema_version": 1,
+  "name": "state-aware generated overlap smoke",
+  "seed": 184467,
+  "requirements": {},
+  "steps": [
+    {
+      "type": "generated",
+      "specification": {
+        "seed": 184467,
+        "actions": 40,
+        "profile": "smoke",
+        "maximum_no_wait_actions": 3
+      }
+    }
+  ],
+  "limits": {
+    "maximum_duration_millis": 1200000,
+    "maximum_native_events": 5000,
+    "maximum_held_millis": 30000
+  }
+}

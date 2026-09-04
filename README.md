@@ -69,6 +69,8 @@ explicitly controlled window, see [the MCP setup and tool guide](docs/MCP.md). T
 fixture index is [validation/manual-suite/README.md](validation/manual-suite/README.md), with the
 full testing procedure in
 [validation/manual-suite/TEST_INSTRUCTIONS.md](validation/manual-suite/TEST_INSTRUCTIONS.md).
+For recorded replay and generated native interaction stress testing on macOS, see
+[the interaction-stress guide](docs/INTERACTION_STRESS.md).
 Historical review material is grouped under [`audits/`](audits/), and resolved defect write-ups
 under [`issues/`](issues/).
 

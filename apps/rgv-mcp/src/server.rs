@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use rgv_control_client::{ControlClient, ControlClientError};
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AlignmentAuxComparison, AlignmentAuxFilterValue,
     AlignmentCigarEventPredicate, AlignmentColorMode, AlignmentFlagPredicate, AlignmentGroupMode,
@@ -30,7 +31,6 @@ use serde_json::{Value, json};
 use crate::{
     artifacts::{ArtifactError, ArtifactStore},
     config::RgvMcpArgs,
-    control_client::{ControlClient, ControlClientError},
 };
 
 const DEFAULT_SETTLE_TIMEOUT_MILLIS: u64 = 30_000;
