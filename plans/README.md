@@ -16,6 +16,7 @@ The remaining documents preserve detailed implementation, remediation, and desig
 
 ## Focused plans
 
+- [Code-review remediation — 2026-09-04](CODE_REVIEW_REMEDIATION_PLAN_2026-09-04.md)
 - [Alignment cache thrash and scroll-materialization recovery](ALIGNMENT_CACHE_THRASH_AND_SCROLL_MATERIALIZATION_RECOVERY_PLAN.md)
 - [Alignment cache liveness and vertical navigation](ALIGNMENT_CACHE_LIVENESS_AND_VERTICAL_NAVIGATION_PLAN.md)
 - [macOS interaction stress-testing framework](NATIVE_INTERACTION_STRESS_AUTOMATION_PLAN.md)
