@@ -52,3 +52,6 @@ pub use track_engine::{
     TrackEngine, TrackEngineEvent, TrackSearchHit, TrackSearchResults, TrackSnapshot,
     TrackSnapshotData, TrackSpec, TrackSpecKind,
 };
+
+#[cfg(test)]
+mod retirement_tests;

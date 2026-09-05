@@ -500,6 +500,15 @@ impl TrackEngine {
             .try_receive()
             .map_err(|_| EngineQueueError::Disconnected)
     }
+
+    /// Close ownership immediately, leaving the caller to poll and join the
+    /// worker. Queued obsolete opens and queries are abandoned on closure.
+    #[must_use]
+    pub fn retire(mut self) -> Option<JoinHandle<()>> {
+        self.input.take();
+        self.output.close();
+        self.worker.take()
+    }
 }
 
 impl Drop for TrackEngine {
@@ -524,6 +533,9 @@ fn worker_loop(
     let mut query_contig_aliases = HashMap::new();
     let mut failed = 0;
     for (specification, aliases) in specifications {
+        if output.is_closed() {
+            return;
+        }
         match open_and_push_track(&specification, &mut tracks, &mut tdf_sources, output) {
             Ok(id) => {
                 if !aliases.is_empty() {
@@ -544,6 +556,9 @@ fn worker_loop(
         },
     );
     while let Ok(request) = input.recv() {
+        if output.is_closed() {
+            break;
+        }
         match request {
             TrackEngineRequest::Add {
                 specification,
@@ -665,6 +680,9 @@ fn open_and_push_tracks(
 ) -> Vec<TrackId> {
     let mut added = Vec::new();
     for specification in specifications {
+        if output.is_closed() {
+            break;
+        }
         match open_and_push_track(&specification, tracks, tdf_sources, output) {
             Ok(id) => added.push(id),
             Err(message) => send_track_open_error(output, &specification, &message),
@@ -951,7 +969,7 @@ fn query_tracks(
     let selected = track_ids.map(|ids| ids.iter().copied().collect::<HashSet<_>>());
     let mut completed = Vec::with_capacity(selected.as_ref().map_or(tracks.len(), HashSet::len));
     for track in tracks {
-        if !clock.is_current(request.generation()) {
+        if output.is_closed() || !clock.is_current(request.generation()) {
             break;
         }
         if selected

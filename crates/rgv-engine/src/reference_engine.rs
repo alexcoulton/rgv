@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
 };
@@ -110,6 +110,7 @@ pub struct ReferenceEngine {
     input: Option<Sender<ReferenceEngineRequest>>,
     output: CoalescingReceiver<ReferenceEngineEvent>,
     worker: Option<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl ReferenceEngine {
@@ -118,14 +119,17 @@ impl ReferenceEngine {
         let capacity = queue_capacity.max(1);
         let (input_tx, input_rx) = bounded(capacity);
         let (output_tx, output_rx) = bounded_coalescing(capacity);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
         let worker = thread::Builder::new()
             .name("rgv-reference-actor".to_owned())
-            .spawn(move || worker_loop(&input_rx, &output_tx))
+            .spawn(move || worker_loop(&input_rx, &output_tx, &worker_shutdown))
             .expect("failed to spawn RGV reference actor");
         Self {
             input: Some(input_tx),
             output: output_rx,
             worker: Some(worker),
+            shutdown,
         }
     }
 
@@ -160,6 +164,17 @@ impl ReferenceEngine {
             .map_err(|_| EngineQueueError::Disconnected)
     }
 
+    /// Stop accepting work and transfer the join obligation to the caller.
+    /// Poll `is_finished` before joining during interactive replacement; final
+    /// shutdown may join directly. In-flight IO still obeys its transport deadline.
+    #[must_use]
+    pub fn retire(mut self) -> Option<JoinHandle<()>> {
+        self.shutdown.store(true, Ordering::Release);
+        self.input.take();
+        self.output.close();
+        self.worker.take()
+    }
+
     fn try_send(&self, request: ReferenceEngineRequest) -> Result<(), EngineQueueError> {
         let Some(input) = &self.input else {
             return Err(EngineQueueError::Disconnected);
@@ -173,6 +188,7 @@ impl ReferenceEngine {
 
 impl Drop for ReferenceEngine {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
         self.input.take();
         self.output.close();
         if let Some(worker) = self.worker.take()
@@ -186,9 +202,13 @@ impl Drop for ReferenceEngine {
 fn worker_loop(
     input: &Receiver<ReferenceEngineRequest>,
     output: &CoalescingSender<ReferenceEngineEvent>,
+    shutdown: &Arc<AtomicBool>,
 ) {
     let mut reference: Option<(FastaReference, ReferenceRevision)> = None;
     while let Ok(request) = input.recv() {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
         let event = match request {
             ReferenceEngineRequest::Open { path, options } => {
                 match FastaReference::open_with_options(path, &options) {
@@ -236,11 +256,19 @@ fn worker_loop(
                 }
                 let query_clock = clock.clone();
                 let generation = query.request.generation();
-                let cancellation: RemoteCancellation =
-                    Arc::new(move || query_clock.is_current(generation));
+                let query_shutdown = Arc::clone(shutdown);
+                let cancellation: RemoteCancellation = Arc::new(move || {
+                    !query_shutdown.load(Ordering::Acquire) && query_clock.is_current(generation)
+                });
                 reference.set_remote_cancellation(Some(cancellation));
-                match fetch_reference_query(reference, &contig_name, query.interval, &clock, query)
-                {
+                match fetch_reference_query(
+                    reference,
+                    &contig_name,
+                    query.interval,
+                    &clock,
+                    query,
+                    shutdown,
+                ) {
                     ReferenceQueryFetch::Completed(slice)
                         if clock.is_current(query.request.generation()) =>
                     {
@@ -292,6 +320,7 @@ fn fetch_reference_query(
     interval: GenomicInterval,
     clock: &GenerationClock,
     query: ReferenceQueryIdentity,
+    shutdown: &AtomicBool,
 ) -> ReferenceQueryFetch {
     let expected_bases = match usize::try_from(interval.len()) {
         Ok(expected) => expected,
@@ -310,7 +339,7 @@ fn fetch_reference_query(
 
     let mut start = interval.start();
     while start < interval.end() {
-        if !clock.is_current(query.request.generation()) {
+        if shutdown.load(Ordering::Acquire) || !clock.is_current(query.request.generation()) {
             return ReferenceQueryFetch::Cancelled;
         }
         let end = start
@@ -345,7 +374,7 @@ fn fetch_reference_query(
         start = end;
     }
 
-    if !clock.is_current(query.request.generation()) {
+    if shutdown.load(Ordering::Acquire) || !clock.is_current(query.request.generation()) {
         return ReferenceQueryFetch::Cancelled;
     }
     if bases.len() != expected_bases {

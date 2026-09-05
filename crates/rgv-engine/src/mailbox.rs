@@ -76,6 +76,15 @@ pub(crate) fn bounded_coalescing<T>(
 }
 
 impl<T> CoalescingSender<T> {
+    pub(crate) fn is_closed(&self) -> bool {
+        !self
+            .inner
+            .state
+            .lock()
+            .expect("mailbox mutex poisoned")
+            .receiver_open
+    }
+
     /// Enqueues a non-discardable control without ever waiting for capacity. UI and render
     /// threads use this form so a saturated worker cannot stall input handling.
     pub(crate) fn try_send_control(&self, value: T) -> Result<(), TryMailboxSendError<T>> {
