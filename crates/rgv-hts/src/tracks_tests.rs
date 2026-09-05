@@ -16,6 +16,119 @@ use tiny_http::{Header as HttpHeader, Method, Response, Server, StatusCode};
 
 use super::*;
 
+fn cohort_filter_fixture(
+    samples: usize,
+    records: usize,
+    late_match: bool,
+) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cohort.bcf");
+    let mut header = Header::new();
+    header.push_record(br"##contig=<ID=chr1,length=1000000>");
+    header.push_record(br#"##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">"#);
+    header.push_record(br#"##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Depth">"#);
+    for index in 0..samples {
+        header.push_sample(format!("sample{index}").as_bytes());
+    }
+    {
+        let mut writer = Writer::from_path(&path, &header, false, Format::Bcf).unwrap();
+        for position in 0..records {
+            let mut record = writer.empty_record();
+            record.set_rid(Some(0));
+            record.set_pos(i64::try_from(position).unwrap());
+            record.set_alleles(&[b"A", b"C"]).unwrap();
+            let alleles = (0..samples)
+                .flat_map(|index| {
+                    [
+                        GenotypeAllele::Unphased(0),
+                        GenotypeAllele::Unphased(i32::from(!late_match || index == samples - 1)),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            record.push_genotypes(&alleles).unwrap();
+            let depths = (0..samples)
+                .map(|index| if index == samples - 1 { 42 } else { 0 })
+                .collect::<Vec<_>>();
+            record.push_format_integer(b"DP", &depths).unwrap();
+            writer.write(&record).unwrap();
+        }
+    }
+    index::build(&path, None, 1, index::Type::Csi(14)).unwrap();
+    (directory, path)
+}
+
+#[test]
+fn variant_eligibility_does_not_depend_on_viewport_or_retained_genotype_budget() {
+    let (_directory, path) = cohort_filter_fixture(256, 1001, false);
+    let mut source = LocalVariantSource::open(path).unwrap();
+    let settings = VariantTrackSettings {
+        genotype: VariantGenotypeFilter::Heterozygous,
+        ..VariantTrackSettings::default()
+    };
+    let broad = source
+        .query_with_settings("chr1", 0, 1001, 2000, &settings)
+        .unwrap();
+    let narrow = source
+        .query_with_settings("chr1", 977, 1001, 2000, &settings)
+        .unwrap();
+    assert_eq!(broad.records.len(), 1001);
+    assert_eq!(broad.provenance.records_filtered, 0);
+    assert_eq!(
+        broad.provenance.genotype_cells_loaded,
+        MAX_VARIANT_GENOTYPE_CELLS_PER_QUERY
+    );
+    assert!(broad.provenance.genotype_cells_omitted > 0);
+    assert_eq!(narrow.records.len(), 24);
+    assert!(
+        narrow
+            .records
+            .iter()
+            .all(|record| broad.records.iter().any(|b| b.start == record.start))
+    );
+}
+
+#[test]
+fn variant_predicates_find_samples_beyond_the_display_sample_cap() {
+    let (_directory, path) = cohort_filter_fixture(MAX_GENOTYPE_SAMPLES_PER_RECORD + 1, 1, true);
+    let mut source = LocalVariantSource::open(path).unwrap();
+    let mut settings = VariantTrackSettings {
+        genotype: VariantGenotypeFilter::Heterozygous,
+        field_predicates: vec![VariantFieldPredicate {
+            scope: VariantFieldScope::Format,
+            key: "DP".into(),
+            comparison: VariantFieldComparison::GreaterThan(40.0),
+            missing: VariantMissingValueRule::Exclude,
+        }],
+        ..VariantTrackSettings::default()
+    };
+    let query = source
+        .query_with_settings("chr1", 0, 1, 10, &settings)
+        .unwrap();
+    assert_eq!(query.records.len(), 1);
+    assert_eq!(
+        query.records[0].genotypes.len(),
+        MAX_GENOTYPE_SAMPLES_PER_RECORD
+    );
+    settings.sample_subset_enabled = true;
+    settings.sample_subset = vec!["sample0".into()];
+    assert!(
+        source
+            .query_with_settings("chr1", 0, 1, 10, &settings)
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    settings.sample_subset = vec![format!("sample{}", MAX_GENOTYPE_SAMPLES_PER_RECORD)];
+    assert_eq!(
+        source
+            .query_with_settings("chr1", 0, 1, 10, &settings)
+            .unwrap()
+            .records
+            .len(),
+        1
+    );
+}
+
 const BIG_GENE_PRED_AUTOSQL: &str = r#"table bigGenePred
 "bigGenePred gene models"
 (

@@ -1,6 +1,8 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+mod filtering;
+
 pub struct LocalVariantSource {
     path: PathBuf,
     reader: bcf::IndexedReader,
@@ -86,17 +88,24 @@ impl LocalVariantSource {
         let mut records_examined = 0_usize;
         let mut records_filtered = 0_usize;
         let selected_sample_indices = selected_sample_indices(&self.header, settings);
+        filtering::validate_filter_authority(
+            self.reader.header(),
+            &self.header,
+            self.omitted_header_samples,
+            settings,
+        )?;
         for result in self.reader.records() {
             let record = result.map_err(|error| TrackError::Backend(error.to_string()))?;
             records_examined = records_examined.saturating_add(1);
-            let (decoded, loaded, omitted) = decode_variant_record(
+            let (mut decoded, _, _) =
+                decode_variant_record(&record, &self.header, &contig, 0, &selected_sample_indices)?;
+            if !filtering::source_record_matches(
                 &record,
+                &decoded,
                 &self.header,
-                &contig,
-                remaining_genotype_cells,
+                settings,
                 &selected_sample_indices,
-            )?;
-            if !variant_record_matches(&decoded, &self.header, settings) {
+            )? {
                 records_filtered = records_filtered.saturating_add(1);
                 continue;
             }
@@ -104,6 +113,13 @@ impl LocalVariantSource {
                 records_truncated = true;
                 break;
             }
+            let (genotypes, loaded, omitted) = decode_genotypes(
+                &record,
+                &self.header,
+                remaining_genotype_cells,
+                &selected_sample_indices,
+            );
+            decoded.genotypes = genotypes;
             remaining_genotype_cells = remaining_genotype_cells.saturating_sub(loaded);
             genotype_cells_loaded = genotype_cells_loaded.saturating_add(loaded);
             genotype_cells_omitted = genotype_cells_omitted.saturating_add(omitted);
@@ -508,7 +524,10 @@ fn decode_info_fields(
                 .string()
                 .map_err(|error| TrackError::Backend(error.to_string()))?
                 .map(|values| {
-                    let truncated = values.len() > MAX_VARIANT_VALUES_PER_FIELD;
+                    let truncated = values.len() > MAX_VARIANT_VALUES_PER_FIELD
+                        || values
+                            .iter()
+                            .any(|value| value.len() > MAX_VARIANT_STRING_BYTES);
                     VariantField {
                         key: schema.id.clone(),
                         value: VariantValue::Strings(
