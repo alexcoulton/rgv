@@ -8255,6 +8255,116 @@ mod tests {
     }
 
     #[test]
+    fn semantic_export_contains_committed_read_and_depth_geometry_and_pins_its_capture() {
+        use rgv_alignment_scene::{
+            AlignmentCamera, AlignmentDerivedLaneCapture, AlignmentDerivedLaneOptions,
+            AlignmentPanelLaneFrame, AlignmentPanelSceneFrame, CpuClipRect, CpuPrimitiveShape,
+        };
+        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+        let scene = test_snapshot(&ledger);
+        let interval = scene.prepared_interval();
+        let viewport = Viewport::new(interval, 256.0).unwrap();
+        let read_camera = AlignmentCamera::from_viewport(
+            viewport,
+            0.0,
+            10.0,
+            8.0,
+            CpuClipRect {
+                x: 0.0,
+                y: 100.0,
+                width: 256.0,
+                height: f64::from(scene.reads().prepared_rows().end) * 10.0,
+            },
+        )
+        .unwrap();
+        let lane = AlignmentPanelLaneFrame {
+            track_id: rgv_core::TrackId::new(1),
+            preparation_camera: read_camera.into(),
+            read_camera: Some(read_camera),
+            row_activity: None,
+            derived_lanes: vec![
+                AlignmentDerivedLaneCapture::new(
+                    camera(interval).clip(),
+                    AlignmentDerivedLaneOptions::Coverage(lane_options(false)),
+                )
+                .unwrap(),
+            ]
+            .into(),
+            source_camera_sequence: 1,
+            snapshot: Some(Arc::clone(&scene)),
+            covered_interval: Some(interval),
+            // The fixture has one atlas row. Empty camera padding is not
+            // evidence demand, matching panel-scene capture's atlas clipping.
+            requested_rows: scene.reads().prepared_rows(),
+            covered_rows: scene.reads().prepared_rows(),
+            scene_contracts_current: true,
+        };
+        let frame = AlignmentPanelSceneFrame {
+            panel_id: rgv_core::PanelId::new(1),
+            viewport,
+            camera_revision: 1,
+            authority_revision: 1,
+            lanes: vec![lane].into(),
+            coherence_groups: Vec::new().into(),
+        };
+        let expected =
+            rgv_alignment_scene::CpuAlignmentProjector::project(scene.reads(), 1, read_camera)
+                .unwrap();
+        let export = crate::project_semantic_alignment_export(
+            std::slice::from_ref(&frame),
+            &ledger,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        for body in expected
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.shape != CpuPrimitiveShape::TextLabel)
+        {
+            assert!(export.display.rectangles.iter().any(|rectangle| {
+                (f64::from(rectangle.x) - body.x).abs() < 1e-4
+                    && (f64::from(rectangle.y) - body.y).abs() < 1e-4
+                    && (f64::from(rectangle.width) - body.width).abs() < 1e-4
+                    && (f64::from(rectangle.height) - body.height).abs() < 1e-4
+            }));
+        }
+        assert!(
+            export
+                .display
+                .rectangles
+                .iter()
+                .any(|rectangle| rectangle.y < 96.0
+                    && rectangle.color == Rgba::new(0.48, 0.48, 0.48, 0.90))
+        );
+        assert!(
+            expected.primitives.iter().any(|primitive| matches!(
+                primitive.component,
+                rgv_alignment_scene::AlignmentComponent::ReadSpan
+                    | rgv_alignment_scene::AlignmentComponent::AlignedSegment { .. }
+            )),
+            "fixture must project a biological read span: {:?}",
+            expected.primitives
+        );
+        let mut next = frame.clone();
+        Arc::make_mut(&mut next.lanes)[0].scene_contracts_current = false;
+        assert!(
+            crate::project_semantic_alignment_export(
+                &[next],
+                &ledger,
+                &std::collections::HashMap::new()
+            )
+            .is_err()
+        );
+        let retained = crate::project_semantic_alignment_export(
+            &[frame],
+            &ledger,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(retained.display, export.display);
+    }
+
+    #[test]
     fn packed_modifications_match_the_dominant_cpu_oracle_for_live_lane_options() {
         let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
         let scene = test_snapshot(&ledger);

@@ -5559,6 +5559,10 @@ impl Viewer {
         path: &Path,
         remote_index_url: Option<String>,
     ) {
+        if let Err(error) = self.ensure_engine_retirement_capacity(2) {
+            self.data_status = error.to_string();
+            return;
+        }
         self.reference_open_error = None;
         self.remote_reference_index_url = remote_index_url;
         let source = track_source(path);
@@ -5569,12 +5573,16 @@ impl Viewer {
             reference_open_options(self.remote_reference_index_url.clone()),
         ) {
             self.data_status = error.to_string();
+            if let Some(worker) = engine.retire() {
+                self.engine_retirement_tasks.push(worker);
+            }
             return;
         }
         self.reference_source = Some(source);
         self.reference_dictionary = None;
         self.reference_revision = None;
         self.reference_remote_io_stats = None;
+        self.retire_reference_engine();
         self.reference_engine = Some(engine);
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
@@ -5664,31 +5672,69 @@ impl Viewer {
         Ok(())
     }
 
-    pub(crate) fn replace_alignment_track_controllers(
+    pub(crate) fn prepare_alignment_track_controllers(
         &mut self,
         configs: Vec<SessionAlignmentTrack>,
-    ) -> Result<()> {
+        reference_path: Option<PathBuf>,
+        remote_reference_index_url: Option<String>,
+        panel_ids: &[PanelId],
+    ) -> Result<Vec<AlignmentTrackController>> {
+        for config in &configs {
+            filter_state_from_session(&config.filters)?;
+        }
         let cache_bytes = NonZeroUsize::new(self.alignment_scene_budget.budget_bytes.max(1))
             .expect("scene budget is non-zero");
-        let reference_path = self.reference_source.as_ref().map(source_path);
-        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         let mut controllers = Vec::with_capacity(configs.len());
         for config in configs {
-            controllers.push(spawn_alignment_track_controller(
+            match spawn_alignment_track_controller(
                 config,
                 cache_bytes,
                 self.alignment_scene_ledger.clone(),
                 reference_path.clone(),
-                self.remote_reference_index_url.clone(),
-                &panel_ids,
-            )?);
+                remote_reference_index_url.clone(),
+                panel_ids,
+            ) {
+                Ok(controller) => controllers.push(controller),
+                Err(error) => {
+                    for controller in controllers {
+                        self.retire_alignment_track_controller(controller);
+                    }
+                    return Err(error);
+                }
+            }
         }
+        Ok(controllers)
+    }
+
+    pub(crate) fn install_alignment_track_controllers(
+        &mut self,
+        controllers: Vec<AlignmentTrackController>,
+    ) {
         let replaced = std::mem::replace(&mut self.alignment_tracks, controllers);
         for controller in replaced {
             self.retire_alignment_track_controller(controller);
         }
         self.reset_alignment_scene_panel_authority();
         self.reconcile_track_presentation();
+    }
+
+    pub(crate) fn replace_alignment_track_controllers(
+        &mut self,
+        configs: Vec<SessionAlignmentTrack>,
+    ) -> Result<()> {
+        self.poll_alignment_retirement_tasks();
+        anyhow::ensure!(
+            self.alignment_retirement_tasks.len() <= rgv_core::MAXIMUM_ALIGNMENT_TRACKS,
+            "Previous alignment sources are still closing; retry shortly"
+        );
+        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let controllers = self.prepare_alignment_track_controllers(
+            configs,
+            self.reference_source.as_ref().map(source_path),
+            self.remote_reference_index_url.clone(),
+            &panel_ids,
+        )?;
+        self.install_alignment_track_controllers(controllers);
         Ok(())
     }
 

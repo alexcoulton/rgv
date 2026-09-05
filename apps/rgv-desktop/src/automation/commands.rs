@@ -898,6 +898,7 @@ impl Viewer {
         command: AutomationCommand,
         now: Instant,
     ) -> AutomationExecution {
+        self.observe_document_changes();
         match command {
             AutomationCommand::DescribeWorkspace => {
                 let snapshot = self.automation_workspace_snapshot();
@@ -1151,7 +1152,7 @@ impl Viewer {
                 path,
                 confirm_replace,
                 unsaved_changes,
-                timeout_millis: _,
+                timeout_millis,
             } => {
                 if !confirm_replace {
                     return automation_failure(
@@ -1160,7 +1161,8 @@ impl Viewer {
                     );
                 }
                 let path = PathBuf::from(path);
-                let dirty = self.workspace_revision != self.last_saved_workspace_revision;
+                let dirty = self.document_state.is_dirty();
+                let mut save_destination = None;
                 if dirty {
                     match unsaved_changes {
                         AutomationUnsavedChangesPolicy::Reject => {
@@ -1176,32 +1178,20 @@ impl Viewer {
                                     "save_then_open requires an existing project destination",
                                 );
                             };
-                            if let Err(error) = self.session_document().write(&current_path) {
-                                return automation_failure(AutomationErrorCode::Io, error);
-                            }
-                            self.last_saved_workspace_revision = self.workspace_revision;
+                            save_destination = Some(current_path);
                         }
                         AutomationUnsavedChangesPolicy::Discard => {}
                     }
                 }
-                let session = match SessionDocument::read(&path) {
-                    Ok(session) => session,
-                    Err(error) => return automation_failure(AutomationErrorCode::Io, error),
-                };
-                if let Err(error) = self.apply_session(&session) {
-                    return automation_failure(AutomationErrorCode::InvalidState, error);
-                }
-                self.current_session_path = Some(path);
-                self.bump_workspace_revision();
-                self.last_saved_workspace_revision = self.workspace_revision;
-                AutomationExecution::Complete {
-                    message: "Opened the requested workspace".to_owned(),
-                    data: serde_json::json!({
-                        "application_instance_id": self.application_instance_id,
-                        "workspace_revision": self.workspace_revision,
-                        "settled": self.automation_is_settled(),
-                        "panels": self.automation_workspace_snapshot().panels,
-                    }),
+                match self.try_start_session_load(
+                    path,
+                    SessionLoadKind::Native,
+                    Some(command_index),
+                    Some(now + Duration::from_millis(timeout_millis)),
+                    save_destination,
+                ) {
+                    Ok(()) => AutomationExecution::Wait(AutomationWait::File { command_index }),
+                    Err(error) => automation_failure(AutomationErrorCode::Io, error),
                 }
             }
             AutomationCommand::SetGenome { source, name } => {
@@ -5076,51 +5066,10 @@ impl Viewer {
             self.window.request_redraw();
             return Ok(());
         }
-        let requested_presentations_committed = match scope {
-            AutomationSnapshotScope::VisibleWorkspace => self
-                .panels
-                .iter()
-                .all(|panel| panel.navigation_presentation.is_interactive()),
-            AutomationSnapshotScope::ActivePanel
-            | AutomationSnapshotScope::FullActivePanel
-            | AutomationSnapshotScope::NativeWindow => self
-                .panels
-                .active()
-                .navigation_presentation
-                .is_interactive(),
-        };
-        anyhow::ensure!(
-            requested_presentations_committed,
-            "the target viewport is still being checked"
-        );
-        let (display, width, height, scope_label) = match scope {
-            AutomationSnapshotScope::VisibleWorkspace => {
-                let bounds = self.workspace_layout.workspace;
-                let width = bounds.width().ceil().max(1.0) as u32;
-                let height = bounds.height().ceil().max(1.0) as u32;
-                (
-                    cropped_display_list(&self.composite_display_list, bounds),
-                    width,
-                    height,
-                    format!(
-                        "visible workspace; committed layout revision {}",
-                        self.workspace_layout.revision
-                    ),
-                )
-            }
-            AutomationSnapshotScope::ActivePanel => {
-                let bounds = self.active_panel_rect();
-                (
-                    cropped_display_list(&self.panels.active_mut().display_list, bounds),
-                    bounds.width().ceil().max(1.0) as u32,
-                    bounds.height().ceil().max(1.0) as u32,
-                    "active panel".to_owned(),
-                )
-            }
-            AutomationSnapshotScope::FullActivePanel => self.full_active_panel_export_display(),
-            AutomationSnapshotScope::NativeWindow => unreachable!(),
-        };
-        let display = semantic_export_display_list(&display);
+        let capture = self.capture_semantic_export(scope)?;
+        let width = capture.width;
+        let height = capture.height;
+        let scope_label = capture.scope_label.clone();
         let mut metadata = automation_snapshot_metadata(
             &self.assembly_name,
             &self.panels,
@@ -5157,89 +5106,8 @@ impl Viewer {
             command_index,
             path,
             completion_data,
-            move |path| match format {
-                AutomationSnapshotFormat::Png => export_png(&display, width, height, path)
-                    .map_err(|error| std::io::Error::other(error.to_string())),
-                AutomationSnapshotFormat::Svg => std::fs::write(
-                    path,
-                    display_list_svg_export(&display, width, height, &metadata),
-                ),
-            },
+            move |path| capture.write(path, format, &metadata),
         )
-    }
-
-    pub(crate) fn full_active_panel_export_display(&mut self) -> (DisplayList, u32, u32, String) {
-        let original_workspace_layout = self.workspace_layout.clone();
-        let original_scroll = self.panels.active().vertical_scroll_points;
-        let original_content_origin = self.panels.active().vertical_content_origin_points;
-        let original_read_panel_scrolls = self.panels.active().read_panel_scrolls.clone();
-        let content_height = (self.panels.active().content_bottom_points
-            - self.canvas_geometry().viewport.top())
-        .ceil()
-        .max(1.0);
-        let export_height = content_height.min(MAX_AUTOMATION_FULL_PANEL_HEIGHT as f32) as u32;
-        let truncated = content_height > MAX_AUTOMATION_FULL_PANEL_HEIGHT as f32;
-        let expanded_workspace = egui::Rect::from_min_max(
-            original_workspace_layout.workspace.min,
-            egui::pos2(
-                original_workspace_layout.workspace.right(),
-                original_workspace_layout.genome_context.bottom() + export_height as f32,
-            ),
-        );
-        let panel_inputs = original_workspace_layout
-            .panels
-            .iter()
-            .map(|panel| WorkspacePanelLayoutInput {
-                panel_id: panel.panel_id,
-                contig_name: panel.contig_name.clone(),
-                contig_length: panel.contig_length,
-                cytobands: panel.cytobands,
-            })
-            .collect::<Vec<_>>();
-        self.workspace_layout = WorkspaceLayoutSnapshot::compute(
-            WorkspaceLayoutInput {
-                workspace: expanded_workspace,
-                properties: original_workspace_layout.properties,
-                properties_expanded: original_workspace_layout.properties_expanded,
-                panels: panel_inputs,
-                metrics: original_workspace_layout.metrics,
-                requested_track_gutter_width: original_workspace_layout
-                    .requested_track_gutter_width,
-                minimum_track_gutter_width: original_workspace_layout.minimum_track_gutter_width,
-                requested_scrollbar_width: original_workspace_layout.requested_scrollbar_width,
-                minimum_scrollbar_width: original_workspace_layout.minimum_scrollbar_width,
-                display_scale: original_workspace_layout.display_scale,
-                accessibility_scale: original_workspace_layout.accessibility_scale,
-            },
-            original_workspace_layout.revision,
-        );
-        self.panels.active_mut().vertical_scroll_points = 0.0;
-        self.panels.active_mut().vertical_content_origin_points = 0.0;
-        for state in self.panels.active_mut().read_panel_scrolls.values_mut() {
-            state.scroll_points = 0.0;
-            state.content_origin_points = 0.0;
-        }
-        self.rebuild_genomic_display();
-        let bounds = self.active_panel_rect();
-        let display = cropped_display_list(&self.panels.active().display_list, bounds);
-        let width = bounds.width().ceil().max(1.0) as u32;
-
-        self.workspace_layout = original_workspace_layout;
-        self.panels.active_mut().vertical_scroll_points = original_scroll;
-        self.panels.active_mut().vertical_content_origin_points = original_content_origin;
-        self.panels.active_mut().read_panel_scrolls = original_read_panel_scrolls;
-        self.rebuild_genomic_display();
-        self.composite_display_list = composite_panel_display_lists(&self.panels);
-        self.mark_display_dirty("explicit display invalidation");
-
-        let scope = if truncated {
-            format!(
-                "full active panel; truncated from {content_height:.0} to {MAX_AUTOMATION_FULL_PANEL_HEIGHT} logical pixels"
-            )
-        } else {
-            "full active panel".to_owned()
-        };
-        (display, width, export_height, scope)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5515,27 +5383,7 @@ impl Viewer {
         command_index: usize,
         path: PathBuf,
     ) -> Result<()> {
-        anyhow::ensure!(
-            !self.session_save_tasks.iter().any(|task| task.path == path),
-            "a save to {} is already in progress",
-            path.display()
-        );
-        let document = self.session_document();
-        let display_path = path.display().to_string();
-        let worker = std::thread::Builder::new()
-            .name("rgv-automation-session-save".to_owned())
-            .spawn({
-                let path = path.clone();
-                move || document.write(path).map_err(|error| error.to_string())
-            })?;
-        self.session_save_tasks.push(SessionSaveTask {
-            path,
-            kind: SessionSaveKind::Manual,
-            automation_command: Some(command_index),
-            worker,
-        });
-        self.data_status = format!("Automation is saving {display_path}…");
-        Ok(())
+        self.try_start_session_save(path, Some(command_index))
     }
 }
 

@@ -4,6 +4,199 @@ use rgv_layout::{
     read_arrow_head_width,
 };
 
+pub(crate) struct SemanticExportCapture {
+    generic: DisplayList,
+    panels: Vec<rgv_alignment_scene::AlignmentPanelSceneFrame>,
+    interactions: HashMap<(PanelId, TrackId), rgv_alignment_scene::AlignmentInteractionState>,
+    bounds: egui::Rect,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) scope_label: String,
+    ledger: rgv_alignment_scene::AllocationLedger,
+    _resources: rgv_alignment_scene::TransientResourceReservation,
+}
+
+impl SemanticExportCapture {
+    pub(crate) fn write(
+        self,
+        path: PathBuf,
+        format: AutomationSnapshotFormat,
+        metadata: &str,
+    ) -> std::io::Result<()> {
+        let geometry = rgv_render::project_semantic_alignment_export(
+            &self.panels,
+            &self.ledger,
+            &self.interactions,
+        )?;
+        let mut display = self.generic;
+        display
+            .rectangles
+            .extend_from_slice(&geometry.display.rectangles);
+        let display = cropped_display_list(&display, self.bounds);
+        match format {
+            AutomationSnapshotFormat::Png => export_png(&display, self.width, self.height, path)
+                .map_err(|error| std::io::Error::other(error.to_string())),
+            AutomationSnapshotFormat::Svg => std::fs::write(
+                path,
+                display_list_svg_export(&display, self.width, self.height, metadata),
+            ),
+        }
+    }
+}
+
+impl Viewer {
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn capture_semantic_export(
+        &self,
+        scope: AutomationSnapshotScope,
+    ) -> Result<SemanticExportCapture> {
+        let active_only = scope != AutomationSnapshotScope::VisibleWorkspace;
+        let bounds = if active_only {
+            self.active_panel_rect()
+        } else {
+            self.workspace_layout.workspace
+        };
+        anyhow::ensure!(
+            scope != AutomationSnapshotScope::NativeWindow,
+            "native window uses composed capture"
+        );
+        if scope == AutomationSnapshotScope::FullActivePanel {
+            let panel = self.panels.active();
+            // We may only promise a complete scope if every lane is already
+            // resident and unscrolled. Acquiring unseen pages requires a separate
+            // bounded source request, never a mutation of the live UI camera.
+            anyhow::ensure!(
+                self.panels.annotation_scroll_points.abs() < f32::EPSILON
+                    && panel.read_stack_scroll_points.abs() < f32::EPSILON
+                    && panel.read_stack_content_bottom_points <= bounds.bottom()
+                    && panel
+                        .scroll_display_cache
+                        .as_ref()
+                        .is_some_and(
+                            |cache| cache.annotation_content_bottom <= cache.annotation_clip_bottom
+                        ),
+                "full active panel is not fully resident in the captured viewport; export refused (no partial file was written)"
+            );
+        }
+        let mut panels = Vec::new();
+        let mut interactions = HashMap::new();
+        for panel in self
+            .panels
+            .iter()
+            .filter(|panel| !active_only || panel.id == self.panels.active().id)
+        {
+            anyhow::ensure!(
+                panel.navigation_presentation.is_interactive(),
+                "target viewport is still being checked"
+            );
+            if let Some(frame) = self
+                .alignment_presented_epoch
+                .as_ref()
+                .and_then(|epoch| epoch.panel_frames.get(&panel.id))
+            {
+                for lane in frame.lanes.iter() {
+                    if scope == AutomationSnapshotScope::FullActivePanel
+                        && let Some(camera) = lane.read_camera
+                    {
+                        let extent = lane.row_activity.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("full-panel row extent is unavailable")
+                        })?;
+                        let end = extent.active_row_end();
+                        anyhow::ensure!(
+                            camera.row_scroll() <= f64::EPSILON
+                                && (end as f64 - camera.row_scroll()) * camera.row_height()
+                                    <= camera.clip().height
+                                && lane.covered_rows.start == 0
+                                && lane.covered_rows.end as usize >= end,
+                            "full active panel requires off-screen read pages; export refused without changing the live camera"
+                        );
+                    }
+                    if let Some(projection) = self
+                        .alignment_tracks
+                        .iter()
+                        .find(|track| track.config.id == lane.track_id)
+                        .and_then(|track| track.projection(panel.id))
+                    {
+                        interactions.insert(
+                            (panel.id, lane.track_id),
+                            projection.scene_interaction.without_hover(),
+                        );
+                    }
+                    let presented = self
+                        .presented_alignment_lane(panel.id, lane.track_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("alignment presentation is stale or unavailable")
+                        })?;
+                    anyhow::ensure!(
+                        lane.visible_complete()
+                            && (lane.read_camera.is_none() || presented.read_authority.is_some()),
+                        "complete alignment evidence is unavailable for export"
+                    );
+                }
+                panels.push(frame.clone());
+            } else {
+                anyhow::ensure!(
+                    self.alignment_tracks.is_empty(),
+                    "committed alignment presentation is unavailable"
+                );
+            }
+        }
+        let width = bounds.width().ceil().max(1.0) as u32;
+        let height = bounds.height().ceil().max(1.0) as u32;
+        anyhow::ensure!(
+            height <= MAX_AUTOMATION_FULL_PANEL_HEIGHT,
+            "export height exceeds its resource limit"
+        );
+        let generic = if active_only {
+            &self.panels.active().display_list
+        } else {
+            &self.composite_display_list
+        };
+        let bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(16))
+            .and_then(|bytes| bytes.checked_add(generic.rectangles.len().saturating_mul(1024)))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    generic
+                        .texts
+                        .iter()
+                        .map(|text| {
+                            std::mem::size_of::<rgv_layout::TextPrimitive>() * 3
+                                + text.text.len() * 12
+                        })
+                        .sum::<usize>(),
+                )
+            })
+            .ok_or_else(|| anyhow::anyhow!("export allocation overflow"))?;
+        let resources = self.alignment_scene_ledger.reserve_transient(
+            rgv_alignment_scene::TransientResourceClass::CpuProjection,
+            bytes,
+            rgv_alignment_scene::ReservationKind::Normal,
+        )?;
+        Ok(SemanticExportCapture {
+            interactions,
+            ledger: self.alignment_scene_ledger.clone(),
+            generic: semantic_export_display_list(generic),
+            panels,
+            bounds,
+            width,
+            height,
+            scope_label: match scope {
+                AutomationSnapshotScope::VisibleWorkspace => format!(
+                    "visible workspace; committed layout revision {}",
+                    self.workspace_layout.revision
+                ),
+                AutomationSnapshotScope::FullActivePanel => {
+                    "full active panel; complete resident scope".into()
+                }
+                _ => "active panel".into(),
+            },
+            _resources: resources,
+        })
+    }
+}
+
 const fn is_transient_sashimi_hover(shape: RectShape) -> bool {
     matches!(
         shape,

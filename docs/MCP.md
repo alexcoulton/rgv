@@ -183,7 +183,9 @@ the single final resolution-dependent refresh.
 
 `rgv_capture_view` with `scope: "visible_workspace"` crops and rebases PNG output to the exact
 committed workspace rectangle. `active_panel` uses the committed active canvas, while
-`full_active_panel` extends that canvas vertically within the documented safety bound.
+`full_active_panel` requires the complete unscrolled content to be resident and fit the captured
+canvas. If off-screen pages would be needed, it fails explicitly without writing a partial export
+or moving the live camera. PNG and SVG project the captured committed alignment scene.
 `rgv_capture_window` remains the complete native client area, including the application shell and
 Properties panel.
 

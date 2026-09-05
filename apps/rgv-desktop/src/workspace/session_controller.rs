@@ -1,5 +1,29 @@
 use super::super::*;
 
+/// Pure desktop preparation: no live state or worker ownership changes until
+/// every capability, filter and panel construction check has succeeded.
+fn prepare_session_geometry(
+    session: &SessionDocument,
+    width: f32,
+    top: f32,
+) -> Result<(PanelWorkspace, Option<PathBuf>)> {
+    session.to_json()?; // Includes core presentation, source and filter validation.
+    let cytobands = match &session.cytobands {
+        Some(TrackSource::Local { path }) => Some(PathBuf::from(path)),
+        Some(TrackSource::Remote { .. }) => {
+            anyhow::bail!("remote session cytoband files are not yet supported")
+        }
+        None => None,
+    };
+    for track in &session.alignment_tracks {
+        filter_state_from_session(&track.filters)?;
+    }
+    Ok((
+        PanelWorkspace::from_session(session, width, top)?,
+        cytobands,
+    ))
+}
+
 impl Viewer {
     pub(crate) fn persist_settings(&mut self) {
         self.remember_current_locus();
@@ -236,16 +260,61 @@ impl Viewer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn apply_session(&mut self, session: &SessionDocument) -> Result<()> {
         let mut rebound_session = session.clone();
-        if let Some(error) = LaunchOptions::rebind_builtin_session_tracks(
+        let landmark_error = LaunchOptions::rebind_builtin_session_tracks(
             &mut rebound_session,
             self.landmark_resource_root.as_deref(),
             self.landmark_catalogue.as_ref(),
-        ) {
+        );
+        let session = &rebound_session;
+        let panel_count = session.panels.len().max(1);
+        let panel_canvas_width = self.workspace_layout.projected_canvas_width(panel_count);
+        let (panels, cytoband_path) = prepare_session_geometry(
+            session,
+            panel_canvas_width,
+            self.canvas_geometry().viewport.top(),
+        )?;
+        self.ensure_engine_retirement_capacity(3)?;
+        self.poll_alignment_retirement_tasks();
+        anyhow::ensure!(
+            self.alignment_retirement_tasks.len() <= rgv_core::MAXIMUM_ALIGNMENT_TRACKS,
+            "Previous alignment sources are still closing; retry shortly"
+        );
+        let panel_ids = panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let controllers = self.prepare_alignment_track_controllers(
+            session.alignment_tracks.clone(),
+            session.reference.as_ref().map(source_path),
+            session.remote_reference_index_url.clone(),
+            &panel_ids,
+        )?;
+        let reference_engine = if let Some(source) = &session.reference {
+            let engine = ReferenceEngine::spawn(8);
+            if let Err(error) = engine.try_open_with_options(
+                source_path(source),
+                reference_open_options(session.remote_reference_index_url.clone()),
+            ) {
+                if let Some(worker) = engine.retire() {
+                    self.engine_retirement_tasks.push(worker);
+                }
+                for controller in controllers {
+                    self.retire_alignment_track_controller(controller);
+                }
+                return Err(error.into());
+            }
+            Some(engine)
+        } else {
+            None
+        };
+        let (specifications, tracks) = session_track_specs(session);
+        let track_engine =
+            (!specifications.is_empty()).then(|| TrackEngine::spawn(specifications, 8));
+
+        // Commit starts here. No fallible preparation or blocking destructor follows.
+        if let Some(error) = landmark_error {
             self.landmark_catalogue_error = Some(error);
         }
-        let session = &rebound_session;
         self.reference_open_error = None;
         self.automation_auxiliary_open_state.clear();
         self.unresolved_session_sources = session.unresolved_local_sources();
@@ -256,7 +325,8 @@ impl Viewer {
         self.variant_sample_search.clear();
         self.variant_settings_sample_search.clear();
         let alignment = primary_alignment_track(session).cloned();
-        self.apply_primary_alignment_config(alignment.as_ref(), session.maximum_alignments)?;
+        self.apply_primary_alignment_config(alignment.as_ref(), session.maximum_alignments)
+            .expect("session filters were validated during preparation");
         self.track_presentation = session.presentation.clone();
         if self.track_presentation.pane_tracks.is_empty()
             && (!session.alignment_tracks.is_empty() || !session.tracks.is_empty())
@@ -287,17 +357,10 @@ impl Viewer {
         self.assembly
             .identity
             .clone_from(&session.assembly_identity);
-        self.cytoband_path = match &session.cytobands {
-            Some(TrackSource::Local { path }) => Some(PathBuf::from(path)),
-            Some(TrackSource::Remote { .. }) => {
-                anyhow::bail!("remote session cytoband files are not yet supported")
-            }
-            None => None,
-        };
+        self.cytoband_path = cytoband_path;
         self.contig_aliases.clone_from(&session.contig_aliases);
         self.suppressed_builtin_gene_bundles
             .clone_from(&session.suppressed_builtin_gene_bundles);
-        let (specifications, tracks) = session_track_specs(session);
         self.tracks = tracks;
         self.automation_auxiliary_open_state.extend(
             self.tracks
@@ -305,15 +368,9 @@ impl Viewer {
                 .iter()
                 .map(|track| (track.id, AutomationAuxiliaryOpenState::Pending)),
         );
-        self.track_engine =
-            (!specifications.is_empty()).then(|| TrackEngine::spawn(specifications, 8));
-        let panel_count = session.panels.len().max(1);
-        let panel_canvas_width = self.workspace_layout.projected_canvas_width(panel_count);
-        self.panels = PanelWorkspace::from_session(
-            session,
-            panel_canvas_width,
-            self.canvas_geometry().viewport.top(),
-        )?;
+        self.retire_track_engine();
+        self.track_engine = track_engine;
+        self.panels = panels;
         // Panel identity replacement and its geometry must be one state
         // transition. Context refresh and display rebuilding call
         // `active_panel_rect`, so they may not observe the previous session's
@@ -321,18 +378,10 @@ impl Viewer {
         self.synchronize_panel_widths();
         self.reference_dictionary = None;
         self.reference_revision = None;
-        self.reference_engine = if let Some(source) = &self.reference_source {
-            let engine = ReferenceEngine::spawn(8);
-            engine.try_open_with_options(
-                source_path(source),
-                reference_open_options(self.remote_reference_index_url.clone()),
-            )?;
-            Some(engine)
-        } else {
-            None
-        };
+        self.retire_reference_engine();
+        self.reference_engine = reference_engine;
         self.refresh_active_panel_context();
-        self.replace_alignment_track_controllers(session.alignment_tracks.clone())?;
+        self.install_alignment_track_controllers(controllers);
         if alignment.is_some() {
             "Opening alignment tracks…".clone_into(&mut self.data_status);
         } else {
@@ -343,6 +392,8 @@ impl Viewer {
             self.request_all_panel_queries();
             self.mark_display_dirty("explicit display invalidation");
         }
+        self.current_session_path = None;
+        self.replace_document_identity(false);
         Ok(())
     }
 
@@ -354,14 +405,8 @@ impl Viewer {
             .minimum_mapping_quality;
         filters.include_secondary = self.primary_active_filters().include_secondary;
         filters.include_supplementary = self.primary_active_filters().include_supplementary;
-        filters.auxiliary_predicates = self
-            .primary_filter_editor()
-            .expression
-            .split(';')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
+        // The editor may contain an unapplied or invalid draft. The canonical
+        // configuration already contains the last successfully applied clauses.
         filters
     }
 
@@ -454,5 +499,38 @@ impl Viewer {
             tracks: self.tracks.tracks().to_vec(),
             maximum_alignments: self.workspace_alignment_limit,
         }
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_cytobands_fail_before_any_replacement_is_constructed() {
+        let a = SessionDocument::new(SessionLocus {
+            contig: "chr1".into(),
+            start: 0,
+            end: 100,
+        });
+        let mut b = a.clone();
+        b.reference = Some(TrackSource::Local {
+            path: "different.fa".into(),
+        });
+        b.genome_name = Some("different assembly".into());
+        b.cytobands = Some(TrackSource::Remote {
+            url: "https://example.invalid/bands.txt".into(),
+        });
+        let (panels_a, _) = prepare_session_geometry(&a, 800.0, 0.0).unwrap();
+        assert!(prepare_session_geometry(&b, 800.0, 0.0).is_err());
+        assert_eq!(panels_a.active().contig_name, "chr1");
+        assert_eq!(panels_a.active().viewport.interval().start(), a.locus.start);
+        b.cytobands = None;
+        assert!(
+            prepare_session_geometry(&b, 800.0, 0.0).is_ok(),
+            "missing sources are a recoverable per-source state"
+        );
+        b.panels[0].locus.end = 0;
+        assert!(prepare_session_geometry(&b, 800.0, 0.0).is_err());
     }
 }

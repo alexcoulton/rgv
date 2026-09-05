@@ -20,6 +20,14 @@ pub struct AlignmentInteractionState {
 }
 
 impl AlignmentInteractionState {
+    /// Export preserves persistent emphasis but never pointer hover.
+    #[must_use]
+    pub fn without_hover(&self) -> Self {
+        let mut state = self.clone();
+        state.hovered = None;
+        state
+    }
+
     #[must_use]
     pub fn new(
         hovered: Option<AlignmentHandle>,

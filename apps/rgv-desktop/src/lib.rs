@@ -1368,7 +1368,7 @@ struct Viewer {
     application_instance_id: String,
     stress_health: Arc<StressHealthPublisher>,
     workspace_revision: u64,
-    last_saved_workspace_revision: u64,
+    document_state: app::document_state::DocumentState,
     next_evidence_revision: u64,
     automation_alignment_handles: HashMap<String, AutomationAlignmentHandleTarget>,
     window: Arc<Window>,
@@ -1414,6 +1414,7 @@ struct Viewer {
     alignment_tracks: Vec<AlignmentTrackController>,
     empty_alignment: EmptyAlignmentState,
     alignment_retirement_tasks: Vec<JoinHandle<()>>,
+    engine_retirement_tasks: Vec<JoinHandle<()>>,
     reference_engine: Option<ReferenceEngine>,
     /// Identity of the currently open FASTA handle. A panel slice is usable only when it carries
     /// this same revision; reopening an equivalent path still creates a distinct authority.

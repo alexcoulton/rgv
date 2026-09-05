@@ -11,3 +11,4 @@ pub(super) mod panels;
 pub(super) mod queries;
 pub(super) mod session_controller;
 pub(super) mod tracks;
+mod worker_retirement;

@@ -1266,6 +1266,7 @@ impl Viewer {
         self.poll_track_events();
         self.synchronize_alignment_contextual_product_states();
         self.poll_alignment_retirement_tasks();
+        self.poll_engine_retirement_tasks();
         self.poll_session_load_tasks();
         self.poll_session_save_tasks();
         self.poll_export_tasks();
@@ -1591,7 +1592,7 @@ impl Viewer {
                         // A failed open is terminal for this actor. Leaving it installed would
                         // make every later Base navigation advertise reference work even though
                         // no open revision exists and no query can be issued.
-                        self.reference_engine = None;
+                        self.retire_reference_engine();
                         for panel in self.panels.iter_mut() {
                             panel.settle_reference_open_failure();
                         }

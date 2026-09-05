@@ -25,6 +25,28 @@ IGV XML is an import format, not an RGV compatibility promise. The importer extr
 loci and resource paths and ignores unsupported IGV renderer state. Importing never rewrites the
 source XML.
 
+## Runtime replacement and file-task identity
+
+Workspace epochs and persisted-document revisions are process-local and do not change session
+JSON or the control protocol's `workspace_revision`. Native controls and automation share the
+canonical persisted-document observation boundary; selection, hover and unapplied filter drafts
+do not count as document edits.
+
+A save records its captured revision, not the state at completion. Old-workspace and out-of-order
+Save As completions cannot change the current destination or clear newer edits. Competing writes
+to the same normalized destination (including SaveThenOpen and autosave) return an explicit busy
+error until the earlier writer finishes.
+
+Only the newest load request can commit. Intervening document edits require a new replacement
+request; they are not implicitly discarded by an earlier confirmation. OpenWorkspace and
+SaveThenOpen file work run asynchronously. Imports and recovered autosaves start dirty with no
+native save destination. Capability/filter/panel preparation failures leave the current workspace
+intact; valid projects with unavailable sources still open with per-source error states.
+
+Reference and auxiliary engines retire through a bounded queue without joining blocked workers
+on the UI thread. When too many sources are still closing, new replacement requests are rejected
+with a retry status. Final application shutdown owns the remaining joins.
+
 ## Version 1 to version 2
 
 Version 2 replaces the single document-level alignment source and filters with an ordered

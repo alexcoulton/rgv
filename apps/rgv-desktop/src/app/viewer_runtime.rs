@@ -523,7 +523,7 @@ impl Viewer {
             application_instance_id,
             stress_health,
             workspace_revision: 1,
-            last_saved_workspace_revision: 1,
+            document_state: app::document_state::DocumentState::default(),
             next_evidence_revision: 1,
             automation_alignment_handles: HashMap::new(),
             window,
@@ -573,6 +573,7 @@ impl Viewer {
                 maximum_alignments: workspace_alignment_limit,
             },
             alignment_retirement_tasks: Vec::new(),
+            engine_retirement_tasks: Vec::new(),
             reference_engine,
             reference_revision: None,
             reference_open_error: None,
@@ -731,6 +732,9 @@ impl Viewer {
             viewer.manual_diagnostic_trace_autostart_pending = false;
             viewer.start_manual_diagnostic_trace("launch option", true);
         }
+        viewer
+            .document_state
+            .replace(viewer.session_document(), true);
         Ok(viewer)
     }
 

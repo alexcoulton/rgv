@@ -3799,7 +3799,14 @@ const fn shape_for(geometry: AlignmentGeometryToken) -> AlignmentGpuShape {
 }
 
 fn color_for(primitive: AlignmentSemanticPrimitive) -> [f32; 4] {
-    match primitive.component {
+    semantic_alignment_color(primitive.component, primitive.style)
+}
+
+pub(crate) fn semantic_alignment_color(
+    component: AlignmentComponent,
+    style: AlignmentStyleToken,
+) -> [f32; 4] {
+    match component {
         AlignmentComponent::Base { base, .. } => base_color(base),
         AlignmentComponent::ModifiedBase { state, .. } => match state {
             rgv_alignment_scene::ModificationState::Modified => [0.58, 0.24, 0.78, 1.0],
@@ -3819,13 +3826,13 @@ fn color_for(primitive: AlignmentSemanticPrimitive) -> [f32; 4] {
         AlignmentComponent::ReferenceSkip { .. } | AlignmentComponent::PairConnector { .. } => {
             [0.38, 0.40, 0.46, 1.0]
         }
-        AlignmentComponent::DirectionTerminal => style_color(primitive.style),
+        AlignmentComponent::DirectionTerminal => style_color(style),
         AlignmentComponent::SmrtKinetics { .. } => [0.10, 0.63, 0.56, 1.0],
         AlignmentComponent::SbxTailBase { .. } => [0.86, 0.52, 0.12, 1.0],
         AlignmentComponent::SpecialistUnavailable { .. } => [0.52, 0.52, 0.54, 0.8],
         AlignmentComponent::Label { .. }
         | AlignmentComponent::ReadSpan
-        | AlignmentComponent::AlignedSegment { .. } => style_color(primitive.style),
+        | AlignmentComponent::AlignedSegment { .. } => style_color(style),
     }
 }
 
@@ -3894,8 +3901,7 @@ fn interaction_page_instances(
         .collect()
 }
 
-#[cfg(test)]
-fn reference_interaction_color(
+pub(crate) fn reference_interaction_color(
     mut color: [f32; 4],
     token: rgv_alignment_scene::AlignmentInteractionToken,
 ) -> [f32; 4] {

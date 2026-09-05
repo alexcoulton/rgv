@@ -1,4 +1,74 @@
 use super::super::*;
+use super::document_state::DocumentTicket;
+
+/// All writers share this key, including `SaveThenOpen` and recovery autosaves.
+fn normalized_session_destination(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for name in suffix.into_iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(
+                    ancestor
+                        .file_name()
+                        .ok_or_else(|| std::io::Error::other("invalid project destination"))?,
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("project destination has no parent"))?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn same_session_destination(left: &Path, right: &Path) -> bool {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        // Conservative serialization also on case-sensitive volumes: a false
+        // positive is a temporary Busy error, never an out-of-order overwrite.
+        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+    } else {
+        left == right
+    }
+}
+
+#[cfg(test)]
+mod file_identity_tests {
+    use super::*;
+
+    #[test]
+    fn destination_identity_covers_new_directories_and_existing_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let new = directory.path().join("autosaves/nested/project.rgv");
+        let normalized = normalized_session_destination(&new).unwrap();
+        assert_eq!(
+            normalized,
+            directory
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("autosaves/nested/project.rgv")
+        );
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        assert_eq!(normalized_session_destination(&new).unwrap(), normalized);
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("alias");
+            std::os::unix::fs::symlink(new.parent().unwrap(), &alias).unwrap();
+            assert_eq!(
+                normalized_session_destination(&alias.join("project.rgv")).unwrap(),
+                normalized
+            );
+        }
+    }
+}
 
 pub(crate) struct ExportTask {
     pub(crate) path: PathBuf,
@@ -17,6 +87,7 @@ pub(crate) struct SessionSaveTask {
     pub(crate) path: PathBuf,
     pub(crate) kind: SessionSaveKind,
     pub(crate) automation_command: Option<usize>,
+    pub(crate) ticket: DocumentTicket,
     pub(crate) worker: JoinHandle<std::result::Result<(), String>>,
 }
 
@@ -36,6 +107,11 @@ pub(crate) enum SessionLoadKind {
 pub(crate) struct SessionLoadTask {
     pub(crate) path: PathBuf,
     pub(crate) kind: SessionLoadKind,
+    pub(crate) ticket: DocumentTicket,
+    pub(crate) automation_command: Option<usize>,
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) save_destination: Option<PathBuf>,
+    pub(crate) save_completed: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) worker: JoinHandle<std::result::Result<LoadedSession, String>>,
 }
 
@@ -55,11 +131,38 @@ impl Viewer {
     }
 
     pub(crate) fn start_session_save(&mut self, path: PathBuf) {
-        if self.session_save_tasks.iter().any(|task| task.path == path) {
-            self.data_status = format!("A save to {} is already in progress", path.display());
-            return;
+        if let Err(error) = self.try_start_session_save(path, None) {
+            self.data_status = format!("Could not start project save: {error}");
         }
+    }
+
+    pub(crate) fn ensure_session_destination_available(&self, path: &Path) -> Result<PathBuf> {
+        let path = normalized_session_destination(path)?;
+        anyhow::ensure!(
+            !self
+                .session_save_tasks
+                .iter()
+                .any(|task| same_session_destination(&task.path, &path))
+                && !self.session_load_tasks.iter().any(|task| task
+                    .save_destination
+                    .as_ref()
+                    .is_some_and(|destination| same_session_destination(destination, &path))),
+            "a save to {} is already in progress",
+            path.display()
+        );
+        Ok(path)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn try_start_session_save(
+        &mut self,
+        path: PathBuf,
+        automation_command: Option<usize>,
+    ) -> Result<()> {
+        let path = self.ensure_session_destination_available(&path)?;
+        self.observe_document_changes();
         let document = self.session_document();
+        let ticket = self.document_state.ticket();
         let display_path = path.display().to_string();
         match std::thread::Builder::new()
             .name("rgv-session-save".to_owned())
@@ -71,13 +174,15 @@ impl Viewer {
                 self.session_save_tasks.push(SessionSaveTask {
                     path,
                     kind: SessionSaveKind::Manual,
-                    automation_command: None,
+                    automation_command,
+                    ticket,
                     worker,
                 });
                 self.data_status = format!("Saving project {display_path}…");
             }
-            Err(error) => self.data_status = format!("Could not start project save: {error}"),
+            Err(error) => return Err(error.into()),
         }
+        Ok(())
     }
 
     pub(crate) fn schedule_next_autosave(&mut self) {
@@ -97,12 +202,21 @@ impl Viewer {
         {
             return;
         }
+        self.observe_document_changes();
         let document = self.session_document();
+        let ticket = self.document_state.ticket();
         let (path, prefix) = autosave_snapshot_path(
             &self.settings_path,
             self.current_session_path.as_deref(),
             SystemTime::now(),
         );
+        let path = match self.ensure_session_destination_available(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.data_status = error.to_string();
+                return;
+            }
+        };
         let directory = autosave_directory(&self.settings_path);
         let retention = self.settings.autosave_retention;
         match std::thread::Builder::new()
@@ -119,6 +233,7 @@ impl Viewer {
                 path,
                 kind: SessionSaveKind::Autosave,
                 automation_command: None,
+                ticket,
                 worker,
             }),
             Err(error) => {
@@ -129,6 +244,10 @@ impl Viewer {
     }
 
     pub(crate) fn poll_session_save_tasks(&mut self) {
+        if self.session_save_tasks.is_empty() {
+            return;
+        }
+        self.observe_document_changes();
         let mut index = 0;
         while index < self.session_save_tasks.len() {
             if !self.session_save_tasks[index].worker.is_finished() {
@@ -141,10 +260,11 @@ impl Viewer {
             let automation_command = task.automation_command;
             let (status, automation_outcome) = match (task.kind, outcome) {
                 (SessionSaveKind::Manual, Ok(Ok(()))) => {
-                    self.last_saved_workspace_revision = self.workspace_revision;
-                    self.current_session_path = Some(path.clone());
-                    self.settings.remember_session(path.display().to_string());
-                    self.persist_settings();
+                    if self.document_state.complete_save(task.ticket) {
+                        self.current_session_path = Some(path.clone());
+                        self.settings.remember_session(path.display().to_string());
+                        self.persist_settings();
+                    }
                     (
                         format!("Saved project to {}", path.display()),
                         automation_command.map(|_| {
@@ -211,64 +331,161 @@ impl Viewer {
     }
 
     pub(crate) fn start_session_load(&mut self, path: PathBuf, kind: SessionLoadKind) {
-        if self.session_load_tasks.iter().any(|task| task.path == path) {
-            self.data_status = format!("{} is already being opened", path.display());
-            return;
+        if let Err(error) = self.try_start_session_load(path, kind, None, None, None) {
+            self.data_status = format!("Could not start project open: {error}");
         }
+    }
+
+    pub(crate) fn try_start_session_load(
+        &mut self,
+        path: PathBuf,
+        kind: SessionLoadKind,
+        automation_command: Option<usize>,
+        deadline: Option<Instant>,
+        save_destination: Option<PathBuf>,
+    ) -> Result<()> {
+        self.observe_document_changes();
+        // Issuing a request supersedes old ones even if this request fails to start.
+        let ticket = self.document_state.begin_load();
+        anyhow::ensure!(
+            self.session_load_tasks.len() < 8,
+            "previous project reads are still finishing; retry shortly"
+        );
+        let save_destination = save_destination
+            .map(|path| self.ensure_session_destination_available(&path))
+            .transpose()?;
+        let save_document = save_destination
+            .as_ref()
+            .map(|path| (path.clone(), self.session_document()));
+        let save_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let display_path = path.display().to_string();
         match std::thread::Builder::new()
             .name("rgv-session-load".to_owned())
             .spawn({
                 let path = path.clone();
-                move || match kind {
-                    SessionLoadKind::Native | SessionLoadKind::Recovery => {
-                        SessionDocument::read(path)
-                            .map(|document| LoadedSession {
-                                document,
-                                igv_report: None,
-                            })
-                            .map_err(|error| error.to_string())
+                let save_completed = Arc::clone(&save_completed);
+                move || {
+                    if let Some((destination, document)) = save_document {
+                        document
+                            .write(destination)
+                            .map_err(|error| error.to_string())?;
+                        save_completed.store(true, std::sync::atomic::Ordering::Release);
                     }
-                    SessionLoadKind::IgvImport => std::fs::read_to_string(&path)
-                        .map_err(|error| error.to_string())
-                        .and_then(|xml| {
-                            SessionDocument::import_igv_with_report(&xml)
+                    match kind {
+                        SessionLoadKind::Native | SessionLoadKind::Recovery => {
+                            SessionDocument::read(path)
+                                .map(|document| LoadedSession {
+                                    document,
+                                    igv_report: None,
+                                })
                                 .map_err(|error| error.to_string())
-                        })
-                        .and_then(|imported| {
-                            let mut document = imported.document;
-                            let parent = path
-                                .parent()
-                                .filter(|parent| !parent.as_os_str().is_empty())
-                                .unwrap_or_else(|| Path::new("."));
-                            let parent =
-                                std::path::absolute(parent).map_err(|error| error.to_string())?;
-                            document.resolve_project_paths(parent);
-                            Ok(LoadedSession {
-                                document,
-                                igv_report: Some(imported.report),
+                        }
+                        SessionLoadKind::IgvImport => std::fs::read_to_string(&path)
+                            .map_err(|error| error.to_string())
+                            .and_then(|xml| {
+                                SessionDocument::import_igv_with_report(&xml)
+                                    .map_err(|error| error.to_string())
                             })
-                        }),
+                            .and_then(|imported| {
+                                let mut document = imported.document;
+                                let parent = path
+                                    .parent()
+                                    .filter(|parent| !parent.as_os_str().is_empty())
+                                    .unwrap_or_else(|| Path::new("."));
+                                let parent = std::path::absolute(parent)
+                                    .map_err(|error| error.to_string())?;
+                                document.resolve_project_paths(parent);
+                                Ok(LoadedSession {
+                                    document,
+                                    igv_report: Some(imported.report),
+                                })
+                            }),
+                    }
                 }
             }) {
             Ok(worker) => {
-                self.session_load_tasks
-                    .push(SessionLoadTask { path, kind, worker });
+                self.session_load_tasks.push(SessionLoadTask {
+                    path,
+                    kind,
+                    ticket,
+                    automation_command,
+                    deadline,
+                    save_destination,
+                    save_completed,
+                    worker,
+                });
                 self.data_status = format!("Opening {display_path}…");
             }
-            Err(error) => self.data_status = format!("Could not start project open: {error}"),
+            Err(error) => return Err(error.into()),
         }
+        Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn poll_session_load_tasks(&mut self) {
+        if self.session_load_tasks.is_empty() {
+            return;
+        }
+        self.observe_document_changes();
         let mut index = 0;
         while index < self.session_load_tasks.len() {
+            if self.session_load_tasks[index]
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                let task = &mut self.session_load_tasks[index];
+                task.deadline = None;
+                self.document_state.cancel_load(task.ticket);
+                if let Some(command) = task.automation_command.take() {
+                    self.finish_automation_command(
+                        command,
+                        Err((
+                            AutomationErrorCode::Timeout,
+                            "project open timed out; late result will not be applied".into(),
+                        )),
+                    );
+                }
+            }
             if !self.session_load_tasks[index].worker.is_finished() {
                 index += 1;
                 continue;
             }
             let task = self.session_load_tasks.remove(index);
             let path = task.path;
+            // A successful save-before-open remains a real save even if parsing
+            // the replacement fails. It still only marks its captured revision.
+            if task
+                .save_completed
+                .load(std::sync::atomic::Ordering::Acquire)
+                && self.document_state.complete_save(task.ticket)
+            {
+                self.current_session_path.clone_from(&task.save_destination);
+            }
+            if !self.document_state.load_can_commit(task.ticket) {
+                let current = self.document_state.current_load(task.ticket);
+                let _ = task.worker.join();
+                if current {
+                    self.data_status =
+                        "Project changed while opening; retry to confirm replacement".into();
+                }
+                if let Some(command) = task.automation_command {
+                    self.finish_automation_command(
+                        command,
+                        Err((
+                            if current {
+                                AutomationErrorCode::UnsavedChanges
+                            } else {
+                                AutomationErrorCode::InvalidState
+                            },
+                            "project open was superseded or the document changed while loading"
+                                .into(),
+                        )),
+                    );
+                }
+                continue;
+            }
+            let mut applied = false;
+            let mut failure_code = AutomationErrorCode::InvalidState;
             match task.worker.join() {
                 Ok(Ok(loaded)) => {
                     let LoadedSession {
@@ -278,9 +495,12 @@ impl Viewer {
                     let unresolved = document.unresolved_local_sources();
                     match self.apply_session(&document) {
                         Ok(()) => {
+                            applied = true;
+                            self.bump_workspace_revision();
                             self.igv_import_report = igv_report;
                             match task.kind {
                                 SessionLoadKind::Native => {
+                                    self.document_state.mark_saved_baseline();
                                     self.current_session_path = Some(path.clone());
                                     self.settings.remember_session(path.display().to_string());
                                     self.persist_settings();
@@ -321,14 +541,32 @@ impl Viewer {
                     }
                 }
                 Ok(Err(error)) => {
+                    failure_code = AutomationErrorCode::Io;
                     self.data_status = format!("Could not open {}: {error}", path.display());
                 }
                 Err(_) => {
+                    failure_code = AutomationErrorCode::Internal;
                     self.data_status = format!(
                         "Project-load worker failed while reading {}",
                         path.display()
                     );
                 }
+            }
+            if let Some(command) = task.automation_command {
+                let result = if applied {
+                    Ok((
+                        self.data_status.clone(),
+                        serde_json::json!({
+                            "application_instance_id": self.application_instance_id,
+                            "workspace_revision": self.workspace_revision,
+                            "settled": self.automation_is_settled(),
+                            "panels": self.automation_workspace_snapshot().panels,
+                        }),
+                    ))
+                } else {
+                    Err((failure_code, self.data_status.clone()))
+                };
+                self.finish_automation_command(command, result);
             }
             self.mark_display_dirty("explicit display invalidation");
         }

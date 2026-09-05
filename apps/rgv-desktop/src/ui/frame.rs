@@ -4193,15 +4193,10 @@ impl Viewer {
                 .add_filter("PNG image", &["png"])
                 .save_file()
         {
-            let width = (f64::from(self.surface_config.width) / self.window.scale_factor())
-                .round()
-                .clamp(1.0, f64::from(u32::MAX)) as u32;
-            let height = (f64::from(self.surface_config.height) / self.window.scale_factor())
-                .round()
-                .clamp(1.0, f64::from(u32::MAX)) as u32;
-            let export_display = semantic_export_display_list(&self.composite_display_list);
-            match export_png(&export_display, width, height, &path) {
-                Ok(()) => self.data_status = format!("Exported image to {}", path.display()),
+            match self.capture_semantic_export(AutomationSnapshotScope::VisibleWorkspace) {
+                Ok(capture) => self.start_export_job(path, move |path| {
+                    capture.write(path, AutomationSnapshotFormat::Png, "RGV manual export")
+                }),
                 Err(error) => self.data_status = error.to_string(),
             }
         }
@@ -4852,6 +4847,7 @@ impl Viewer {
             ManualDiagnosticFramePhase::ShellPostProcess,
             shell_post_process_started.elapsed(),
         );
+        self.observe_document_changes();
         (full_output, repaint_delay)
     }
 }

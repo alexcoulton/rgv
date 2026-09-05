@@ -31,8 +31,11 @@ RGV's bounded validator-aware range cache. BAM tries both conventional BAI/CSI n
 both conventional CRAI names; `--remote-index-url` supplies a nonconventional BAI, CSI, or CRAI.
 `--remote-reference-index-url` supplies a nonconventional FAI for a remote reference. A CRAM
 reference may be local or remote. Runtime bearer authentication, bounded redirects and retries,
-generation cancellation, and request/byte/cache counters apply to remote BAM/CRAM/FASTA. Indexed
-VCF/BCF uses its conventional adjacent index through HTSlib; BigWig, TDF, and BigBed-derived tracks
+generation cancellation, and request/byte/cache counters apply to remote BAM/CRAM/FASTA. RGV
+range requests with configured bearer or custom-header authentication reject redirects outside
+their original scheme/host/effective-port origin. Same-origin redirects retain authentication.
+Speculative read-ahead is capped to cache capacity, even when configured minimum read-ahead is larger.
+Indexed VCF/BCF uses its conventional adjacent index through HTSlib; BigWig, TDF, and BigBed-derived tracks
 use RGV's bounded range reader. Signed source query strings are preserved during I/O, while project
 persistence removes them. RGV reports missing indexes, dictionary mismatches, malformed data,
 changed objects, and unsupported range servers without crashing the UI thread.
@@ -582,6 +585,11 @@ GQ, DP, AD, PS, and PL schemas are prioritized when a malformed or unusually bro
 those limits. The inspector reports record, sample, schema, and genotype omissions explicitly
 rather than presenting partial evidence as complete.
 
+These genotype limits bound retained display data, not biological eligibility. Genotype and
+FORMAT filters examine the selected cohort independently of the display budget. A required
+schema, sample-name set, or field value that exceeds exact-evaluation limits produces an explicit
+query error, not a silently filtered record. An omitted display cell is not a missing source value.
+
 ### Quantitative and interaction tracks
 
 BigWig, TDF, bedGraph, and fixedStep/variableStep WIG use one quantitative display model. Track settings
@@ -881,10 +889,14 @@ layout, and the rendered display state; it does not sleep for an assumed loading
 }
 ```
 
-Visible-workspace, visible active-panel, and bounded full-active-panel snapshots support
-deterministic PNG and semantic SVG. A full-panel export starts at the pinned top rather than the
-current vertical scroll position and includes retained offscreen rows up to a declared 16,384
-logical-pixel height; metadata states when deeper content was truncated at that safety limit. SVG
+Visible-workspace, visible active-panel, and resident full-active-panel snapshots support
+deterministic PNG and semantic SVG from the committed alignment scene, including read bodies and
+derived summaries. Exports retain their captured camera/evidence while navigation continues;
+projection and encoding run in a budgeted worker. Full-panel export succeeds only when its
+complete, unscrolled content is already resident and fits the captured canvas (at most 16,384
+logical pixels high). Requests requiring off-screen pages are explicitly refused, without changing
+the live layout or silently exporting partial evidence. Manual PNG uses the same visible-workspace
+composition. SVG
 metadata records the RGV version, genome, loci, visible stable track IDs and names without
 embedding source URLs, credentials, read names, or sequence. Structured commands export visible
 active-panel alignments, pileup bins, modified-base series, junctions, variants/genotypes,

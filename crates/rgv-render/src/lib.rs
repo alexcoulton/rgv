@@ -3,6 +3,8 @@
 mod alignment_scene;
 mod alignment_summary;
 mod context_scene;
+mod semantic_export;
+pub use semantic_export::{SemanticAlignmentExport, project_semantic_alignment_export};
 
 /// Constant-size policy view accepted by replacement planners. Desktop code supplies
 /// `LedgerProgress`; explicit inventory tests may supply `LedgerSnapshot`. Planning never needs
