@@ -205,6 +205,11 @@ impl HttpRangeReader {
         }
         let redirect_count = Arc::new(AtomicU64::new(0));
         let policy_count = Arc::clone(&redirect_count);
+        // A custom credential is not one of reqwest's automatically stripped
+        // headers. Bind it to the opening origin for the entire redirect chain,
+        // including the probe and every later range request.
+        let authentication_origin =
+            (!matches!(config.authentication, RemoteAuthentication::None)).then(|| url.origin());
         let redirect_policy = Policy::custom(move |attempt| {
             if attempt.previous().len() > 10 {
                 return attempt.error(io::Error::other("remote redirect limit exceeded"));
@@ -222,6 +227,14 @@ impl HttpRangeReader {
             {
                 return attempt.error(io::Error::other(
                     "remote redirect attempted a secure transport downgrade",
+                ));
+            }
+            if authentication_origin
+                .as_ref()
+                .is_some_and(|origin| *origin != next.origin())
+            {
+                return attempt.error(io::Error::other(
+                    "authenticated remote redirect crossed its authorized origin",
                 ));
             }
             policy_count.fetch_add(1, Ordering::Relaxed);
@@ -380,7 +393,14 @@ impl HttpRangeReader {
         requested_bytes: usize,
     ) -> Result<(), RemoteError> {
         let chunk_size = self.config.chunk_size.get() as u64;
-        let maximum_chunks = self.config.maximum_coalesced_chunks.get();
+        // Minimum read-ahead is speculative: cache capacity takes precedence.
+        // Otherwise inserting the response can evict its demand block before
+        // load_block has had a chance to deliver it.
+        let maximum_chunks = self
+            .config
+            .maximum_coalesced_chunks
+            .get()
+            .min(self.blocks.cap().get());
         let minimum_chunks = self
             .config
             .minimum_coalesced_chunks
@@ -884,6 +904,115 @@ mod tests {
         let authentication = RemoteAuthentication::Bearer("top-secret".to_owned());
         let debug = format!("{authentication:?}");
         assert!(!debug.contains("top-secret"));
+    }
+
+    #[test]
+    fn authenticated_redirects_cannot_leave_the_opening_origin() {
+        for bearer in [false, true] {
+            for redirect_probe in [false, true] {
+                let origin = Server::http("127.0.0.1:0").unwrap();
+                let destination = Server::http("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/object?token=private-token", origin.server_addr());
+                let location = format!("http://{}/elsewhere", destination.server_addr());
+                let worker = thread::spawn(move || {
+                    if !redirect_probe {
+                        origin
+                            .recv()
+                            .unwrap()
+                            .respond(
+                                Response::from_data(vec![0])
+                                    .with_status_code(StatusCode(206))
+                                    .with_header(test_header("Content-Range", "bytes 0-0/32")),
+                            )
+                            .unwrap();
+                    }
+                    // A same-origin hop must not authorize the next foreign origin.
+                    origin
+                        .recv()
+                        .unwrap()
+                        .respond(
+                            Response::empty(StatusCode(302))
+                                .with_header(test_header("Location", "/hop")),
+                        )
+                        .unwrap();
+                    origin
+                        .recv()
+                        .unwrap()
+                        .respond(
+                            Response::empty(StatusCode(302))
+                                .with_header(test_header("Location", location)),
+                        )
+                        .unwrap();
+                });
+                let config = HttpRangeConfig {
+                    maximum_retries: 0,
+                    authentication: if bearer {
+                        RemoteAuthentication::Bearer("private-key".into())
+                    } else {
+                        RemoteAuthentication::Header {
+                            name: HeaderName::from_static("x-api-key"),
+                            value: HeaderValue::from_static("private-key"),
+                        }
+                    },
+                    ..HttpRangeConfig::default()
+                };
+                let message = if redirect_probe {
+                    HttpRangeReader::open(&url, config)
+                        .err()
+                        .unwrap()
+                        .to_string()
+                } else {
+                    HttpRangeReader::open(&url, config)
+                        .unwrap()
+                        .read_exact(&mut [0; 8])
+                        .unwrap_err()
+                        .to_string()
+                };
+                worker.join().unwrap();
+                assert!(destination.try_recv().unwrap().is_none());
+                assert!(!message.contains("private-key"));
+                assert!(!message.contains("private-token"));
+            }
+        }
+        assert_eq!(
+            Url::parse("https://example.org/object").unwrap().origin(),
+            Url::parse("https://example.org:443/hop").unwrap().origin()
+        );
+        assert_ne!(
+            Url::parse("https://example.org/object").unwrap().origin(),
+            Url::parse("http://example.org/hop").unwrap().origin()
+        );
+    }
+
+    #[test]
+    fn read_ahead_is_capped_to_cache_capacity_even_below_its_minimum() {
+        for minimum in [1, 4] {
+            for length in [32, 35] {
+                let data = (0..length).collect::<Vec<u8>>();
+                let fixture = RangeFixture::start(data.clone()).unwrap();
+                let mut reader = HttpRangeReader::open(
+                    &fixture.url,
+                    HttpRangeConfig {
+                        chunk_size: NonZeroUsize::new(8).unwrap(),
+                        maximum_cache_bytes: NonZeroUsize::new(8).unwrap(),
+                        minimum_coalesced_chunks: NonZeroUsize::new(minimum).unwrap(),
+                        maximum_coalesced_chunks: NonZeroUsize::new(4).unwrap(),
+                        ..HttpRangeConfig::default()
+                    },
+                )
+                .unwrap();
+                let mut bytes = vec![0; usize::from(length)];
+                reader.read_exact(&mut bytes).unwrap();
+                assert_eq!(bytes, data);
+                assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+                reader.seek(SeekFrom::Start(3)).unwrap();
+                reader.read_exact(&mut bytes[..12]).unwrap();
+                assert_eq!(bytes[..12], data[3..15]);
+                assert_eq!(reader.blocks.len(), 1);
+                assert!(reader.stats().evictions > 0);
+                assert!(reader.current_block.as_ref().unwrap().1.len() <= 8);
+            }
+        }
     }
 
     #[test]
