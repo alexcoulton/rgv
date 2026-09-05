@@ -1,6 +1,7 @@
 # RGV code-review remediation plan — 2026-09-04
 
-Status: planned; none of the fixes in this document are implemented or qualified yet.
+Status: implementation landed on 2026-09-05; qualification results and remaining gates are
+recorded below. This is not a claim that all release/platform acceptance gates have passed.
 
 Baseline: `0ef9d56` (`feat: add native interaction recording and stress tooling`). This checkpoint
 preserves the pending implementation reviewed on 2026-09-04. The review covered the working tree,
@@ -353,18 +354,133 @@ supported platforms; mark unavailable platform gates pending rather than claimin
 Acceptance requires all of the following:
 
 - [ ] R01: native and semantic exports contain the same committed alignment evidence for each scope.
-- [ ] R02: viewport width and display caps cannot change exact variant-filter eligibility.
+- [x] R02: viewport width and display caps cannot change exact variant-filter eligibility.
 - [ ] R03: every persisted UI/automation edit participates in dirty-state tracking.
-- [ ] R04: no configured credential reaches an unauthorized redirect origin.
+- [x] R04: no configured credential reaches an unauthorized redirect origin.
 - [ ] R05: failed replacement cannot partially mutate the active workspace.
 - [ ] R06: ordinary engine replacement never joins a blocked worker on the UI thread.
-- [ ] R07: save results apply only to the snapshot and workspace that produced them.
-- [ ] R08: superseded loads cannot replace a newer workspace or override intervening edit policy.
-- [ ] R09: every valid range/cache configuration can serve its requested bytes within its bounds.
-- [ ] R10: bounded IGV notices remain valid UTF-8 without panics.
-- [ ] Regression, fixture, export, and lifecycle evidence is recorded against the fixing commits.
-- [ ] Existing session/control compatibility and resource limits remain intact; any intentional
+- [x] R07: save results apply only to the snapshot and workspace that produced them.
+- [x] R08: superseded loads cannot replace a newer workspace or override intervening edit policy.
+- [x] R09: every valid range/cache configuration can serve its requested bytes within its bounds.
+- [x] R10: bounded IGV notices remain valid UTF-8 without panics.
+- [x] Regression, fixture, export, and lifecycle evidence is recorded against the fixing commits.
+- [x] Existing session/control compatibility and resource limits remain intact; any intentional
       observable policy changes are documented in the relevant user/API guides.
 
 Update this document with commit references and actual gate results as work lands. A green baseline
 suite, a successful export response, or a passing stress run alone does not close these findings.
+
+## Implementation record — 2026-09-05
+
+| Package / findings | Fixing commit | Implementation and permanent regression evidence |
+| --- | --- | --- |
+| C / R04, R09 | `dd701cf` | Authentication is bound to the opening origin throughout probe/range redirects; coalescing is capped by cache capacity. `remote::tests::authenticated_redirects_cannot_leave_the_opening_origin` and `read_ahead_is_capped_to_cache_capacity_even_below_its_minimum` cover both credentials, same-origin hops followed by foreign origins, tiny caches, seeks and partial EOF blocks. Existing authenticated same-origin tests remain. |
+| G / R10 | `6c3286c` | Notice truncation backs up to a UTF-8 boundary. `igv_notices_truncate_at_utf8_boundaries_and_still_deduplicate` covers ASCII, multibyte boundaries, deduplication and the long Unicode XML name. |
+| B / R02 | `5f409c1` | Source-record predicates run before bounded genotype retention. Generated indexed BCF regressions cover all 1,001 × 256 heterozygous records, the matching 24-record narrow query, a matching sample beyond the 10,000-sample display cap, explicit subsets and FORMAT clauses. Required truncated values or omitted schema/sample authority fail explicitly; actual missing values retain their configured semantics. |
+| E / R06, engine boundary | `6ef08a8` | Reference/auxiliary retirement closes control and output ownership, cancels queued work, and returns the join handle. `retirement_returns_before_blocked_io_and_abandons_queued_opens` holds loopback IO behind a barrier, requires retirement to return before release, then verifies joins and abandonment of queued opens for both engines. |
+| A, D, E desktop integration, F / R01, R03, R05–R08 | `8deccbd` | Committed-scene export capture/project/encode; canonical document revision and epoch; ordered save/load tickets and destination admission; pure session preflight and owned replacement preparation; bounded, polled desktop retirement. Permanent regressions live in `document_state.rs`, `tasks.rs`, `session_controller.rs` and `alignment_summary.rs`. |
+| D hot-path follow-up / R03, R07, R08 | `96c1639` | Observe the persisted document before commands/file-job start and completed-result commit, not on ordinary redraws or unfinished-worker polls. This preserves latest-value dirty/commit checks without repeatedly cloning large sample metadata tables during navigation. |
+
+The desktop packages share an integration commit because command dispatch, captured file jobs,
+workspace replacement and worker ownership must compile against the same Viewer state. Transport,
+variant, Unicode and engine-boundary changes remain separate commits.
+
+### Implemented policies and limits
+
+- Native controls and automation are observed through the canonical `SessionDocument` projection
+  at command/file-task start and completion boundaries. Only a changed persisted value advances document revision;
+  the existing control-protocol workspace revision is not repurposed. Unapplied filter drafts are
+  excluded. New/imported/recovered workspaces do not inherit a prior saved baseline or destination.
+  Ordinary redraws and pending-worker polls do not clone potentially large sample metadata tables;
+  every dirty-state read and file-result commit observes the latest persisted values first.
+- A save completion records its captured epoch/revision. Older-epoch and out-of-order Save As
+  completions cannot change the active path. Normalized same-destination writers, including
+  symlink/case aliases, return a busy error until the current writer completes. A successful
+  save-before-open remains saved even if reading the replacement subsequently fails.
+- Loads are bounded to eight pending workers. A newer request supersedes older reads, even when
+  it fails to start; intervening document edits reject commit. Timeout invalidates late results
+  while retaining ownership of the worker for eventual cleanup. File reading and save-before-open
+  run outside the UI thread; only prepared, current results reach session commit.
+- Session capability/filter/panel validation and replacement-controller preparation precede live
+  mutation. Valid sessions with missing sources still install and expose source-specific failures.
+  Reference/auxiliary retirement is bounded to eight pending context workers; alignment replacement
+  also checks its retirement backlog. Finished workers are polled and joined; final shutdown owns
+  blocking joins. Already-blocked IO still relies on the existing transport deadlines.
+- Semantic PNG/SVG and manual PNG use immutable committed scene/camera captures. CPU projectors
+  supply reads and derived summaries, captured read emphasis is retained, hover is excluded, and
+  export scratch is charged through encoding. NativeWindow remains the physical-pixel window path.
+- FullActivePanel deliberately implements the plan's explicit-refusal alternative: complete,
+  unscrolled content must already be resident and fit the captured canvas. Off-screen page
+  acquisition is not implemented; such requests fail without a partial file or live-camera change.
+  Manual PNG now uses visible-workspace dimensions. These observable policies are documented in
+  `docs/USER_GUIDE.md`, `docs/MCP.md` and `docs/SESSION_COMPATIBILITY.md`; no schema version changed.
+
+### Qualification record
+
+- Focused core/HTS/engine/desktop regressions passed. The permanent semantic-export regression
+  checks aligned-segment/splice geometry against CPU projection, requires real read evidence and
+  coverage, rejects stale authority and verifies that an independently changed frame does not
+  change the retained capture. Its fixture uses the atlas's actual row demand, not empty camera
+  padding, and recognizes directional aligned segments as read bodies.
+- `cargo test --workspace --offline` at `8deccbd`: passed all 1,283 tests with one ignored,
+  including dependency/feature/source-inventory and atomic-render-bundle integration tests plus
+  all doc-test targets. The subsequent document-observation hot-path follow-up is separately
+  rechecked with the complete desktop test target and native smoke flow below.
+- Final hot-path follow-up: `cargo test -p rgv-desktop --offline` passed all 452 desktop tests and
+  its doc-test target. A fresh release build and combined native batch passed all 16 commands,
+  repeating every export scope, clean reopen, navigation, SaveThenOpen and Save As. The two saved
+  documents again contained the expected navigated locus. Formatting and diff checks passed on
+  the final source tree.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `cargo clippy -p rgv-desktop -p rgv-hts -p rgv-engine -p rgv-render --all-targets --offline`:
+  completed successfully with baseline warnings; no new warnings were reported in added modules.
+  Strict workspace Clippy (`-D warnings`) remains failed on baseline diagnostics, including
+  `rgv-core` automation struct/length warnings, landmark allocation/formatting warnings and existing
+  session/test warnings. These were not suppressed or folded into this correctness remediation.
+- Fresh release desktop build: passed. On macOS with isolated settings, the local variants fixture
+  at `chrVariants:9951-10150` passed seven native batch commands: settle, NativeWindow PNG,
+  VisibleWorkspace PNG/SVG, ActivePanel PNG, resident FullActivePanel SVG and exit. Native and
+  semantic raster inspection showed the 25-alignment fixture's reads and coverage, not just labels.
+  Dimensions were 2,560 × 1,600 physical pixels for NativeWindow, 940 × 714 logical pixels for the
+  workspace and 750 × 642 for panel scopes. Native raster color/antialiasing differences remain
+  distinct from the structural geometry assertion; this is mechanical evidence, not user visual
+  approval under ADR 0007.
+- A second fresh-native smoke run passed all ten session commands: settle, save A, clean reopen
+  with Reject, settle, navigate, settle, SaveThenOpen A, settle, Save As B and exit. The saved A and
+  B documents both contained the navigated zero-based locus `chrVariants:[9970,10130)`, proving the
+  save-before-open snapshot was written before replacement reading. Settings and artifacts were
+  isolated outside the repository; no user project was overwritten.
+- `rgv-manual-fixture-check verify --require-complete`: failed because the coverage source
+  `docs/DESKTOP_FEATURE_ACCESS.md` differs from the checked-in catalog. That source is unchanged by
+  these commits. Disposable `rgv-manual-fixtures qualify` also failed its existing MF-01 assertion:
+  “lost its eight focused pair/group/sort/density track configurations.” The generator/verifier
+  sources are unchanged. The disposable runner cleaned its generated trees; the checked-in catalog
+  was not regenerated to conceal either failure.
+- The documented interaction benchmark's strict 250 ms first-useful-scene gate failed both with
+  other checks active (2,196.41 ms) and after they finished (2,249.46 ms). A separate ungated run
+  recorded 2,242.94 ms first useful, 0.043 ms median and 0.108 ms p95 camera interaction for 156,152
+  committed records. All ten measured interactions were camera-only with no source acquisition
+  or scene rebuild; charged scene memory was 134,413,493 bytes within the 320 MiB ledger budget.
+  The [retained benchmark report](../benchmark-results/code-review-remediation-interaction-2026-09-05.json)
+  is measurement evidence, **not a pass of the first-useful gate**. The benchmark and alignment
+  scene acquisition/coordinator path are unchanged by this remediation; no baseline timing
+  comparison was made to attribute the startup miss to a specific change.
+
+### Remaining acceptance gates
+
+The checkboxes above remain the release acceptance checklist, not an assertion that every manual
+scenario has been exercised. The ten findings have implementation changes and focused regressions;
+the following qualification is still required before declaring the complete plan release-qualified:
+
+1. Resolve the baseline strict-lint and manual-fixture catalog/generator failures, investigate the
+   first-useful-scene benchmark threshold miss, and rerun those gates. These are recorded failures,
+   not waived passes.
+2. Complete the expanded native export matrix (all specialist modes and summaries, multiple panels,
+   fractional pan and clipping, in-flight selection/navigation, refused off-screen full scope) and
+   obtain the user's native visual assessment. Existing scene/projector tests do not substitute for
+   that entire end-to-end matrix.
+3. Complete native-control dirty-state checks and repeated-replacement UI heartbeat/resource
+   measurement under delayed IO. Current deterministic tests cover document identity and blocked
+   worker retirement separately; they do not claim a full GUI race/stress campaign.
+4. Run the same file/session semantics and rendering checks on the other supported platforms and
+   backends. Only this macOS host was exercised here.
