@@ -247,13 +247,15 @@ impl Viewer {
         if self.session_save_tasks.is_empty() {
             return;
         }
-        self.observe_document_changes();
         let mut index = 0;
         while index < self.session_save_tasks.len() {
             if !self.session_save_tasks[index].worker.is_finished() {
                 index += 1;
                 continue;
             }
+            // Compare the current persisted values before applying this result,
+            // not on every redraw while a potentially slow writer is pending.
+            self.observe_document_changes();
             let task = self.session_save_tasks.remove(index);
             let path = task.path;
             let outcome = task.worker.join();
@@ -426,7 +428,6 @@ impl Viewer {
         if self.session_load_tasks.is_empty() {
             return;
         }
-        self.observe_document_changes();
         let mut index = 0;
         while index < self.session_load_tasks.len() {
             if self.session_load_tasks[index]
@@ -450,6 +451,7 @@ impl Viewer {
                 index += 1;
                 continue;
             }
+            self.observe_document_changes();
             let task = self.session_load_tasks.remove(index);
             let path = task.path;
             // A successful save-before-open remains a real save even if parsing

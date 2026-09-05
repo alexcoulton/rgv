@@ -4847,7 +4847,6 @@ impl Viewer {
             ManualDiagnosticFramePhase::ShellPostProcess,
             shell_post_process_started.elapsed(),
         );
-        self.observe_document_changes();
         (full_output, repaint_delay)
     }
 }

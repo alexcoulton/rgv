@@ -29,7 +29,8 @@ source XML.
 
 Workspace epochs and persisted-document revisions are process-local and do not change session
 JSON or the control protocol's `workspace_revision`. Native controls and automation share the
-canonical persisted-document observation boundary; selection, hover and unapplied filter drafts
+canonical persisted-document observation boundary before commands and file-job start/completion;
+ordinary redraws do not clone the persisted document. Selection, hover and unapplied filter drafts
 do not count as document edits.
 
 A save records its captured revision, not the state at completion. Old-workspace and out-of-order

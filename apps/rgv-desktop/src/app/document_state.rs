@@ -21,7 +21,8 @@ pub(crate) struct DocumentState {
 }
 
 impl DocumentState {
-    /// Observe the canonical persisted projection at a UI/command boundary.
+    /// Observe the canonical persisted projection before a document operation
+    /// starts or commits. Ordinary redraws must not clone large metadata tables.
     /// Comparing values covers native controls without treating selection,
     /// hover, failed drafts or redundant redraws as document edits.
     pub(crate) fn observe(&mut self, document: SessionDocument) -> bool {
@@ -90,6 +91,8 @@ impl DocumentState {
 }
 
 impl super::super::Viewer {
+    /// All dirty-state readers and file completion gates call this first, so
+    /// native edits are included without serializing/cloning state on redraws.
     pub(crate) fn observe_document_changes(&mut self) {
         let document = self.session_document();
         self.document_state.observe(document);
