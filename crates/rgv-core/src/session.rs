@@ -197,7 +197,11 @@ impl IgvImportReportBuilder {
 
 fn insert_igv_notice(notices: &mut BTreeSet<String>, omitted: &mut usize, mut notice: String) {
     if notice.len() > MAXIMUM_IGV_NOTICE_BYTES {
-        notice.truncate(MAXIMUM_IGV_NOTICE_BYTES);
+        let mut end = MAXIMUM_IGV_NOTICE_BYTES;
+        while !notice.is_char_boundary(end) {
+            end -= 1;
+        }
+        notice.truncate(end);
     }
     if notices.contains(&notice) {
         return;

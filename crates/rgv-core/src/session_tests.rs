@@ -2479,3 +2479,32 @@ fn sbx_display_options_round_trip_and_reject_reversed_thresholds() {
         Err(SessionError::InvalidAlignmentDisplayThreshold)
     ));
 }
+#[test]
+fn igv_notices_truncate_at_utf8_boundaries_and_still_deduplicate() {
+    let mut notices = std::collections::BTreeSet::new();
+    let mut omitted = 0;
+    for text in [
+        "a".repeat(512),
+        "a".repeat(600),
+        format!("a{}", "é".repeat(300)),
+    ] {
+        super::insert_igv_notice(&mut notices, &mut omitted, text.clone());
+        super::insert_igv_notice(&mut notices, &mut omitted, text);
+    }
+    assert_eq!(notices.len(), 2);
+    assert_eq!(omitted, 0);
+    assert!(notices.iter().all(|notice| notice.len() <= 512));
+    let xml = format!(
+        "<Session locus=\"chr1:1-100\"><{}/></Session>",
+        "é".repeat(300)
+    );
+    let imported = super::SessionDocument::import_igv_with_report(&xml).unwrap();
+    assert!(!imported.report.ignored.is_empty());
+    assert!(
+        imported
+            .report
+            .ignored
+            .iter()
+            .all(|notice| notice.len() <= 512)
+    );
+}
