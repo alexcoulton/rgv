@@ -225,11 +225,12 @@ annotation tracks. Nothing in this wave has been checked in the running applicat
         and absent from non-GPU exports
 - [~] ARCH-2 / ARCH-7 headless `rgv-session` crate (workspace state, `Action` reducer, engines,
       scene publication); desktop, CLI snapshot, MCP and automation drive it
-      — `rgv-session` exists and owns document, panels, tracks, reference engine and
-        lifecycle, track-engine polling, settings, notifications and undo (43 fields;
-        `Viewer` 180 → 144). Remaining: track load, reference query dispatch, routing track
-        events into panels, alignment dispatch/settlement, the `PanelPresentation`
-        boundary, the remaining `Action` domains, and the headless `rgv-snapshot`
+      — `rgv-session` owns document, panels, tracks and track load, track-event routing,
+        reference engine and query dispatch, alignment track controllers and settlement
+        decisions, settings, notifications and undo (50 fields; `Viewer` 143 → 136).
+        Remaining: `dispatch_alignment_query`, `poll_alignment_events` and
+        `poll_reference_events` interleave GPU work with settlement and stay in the desktop;
+        `PanelPresentation`, the remaining `Action` domains and `rgv-snapshot` are not started
 - [~] ARCH-4 explicit `(PanelId, TrackId)` throughout
       — all 37 activate-swaps removed; ~55 functions take a panel; `inspection/selection.rs`
         and wheel/junction hover still use the focused panel

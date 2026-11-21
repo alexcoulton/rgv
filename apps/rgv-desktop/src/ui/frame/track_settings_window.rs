@@ -403,6 +403,7 @@ impl Viewer {
                 );
             });
         } else if let Some(maximum) = self
+            .session
             .alignment_tracks
             .first()
             .and_then(|track| {

@@ -1,7 +1,4 @@
-use crate::inspection::model::{
-    CopyNumberSelection, FeatureSelection, GwasSelection, InteractionSelection, MutationSelection,
-    QuantitativeSelection, RetainedEvidenceSnapshot, SelectedSupplementaryChain, VariantSelection,
-};
+use crate::inspection::model::{RetainedEvidenceSnapshot, SelectedSupplementaryChain};
 use crate::ui::{ScrollbarOverview, WorkspacePaneLayout};
 use crate::ui::{TrackFrame, TrackFrameKey};
 use crate::workspace::context_lanes::PanelContextScene;
@@ -360,13 +357,6 @@ pub(crate) struct ViewPanelController {
     pub(crate) selected_modification_position: Option<u64>,
     pub(crate) selected_junction: Option<(u64, u64)>,
     pub(crate) selected_junction_component: Option<JunctionArcComponent>,
-    pub(crate) selected_feature: Option<FeatureSelection>,
-    pub(crate) selected_variant: Option<VariantSelection>,
-    pub(crate) selected_gwas: Option<GwasSelection>,
-    pub(crate) selected_quantitative: Option<QuantitativeSelection>,
-    pub(crate) selected_copy_number: Option<CopyNumberSelection>,
-    pub(crate) selected_mutation: Option<MutationSelection>,
-    pub(crate) selected_interaction: Option<InteractionSelection>,
     pub(crate) selected_chain: Option<SelectedSupplementaryChain>,
     pub(crate) retained_evidence: Option<RetainedEvidenceSnapshot>,
     /// Durable semantic identity used to resolve a read after cross-locus navigation.
@@ -534,13 +524,6 @@ impl Panel for ViewPanelController {
             selected_modification_position: None,
             selected_junction: None,
             selected_junction_component: None,
-            selected_feature: None,
-            selected_variant: None,
-            selected_gwas: None,
-            selected_quantitative: None,
-            selected_copy_number: None,
-            selected_mutation: None,
-            selected_interaction: None,
             selected_chain: None,
             retained_evidence: None,
             pending_read_selection: None,

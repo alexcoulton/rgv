@@ -13,6 +13,7 @@ rgv-automation = { version = "0.1.0", path = "../rgv-automation" }
 rgv-core = { version = "0.1.0", path = "../rgv-core" }
 rgv-engine = { version = "0.1.0", path = "../rgv-engine" }
 rgv-hts = { version = "0.1.0", path = "../rgv-hts" }
+rgv-layout = { version = "0.1.0", path = "../rgv-layout" }
 serde_json.workspace = true
 tracing.workspace = true
 

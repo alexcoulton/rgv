@@ -23,7 +23,7 @@ use rgv_engine::{
     AlignmentCoordinatorFrame, AlignmentIndividualReadCapability, AlignmentSceneBuildContract,
     AlignmentSceneCoordinatorTelemetry, AlignmentSceneEngine, AlignmentSceneEngineEvent,
     AlignmentScenePreparationPolicy, AlignmentSceneRequestToken, LocalAlignmentSceneEngineConfig,
-    LocalBamCanonicalBackend, SourceOwnerId,
+    PositionedAlignmentBackend, SourceOwnerId,
 };
 use rgv_hts::{AlignmentOpenOptions, QueryDetail, QueryOptions, TemplateLengthBounds};
 use serde::Serialize;
@@ -660,7 +660,7 @@ fn build_contract(
 }
 
 fn wait_for_source(
-    engine: &AlignmentSceneEngine<LocalBamCanonicalBackend>,
+    engine: &AlignmentSceneEngine<PositionedAlignmentBackend>,
 ) -> Result<rgv_engine::AlignmentSceneSourceMetadata> {
     let deadline = Instant::now() + EVENT_TIMEOUT;
     while Instant::now() < deadline {
@@ -674,7 +674,7 @@ fn wait_for_source(
 }
 
 fn wait_for_frames(
-    engine: &AlignmentSceneEngine<LocalBamCanonicalBackend>,
+    engine: &AlignmentSceneEngine<PositionedAlignmentBackend>,
     expected: &HashMap<SourceOwnerId, AlignmentSceneRequestToken>,
 ) -> Result<
     HashMap<

@@ -22,7 +22,7 @@ impl Viewer {
     ) -> AutomationNavigationState {
         let mut state = AutomationNavigationState::default();
         let mut phases = Vec::new();
-        for track in &self.alignment_tracks {
+        for track in &self.session.alignment_tracks {
             if track.scene_engine.is_none() {
                 continue;
             }
@@ -100,7 +100,7 @@ impl Viewer {
             ) {
                 return false;
             }
-            for track in &self.alignment_tracks {
+            for track in &self.session.alignment_tracks {
                 match track.lifecycle {
                     AlignmentTrackLifecycle::Opening => return false,
                     AlignmentTrackLifecycle::Ready => {
@@ -171,7 +171,7 @@ impl Viewer {
             if panel.pending_queries.tracks {
                 reasons.push(format!("panel{}_tracks", panel.id.get()));
             }
-            for track in &self.alignment_tracks {
+            for track in &self.session.alignment_tracks {
                 if track.scene_engine.is_none() {
                     continue;
                 }
@@ -346,6 +346,7 @@ impl Viewer {
                 deadline,
             }) => {
                 let lifecycle = self
+                    .session
                     .alignment_tracks
                     .iter()
                     .find(|track| track.config.id == track_id)

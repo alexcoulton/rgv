@@ -7,16 +7,12 @@ use crate::display::hit_test::JunctionArcHitTestResult;
 use crate::launch::{LaunchOptions, RunMarker, discover_recovery_candidates};
 use crate::runtime::Application;
 use crate::sources::inferred_desktop_track_kind;
-use crate::workspace::alignments::{
-    AlignmentSceneBudgetSnapshot, AlignmentTrackController, EmptyAlignmentState,
-};
 use crate::workspace::navigation_transaction::NavigationPresentationPhase;
 use crate::workspace::panels::ViewPanelController;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -1288,7 +1284,6 @@ struct Viewer {
     rectangle_renderer: RectangleRenderer,
     context_scene_gpu_renderer: ContextSceneGpuRenderer,
     context_scene_gpu_frame: ContextSceneGpuFrame,
-    alignment_scene_ledger: AllocationLedger,
     alignment_ledger_progress: LedgerProgressSubscription,
     /// The ledger every alignment GPU page, page table and frame slot is charged to. Under the
     /// strict memory policy it is `alignment_scene_ledger` itself. Under the bounded policy it
@@ -1330,20 +1325,16 @@ struct Viewer {
     /// Canonical workspace annotation row heights, keyed by presentation
     /// identity. Every locus uses this table before its display is clipped.
     shared_annotation_frame_heights: BTreeMap<PresentationNodeId, f32>,
-    alignment_tracks: Vec<AlignmentTrackController>,
-    empty_alignment: EmptyAlignmentState,
-    alignment_retirement_tasks: Vec<JoinHandle<()>>,
-    /// Coverage workers being stopped off the UI thread; see `workspace::alignment_coverage`.
-    alignment_coverage_retirement_tasks: Vec<JoinHandle<()>>,
     /// Persistent coverage-tile cache shared by every alignment source. `None` until first
     /// used, while the setting disables it, or when no cache directory can be created.
     alignment_coverage_sidecar: Option<Arc<rgv_hts::CoverageSidecarCache>>,
     alignment_depth_pyramid_gpu_renderer: rgv_render::AlignmentDepthPyramidGpuRenderer,
     /// This frame's coverage-pyramid draws, captured after the pane layout is final.
     alignment_depth_pyramid_gpu_frame: Option<rgv_render::AlignmentDepthPyramidGpuFrame>,
-    /// Pyramid pages the GPU ledger refused in the last prepared frame; while non-zero a
-    /// pyramid lane is presented as pending, not complete.
-    alignment_depth_pyramid_pages_refused: usize,
+    /// Pyramid pages the GPU ledger refused in the last prepared frame, per `(panel, track)`
+    /// lane (only lanes with a refusal); a lane with a refusal is presented as pending, not
+    /// complete, while every other lane keeps its own mode.
+    alignment_depth_pyramid_pages_refused: BTreeMap<(PanelId, TrackId), usize>,
     automation_auxiliary_open_state: HashMap<TrackId, AutomationAuxiliaryOpenState>,
     reference_remote_io_stats: Option<RemoteIoStats>,
     landmark_resource_root: Option<PathBuf>,
@@ -1382,7 +1373,6 @@ struct Viewer {
     hosted_genomes: crate::workspace::genomes::HostedGenomes,
     /// Ephemeral selection ordering; never written to sessions or diagnostics.
     promoted_read: Option<(TrackId, u64)>,
-    workspace_alignment_limit: usize,
     display_dirty: bool,
     display_upload_pending_metrics: bool,
     pending_resolution_query_refresh: Option<Instant>,
@@ -1435,7 +1425,6 @@ struct Viewer {
     /// The experimental track tile pipeline: its engine, renderer and per-lane state. Empty
     /// and untouched while `settings.track_pipeline` is `Legacy`.
     track_tiles: workspace::track_tiles::TrackTilePipelineState,
-    alignment_scene_budget: AlignmentSceneBudgetSnapshot,
     locus_editor: String,
     resizing_annotation_track: Option<(TrackFrameKey, f32)>,
     resizing_read_track: Option<(TrackId, f32)>,

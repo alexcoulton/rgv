@@ -46,6 +46,7 @@ impl Viewer {
         );
         let (filters, snapshot, generation) = {
             let track = self
+                .session
                 .alignment_tracks
                 .iter()
                 .find(|track| track.config.id == track_id)
@@ -306,6 +307,7 @@ impl Viewer {
             .get(target.panel_id)
             .is_some_and(|panel| panel.navigation_presentation.is_interactive());
         let track = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == target.track_id)
@@ -420,6 +422,7 @@ impl Viewer {
             .selected_alignment_track
             .context("no alignment is selected")?;
         let track = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == track_id)
@@ -548,6 +551,7 @@ impl Viewer {
             })
         });
         for track in self
+            .session
             .alignment_tracks
             .iter_mut()
             .filter(|track| track_ids.contains(&track.config.id))
@@ -571,7 +575,8 @@ impl Viewer {
         &self,
         track_ids: &[TrackId],
     ) -> Vec<serde_json::Value> {
-        self.alignment_tracks
+        self.session
+            .alignment_tracks
             .iter()
             .filter(|track| track_ids.contains(&track.config.id))
             .map(|track| {
@@ -595,7 +600,8 @@ impl Viewer {
         &self,
         track_ids: &[TrackId],
     ) -> Vec<serde_json::Value> {
-        self.alignment_tracks
+        self.session
+            .alignment_tracks
             .iter()
             .filter(|track| track_ids.contains(&track.config.id))
             .map(|track| {
@@ -616,7 +622,8 @@ impl Viewer {
         &self,
         track_ids: &[TrackId],
     ) -> Vec<serde_json::Value> {
-        self.alignment_tracks
+        self.session
+            .alignment_tracks
             .iter()
             .filter(|track| track_ids.contains(&track.config.id))
             .map(|track| {
@@ -648,6 +655,7 @@ impl Viewer {
             None
         };
         for track in self
+            .session
             .alignment_tracks
             .iter_mut()
             .filter(|track| track_ids.contains(&track.config.id))
@@ -685,6 +693,7 @@ impl Viewer {
             .map(|part| part.parse::<AuxPredicate>().map(|_| part.to_owned()))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for track in self
+            .session
             .alignment_tracks
             .iter_mut()
             .filter(|track| track_ids.contains(&track.config.id))
@@ -711,7 +720,8 @@ impl Viewer {
     pub(crate) fn ensure_automation_alignment_tracks(&self, track_ids: &[TrackId]) -> Result<()> {
         for id in track_ids {
             anyhow::ensure!(
-                self.alignment_tracks
+                self.session
+                    .alignment_tracks
                     .iter()
                     .any(|track| track.config.id == *id),
                 "alignment track {} was not found",
@@ -726,10 +736,10 @@ impl Viewer {
         track_ids: Option<&[TrackId]>,
         query_changed: bool,
     ) {
-        for track in self
-            .alignment_tracks
-            .iter_mut()
-            .filter(|track| track_ids.is_none_or(|track_ids| track_ids.contains(&track.config.id)))
+        for track in
+            self.session.alignment_tracks.iter_mut().filter(|track| {
+                track_ids.is_none_or(|track_ids| track_ids.contains(&track.config.id))
+            })
         {
             for projection in track.projections.values_mut() {
                 if query_changed {
@@ -909,6 +919,7 @@ impl Viewer {
         position: u64,
     ) -> bool {
         if let Some(available) = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == track_id)
@@ -932,6 +943,7 @@ impl Viewer {
 
     pub(crate) fn automation_track_key(&self, track_id: TrackId) -> Result<TrackFrameKey> {
         if self
+            .session
             .alignment_tracks
             .iter()
             .any(|track| track.config.id == track_id)

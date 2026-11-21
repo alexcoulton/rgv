@@ -728,7 +728,8 @@ impl Viewer {
         let filters = if track_id == primary_id {
             Some(self.primary_alignment_filters_mut())
         } else {
-            self.alignment_tracks
+            self.session
+                .alignment_tracks
                 .iter_mut()
                 .find(|track| track.config.id == track_id)
                 .map(|track| &mut track.config.filters)

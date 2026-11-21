@@ -981,16 +981,18 @@ established pipeline).
 - Dense regions are drawn as a feature-density summary instead of individual features; the
   established pipeline draws packed features with an overflow marker.
 - Rows are packed per tile in genomic space, so row assignment differs from the established
-  layout, and features below the twelfth row are not drawn (the gutter says how many rows are
-  hidden) instead of being summarised by an overflow marker.
+  layout, and features below the twelfth row are not drawn (the gutter says how many rows and
+  how many distinct features are hidden) instead of being summarised by an overflow marker.
 - A label band is reserved above every row when rows are tall enough, not only above rows that
   have a label. Labels are measured in the font they are painted in.
 - Strand colours come from the theme's track palette and differ slightly from the established
   colours; the score does not change a feature's opacity, and strand is shown by an arrow-shaped
   end (and chevrons on intron lines) rather than repeated direction markers.
-- The inspector shows name, interval, strand and score only. Feature type, attributes
-  (including gene and transcript identifiers), exon blocks, the coding interval and "show all
-  transcripts" are not available.
+- On selection the inspector first shows what the tile carries (name, interval, strand and
+  score) and then, once the record has been looked up in the source, the same fields as the
+  established pipeline: feature type, attributes (including gene and transcript identifiers),
+  exon blocks and the coding interval. A record that can no longer be found keeps the tile's
+  fields. "Show all transcripts" is not available.
 - Keyboard stepping through loaded evidence skips covered tracks.
 - PNG, SVG and semantic exports rendered from the display list, and the automation render-lane
   and context-lane reports, do not include covered tracks. A native window capture does.

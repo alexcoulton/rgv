@@ -507,7 +507,7 @@ impl Viewer {
                 .cache_budget_mib
                 .saturating_mul(1024 * 1024)
                 .max(1);
-            for track in &mut self.alignment_tracks {
+            for track in &mut self.session.alignment_tracks {
                 if let Some(engine) = &track.scene_engine {
                     if let Err(error) = engine.try_clear_cache_budget(budget) {
                         crate::app::shell_state::report_error_to(

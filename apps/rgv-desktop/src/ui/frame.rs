@@ -238,6 +238,7 @@ impl Viewer {
             contig_name: contig_name.to_owned(),
             contig_length,
             tracks: self
+                .session
                 .alignment_tracks
                 .iter()
                 .map(|track| GenomeOverviewTrackCacheKey {
@@ -261,7 +262,7 @@ impl Viewer {
 
         let mut genome_overview = ui::GenomeOverviewData::default();
         let mut scene_overview = ui::GenomeOverviewData::default();
-        for track in &self.alignment_tracks {
+        for track in &self.session.alignment_tracks {
             let index_bins = track
                 .dictionary
                 .as_ref()

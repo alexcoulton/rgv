@@ -157,26 +157,13 @@ impl Viewer {
                 .panels
                 .panel(dictionary_panel)
                 .selected_alignment_track;
-            let alignment_tracks = &self.alignment_tracks;
-            let alignment_dictionary = selected
-                .and_then(|id| {
-                    alignment_tracks
-                        .iter()
-                        .find(|track| track.config.id == id)
-                        .and_then(|track| track.dictionary.as_ref())
-                })
-                .or_else(|| {
-                    alignment_tracks
-                        .first()
-                        .and_then(|track| track.dictionary.as_ref())
-                });
             let layout = &self.workspace_layout;
             let canvas_width_for = |count: usize| layout.projected_canvas_width(count);
             let canvas = PanelCanvas {
                 width_for: &canvas_width_for,
                 content_top,
             };
-            self.session.reduce(action, &canvas, alignment_dictionary)?
+            self.session.reduce(action, &canvas, selected)?
         };
         let SessionReduction {
             outcome,
@@ -214,7 +201,7 @@ impl Viewer {
                 self.request_all_panel_queries();
             }
             Effect::PanelClosed { panel_id } => {
-                for track in &mut self.alignment_tracks {
+                for track in &mut self.session.alignment_tracks {
                     if let Some(projection) = track.projections.remove(&panel_id) {
                         projection.advance_scene_generation();
                     }
@@ -298,6 +285,7 @@ impl Viewer {
         let selected = track_ids.iter().copied().collect::<BTreeSet<_>>();
         let restore = super::TrackRestore {
             alignment: self
+                .session
                 .alignment_tracks
                 .iter()
                 .enumerate()
@@ -349,6 +337,7 @@ impl Viewer {
         let mut restored = Vec::new();
         if !restore.alignment.is_empty() {
             let mut configs = self
+                .session
                 .alignment_tracks
                 .iter()
                 .map(|track| track.config.clone())
@@ -360,9 +349,19 @@ impl Viewer {
                 configs.insert((*index).min(configs.len()), config.clone());
                 restored.push(config.id);
             }
-            let primary_before = self.alignment_tracks.first().map(|track| track.config.id);
+            let primary_before = self
+                .session
+                .alignment_tracks
+                .first()
+                .map(|track| track.config.id);
             self.replace_alignment_track_controllers(configs)?;
-            if self.alignment_tracks.first().map(|track| track.config.id) != primary_before {
+            if self
+                .session
+                .alignment_tracks
+                .first()
+                .map(|track| track.config.id)
+                != primary_before
+            {
                 // The restored track is the first one again: it owns the primary settings.
                 self.activate_first_alignment_track()?;
             }

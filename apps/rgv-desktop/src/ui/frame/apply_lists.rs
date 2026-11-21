@@ -218,6 +218,7 @@ impl Viewer {
         self.metadata_selected_tracks = std::mem::take(&mut st.lists.metadata_selected_tracks);
         if metadata_selection_changed {
             let selected_alignment_tracks = self
+                .session
                 .alignment_tracks
                 .iter()
                 .filter(|track| self.metadata_selected_tracks.contains(&track.config.id))

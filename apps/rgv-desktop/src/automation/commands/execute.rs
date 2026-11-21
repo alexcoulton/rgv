@@ -375,6 +375,7 @@ impl Viewer {
                 }
                 let effective_kind = inferred_automation_track_kind(&source, kind);
                 let before = self
+                    .session
                     .alignment_tracks
                     .iter()
                     .map(|track| track.config.id)
@@ -403,6 +404,7 @@ impl Viewer {
                     TrackKind::Alignment => {
                         self.open_alignment_source(&path);
                         let track_id = self
+                            .session
                             .alignment_tracks
                             .iter()
                             .find(|track| !before.contains(&track.config.id))
@@ -415,6 +417,7 @@ impl Viewer {
                         };
                         if let Some(name) = name
                             && let Some(track) = self
+                                .session
                                 .alignment_tracks
                                 .iter_mut()
                                 .find(|track| track.config.id == track_id)

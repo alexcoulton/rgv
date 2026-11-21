@@ -1377,7 +1377,7 @@ impl Viewer {
             for panel in &mut self.session.panels.panels {
                 panel.generation_clock.advance();
             }
-            for track in &mut self.alignment_tracks {
+            for track in &mut self.session.alignment_tracks {
                 for projection in track.projections.values_mut() {
                     projection.advance_scene_generation();
                 }
@@ -1756,7 +1756,8 @@ impl Viewer {
                 if id == self.primary_alignment_track_id() {
                     self.primary_alignment_filters().inspector_activation
                 } else {
-                    self.alignment_tracks
+                    self.session
+                        .alignment_tracks
                         .iter()
                         .find(|track| track.config.id == id)
                         .map_or(

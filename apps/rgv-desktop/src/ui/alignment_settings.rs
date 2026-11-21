@@ -35,13 +35,7 @@ pub(crate) fn modification_code_label(code: ModificationCode) -> String {
     }
 }
 
-pub(crate) fn parse_modification_code(value: &str) -> Option<ModificationCode> {
-    if let Some(code) = value.strip_prefix("CHEBI:") {
-        return code.parse().ok().map(ModificationCode::Chebi);
-    }
-    let bytes = value.as_bytes();
-    (bytes.len() == 1 && bytes[0].is_ascii_alphabetic()).then(|| ModificationCode::Letter(bytes[0]))
-}
+pub(crate) use rgv_session::alignment::track::parse_modification_code;
 
 pub(crate) fn rgba_to_color32(color: rgv_layout::Rgba) -> egui::Color32 {
     let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -84,6 +78,7 @@ impl Viewer {
     ) -> Vec<ModificationCode> {
         let panel_id = self.session.panels.active().id;
         let Some(authority) = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == track_id && track.scene_engine.is_some())
@@ -120,6 +115,7 @@ impl Viewer {
     ) -> Option<rgv_hts::PairSummary> {
         let panel_id = self.session.panels.active().id;
         let track = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == track_id)?;

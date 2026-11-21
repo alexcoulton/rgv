@@ -1,4 +1,5 @@
-//! Keeps auxiliary-track selections attached to the same record across lane refreshes.
+//! Selections of records in auxiliary-track lanes, and keeping them attached to the same record
+//! across lane refreshes.
 //!
 //! A selection stores an index into the lane's current query result. When a refreshed result
 //! replaces that lane the index is meaningless on its own, so the selected record itself is the
@@ -8,13 +9,51 @@
 use rgv_core::TrackId;
 use rgv_engine::{TrackSnapshot, TrackSnapshotData};
 
-use super::model::{
-    CopyNumberSelection, FeatureSelection, GwasSelection, InteractionSelection, MutationSelection,
-    QuantitativeSelection, VariantSelection,
-};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeatureSelection {
+    pub track_id: TrackId,
+    pub record_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VariantSelection {
+    pub track_id: TrackId,
+    pub record_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GwasSelection {
+    pub track_id: TrackId,
+    pub record_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuantitativeSelection {
+    pub track_id: TrackId,
+    pub record_index: usize,
+    pub position: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CopyNumberSelection {
+    pub track_id: TrackId,
+    pub segment_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MutationSelection {
+    pub track_id: TrackId,
+    pub record_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InteractionSelection {
+    pub track_id: TrackId,
+    pub record_index: usize,
+}
 
 /// Index of the record previously at `previous_index` in `previous`, within `refreshed`.
-pub(crate) fn reresolve_record_index<T: PartialEq>(
+pub fn reresolve_record_index<T: PartialEq>(
     previous: &[T],
     previous_index: usize,
     refreshed: &[T],
@@ -29,14 +68,14 @@ pub(crate) fn reresolve_record_index<T: PartialEq>(
 
 /// The auxiliary selections of one panel.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct AuxiliarySelections {
-    pub(crate) feature: Option<FeatureSelection>,
-    pub(crate) variant: Option<VariantSelection>,
-    pub(crate) gwas: Option<GwasSelection>,
-    pub(crate) quantitative: Option<QuantitativeSelection>,
-    pub(crate) copy_number: Option<CopyNumberSelection>,
-    pub(crate) mutation: Option<MutationSelection>,
-    pub(crate) interaction: Option<InteractionSelection>,
+pub struct AuxiliarySelections {
+    pub feature: Option<FeatureSelection>,
+    pub variant: Option<VariantSelection>,
+    pub gwas: Option<GwasSelection>,
+    pub quantitative: Option<QuantitativeSelection>,
+    pub copy_number: Option<CopyNumberSelection>,
+    pub mutation: Option<MutationSelection>,
+    pub interaction: Option<InteractionSelection>,
 }
 
 fn reresolve<S: Copy>(
@@ -55,7 +94,7 @@ fn reresolve<S: Copy>(
 /// untouched; a selection on this track follows its record or, if the record is gone (or the
 /// lane had no previous result to identify it by), is cleared.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn reresolve_auxiliary_selections(
+pub fn reresolve_auxiliary_selections(
     selections: AuxiliarySelections,
     previous: Option<&TrackSnapshot>,
     refreshed: &TrackSnapshot,

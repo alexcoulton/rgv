@@ -4247,6 +4247,7 @@ dependencies = [
  "rgv-core",
  "rgv-engine",
  "rgv-hts",
+ "rgv-layout",
  "serde_json",
  "tempfile",
  "tracing",

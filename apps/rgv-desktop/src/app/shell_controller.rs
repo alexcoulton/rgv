@@ -293,35 +293,10 @@ impl Viewer {
 
     // ----- Track ids (APP-14) ----------------------------------------------------------------
 
-    fn largest_live_track_id(&self) -> u64 {
-        self.session
-            .tracks
-            .tracks()
-            .iter()
-            .map(|track| track.id.get())
-            .chain(
-                self.alignment_tracks
-                    .iter()
-                    .map(|track| track.config.id.get()),
-            )
-            .max()
-            .unwrap_or_default()
-    }
-
     /// A track id that has not been used before in this run, even by a track since removed:
     /// worker events for a removed track may still be in flight.
     pub(crate) fn allocate_track_id(&mut self) -> TrackId {
-        let largest_live = self.largest_live_track_id();
-        self.session.track_ids.allocate(largest_live)
-    }
-
-    /// First id of a caller-numbered block; `reserve_track_ids_through` records its end.
-    pub(crate) fn peek_track_id(&self) -> Option<u64> {
-        self.session.track_ids.peek(self.largest_live_track_id())
-    }
-
-    pub(crate) fn reserve_track_ids_through(&mut self, id: u64) {
-        self.session.track_ids.reserve_through(id);
+        self.session.allocate_track_id()
     }
 
     // ----- Notifications (APP-7) -------------------------------------------------------------

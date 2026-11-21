@@ -10,6 +10,10 @@
 use crate::action::history::{UndoEntry, UndoHistory, track_intents_coalesce_key};
 use crate::action::reduce::{self, PanelContext, Reduced};
 use crate::action::{Action, ActionOutcome, Effect};
+use crate::alignment::track::{
+    AlignmentSceneBudgetSnapshot, AlignmentTrackController, EmptyAlignmentState,
+    filter_state_from_session,
+};
 use crate::document_state::{AutosaveMarker, DocumentState};
 use crate::gesture::NavigationGestureCommit;
 use crate::navigation::ImportedLocusRequest;
@@ -20,11 +24,13 @@ use crate::status::{BusyStatus, StatusActivity};
 use crate::track_diagnostics::SkippedLineReporter;
 use crate::track_ids::TrackIdAllocator;
 use anyhow::Result;
+use rgv_alignment_scene::AllocationLedger;
 use rgv_alignment_scene::ReferenceRevision;
 use rgv_core::{
     ContigAliases, DesktopSettings, GenomeAssembly, GenomeAssemblyIdentity, IgvImportReport,
-    PanelId, ReferenceDictionary, RegionOfInterest, ReviewItem, SampleMetadataTable, TrackChannel,
-    TrackCollection, TrackConfig, TrackSource, UnresolvedSessionSource, WorkspacePresentation,
+    PanelId, ReferenceDictionary, RegionOfInterest, ReviewItem, SampleMetadataTable,
+    SessionAlignmentTrack, SessionFilters, TrackChannel, TrackCollection, TrackConfig, TrackId,
+    TrackSource, UnresolvedSessionSource, WorkspacePresentation,
 };
 use rgv_engine::{ReferenceEngine, TrackEngine, TrackEngineEvent};
 use rgv_hts::FastaOpenOptions;
@@ -90,6 +96,22 @@ pub struct Session<P: Panel = PanelState> {
     pub last_autosaved: Option<AutosaveMarker>,
     /// Which tracks of the current track engine have already reported skipped lines.
     pub skipped_lines: SkippedLineReporter,
+    /// One controller per open alignment track, in workspace order: its scene and coverage
+    /// engines, filters and per-panel projections. GPU state derived from them is the host's.
+    pub alignment_tracks: Vec<AlignmentTrackController>,
+    /// The primary alignment track's settings while no alignment source is open; the first
+    /// controller owns them once one is.
+    pub empty_alignment: EmptyAlignmentState,
+    /// Scene workers being stopped off the calling thread.
+    pub alignment_retirement_tasks: Vec<JoinHandle<()>>,
+    /// Coverage workers being stopped off the calling thread.
+    pub alignment_coverage_retirement_tasks: Vec<JoinHandle<()>>,
+    /// The one enforcing authority every alignment source and immutable scene layer is charged
+    /// to, sized from `settings.cache_budget_mib` and its memory policy.
+    pub alignment_scene_ledger: AllocationLedger,
+    pub alignment_scene_budget: AlignmentSceneBudgetSnapshot,
+    /// Most alignments any track of the workspace may hold.
+    pub workspace_alignment_limit: usize,
 }
 
 /// What the host's canvas contributes to a panel action: how wide each panel would be, and
@@ -123,6 +145,37 @@ impl<P: Panel> Session<P> {
         settings: DesktopSettings,
         settings_path: PathBuf,
     ) -> Self {
+        let total_cache_bytes = settings.cache_budget_mib.saturating_mul(1024 * 1024).max(1);
+        let alignment_scene_ledger = AllocationLedger::with_policy(
+            settings.alignment_memory_policy,
+            total_cache_bytes,
+            total_cache_bytes,
+            total_cache_bytes,
+        );
+        let alignment_scene_budget = alignment_scene_ledger
+            .progress()
+            .map(|progress| AlignmentSceneBudgetSnapshot::from_progress(progress, 0))
+            .unwrap_or_default();
+        let filters = SessionFilters::default();
+        let (filter_editor, active_filters) =
+            filter_state_from_session(&filters).expect("the default alignment filters are valid");
+        let workspace_alignment_limit = SessionAlignmentTrack::new(
+            TrackId::new(1),
+            String::new(),
+            TrackSource::Local {
+                path: String::new(),
+            },
+        )
+        .maximum_alignments;
+        let empty_alignment = EmptyAlignmentState {
+            filters,
+            filter_editor,
+            active_filters,
+            name: String::new(),
+            visible: true,
+            collapsed: false,
+            maximum_alignments: workspace_alignment_limit,
+        };
         Self {
             panels: PanelWorkspace::new(initial_panel),
             document_state: DocumentState::default(),
@@ -167,6 +220,13 @@ impl<P: Panel> Session<P> {
             track_ids: TrackIdAllocator::default(),
             last_autosaved: None,
             skipped_lines: SkippedLineReporter::default(),
+            alignment_tracks: Vec::new(),
+            empty_alignment,
+            alignment_retirement_tasks: Vec::new(),
+            alignment_coverage_retirement_tasks: Vec::new(),
+            alignment_scene_ledger,
+            alignment_scene_budget,
+            workspace_alignment_limit,
         }
     }
 
@@ -453,14 +513,14 @@ impl<P: Panel> Session<P> {
     /// Carries out one navigation, panel-management or list action and reports the effects the
     /// host owes and the actions that undo it. Nothing is recorded in the undo history.
     ///
-    /// `alignment_dictionary` is the dictionary of the alignment source the
-    /// [`Self::dictionary_panel`] reads, when the host has one open; without it the reference
-    /// dictionary is used. It is an argument only while alignment sources live in the host.
+    /// `selected_alignment` is the alignment track the [`Self::dictionary_panel`] has selected:
+    /// a panel action is expressed in that source's dictionary (or the first alignment
+    /// source's), and in the reference dictionary when no alignment source is open.
     pub fn reduce(
         &mut self,
         action: &Action,
         canvas: &PanelCanvas<'_>,
-        alignment_dictionary: Option<&ReferenceDictionary>,
+        selected_alignment: Option<TrackId>,
     ) -> Result<SessionReduction> {
         if let Action::SetWorkspaceLists {
             regions,
@@ -493,6 +553,19 @@ impl<P: Panel> Session<P> {
             "{} needs the host",
             action.label()
         );
+        let alignment_tracks = &self.alignment_tracks;
+        let alignment_dictionary = selected_alignment
+            .and_then(|id| {
+                alignment_tracks
+                    .iter()
+                    .find(|track| track.config.id == id)
+                    .and_then(|track| track.dictionary.as_ref())
+            })
+            .or_else(|| {
+                alignment_tracks
+                    .first()
+                    .and_then(|track| track.dictionary.as_ref())
+            });
         let ctx = PanelContext {
             dictionary: alignment_dictionary.or(self.reference_dictionary.as_ref()),
             fallback_dictionary: &self.assembly.dictionary,

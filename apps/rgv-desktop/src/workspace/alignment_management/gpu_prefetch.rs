@@ -161,7 +161,7 @@ impl Viewer {
                 panel.navigation_query_schedule.gesture_active
                     || panel.navigation_query_schedule.pending.is_some()
             })
-            || self.alignment_tracks.iter().any(|track| {
+            || self.session.alignment_tracks.iter().any(|track| {
                 track
                     .projections
                     .values()

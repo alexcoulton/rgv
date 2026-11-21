@@ -23,15 +23,15 @@ impl Viewer {
         advance_generation: bool,
         reason: &'static str,
     ) {
-        if track_index >= self.alignment_tracks.len() {
+        if track_index >= self.session.alignment_tracks.len() {
             return;
         }
         let failed = matches!(
-            self.alignment_tracks[track_index].lifecycle,
+            self.session.alignment_tracks[track_index].lifecycle,
             AlignmentTrackLifecycle::Failed(_)
         );
         if failed {
-            let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+            let projection = self.session.alignment_tracks[track_index].projection_mut(panel_id);
             projection.navigation.transition(
                 AlignmentNavigationPhase::Failed,
                 "alignment source is already failed",
@@ -39,13 +39,13 @@ impl Viewer {
             return;
         }
         if advance_generation {
-            self.alignment_tracks[track_index]
+            self.session.alignment_tracks[track_index]
                 .projection_mut(panel_id)
                 .advance_scene_generation();
         }
         let token = self.take_alignment_scene_request_token();
-        let track_id = self.alignment_tracks[track_index].config.id;
-        let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+        let track_id = self.session.alignment_tracks[track_index].config.id;
+        let projection = self.session.alignment_tracks[track_index].projection_mut(panel_id);
         let generation = projection.clock.current().get();
         projection.navigation.bind_identity(panel_id, track_id);
         projection.navigation.begin(generation, token, reason);
@@ -65,7 +65,7 @@ impl Viewer {
         {
             return;
         }
-        if self.alignment_tracks.is_empty() {
+        if self.session.alignment_tracks.is_empty() {
             self.session
                 .panels
                 .panel_mut(panel_id)
@@ -78,7 +78,7 @@ impl Viewer {
         if !resolution.requires_alignment_records() {
             let mut settled = 0_usize;
             let mut retired_tracks = Vec::new();
-            for track in &mut self.alignment_tracks {
+            for track in &mut self.session.alignment_tracks {
                 match &track.lifecycle {
                     AlignmentTrackLifecycle::Opening => {}
                     AlignmentTrackLifecycle::Ready => {
@@ -127,7 +127,7 @@ impl Viewer {
                 .panels
                 .panel_mut(panel_id)
                 .pending_queries
-                .alignment = self.alignment_tracks.iter().any(|track| {
+                .alignment = self.session.alignment_tracks.iter().any(|track| {
                 track
                     .projection(panel_id)
                     .is_some_and(|projection| projection.navigation.is_queued())
@@ -142,31 +142,35 @@ impl Viewer {
         }
         let contig_name = self.session.panels.panel(panel_id).contig_name.clone();
         let mut sent = 0_usize;
-        for track_index in 0..self.alignment_tracks.len() {
+        for track_index in 0..self.session.alignment_tracks.len() {
             if matches!(
-                self.alignment_tracks[track_index].lifecycle,
+                self.session.alignment_tracks[track_index].lifecycle,
                 AlignmentTrackLifecycle::Opening
             ) {
                 continue;
             }
             if matches!(
-                self.alignment_tracks[track_index].lifecycle,
+                self.session.alignment_tracks[track_index].lifecycle,
                 AlignmentTrackLifecycle::Failed(_)
             ) {
-                let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+                let projection =
+                    self.session.alignment_tracks[track_index].projection_mut(panel_id);
                 projection.navigation.transition(
                     AlignmentNavigationPhase::Failed,
                     "alignment source is disconnected",
                 );
                 continue;
             }
-            if !self.alignment_tracks[track_index]
+            if !self.session.alignment_tracks[track_index]
                 .projection(panel_id)
                 .is_some_and(|projection| projection.navigation.is_queued())
             {
                 continue;
             }
-            let Some(metadata) = self.alignment_tracks[track_index].scene_metadata.clone() else {
+            let Some(metadata) = self.session.alignment_tracks[track_index]
+                .scene_metadata
+                .clone()
+            else {
                 continue;
             };
             let Some((contig, contig_length)) = metadata
@@ -183,28 +187,28 @@ impl Viewer {
                     "{} is not available in this alignment",
                     self.session.panels.panel(panel_id).contig_name
                 );
-                self.alignment_tracks[track_index].mark_unavailable(panel_id, message);
+                self.session.alignment_tracks[track_index].mark_unavailable(panel_id, message);
                 continue;
             };
-            let track_id = self.alignment_tracks[track_index].config.id;
-            let existing_owner = self.alignment_tracks[track_index]
+            let track_id = self.session.alignment_tracks[track_index].config.id;
+            let existing_owner = self.session.alignment_tracks[track_index]
                 .projection(panel_id)
                 .and_then(|projection| projection.scene_owner);
-            let existing_contig = self.alignment_tracks[track_index]
+            let existing_contig = self.session.alignment_tracks[track_index]
                 .projection(panel_id)
                 .and_then(|projection| projection.scene_contig);
-            let existing_contract = self.alignment_tracks[track_index]
+            let existing_contract = self.session.alignment_tracks[track_index]
                 .projection(panel_id)
                 .and_then(|projection| projection.scene_contract.as_ref())
                 .cloned();
-            let existing_policy = self.alignment_tracks[track_index]
+            let existing_policy = self.session.alignment_tracks[track_index]
                 .projection(panel_id)
                 .and_then(|projection| projection.scene_policy);
             let target_viewport = match viewport.remapped_contig(contig, contig_length) {
                 Ok(viewport) => viewport,
                 Err(_) => continue,
             };
-            let old_atlas_interval = self.alignment_tracks[track_index]
+            let old_atlas_interval = self.session.alignment_tracks[track_index]
                 .projection(panel_id)
                 .and_then(|projection| projection.scene_frame.as_ref())
                 .and_then(|frame| frame.snapshot.as_ref())
@@ -234,7 +238,8 @@ impl Viewer {
                 reset
             };
             if authority_discontinuity || scroll_reset {
-                let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+                let projection =
+                    self.session.alignment_tracks[track_index].projection_mut(panel_id);
                 projection.scene_frame = None;
                 projection.scene_frame_request_token = None;
                 projection.scene_pressure_retry = None;
@@ -251,8 +256,8 @@ impl Viewer {
             let reference_revision =
                 self.compatible_alignment_reference_revision(&metadata.dictionary);
             let contract = alignment_scene_build_contract(
-                &self.alignment_tracks[track_index].config,
-                &self.alignment_tracks[track_index].active_filters,
+                &self.session.alignment_tracks[track_index].config,
+                &self.session.alignment_tracks[track_index].active_filters,
                 &metadata,
                 contig,
                 contig_length,
@@ -287,7 +292,7 @@ impl Viewer {
                 self.session.settings.read_browsing_buffer_percent,
                 preparation_camera,
             );
-            let complete_read_limit = self.alignment_tracks[track_index]
+            let complete_read_limit = self.session.alignment_tracks[track_index]
                 .config
                 .effective_complete_read_limit();
             let mut queue_error = None;
@@ -297,11 +302,11 @@ impl Viewer {
             } else {
                 existing_owner.expect("an existing alignment scene lane has an owner")
             };
-            let request_token = self.alignment_tracks[track_index]
+            let request_token = self.session.alignment_tracks[track_index]
                 .projection(panel_id)
                 .and_then(|projection| projection.navigation.request_token())
                 .expect("a queued alignment transaction has a request token");
-            self.alignment_tracks[track_index]
+            self.session.alignment_tracks[track_index]
                 .projection_mut(panel_id)
                 .navigation
                 .bind_camera(preparation_camera);
@@ -330,20 +335,24 @@ impl Viewer {
                 .get();
             let filter_authority_changed = previous_view_filter != Some(requested_view_filter)
                 || previous_highlight_filter != Some(requested_highlight_filter);
-            let source_acquisitions_before = self.alignment_tracks[track_index]
+            let source_acquisitions_before = self.session.alignment_tracks[track_index]
                 .projection(panel_id)
                 .map_or(0, |projection| {
                     projection.scene_telemetry.source_acquisitions
                 });
-            let limit_changed =
-                self.alignment_tracks[track_index].scene_complete_read_limit != complete_read_limit;
+            let limit_changed = self.session.alignment_tracks[track_index]
+                .scene_complete_read_limit
+                != complete_read_limit;
             let mut limit_queued = false;
             let mut lane_removed = false;
             let mut lane_inserted = false;
             let mut contract_replaced = false;
             let mut policy_replaced = false;
-            let Some(engine) = self.alignment_tracks[track_index].scene_engine.as_ref() else {
-                let track = &mut self.alignment_tracks[track_index];
+            let Some(engine) = self.session.alignment_tracks[track_index]
+                .scene_engine
+                .as_ref()
+            else {
+                let track = &mut self.session.alignment_tracks[track_index];
                 track.lifecycle = AlignmentTrackLifecycle::Failed(
                     "Unified alignment scene source is unavailable; no legacy fallback was used"
                         .to_owned(),
@@ -405,7 +414,7 @@ impl Viewer {
                 queue_error = Some(error);
             }
             {
-                let track = &mut self.alignment_tracks[track_index];
+                let track = &mut self.session.alignment_tracks[track_index];
                 if limit_queued {
                     track.scene_complete_read_limit = complete_read_limit;
                 }
@@ -447,7 +456,7 @@ impl Viewer {
                 None => {
                     {
                         let projection =
-                            self.alignment_tracks[track_index].projection_mut(panel_id);
+                            self.session.alignment_tracks[track_index].projection_mut(panel_id);
                         projection.begin_checking(Instant::now());
                         projection.last_scene_resolution = Some(resolution);
                         projection.scene_pressure_retry = None;
@@ -484,7 +493,7 @@ impl Viewer {
                 }
                 Some(EngineQueueError::Full) => {}
                 Some(EngineQueueError::Disconnected) => {
-                    let track = &mut self.alignment_tracks[track_index];
+                    let track = &mut self.session.alignment_tracks[track_index];
                     let projection = track.projection_mut(panel_id);
                     projection.navigation.transition(
                         AlignmentNavigationPhase::Failed,
@@ -499,7 +508,7 @@ impl Viewer {
             .panels
             .panel_mut(panel_id)
             .pending_queries
-            .alignment = self.alignment_tracks.iter().any(|track| {
+            .alignment = self.session.alignment_tracks.iter().any(|track| {
             track
                 .projection(panel_id)
                 .is_some_and(|projection| projection.navigation.is_queued())

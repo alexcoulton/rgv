@@ -73,6 +73,7 @@ impl Viewer {
                     )
                 {
                     let interaction = self
+                        .session
                         .alignment_tracks
                         .iter()
                         .find(|track| track.config.id == lane.track_id)

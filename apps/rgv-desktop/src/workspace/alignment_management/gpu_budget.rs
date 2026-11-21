@@ -113,7 +113,7 @@ impl Viewer {
         // capacity which could admit this candidate, so none is asked and the cycle settles at
         // once instead of waiting on another layer.
         if !self.alignment_gpu_ledger_is_private() {
-            for track in &self.alignment_tracks {
+            for track in &self.session.alignment_tracks {
                 let Some(engine) = &track.scene_engine else {
                     continue;
                 };
@@ -400,7 +400,11 @@ impl Viewer {
             }
         }
 
-        Ok(self.alignment_scene_ledger.progress()?.progress_epoch())
+        Ok(self
+            .session
+            .alignment_scene_ledger
+            .progress()?
+            .progress_epoch())
     }
 
     /// Coordinates one composable failure-time reclaim goal across both GPU cache owners. Every
@@ -509,12 +513,10 @@ impl Viewer {
     }
 
     pub(crate) fn apply_live_cache_budget(&mut self, cache_budget_mib: usize) {
-        let previous_budget_bytes = self
-            .alignment_gpu_ledger
-            .progress()
-            .map_or(self.alignment_scene_budget.budget_bytes, |snapshot| {
-                snapshot.budget
-            });
+        let previous_budget_bytes = self.alignment_gpu_ledger.progress().map_or(
+            self.session.alignment_scene_budget.budget_bytes,
+            |snapshot| snapshot.budget,
+        );
         let total_bytes = cache_budget_mib.saturating_mul(1024 * 1024).max(1);
         self.refresh_alignment_scene_budget();
         let current_budget_bytes = self
@@ -587,7 +589,7 @@ impl Viewer {
                 progress.charged.saturating_add(progress.reserved)
             })
         };
-        let scene = occupied(&self.alignment_scene_ledger);
+        let scene = occupied(&self.session.alignment_scene_ledger);
         if self.alignment_gpu_ledger_is_private() {
             scene.saturating_add(occupied(&self.alignment_gpu_ledger))
         } else {
@@ -598,7 +600,7 @@ impl Viewer {
     /// Whether GPU pages are charged to their own ledger (the bounded memory policy) rather
     /// than to the ledger shared with the source engines (the strict policy).
     pub(crate) fn alignment_gpu_ledger_is_private(&self) -> bool {
-        self.alignment_scene_ledger.is_bounded()
+        self.session.alignment_scene_ledger.is_bounded()
     }
 
     /// Reconciles the shared alignment ledger and the two not-yet-ledger-native GPU caches under
@@ -614,8 +616,8 @@ impl Viewer {
         let alignment_budget_bytes = total_budget_bytes
             .saturating_sub(external_reservation)
             .max(1);
-        self.alignment_scene_budget.budget_bytes = alignment_budget_bytes;
-        if let Err(error) = self.alignment_scene_ledger.set_limits(
+        self.session.alignment_scene_budget.budget_bytes = alignment_budget_bytes;
+        if let Err(error) = self.session.alignment_scene_ledger.set_limits(
             alignment_budget_bytes,
             total_budget_bytes,
             total_budget_bytes,
@@ -640,7 +642,7 @@ impl Viewer {
         let allowance = NonZeroUsize::new(alignment_budget_bytes)
             .expect("the effective alignment budget is non-zero");
         let mut first_error = None;
-        for track in &mut self.alignment_tracks {
+        for track in &mut self.session.alignment_tracks {
             let Some(engine) = &track.scene_engine else {
                 continue;
             };
@@ -662,10 +664,13 @@ impl Viewer {
             .saturating_sub(self.alignment_ledger_occupied_bytes())
             .saturating_sub(context_bytes)
             .saturating_sub(self.rectangle_renderer.primary_resident_bytes());
-        if let Ok(progress) = self.alignment_scene_ledger.progress() {
-            self.alignment_scene_budget = AlignmentSceneBudgetSnapshot::from_progress(
+        if let Ok(progress) = self.session.alignment_scene_ledger.progress() {
+            self.session.alignment_scene_budget = AlignmentSceneBudgetSnapshot::from_progress(
                 progress,
-                self.alignment_scene_budget.refreshes.saturating_add(1),
+                self.session
+                    .alignment_scene_budget
+                    .refreshes
+                    .saturating_add(1),
             );
         }
         if let Some(error) = first_error {

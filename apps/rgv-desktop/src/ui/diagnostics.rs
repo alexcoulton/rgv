@@ -87,8 +87,12 @@ impl Viewer {
         }
 
         let active_panel_id = self.session.panels.active().id;
-        let alignment_ledger_progress = self.alignment_scene_ledger.progress().ok();
-        let alignment_ledger_operations = self.alignment_scene_ledger.operation_counters().ok();
+        let alignment_ledger_progress = self.session.alignment_scene_ledger.progress().ok();
+        let alignment_ledger_operations = self
+            .session
+            .alignment_scene_ledger
+            .operation_counters()
+            .ok();
         let read_gpu_operations = self.alignment_gpu_renderer.operation_counters();
         let summary_gpu_operations = self.alignment_summary_gpu_renderer.operation_counters();
         let context_gpu_operations = self.context_scene_gpu_renderer.operation_counters();
@@ -96,8 +100,8 @@ impl Viewer {
         let aggregate_cache_budget = self.aggregate_cache_budget_bytes();
         let context_gpu_bytes = self.context_scene_gpu_renderer.resident_bytes();
         let generic_gpu_bytes = self.rectangle_renderer.resident_bytes();
-        let mut alignment_tracks = Vec::with_capacity(self.alignment_tracks.len());
-        for track in &self.alignment_tracks {
+        let mut alignment_tracks = Vec::with_capacity(self.session.alignment_tracks.len());
+        for track in &self.session.alignment_tracks {
             let projection = track.projection(active_panel_id);
             if track.scene_engine.is_some() {
                 let Some(projection) = projection else {
@@ -326,11 +330,11 @@ impl Viewer {
                 self.smoothed_frame_ms,
                 1_000.0 / self.smoothed_frame_ms.max(0.01)
             ),
-            workspace: (!self.alignment_tracks.is_empty()).then(|| {
+            workspace: (!self.session.alignment_tracks.is_empty()).then(|| {
                 format!(
                     "{} alignment tracks · {} visible · {} complete-read ceiling · {:.2}× browsing buffer/side",
-                    self.alignment_tracks.len(),
-                    self.alignment_tracks
+                    self.session.alignment_tracks.len(),
+                    self.session.alignment_tracks
                         .iter()
                         .filter(|track| {
                             self.session.track_presentation
@@ -348,7 +352,7 @@ impl Viewer {
                                     .unwrap_or(false)
                         })
                         .count(),
-                    self.workspace_alignment_limit,
+                    self.session.workspace_alignment_limit,
                     f32::from(self.session.settings.read_browsing_buffer_percent) / 100.0,
                 )
             }),
@@ -432,7 +436,7 @@ impl Viewer {
                 self.resize_query_refreshes,
             )),
             data_cache: None,
-            alignment_scene_budget: (!self.alignment_tracks.is_empty()).then(|| {
+            alignment_scene_budget: (!self.session.alignment_tracks.is_empty()).then(|| {
                 let scene = alignment_ledger_progress.map_or_else(
                     || "scene ledger unavailable".to_owned(),
                     |progress| {

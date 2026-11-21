@@ -746,42 +746,7 @@ fn project_context_lane_text(
     candidates.len()
 }
 
-/// Uses the same user-facing side-buffer convention as alignment scenes: 100% means one visible
-/// viewport on each side. The optional cap is used by bounded sources such as FASTA.
-pub(crate) fn buffered_context_interval(
-    viewport: Viewport,
-    contig_length: u64,
-    buffer_percent: u16,
-    maximum_bases: Option<u64>,
-) -> GenomicInterval {
-    let visible = viewport.interval();
-    let side = ((viewport.span() * f64::from(buffer_percent) / 100.0).ceil() as u64).max(1);
-    let start = visible.start().saturating_sub(side);
-    let end = visible.end().saturating_add(side).min(contig_length.max(1));
-    let mut interval = GenomicInterval::new(
-        visible.contig(),
-        start.min(contig_length.saturating_sub(1)),
-        end.max(start.saturating_add(1)).min(contig_length.max(1)),
-    )
-    .expect("a buffered viewport remains non-empty");
-    if let Some(maximum) = maximum_bases.filter(|maximum| *maximum > 0)
-        && interval.len() > maximum
-        && maximum >= visible.len()
-    {
-        let spare = maximum - visible.len();
-        let before = spare / 2;
-        let after = spare - before;
-        let mut bounded_start = visible.start().saturating_sub(before);
-        let mut bounded_end = visible.end().saturating_add(after).min(contig_length);
-        if bounded_end - bounded_start < maximum {
-            bounded_start = bounded_end.saturating_sub(maximum);
-            bounded_end = bounded_start.saturating_add(maximum).min(contig_length);
-        }
-        interval = GenomicInterval::new(visible.contig(), bounded_start, bounded_end)
-            .expect("a capped buffered viewport remains non-empty");
-    }
-    interval
-}
+pub(crate) use rgv_session::reference_dispatch::buffered_context_interval;
 
 pub(crate) fn prepared_context_viewport(interval: GenomicInterval, target: Viewport) -> Viewport {
     let pixel_width = interval.len() as f64 / target.bases_per_pixel();

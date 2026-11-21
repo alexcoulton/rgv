@@ -316,7 +316,7 @@ pub(crate) fn show_system_dialogs(
                                 rgv_core::TrackPipeline::Legacy
                             };
                         }
-                        let budget = viewer.alignment_scene_budget;
+                        let budget = viewer.session.alignment_scene_budget;
                         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
                         let context_gpu = viewer.context_scene_gpu_renderer.resident_bytes();
                         let generic_gpu = viewer.rectangle_renderer.resident_bytes();
@@ -371,7 +371,7 @@ pub(crate) fn show_system_dialogs(
 
                             let active_panel_id = viewer.session.panels.active().id;
                             if let Some(projection) = viewer
-                                .alignment_tracks
+                                .session.alignment_tracks
                                 .first()
                                 .and_then(|track| track.projection(active_panel_id))
                             {

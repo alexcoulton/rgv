@@ -714,7 +714,6 @@ impl Viewer {
                 options.reference.clone(),
                 remote_reference_index_url.clone(),
                 &panel_ids,
-                coverage_sidecar.clone(),
             )?);
         }
         crate::workspace::alignments::connect_reference_slice_sinks(
@@ -919,6 +918,21 @@ impl Viewer {
                 track_ids: app::shell_state::TrackIdAllocator::default(),
                 last_autosaved: None,
                 skipped_lines: rgv_session::track_diagnostics::SkippedLineReporter::default(),
+                alignment_tracks,
+                empty_alignment: EmptyAlignmentState {
+                    filters: session_filters.clone(),
+                    filter_editor: filter_editor.clone(),
+                    active_filters: active_filters.clone(),
+                    name: alignment_name.clone(),
+                    visible: alignment_visible,
+                    collapsed: alignment_collapsed,
+                    maximum_alignments: workspace_alignment_limit,
+                },
+                alignment_retirement_tasks: Vec::new(),
+                alignment_coverage_retirement_tasks: Vec::new(),
+                alignment_scene_ledger,
+                alignment_scene_budget: initial_alignment_scene_budget,
+                workspace_alignment_limit,
             },
             application_instance_id,
             shell: app::shell_state::ShellState::default(),
@@ -935,7 +949,6 @@ impl Viewer {
             rectangle_renderer,
             context_scene_gpu_renderer,
             context_scene_gpu_frame: ContextSceneGpuFrame::default(),
-            alignment_scene_ledger,
             alignment_ledger_progress,
             alignment_gpu_ledger,
             alignment_gpu_ledger_progress,
@@ -965,22 +978,10 @@ impl Viewer {
             pane_divider_rect: None,
             composite_display_list: DisplayList::default(),
             shared_annotation_frame_heights: BTreeMap::new(),
-            alignment_tracks,
-            empty_alignment: EmptyAlignmentState {
-                filters: session_filters.clone(),
-                filter_editor: filter_editor.clone(),
-                active_filters: active_filters.clone(),
-                name: alignment_name.clone(),
-                visible: alignment_visible,
-                collapsed: alignment_collapsed,
-                maximum_alignments: workspace_alignment_limit,
-            },
-            alignment_retirement_tasks: Vec::new(),
-            alignment_coverage_retirement_tasks: Vec::new(),
             alignment_coverage_sidecar: coverage_sidecar,
             alignment_depth_pyramid_gpu_renderer,
             alignment_depth_pyramid_gpu_frame: None,
-            alignment_depth_pyramid_pages_refused: 0,
+            alignment_depth_pyramid_pages_refused: BTreeMap::new(),
             automation_auxiliary_open_state,
             reference_remote_io_stats: None,
             landmark_resource_root: options.landmark_resource_root.clone(),
@@ -1030,7 +1031,6 @@ impl Viewer {
             landmark_install_ticket: 0,
             hosted_genomes: crate::workspace::genomes::HostedGenomes::default(),
             promoted_read: None,
-            workspace_alignment_limit,
             display_dirty: true,
             display_upload_pending_metrics: false,
             pending_resolution_query_refresh: None,
@@ -1076,7 +1076,6 @@ impl Viewer {
             user_exit_requested: false,
             context_lane_gpu_budget_bytes,
             track_tiles: crate::workspace::track_tiles::TrackTilePipelineState::default(),
-            alignment_scene_budget: initial_alignment_scene_budget,
             locus_editor,
             resizing_annotation_track: None,
             resizing_read_track: None,
@@ -1091,7 +1090,7 @@ impl Viewer {
             alignment_context_menu: None,
         };
         if start_diagnostic_trace
-            && (viewer.session.synthetic || viewer.alignment_tracks.is_empty())
+            && (viewer.session.synthetic || viewer.session.alignment_tracks.is_empty())
         {
             viewer.manual_diagnostic_trace_autostart_pending = false;
             viewer.start_manual_diagnostic_trace("launch option", true);
@@ -1263,7 +1262,7 @@ impl Viewer {
             );
         self.alignment_depth_pyramid_gpu_renderer
             .set_ledger(self.alignment_gpu_ledger.clone());
-        self.alignment_depth_pyramid_pages_refused = 0;
+        self.alignment_depth_pyramid_pages_refused.clear();
         self.context_scene_gpu_renderer = ContextSceneGpuRenderer::new(&device, format);
         self.context_scene_gpu_frame = ContextSceneGpuFrame::default();
         // Track tile pages are plain uploads of the engine's cached scenes: the renderer (and

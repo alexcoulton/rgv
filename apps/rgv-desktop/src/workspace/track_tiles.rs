@@ -30,11 +30,12 @@ use rgv_engine::{
 };
 use rgv_hts::FeatureRecord;
 use rgv_layout::{
-    Rgba, TextPrimitive, TrackLabelView, TrackLayoutOptions, hit_test_track_scene,
+    Rgba, TextPrimitive, TrackLabelView, TrackLayoutOptions, hit_test_track_scene_at,
     place_track_labels,
 };
 use rgv_model::{
-    TrackDigest, TrackRecordId, TrackRendererId, TrackTileKey, TrackTilePayload, TrackTileSettings,
+    TrackRecord, TrackRecordId, TrackRecordLookup, TrackRendererId, TrackTileKey, TrackTilePayload,
+    TrackTileSettings,
 };
 use rgv_render::{
     TrackBinStyle, TrackLaneDraw, TrackLanePage, TrackLaneProjection, TrackPalette, TrackTileFrame,
@@ -198,8 +199,12 @@ pub(crate) fn track_tile_view_key(view: &TrackTileView) -> TrackTileViewKey {
 pub(crate) enum TrackTileLaneStatus {
     /// A visible tile is still being read, or its page is not on the GPU yet.
     Loading,
-    /// Every visible tile is drawn. `hidden_rows` rows lie below the lane's bottom edge.
-    Ready { hidden_rows: u32 },
+    /// Every visible tile is drawn. The view's row cap left out `hidden_rows` packed rows
+    /// holding `hidden_features` distinct features ([`TrackTileViewSnapshot::overflow`]).
+    Ready {
+        hidden_rows: u32,
+        hidden_features: u32,
+    },
     /// The track could not be opened, a visible tile failed, or a page does not fit the GPU.
     Failed(String),
 }
@@ -210,7 +215,6 @@ pub(crate) fn track_tile_lane_status(
     gpu_failure: Option<&str>,
     gpu_page_missing: bool,
     snapshot: Option<&TrackTileViewSnapshot>,
-    visible_rows: u32,
 ) -> TrackTileLaneStatus {
     if let Some(message) = open_failure {
         return TrackTileLaneStatus::Failed(message.to_owned());
@@ -227,15 +231,10 @@ pub(crate) fn track_tile_lane_status(
     if !snapshot.is_settled() || gpu_page_missing {
         return TrackTileLaneStatus::Loading;
     }
-    let rows = snapshot
-        .tiles
-        .iter()
-        .filter(|tile| tile.scene.renderer == TrackRendererId::FEATURES)
-        .map(|tile| tile.scene.row_count)
-        .max()
-        .unwrap_or(0);
+    let overflow = snapshot.overflow();
     TrackTileLaneStatus::Ready {
-        hidden_rows: rows.saturating_sub(visible_rows),
+        hidden_rows: overflow.hidden_rows,
+        hidden_features: overflow.hidden_features,
     }
 }
 
@@ -245,10 +244,18 @@ pub(crate) fn track_tile_lane_label(
 ) -> Option<(String, Option<String>)> {
     match status {
         TrackTileLaneStatus::Loading => Some(("Loading…".to_owned(), None)),
-        TrackTileLaneStatus::Ready { hidden_rows: 0 } => None,
-        TrackTileLaneStatus::Ready { hidden_rows } => Some((
+        TrackTileLaneStatus::Ready {
+            hidden_rows: 0,
+            hidden_features: 0,
+        } => None,
+        TrackTileLaneStatus::Ready {
+            hidden_rows,
+            hidden_features,
+        } => Some((
             "Rows hidden".to_owned(),
-            Some(format!("{hidden_rows} more row(s); enlarge the track")),
+            Some(format!(
+                "{hidden_rows} more row(s) holding {hidden_features} feature(s); enlarge the track"
+            )),
         )),
         TrackTileLaneStatus::Failed(message) => {
             Some(("Unavailable".to_owned(), Some(message.clone())))
@@ -413,23 +420,21 @@ pub(crate) fn track_tile_draw_order(
         .collect()
 }
 
-/// GPU page identity of a tile. The renderer's key has no contig, and two panels may show the
-/// same tile index of different contigs, so the contig is folded into the settings digest.
-pub(crate) fn track_tile_page_key(track: TrackId, tile: &LaidOutTrackTile) -> TrackTilePageKey {
-    let mut digest = TrackDigest::new();
-    digest.write_u64(tile.settings_digest);
-    digest.write_text(Some(&tile.tile.contig));
-    TrackTilePageKey {
-        track: track.get(),
-        tile: tile.tile.key,
-        settings_digest: digest.finish(),
-    }
+/// GPU page identity of a tile. Two panels may show the same tile index of different contigs,
+/// so the key carries the contig ([`TrackTilePageKey::for_contig`]).
+fn track_tile_page_key(track: TrackId, tile: &LaidOutTrackTile) -> TrackTilePageKey {
+    TrackTilePageKey::for_contig(
+        track.get(),
+        tile.contig(),
+        tile.tile.key,
+        tile.settings_digest,
+    )
 }
 
-/// The feature a tile carries for `id`, as the record the feature inspector shows. A tile
-/// carries the label, interval, strand and score; it does not carry the feature type, the
-/// attribute list, the coding interval, peak metrics or the complete block list (blocks are
-/// clipped to the tile), so those are absent from the record.
+/// The feature a tile carries for `id`, as a stand-in record while the complete one is looked
+/// up ([`TrackTileEngine::lookup_record`]). A tile carries the label, interval, strand and
+/// score; it does not carry the feature type, the attribute list, the coding interval, peak
+/// metrics or the complete block list (blocks are clipped to the tile).
 pub(crate) fn track_tile_feature_record(
     tile: &LaidOutTrackTile,
     contig: &str,
@@ -497,17 +502,10 @@ pub(crate) fn track_tile_hit_in_lane(lane: &TrackTileLane, x: f32, y: f32) -> Op
         return None;
     }
     let projection = lane.projection();
-    let mut point = projection.scene_point(x, y);
-    // `scene_point` measures the fraction down a row against the row pitch, while scenes state
-    // a shape's extent as a fraction of the row's content height. Re-express it, and treat the
-    // gap between two rows as empty.
-    let row = point.row.floor();
-    let content_fraction = (point.row - row) * f64::from(projection.row_pitch)
-        / f64::from(projection.row_height.max(f32::MIN_POSITIVE));
-    if content_fraction > 1.0 {
-        return None;
-    }
-    point.row = row + content_fraction.min(1.0 - f64::EPSILON);
+    // The probe measures the fraction down a row against the row's content height, the unit
+    // scenes state extents in, and has no row in the gap between two rows.
+    let point = projection.scene_probe(x, y);
+    point.row?;
     let tolerance = projection.hit_tolerance_bases();
     lane.tiles.iter().rev().find_map(|tile| {
         if tile.scene.renderer != TrackRendererId::FEATURES {
@@ -518,7 +516,7 @@ pub(crate) fn track_tile_hit_in_lane(lane: &TrackTileLane, x: f32, y: f32) -> Op
         if point.position < start || point.position >= end {
             return None;
         }
-        let id = hit_test_track_scene(&tile.scene, point, tolerance)?.id?;
+        let id = hit_test_track_scene_at(&tile.scene, point, tolerance)?.id?;
         Some(TrackTileHit {
             panel_id: lane.panel_id,
             track_id: lane.track_id,
@@ -536,7 +534,35 @@ pub(crate) fn track_tile_hit_in_lane(lane: &TrackTileLane, x: f32, y: f32) -> Op
 pub(crate) struct TrackTileSelection {
     pub(crate) track_id: TrackId,
     pub(crate) id: TrackRecordId,
+    /// Workspace contig the record was selected on.
+    pub(crate) contig: String,
     pub(crate) record: FeatureRecord,
+    /// Whether `record` is final: the complete source record, or the tile's stand-in after
+    /// the lookup found nothing more. While `false` the engine is asked again each poll.
+    pub(crate) complete: bool,
+}
+
+/// What to do with a selection given the outcome of its record lookup: the record to show
+/// from now on, or `None` while the lookup is pending. A complete record keeps the
+/// workspace's spelling of the contig, as the stand-in does; a lookup that found nothing or
+/// failed leaves the stand-in in place.
+pub(crate) fn resolve_track_tile_record(
+    stand_in: &FeatureRecord,
+    lookup: &TrackRecordLookup,
+) -> Option<FeatureRecord> {
+    match lookup {
+        TrackRecordLookup::Pending => None,
+        TrackRecordLookup::Ready(record) => match record.as_ref() {
+            TrackRecord::Feature(record) => {
+                let mut record = record.clone();
+                record.contig.clone_from(&stand_in.contig);
+                Some(record)
+            }
+            // A feature lane names no other kind of record; keep what the tile showed.
+            _ => Some(stand_in.clone()),
+        },
+        TrackRecordLookup::NotFound | TrackRecordLookup::Failed(_) => Some(stand_in.clone()),
+    }
 }
 
 /// Everything the desktop holds for the tile pipeline. Empty (and never touched) while the
@@ -698,6 +724,7 @@ impl Viewer {
         }
         self.poll_track_tile_events();
         self.synchronize_track_tile_views();
+        self.refresh_track_tile_selection_records();
     }
 
     /// Registers `ids` in the tile engine through the legacy engine's open readers and clears
@@ -881,18 +908,18 @@ impl Viewer {
                 ) else {
                     continue;
                 };
+                // The engine caps each scene at the rows the lane shows, so the view's
+                // overflow is exactly what the lane cannot show.
                 wanted.insert(
                     (panel.id, *track),
-                    (
-                        track_tile_view(
-                            panel.id,
-                            *track,
-                            &panel.contig_name,
-                            panel.viewport,
-                            panel.contig_length,
-                            TrackTileSettings::default(),
-                        ),
-                        geometry.visible_rows,
+                    track_tile_view(
+                        panel.id,
+                        *track,
+                        &panel.contig_name,
+                        panel.viewport,
+                        panel.contig_length,
+                        TrackTileSettings::default()
+                            .with_maximum_feature_rows(geometry.visible_rows),
                     ),
                 );
             }
@@ -909,7 +936,7 @@ impl Viewer {
             keep
         });
         let mut changed = false;
-        for (key, (view, visible_rows)) in wanted {
+        for (key, view) in wanted {
             let view_key = track_tile_view_key(&view);
             if state.views.get(&key) != Some(&view_key) && engine.request_view(view).is_some() {
                 state.views.insert(key, view_key);
@@ -924,7 +951,6 @@ impl Viewer {
                 state.gpu_failures.get(&key).map(String::as_str),
                 state.gpu_missing.contains(&key),
                 snapshot.as_ref(),
-                visible_rows,
             );
             if state.presented.get(&key) != Some(&status) {
                 state.presented.insert(key, status);
@@ -1245,15 +1271,121 @@ impl Viewer {
             track_id: hit.track_id,
             record_index: TRACK_TILE_SELECTION_RECORD_INDEX,
         });
+        let contig = self.session.panels.get(hit.panel_id).map_or_else(
+            || hit.record.contig.clone(),
+            |panel| panel.contig_name.clone(),
+        );
         self.track_tiles.selections.insert(
             hit.panel_id,
             TrackTileSelection {
                 track_id: hit.track_id,
                 id: hit.id,
+                contig,
                 record: hit.record,
+                complete: false,
             },
         );
+        self.refresh_track_tile_selection_records();
         true
+    }
+
+    /// Asks the tile engine for the complete record of every selection still showing the
+    /// tile's stand-in. Only selections their panel currently holds are asked; the others are
+    /// kept as they are (a selection is valid only while its panel holds it, as before) and
+    /// their lookup is abandoned unless a held selection of the same track still wants one. A
+    /// track runs one lookup at a time, so only one selection per track is asked per poll; the
+    /// others wait their turn rather than cancelling each other.
+    pub(crate) fn refresh_track_tile_selection_records(&mut self) {
+        let state = &mut self.track_tiles;
+        if state.selections.is_empty() {
+            return;
+        }
+        let Some(engine) = &state.engine else {
+            return;
+        };
+        let panels = &self.session.panels;
+        let routed = &state.routed;
+        let held = |panel_id: PanelId, selection: &TrackTileSelection| {
+            panels
+                .get(panel_id)
+                .and_then(|panel| panel.selected_feature)
+                .is_some_and(|held| {
+                    held.record_index == TRACK_TILE_SELECTION_RECORD_INDEX
+                        && held.track_id == selection.track_id
+                })
+                && routed.contains(&selection.track_id)
+        };
+        let wanted = state
+            .selections
+            .iter()
+            .filter(|(panel_id, selection)| !selection.complete && held(**panel_id, selection))
+            .map(|(_, selection)| selection.track_id)
+            .collect::<BTreeSet<_>>();
+        let abandoned = state
+            .selections
+            .iter()
+            .filter(|(panel_id, selection)| !selection.complete && !held(**panel_id, selection))
+            .map(|(_, selection)| selection.track_id)
+            .filter(|track| !wanted.contains(track))
+            .collect::<BTreeSet<_>>();
+        for track in abandoned {
+            engine.cancel_record_lookup(track);
+        }
+        let mut asked = BTreeSet::new();
+        let mut resolved = false;
+        for (panel_id, selection) in &mut state.selections {
+            if selection.complete
+                || !wanted.contains(&selection.track_id)
+                || !held(*panel_id, selection)
+                || !asked.insert(selection.track_id)
+            {
+                continue;
+            }
+            let lookup = engine.lookup_record(selection.track_id, &selection.contig, selection.id);
+            if let TrackRecordLookup::Failed(message) = &lookup {
+                tracing::debug!(
+                    track_id = selection.track_id.get(),
+                    error = %message,
+                    "track tile record lookup failed; the inspector shows the tile's fields"
+                );
+            }
+            if let Some(record) = resolve_track_tile_record(&selection.record, &lookup) {
+                selection.record = record;
+                selection.complete = true;
+                resolved = true;
+            }
+        }
+        if resolved {
+            self.window.request_redraw();
+        }
+    }
+
+    /// The active panel's tile selection with its complete record, waiting up to `timeout`
+    /// for the lookup: for automation, which cannot wait for a later poll. The stored
+    /// selection is not changed; the next poll collects the same outcome.
+    pub(crate) fn track_tile_feature_inspector_snapshot_blocking(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<FeatureInspectorSnapshot> {
+        let mut snapshot = self.track_tile_feature_inspector_snapshot()?;
+        let panel = self.session.panels.active();
+        let selection = self
+            .track_tiles
+            .selection(panel.id, panel.selected_feature)?;
+        if !selection.complete
+            && let Some(engine) = &self.track_tiles.engine
+        {
+            let lookup = engine.lookup_record_blocking(
+                selection.track_id,
+                &selection.contig,
+                selection.id,
+                timeout,
+            );
+            if let Some(record) = resolve_track_tile_record(&selection.record, &lookup) {
+                snapshot.record = record;
+            }
+        }
+        Some(snapshot)
     }
 
     /// The inspector snapshot of the active panel's tile selection.
@@ -1579,50 +1711,73 @@ mod tests {
         TrackTileKey { level, index }
     }
 
+    /// A view of one tile laid out with `cap` rows, as the engine serves it.
+    fn capped_view(features: Vec<TileFeature>, cap: u32) -> TrackTileViewSnapshot {
+        let tile = laid_out(key(0, 0), features);
+        let mut scene = tile.scene.clone();
+        scene.apply_row_cap(cap);
+        TrackTileViewSnapshot {
+            tiles: vec![Arc::new(LaidOutTrackTile {
+                tile: tile.tile.clone(),
+                scene,
+                settings_digest: tile.settings_digest,
+            })],
+            ..TrackTileViewSnapshot::default()
+        }
+    }
+
     #[test]
     fn lane_status_follows_the_view_and_the_gpu() {
-        let ready = TrackTileViewSnapshot {
-            tiles: vec![laid_out(
-                key(0, 0),
-                vec![feature(1, 10, 20, 0, "a"), feature(2, 12, 30, 14, "b")],
-            )],
-            ..TrackTileViewSnapshot::default()
+        let stacked = || {
+            vec![
+                feature(1, 10, 20, 0, "a"),
+                feature(2, 12, 30, 14, "b"),
+                feature(3, 40, 50, 13, "c"),
+            ]
         };
+        let ready = capped_view(stacked(), 12);
         assert_eq!(
-            track_tile_lane_status(None, None, false, None, 12),
+            track_tile_lane_status(None, None, false, None),
             TrackTileLaneStatus::Loading
         );
+        // Rows 12 to 14 are past the cap: three rows holding two features.
         assert_eq!(
-            track_tile_lane_status(None, None, false, Some(&ready), 12),
-            TrackTileLaneStatus::Ready { hidden_rows: 3 }
+            track_tile_lane_status(None, None, false, Some(&ready)),
+            TrackTileLaneStatus::Ready {
+                hidden_rows: 3,
+                hidden_features: 2
+            }
         );
         assert_eq!(
-            track_tile_lane_status(None, None, false, Some(&ready), 20),
-            TrackTileLaneStatus::Ready { hidden_rows: 0 }
+            track_tile_lane_status(None, None, false, Some(&capped_view(stacked(), 20))),
+            TrackTileLaneStatus::Ready {
+                hidden_rows: 0,
+                hidden_features: 0
+            }
         );
         // A page that is not on the GPU yet reads as loading, never as complete.
         assert_eq!(
-            track_tile_lane_status(None, None, true, Some(&ready), 20),
+            track_tile_lane_status(None, None, true, Some(&ready)),
             TrackTileLaneStatus::Loading
         );
         let mut loading = ready.clone();
         loading.missing.push(key(0, 1));
         assert_eq!(
-            track_tile_lane_status(None, None, false, Some(&loading), 20),
+            track_tile_lane_status(None, None, false, Some(&loading)),
             TrackTileLaneStatus::Loading
         );
         let mut failed = loading;
         failed.failed.push((key(0, 2), "read failed".to_owned()));
         assert_eq!(
-            track_tile_lane_status(None, None, false, Some(&failed), 20),
+            track_tile_lane_status(None, None, false, Some(&failed)),
             TrackTileLaneStatus::Failed("read failed".to_owned())
         );
         assert_eq!(
-            track_tile_lane_status(None, Some("page too large"), false, Some(&ready), 20),
+            track_tile_lane_status(None, Some("page too large"), false, Some(&ready)),
             TrackTileLaneStatus::Failed("page too large".to_owned())
         );
         assert_eq!(
-            track_tile_lane_status(Some("no such file"), None, false, Some(&ready), 20),
+            track_tile_lane_status(Some("no such file"), None, false, Some(&ready)),
             TrackTileLaneStatus::Failed("no such file".to_owned())
         );
     }
@@ -1630,17 +1785,25 @@ mod tests {
     #[test]
     fn a_complete_lane_has_no_status_row_and_a_pending_one_never_reads_as_complete() {
         assert_eq!(
-            track_tile_lane_label(&TrackTileLaneStatus::Ready { hidden_rows: 0 }),
+            track_tile_lane_label(&TrackTileLaneStatus::Ready {
+                hidden_rows: 0,
+                hidden_features: 0
+            }),
             None
         );
         assert_eq!(
             track_tile_lane_label(&TrackTileLaneStatus::Loading),
             Some(("Loading…".to_owned(), None))
         );
-        let (label, detail) =
-            track_tile_lane_label(&TrackTileLaneStatus::Ready { hidden_rows: 4 }).unwrap();
+        let (label, detail) = track_tile_lane_label(&TrackTileLaneStatus::Ready {
+            hidden_rows: 4,
+            hidden_features: 9,
+        })
+        .unwrap();
         assert_eq!(label, "Rows hidden");
-        assert!(detail.unwrap().starts_with("4 more row"));
+        let detail = detail.unwrap();
+        assert!(detail.starts_with("4 more row"));
+        assert!(detail.contains("9 feature"));
         assert_eq!(
             track_tile_lane_label(&TrackTileLaneStatus::Failed("boom".to_owned())),
             Some(("Unavailable".to_owned(), Some("boom".to_owned())))
@@ -1839,6 +2002,41 @@ mod tests {
     }
 
     #[test]
+    fn a_looked_up_record_replaces_the_stand_in_and_keeps_the_workspace_contig() {
+        let stand_in = track_tile_feature_record(
+            &laid_out(key(0, 0), vec![feature(22, 300, 400, 0, "b")]),
+            "chr1",
+            TrackRecordId(22),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_track_tile_record(&stand_in, &TrackRecordLookup::Pending),
+            None
+        );
+        for outcome in [
+            TrackRecordLookup::NotFound,
+            TrackRecordLookup::Failed("gone".to_owned()),
+        ] {
+            assert_eq!(
+                resolve_track_tile_record(&stand_in, &outcome),
+                Some(stand_in.clone())
+            );
+        }
+        let mut complete = stand_in.clone();
+        complete.contig = "1".to_owned();
+        complete.feature_type = Some("exon".to_owned());
+        complete.attributes = vec![("gene_id".to_owned(), "G1".to_owned())];
+        let resolved = resolve_track_tile_record(
+            &stand_in,
+            &TrackRecordLookup::Ready(Arc::new(TrackRecord::Feature(complete))),
+        )
+        .unwrap();
+        assert_eq!(resolved.contig, "chr1");
+        assert_eq!(resolved.feature_type.as_deref(), Some("exon"));
+        assert_eq!(resolved.attributes.len(), 1);
+    }
+
+    #[test]
     fn a_tile_selection_is_valid_only_while_the_panel_selects_that_routed_track() {
         let mut state = TrackTilePipelineState::default();
         state.routed.insert(TrackId::new(9));
@@ -1848,12 +2046,14 @@ mod tests {
             TrackTileSelection {
                 track_id: TrackId::new(9),
                 id: TrackRecordId(22),
+                contig: "chr1".to_owned(),
                 record: track_tile_feature_record(
                     &laid_out(key(0, 0), vec![feature(22, 300, 400, 0, "b")]),
                     "chr1",
                     TrackRecordId(22),
                 )
                 .unwrap(),
+                complete: false,
             },
         );
         let tile_selection = |track: u64| {

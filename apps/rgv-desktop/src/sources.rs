@@ -5,11 +5,15 @@ use rgv_core::{
     SessionDocument, TrackCollection, TrackConfig, TrackFormat, TrackId, TrackKind, TrackSource,
     UnresolvedSessionSource, classify_genomic_source, parse_ucsc_cytobands,
 };
-use rgv_engine::{TrackEngine, TrackSpec, TrackSpecKind};
-use rgv_hts::{AlignmentOpenOptions, FastaOpenOptions, HttpRangeConfig, RemoteAuthentication};
-use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use rgv_engine::{TrackSpec, TrackSpecKind};
+use std::path::Path;
+
+#[cfg(test)]
+pub(super) use rgv_session::sources::{build_tdf_channel_expansion, tdf_channel_display_name};
+pub(super) use rgv_session::sources::{
+    primary_alignment_track, reference_open_options, remote_range_config, source_path,
+    spawn_track_engine_without_aliases,
+};
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn build_track_specs(options: &LaunchOptions) -> (Vec<TrackSpec>, TrackCollection) {
@@ -191,76 +195,6 @@ pub(super) fn session_track_specs(session: &SessionDocument) -> (Vec<TrackSpec>,
     (specifications, tracks)
 }
 
-pub(super) fn source_path(source: &TrackSource) -> PathBuf {
-    match source {
-        TrackSource::Local { path } => PathBuf::from(path),
-        TrackSource::Remote { url } => PathBuf::from(url),
-    }
-}
-
-pub(super) fn tdf_channel_display_name(
-    base_name: &str,
-    embedded_name: &str,
-    index: usize,
-) -> String {
-    let embedded_name = embedded_name.trim();
-    if embedded_name.is_empty() {
-        format!("{base_name} · channel {}", index + 1)
-    } else {
-        embedded_name.to_owned()
-    }
-}
-
-pub(super) struct TdfChannelExpansion {
-    pub(super) selected_name: String,
-    pub(super) specifications: Vec<TrackSpec>,
-    pub(super) children: Vec<TrackConfig>,
-}
-
-pub(super) fn build_tdf_channel_expansion(
-    parent: &TrackConfig,
-    path: &Path,
-    track_names: &[String],
-    selected_index: usize,
-    mut next_id: u64,
-) -> Result<TdfChannelExpansion> {
-    if track_names.is_empty() || selected_index >= track_names.len() {
-        anyhow::bail!("TDF source returned an invalid embedded-channel catalogue");
-    }
-    let mut specifications = Vec::with_capacity(track_names.len().saturating_sub(1));
-    let mut children = Vec::with_capacity(track_names.len().saturating_sub(1));
-    for (index, embedded_name) in track_names.iter().enumerate() {
-        if index == selected_index {
-            continue;
-        }
-        let id = TrackId::new(next_id);
-        next_id = next_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("TDF channel track ID space is exhausted"))?;
-        let name = tdf_channel_display_name(&parent.name, embedded_name, index);
-        specifications.push(TrackSpec {
-            id,
-            name: name.clone(),
-            path: path.to_path_buf(),
-            kind: TrackSpecKind::TdfChannel { index },
-        });
-        let mut child = parent.clone();
-        child.id = id;
-        child.name = name;
-        child.format = Some(TrackFormat::TdfChannel { index });
-        children.push(child);
-    }
-    Ok(TdfChannelExpansion {
-        selected_name: tdf_channel_display_name(
-            &parent.name,
-            &track_names[selected_index],
-            selected_index,
-        ),
-        specifications,
-        children,
-    })
-}
-
 pub(super) fn inferred_automation_track_kind(
     source: &TrackSource,
     explicit: Option<TrackKind>,
@@ -286,10 +220,6 @@ pub(super) fn opened_project_status(path: &Path, unresolved: &[UnresolvedSession
         path.display(),
         unresolved.len()
     )
-}
-
-pub(super) fn primary_alignment_track(session: &SessionDocument) -> Option<&SessionAlignmentTrack> {
-    session.alignment_tracks.first()
 }
 
 pub(super) fn upsert_primary_alignment_config<'a>(
@@ -367,62 +297,6 @@ pub(super) fn load_assembly_reporting(
             (assembly, Some(failure))
         }
     }
-}
-
-pub(super) fn alignment_open_options(
-    reference_path: Option<PathBuf>,
-    remote_index_url: Option<String>,
-    remote_reference_index_url: Option<String>,
-) -> AlignmentOpenOptions {
-    let mut options = AlignmentOpenOptions {
-        reference_path,
-        remote_index_url,
-        remote_reference_index_url,
-        ..AlignmentOpenOptions::default()
-    };
-    options.remote_range = remote_range_config();
-    options
-}
-
-pub(super) fn reference_open_options(remote_index_url: Option<String>) -> FastaOpenOptions {
-    FastaOpenOptions {
-        remote_index_url,
-        remote_range: remote_range_config(),
-        ..FastaOpenOptions::default()
-    }
-}
-
-/// Starts the annotation-track engine with the desktop's remote configuration, so remote
-/// bigWig, bigBed, TDF and text tracks get the same bearer authentication, cancellation and
-/// budgets as remote alignments instead of anonymous defaults.
-pub(super) fn spawn_track_engine(
-    specifications: Vec<(TrackSpec, BTreeMap<String, String>)>,
-) -> TrackEngine {
-    TrackEngine::spawn_with_remote_config(specifications, 8, remote_range_config())
-}
-
-/// [`spawn_track_engine`] for tracks that need no query-contig aliases.
-pub(super) fn spawn_track_engine_without_aliases(specifications: Vec<TrackSpec>) -> TrackEngine {
-    spawn_track_engine(
-        specifications
-            .into_iter()
-            .map(|specification| (specification, BTreeMap::new()))
-            .collect(),
-    )
-}
-
-pub(super) fn remote_range_config() -> HttpRangeConfig {
-    let mut config = HttpRangeConfig {
-        minimum_coalesced_chunks: NonZeroUsize::new(8).unwrap(),
-        maximum_coalesced_chunks: NonZeroUsize::new(8).unwrap(),
-        ..HttpRangeConfig::default()
-    };
-    if let Ok(token) = std::env::var("RGV_REMOTE_BEARER_TOKEN")
-        && !token.is_empty()
-    {
-        config.authentication = RemoteAuthentication::Bearer(token);
-    }
-    config
 }
 
 pub(super) fn track_spec_kind(

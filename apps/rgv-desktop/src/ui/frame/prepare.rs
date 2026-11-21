@@ -36,7 +36,7 @@ impl Viewer {
         let detail = self.session.panels.active().viewport.detail_level();
         let contig_name = self.session.panels.active().contig_name.clone();
         let navigation = &self.session.panels.active().navigation_presentation;
-        let alignment_navigation_status = self.alignment_tracks.iter().find_map(|track| {
+        let alignment_navigation_status = self.session.alignment_tracks.iter().find_map(|track| {
             let projection = track.projection(self.session.panels.active().id)?;
             (!projection
                 .navigation
@@ -182,7 +182,8 @@ impl Viewer {
         };
         let edited_track_sample_key = editing_alignment_id
             .and_then(|id| {
-                self.alignment_tracks
+                self.session
+                    .alignment_tracks
                     .iter()
                     .find(|track| track.config.id == id)
                     .and_then(|track| track.config.sample_key.clone())
@@ -208,6 +209,7 @@ impl Viewer {
             self.available_modification_codes(track_id)
         });
         let settings_controller = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == settings_alignment_id)
@@ -463,6 +465,7 @@ impl Viewer {
         let variant_predicate_missing = self.variant_predicate_missing;
         let variant_predicate_error = None;
         let alignment_track_controls = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| {
@@ -491,6 +494,7 @@ impl Viewer {
             })
             .collect::<Vec<_>>();
         let alignment_subtrack_controls = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| {
@@ -1174,6 +1178,7 @@ impl Viewer {
         let metadata_bulk_quantitative_separate_requested = false;
         let metadata_bulk_remove_requested = false;
         let metadata_track_rows = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| {
@@ -1269,6 +1274,7 @@ impl Viewer {
         let alignment_context_menu = self.alignment_context_menu.clone();
         let alignment_context_menu_view = alignment_context_menu.as_ref().and_then(|menu| {
             let track = self
+                .session
                 .alignment_tracks
                 .iter()
                 .find(|track| track.config.id == menu.target.track_id)?;

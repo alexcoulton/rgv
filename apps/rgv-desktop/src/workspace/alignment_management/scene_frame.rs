@@ -43,7 +43,7 @@ impl Viewer {
             .iter()
             .map(|authority| {
                 let projection = self
-                    .alignment_tracks
+                    .session.alignment_tracks
                     .iter()
                     .find(|track| track.config.id == authority.track_id)
                     .and_then(|track| track.projection(authority.panel_id));
@@ -851,7 +851,7 @@ impl Viewer {
             // presenting until the replacement publishes atomically.
             let mut panel_deferred_sources = Vec::new();
             let mut capture_error = None;
-            for track in &self.alignment_tracks {
+            for track in &self.session.alignment_tracks {
                 let Some(projection) = track.projection(panel_id) else {
                     continue;
                 };
@@ -1132,6 +1132,7 @@ impl Viewer {
                             continue;
                         }
                         let desired_request_token = self
+                            .session
                             .alignment_tracks
                             .iter()
                             .find(|track| track.config.id == lane.track_id)

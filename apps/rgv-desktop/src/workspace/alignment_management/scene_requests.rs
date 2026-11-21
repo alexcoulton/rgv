@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 impl Viewer {
     pub(crate) fn request_alignment_query(&mut self, panel_id: PanelId) {
-        for track_index in 0..self.alignment_tracks.len() {
+        for track_index in 0..self.session.alignment_tracks.len() {
             self.queue_alignment_navigation_for_track(
                 track_index,
                 panel_id,
@@ -44,7 +44,7 @@ impl Viewer {
             .panels
             .panel_mut(panel_id)
             .pending_queries
-            .alignment = self.alignment_tracks.iter().any(|track| {
+            .alignment = self.session.alignment_tracks.iter().any(|track| {
             track
                 .projection(panel_id)
                 .is_some_and(|projection| projection.navigation.is_queued())
@@ -58,6 +58,7 @@ impl Viewer {
         track_id: TrackId,
     ) {
         let Some(track_index) = self
+            .session
             .alignment_tracks
             .iter()
             .position(|track| track.config.id == track_id)
@@ -65,7 +66,7 @@ impl Viewer {
             return;
         };
         if !matches!(
-            self.alignment_tracks[track_index].lifecycle,
+            self.session.alignment_tracks[track_index].lifecycle,
             AlignmentTrackLifecycle::Ready
         ) {
             return;
@@ -108,6 +109,7 @@ impl Viewer {
             return Ok(None);
         }
         let Some(track) = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == track_id)
@@ -204,6 +206,7 @@ impl Viewer {
             };
             let contig_name = panel.contig_name.clone();
             let changed = self
+                .session
                 .alignment_tracks
                 .iter()
                 .filter_map(|track| {
@@ -254,6 +257,7 @@ impl Viewer {
         for (panel_id, track_ids) in changed_by_panel {
             for track_id in track_ids {
                 let Some(track_index) = self
+                    .session
                     .alignment_tracks
                     .iter()
                     .position(|track| track.config.id == track_id)
@@ -341,6 +345,7 @@ impl Viewer {
                 continue;
             }
             let Some(track) = self
+                .session
                 .alignment_tracks
                 .iter_mut()
                 .find(|track| track.config.id == authority.track_id)
@@ -376,7 +381,7 @@ impl Viewer {
             .map(|panel| panel.id)
             .collect::<Vec<_>>();
         for panel_id in panel_ids {
-            let pending = self.alignment_tracks.iter().any(|track| {
+            let pending = self.session.alignment_tracks.iter().any(|track| {
                 matches!(track.lifecycle, AlignmentTrackLifecycle::Ready)
                     && track.projection(panel_id).is_some_and(|projection| {
                         !projection
@@ -399,6 +404,7 @@ impl Viewer {
                 continue;
             }
             let Some(track) = self
+                .session
                 .alignment_tracks
                 .iter_mut()
                 .find(|track| track.config.id == candidate.track_id)
@@ -427,6 +433,7 @@ impl Viewer {
                 continue;
             }
             let Some(track) = self
+                .session
                 .alignment_tracks
                 .iter_mut()
                 .find(|track| track.config.id == candidate.track_id)
@@ -456,6 +463,7 @@ impl Viewer {
                 continue;
             }
             let Some(track) = self
+                .session
                 .alignment_tracks
                 .iter_mut()
                 .find(|track| track.config.id == candidate.track_id)
@@ -479,7 +487,7 @@ impl Viewer {
     }
 
     pub(super) fn settle_alignment_navigation_gpu_budget_limited(&mut self, message: &str) {
-        for track in &mut self.alignment_tracks {
+        for track in &mut self.session.alignment_tracks {
             for projection in track.projections.values_mut() {
                 if projection.navigation.phase() == AlignmentNavigationPhase::WaitingForGpuPressure
                 {

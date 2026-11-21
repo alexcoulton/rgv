@@ -120,48 +120,10 @@ pub(crate) struct SupplementaryChainDiagram {
     pub(crate) alignment_order: Vec<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FeatureSelection {
-    pub(crate) track_id: TrackId,
-    pub(crate) record_index: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct VariantSelection {
-    pub(crate) track_id: TrackId,
-    pub(crate) record_index: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct GwasSelection {
-    pub(crate) track_id: TrackId,
-    pub(crate) record_index: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct QuantitativeSelection {
-    pub(crate) track_id: TrackId,
-    pub(crate) record_index: usize,
-    pub(crate) position: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CopyNumberSelection {
-    pub(crate) track_id: TrackId,
-    pub(crate) segment_index: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MutationSelection {
-    pub(crate) track_id: TrackId,
-    pub(crate) record_index: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InteractionSelection {
-    pub(crate) track_id: TrackId,
-    pub(crate) record_index: usize,
-}
+pub(crate) use rgv_session::selection::{
+    CopyNumberSelection, FeatureSelection, GwasSelection, InteractionSelection, MutationSelection,
+    QuantitativeSelection, VariantSelection,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EvidenceSelection {

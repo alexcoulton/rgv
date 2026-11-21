@@ -20,7 +20,7 @@ use rgv_core::{
     SessionFilters, TrackChangeSet, TrackConfig, TrackId, TrackIntent, TrackKind,
     WorkspacePresentation,
 };
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 fn updated_track_pane_selection<T: Copy + Eq>(
     track_order: &[T],
@@ -201,68 +201,13 @@ impl Viewer {
     /// back from legacy source/configuration booleans: existing node order,
     /// visibility, preferred sizes, and groups remain authoritative.
     pub(crate) fn reconcile_track_presentation(&mut self) {
-        let alignment_defaults = self
-            .alignment_tracks
-            .iter()
-            .map(|track| {
-                (
-                    track.config.id,
-                    track.config.annotation_height,
-                    track
-                        .config
-                        .read_group_height
-                        .or(Some(track.config.height.clamp(40.0, 1_200.0))),
-                )
-            })
-            .collect::<Vec<_>>();
-        let auxiliary_defaults = self
-            .session
-            .tracks
-            .tracks()
-            .iter()
-            .map(|track| (track.id, Some(track.height.clamp(26.0, 1_200.0))))
-            .collect::<Vec<_>>();
-        self.session
-            .track_presentation
-            .reconcile_sources(&alignment_defaults, &auxiliary_defaults);
-        let overlay_ids = self
-            .session
-            .tracks
-            .tracks()
-            .iter()
-            .filter(|track| track.kind == TrackKind::Quantitative)
-            .filter_map(|track| track.quantitative.overlay_group)
-            .fold(BTreeMap::<u32, usize>::new(), |mut counts, id| {
-                *counts.entry(id).or_default() += 1;
-                counts
-            })
-            .into_iter()
-            .filter_map(|(id, count)| (count >= 2).then_some(id))
-            .collect::<BTreeSet<_>>();
-        self.session
-            .track_presentation
-            .reconcile_composites(ui::TrackPane::Annotation, &overlay_ids);
-        self.session
-            .track_presentation
-            .reconcile_composites(ui::TrackPane::Reads, &BTreeSet::new());
-        for track in &mut self.alignment_tracks {
-            track.config.visible = true;
-            track.config.collapsed = false;
-            track.config.height = 360.0;
-            track.config.annotation_height = None;
-            track.config.read_group_height = None;
-            track.config.filters.show_reads = true;
-        }
-        for track in self.session.tracks.tracks_mut() {
-            track.visible = true;
-            track.collapsed = false;
-            track.height = 120.0;
-        }
+        self.session.reconcile_track_sources();
         self.reconcile_presentation_interaction_state();
     }
 
     pub(crate) fn reconcile_presentation_interaction_state(&mut self) {
         let alignment_ids = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| track.config.id)
@@ -439,11 +384,12 @@ impl Viewer {
     }
 
     pub(crate) fn has_alignment_engine(&self) -> bool {
-        !self.alignment_tracks.is_empty()
+        !self.session.alignment_tracks.is_empty()
     }
 
     pub(crate) fn primary_alignment_track_id(&self) -> TrackId {
-        self.alignment_tracks
+        self.session
+            .alignment_tracks
             .first()
             .map_or(SYNTHETIC_ALIGNMENT_TRACK_ID, |track| track.config.id)
     }
@@ -452,20 +398,20 @@ impl Viewer {
         &self,
         id: TrackId,
     ) -> Option<&ReferenceDictionary> {
-        self.alignment_tracks
+        self.session
+            .alignment_tracks
             .iter()
             .find(|track| track.config.id == id)
             .and_then(|track| track.dictionary.as_ref())
     }
 
     pub(crate) fn primary_alignment_dictionary(&self) -> Option<&ReferenceDictionary> {
-        self.alignment_tracks
-            .first()
-            .and_then(|track| track.dictionary.as_ref())
+        self.session.primary_alignment_dictionary()
     }
 
     pub(crate) fn alignment_track_name_for_id(&self, id: TrackId) -> String {
-        self.alignment_tracks
+        self.session
+            .alignment_tracks
             .iter()
             .find(|track| track.config.id == id)
             .map_or_else(
@@ -499,6 +445,7 @@ impl Viewer {
         members: &[TrackId],
     ) {
         let alignment_ids = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| track.config.id)
@@ -607,7 +554,8 @@ impl Viewer {
         if id == self.primary_alignment_track_id() {
             return self.live_session_filters();
         }
-        self.alignment_tracks
+        self.session
+            .alignment_tracks
             .iter()
             .find(|track| track.config.id == id)
             .map_or_else(SessionFilters::default, |track| {
@@ -650,7 +598,7 @@ impl Viewer {
         let mut omitted_tracks = 0_usize;
         let mut tracks = Vec::new();
         let interval = self.session.panels.active().viewport.interval();
-        for track in self.alignment_tracks.iter().filter(|track| {
+        for track in self.session.alignment_tracks.iter().filter(|track| {
             self.session
                 .track_presentation
                 .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
@@ -730,6 +678,7 @@ impl Viewer {
         let (next, next_anchor) =
             updated_track_pane_selection(&order, &selected, anchor, target, shift_range, toggle);
         let alignment_ids = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| track.config.id)
@@ -747,6 +696,7 @@ impl Viewer {
         selected_ids: &[TrackId],
     ) -> Result<()> {
         let Some(source) = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == source_id)
@@ -757,6 +707,7 @@ impl Viewer {
         let primary_id = self.primary_alignment_track_id();
         let mut query_requested = false;
         for track in self
+            .session
             .alignment_tracks
             .iter_mut()
             .filter(|track| selected_ids.contains(&track.config.id))
@@ -797,6 +748,7 @@ impl Viewer {
                 .into_iter()
                 .collect::<HashSet<_>>();
         let alignment_ids = self
+            .session
             .alignment_tracks
             .iter()
             .filter(|track| selected.contains(&track.config.id))
@@ -832,6 +784,7 @@ impl Viewer {
         if let Some(height) = height {
             presentation_intents.extend(selected.iter().copied().filter_map(|track_id| {
                 let is_alignment = self
+                    .session
                     .alignment_tracks
                     .iter()
                     .any(|track| track.config.id == track_id);
@@ -861,6 +814,7 @@ impl Viewer {
         }
         let mut changed = false;
         for track in self
+            .session
             .alignment_tracks
             .iter_mut()
             .filter(|track| selected.contains(&track.config.id))
@@ -906,6 +860,7 @@ impl Viewer {
         selected: &BTreeSet<TrackId>,
     ) -> Result<()> {
         let Some(source) = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| selected.contains(&track.config.id))
@@ -914,6 +869,7 @@ impl Viewer {
             return Ok(());
         };
         for track in self
+            .session
             .alignment_tracks
             .iter_mut()
             .filter(|track| selected.contains(&track.config.id) && track.config.id != source.id)
@@ -1054,6 +1010,7 @@ impl Viewer {
             .map(|track| track.id)
             .collect::<Vec<_>>();
         let alignment_ids = self
+            .session
             .alignment_tracks
             .iter()
             .rev()
@@ -1073,7 +1030,7 @@ impl Viewer {
     }
 
     pub(crate) fn advance_alignment_generations(&self, panel_id: PanelId) {
-        for track in &self.alignment_tracks {
+        for track in &self.session.alignment_tracks {
             if let Some(projection) = track.projection(panel_id) {
                 projection.advance_scene_generation();
             }
@@ -1086,12 +1043,13 @@ impl Viewer {
         mut update: AlignmentSettingsDraft,
     ) {
         let (workspace_limit, requested_limit) = expanded_workspace_alignment_limit(
-            self.workspace_alignment_limit,
+            self.session.workspace_alignment_limit,
             update.maximum_alignments,
         );
-        self.workspace_alignment_limit = workspace_limit;
+        self.session.workspace_alignment_limit = workspace_limit;
         update.maximum_alignments = requested_limit;
         let Some(track) = self
+            .session
             .alignment_tracks
             .iter_mut()
             .find(|track| track.config.id == id)

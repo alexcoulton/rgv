@@ -453,6 +453,7 @@ impl Viewer {
             track_effects.annotation_geometry_changed || track_effects.read_geometry_changed;
         for control in std::mem::take(&mut st.tracks.alignment_track_controls) {
             if let Some(track) = self
+                .session
                 .alignment_tracks
                 .iter_mut()
                 .find(|track| track.config.id == control.id)
@@ -464,6 +465,7 @@ impl Viewer {
         normalize_sample_association(&mut st.align.edited_track_sample_key);
         if let Some(id) = st.align.editing_alignment_id
             && let Some(track) = self
+                .session
                 .alignment_tracks
                 .iter_mut()
                 .find(|track| track.config.id == id)
@@ -480,21 +482,21 @@ impl Viewer {
             self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
-        if self.alignment_tracks.is_empty()
+        if self.session.alignment_tracks.is_empty()
             && st.align.alignment_visible != self.primary_alignment_visible()
         {
             self.set_primary_alignment_visible(st.align.alignment_visible);
             self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
-        if self.alignment_tracks.is_empty()
+        if self.session.alignment_tracks.is_empty()
             && st.align.alignment_collapsed != self.primary_alignment_collapsed()
         {
             self.set_primary_alignment_collapsed(st.align.alignment_collapsed);
             self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
-        if self.alignment_tracks.is_empty()
+        if self.session.alignment_tracks.is_empty()
             && !st.align.alignment_name.trim().is_empty()
             && st.align.alignment_name != self.primary_alignment_name()
         {

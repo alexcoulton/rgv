@@ -7,7 +7,8 @@
     "crates/rgv-engine/src",
     "crates/rgv-layout/src",
     "crates/rgv-model/src",
-    "crates/rgv-render/src"
+    "crates/rgv-render/src",
+    "crates/rgv-session/src"
   ],
   "deleted_files": [
     "crates/rgv-engine/src/alignment_engine.rs",

@@ -71,20 +71,24 @@ impl Viewer {
             // Overview zoom keeps the same lane geometry as regional zoom: the coverage lane is
             // then drawn from the coverage pyramid (or labelled as the index-only placeholder
             // until its first publication) instead of from read evidence.
-            let mut frame =
-                if let Some(config) = self.alignment_tracks.first().map(|track| &track.config) {
-                    alignment::alignment_scene_annotation_frame(
-                        config,
-                        self.session.panels.panel(panel_id).viewport,
-                        top,
-                        self.session
-                            .track_presentation
-                            .pane_track_state(ui::TrackPane::Annotation, primary_alignment_id)
-                            .and_then(|node| node.preferred_height),
-                    )
-                } else {
-                    unreachable!("the primary source exists only with a primary track")
-                };
+            let mut frame = if let Some(config) = self
+                .session
+                .alignment_tracks
+                .first()
+                .map(|track| &track.config)
+            {
+                alignment::alignment_scene_annotation_frame(
+                    config,
+                    self.session.panels.panel(panel_id).viewport,
+                    top,
+                    self.session
+                        .track_presentation
+                        .pane_track_state(ui::TrackPane::Annotation, primary_alignment_id)
+                        .and_then(|node| node.preferred_height),
+                )
+            } else {
+                unreachable!("the primary source exists only with a primary track")
+            };
             if self.session.panels.panel(panel_id).viewport.detail_level() == DetailLevel::Overview
             {
                 // The overview frame has always carried the primary track's display identity.
@@ -119,6 +123,7 @@ impl Viewer {
         let annotation_group_headers_by_anchor = &pass.annotation_group_headers_by_anchor;
         let mut top = pass.top;
         let secondary_tracks = self
+            .session
             .alignment_tracks
             .iter()
             .skip(1)
@@ -264,6 +269,7 @@ impl Viewer {
                 continue;
             }
             let Some(track) = self
+                .session
                 .alignment_tracks
                 .iter()
                 .find(|track| track.config.id == track_id)

@@ -416,8 +416,11 @@ impl ApplicationHandler for Application {
                 || !viewer.session_load_tasks.is_empty()
                 || !viewer.workspace_list_import_tasks.is_empty()
                 || !viewer.genome_tasks.is_empty()
-                || !viewer.alignment_retirement_tasks.is_empty()
-                || !viewer.alignment_coverage_retirement_tasks.is_empty()
+                || !viewer.session.alignment_retirement_tasks.is_empty()
+                || !viewer
+                    .session
+                    .alignment_coverage_retirement_tasks
+                    .is_empty()
                 || !viewer.session.engine_retirement_tasks.is_empty()
                 || viewer
                     .automation

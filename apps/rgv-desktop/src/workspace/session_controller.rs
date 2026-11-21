@@ -4,10 +4,10 @@ use crate::automation::AutomationAuxiliaryOpenState;
 use crate::display::alignment::persisted_style_tag;
 use crate::launch::LaunchOptions;
 use crate::sources::{
-    DroppedFileKind, DroppedJsonKind, build_tdf_channel_expansion, classify_dropped_file,
-    classify_dropped_json, inferred_desktop_track_kind, primary_alignment_track,
-    reference_open_options, session_track_specs, source_display_name, source_path,
-    spawn_track_engine, spawn_track_engine_without_aliases, track_source,
+    DroppedFileKind, DroppedJsonKind, classify_dropped_file, classify_dropped_json,
+    inferred_desktop_track_kind, primary_alignment_track, reference_open_options,
+    session_track_specs, source_display_name, source_path, spawn_track_engine_without_aliases,
+    track_source,
 };
 use crate::workspace::alignments::filter_state_from_session;
 use crate::workspace::navigation::{ImportedLocusRequest, RequestedLocus, resolve_requested_locus};
@@ -17,7 +17,7 @@ use rgv_core::{
     ReferenceDictionary, SessionAlignmentTrack, SessionDocument, SessionFilters, TrackConfig,
     TrackFormat, TrackId, TrackKind, TrackSource, WorkspacePresentation,
 };
-use rgv_engine::{TrackSpec, TrackSpecKind};
+use rgv_engine::TrackSpecKind;
 use rgv_layout::DisplayList;
 pub(crate) use rgv_session::panels::session_panel_documents;
 use std::collections::BTreeMap;
@@ -225,32 +225,10 @@ impl Viewer {
         config: TrackConfig,
         query_contig_aliases: BTreeMap<String, String>,
     ) -> Result<TrackId> {
-        let id = config.id;
-        let specification = TrackSpec {
-            id,
-            name: config.name.clone(),
-            path: path.to_path_buf(),
-            kind,
-        };
-        if let Some(engine) = &self.session.track_engine {
-            if query_contig_aliases.is_empty() {
-                engine.try_add(specification)?;
-            } else {
-                engine.try_add_with_query_contig_aliases(specification, query_contig_aliases)?;
-            }
-        } else {
-            // An empty alias map is the no-alias case.
-            self.session.track_engine = Some(spawn_track_engine(vec![(
-                specification,
-                query_contig_aliases,
-            )]));
-        }
-        let source_label = config.source.redacted_label();
-        self.session.tracks.push(config);
-        self.invalidate_navigation_contract("auxiliary track added");
-        self.reconcile_track_presentation();
-        self.session.synthetic = false;
-        self.session.data_status = format!("Opening track {source_label}…");
+        let id = self
+            .session
+            .add_track_source(path, kind, config, query_contig_aliases)?;
+        self.reconcile_presentation_interaction_state();
         Ok(id)
     }
 
@@ -260,59 +238,12 @@ impl Viewer {
         track_names: &[String],
         selected_index: usize,
     ) -> Result<()> {
-        if track_names.is_empty() || selected_index >= track_names.len() {
-            anyhow::bail!("TDF source returned an invalid embedded-channel catalogue");
-        }
-        let Some(parent_position) = self
+        if self
             .session
-            .tracks
-            .tracks()
-            .iter()
-            .position(|track| track.id == parent_id)
-        else {
-            return Ok(());
-        };
-        let parent = self.session.tracks.tracks()[parent_position].clone();
-        if matches!(parent.format, Some(TrackFormat::TdfChannel { .. })) {
-            return Ok(());
+            .expand_tdf_channels(parent_id, track_names, selected_index)?
+        {
+            self.reconcile_presentation_interaction_state();
         }
-        let path = source_path(&parent.source);
-        let source_label = parent.source.redacted_label();
-        let next_id = self
-            .peek_track_id()
-            .ok_or_else(|| anyhow::anyhow!("TDF channel track ID space is exhausted"))?;
-        let expansion =
-            build_tdf_channel_expansion(&parent, &path, track_names, selected_index, next_id)?;
-        if !expansion.specifications.is_empty() {
-            let engine = self
-                .session
-                .track_engine
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("TDF track engine is unavailable"))?;
-            engine.try_add_many(expansion.specifications)?;
-        }
-        let parent = &mut self.session.tracks.tracks_mut()[parent_position];
-        parent.name = expansion.selected_name;
-        parent.format = Some(TrackFormat::TdfChannel {
-            index: selected_index,
-        });
-        if let Some(largest) = expansion.children.iter().map(|track| track.id.get()).max() {
-            self.reserve_track_ids_through(largest);
-        }
-        self.session
-            .tracks
-            .insert_after(parent_id, expansion.children);
-        if selected_index > 0 {
-            self.session
-                .tracks
-                .move_track(parent_id, parent_position.saturating_add(selected_index));
-        }
-        self.reconcile_track_presentation();
-        self.session.data_status = format!(
-            "Opened {} embedded TDF channels from {}",
-            track_names.len(),
-            source_label
-        );
         Ok(())
     }
 
@@ -328,14 +259,14 @@ impl Viewer {
             filters.alignment_group_mode,
             filters.alignment_sort_mode,
         );
-        self.workspace_alignment_limit = workspace_limit.max(1);
+        self.session.workspace_alignment_limit = workspace_limit.max(1);
         let maximum_alignments = alignment
-            .map_or(self.workspace_alignment_limit, |track| {
+            .map_or(self.session.workspace_alignment_limit, |track| {
                 track.maximum_alignments
             })
-            .min(self.workspace_alignment_limit)
+            .min(self.session.workspace_alignment_limit)
             .max(1);
-        if let Some(track) = self.alignment_tracks.first_mut()
+        if let Some(track) = self.session.alignment_tracks.first_mut()
             && alignment.is_some_and(|alignment| alignment.id == track.config.id)
         {
             track.config.filters = filters;
@@ -343,14 +274,14 @@ impl Viewer {
             track.filter_editor = filter_editor;
             track.active_filters = active_filters;
         } else {
-            self.empty_alignment.filters = filters;
-            self.empty_alignment.filter_editor = filter_editor;
-            self.empty_alignment.active_filters = active_filters;
-            self.empty_alignment.name =
+            self.session.empty_alignment.filters = filters;
+            self.session.empty_alignment.filter_editor = filter_editor;
+            self.session.empty_alignment.active_filters = active_filters;
+            self.session.empty_alignment.name =
                 alignment.map_or_else(|| "Alignments".to_owned(), |track| track.name.clone());
-            self.empty_alignment.visible = alignment.is_none_or(|track| track.visible);
-            self.empty_alignment.collapsed = alignment.is_some_and(|track| track.collapsed);
-            self.empty_alignment.maximum_alignments = maximum_alignments;
+            self.session.empty_alignment.visible = alignment.is_none_or(|track| track.visible);
+            self.session.empty_alignment.collapsed = alignment.is_some_and(|track| track.collapsed);
+            self.session.empty_alignment.maximum_alignments = maximum_alignments;
         }
         Ok(())
     }
@@ -374,7 +305,7 @@ impl Viewer {
         self.ensure_engine_retirement_capacity(3)?;
         self.poll_alignment_retirement_tasks();
         anyhow::ensure!(
-            self.alignment_retirement_tasks.len() <= rgv_core::MAXIMUM_ALIGNMENT_TRACKS,
+            self.session.alignment_retirement_tasks.len() <= rgv_core::MAXIMUM_ALIGNMENT_TRACKS,
             "Previous alignment sources are still closing; retry shortly"
         );
         let panel_ids = panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
@@ -517,6 +448,7 @@ impl Viewer {
     pub(crate) fn session_document(&self) -> SessionDocument {
         let (locus, panels, active_panel) = session_panel_documents(&self.session.panels);
         let mut alignment_tracks = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| track.config.clone())
@@ -562,7 +494,7 @@ impl Viewer {
                 }),
             suppressed_builtin_gene_bundles: self.session.suppressed_builtin_gene_bundles.clone(),
             tracks: self.session.tracks.tracks().to_vec(),
-            maximum_alignments: self.workspace_alignment_limit,
+            maximum_alignments: self.session.workspace_alignment_limit,
         }
     }
 }

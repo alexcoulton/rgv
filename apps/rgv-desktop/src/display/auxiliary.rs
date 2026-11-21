@@ -10,8 +10,8 @@ use rgv_core::{
 };
 use rgv_engine::{TrackSnapshot, TrackSnapshotData};
 use rgv_layout::{
-    AlignmentSortMode, DisplayList, ObjectIdAllocator, ObjectIdRange, QuantitativeRange,
-    TrackLayoutOptions, compose_quantitative_records, gwas_point_y, quantitative_data_range,
+    DisplayList, ObjectIdAllocator, ObjectIdRange, QuantitativeRange, TrackLayoutOptions,
+    compose_quantitative_records, gwas_point_y, quantitative_data_range,
 };
 use std::borrow::Cow;
 
@@ -525,24 +525,7 @@ pub(crate) fn interaction_record_index_at_position(
         .map(|(index, _, _, _, _)| index)
 }
 
-pub(crate) fn alignment_sort_position(
-    mode: AlignmentSortMode,
-    fixed_anchor: Option<u64>,
-    viewport: Viewport,
-) -> Option<u64> {
-    if mode != AlignmentSortMode::Base {
-        return None;
-    }
-    let interval = viewport.interval();
-    fixed_anchor.or_else(|| {
-        Some(
-            interval
-                .start()
-                .saturating_add(interval.len() / 2)
-                .min(interval.end().saturating_sub(1)),
-        )
-    })
-}
+pub(crate) use rgv_session::alignment::track::alignment_sort_position;
 
 pub(crate) fn mutation_record_index_at_position(
     records: &[rgv_hts::MutationRecord],

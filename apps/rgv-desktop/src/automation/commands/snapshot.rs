@@ -37,11 +37,16 @@ use rgv_engine::{AlignmentIndividualReadCapability, AlignmentSceneCoordinatorTel
 use rgv_render::GpuBudgetPressure;
 use std::time::Instant;
 
+/// Longest an automation selection snapshot waits for a tile-pipeline record lookup.
+const AUTOMATION_TILE_RECORD_LOOKUP_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
 impl Viewer {
     pub(super) fn automation_alignment_scene_diagnostics(
         &self,
     ) -> AutomationAlignmentSceneDiagnostics {
         let telemetry = self
+            .session
             .alignment_tracks
             .iter()
             .flat_map(|track| track.projections.values())
@@ -86,7 +91,7 @@ impl Viewer {
                     total
                 },
             );
-        let ledger = self.alignment_scene_ledger.progress().ok();
+        let ledger = self.session.alignment_scene_ledger.progress().ok();
         let context = self.context_scene_gpu_renderer.last_prepare_stats();
         let generic = self.rectangle_renderer.last_prepare_stats();
         let context_operations = self.context_scene_gpu_renderer.operation_counters();
@@ -221,7 +226,7 @@ impl Viewer {
                 .max(0.0);
                 let maximum_annotation_scroll = maximum_shared_annotation_scroll;
                 let filters = self.primary_alignment_filters();
-                let primary_track = self.alignment_tracks.first();
+                let primary_track = self.session.alignment_tracks.first();
                 let alignment_projection =
                     primary_track.and_then(|track| track.projection(panel.id));
                 let presented_scene = primary_track
@@ -386,16 +391,15 @@ impl Viewer {
                         && !panel.pending_queries.tracks
                         && !panel.navigation_presentation.is_unsettled()
                         && panel.navigation_query_schedule.pending.is_none()
-                        && self
-                            .alignment_tracks
-                            .iter()
-                            .all(|track| match track.lifecycle {
+                        && self.session.alignment_tracks.iter().all(|track| {
+                            match track.lifecycle {
                                 AlignmentTrackLifecycle::Opening => false,
                                 AlignmentTrackLifecycle::Failed(_) => true,
                                 AlignmentTrackLifecycle::Ready => track
                                     .projection(panel.id)
                                     .is_some_and(AlignmentPanelProjection::scene_is_current),
-                            }),
+                            }
+                        }),
                     navigation_transaction_active: panel.navigation_presentation.is_unsettled(),
                     navigation_target_locus: panel.navigation_presentation.is_unsettled().then(
                         || {
@@ -452,6 +456,7 @@ impl Viewer {
                         })
                         .collect(),
                     read_panel_states: self
+                        .session
                         .alignment_tracks
                         .iter()
                         .map(|track| {
@@ -487,6 +492,7 @@ impl Viewer {
                     selected_presentation_nodes: panel.selected_presentation_nodes.clone(),
                     presentation_selection_anchor: panel.presentation_selection_anchor,
                     coverage_sources: self
+                        .session
                         .alignment_tracks
                         .iter()
                         .map(|track| rgv_automation::AutomationCoverageSourceSnapshot {
@@ -507,6 +513,7 @@ impl Viewer {
             .navigation_presentation
             .is_interactive();
         let mut tracks = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| {
@@ -724,7 +731,8 @@ impl Viewer {
             }
         }));
         let source_available = |track_id: TrackId| {
-            self.alignment_tracks
+            self.session
+                .alignment_tracks
                 .iter()
                 .find(|track| track.config.id == track_id)
                 .is_some_and(|track| !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_)))
@@ -1009,7 +1017,7 @@ impl Viewer {
             || tracks.len() > MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS;
         panels.truncate(MAXIMUM_AUTOMATION_LOCI);
         tracks.truncate(MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS);
-        let scene_budget = self.alignment_scene_budget;
+        let scene_budget = self.session.alignment_scene_budget;
         let alignment_scene_diagnostics = self.automation_alignment_scene_diagnostics();
         AutomationWorkspaceSnapshot {
             application_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -1196,7 +1204,14 @@ impl Viewer {
             ));
         }
         if let Some(selection) = panel.selected_feature
-            && let Some(inspector) = self.feature_inspector_snapshot()
+            && let Some(inspector) = self.feature_inspector_snapshot().map(|inspector| {
+                // A tile-pipeline selection may still show the tile's stand-in record; wait
+                // briefly for the complete one so automation sees the inspector's fields.
+                self.track_tile_feature_inspector_snapshot_blocking(
+                    AUTOMATION_TILE_RECORD_LOOKUP_TIMEOUT,
+                )
+                .unwrap_or(inspector)
+            })
         {
             return Some(snapshot(
                 Some(selection.track_id),
@@ -1284,6 +1299,7 @@ impl Viewer {
         {
             let scene_evidence = alignment_track.and_then(|track_id| {
                 let track = self
+                    .session
                     .alignment_tracks
                     .iter()
                     .find(|track| track.config.id == track_id)?;

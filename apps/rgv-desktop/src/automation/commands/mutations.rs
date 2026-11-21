@@ -61,6 +61,7 @@ impl Viewer {
         selection.granularity = granularity;
         if let Some(track_id) = selection.track_id
             && let Some((authority, generation)) = self
+                .session
                 .alignment_tracks
                 .iter()
                 .find(|track| track.config.id == track_id)
@@ -203,7 +204,8 @@ impl Viewer {
     /// must be an open alignment track, else the primary alignment.
     pub(crate) fn automation_alignment_target(&self, named: Option<TrackId>) -> Result<TrackId> {
         automation_alignment_target(named, self.primary_alignment_track_id(), |track_id| {
-            self.alignment_tracks
+            self.session
+                .alignment_tracks
                 .iter()
                 .any(|track| track.config.id == track_id)
         })
@@ -366,6 +368,7 @@ impl Viewer {
             }
             AutomationOptionScope::Track { track_id } => {
                 let source_exists = self
+                    .session
                     .alignment_tracks
                     .iter()
                     .any(|track| track.config.id == track_id)
@@ -408,6 +411,7 @@ impl Viewer {
                 }
                 let primary_id = self.primary_alignment_track_id();
                 if let Some(track) = self
+                    .session
                     .alignment_tracks
                     .iter_mut()
                     .find(|track| track.config.id == track_id)
@@ -679,6 +683,7 @@ impl Viewer {
             AutomationSetting::AlignmentColorMode { track_ids, value } => {
                 self.ensure_automation_alignment_tracks(track_ids)?;
                 for track in self
+                    .session
                     .alignment_tracks
                     .iter_mut()
                     .filter(|track| track_ids.contains(&track.config.id))
@@ -699,6 +704,7 @@ impl Viewer {
                     "reference-backed alignment filters require a matching reference FASTA"
                 );
                 for track in self
+                    .session
                     .alignment_tracks
                     .iter_mut()
                     .filter(|track| track_ids.contains(&track.config.id))
@@ -720,6 +726,7 @@ impl Viewer {
                     "reference-backed alignment highlights require a matching reference FASTA"
                 );
                 for track in self
+                    .session
                     .alignment_tracks
                     .iter_mut()
                     .filter(|track| track_ids.contains(&track.config.id))
@@ -733,6 +740,7 @@ impl Viewer {
             AutomationSetting::ReadStackingMode { track_ids, value } => {
                 self.ensure_automation_alignment_tracks(track_ids)?;
                 for track in self
+                    .session
                     .alignment_tracks
                     .iter_mut()
                     .filter(|track| track_ids.contains(&track.config.id))
@@ -744,10 +752,13 @@ impl Viewer {
             }
             AutomationSetting::CompleteReadLimit { track_ids, value } => {
                 self.ensure_automation_alignment_tracks(track_ids)?;
-                let (workspace_limit, requested_limit) =
-                    expanded_workspace_alignment_limit(self.workspace_alignment_limit, *value);
-                self.workspace_alignment_limit = workspace_limit;
+                let (workspace_limit, requested_limit) = expanded_workspace_alignment_limit(
+                    self.session.workspace_alignment_limit,
+                    *value,
+                );
+                self.session.workspace_alignment_limit = workspace_limit;
                 for track in self
+                    .session
                     .alignment_tracks
                     .iter_mut()
                     .filter(|track| track_ids.contains(&track.config.id))
@@ -769,6 +780,7 @@ impl Viewer {
                     panel_id.get()
                 );
                 for track in self
+                    .session
                     .alignment_tracks
                     .iter_mut()
                     .filter(|track| track_ids.contains(&track.config.id))

@@ -158,6 +158,7 @@ impl Viewer {
         let mut read_panel_specs = Vec::new();
         for track_id in read_track_order {
             if !self
+                .session
                 .alignment_tracks
                 .iter()
                 .any(|track| track.config.id == track_id)
@@ -360,6 +361,7 @@ impl Viewer {
             top += 26.0;
         }
         let mut annotation_fallback_frames = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| {

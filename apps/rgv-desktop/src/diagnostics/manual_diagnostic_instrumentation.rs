@@ -647,13 +647,14 @@ impl Viewer {
             return;
         }
         let source_is_ready = self.session.synthetic
-            || self.alignment_tracks.is_empty()
+            || self.session.alignment_tracks.is_empty()
             || self
+                .session
                 .alignment_tracks
                 .iter()
                 .any(|track| track.dictionary.is_some());
         let bootstrap_locus_is_resolved = self.session.synthetic
-            || self.alignment_tracks.is_empty()
+            || self.session.alignment_tracks.is_empty()
             || self.session.panels.active().contig_name != "chrSynthetic";
         if source_is_ready && bootstrap_locus_is_resolved {
             self.manual_diagnostic_trace_autostart_pending = false;
@@ -667,6 +668,7 @@ impl Viewer {
             .reset_for_recording(&self.session.data_status);
         let panel = self.session.panels.active();
         let source_kinds = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| {
@@ -693,7 +695,7 @@ impl Viewer {
             "scale_factor": self.window.scale_factor(),
             "cache_budget_mib": self.session.settings.cache_budget_mib,
             "read_browsing_buffer_percent": self.session.settings.read_browsing_buffer_percent,
-            "workspace_alignment_limit": self.workspace_alignment_limit,
+            "workspace_alignment_limit": self.session.workspace_alignment_limit,
             "active_locus": {
                 "panel_id": panel.id.get(),
                 "contig": panel.contig_name,
@@ -1309,6 +1311,7 @@ impl Viewer {
             return serde_json::Value::Null;
         }
         let Some(track) = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == track_id)
@@ -1643,7 +1646,8 @@ impl Viewer {
         panel_id: PanelId,
     ) -> serde_json::Value {
         serde_json::Value::Array(
-            self.alignment_tracks
+            self.session
+                .alignment_tracks
                 .iter()
                 .map(|track| {
                     serde_json::json!({
@@ -1666,7 +1670,7 @@ impl Viewer {
             .iter()
             .map(|panel| {
                 let tracks = self
-                    .alignment_tracks
+                    .session.alignment_tracks
                     .iter()
                     .map(|track| {
                         let track_id = track.config.id;
@@ -1768,7 +1772,7 @@ impl Viewer {
     fn manual_diagnostic_state_snapshot(&self) -> serde_json::Value {
         let panel = self.session.panels.active();
         let tracks = self
-            .alignment_tracks
+            .session.alignment_tracks
             .iter()
             .map(|track| {
                 let projection = track.projection(panel.id);
@@ -1967,8 +1971,8 @@ impl Viewer {
         let context_ops = self.context_scene_gpu_renderer.operation_counters();
         let read_stats = self.alignment_gpu_last_prepare_stats;
         let summary_stats = self.alignment_summary_gpu_last_prepare_stats;
-        let budget = self.alignment_scene_budget;
-        let ledger_progress = self.alignment_scene_ledger.progress().ok();
+        let budget = self.session.alignment_scene_budget;
+        let ledger_progress = self.session.alignment_scene_ledger.progress().ok();
         let retained_breakdown = ledger_progress.map_or(serde_json::Value::Null, |progress| {
             let retained = progress.retained;
             serde_json::json!({

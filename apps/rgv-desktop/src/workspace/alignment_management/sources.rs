@@ -3,9 +3,7 @@ use crate::sources::{
     upsert_primary_alignment_config,
 };
 use crate::ui::TrackFrameKey;
-use crate::workspace::alignments::{
-    AlignmentTrackController, filter_state_from_session, spawn_alignment_track_controller,
-};
+use crate::workspace::alignments::{AlignmentTrackController, spawn_alignment_track_controller};
 use crate::{
     RemoteSourceKind, RemoteSourceRequest, SYNTHETIC_ALIGNMENT_TRACK_ID, UiPanel, Viewer,
     clear_removed_alignment_panel_state,
@@ -16,14 +14,13 @@ use rgv_core::{
     GenomeConfiguration, MAXIMUM_ALIGNMENT_TRACKS, PanelId, SessionAlignmentTrack, TrackId,
     TrackSource,
 };
-use rgv_engine::AlignmentSceneEngine;
 use rgv_layout::DisplayList;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 impl Viewer {
     pub(crate) fn alignment_track_limit_reached(&mut self) -> bool {
-        if self.alignment_tracks.len() >= MAXIMUM_ALIGNMENT_TRACKS {
+        if self.session.alignment_tracks.len() >= MAXIMUM_ALIGNMENT_TRACKS {
             self.session.data_status =
                 format!("A workspace supports at most {MAXIMUM_ALIGNMENT_TRACKS} alignment tracks");
             return true;
@@ -38,6 +35,7 @@ impl Viewer {
         remote_index_url: Option<String>,
     ) {
         let mut configs = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| track.config.clone())
@@ -47,7 +45,7 @@ impl Viewer {
         config.remote_index_url = remote_index_url;
         config.maximum_alignments = config
             .maximum_alignments
-            .min(self.workspace_alignment_limit)
+            .min(self.session.workspace_alignment_limit)
             .max(1);
         configs.push(config);
         match self.replace_alignment_track_controllers(configs) {
@@ -106,7 +104,7 @@ impl Viewer {
         }
         let source = track_source(path);
         let opened_name = source_display_name(Some(&source), "Alignments");
-        if !self.alignment_tracks.is_empty() {
+        if !self.session.alignment_tracks.is_empty() {
             self.add_alignment_track(source, &opened_name, remote_index_url);
             return;
         }
@@ -117,6 +115,7 @@ impl Viewer {
             self.primary_alignment_name().to_owned()
         };
         let mut configs = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| track.config.clone())
@@ -131,15 +130,15 @@ impl Viewer {
         config.filters = self.primary_alignment_filters().clone();
         config.maximum_alignments = self
             .primary_alignment_limit()
-            .min(self.workspace_alignment_limit)
+            .min(self.session.workspace_alignment_limit)
             .max(1);
-        let cache_bytes = NonZeroUsize::new(self.alignment_scene_budget.budget_bytes.max(1))
-            .expect("scene budget is non-zero");
-        let coverage_sidecar = self.alignment_coverage_sidecar();
+        let cache_bytes =
+            NonZeroUsize::new(self.session.alignment_scene_budget.budget_bytes.max(1))
+                .expect("scene budget is non-zero");
         let controller = spawn_alignment_track_controller(
             configs.remove(0),
             cache_bytes,
-            self.alignment_scene_ledger.clone(),
+            self.session.alignment_scene_ledger.clone(),
             self.session.reference_source.as_ref().map(source_path),
             self.session.remote_reference_index_url.clone(),
             &self
@@ -148,7 +147,6 @@ impl Viewer {
                 .iter()
                 .map(|panel| panel.id)
                 .collect::<Vec<_>>(),
-            coverage_sidecar,
         );
         match controller {
             Ok(controller) => {
@@ -164,10 +162,10 @@ impl Viewer {
                     self.session.reference_engine.as_ref(),
                     [&controller],
                 );
-                if self.alignment_tracks.is_empty() {
-                    self.alignment_tracks.push(controller);
+                if self.session.alignment_tracks.is_empty() {
+                    self.session.alignment_tracks.push(controller);
                 } else {
-                    self.alignment_tracks[0] = controller;
+                    self.session.alignment_tracks[0] = controller;
                 }
                 self.invalidate_navigation_contract("alignment source changed");
                 self.begin_all_panel_refresh_transactions();
@@ -215,11 +213,12 @@ impl Viewer {
         // The retired engine took its slice sinks with it: reconnect every scene engine.
         crate::workspace::alignments::connect_reference_slice_sinks(
             self.session.reference_engine.as_ref(),
-            &self.alignment_tracks,
+            &self.session.alignment_tracks,
         );
         self.session.rerequest_panel_references();
-        if !self.alignment_tracks.is_empty() {
+        if !self.session.alignment_tracks.is_empty() {
             let configs = self
+                .session
                 .alignment_tracks
                 .iter()
                 .map(|track| track.config.clone())
@@ -263,33 +262,12 @@ impl Viewer {
         remote_reference_index_url: Option<String>,
         panel_ids: &[PanelId],
     ) -> Result<Vec<AlignmentTrackController>> {
-        for config in &configs {
-            filter_state_from_session(&config.filters)?;
-        }
-        let cache_bytes = NonZeroUsize::new(self.alignment_scene_budget.budget_bytes.max(1))
-            .expect("scene budget is non-zero");
-        let coverage_sidecar = self.alignment_coverage_sidecar();
-        let mut controllers = Vec::with_capacity(configs.len());
-        for config in configs {
-            match spawn_alignment_track_controller(
-                config,
-                cache_bytes,
-                self.alignment_scene_ledger.clone(),
-                reference_path.clone(),
-                remote_reference_index_url.clone(),
-                panel_ids,
-                coverage_sidecar.clone(),
-            ) {
-                Ok(controller) => controllers.push(controller),
-                Err(error) => {
-                    for controller in controllers {
-                        self.retire_alignment_track_controller(controller);
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        Ok(controllers)
+        self.session.prepare_alignment_track_controllers(
+            configs,
+            reference_path,
+            remote_reference_index_url,
+            panel_ids,
+        )
     }
 
     pub(crate) fn install_alignment_track_controllers(
@@ -297,14 +275,7 @@ impl Viewer {
         controllers: Vec<AlignmentTrackController>,
     ) {
         // Covers a session load too: its new reference engine is installed before this call.
-        crate::workspace::alignments::connect_reference_slice_sinks(
-            self.session.reference_engine.as_ref(),
-            &controllers,
-        );
-        let replaced = std::mem::replace(&mut self.alignment_tracks, controllers);
-        for controller in replaced {
-            self.retire_alignment_track_controller(controller);
-        }
+        self.session.swap_alignment_track_controllers(controllers);
         self.reset_alignment_scene_panel_authority();
         self.reconcile_track_presentation();
     }
@@ -313,29 +284,16 @@ impl Viewer {
         &mut self,
         configs: Vec<SessionAlignmentTrack>,
     ) -> Result<()> {
-        self.poll_alignment_retirement_tasks();
-        anyhow::ensure!(
-            self.alignment_retirement_tasks.len() <= rgv_core::MAXIMUM_ALIGNMENT_TRACKS,
-            "Previous alignment sources are still closing; retry shortly"
-        );
-        let panel_ids = self
+        let controllers = self
             .session
-            .panels
-            .iter()
-            .map(|panel| panel.id)
-            .collect::<Vec<_>>();
-        let controllers = self.prepare_alignment_track_controllers(
-            configs,
-            self.session.reference_source.as_ref().map(source_path),
-            self.session.remote_reference_index_url.clone(),
-            &panel_ids,
-        )?;
+            .prepare_alignment_track_controllers_for_workspace(configs)?;
         self.install_alignment_track_controllers(controllers);
         Ok(())
     }
 
     pub(super) fn reset_alignment_scene_panel_authority(&mut self) {
         let track_ids = self
+            .session
             .alignment_tracks
             .iter()
             .filter(|track| track.scene_engine.is_some())
@@ -365,28 +323,12 @@ impl Viewer {
         &mut self,
         controller: AlignmentTrackController,
     ) {
-        for projection in controller.projections.values() {
-            projection.advance_scene_generation();
-        }
-        let AlignmentTrackController {
-            scene_engine,
-            coverage_engine,
-            ..
-        } = controller;
-        if let Some(task) = scene_engine.and_then(AlignmentSceneEngine::retire) {
-            self.alignment_retirement_tasks.push(task);
-        }
-        // The coverage worker ends with its track; stopping it never blocks the UI thread.
-        if let Some(task) = coverage_engine
-            .and_then(crate::workspace::alignment_coverage::retire_alignment_coverage_engine)
-        {
-            self.alignment_coverage_retirement_tasks.push(task);
-        }
+        self.session.retire_alignment_track_controller(controller);
     }
 
     pub(crate) fn activate_first_alignment_track(&mut self) -> Result<()> {
         if let Some((config, filter_editor, active_filters)) =
-            self.alignment_tracks.first().map(|track| {
+            self.session.alignment_tracks.first().map(|track| {
                 (
                     track.config.clone(),
                     track.filter_editor.clone(),
@@ -394,15 +336,19 @@ impl Viewer {
                 )
             })
         {
-            self.apply_primary_alignment_config(Some(&config), self.workspace_alignment_limit)?;
+            self.apply_primary_alignment_config(
+                Some(&config),
+                self.session.workspace_alignment_limit,
+            )?;
             let primary = self
+                .session
                 .alignment_tracks
                 .first_mut()
                 .expect("primary alignment still exists");
             primary.filter_editor = filter_editor;
             primary.active_filters = active_filters;
         } else {
-            self.apply_primary_alignment_config(None, self.workspace_alignment_limit)?;
+            self.apply_primary_alignment_config(None, self.session.workspace_alignment_limit)?;
         }
         Ok(())
     }
@@ -412,6 +358,7 @@ impl Viewer {
             return Ok(false);
         }
         let Some(index) = self
+            .session
             .alignment_tracks
             .iter()
             .position(|track| track.config.id == id)
@@ -419,7 +366,7 @@ impl Viewer {
             return Ok(false);
         };
         let removed_was_primary = index == 0;
-        let removed_track = self.alignment_tracks.remove(index);
+        let removed_track = self.session.alignment_tracks.remove(index);
         self.retire_alignment_track_controller(removed_track);
         self.reset_alignment_scene_panel_authority();
         self.session.track_presentation.remove_source(id);
@@ -460,7 +407,7 @@ impl Viewer {
         for panel in self.session.panels.iter_mut() {
             clear_removed_alignment_panel_state(panel, id, removed_was_primary);
         }
-        for track in &self.alignment_tracks {
+        for track in &self.session.alignment_tracks {
             for projection in track.projections.values() {
                 projection.advance_scene_generation();
             }

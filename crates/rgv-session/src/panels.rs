@@ -7,6 +7,10 @@
 
 use crate::navigation::{IMPORTED_PLACEHOLDER_LOCUS, ImportedLocusRequest, standalone_locus};
 use crate::navigation_transaction::{NavigationPresentation, NavigationQuerySchedule};
+use crate::selection::{
+    CopyNumberSelection, FeatureSelection, GwasSelection, InteractionSelection, MutationSelection,
+    QuantitativeSelection, VariantSelection,
+};
 use anyhow::{Context as _, Result};
 use rgv_alignment_scene::{ReferenceRevision, RowCoordinateSpaceRevision};
 use rgv_core::{
@@ -151,6 +155,16 @@ pub struct PanelState {
     pub reference_query_error_generation: Option<u64>,
     /// Per-lane terminal failures for the current contextual query generation.
     pub track_query_error_generations: BTreeMap<TrackId, u64>,
+    /// The record selected in an auxiliary lane, by kind. Each indexes into the lane's
+    /// current snapshot in `track_snapshots` and follows its record when the lane refreshes
+    /// ([`crate::selection::reresolve_auxiliary_selections`]).
+    pub selected_feature: Option<FeatureSelection>,
+    pub selected_variant: Option<VariantSelection>,
+    pub selected_gwas: Option<GwasSelection>,
+    pub selected_quantitative: Option<QuantitativeSelection>,
+    pub selected_copy_number: Option<CopyNumberSelection>,
+    pub selected_mutation: Option<MutationSelection>,
+    pub selected_interaction: Option<InteractionSelection>,
 }
 
 /// A panel as the panel workspace and the action reducer see it.
@@ -257,6 +271,13 @@ impl PanelState {
             navigation_query_schedule: NavigationQuerySchedule::default(),
             reference_query_error_generation: None,
             track_query_error_generations: BTreeMap::new(),
+            selected_feature: None,
+            selected_variant: None,
+            selected_gwas: None,
+            selected_quantitative: None,
+            selected_copy_number: None,
+            selected_mutation: None,
+            selected_interaction: None,
         }
     }
 

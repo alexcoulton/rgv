@@ -78,7 +78,7 @@ impl Viewer {
         let mut metadata = automation_snapshot_metadata(
             &self.session.assembly_name,
             &self.session.panels,
-            &self.alignment_tracks,
+            &self.session.alignment_tracks,
             &self.session.tracks,
             &self.session.track_presentation,
             &scope_label,
@@ -139,7 +139,7 @@ impl Viewer {
                 let contents = automation_track_names_export(
                     &self.session.assembly_name,
                     &self.session.panels,
-                    &self.alignment_tracks,
+                    &self.session.alignment_tracks,
                     &self.session.tracks,
                     &self.session.track_presentation,
                 );
@@ -164,7 +164,7 @@ impl Viewer {
                     "the target viewport is still being checked"
                 );
                 let mut tracks = Vec::new();
-                for track in self.alignment_tracks.iter().filter(|track| {
+                for track in self.session.alignment_tracks.iter().filter(|track| {
                     self.session
                         .track_presentation
                         .track_content_exposed(ui::TrackPane::Annotation, track.config.id)

@@ -409,6 +409,7 @@ impl Viewer {
             .collect::<Vec<_>>();
         for panel_id in panel_ids {
             if let Some(track) = self
+                .session
                 .alignment_tracks
                 .iter_mut()
                 .find(|track| track.config.id == track_id)
@@ -459,6 +460,7 @@ impl Viewer {
             return;
         }
         let compatible_reference_available = self
+            .session
             .alignment_tracks
             .iter()
             .find(|track| track.config.id == target.track_id)
@@ -638,6 +640,7 @@ impl Viewer {
                     .map(|panel| panel.contig_name.clone())
                     .unwrap_or_default();
                 let Some(track) = self
+                    .session
                     .alignment_tracks
                     .iter_mut()
                     .find(|track| track.config.id == target.track_id)

@@ -262,6 +262,7 @@ impl Viewer {
                         );
                     }
                     if let Some(projection) = self
+                        .session
                         .alignment_tracks
                         .iter()
                         .find(|track| track.config.id == lane.track_id)
@@ -286,7 +287,7 @@ impl Viewer {
                 panels.push(frame.clone());
             } else {
                 anyhow::ensure!(
-                    self.alignment_tracks.is_empty(),
+                    self.session.alignment_tracks.is_empty(),
                     "committed alignment presentation is unavailable"
                 );
             }
@@ -319,14 +320,14 @@ impl Viewer {
                 )
             })
             .ok_or_else(|| anyhow::anyhow!("export allocation overflow"))?;
-        let resources = self.alignment_scene_ledger.reserve_transient(
+        let resources = self.session.alignment_scene_ledger.reserve_transient(
             rgv_alignment_scene::TransientResourceClass::CpuProjection,
             bytes,
             rgv_alignment_scene::ReservationKind::Normal,
         )?;
         Ok(SemanticExportCapture {
             interactions,
-            ledger: self.alignment_scene_ledger.clone(),
+            ledger: self.session.alignment_scene_ledger.clone(),
             theme: crate::theme::active(),
             generic: semantic_export_display_list(generic),
             panels,

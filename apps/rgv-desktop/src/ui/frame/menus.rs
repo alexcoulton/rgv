@@ -302,7 +302,7 @@ impl Viewer {
             ui.close();
         }
         ui.separator();
-        if self.alignment_tracks.is_empty() && self.session.synthetic {
+        if self.session.alignment_tracks.is_empty() && self.session.synthetic {
             let id = self.primary_alignment_track_id();
             let filters = self.live_session_filters();
             ui.menu_button(self.alignment_track_name(), |ui| {

@@ -1087,7 +1087,8 @@ impl Viewer {
         inspector: &VariantInspectorSnapshot,
     ) -> Vec<VariantAlignmentEvidence> {
         let record = &inspector.query.records[inspector.record_index];
-        self.alignment_tracks
+        self.session
+            .alignment_tracks
             .iter()
             .filter_map(|track| {
                 if let Some(presented) = self
@@ -1921,7 +1922,7 @@ impl Viewer {
     }
 
     pub(crate) fn invalidate_alignment_row_layouts(&mut self) {
-        for track in &mut self.alignment_tracks {
+        for track in &mut self.session.alignment_tracks {
             if track.scene_engine.is_none() {
                 continue;
             }

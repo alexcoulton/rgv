@@ -404,6 +404,7 @@ impl Viewer {
                     })
             });
             let read_group = self
+                .session
                 .alignment_tracks
                 .iter()
                 .find(|track| track.config.id == track_id)

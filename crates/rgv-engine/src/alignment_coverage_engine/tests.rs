@@ -171,6 +171,11 @@ fn whole_contig_coverage_is_built_from_bounded_units_and_persisted_for_the_next_
             assert_eq!(ledger.owner_usage(owner).unwrap().charged, 0);
         }
         drop(publication);
+        // Dropping the engine hands its worker to a reaper and returns at once, so wait for
+        // the worker to exit before checking that its charge was released.
+        if let Some(reaper) = engine.retire() {
+            reaper.join().expect("the coverage reaper exits cleanly");
+        }
     }
     // The engine is gone: nothing stays charged.
     assert_eq!(summary_charged(&ledger), 0);

@@ -25,6 +25,7 @@ impl Viewer {
                 (panel.hovered_alignment_hit, panel.selected_alignment_hit)
             });
         let track_ids = self
+            .session
             .alignment_tracks
             .iter()
             .map(|track| track.config.id)
@@ -32,6 +33,7 @@ impl Viewer {
         for track_id in track_ids {
             let highlighted = self.alignment_highlight_handles(panel_id, track_id);
             let Some(track) = self
+                .session
                 .alignment_tracks
                 .iter_mut()
                 .find(|track| track.config.id == track_id)
@@ -55,12 +57,14 @@ impl Viewer {
     /// Highlighting never changes evidence membership, row assignment, or summaries.
     pub(crate) fn refresh_alignment_highlight_interactions(&mut self, track_ids: &[TrackId]) {
         let panel_ids = self
+            .session
             .alignment_tracks
             .iter()
             .filter(|track| track_ids.contains(&track.config.id))
             .flat_map(|track| track.projections.keys().copied())
             .collect::<BTreeSet<_>>();
         for track in self
+            .session
             .alignment_tracks
             .iter_mut()
             .filter(|track| track_ids.contains(&track.config.id))
@@ -80,25 +84,29 @@ impl Viewer {
         track_id: TrackId,
     ) -> Arc<[AlignmentHandle]> {
         let Some(track_index) = self
+            .session
             .alignment_tracks
             .iter()
             .position(|track| track.config.id == track_id)
         else {
             return Arc::from([]);
         };
-        let Some(metadata) = self.alignment_tracks[track_index].scene_metadata.as_ref() else {
+        let Some(metadata) = self.session.alignment_tracks[track_index]
+            .scene_metadata
+            .as_ref()
+        else {
             return Arc::from([]);
         };
         let contract = alignment_highlight_filter_contract(
-            &self.alignment_tracks[track_index].config.filters,
+            &self.session.alignment_tracks[track_index].config.filters,
             &metadata.dictionary,
         );
         if contract.is_empty() {
-            let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+            let projection = self.session.alignment_tracks[track_index].projection_mut(panel_id);
             projection.invalidate_scene_highlight();
             return Arc::clone(&projection.scene_highlighted);
         }
-        let Some(snapshot) = self.alignment_tracks[track_index]
+        let Some(snapshot) = self.session.alignment_tracks[track_index]
             .projection(panel_id)
             .and_then(|projection| projection.scene_frame.as_ref())
             .and_then(|frame| frame.snapshot.as_ref())
@@ -123,7 +131,7 @@ impl Viewer {
                 .then(|| reference.map(|(revision, slice)| (revision, slice.interval)))
                 .flatten(),
         };
-        if let Some(projection) = self.alignment_tracks[track_index].projection(panel_id)
+        if let Some(projection) = self.session.alignment_tracks[track_index].projection(panel_id)
             && projection.scene_highlight_key == Some(key)
         {
             return Arc::clone(&projection.scene_highlighted);
@@ -142,7 +150,7 @@ impl Viewer {
         };
         let matching_handles = highlighted.len();
         let diagnostic_status = status.clone();
-        let projection = self.alignment_tracks[track_index].projection_mut(panel_id);
+        let projection = self.session.alignment_tracks[track_index].projection_mut(panel_id);
         projection.scene_highlight_key = Some(key);
         projection.scene_highlighted = Arc::clone(&highlighted);
         projection.scene_highlight_status = status;
