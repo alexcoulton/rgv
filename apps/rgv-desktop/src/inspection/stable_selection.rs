@@ -145,9 +145,7 @@ pub(crate) fn reresolve_auxiliary_selections(
                             .cloned()
                     };
                     reresolve_record_index(&old.segments, selection.segment_index, &new.segments)
-                        .filter(|index| {
-                            sample(old, selection.segment_index) == sample(new, *index)
-                        })
+                        .filter(|index| sample(old, selection.segment_index) == sample(new, *index))
                         .map(|segment_index| CopyNumberSelection {
                             track_id,
                             segment_index,
@@ -233,7 +231,10 @@ mod tests {
     #[test]
     fn a_record_is_found_again_at_its_new_index() {
         assert_eq!(reresolve_record_index(&[1, 2, 3], 1, &[1, 2, 3]), Some(1));
-        assert_eq!(reresolve_record_index(&[1, 2, 3], 1, &[0, 1, 2, 3]), Some(2));
+        assert_eq!(
+            reresolve_record_index(&[1, 2, 3], 1, &[0, 1, 2, 3]),
+            Some(2)
+        );
         assert_eq!(reresolve_record_index(&[1, 2, 3], 2, &[3]), Some(0));
         assert_eq!(reresolve_record_index(&[1, 2, 3], 1, &[1, 3]), None);
         assert_eq!(reresolve_record_index(&[1, 2, 3], 9, &[1, 2, 3]), None);
@@ -243,7 +244,10 @@ mod tests {
     fn a_selected_feature_survives_a_refresh_that_reorders_the_lane() {
         let before = lane(4, vec![feature("A", 100), feature("B", 500)]);
         // Panning left loads an extra upstream feature: B moves from index 1 to 2.
-        let after = lane(4, vec![feature("Z", 10), feature("A", 100), feature("B", 500)]);
+        let after = lane(
+            4,
+            vec![feature("Z", 10), feature("A", 100), feature("B", 500)],
+        );
         let resolved = reresolve_auxiliary_selections(selected(4, 1), Some(&before), &after);
         assert_eq!(resolved, selected(4, 2));
     }

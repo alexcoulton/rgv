@@ -14,6 +14,7 @@ pub(crate) mod track_settings;
 mod tracks;
 pub(crate) mod workspace_dialogs;
 
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_imports))]
 pub(crate) use diagnostics::{
     ManualInteractionTraceAction, ManualInteractionTraceSnapshot, ManualInteractionTraceState,
     show_diagnostics, toggled_diagnostics,

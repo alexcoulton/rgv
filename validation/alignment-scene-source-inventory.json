@@ -69,7 +69,7 @@
       "purpose": "horizontal genomic camera movement cannot rebuild or rehash generic screen-space slabs"
     },
     {
-      "path": "apps/rgv-desktop/src/workspace/alignment_management.rs",
+      "path": "apps/rgv-desktop/src/workspace/alignment_management/gpu_bundle.rs",
       "caller": "capture_alignment_gpu_bundle_from_resident_content",
       "callee": "stage_replacement",
       "purpose": "alignment camera capture cannot enter immutable replacement staging"

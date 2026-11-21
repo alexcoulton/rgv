@@ -1029,6 +1029,14 @@ impl PositionedBamRecords<'_> {
             }
             self.high_water = end_position;
             if !noodles_record_intersects(&self.scratch, self.header, self.interval)? {
+                if noodles_record_starts_at_or_after_end(&self.scratch, self.header, self.interval)?
+                {
+                    // Coordinate order: nothing later in the file can intersect, so the
+                    // remaining chunks (records of coarser bins, far ahead) are never fetched.
+                    self.chunks = Vec::new().into_iter();
+                    self.chunk_end = None;
+                    return Ok(None);
+                }
                 continue;
             }
             return Ok(Some((
@@ -1065,6 +1073,12 @@ fn positioned_bam_records<'a>(
         usize::try_from(interval.contig().get()).map_err(|_| AlignmentError::CoordinateOverflow)?;
     let mut chunks = index.query(reference_sequence_id, region.interval())?;
     chunks.sort_by_key(|chunk| (chunk.start(), chunk.end()));
+    // Fetch what the index says this region needs, not a fixed read-ahead window.
+    reader.get_mut().set_bgzf_read_plan(
+        chunks
+            .iter()
+            .map(|chunk| (u64::from(chunk.start()), u64::from(chunk.end()))),
+    );
     Ok(PositionedBamRecords {
         reader: bam::io::Reader::from(reader),
         header,
@@ -1478,6 +1492,28 @@ where
         .is_some_and(|(start, end)| start < interval.end() && interval.start() < end))
 }
 
+/// Whether a record placed on the interval's contig starts at or beyond the interval's end.
+/// An indexed BAM is coordinate-sorted, so every later record of the file does too.
+fn noodles_record_starts_at_or_after_end<R>(
+    record: &R,
+    header: &sam::Header,
+    interval: GenomicInterval,
+) -> Result<bool, AlignmentError>
+where
+    R: sam::alignment::Record,
+{
+    let Some(reference_sequence_id) = record.reference_sequence_id(header).transpose()? else {
+        return Ok(false);
+    };
+    if u32::try_from(reference_sequence_id).ok().map(ContigId::new) != Some(interval.contig()) {
+        return Ok(false);
+    }
+    Ok(record
+        .alignment_start()
+        .transpose()?
+        .is_some_and(|start| start.get() as u64 > interval.end()))
+}
+
 /// Zero-based half-open reference span of a record placed on `contig`.
 fn noodles_record_span_on<R>(
     record: &R,
@@ -1889,7 +1925,7 @@ fn read_cram_index(
     Ok((index, stats, digest))
 }
 
-fn parse_cram_index(
+pub(crate) fn parse_cram_index(
     compressed: &[u8],
     source_length: u64,
 ) -> Result<cram::crai::Index, AlignmentError> {
@@ -2546,6 +2582,8 @@ mod tests {
         bam_url: String,
         index_url: String,
         requested_urls: Arc<Mutex<Vec<String>>>,
+        /// Inclusive byte ranges served, with the object path, in request order.
+        served_ranges: Arc<Mutex<Vec<(String, usize, usize)>>>,
         stop: Arc<AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
@@ -2583,6 +2621,8 @@ mod tests {
             let objects = Arc::new(objects);
             let requested_urls = Arc::new(Mutex::new(Vec::new()));
             let worker_requested_urls = Arc::clone(&requested_urls);
+            let served_ranges = Arc::new(Mutex::new(Vec::new()));
+            let worker_served_ranges = Arc::clone(&served_ranges);
             let stop = Arc::new(AtomicBool::new(false));
             let worker_stop = Arc::clone(&stop);
             let worker = thread::spawn(move || {
@@ -2609,6 +2649,10 @@ mod tests {
                         request.respond(Response::empty(StatusCode(416))).unwrap();
                         continue;
                     };
+                    worker_served_ranges
+                        .lock()
+                        .unwrap()
+                        .push((path.to_owned(), start, end));
                     let response = Response::from_data(data[start..=end].to_vec())
                         .with_status_code(StatusCode(206))
                         .with_header(header(
@@ -2623,6 +2667,7 @@ mod tests {
                 bam_url: format!("http://{address}/fixture.bam?signature=source"),
                 index_url: format!("http://{address}{explicit_index_path}?signature=index"),
                 requested_urls,
+                served_ranges,
                 stop,
                 worker: Some(worker),
             })
@@ -2630,6 +2675,18 @@ mod tests {
 
         fn requested_urls(&self) -> Vec<String> {
             self.requested_urls.lock().unwrap().clone()
+        }
+
+        /// Inclusive BAM byte ranges served since the first `skip` of them.
+        fn bam_ranges_after(&self, skip: usize) -> Vec<(u64, u64)> {
+            self.served_ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _, _)| path == "/fixture.bam")
+                .skip(skip)
+                .map(|(_, start, end)| (*start as u64, *end as u64))
+                .collect()
         }
     }
 
@@ -3432,6 +3489,213 @@ mod tests {
             total += before;
         }
         assert!(total > 0, "the CRAM fixture should contain mapped records");
+    }
+
+    /// A coordinate-sorted BAM of incompressible 150 bp reads every 100 bp of one contig.
+    fn write_dense_bam(path: &Path, records: u32) {
+        use rust_htslib::bam::{
+            Format, Header, Record, Writer,
+            header::HeaderRecord,
+            record::{Cigar, CigarString},
+        };
+
+        let mut header = Header::new();
+        header.push_record(
+            HeaderRecord::new(b"HD")
+                .push_tag(b"VN", "1.6")
+                .push_tag(b"SO", "coordinate"),
+        );
+        header.push_record(
+            HeaderRecord::new(b"SQ")
+                .push_tag(b"SN", "chr1")
+                .push_tag(b"LN", 16_000_000),
+        );
+        let mut writer = Writer::from_path(path, &header, Format::Bam).unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u32
+        };
+        let cigar = CigarString(vec![Cigar::Match(150)]);
+        for index in 0..records {
+            let sequence = (0..150)
+                .map(|_| b"ACGT"[(random() % 4) as usize])
+                .collect::<Vec<_>>();
+            let qualities = (0..150).map(|_| (random() % 41) as u8).collect::<Vec<_>>();
+            let mut record = Record::new();
+            record.set(
+                format!("read{index}").as_bytes(),
+                Some(&cigar),
+                &sequence,
+                &qualities,
+            );
+            record.set_tid(0);
+            record.set_pos(i64::from(index) * 100);
+            record.set_mapq(60);
+            record.set_flags(0);
+            writer.write(&record).unwrap();
+        }
+        drop(writer);
+        let index = format!("{}.bai", path.display());
+        rust_htslib::bam::index::build(
+            path,
+            Some(Path::new(&index)),
+            rust_htslib::bam::index::Type::Bai,
+            1,
+        )
+        .unwrap();
+    }
+
+    /// The compressed span of the index chunks of a region of the first contig, and their
+    /// number, derived from the BAI independently of the reader under test.
+    fn bai_compressed_span(index: &bam::bai::Index, start: usize, end: usize) -> (u64, u64, usize) {
+        let interval = noodles::core::Position::try_from(start + 1).unwrap()
+            ..=noodles::core::Position::try_from(end).unwrap();
+        let chunks = index.query(0, interval.into()).unwrap();
+        (
+            chunks
+                .iter()
+                .map(|chunk| chunk.start().compressed())
+                .min()
+                .unwrap(),
+            chunks
+                .iter()
+                .map(|chunk| chunk.end().compressed())
+                .max()
+                .unwrap(),
+            chunks.len(),
+        )
+    }
+
+    /// Queries a region remotely, checks it against the local source and against exact
+    /// request/byte accounting, and returns the BAM ranges the server sent for it.
+    fn query_and_served_ranges(
+        fixture: &BamFixture,
+        source: &mut RemoteBamAlignmentSource,
+        local: &mut LocalAlignmentSource,
+        start: u64,
+        end: u64,
+    ) -> (AlignmentQuery, Vec<(u64, u64)>) {
+        let interval = GenomicInterval::new(ContigId::new(0), start, end).unwrap();
+        let served = fixture.bam_ranges_after(0).len();
+        let before = source.remote_io_stats();
+        let query = source
+            .query(interval, QueryOptions::default(), &|| true)
+            .unwrap();
+        let expected = local
+            .query(interval, QueryOptions::default(), &|| true)
+            .unwrap();
+        assert_eq!(query.stats.records_seen, expected.stats.records_seen);
+        assert_eq!(query.batch.len(), expected.batch.len());
+        assert_eq!(
+            query.stats.records_eligible,
+            expected.stats.records_eligible
+        );
+        assert!(query.stats.records_eligible > 0);
+        let ranges = fixture.bam_ranges_after(served);
+        let after = source.remote_io_stats();
+        assert_eq!(after.requests - before.requests, ranges.len() as u64);
+        assert_eq!(
+            after.response_bytes - before.response_bytes,
+            ranges
+                .iter()
+                .map(|(start, end)| end - start + 1)
+                .sum::<u64>()
+        );
+        (query, ranges)
+    }
+
+    #[test]
+    fn remote_bam_fetches_index_chunks_instead_of_a_fixed_read_ahead_window() {
+        const BGZF_BLOCK: u64 = 64 * 1024;
+        const LEGACY_WINDOW: u64 = 8 * 256 * 1024;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dense.bam");
+        write_dense_bam(&path, 120_000);
+        let bam = fs::read(&path).unwrap();
+        let bam_length = bam.len() as u64;
+        assert!(
+            bam_length > 3 * LEGACY_WINDOW,
+            "fixture is only {bam_length} bytes"
+        );
+        let index_path = format!("{}.bai", path.display());
+        let index = bam::bai::io::Reader::new(File::open(&index_path).unwrap())
+            .read_index()
+            .unwrap();
+        let Some(fixture) = BamFixture::start(bam, fs::read(&index_path).unwrap()) else {
+            return;
+        };
+        // The production defaults: 8 x 256 KiB read-ahead for anything unplanned.
+        let options = AlignmentOpenOptions {
+            remote_index_url: Some(fixture.index_url.clone()),
+            ..AlignmentOpenOptions::default()
+        };
+        let mut source = RemoteBamAlignmentSource::open(&fixture.bam_url, &options).unwrap();
+        let mut local =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let implied_span = |start, end| bai_compressed_span(&index, start, end);
+        let mut run = |source: &mut RemoteBamAlignmentSource, start: u64, end: u64| {
+            query_and_served_ranges(&fixture, source, &mut local, start, end)
+        };
+
+        // A 2 kb region deep inside the file: one request starting at the first index chunk
+        // and a fraction of the old 2 MiB window.
+        let (small, ranges) = run(&mut source, 11_500_000, 11_502_000);
+        assert_eq!(small.stats.records_seen, 21);
+        let (first, last, chunk_count) = implied_span(11_500_000, 11_502_000);
+        assert!(chunk_count >= 1);
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        assert_eq!(ranges[0].0, first);
+        let transferred = ranges[0].1 - ranges[0].0 + 1;
+        assert!(
+            transferred <= (last - first) + BGZF_BLOCK,
+            "transferred {transferred} for an index span of {}",
+            last - first
+        );
+        assert!(
+            transferred < LEGACY_WINDOW / 4,
+            "a small region transferred {transferred} bytes"
+        );
+
+        // Revisiting it costs nothing.
+        let (_, ranges) = run(&mut source, 11_500_500, 11_501_500);
+        assert!(ranges.is_empty(), "{ranges:?}");
+
+        // A 9 Mb region spanning dozens of 256 KiB cache blocks, beyond the bytes the header
+        // read already cached: contiguous ranges that start at the first chunk, double from
+        // 2 MiB to 8 MiB and stop within one BGZF block of the last record needed, instead of
+        // one request per block or per 2 MiB window.
+        let (deep, ranges) = run(&mut source, 2_000_000, 11_000_000);
+        assert_eq!(deep.stats.records_seen, 90_001);
+        let (first, last, _) = implied_span(2_000_000, 11_000_000);
+        assert!(first > LEGACY_WINDOW);
+        let blocks = (last - first) / (256 * 1024);
+        assert!(blocks > 32, "the region spans only {blocks} cache blocks");
+        assert_eq!(ranges.len(), 4, "{blocks} blocks: {ranges:?}");
+        assert!((ranges.len() as u64) * 2 <= (last - first).div_ceil(LEGACY_WINDOW));
+        assert_eq!(ranges[0], (first, first + LEGACY_WINDOW - 1));
+        assert_eq!(
+            ranges[1],
+            (ranges[0].1 + 1, ranges[0].1 + 2 * LEGACY_WINDOW)
+        );
+        assert_eq!(
+            ranges[2],
+            (ranges[1].1 + 1, ranges[1].1 + 4 * LEGACY_WINDOW)
+        );
+        assert_eq!(ranges[3].0, ranges[2].1 + 1);
+        assert!(ranges[3].1 < bam_length);
+        let transferred = ranges
+            .iter()
+            .map(|(start, end)| end - start + 1)
+            .sum::<u64>();
+        assert!(
+            transferred <= (last - first) + BGZF_BLOCK,
+            "transferred {transferred} for an index span of {}",
+            last - first
+        );
     }
 
     #[test]

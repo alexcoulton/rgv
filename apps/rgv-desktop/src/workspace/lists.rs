@@ -1,4 +1,10 @@
-use super::super::*;
+use crate::inspection::read::truncate_string_to_bytes;
+use crate::{MAX_METADATA_FILTER_VALUES, MetadataTrackRow, QuantitativeBulkAction};
+use rgv_core::{
+    GenomicInterval, MAXIMUM_REVIEW_NOTE_BYTES, QuantitativeScaleMode, RegionOfInterest,
+    ReviewItem, ReviewStatus, SampleMetadataTable, SessionLocus, TrackConfig, TrackId, TrackKind,
+};
+use std::collections::BTreeSet;
 
 pub(crate) fn next_available_item_id(ids: impl IntoIterator<Item = u64>) -> Option<u64> {
     let used = ids.into_iter().collect::<BTreeSet<_>>();

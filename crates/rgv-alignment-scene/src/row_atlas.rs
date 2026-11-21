@@ -20,8 +20,13 @@ use crate::{
     EvidenceSelectionError, LayoutContract, LedgerError, PinnedAllocationLease, ReservationKind,
     RowAtlasRevision, RowCoordinateSpaceRevision,
     fingerprint::StableHasher,
-    row_oracle::{AlignmentRowGroup, OracleRowExtent, RowOracleError, build_row_oracle},
-    sampling::{SamplingCandidate, retained_by_sampling, sampling_priority, sampling_window},
+    row_oracle::{
+        AlignmentRowGroup, OracleRowExtent, RowOracleError, build_row_oracle, extend_row_order,
+    },
+    sampling::{
+        SamplingCandidate, retained_by_sampling, sampling_priority, sampling_window,
+        sampling_window_starts,
+    },
 };
 
 /// One immutable row assignment addressed by physical source identity.
@@ -273,72 +278,178 @@ struct RowActivityInterval {
 /// A camera cursor maintains the active set. Moving either camera edge visits only entries whose
 /// start/end predicate changed, rather than asking every canonical row whether it overlaps the
 /// new exact viewport.
+///
+/// The index is a directory of segments, one per atlas layer plus one for pair connectors. Each
+/// layer owns its own boundary orders, so extending an atlas shares every incumbent segment and
+/// sorts only the reads it admits.
 #[derive(Debug)]
 struct RowActivityIndex {
-    by_start: Arc<[RowActivityInterval]>,
-    end_order: Arc<[u32]>,
+    layers: Arc<[Arc<RowAtlasLayer>]>,
+    connectors: Arc<ConnectorIndex>,
+    /// First item id of each segment, then the total. The connector segment is last.
+    offsets: Box<[usize]>,
 }
 
 impl RowActivityIndex {
-    fn build(
-        layers: &[Arc<RowAtlasLayer>],
-        connectors: &[AlignmentRowConnector],
-    ) -> Result<Arc<Self>, AlignmentRowAtlasError> {
-        let record_count = layers
-            .iter()
-            .map(|layer| layer.records.len())
-            .sum::<usize>();
-        let mut by_start = Vec::with_capacity(record_count.saturating_add(connectors.len()));
-        for layer in layers {
-            by_start.extend(layer.records.iter().map(|record| RowActivityInterval {
+    fn new(layers: Arc<[Arc<RowAtlasLayer>]>, connectors: Arc<ConnectorIndex>) -> Arc<Self> {
+        let mut offsets = Vec::with_capacity(layers.len().saturating_add(2));
+        let mut total = 0_usize;
+        for layer in layers.iter() {
+            offsets.push(total);
+            total = total.saturating_add(layer.records.len());
+        }
+        offsets.push(total);
+        offsets.push(total.saturating_add(connectors.by_row.len()));
+        Arc::new(Self {
+            layers,
+            connectors,
+            offsets: offsets.into(),
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.offsets.last().copied().unwrap_or_default()
+    }
+
+    fn segment_count(&self) -> usize {
+        self.layers.len().saturating_add(1)
+    }
+
+    fn segment_offset(&self, segment: usize) -> usize {
+        self.offsets[segment]
+    }
+
+    /// Entry at `position` of the segment's start-ordered sequence.
+    fn entry(&self, segment: usize, position: usize) -> RowActivityInterval {
+        if let Some(layer) = self.layers.get(segment) {
+            let record = layer.records[layer.start_order[position] as usize];
+            RowActivityInterval {
                 start: record.start,
                 end: record.end,
                 row: record.row,
                 kind: RowActivityKind::Record,
-            }));
+            }
+        } else {
+            let connector = self.connectors.by_row[self.connectors.start_order[position] as usize];
+            RowActivityInterval {
+                start: connector.start,
+                end: connector.end,
+                row: connector.row,
+                kind: RowActivityKind::Connector,
+            }
         }
-        by_start.extend(connectors.iter().map(|connector| RowActivityInterval {
-            start: connector.start,
-            end: connector.end,
-            row: connector.row,
-            kind: RowActivityKind::Connector,
-        }));
-        by_start.sort_unstable_by_key(|entry| {
+    }
+
+    /// Position in the start-ordered sequence of the `order`th entry by end.
+    fn end_ordered(&self, segment: usize, order: usize) -> usize {
+        self.layers.get(segment).map_or_else(
+            || self.connectors.end_order[order] as usize,
+            |layer| layer.end_order[order] as usize,
+        )
+    }
+
+    fn segment_len(&self, segment: usize) -> usize {
+        self.offsets[segment.saturating_add(1)].saturating_sub(self.offsets[segment])
+    }
+
+    /// Number of the segment's entries starting before `end`.
+    fn start_partition(&self, segment: usize, end: u64) -> usize {
+        partition(self.segment_len(segment), |position| {
+            self.entry(segment, position).start < end
+        })
+    }
+
+    /// Number of the segment's entries, in end order, ending at or before `start`.
+    fn end_partition(&self, segment: usize, start: u64) -> usize {
+        partition(self.segment_len(segment), |order| {
+            self.entry(segment, self.end_ordered(segment, order)).end <= start
+        })
+    }
+}
+
+/// `partition_point` over `0..len` for a predicate on positions.
+fn partition(len: usize, predicate: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0_usize, len);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if predicate(middle) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+/// Pair connectors of one atlas with the orders its queries need.
+#[derive(Debug)]
+struct ConnectorIndex {
+    /// Ordered by `(row, start, end, template, left)`, so one row block is one slice.
+    by_row: Arc<[AlignmentRowConnector]>,
+    /// Indices into `by_row` ordered by `(start, end, row)`.
+    start_order: Arc<[u32]>,
+    /// Positions in `start_order` ordered by `(end, start, row)`.
+    end_order: Arc<[u32]>,
+}
+
+impl ConnectorIndex {
+    fn new(
+        mut connectors: Vec<AlignmentRowConnector>,
+    ) -> Result<Arc<Self>, AlignmentRowAtlasError> {
+        connectors.sort_by_key(|connector| {
             (
-                entry.start,
-                entry.end,
-                entry.row,
-                matches!(entry.kind, RowActivityKind::Connector),
+                connector.row,
+                connector.start,
+                connector.end,
+                connector.template,
+                connector.left,
             )
         });
-        let mut end_order = (0..by_start.len())
-            .map(|index| u32::try_from(index).map_err(|_| AlignmentRowAtlasError::IndexOverflow))
-            .collect::<Result<Vec<_>, _>>()?;
-        end_order.sort_unstable_by_key(|index| {
-            let entry = by_start[*index as usize];
-            (
-                entry.end,
-                entry.start,
-                entry.row,
-                matches!(entry.kind, RowActivityKind::Connector),
-            )
-        });
-        by_start.shrink_to_fit();
-        end_order.shrink_to_fit();
+        connectors.shrink_to_fit();
+        let (start_order, end_order) = boundary_orders(connectors.len(), |index| {
+            let connector = connectors[index];
+            (connector.start, connector.end, connector.row)
+        })?;
         Ok(Arc::new(Self {
-            by_start: by_start.into(),
-            end_order: end_order.into(),
+            by_row: connectors.into(),
+            start_order,
+            end_order,
         }))
     }
 
-    fn start_partition(&self, end: u64) -> usize {
-        self.by_start.partition_point(|entry| entry.start < end)
+    /// Connectors in `rows`, which are contiguous because the directory is row ordered.
+    fn in_rows(&self, rows: &Range<u32>) -> &[AlignmentRowConnector] {
+        let start = self
+            .by_row
+            .partition_point(|connector| connector.row < rows.start);
+        let end = self
+            .by_row
+            .partition_point(|connector| connector.row < rows.end);
+        &self.by_row[start..end.max(start)]
     }
+}
 
-    fn end_partition(&self, start: u64) -> usize {
-        self.end_order
-            .partition_point(|index| self.by_start[*index as usize].end <= start)
-    }
+/// Start order over some items and, over positions in it, end order.
+type BoundaryOrders = (Arc<[u32]>, Arc<[u32]>);
+
+/// Start order over `0..len` and, over positions in it, end order.
+fn boundary_orders(
+    len: usize,
+    key: impl Fn(usize) -> (u64, u64, u32),
+) -> Result<BoundaryOrders, AlignmentRowAtlasError> {
+    let mut start_order = (0..len)
+        .map(|index| u32::try_from(index).map_err(|_| AlignmentRowAtlasError::IndexOverflow))
+        .collect::<Result<Vec<_>, _>>()?;
+    start_order.sort_unstable_by_key(|index| {
+        let (start, end, row) = key(*index as usize);
+        (start, end, row, *index)
+    });
+    let mut end_order = (0..len as u32).collect::<Vec<_>>();
+    end_order.sort_unstable_by_key(|position| {
+        let (start, end, row) = key(start_order[*position as usize] as usize);
+        (end, start, row, *position)
+    });
+    Ok((start_order.into(), end_order.into()))
 }
 
 /// Work performed by the most recent exact camera-activity update.
@@ -470,7 +581,7 @@ impl AlignmentRowActivityCursor {
             row_coordinate_space: atlas.row_coordinate_space,
             atlas_interval: atlas.interval,
             stable_row_count: atlas.row_extents.len(),
-            active: vec![0; index.by_start.len().saturating_add(63) / 64],
+            active: vec![0; index.len().saturating_add(63) / 64],
             record_counts: vec![0; atlas.row_extents.len()],
             connector_counts: vec![0; atlas.row_extents.len()],
             occupied_rows: ActivityFenwick::new(atlas.row_extents.len()),
@@ -482,14 +593,20 @@ impl AlignmentRowActivityCursor {
             visible_connector_count: 0,
             last_update: AlignmentRowActivityUpdateStats::default(),
         };
-        let end = cursor.index.start_partition(interval.end());
-        for item in 0..end {
-            if cursor.index.by_start[item].end > interval.start() {
-                cursor.set_active(item, true);
+        let mut examined = 0_usize;
+        for segment in 0..cursor.index.segment_count() {
+            let offset = cursor.index.segment_offset(segment);
+            let end = cursor.index.start_partition(segment, interval.end());
+            examined = examined.saturating_add(end);
+            for position in 0..end {
+                let entry = cursor.index.entry(segment, position);
+                if entry.end > interval.start() {
+                    cursor.set_active(offset.saturating_add(position), entry, true);
+                }
             }
         }
         cursor.last_update = AlignmentRowActivityUpdateStats {
-            examined_intervals: end,
+            examined_intervals: examined,
             changed_intervals: cursor
                 .visible_record_count
                 .saturating_add(cursor.visible_connector_count),
@@ -519,25 +636,38 @@ impl AlignmentRowActivityCursor {
             self.last_update = AlignmentRowActivityUpdateStats::default();
             return true;
         }
-        let old_start_partition = self.index.start_partition(self.interval.end());
-        let new_start_partition = self.index.start_partition(interval.end());
-        let old_end_partition = self.index.end_partition(self.interval.start());
-        let new_end_partition = self.index.end_partition(interval.start());
         let mut examined = 0_usize;
         let mut changed = 0_usize;
-
-        let start_range = old_start_partition.min(new_start_partition)
-            ..old_start_partition.max(new_start_partition);
-        for item in start_range {
-            examined = examined.saturating_add(1);
-            changed = changed.saturating_add(usize::from(self.refresh_item(item, interval)));
-        }
-        let end_range =
-            old_end_partition.min(new_end_partition)..old_end_partition.max(new_end_partition);
-        for order_index in end_range {
-            examined = examined.saturating_add(1);
-            let item = self.index.end_order[order_index] as usize;
-            changed = changed.saturating_add(usize::from(self.refresh_item(item, interval)));
+        let index = Arc::clone(&self.index);
+        for segment in 0..index.segment_count() {
+            let offset = index.segment_offset(segment);
+            let old_start_partition = index.start_partition(segment, self.interval.end());
+            let new_start_partition = index.start_partition(segment, interval.end());
+            let old_end_partition = index.end_partition(segment, self.interval.start());
+            let new_end_partition = index.end_partition(segment, interval.start());
+            let start_range = old_start_partition.min(new_start_partition)
+                ..old_start_partition.max(new_start_partition);
+            for position in start_range {
+                examined = examined.saturating_add(1);
+                let entry = index.entry(segment, position);
+                changed = changed.saturating_add(usize::from(self.refresh_item(
+                    offset.saturating_add(position),
+                    entry,
+                    interval,
+                )));
+            }
+            let end_range =
+                old_end_partition.min(new_end_partition)..old_end_partition.max(new_end_partition);
+            for order in end_range {
+                examined = examined.saturating_add(1);
+                let position = index.end_ordered(segment, order);
+                let entry = index.entry(segment, position);
+                changed = changed.saturating_add(usize::from(self.refresh_item(
+                    offset.saturating_add(position),
+                    entry,
+                    interval,
+                )));
+            }
         }
         self.interval = interval;
         self.last_update = AlignmentRowActivityUpdateStats {
@@ -575,14 +705,18 @@ impl AlignmentRowActivityCursor {
         }
     }
 
-    fn refresh_item(&mut self, item: usize, interval: GenomicInterval) -> bool {
-        let entry = self.index.by_start[item];
+    fn refresh_item(
+        &mut self,
+        item: usize,
+        entry: RowActivityInterval,
+        interval: GenomicInterval,
+    ) -> bool {
         let should_be_active = entry.start < interval.end() && entry.end > interval.start();
         let is_active = self.is_active(item);
         if should_be_active == is_active {
             return false;
         }
-        self.set_active(item, should_be_active);
+        self.set_active(item, entry, should_be_active);
         true
     }
 
@@ -592,8 +726,7 @@ impl AlignmentRowActivityCursor {
             .is_some_and(|word| word & (1_u64 << (item % 64)) != 0)
     }
 
-    fn set_active(&mut self, item: usize, active: bool) {
-        let entry = self.index.by_start[item];
+    fn set_active(&mut self, item: usize, entry: RowActivityInterval, active: bool) {
         let word = &mut self.active[item / 64];
         let mask = 1_u64 << (item % 64);
         let was_active = *word & mask != 0;
@@ -657,6 +790,14 @@ pub(crate) struct RowAtlasLayer {
     /// Running maximum end within each row in `row_order`. This permits interval queries to stop
     /// before scanning the entire prefix when a row contains long reads.
     row_prefix_max_end: Arc<[u64]>,
+    /// Indices into `records` ordered by `(start, end, row)`: this layer's segment of the
+    /// atlas activity index, and the order read sampling counts window occupancy in.
+    start_order: Arc<[u32]>,
+    /// Positions in `start_order` ordered by `(end, start, row)`.
+    end_order: Arc<[u32]>,
+    /// This layer's order-independent share of the atlas assignment fingerprint.
+    fingerprint_xor: u64,
+    fingerprint_sum: u64,
     allocation: AllocationLease,
 }
 
@@ -695,14 +836,43 @@ impl RowAtlasLayer {
         records.shrink_to_fit();
         row_order.shrink_to_fit();
         row_prefix_max_end.shrink_to_fit();
-        let retained_bytes = layer_bytes(records.len(), row_order.len(), row_prefix_max_end.len());
+        let (start_order, end_order) = boundary_orders(records.len(), |index| {
+            let record = records[index];
+            (record.start, record.end, record.row)
+        })?;
+        let (mut fingerprint_xor, mut fingerprint_sum) = (0_u64, 0_u64);
+        for record in &records {
+            let mut hash = StableHasher::default();
+            write_handle(&mut hash, record.handle);
+            hash.write(&record.row.to_le_bytes());
+            hash.write(&record.start.to_le_bytes());
+            hash.write(&record.end.to_le_bytes());
+            let value = hash.finish().get();
+            fingerprint_xor ^= value.rotate_left((record.row % 63).saturating_add(1));
+            fingerprint_sum =
+                fingerprint_sum.wrapping_add(value.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        }
+        let retained_bytes = layer_bytes(records.len());
         let allocation = reservation.register(retained_bytes, publication_revision)?;
         Ok(Arc::new(Self {
             records: records.into(),
             row_order: row_order.into(),
             row_prefix_max_end: row_prefix_max_end.into(),
+            start_order,
+            end_order,
+            fingerprint_xor,
+            fingerprint_sum,
             allocation,
         }))
+    }
+
+    /// Records whose alignment starts in `starts`.
+    fn count_starting_in(&self, starts: Range<u64>) -> usize {
+        let before = |bound: u64| {
+            self.start_order
+                .partition_point(|index| self.records[*index as usize].start < bound)
+        };
+        before(starts.end).saturating_sub(before(starts.start))
     }
 
     pub(crate) const fn allocation(&self) -> &AllocationLease {
@@ -764,6 +934,28 @@ impl RowAtlasLayer {
     }
 }
 
+/// Geometric tail compaction starts once an atlas holds more than this many layers. Up to here
+/// an extension only appends; beyond it the two newest layers merge while the older of them is
+/// no more than twice the newer, which keeps the layer count logarithmic in the record count
+/// and the amortised merge work per record logarithmic too.
+const UNCOMPACTED_ROW_ATLAS_LAYERS: usize = 4;
+
+/// Work done to construct one atlas root, counted in record slots rather than time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentRowAtlasConstructionWork {
+    /// Record slots visited: selected from evidence, sorted into a new layer, merged by layer
+    /// compaction, or rewritten by a row reshuffle. A layered extension visits the reads of
+    /// the newly certified strip and whatever compaction merges; it never visits the rest.
+    pub records_visited: u64,
+    /// Records which received a row in this construction.
+    pub records_admitted: u64,
+    /// Layers merged into another by compaction.
+    pub layers_compacted: u32,
+    /// Incumbent rows changed: the atlas was rebuilt from evidence, or an ordered extension
+    /// had to permute rows. Either way the root has a new row-coordinate space.
+    pub rows_reassigned: bool,
+}
+
 /// Immutable, viewport-independent row authority.
 ///
 /// Extensions append private immutable layers and share every incumbent layer. No published map
@@ -781,8 +973,14 @@ pub struct AlignmentRowAtlas {
     layers: Arc<[Arc<RowAtlasLayer>]>,
     row_extents: Arc<[RowExtent]>,
     groups: Arc<[AlignmentRowGroup]>,
-    connectors: Arc<[AlignmentRowConnector]>,
+    connectors: Arc<ConnectorIndex>,
     activity_index: Arc<RowActivityIndex>,
+    /// Ordered layouts only (empty otherwise). Per row: the lane it was packed as within its
+    /// group, and the read that gives the row its sort priority. Together they let a rightward
+    /// extension keep packing and re-rank rows without consulting any other incumbent read.
+    row_packing: Arc<[u32]>,
+    row_best: Arc<[AlignmentHandle]>,
+    construction_work: AlignmentRowAtlasConstructionWork,
     record_count: usize,
     /// Eligible reads considered for rows, including any declined by read sampling.
     eligible_record_count: usize,
@@ -804,7 +1002,7 @@ impl AlignmentRowAtlas {
         let maximum_records = maximum_selected_records(evidence, interval);
         let layer_reservation = ledger.reserve(
             AllocationClass::RowAtlas,
-            layer_bytes(maximum_records, maximum_records, maximum_records),
+            layer_bytes(maximum_records),
             reservation_kind,
         )?;
         let oracle = build_row_oracle(evidence, interval, layout_contract)?;
@@ -813,14 +1011,18 @@ impl AlignmentRowAtlas {
             .iter()
             .map(crate::row_oracle::OracleGroup::retained_bytes)
             .sum::<usize>();
+        let retains_order = retains_row_order(layout_contract);
         let metadata_reservation = ledger.reserve(
             AllocationClass::RowAtlas,
             atlas_metadata_bytes(oracle.extents.len(), 1)
                 .saturating_add(retained_group_bytes)
                 .saturating_add(connector_bytes(oracle.connectors.len()))
-                .saturating_add(activity_index_bytes(
-                    maximum_records.saturating_add(oracle.connectors.len()),
-                )),
+                .saturating_add(activity_index_bytes(1, oracle.connectors.len()))
+                .saturating_add(if retains_order {
+                    ordered_rows_bytes(oracle.extents.len())
+                } else {
+                    0
+                }),
             reservation_kind,
         )?;
         let record_count = oracle.assignments.len();
@@ -841,18 +1043,25 @@ impl AlignmentRowAtlas {
             .into_iter()
             .map(crate::row_oracle::OracleGroup::into_retained)
             .collect();
-        let connectors = oracle
-            .connectors
-            .into_iter()
-            .map(|connector| AlignmentRowConnector {
-                template: connector.template,
-                left: connector.left,
-                right: connector.right,
-                row: connector.row,
-                start: connector.start,
-                end: connector.end,
-            })
-            .collect();
+        let connectors = ConnectorIndex::new(
+            oracle
+                .connectors
+                .into_iter()
+                .map(|connector| AlignmentRowConnector {
+                    template: connector.template,
+                    left: connector.left,
+                    right: connector.right,
+                    row: connector.row,
+                    start: connector.start,
+                    end: connector.end,
+                })
+                .collect(),
+        )?;
+        let (row_packing, row_best) = if retains_order {
+            (oracle.row_packing, oracle.row_best)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let layer = RowAtlasLayer::new(records, layer_reservation, publication_revision)?;
         Self::from_parts(
             revision,
@@ -867,8 +1076,16 @@ impl AlignmentRowAtlas {
             row_extents,
             groups,
             connectors,
+            row_packing,
+            row_best,
             record_count,
             eligible_record_count,
+            AlignmentRowAtlasConstructionWork {
+                records_visited: (eligible_record_count as u64).saturating_add(record_count as u64),
+                records_admitted: record_count as u64,
+                layers_compacted: 0,
+                rows_reassigned: true,
+            },
             metadata_reservation,
             publication_revision,
         )
@@ -876,9 +1093,32 @@ impl AlignmentRowAtlas {
 
     /// Extends a canonical atlas without selecting or repacking incumbent records.
     ///
-    /// Compact left extension is rebuilt canonically because inserting a prefix can change every
-    /// compact row. Stable left extension freezes incumbent rows and places only new handles.
-    #[allow(clippy::too_many_arguments)]
+    /// The cost is proportional to the reads of the newly certified strip plus a bounded layer
+    /// merge ([`AlignmentRowAtlasConstructionWork`] reports it). Which layouts extend in place:
+    ///
+    /// * **Default order** (no grouping, sorted by start, not paired). Rightwards always;
+    ///   leftwards under stable stacking, which freezes incumbent rows. Compact left extension
+    ///   is rebuilt canonically because inserting a prefix can change every compact row.
+    /// * **Sorted and/or grouped, not paired.** Rightwards only. New reads start after every
+    ///   incumbent read of their group, so the incumbent interval colouring is a prefix of the
+    ///   new one and only the new reads are packed. Rows are then ranked by their best read
+    ///   exactly as a clean build ranks them, so the result equals a clean build. Incumbent row
+    ///   indices are kept, and the row-coordinate space with them, unless that ranking moves
+    ///   one, which happens exactly when
+    ///   1. a new row ranks before an incumbent row (a new read that fits no incumbent lane
+    ///      and outranks some row's best read, or one that opens or grows a group which is not
+    ///      last in group order), or
+    ///   2. a new read placed in an incumbent lane outranks that row's best read by enough to
+    ///      pass a neighbouring row.
+    ///
+    ///   In those cases the sort contract itself requires the move: incumbent records are
+    ///   rewritten with their new rows (no evidence is re-read and nothing is re-sorted
+    ///   except the row ranking) and the root gets a new row-coordinate space. A leftward
+    ///   extension of an ordered layout is rebuilt.
+    /// * **View as pairs.** Always rebuilt: a mate arriving in the new strip joins an
+    ///   incumbent template, changing that template's extent and connector, so the incumbent
+    ///   packing is not a prefix of the new one.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn extend(
         self: &Arc<Self>,
         revision: RowAtlasRevision,
@@ -892,9 +1132,13 @@ impl AlignmentRowAtlas {
         if target == self.interval {
             return Ok(Arc::clone(self));
         }
-        if !supports_layered_extension(self.layout_contract)
-            || (self.layout_contract.stacking == ReadStackingMode::Compact
-                && target.start() < self.interval.start())
+        let ordered = !supports_layered_extension(self.layout_contract);
+        let extends_left = target.start() < self.interval.start();
+        if (ordered
+            && (extends_left
+                || !retains_row_order(self.layout_contract)
+                || self.row_packing.len() != self.row_extents.len()))
+            || (self.layout_contract.stacking == ReadStackingMode::Compact && extends_left)
         {
             return Self::build(
                 revision,
@@ -911,32 +1155,45 @@ impl AlignmentRowAtlas {
             maximum_selected_records(evidence, target).saturating_sub(self.record_count);
         let layer_reservation = ledger.reserve(
             AllocationClass::RowAtlas,
-            layer_bytes(maximum_records, maximum_records, maximum_records),
+            layer_bytes(maximum_records),
             reservation_kind,
         )?;
+        let maximum_rows = self.row_extents.len().saturating_add(maximum_records);
         let metadata_reservation = ledger.reserve(
             AllocationClass::RowAtlas,
-            atlas_metadata_bytes(
-                self.row_extents.len().saturating_add(maximum_records),
-                self.layers.len().saturating_add(1),
-            )
-            .saturating_add(size_of::<AlignmentRowGroup>())
-            .saturating_add(activity_index_bytes(
-                self.record_count.saturating_add(maximum_records),
-            )),
+            atlas_metadata_bytes(maximum_rows, self.layers.len().saturating_add(1))
+                .saturating_add(row_group_bytes(&self.groups))
+                .saturating_add(if ordered {
+                    // Every new read may open a group of its own, labelled by a tag value.
+                    maximum_records
+                        .saturating_mul(size_of::<AlignmentRowGroup>() + MAXIMUM_GROUP_LABEL_BYTES)
+                } else {
+                    size_of::<AlignmentRowGroup>()
+                })
+                .saturating_add(connector_bytes(self.connectors.by_row.len()))
+                .saturating_add(activity_index_bytes(
+                    self.layers.len().saturating_add(1),
+                    self.connectors.by_row.len(),
+                ))
+                .saturating_add(if ordered {
+                    ordered_rows_bytes(maximum_rows)
+                } else {
+                    0
+                }),
             reservation_kind,
         )?;
 
+        let mut work = AlignmentRowAtlasConstructionWork::default();
         let mut novel = Vec::<RowInput>::new();
-        if target.start() < self.interval.start() {
+        if extends_left {
             let left = GenomicInterval::new(target.contig(), target.start(), self.interval.start())
                 .map_err(|_| AlignmentRowAtlasError::InvalidExtensionInterval)?;
-            self.collect_novel(evidence, left, target, &mut novel)?;
+            self.collect_novel(evidence, left, target, &mut novel, &mut work)?;
         }
         if target.end() > self.interval.end() {
             let right = GenomicInterval::new(target.contig(), self.interval.end(), target.end())
                 .map_err(|_| AlignmentRowAtlasError::InvalidExtensionInterval)?;
-            self.collect_novel(evidence, right, target, &mut novel)?;
+            self.collect_novel(evidence, right, target, &mut novel, &mut work)?;
         }
         novel.sort_unstable_by_key(|record| (record.start, record.end, record.handle));
         novel.dedup_by_key(|record| record.handle);
@@ -952,6 +1209,24 @@ impl AlignmentRowAtlas {
                 });
             }
         }
+        work.records_admitted = novel.len() as u64;
+        work.records_visited = work.records_visited.saturating_add(novel.len() as u64);
+
+        if ordered {
+            return self.extend_ordered(
+                revision,
+                evidence,
+                target,
+                &novel,
+                eligible_record_count,
+                work,
+                layer_reservation,
+                metadata_reservation,
+                ledger,
+                reservation_kind,
+                publication_revision,
+            );
+        }
 
         let mut extents = self.row_extents.to_vec();
         let records = assign_extension_rows(&novel, &mut extents, self.interval)?;
@@ -962,6 +1237,13 @@ impl AlignmentRowAtlas {
                 layer_reservation,
                 publication_revision,
             )?);
+            compact_layers(
+                &mut layers,
+                ledger,
+                reservation_kind,
+                publication_revision,
+                &mut work,
+            )?;
         }
         let row_count =
             u32::try_from(extents.len()).map_err(|_| AlignmentRowAtlasError::IndexOverflow)?;
@@ -977,9 +1259,144 @@ impl AlignmentRowAtlas {
             layers,
             extents,
             vec![AlignmentRowGroup::all(row_count)],
+            Arc::clone(&self.connectors),
+            Vec::new(),
             Vec::new(),
             self.record_count.saturating_add(novel.len()),
             eligible_record_count,
+            work,
+            metadata_reservation,
+            publication_revision,
+        )
+    }
+
+    /// Rightward extension of a sorted and/or grouped, unpaired layout. See [`Self::extend`].
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn extend_ordered(
+        self: &Arc<Self>,
+        revision: RowAtlasRevision,
+        evidence: &Arc<EvidenceRoot>,
+        target: GenomicInterval,
+        novel: &[RowInput],
+        eligible_record_count: usize,
+        mut work: AlignmentRowAtlasConstructionWork,
+        layer_reservation: AllocationReservation,
+        metadata_reservation: AllocationReservation,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, AlignmentRowAtlasError> {
+        for record in novel {
+            validate_record(*record)?;
+        }
+        let incumbent_extents = self
+            .row_extents
+            .iter()
+            .map(|extent| OracleRowExtent {
+                minimum_start: extent.minimum_start,
+                maximum_end: extent.maximum_end,
+                record_count: extent.record_count,
+            })
+            .collect::<Vec<_>>();
+        let extension = extend_row_order(
+            evidence,
+            target,
+            self.layout_contract,
+            &self.groups,
+            &incumbent_extents,
+            &self.row_packing,
+            &self.row_best,
+            &novel
+                .iter()
+                .map(|record| (record.handle, record.start, record.end))
+                .collect::<Vec<_>>(),
+            reservation_kind,
+        )?;
+        // The ranking read the new reads and one priority read per row.
+        work.records_visited = work
+            .records_visited
+            .saturating_add(novel.len().saturating_add(self.row_best.len()) as u64);
+        let novel_records = novel
+            .iter()
+            .zip(&extension.novel_rows)
+            .map(|(record, row)| RowAtlasRecord {
+                handle: record.handle,
+                row: *row,
+                start: record.start,
+                end: record.end,
+            })
+            .collect::<Vec<_>>();
+        let (layers, row_coordinate_space) = if let Some(remap) = &extension.remap {
+            // The sort contract moved incumbent rows. Rewrite their row numbers in one pass;
+            // this reads no evidence and re-sorts nothing but the new layer's own indices.
+            drop(layer_reservation);
+            let total = self.record_count.saturating_add(novel_records.len());
+            let reservation = ledger.reserve(
+                AllocationClass::RowAtlas,
+                layer_bytes(total),
+                reservation_kind,
+            )?;
+            let mut records = Vec::with_capacity(total);
+            for layer in self.layers.iter() {
+                records.extend(layer.records.iter().map(|record| RowAtlasRecord {
+                    row: remap[record.row as usize],
+                    ..*record
+                }));
+            }
+            records.extend(novel_records);
+            work.records_visited = work.records_visited.saturating_add(total as u64);
+            work.layers_compacted = work
+                .layers_compacted
+                .saturating_add(u32::try_from(self.layers.len()).unwrap_or(u32::MAX));
+            work.rows_reassigned = true;
+            (
+                vec![RowAtlasLayer::new(
+                    records,
+                    reservation,
+                    publication_revision,
+                )?],
+                RowCoordinateSpaceRevision::new(revision.fingerprint()),
+            )
+        } else {
+            let mut layers = self.layers.to_vec();
+            if !novel_records.is_empty() {
+                layers.push(RowAtlasLayer::new(
+                    novel_records,
+                    layer_reservation,
+                    publication_revision,
+                )?);
+                compact_layers(
+                    &mut layers,
+                    ledger,
+                    reservation_kind,
+                    publication_revision,
+                    &mut work,
+                )?;
+            }
+            (layers, self.row_coordinate_space)
+        };
+        Self::from_parts(
+            revision,
+            row_coordinate_space,
+            evidence.revision(),
+            self.source_revision,
+            self.record_contract,
+            self.view_filter,
+            self.layout_contract,
+            target,
+            layers,
+            extension.extents.into_iter().map(RowExtent::from).collect(),
+            extension
+                .groups
+                .into_iter()
+                .map(crate::row_oracle::OracleGroup::into_retained)
+                .collect(),
+            Arc::clone(&self.connectors),
+            extension.row_packing,
+            extension.row_best,
+            self.record_count.saturating_add(novel.len()),
+            eligible_record_count,
+            work,
             metadata_reservation,
             publication_revision,
         )
@@ -995,27 +1412,32 @@ impl AlignmentRowAtlas {
         view_filter: ContractFingerprint,
         layout_contract: LayoutContract,
         interval: GenomicInterval,
-        mut layers: Vec<Arc<RowAtlasLayer>>,
+        layers: Vec<Arc<RowAtlasLayer>>,
         mut row_extents: Vec<RowExtent>,
         mut groups: Vec<AlignmentRowGroup>,
-        mut connectors: Vec<AlignmentRowConnector>,
+        connectors: Arc<ConnectorIndex>,
+        mut row_packing: Vec<u32>,
+        mut row_best: Vec<AlignmentHandle>,
         record_count: usize,
         eligible_record_count: usize,
+        construction_work: AlignmentRowAtlasConstructionWork,
         mut metadata_reservation: AllocationReservation,
         publication_revision: u64,
     ) -> Result<Arc<Self>, AlignmentRowAtlasError> {
-        layers.shrink_to_fit();
         row_extents.shrink_to_fit();
         groups.shrink_to_fit();
-        connectors.shrink_to_fit();
-        let activity_index = RowActivityIndex::build(&layers, &connectors)?;
+        row_packing.shrink_to_fit();
+        row_best.shrink_to_fit();
+        let layers: Arc<[Arc<RowAtlasLayer>]> = layers.into();
         let assignment_fingerprint = assignment_fingerprint(layout_contract, &layers, record_count);
         let retained_bytes = atlas_metadata_bytes(row_extents.len(), layers.len())
             .saturating_add(row_group_bytes(&groups))
-            .saturating_add(connector_bytes(connectors.len()))
-            .saturating_add(activity_index_bytes(activity_index.by_start.len()));
+            .saturating_add(connector_bytes(connectors.by_row.len()))
+            .saturating_add(activity_index_bytes(layers.len(), connectors.by_row.len()))
+            .saturating_add(ordered_rows_bytes(row_packing.len()));
         let metadata_allocation =
             metadata_reservation.register(retained_bytes, publication_revision)?;
+        let activity_index = RowActivityIndex::new(Arc::clone(&layers), Arc::clone(&connectors));
         Ok(Arc::new(Self {
             revision,
             row_coordinate_space,
@@ -1025,11 +1447,14 @@ impl AlignmentRowAtlas {
             view_filter,
             layout_contract,
             interval,
-            layers: layers.into(),
+            layers,
             row_extents: row_extents.into(),
             groups: groups.into(),
-            connectors: connectors.into(),
+            connectors,
             activity_index,
+            row_packing: row_packing.into(),
+            row_best: row_best.into(),
+            construction_work,
             record_count,
             eligible_record_count,
             assignment_fingerprint,
@@ -1066,9 +1491,11 @@ impl AlignmentRowAtlas {
         interval: GenomicInterval,
         extension: GenomicInterval,
         target: &mut Vec<RowInput>,
+        work: &mut AlignmentRowAtlasConstructionWork,
     ) -> Result<(), AlignmentRowAtlasError> {
         let sampled = self.layout_contract.sampling.is_downsampled();
         let selection = evidence.select(interval)?;
+        work.records_visited = work.records_visited.saturating_add(selection.len() as u64);
         // Novel reads whose mate may overlap the incumbent interval: (position in `target`,
         // template priority, mate start). Such a mate was already given or declined a row.
         let mut incumbent_mates = Vec::<(usize, u64, u64)>::new();
@@ -1105,7 +1532,7 @@ impl AlignmentRowAtlas {
                 decided: None,
             });
         }
-        self.resolve_incumbent_mate_decisions(evidence, extension, &incumbent_mates, target)
+        self.resolve_incumbent_mate_decisions(evidence, extension, &incumbent_mates, target, work)
     }
 
     /// Carries the incumbent atlas's sampling decision across an extension seam. A novel read
@@ -1117,6 +1544,7 @@ impl AlignmentRowAtlas {
         extension: GenomicInterval,
         incumbent_mates: &[(usize, u64, u64)],
         target: &mut [RowInput],
+        work: &mut AlignmentRowAtlasConstructionWork,
     ) -> Result<(), AlignmentRowAtlasError> {
         let (Some(first), Some(last)) = (
             incumbent_mates.iter().map(|(_, _, start)| *start).min(),
@@ -1139,6 +1567,7 @@ impl AlignmentRowAtlas {
             .map(|(_, priority, start)| (*priority, *start))
             .collect::<HashSet<_>>();
         let selection = evidence.select(band)?;
+        work.records_visited = work.records_visited.saturating_add(selection.len() as u64);
         let mut decisions = HashMap::<(u64, u64), bool>::with_capacity(wanted.len());
         for (index, reference) in selection.records().iter().enumerate() {
             let view = selection
@@ -1171,14 +1600,18 @@ impl AlignmentRowAtlas {
             .filter_map(|record| sampling_window(sampling, record.start))
             .map(|window| (window, 0_u32))
             .collect::<HashMap<_, _>>();
-        for layer in self.layers.iter() {
-            for record in layer.records.iter() {
-                if let Some(count) = sampling_window(sampling, record.start)
-                    .and_then(|window| occupied.get_mut(&window))
-                {
-                    *count = count.saturating_add(1);
-                }
-            }
+        // Incumbent occupancy of just the windows the new reads start in, read off each
+        // layer's start order instead of scanning every incumbent record.
+        for (window, count) in &mut occupied {
+            let Some(starts) = sampling_window_starts(sampling, *window) else {
+                continue;
+            };
+            let incumbents = self
+                .layers
+                .iter()
+                .map(|layer| layer.count_starting_in(starts.clone()))
+                .sum::<usize>();
+            *count = u32::try_from(incumbents).unwrap_or(u32::MAX);
         }
         let candidates = novel
             .iter()
@@ -1307,6 +1740,8 @@ impl AlignmentRowAtlas {
         &self.groups
     }
 
+    /// Connectors crossing `interval` in `rows`, in `(row, start, end)` order. The directory
+    /// is row ordered, so this reads one row block's slice rather than every connector.
     #[must_use]
     pub fn connectors_for_rows(
         &self,
@@ -1316,14 +1751,14 @@ impl AlignmentRowAtlas {
         if interval.contig() != self.interval.contig() {
             return Vec::new();
         }
-        let mut connectors =
-            Vec::with_capacity(self.connector_count_for_rows(rows.clone(), interval));
-        connectors.extend(self.connectors.iter().filter(|connector| {
-            rows.contains(&connector.row)
-                && connector.start < interval.end()
-                && connector.end > interval.start()
-        }));
-        connectors
+        self.connectors
+            .in_rows(&rows)
+            .iter()
+            .filter(|connector| {
+                connector.start < interval.end() && connector.end > interval.start()
+            })
+            .copied()
+            .collect()
     }
 
     #[must_use]
@@ -1332,13 +1767,18 @@ impl AlignmentRowAtlas {
             return 0;
         }
         self.connectors
+            .in_rows(&rows)
             .iter()
             .filter(|connector| {
-                rows.contains(&connector.row)
-                    && connector.start < interval.end()
-                    && connector.end > interval.start()
+                connector.start < interval.end() && connector.end > interval.start()
             })
             .count()
+    }
+
+    /// Work done to construct this root. An extension reports only what it visited.
+    #[must_use]
+    pub const fn construction_work(&self) -> AlignmentRowAtlasConstructionWork {
+        self.construction_work
     }
 
     #[must_use]
@@ -1696,6 +2136,51 @@ const fn supports_layered_extension(contract: LayoutContract) -> bool {
         && contract.promoted_template.is_none()
 }
 
+/// Ordered layouts whose rightward extension is incremental: everything but view-as-pairs.
+const fn retains_row_order(contract: LayoutContract) -> bool {
+    !supports_layered_extension(contract) && !contract.view_as_pairs
+}
+
+/// Reserved per potential new group label. A SAM tag value can be longer; the metadata
+/// registration then fails cleanly rather than under-charging.
+const MAXIMUM_GROUP_LABEL_BYTES: usize = 64;
+
+/// Merges the two newest layers while the atlas is past its uncompacted allowance and the
+/// older of the two is no more than twice the newer. Compaction is an optimisation: when the
+/// ledger cannot admit the merged layer the atlas simply keeps its layers.
+fn compact_layers(
+    layers: &mut Vec<Arc<RowAtlasLayer>>,
+    ledger: &AllocationLedger,
+    reservation_kind: ReservationKind,
+    publication_revision: u64,
+    work: &mut AlignmentRowAtlasConstructionWork,
+) -> Result<(), AlignmentRowAtlasError> {
+    while layers.len() > UNCOMPACTED_ROW_ATLAS_LAYERS {
+        let newer = &layers[layers.len() - 1];
+        let older = &layers[layers.len() - 2];
+        if older.records.len() > newer.records.len().saturating_mul(2) {
+            break;
+        }
+        let merged = older.records.len().saturating_add(newer.records.len());
+        let Ok(reservation) = ledger.reserve(
+            AllocationClass::RowAtlas,
+            layer_bytes(merged),
+            reservation_kind,
+        ) else {
+            break;
+        };
+        let mut records = Vec::with_capacity(merged);
+        records.extend_from_slice(&older.records);
+        records.extend_from_slice(&newer.records);
+        let layer = RowAtlasLayer::new(records, reservation, publication_revision)?;
+        work.records_visited = work.records_visited.saturating_add(merged as u64);
+        work.layers_compacted = work.layers_compacted.saturating_add(1);
+        layers.truncate(layers.len() - 2);
+        layers.push(layer);
+    }
+    Ok(())
+}
+
 fn maximum_selected_records(evidence: &EvidenceRoot, interval: GenomicInterval) -> usize {
     evidence
         .exact_filter_provenance(interval)
@@ -1703,11 +2188,13 @@ fn maximum_selected_records(evidence: &EvidenceRoot, interval: GenomicInterval) 
         .unwrap_or_else(|| evidence.record_count_upper_bound())
 }
 
-const fn layer_bytes(records: usize, row_order: usize, prefix: usize) -> usize {
-    size_of::<RowAtlasLayer>()
-        .saturating_add(records.saturating_mul(size_of::<RowAtlasRecord>()))
-        .saturating_add(row_order.saturating_mul(size_of::<u32>()))
-        .saturating_add(prefix.saturating_mul(size_of::<u64>()))
+/// Retained bytes of one layer: its records, the row order and running maximum end, and the
+/// two activity boundary orders.
+const fn layer_bytes(records: usize) -> usize {
+    size_of::<RowAtlasLayer>().saturating_add(
+        records
+            .saturating_mul(size_of::<RowAtlasRecord>() + size_of::<u32>() * 3 + size_of::<u64>()),
+    )
 }
 
 const fn atlas_metadata_bytes(rows: usize, layers: usize) -> usize {
@@ -1724,12 +2211,22 @@ const fn connector_bytes(connectors: usize) -> usize {
     connectors.saturating_mul(size_of::<AlignmentRowConnector>())
 }
 
-const fn activity_index_bytes(items: usize) -> usize {
+/// Retained bytes of the activity directory and the connector orders. Each layer's activity
+/// orders are part of [`layer_bytes`].
+const fn activity_index_bytes(layers: usize, connectors: usize) -> usize {
     size_of::<RowActivityIndex>()
-        .saturating_add(items.saturating_mul(size_of::<RowActivityInterval>()))
-        .saturating_add(items.saturating_mul(size_of::<u32>()))
+        .saturating_add(size_of::<ConnectorIndex>())
+        .saturating_add(layers.saturating_add(2).saturating_mul(size_of::<usize>()))
+        .saturating_add(connectors.saturating_mul(size_of::<u32>() * 2))
 }
 
+/// Retained bytes of the per-row packing lane and priority read kept by ordered layouts.
+const fn ordered_rows_bytes(rows: usize) -> usize {
+    rows.saturating_mul(size_of::<u32>() + size_of::<AlignmentHandle>())
+}
+
+/// Combines each layer's order-independent share, computed once when the layer was built, so
+/// an extension hashes only the reads it admits.
 fn assignment_fingerprint(
     contract: LayoutContract,
     layers: &[Arc<RowAtlasLayer>],
@@ -1738,16 +2235,8 @@ fn assignment_fingerprint(
     let mut xor = 0_u64;
     let mut sum = 0_u64;
     for layer in layers {
-        for record in layer.records.iter() {
-            let mut hash = StableHasher::default();
-            write_handle(&mut hash, record.handle);
-            hash.write(&record.row.to_le_bytes());
-            hash.write(&record.start.to_le_bytes());
-            hash.write(&record.end.to_le_bytes());
-            let value = hash.finish().get();
-            xor ^= value.rotate_left((record.row % 63).saturating_add(1));
-            sum = sum.wrapping_add(value.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        }
+        xor ^= layer.fingerprint_xor;
+        sum = sum.wrapping_add(layer.fingerprint_sum);
     }
     let mut hash = StableHasher::default();
     hash.write(b"alignment-row-atlas-v1\0");

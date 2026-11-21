@@ -19,7 +19,7 @@ use rgv_hts::{
     ProductionAlignmentSource, QueryOptions,
 };
 
-use crate::alignment_scene_coordinator::coordinator_budget_pressure;
+use crate::alignment_scene_coordinator::{coordinator_budget_pressure, source_allocation_pressure};
 use crate::{
     AlignmentCoordinatorEviction, AlignmentCoordinatorFrame, AlignmentCoordinatorPressure,
     AlignmentCoordinatorUpdate, AlignmentReferenceAuthority, AlignmentSceneBuildContract,
@@ -29,7 +29,7 @@ use crate::{
     SourceOwnerId,
     mailbox::{
         CoalescingReceiver, CoalescingSender, TryMailboxSendError, bounded_coalescing,
-        bounded_coalescing_to_ui, run_thread_root,
+        bounded_coalescing_to_ui, reap_worker, run_thread_root,
     },
 };
 
@@ -664,24 +664,11 @@ where
     }
 
     /// Closes the worker without joining on the caller, matching desktop track-removal semantics.
+    /// The returned handle is the reaper which joins the worker; it finishes when the worker
+    /// has exited. `None` means the worker had already exited.
     #[must_use]
     pub fn retire(mut self) -> Option<JoinHandle<()>> {
-        self.input.take();
-        self.output.close();
-        let worker = self.worker.take()?;
-        match thread::Builder::new()
-            .name("rgv-alignment-scene-reaper".to_owned())
-            .spawn(move || {
-                if worker.join().is_err() {
-                    tracing::warn!("unified alignment scene worker panicked while retiring");
-                }
-            }) {
-            Ok(reaper) => Some(reaper),
-            Err(error) => {
-                tracing::warn!(%error, "could not spawn unified scene reaper; worker detached");
-                None
-            }
-        }
+        self.signal_shutdown()
     }
 
     fn try_control(
@@ -823,18 +810,32 @@ fn local_bam_worker(
     );
 }
 
+impl<B> AlignmentSceneEngine<B>
+where
+    B: CanonicalAlignmentSourceBackend,
+{
+    /// Stops accepting requests, closes the event queue, and hands the worker to a reaper.
+    /// Never blocks: the worker notices the closed queues at its next turn, and any source I/O
+    /// it is in the middle of is waited for by the reaper, not by this caller.
+    fn signal_shutdown(&mut self) -> Option<JoinHandle<()>> {
+        self.input.take();
+        self.output.close();
+        reap_worker(
+            self.worker.take()?,
+            "rgv-alignment-scene-reaper",
+            "unified alignment scene",
+        )
+    }
+}
+
 impl<B> Drop for AlignmentSceneEngine<B>
 where
     B: CanonicalAlignmentSourceBackend,
 {
+    /// Dropping is `retire` without a handle: it signals the worker and returns. A path which
+    /// forgets to retire explicitly therefore cannot block its thread on in-flight source I/O.
     fn drop(&mut self) {
-        self.input.take();
-        self.output.close();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            tracing::warn!("unified alignment scene worker panicked while shutting down");
-        }
+        drop(self.signal_shutdown());
     }
 }
 
@@ -975,6 +976,8 @@ fn merge_inactive_eviction(
 enum WorkerTurn {
     /// Build a missing visible row block.
     ForegroundPresentation,
+    /// Run one stage of a lane's scene build from cached evidence.
+    SceneBuild,
     /// Apply a source control or advance a foreground decode.
     ForegroundSource,
     /// Release one bounded quantum of inactive cache.
@@ -993,6 +996,7 @@ enum WorkerTurn {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct WorkerDemand {
     foreground_presentation: bool,
+    scene_build: bool,
     foreground_source: bool,
     reclaim: bool,
     speculative_source: bool,
@@ -1000,7 +1004,9 @@ struct WorkerDemand {
 }
 
 /// The worker's whole scheduling policy. Requests are always drained first by the caller; then
-/// visible presentation, visible source work, cache reclaim, and finally optional work. The one
+/// visible presentation, staged scene builds (a bounded number of stages which turn evidence
+/// that is already cached into a scene), visible source work, cache reclaim, and finally
+/// optional work. The one
 /// exception keeps the order from becoming starvation: a reclaim passed over
 /// `MAXIMUM_RECLAIM_DEFERRALS` times in a row gets a single quantum.
 fn next_worker_turn(demand: WorkerDemand, reclaim_deferrals: u32) -> WorkerTurn {
@@ -1008,6 +1014,8 @@ fn next_worker_turn(demand: WorkerDemand, reclaim_deferrals: u32) -> WorkerTurn 
         WorkerTurn::Reclaim
     } else if demand.foreground_presentation {
         WorkerTurn::ForegroundPresentation
+    } else if demand.scene_build {
+        WorkerTurn::SceneBuild
     } else if demand.foreground_source {
         WorkerTurn::ForegroundSource
     } else if demand.reclaim {
@@ -1042,6 +1050,9 @@ fn scene_worker_loop<B>(
 {
     let mut request_tokens = BTreeMap::new();
     let mut pending_eviction = None;
+    // Scene builds from cached evidence run one stage per turn, so every request below is
+    // serviced within one stage instead of behind a whole build.
+    coordinator.set_staged_scene_builds(true);
     // A backend that wakes this mailbox when a decoded unit is ready lets the worker sleep
     // instead of polling it.
     let source_wait = if coordinator
@@ -1085,20 +1096,25 @@ fn scene_worker_loop<B>(
         // other runnable work goes first, and with none the worker sleeps below.
         let source_runnable = source_pending && !source_was_waiting;
         let reclaim = pending_eviction.is_some();
+        let scene_build = coordinator.has_pending_scene_build();
         let demand = WorkerDemand {
             foreground_presentation,
+            scene_build,
             foreground_source: source_runnable && foreground_source,
             reclaim,
             speculative_source: source_runnable && !foreground_source,
             // Only consulted when nothing above it is runnable, and the costliest to answer.
             optional_presentation: !foreground_presentation
+                && !scene_build
                 && !source_runnable
                 && !reclaim
                 && coordinator.has_pending_presentation_work(),
         };
         let turn = next_worker_turn(demand, reclaim_deferrals);
         reclaim_deferrals = match turn {
-            WorkerTurn::ForegroundPresentation | WorkerTurn::ForegroundSource
+            WorkerTurn::ForegroundPresentation
+            | WorkerTurn::SceneBuild
+            | WorkerTurn::ForegroundSource
                 if demand.reclaim =>
             {
                 reclaim_deferrals.saturating_add(1)
@@ -1108,6 +1124,16 @@ fn scene_worker_loop<B>(
         match turn {
             WorkerTurn::ForegroundPresentation | WorkerTurn::OptionalPresentation => {
                 if !run_presentation_turn(
+                    &mut coordinator,
+                    &request_tokens,
+                    &mut pending_eviction,
+                    output,
+                ) {
+                    return;
+                }
+            }
+            WorkerTurn::SceneBuild => {
+                if !run_scene_build_turn(
                     &mut coordinator,
                     &request_tokens,
                     &mut pending_eviction,
@@ -1272,110 +1298,8 @@ where
                 // turn, or sleeps until the decoder or a request wakes it.
                 waiting = true;
             }
-            for publication in pump.publications {
-                let Ok(Some(frame)) = coordinator.frame(publication.owner) else {
-                    continue;
-                };
-                let Ok(telemetry) = coordinator.telemetry(publication.owner) else {
-                    continue;
-                };
-                let Ok(work) = coordinator.owner_work_state(publication.owner) else {
-                    continue;
-                };
-                if output
-                    .send_latest_for(
-                        publication.owner.get(),
-                        AlignmentSceneEngineEvent::FrameUpdated {
-                            owner: publication.owner,
-                            request_token: current_request_token(
-                                request_tokens,
-                                publication.owner,
-                            ),
-                            cause: AlignmentSceneFrameCause::SourcePublication,
-                            update: None,
-                            published_scene: Some(publication.revision),
-                            frame,
-                            work,
-                            telemetry,
-                        },
-                    )
-                    .is_err()
-                {
-                    return SourceTurn::Closed;
-                }
-            }
-            for owner in pump.source_settlements {
-                if !send_frame(
-                    coordinator,
-                    output,
-                    owner,
-                    current_request_token(request_tokens, owner),
-                    AlignmentSceneFrameCause::SourceSettlement,
-                    None,
-                    None,
-                ) {
-                    return SourceTurn::Closed;
-                }
-            }
-            for refusal in pump.refusals {
-                let Ok(Some(frame)) = coordinator.frame(refusal.owner) else {
-                    continue;
-                };
-                let Ok(telemetry) = coordinator.telemetry(refusal.owner) else {
-                    continue;
-                };
-                // This is a terminal source decision, not replaceable viewport data. A
-                // later camera/clip frame may carry the same typed refusal, but must not
-                // erase the only explicit terminal edge before the desktop consumes it.
-                if output
-                    .send_control(AlignmentSceneEngineEvent::IndividualReadsRefused {
-                        owner: refusal.owner,
-                        request_token: current_request_token(
-                            request_tokens,
-                            refusal.owner,
-                        ),
-                        target: refusal.target,
-                        complete_read_limit: refusal.complete_read_limit,
-                        eligible_records: refusal.eligible_records,
-                        frame,
-                        telemetry,
-                    })
-                    .is_err()
-                {
-                    return SourceTurn::Closed;
-                }
-            }
-            for failure in pump.failures {
-                // One owner's scene candidate failed. That owner's current request is
-                // settled; the shared source and every other owner carry on.
-                if !send_error(
-                    output,
-                    Some(failure.owner),
-                    Some(current_request_token(request_tokens, failure.owner)),
-                    AlignmentSceneEngineOperation::PumpSource,
-                    failure.message,
-                ) {
-                    return SourceTurn::Closed;
-                }
-            }
-            for pressure in pump.pressures {
-                schedule_internal_reclaim(
-                    coordinator,
-                    pending_eviction,
-                    pressure.owner,
-                    pressure.pressure,
-                );
-                if !send_resource_pressure(
-                    output,
-                    pressure.owner,
-                    current_request_token(request_tokens, pressure.owner),
-                    pressure.target,
-                    AlignmentSceneEngineOperation::PumpSource,
-                    pressure.intent,
-                    pressure.pressure,
-                ) {
-                    return SourceTurn::Closed;
-                }
+            if !publish_source_pump(coordinator, request_tokens, pending_eviction, output, pump) {
+                return SourceTurn::Closed;
             }
         }
         Err(error) => {
@@ -1394,6 +1318,162 @@ where
         SourceTurn::Waiting
     } else {
         SourceTurn::Progressed
+    }
+}
+
+/// Publishes everything one source pump or scene-build stage settled: scenes, frames whose
+/// state changed without a scene, terminal refusals, owner-scoped failures and pressure.
+/// Returns `false` once the event receiver is gone.
+fn publish_source_pump<B>(
+    coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    request_tokens: &BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+    pump: crate::AlignmentSceneSourcePump,
+) -> bool
+where
+    B: CanonicalAlignmentSourceBackend,
+    B::Error: Error + Send + Sync + 'static,
+{
+    for publication in pump.publications {
+        let Ok(Some(frame)) = coordinator.frame(publication.owner) else {
+            continue;
+        };
+        let Ok(telemetry) = coordinator.telemetry(publication.owner) else {
+            continue;
+        };
+        let Ok(work) = coordinator.owner_work_state(publication.owner) else {
+            continue;
+        };
+        if output
+            .send_latest_for(
+                publication.owner.get(),
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: publication.owner,
+                    request_token: current_request_token(request_tokens, publication.owner),
+                    cause: AlignmentSceneFrameCause::SourcePublication,
+                    update: None,
+                    published_scene: Some(publication.revision),
+                    frame,
+                    work,
+                    telemetry,
+                },
+            )
+            .is_err()
+        {
+            return false;
+        }
+    }
+    for owner in pump.source_settlements {
+        if !send_frame(
+            coordinator,
+            output,
+            owner,
+            current_request_token(request_tokens, owner),
+            AlignmentSceneFrameCause::SourceSettlement,
+            None,
+            None,
+        ) {
+            return false;
+        }
+    }
+    for refusal in pump.refusals {
+        let Ok(Some(frame)) = coordinator.frame(refusal.owner) else {
+            continue;
+        };
+        let Ok(telemetry) = coordinator.telemetry(refusal.owner) else {
+            continue;
+        };
+        // This is a terminal source decision, not replaceable viewport data. A
+        // later camera/clip frame may carry the same typed refusal, but must not
+        // erase the only explicit terminal edge before the desktop consumes it.
+        if output
+            .send_control(AlignmentSceneEngineEvent::IndividualReadsRefused {
+                owner: refusal.owner,
+                request_token: current_request_token(request_tokens, refusal.owner),
+                target: refusal.target,
+                complete_read_limit: refusal.complete_read_limit,
+                eligible_records: refusal.eligible_records,
+                frame,
+                telemetry,
+            })
+            .is_err()
+        {
+            return false;
+        }
+    }
+    for failure in pump.failures {
+        // One owner's scene candidate failed. That owner's current request is
+        // settled; the shared source and every other owner carry on.
+        if !send_error(
+            output,
+            Some(failure.owner),
+            Some(current_request_token(request_tokens, failure.owner)),
+            AlignmentSceneEngineOperation::PumpSource,
+            failure.message,
+        ) {
+            return false;
+        }
+    }
+    for pressure in pump.pressures {
+        schedule_internal_reclaim(
+            coordinator,
+            pending_eviction,
+            pressure.owner,
+            pressure.pressure,
+        );
+        if !send_resource_pressure(
+            output,
+            pressure.owner,
+            current_request_token(request_tokens, pressure.owner),
+            pressure.target,
+            AlignmentSceneEngineOperation::PumpSource,
+            pressure.intent,
+            pressure.pressure,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Runs one stage of one lane's staged scene build and publishes what it settled. Returns
+/// `false` once the event receiver is gone.
+fn run_scene_build_turn<B>(
+    coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    request_tokens: &BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+) -> bool
+where
+    B: CanonicalAlignmentSourceBackend,
+    B::Error: Error + Send + Sync + 'static,
+{
+    let stage_started = Instant::now();
+    let stage_result = coordinator.pump_scene_build_once();
+    if !report_slow_worker_phase(
+        output,
+        AlignmentSceneWorkerPhase::PumpPresentation,
+        None,
+        stage_started,
+    ) {
+        return false;
+    }
+    match stage_result {
+        // A build settles exactly like the completed source transaction which used to run it
+        // inline, and is reported as that operation.
+        Ok(Some(pump)) => {
+            publish_source_pump(coordinator, request_tokens, pending_eviction, output, pump)
+        }
+        Ok(None) => true,
+        // The coordinator dropped the failed build before returning, so this is reported once.
+        Err(error) => send_error(
+            output,
+            None,
+            None,
+            AlignmentSceneEngineOperation::PumpSource,
+            error,
+        ),
     }
 }
 
@@ -1695,41 +1775,6 @@ fn send_resource_pressure(
             disposition: AlignmentSceneResourcePressureDisposition::for_pressure(pressure),
         },
     )
-}
-
-fn allocation_pressure(error: &(dyn Error + 'static)) -> Option<LedgerError> {
-    let mut current = Some(error);
-    while let Some(candidate) = current {
-        if let Some(pressure) = candidate.downcast_ref::<LedgerError>()
-            && matches!(
-                pressure,
-                LedgerError::BudgetExceeded { .. }
-                    | LedgerError::TransientBudgetExceeded { .. }
-                    | LedgerError::ReplacementTransitionActive { .. }
-            )
-        {
-            return Some(*pressure);
-        }
-        current = candidate.source();
-    }
-    None
-}
-
-fn source_allocation_pressure<B>(
-    error: &crate::AlignmentSceneCoordinatorError<B::Error>,
-) -> Option<LedgerError>
-where
-    B: CanonicalAlignmentSourceBackend,
-    B::Error: Error + 'static,
-{
-    match error {
-        crate::AlignmentSceneCoordinatorError::Source(source) => source
-            .backend_error()
-            .and_then(B::allocation_pressure)
-            .or_else(|| coordinator_budget_pressure(error))
-            .or_else(|| allocation_pressure(error)),
-        _ => coordinator_budget_pressure(error).or_else(|| allocation_pressure(error)),
-    }
 }
 
 fn owner_pressure_target<B>(
@@ -2481,15 +2526,24 @@ mod tests {
     fn worker_turns_follow_the_documented_priority_order() {
         let all = WorkerDemand {
             foreground_presentation: true,
+            scene_build: true,
             foreground_source: true,
             reclaim: true,
             speculative_source: true,
             optional_presentation: true,
         };
         assert_eq!(next_worker_turn(all, 0), WorkerTurn::ForegroundPresentation);
-        let without_presentation = WorkerDemand {
+        let without_row_presentation = WorkerDemand {
             foreground_presentation: false,
             ..all
+        };
+        assert_eq!(
+            next_worker_turn(without_row_presentation, 0),
+            WorkerTurn::SceneBuild
+        );
+        let without_presentation = WorkerDemand {
+            scene_build: false,
+            ..without_row_presentation
         };
         assert_eq!(
             next_worker_turn(without_presentation, 0),

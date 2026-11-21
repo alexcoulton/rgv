@@ -1,4 +1,6 @@
-use super::super::*;
+use crate::workspace::panels::{ReadRowCoordinateSpace, StableRowCameraAnchor};
+use crate::{MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY};
+use rgv_core::{GenomicInterval, Viewport};
 
 pub(crate) fn overview_drag_step(
     viewport: Viewport,

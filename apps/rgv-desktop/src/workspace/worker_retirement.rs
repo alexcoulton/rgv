@@ -1,4 +1,5 @@
-use super::super::*;
+use crate::Viewer;
+use anyhow::Result;
 
 const MAX_RETIRING_CONTEXT_ENGINES: usize = 8;
 

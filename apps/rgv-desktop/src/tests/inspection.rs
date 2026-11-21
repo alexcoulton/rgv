@@ -1,4 +1,53 @@
-use super::super::*;
+use crate::display::alignment::parse_style_tag;
+use crate::display::auxiliary::genomic_distance_to_interval;
+use crate::inspection::document::{InspectorActionId, InspectorProvenance, InspectorValue};
+use crate::inspection::model::{
+    BoundedSequenceCopy, ChainDiagramSegment, InspectorSnapshot, SelectedSupplementaryChain,
+    VariantAlignmentEvidence, VariantInspectorSnapshot,
+};
+use crate::inspection::read::{
+    SubstitutionCountSource, aligned_event_sequence, alignment_edit_fields, alignment_edit_summary,
+    alignment_inspector_document, auxiliary_tags_text, bounded_aligned_sequence_copy,
+    bounded_auxiliary_value, bounded_oriented_sequence_copy, bounded_sequence_copy, format_cigar,
+    inspector_cigar_value, read_event_details, sequence_copy_hover, truncate_string_to_bytes,
+};
+use crate::inspection::rna::{
+    JunctionAnnotationContext, SashimiExportBundle, SashimiExportTrack,
+    junction_annotation_context, junction_bed_export, paint_supplementary_chain_diagram,
+    sashimi_export_display, sashimi_export_shared_maximum, sashimi_svg_export,
+    segment_read_coordinates, selected_supplementary_chain, supplementary_chain_diagram,
+    supplementary_chain_inspector_document,
+};
+use crate::inspection::variant::{
+    bounded_variant_allele, format_genotype, variant_allele_evidence_summary, variant_details_text,
+    variant_evidence_export_tsv, variant_export_file_name, variant_genotype_export_tsv,
+    variant_genotype_group_label, variant_genotype_group_rank, variant_inspector_fields,
+    variant_inspector_presentation_document,
+};
+use crate::launch::{
+    RunMarker, autosave_directory, autosave_group_prefix, autosave_snapshot_path,
+    discover_recovery_candidates, prune_autosaves,
+};
+use crate::ui::track_settings::build_variant_predicate;
+use crate::{
+    AUXILIARY_TAGS_COPY_BYTES, AUXILIARY_VALUE_DISPLAY_BYTES, MAX_RNA_EXPORT_BYTES,
+    MAX_VARIANT_EXPORT_BYTES, SEQUENCE_COPY_BASES, VARIANT_ALLELE_PREVIEW_BASES,
+    VariantPredicateOperator, apply_accessibility_preferences,
+};
+use rgv_core::{
+    ContigId, DesktopSettings, GenomicInterval, JunctionDisplayMode, SashimiCountMode,
+    SashimiScaleMode, SessionFilters, TrackCollection, TrackConfig, TrackId, TrackKind,
+    TrackSource, VariantFieldComparison, VariantFieldPredicate, VariantFieldScope,
+    VariantGenotypeGrouping, VariantMissingValueRule, VariantTrackSettings, Viewport,
+};
+use rgv_engine::{TrackSnapshot, TrackSnapshotData};
+use rgv_hts::{
+    AlignmentRecord, AuxValue, CigarOpKind, ReferenceSlice, SequenceData, SupplementarySegment,
+};
+use rgv_layout::{JunctionAnnotationLookup, JunctionAnnotationStatus, JunctionArcComponent};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 #[test]
 fn pathological_cigar_is_summarized_without_losing_exact_copy_text() {

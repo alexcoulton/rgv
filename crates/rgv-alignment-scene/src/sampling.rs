@@ -148,6 +148,22 @@ pub(crate) fn sampling_window(sampling: ReadSampling, start: u64) -> Option<u64>
     }
 }
 
+/// Alignment starts belonging to one sampling window.
+#[must_use]
+pub(crate) fn sampling_window_starts(
+    sampling: ReadSampling,
+    window: u64,
+) -> Option<std::ops::Range<u64>> {
+    match sampling {
+        ReadSampling::Complete => None,
+        ReadSampling::Downsampled { window_bases, .. } => {
+            let width = u64::from(window_bases.get());
+            let start = window.checked_mul(width)?;
+            Some(start..start.saturating_add(width))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rgv_hts::AlignmentSourcePosition;

@@ -126,10 +126,11 @@ pub use tracks::{
     MAX_MUTATION_ANNOTATION_BYTES_PER_RECORD, MAX_MUTATION_COLUMNS, MAX_MUTATION_FIELD_BYTES,
     MAX_MUTATION_LINE_BYTES, MAX_MUTATION_RECORDS_PER_QUERY, MAX_MUTATION_SAMPLE_NAME_BYTES,
     MAX_MUTATION_SAMPLES, MAX_MUTATION_SOURCE_ANNOTATION_BYTES, MAX_MUTATION_SOURCE_RECORDS,
-    MAX_QUANTITATIVE_RECORDS_PER_QUERY, MAX_VARIANT_ID_ASSOCIATIONS, MAX_VARIANT_ID_INDEX_RECORDS,
-    MAX_VARIANT_ID_SEARCH_RESULTS, MutationAnnotation, MutationQuery, MutationQueryProvenance,
-    MutationRecord, PeakMetrics, QuantitativeFormat, QuantitativeQuery,
-    QuantitativeQueryProvenance, QuantitativeRecord, QuantitativeSourceMetadata, Strand,
+    MAX_QUANTITATIVE_RECORDS_PER_QUERY, MAX_REMOTE_VARIANT_ID_SCAN_BYTES,
+    MAX_VARIANT_ID_ASSOCIATIONS, MAX_VARIANT_ID_INDEX_RECORDS, MAX_VARIANT_ID_SEARCH_RESULTS,
+    MutationAnnotation, MutationQuery, MutationQueryProvenance, MutationRecord, PeakMetrics,
+    QuantitativeFormat, QuantitativeQuery, QuantitativeQueryProvenance, QuantitativeRecord,
+    QuantitativeSourceMetadata, QuantitativeSummaryQuery, QuantitativeSummaryRecord, Strand,
     TdfQueryMetadata, TextCopyNumberSource, TextFeatureSource, TextGwasSource,
     TextInteractionSource, TextMutationSource, TextQuantitativeSource, TrackError, VariantField,
     VariantFieldSchema, VariantFilterSchema, VariantGenotype, VariantGenotypeAllele, VariantHeader,
@@ -141,3 +142,29 @@ pub use ultima::{
     UltimaIndelKind, UltimaQualitySource, UltimaRecordAnalysis, UltimaSummary,
     analyze_ultima_record, analyze_ultima_record_with_tag_orientation,
 };
+
+/// Entry points for the fuzz targets in `fuzz/`: RGV's own parsers of untrusted index bytes,
+/// which are otherwise reachable only through a network fetch. Not a supported API.
+#[doc(hidden)]
+pub mod fuzzing {
+    /// Parses a gzip-compressed CRAI as the remote CRAM path does, against a CRAM of
+    /// `source_length` bytes.
+    pub fn parse_cram_index(compressed: &[u8], source_length: u64) -> bool {
+        crate::remote_alignment::parse_cram_index(compressed, source_length).is_ok()
+    }
+
+    /// Parses a `.fai` as the remote FASTA path does.
+    pub fn parse_fasta_index(bytes: &[u8]) -> bool {
+        crate::reference::parse_fasta_index(bytes).is_ok()
+    }
+
+    /// Parses a bgzip-compressed `.tbi` or `.csi` as the remote VCF path does, and queries it.
+    pub fn parse_variant_index(bytes: &[u8]) -> bool {
+        crate::tracks::fuzz_variant_index(bytes)
+    }
+
+    /// Computes the tabix interval of one VCF data line as the remote VCF path does.
+    pub fn variant_line_interval(line: &[u8]) -> Option<(i64, i64)> {
+        crate::tracks::fuzz_variant_line_interval(line)
+    }
+}

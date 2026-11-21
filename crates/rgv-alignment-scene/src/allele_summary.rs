@@ -54,9 +54,73 @@ pub struct ExactAlleleSummaryTile {
     allocation: AllocationLease,
 }
 
+/// How a summary builder walks each overlapping read's CIGAR.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CigarWalk {
+    /// Visit only what can reach the tile and stop once past it.
+    EnterAtTile,
+    /// Visit every operation and base of the read. The former behaviour, kept as an oracle.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Whole,
+}
+
 impl ExactAlleleSummaryTile {
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
+        evidence: &Arc<EvidenceRoot>,
+        tile: CanonicalGenomicTile,
+        contig_length: u64,
+        contract: AlleleSummaryContract,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, ExactAlleleSummaryError> {
+        Self::build_with_selection(
+            None,
+            CigarWalk::EnterAtTile,
+            evidence,
+            tile,
+            contig_length,
+            contract,
+            ledger,
+            reservation_kind,
+            publication_revision,
+        )
+    }
+
+    /// The former builder, which visited every aligned base of every overlapping read whether
+    /// or not it lay in the tile. Kept as the oracle for the tile-clipped walk.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_walking_whole_cigars(
+        evidence: &Arc<EvidenceRoot>,
+        tile: CanonicalGenomicTile,
+        contig_length: u64,
+        contract: AlleleSummaryContract,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, ExactAlleleSummaryError> {
+        Self::build_with_selection(
+            None,
+            CigarWalk::Whole,
+            evidence,
+            tile,
+            contig_length,
+            contract,
+            ledger,
+            reservation_kind,
+            publication_revision,
+        )
+    }
+
+    /// [`Self::build`] over a selection of the tile already made for another summary family.
+    /// One tile's families all read the same complete selection, so the store selects once per
+    /// tile. A selection of another root or interval is ignored and the tile selects its own.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) fn build_with_selection(
+        shared: Option<&crate::EvidenceSelection>,
+        walk: CigarWalk,
         evidence: &Arc<EvidenceRoot>,
         tile: CanonicalGenomicTile,
         contig_length: u64,
@@ -79,7 +143,15 @@ impl ExactAlleleSummaryTile {
         let interval = tile.interval(contig_length)?;
         let bins = usize::try_from(interval.len())
             .map_err(|_| ExactAlleleSummaryError::TileTooWide(interval.len()))?;
-        let selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
+        let owned_selection;
+        let selection = if let Some(shared) =
+            shared.filter(|shared| shared.is_over(evidence, interval))
+        {
+            shared
+        } else {
+            owned_selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
+            &owned_selection
+        };
         let maximum_bytes = size_of::<Self>().saturating_add(
             bins.saturating_mul(2)
                 .saturating_mul(size_of::<PileupBin>()),
@@ -146,12 +218,29 @@ impl ExactAlleleSummaryTile {
             let mut read_position = 0_usize;
             let mut collapsed = 0_u64;
             for operation in record.cigar() {
+                // An insertion at the tile's end is still owned by the tile's last base, so
+                // only an operation starting beyond the end proves the rest is irrelevant.
+                if walk == CigarWalk::EnterAtTile && reference_position > interval.end() {
+                    break;
+                }
                 match operation.kind {
                     CigarOpKind::Match
                     | CigarOpKind::SequenceMatch
                     | CigarOpKind::SequenceMismatch => {
                         let end = reference_position.saturating_add(u64::from(operation.len));
-                        for offset in 0..operation.len as usize {
+                        // Only the bases inside the tile can be counted here; a long read
+                        // crossing many tiles must not be re-read base by base for each.
+                        let offsets = match walk {
+                            CigarWalk::Whole => 0..operation.len as usize,
+                            CigarWalk::EnterAtTile => {
+                                let first = interval.start().saturating_sub(reference_position);
+                                let last =
+                                    interval.end().min(end).saturating_sub(reference_position);
+                                usize::try_from(first).unwrap_or(usize::MAX)
+                                    ..usize::try_from(last).unwrap_or(usize::MAX)
+                            }
+                        };
+                        for offset in offsets {
                             let position = reference_position.saturating_add(offset as u64);
                             if !interval.contains(position)
                                 || overlap_mask.is_some_and(|mask| mask.masks_base(position))

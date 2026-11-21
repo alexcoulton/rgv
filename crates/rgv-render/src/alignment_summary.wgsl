@@ -1,9 +1,13 @@
+// Prefixed with `shaders/common.wgsl`; see `shaders.rs`.
+
 struct SummaryUniform {
     screen_size: vec2<f32>,
     clip_origin: vec2<f32>,
     clip_size: vec2<f32>,
     points_per_base: vec2<f32>,
-    page_start_from_camera: vec2<f32>,
+    // Whole-base and fractional parts of (page start - camera start); see `project_genomic_x`.
+    page_start_whole: i32,
+    page_start_fraction: f32,
     covered_clip_x: vec2<f32>,
     scale_maximum: f32,
     minimum_alternate_fraction: f32,
@@ -82,47 +86,13 @@ struct VertexOutput {
     @location(6) @interpolate(flat) junction_component: u32,
 };
 
-fn corner(vertex_index: u32) -> vec2<f32> {
-    let corners = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(1.0, 0.0),
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(1.0, 0.0),
-        vec2<f32>(1.0, 1.0),
-    );
-    return corners[vertex_index];
-}
-
-fn two_sum(a: f32, b: f32) -> vec2<f32> {
-    let sum = a + b;
-    let recovered_b = sum - a;
-    return vec2<f32>(sum, (a - (sum - recovered_b)) + (b - recovered_b));
-}
-
-fn quick_two_sum(a: f32, b: f32) -> vec2<f32> {
-    let sum = a + b;
-    return vec2<f32>(sum, b - (sum - a));
-}
-
-fn double_single_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    let leading = two_sum(a.x, b.x);
-    return quick_two_sum(leading.x, leading.y + a.y + b.y);
-}
-
-fn double_single_multiply(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    let product = a.x * b.x;
-    var error = fma(a.x, b.x, -product);
-    error += a.x * b.y;
-    error += a.y * b.x;
-    error += a.y * b.y;
-    return quick_two_sum(product, error);
-}
-
 fn project_x(page_offset: vec2<f32>) -> f32 {
-    let delta = double_single_add(frame.page_start_from_camera, page_offset);
-    let projected = double_single_multiply(delta, frame.points_per_base);
-    return frame.clip_origin.x + projected.x + projected.y;
+    return frame.clip_origin.x + project_genomic_x(
+        page_offset,
+        frame.page_start_whole,
+        frame.page_start_fraction,
+        frame.points_per_base,
+    );
 }
 
 fn transformed_depth_fraction(depth: u32) -> f32 {
@@ -140,18 +110,12 @@ fn rectangle_output(
     color: vec4<f32>,
     visible: u32,
 ) -> VertexOutput {
-    let point = origin + corner(vertex_index) * size;
-    let normalized = point / frame.screen_size;
+    let point = origin + quad_corner(vertex_index) * size;
     var output: VertexOutput;
-    output.position = vec4<f32>(
-        normalized.x * 2.0 - 1.0,
-        1.0 - normalized.y * 2.0,
-        0.0,
-        1.0,
-    );
+    output.position = points_to_clip(point, frame.screen_size);
     output.color = color;
     output.visible = visible;
-    output.local = corner(vertex_index);
+    output.local = quad_corner(vertex_index);
     output.pixel_size = size;
     output.shape = 0u;
     output.stroke = 0.0;
@@ -419,7 +383,7 @@ fn junction_vertex(input: JunctionInput) -> VertexOutput {
     // CPU summary projector, which both report the unclamped arc bounds.
     let full_width = max(full_right - full_left, 1.0);
     let arc_parameter = (vec2<f32>(left, right) - vec2<f32>(full_left)) / full_width;
-    output.local.x = mix(arc_parameter.x, arc_parameter.y, corner(input.vertex_index).x);
+    output.local.x = mix(arc_parameter.x, arc_parameter.y, quad_corner(input.vertex_index).x);
     output.pixel_size = vec2<f32>(full_width, height);
     return output;
 }

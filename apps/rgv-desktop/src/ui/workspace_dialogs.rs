@@ -1,4 +1,11 @@
-use super::super::*;
+use crate::inspection::read::bounded_preview;
+use crate::workspace::lists::{review_status_label, session_locus_text};
+use crate::{MAX_METADATA_FILTER_VALUES, MAX_METADATA_VISIBLE_COLUMNS, MetadataTrackRow};
+use rgv_core::{
+    MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS, RegionOfInterest, ReviewItem, ReviewStatus,
+    SampleMetadataTable, TrackId, TrackKind,
+};
+use std::collections::BTreeSet;
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
@@ -542,7 +549,8 @@ pub(crate) fn show_workspace_dialogs(ui: &mut egui::Ui, draft: &mut WorkspaceDia
                     draft.review_items.len()
                 ));
                 // Up to 100,000 items: only the rows in view are laid out.
-                let visible = filtered_review_indices(&draft.review_items, draft.review_status_filter);
+                let visible =
+                    filtered_review_indices(&draft.review_items, draft.review_status_filter);
                 let notes_height = 2.0 * ui.text_style_height(&egui::TextStyle::Body) + 10.0;
                 let row_height = list_row_height(ui, 2, 2, 0) + notes_height;
                 let mut managed_locus_requested = None;
@@ -623,13 +631,15 @@ pub(crate) fn show_workspace_dialogs(ui: &mut egui::Ui, draft: &mut WorkspaceDia
                                                 .desired_width(f32::INFINITY)
                                                 .hint_text("Notes"),
                                         )
-                                        .widget_info(|| {
-                                            egui::WidgetInfo::labeled(
-                                                egui::WidgetType::TextEdit,
-                                                true,
-                                                "Notes",
-                                            )
-                                        });
+                                        .widget_info(
+                                            || {
+                                                egui::WidgetInfo::labeled(
+                                                    egui::WidgetType::TextEdit,
+                                                    true,
+                                                    "Notes",
+                                                )
+                                            },
+                                        );
                                     });
                             });
                         }
@@ -664,7 +674,10 @@ pub(crate) fn filtered_review_indices(
 /// rows of plain text, plus `extra` points.
 fn list_row_height(ui: &egui::Ui, control_lines: u8, text_lines: u8, extra: u8) -> f32 {
     let spacing = ui.spacing();
-    let controls = spacing.interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body) + 6.0);
+    let controls = spacing
+        .interact_size
+        .y
+        .max(ui.text_style_height(&egui::TextStyle::Body) + 6.0);
     f32::from(control_lines) * controls
         + f32::from(text_lines) * ui.text_style_height(&egui::TextStyle::Body)
         + f32::from(control_lines + text_lines) * spacing.item_spacing.y
@@ -696,6 +709,7 @@ fn fixed_height_row(ui: &mut egui::Ui, height: f32, contents: impl FnOnce(&mut e
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rgv_core::SessionLocus;
 
     fn region(id: u64) -> RegionOfInterest {
         RegionOfInterest {
@@ -767,7 +781,11 @@ mod tests {
             large_nodes < small_nodes + 400,
             "100,000 regions laid out {large_nodes} widgets (3 regions: {small_nodes})"
         );
-        assert_eq!(large.regions.len(), 100_000, "rows out of view are untouched");
+        assert_eq!(
+            large.regions.len(),
+            100_000,
+            "rows out of view are untouched"
+        );
     }
 
     #[test]
@@ -781,7 +799,10 @@ mod tests {
         };
         let nodes = laid_out_nodes(&mut large);
         assert!(nodes > 0);
-        assert!(nodes < 1_000, "100,000 review items laid out {nodes} widgets");
+        assert!(
+            nodes < 1_000,
+            "100,000 review items laid out {nodes} widgets"
+        );
     }
 
     #[test]

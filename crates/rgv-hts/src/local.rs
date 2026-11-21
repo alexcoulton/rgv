@@ -1,7 +1,10 @@
 use std::{
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Instant,
 };
 
@@ -121,10 +124,78 @@ impl QueryOptions {
     }
 }
 
+/// A bounded count of `HTSlib` decompression threads shared by every holder of a lease.
+#[derive(Debug)]
+struct DecompressionThreadAllowance {
+    leased: AtomicU32,
+}
+
+/// The allowance all open local alignment sources of the process draw from.
+static DECOMPRESSION_THREADS: DecompressionThreadAllowance = DecompressionThreadAllowance {
+    leased: AtomicU32::new(0),
+};
+
+/// Most `HTSlib` decompression threads all open local alignment sources may hold together:
+/// the machine's parallelism, kept between 2 and 16.
+fn decompression_thread_limit() -> u32 {
+    static LIMIT: OnceLock<u32> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(4, |threads| {
+                u32::try_from(threads.get()).unwrap_or(u32::MAX)
+            })
+            .clamp(2, 16)
+    })
+}
+
+/// A share of a decompression thread allowance, returned when dropped.
+///
+/// ADR 0002 calls for one shared `HTSlib` pool. rust-htslib 1.0.1 cannot provide that
+/// soundly: its `ThreadPool` is an `Rc<RefCell<_>>` (neither `Send` nor `Sync`, so it cannot
+/// live in a `static`), and every reader keeps a clone of that `Rc` while being declared
+/// `Send`, so one pool attached to readers owned by different track threads would race on a
+/// non-atomic reference count. Each source therefore still owns a private pool, but all of
+/// them draw its size from one bounded process-wide allowance: opening many sources never
+/// raises the process's decompression thread count beyond [`decompression_thread_limit`]. A
+/// source that finds the allowance exhausted decompresses on its own thread.
+#[derive(Debug)]
+struct DecompressionThreadLease {
+    allowance: &'static DecompressionThreadAllowance,
+    threads: u32,
+}
+
+impl DecompressionThreadAllowance {
+    /// Leases up to `requested` threads, as many as `limit` still leaves.
+    fn lease(&'static self, requested: u32, limit: u32) -> DecompressionThreadLease {
+        let mut threads = 0;
+        let _ = self
+            .leased
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |leased| {
+                threads = requested.min(limit.saturating_sub(leased));
+                Some(leased.saturating_add(threads))
+            });
+        DecompressionThreadLease {
+            allowance: self,
+            threads,
+        }
+    }
+}
+
+impl Drop for DecompressionThreadLease {
+    fn drop(&mut self) {
+        self.allowance
+            .leased
+            .fetch_sub(self.threads, Ordering::AcqRel);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AlignmentOpenOptions {
     pub index_path: Option<PathBuf>,
     pub reference_path: Option<PathBuf>,
+    /// Most `HTSlib` decompression threads a local source asks for. The grant is capped by a
+    /// process-wide allowance sized from the machine's parallelism, so the total over every
+    /// open source stays bounded however many are open.
     pub decompression_threads: NonZeroU32,
     pub remote_index_url: Option<String>,
     pub remote_reference_index_url: Option<String>,
@@ -924,6 +995,9 @@ pub struct LocalAlignmentSource {
     source_stamp: Option<AlignmentSourceStamp>,
     source_guard: Option<LocalSourceGuard>,
     positioned_stream: Option<LocalPositionedStreamState>,
+    /// Declared after `reader`: the reader (and its thread pool) is dropped before its
+    /// threads are handed back to the process-wide allowance.
+    decompression_threads: DecompressionThreadLease,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -938,6 +1012,14 @@ impl LocalAlignmentSource {
     #[must_use]
     pub fn header_metadata(&self) -> &Arc<AlignmentHeaderMetadata> {
         &self.header
+    }
+
+    /// `HTSlib` decompression threads granted to this source from the process-wide allowance:
+    /// at most the requested [`AlignmentOpenOptions::decompression_threads`], and zero when
+    /// other open sources already hold the whole allowance.
+    #[must_use]
+    pub const fn decompression_threads(&self) -> u32 {
+        self.decompression_threads.threads
     }
 
     /// Exact mapped-record total obtained from constant-time local BAM index statistics when it
@@ -982,8 +1064,14 @@ impl LocalAlignmentSource {
         if let Some(reference_path) = &options.reference_path {
             reader.set_reference(reference_path)?;
         }
-        let pool = ThreadPool::new(options.decompression_threads.get())?;
-        reader.set_thread_pool(&pool)?;
+        let decompression_threads = DECOMPRESSION_THREADS.lease(
+            options.decompression_threads.get(),
+            decompression_thread_limit(),
+        );
+        if decompression_threads.threads > 0 {
+            let pool = ThreadPool::new(decompression_threads.threads)?;
+            reader.set_thread_pool(&pool)?;
+        }
 
         // `index_stats` is constant-time for indexed BAM, but scans CRAM/SAM. Only use the exact
         // BAM index metadata here so opening a CRAM never acquires a hidden whole-file cost.
@@ -1052,6 +1140,7 @@ impl LocalAlignmentSource {
             source_stamp,
             source_guard,
             positioned_stream: None,
+            decompression_threads,
         })
     }
 
@@ -2041,6 +2130,86 @@ mod tests {
         drop(writer);
         let index = PathBuf::from(format!("{}.bai", path.display()));
         bam::index::build(path, Some(&index), bam::index::Type::Bai, 1).unwrap();
+    }
+
+    #[test]
+    fn decompression_thread_leases_never_exceed_their_allowance_and_are_returned() {
+        static ALLOWANCE: DecompressionThreadAllowance = DecompressionThreadAllowance {
+            leased: AtomicU32::new(0),
+        };
+        let first = ALLOWANCE.lease(4, 10);
+        let second = ALLOWANCE.lease(4, 10);
+        let third = ALLOWANCE.lease(4, 10);
+        let fourth = ALLOWANCE.lease(4, 10);
+        assert_eq!(
+            [first.threads, second.threads, third.threads, fourth.threads],
+            [4, 4, 2, 0]
+        );
+        assert_eq!(ALLOWANCE.leased.load(Ordering::Acquire), 10);
+        drop(second);
+        assert_eq!(ALLOWANCE.leased.load(Ordering::Acquire), 6);
+        assert_eq!(ALLOWANCE.lease(8, 10).threads, 4);
+        drop((first, third, fourth));
+        assert_eq!(ALLOWANCE.leased.load(Ordering::Acquire), 0);
+
+        // Leases taken from many threads at once still respect the limit.
+        let leases = std::thread::scope(|scope| {
+            let workers = (0..16)
+                .map(|_| scope.spawn(|| ALLOWANCE.lease(3, 10)))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(leases.iter().map(|lease| lease.threads).sum::<u32>(), 10);
+        drop(leases);
+        assert_eq!(ALLOWANCE.leased.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn opening_many_local_sources_does_not_grow_the_decompression_thread_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("many.bam");
+        write_positioned_stream_fixture(&path, 400);
+        let limit = decompression_thread_limit();
+        assert!((2..=16).contains(&limit));
+        let options = AlignmentOpenOptions::default();
+        let requested = options.decompression_threads.get();
+        let count = 24_u32;
+        assert!(count * requested > limit);
+        let mut sources = (0..count)
+            .map(|_| {
+                let source = LocalAlignmentSource::open(&path, &options).unwrap();
+                // Other tests of this process lease from the same allowance concurrently; the
+                // bound holds for everyone together.
+                assert!(DECOMPRESSION_THREADS.leased.load(Ordering::Acquire) <= limit);
+                source
+            })
+            .collect::<Vec<_>>();
+        // 24 sources asking for 4 threads each hold at most the allowance, not 96 threads.
+        let granted = sources
+            .iter()
+            .map(LocalAlignmentSource::decompression_threads)
+            .sum::<u32>();
+        assert!(granted <= limit, "{granted} threads for a limit of {limit}");
+        let unthreaded = sources
+            .iter()
+            .filter(|source| source.decompression_threads() == 0)
+            .count();
+        assert!(unthreaded >= (count - limit) as usize);
+
+        // A source without pool threads returns exactly what a threaded one does.
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 100_000).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for source in &mut sources {
+            let query = source
+                .query(interval, QueryOptions::default(), &|| true)
+                .unwrap();
+            assert!(query.stats.records_seen > 0);
+            seen.insert((query.stats.records_seen, query.batch.len()));
+        }
+        assert_eq!(seen.len(), 1);
     }
 
     fn write_positioned_stream_fixture(path: &Path, record_count: usize) {

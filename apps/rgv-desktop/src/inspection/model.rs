@@ -1,4 +1,13 @@
-use super::super::*;
+use crate::inspection::document::{
+    InspectorDocument, InspectorField, InspectorNotice, InspectorSection, InspectorTone,
+    InspectorValue,
+};
+use rgv_core::{
+    AutomationSelectionSnapshot, CopyNumberTrackSettings, GwasTrackSettings,
+    InteractionTrackSettings, QuantitativeTrackSettings, TrackId, VariantTrackSettings,
+};
+use rgv_hts::SupplementarySegment;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct InspectorSnapshot {

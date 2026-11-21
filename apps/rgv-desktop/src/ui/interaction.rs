@@ -1,4 +1,26 @@
-use super::super::*;
+use crate::diagnostics::{InteractionTraceStage, LatencyEvent};
+use crate::display::hit_test::JunctionArcHitTestResult;
+use crate::ui::gestures::{
+    density_from_horizontal_drag, overview_drag_origin, overview_drag_step,
+    vertical_camera_maximum, vertical_density_camera_padding, vertical_overview_step,
+};
+use crate::ui::{TrackFrameKey, UiCommand};
+use crate::workspace::navigation::resolve_initial_locus;
+use crate::workspace::panels::{
+    ReadRowCoordinateAuthority, ViewPanelController, current_read_row_authority,
+};
+use crate::{
+    COMMAND_SEARCH_ID, HorizontalOverviewDrag, HoverInspectorTarget, OverviewCapture,
+    SashimiHitTestGate, UiPanel, VerticalOverviewDrag, Viewer, ui,
+};
+use anyhow::Result;
+use rgv_core::{
+    GenomicInterval, InspectorActivation, MAXIMUM_VIEW_PANELS, PanelId, TrackId, Viewport,
+};
+use std::time::Instant;
+use winit::dpi::PhysicalPosition;
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{CursorGrabMode, CursorIcon};
 
 fn pointer_targets_unobstructed_canvas(
     canvas_contains_pointer: bool,
@@ -230,8 +252,8 @@ impl Viewer {
 
     fn set_read_panel_scroll(&mut self, track_id: TrackId, requested: f32) {
         let Some((_, clip_bottom, _)) = self.read_panel_metrics(track_id) else {
-            if self.manual_diagnostic_trace_is_recording() {
-                self.record_manual_diagnostic_event(
+            if self.diagnostics.recording() {
+                self.diagnostics.event(
                     "vertical_navigation",
                     "scroll_rejected",
                     serde_json::json!({
@@ -271,8 +293,8 @@ impl Viewer {
                     self.panels.active_mut().latent_vertical_scroll_fraction = Some(fraction);
                 }
             }
-            if self.manual_diagnostic_trace_is_recording() {
-                self.record_manual_diagnostic_event(
+            if self.diagnostics.recording() {
+                self.diagnostics.event(
                     "vertical_navigation",
                     "scroll_rejected",
                     serde_json::json!({
@@ -330,8 +352,8 @@ impl Viewer {
             if !self.refresh_active_panel_scroll_display() {
                 self.mark_display_dirty("covered read-panel fast-scroll refresh was unavailable");
             }
-        } else if self.manual_diagnostic_trace_is_recording() {
-            self.record_manual_diagnostic_event(
+        } else if self.diagnostics.recording() {
+            self.diagnostics.event(
                 "vertical_navigation",
                 "scroll_waiting_for_materialization",
                 serde_json::json!({
@@ -601,11 +623,11 @@ impl Viewer {
     ) {
         let row_authority = self.read_panel_row_authority(track_id);
         if !row_authority.is_exact() {
-            if self.manual_diagnostic_trace_is_recording()
+            if self.diagnostics.recording()
                 && (interaction.pointer_down
                     || interaction.keyboard_density_pixels.abs() > f32::EPSILON)
             {
-                self.record_manual_diagnostic_event(
+                self.diagnostics.event(
                     "vertical_navigation",
                     "overview_interaction_rejected",
                     serde_json::json!({
@@ -624,8 +646,9 @@ impl Viewer {
             return;
         }
         if interaction.pointer_down {
-            self.interaction_trace
-                .record_once(InteractionTraceStage::EguiPointerDown);
+            self.diagnostics.latency(LatencyEvent::StageOnce(
+                InteractionTraceStage::EguiPointerDown,
+            ));
         }
         if interaction.keyboard_density_pixels.abs() > f32::EPSILON {
             let viewport_height = self.read_panel_metrics(track_id).map_or(
@@ -745,7 +768,7 @@ impl Viewer {
             pending_motion_x: 0.0,
             pending_motion_y: 0.0,
         });
-        self.interaction_trace.begin();
+        self.diagnostics.latency(LatencyEvent::Begin);
         if !thumb_hit {
             self.update_vertical_scrollbar_drag(self.cursor);
         }
@@ -767,8 +790,9 @@ impl Viewer {
             drag.density_dragging = true;
             drag.last_pointer_x = pointer.x;
             self.vertical_overview_drag = Some(drag);
-            self.interaction_trace
-                .record_once(InteractionTraceStage::DensityIntentDetected);
+            self.diagnostics.latency(LatencyEvent::StageOnce(
+                InteractionTraceStage::DensityIntentDetected,
+            ));
             self.apply_vertical_density_delta(total_x, total_y);
             self.begin_overview_capture(OverviewCapture::VerticalDensity);
             drag = self
@@ -879,8 +903,8 @@ impl Viewer {
 
     pub(crate) fn finish_vertical_scrollbar_drag(&mut self) {
         if self.vertical_overview_drag.take().is_some() {
-            if self.interaction_trace.is_active() {
-                self.interaction_trace.release();
+            if self.diagnostics.latency_active() {
+                self.diagnostics.latency(LatencyEvent::Release);
             }
             self.window.request_redraw();
         }
@@ -901,8 +925,9 @@ impl Viewer {
                 self.captured_motion = (0.0, 0.0);
                 self.captured_motion_distance = 0.0;
                 if capture == OverviewCapture::VerticalDensity {
-                    self.interaction_trace
-                        .record_once(InteractionTraceStage::PointerCaptureAcquired);
+                    self.diagnostics.latency(LatencyEvent::StageOnce(
+                        InteractionTraceStage::PointerCaptureAcquired,
+                    ));
                 }
                 true
             }
@@ -935,8 +960,9 @@ impl Viewer {
             if logical_x.abs() >= 0.5 && logical_x.abs() > logical_y.abs() * 1.25 {
                 drag.density_dragging = true;
                 self.vertical_overview_drag = Some(drag);
-                self.interaction_trace
-                    .record_once(InteractionTraceStage::DensityIntentDetected);
+                self.diagnostics.latency(LatencyEvent::StageOnce(
+                    InteractionTraceStage::DensityIntentDetected,
+                ));
                 if self.begin_overview_capture(OverviewCapture::VerticalDensity) {
                     self.captured_motion = (drag.pending_motion_x, drag.pending_motion_y);
                     self.captured_motion_distance =
@@ -1078,8 +1104,9 @@ impl Viewer {
         if density_changed {
             self.set_read_panel_density(drag.panel_id, drag.track_id, density);
             self.mark_display_dirty("vertical overview changed read-panel density");
-            self.interaction_trace
-                .record_once(InteractionTraceStage::DensityChanged);
+            self.diagnostics.latency(LatencyEvent::StageOnce(
+                InteractionTraceStage::DensityChanged,
+            ));
         } else if scroll_changed {
             let materialization = self.active_read_panel_materialization_coverage(drag.track_id);
             if self.synthetic {
@@ -1088,8 +1115,8 @@ impl Viewer {
                 self.mark_display_dirty(
                     "covered vertical overview fast-scroll refresh was unavailable",
                 );
-            } else if !materialization.is_covered() && self.manual_diagnostic_trace_is_recording() {
-                self.record_manual_diagnostic_event(
+            } else if !materialization.is_covered() && self.diagnostics.recording() {
+                self.diagnostics.event(
                     "vertical_navigation",
                     "scroll_waiting_for_materialization",
                     serde_json::json!({

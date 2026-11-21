@@ -1,215 +1,80 @@
-#![allow(clippy::wildcard_imports)]
-
+use crate::app::alignment_context::AlignmentContextMenuState;
+use crate::app::tasks::{
+    ExportTask, NativeWindowCaptureTask, SessionLoadTask, SessionSaveTask, WorkspaceListImportTask,
+};
+use crate::automation::{AutomationAuxiliaryOpenState, AutomationRunner};
+use crate::display::hit_test::JunctionArcHitTestResult;
+use crate::launch::{LaunchOptions, RunMarker, discover_recovery_candidates};
+use crate::runtime::Application;
+use crate::sources::inferred_desktop_track_kind;
+use crate::workspace::alignments::{
+    AlignmentSceneBudgetSnapshot, AlignmentTrackController, EmptyAlignmentState,
+};
+use crate::workspace::navigation::ImportedLocusRequest;
+use crate::workspace::navigation_transaction::NavigationPresentationPhase;
+use crate::workspace::panels::{PanelWorkspace, ViewPanelController};
 use std::{
-    borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    fmt::Write as _,
-    io::Write as _,
-    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 mod app;
 mod automation;
 mod control_service;
+mod diagnostics;
 mod display;
 mod inspection;
-mod interaction_recording;
-mod interaction_trace;
 mod launch;
-mod manual_diagnostic_instrumentation;
-mod manual_diagnostic_trace;
 mod runtime;
 mod sources;
-mod stress_health;
 mod ui;
 mod workspace;
 mod workspace_lists;
 
 use anyhow::{Context as _, Result};
-use app::{actions::*, alignment_context::*, tasks::*};
-use automation::*;
 use clap::Parser;
-use control_service::{ControlRequest, ControlService, ControlStatusMetadata, read_control_secret};
-#[cfg(test)]
-use display::reference_bases_label;
-use display::{alignment::*, auxiliary::*, hit_test::*};
-use display::{
-    alignment_row_activity_overview, alignment_scene_read_extent,
-    reconcile_read_panel_scroll_for_authority,
-};
-use egui_wgpu::{RendererOptions, ScreenDescriptor};
-use inspection::{auxiliary::*, document::*, model::*, read::*, rna::*, variant::*};
-use interaction_recording::InteractionRecorder;
-use interaction_trace::{InteractionTraceRecorder, InteractionTraceStage};
-use launch::*;
-use manual_diagnostic_instrumentation::{
-    ManualDiagnosticFramePhase, ManualDiagnosticTraceRuntime, object_fields,
-};
-use manual_diagnostic_trace::{
-    ManualDiagnosticInteractionId, ManualDiagnosticTraceFields, ManualDiagnosticTraceRecorder,
-    ManualDiagnosticTraceState,
-};
+use control_service::ControlService;
+
+use diagnostics::Diagnostics;
 use rgv_alignment_scene::{
-    AlignmentCamera, AlignmentCoherenceGroupId, AlignmentCoherenceGroupKind,
-    AlignmentCoherenceGroupSpec, AlignmentComponent, AlignmentCoverageLaneOptions,
-    AlignmentDerivedLaneCapture, AlignmentDerivedLaneKind, AlignmentDerivedLaneOptions,
-    AlignmentFilterPredicate, AlignmentFilterScope, AlignmentHandle, AlignmentHit,
-    AlignmentInteractionState, AlignmentModificationLaneOptions, AlignmentPageKey,
-    AlignmentPanelLaneCapture, AlignmentPanelLanePublication, AlignmentPanelSceneAdmission,
-    AlignmentPanelSceneError, AlignmentPanelSceneFrame, AlignmentPanelSceneStore,
-    AlignmentPresentationScene, AlignmentReadLabelMode, AlignmentRowActivityProfile,
-    AlignmentSashimiLaneOptions, AlignmentSashimiScalePolicy, AlignmentSceneCamera,
-    AlignmentSceneSnapshot, AlignmentSemanticRetirementStats, AlignmentStyleContract,
-    AlignmentTraversalDirection, AlignmentViewFilterContract, AlleleSummaryDetail,
-    AllocationBundleActual, AllocationBundleCommit, AllocationBundleError, AllocationBundleLease,
-    AllocationBundleSlot, AllocationBundleSpec, AllocationLedger, AllocationRetirementClaimSet,
-    AllocationRetirementToken, CapabilityRequirement, ContractFingerprint,
-    CoverageAlleleInterpretation, CpuAlignmentProjector, CpuAlleleProjectionOptions, CpuClipRect,
-    CpuDepthProjectionOptions, CpuJunctionProjectionOptions, CpuModificationProjectionOptions,
-    CpuProjectionError, CpuSummaryCamera, GeometryLod, LayoutContract, LedgerError, LedgerProgress,
-    LedgerProgressEpoch, LedgerProgressSubscription, LedgerSnapshot,
-    MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract, ReadSampling,
-    ReferenceRevision, RevisionFingerprint, RowAtlasRevision, RowCoordinateSpaceRevision,
-    SummaryContract, SummaryPageFamily, SummaryRevision, SummarySemanticComponent,
-    build_alignment_semantic_retirement_claim_set, evaluate_alignment_filter,
+    AlignmentCamera, AlignmentDerivedLaneKind, AlignmentHandle, AlignmentHit, AlignmentPageKey,
+    AlignmentPanelSceneFrame, AlignmentPanelSceneStore, AlignmentSceneCamera,
+    AlignmentSceneSnapshot, AllocationLedger, CpuClipRect, LedgerError, LedgerProgressEpoch,
+    LedgerProgressSubscription, ReferenceRevision, SummaryRevision,
 };
 use rgv_core::{
-    AUTOMATION_SCHEMA_VERSION, AlignmentAuxComparison, AlignmentAuxFilterValue,
-    AlignmentPredicateScope, AlignmentReadSampling, AlignmentViewPredicate,
-    AutomationAlignmentRelationship, AutomationAlignmentReveal,
-    AutomationAlignmentSceneDiagnostics, AutomationAlignmentSelector, AutomationAlignmentState,
-    AutomationAlignmentTrackSnapshot, AutomationBatch, AutomationCommand, AutomationCommandResult,
-    AutomationCommandStatus, AutomationContextLaneSnapshot, AutomationCytobandAvailability,
-    AutomationEnvironmentTelemetry, AutomationErrorCode, AutomationEvidenceField,
-    AutomationExportKind, AutomationFrameTelemetry, AutomationGenomeSnapshot,
-    AutomationGpuTelemetry, AutomationHistoryNavigation, AutomationLandmarkIntegrityState,
-    AutomationLandmarkSnapshot, AutomationLandmarkTrackState, AutomationNavigationDestination,
-    AutomationNavigationTelemetry, AutomationOptionScope, AutomationPaneItemLayoutSnapshot,
-    AutomationPaneLayoutSnapshot, AutomationPanelSnapshot, AutomationPresentationCompositeSnapshot,
-    AutomationPresentationGroupSnapshot, AutomationPresentationNodeSnapshot,
-    AutomationReadPanelStateSnapshot, AutomationReadPresentationState, AutomationRectSnapshot,
-    AutomationRenderLaneSnapshot, AutomationRenderOmissionReason, AutomationReviewNavigation,
-    AutomationRunReport, AutomationRunTelemetry, AutomationSelection,
-    AutomationSelectionGranularity, AutomationSelectionKind, AutomationSelectionSnapshot,
-    AutomationSetting, AutomationSnapshotFormat, AutomationSnapshotScope,
-    AutomationTrackGestureKind, AutomationTrackGestureSnapshot, AutomationTrackLifecycle,
-    AutomationTrackSnapshot, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
-    AutomationWorkspaceLayoutSnapshot, AutomationWorkspacePanelLayoutSnapshot,
-    AutomationWorkspaceSnapshot, BisulfiteContext, ContigAliases, ContigId, CopyNumberSortLocus,
-    CopyNumberSortMode, CopyNumberTrackSettings, CopyNumberValueMode, CoverageScaleTransform,
-    DesktopSettings, DetailLevel, FeatureDisplayMode, GenerationClock, GeneticCode, GenomeAssembly,
-    GenomeAssemblyIdentity, GenomeConfiguration, GenomeLandmarkCatalogue, GenomicInterval,
-    GenomicSourceFormat, GwasColorMode, GwasTrackSettings, IgvImportReport, IgvLocusResolution,
-    InspectorActivation, InteractionDisplayMode, InteractionTrackSettings, JunctionDisplayMode,
-    LandmarkAssetRole, LandmarkSearchIndex, Locus, LocusError, LocusRange,
-    MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_AUTOMATION_EVIDENCE_FIELDS,
-    MAXIMUM_AUTOMATION_HISTORY_ENTRIES, MAXIMUM_AUTOMATION_LOCI,
-    MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS, MAXIMUM_AUTOSAVE_INTERVAL_SECONDS,
-    MAXIMUM_AUTOSAVE_RETENTION, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, MAXIMUM_CACHE_BUDGET_MIB,
-    MAXIMUM_INTERFACE_SCALE_PERCENT, MAXIMUM_READ_BROWSING_BUFFER_PERCENT,
-    MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS, MAXIMUM_REVIEW_NOTE_BYTES,
-    MAXIMUM_VIEW_PANELS, MINIMUM_AUTOSAVE_INTERVAL_SECONDS, MINIMUM_AUTOSAVE_RETENTION,
-    MINIMUM_CACHE_BUDGET_MIB, MINIMUM_INTERFACE_SCALE_PERCENT,
-    MINIMUM_READ_BROWSING_BUFFER_PERCENT, ModifiedBaseColorMode, MutationColorMode,
-    MutationTrackSettings, NamedNavigationHistory, NavigationEntry, OverlappingMatePolicy,
-    PanelGeneration, PanelId, PresentationNodeId, QuantitativeArithmetic, QuantitativeDisplayMode,
-    QuantitativeMissingMode, QuantitativeScaleMode, QuantitativeScaleTransform,
-    QuantitativeTrackSettings, QuantitativeWindowFunction, ReadBaseDisplayMode, ReadStackingMode,
-    ReferenceDictionary, ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus,
-    SampleMetadataTable, SashimiCountMode, SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode,
-    SessionAlignmentTrack, SessionDocument, SessionFilters, SessionLocus, SessionPaneTrackState,
-    SessionReadPanelState, SessionViewPanel, SmrtKineticsMode, TrackChangeSet, TrackCollection,
-    TrackConfig, TrackFormat, TrackId, TrackIntent, TrackKind, TrackSource, UltimaDisplayOptions,
-    UltimaQualityMode, UnresolvedSessionSource, VariantColorMode, VariantFieldComparison,
-    VariantFieldPredicate, VariantFieldScope, VariantGenotypeFilter, VariantGenotypeGrouping,
-    VariantMissingValueRule, VariantTrackSettings, VariantTypeGroup, Viewport, ViewportGeneration,
-    WorkspacePresentation, classify_genomic_source, parse_ucsc_cytobands,
+    ContigAliases, DesktopSettings, GeneticCode, GenomeAssembly, GenomeAssemblyIdentity,
+    GenomeLandmarkCatalogue, GenomicInterval, GenomicSourceFormat, IgvImportReport,
+    LandmarkSearchIndex, PanelId, PresentationNodeId, QuantitativeArithmetic, ReferenceDictionary,
+    ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus, SampleMetadataTable,
+    TrackCollection, TrackConfig, TrackId, TrackKind, TrackSource, UnresolvedSessionSource,
+    VariantFieldScope, VariantMissingValueRule, Viewport, WorkspacePresentation,
+    classify_genomic_source,
 };
 use rgv_engine::{
-    AlignmentCoordinatorFrame, AlignmentIndividualReadCapability, AlignmentReferenceAuthority,
-    AlignmentReferenceRequirement, AlignmentSceneBuildContract, AlignmentSceneCoordinatorTelemetry,
-    AlignmentSceneEngine, AlignmentSceneEngineEvent, AlignmentSceneEngineOperation,
-    AlignmentSceneFrameCause, AlignmentScenePreparationPolicy, AlignmentSceneRequestToken,
-    AlignmentSceneResourcePressureDisposition, AlignmentSceneSourceMetadata,
-    AlignmentVerticalResidency, EngineQueueError, LocalAlignmentSceneEngineConfig,
-    LocalBamCanonicalBackend, LocalBamSourceControl, MAX_REFERENCE_QUERY_BASES, ReferenceEngine,
-    ReferenceEngineEvent, ReferenceQueryIdentity, SourceIntentKind, SourceOwnerId, TrackEngine,
-    TrackEngineEvent, TrackSearchHit, TrackSearchResults, TrackSnapshot, TrackSnapshotData,
-    TrackSpec, TrackSpecKind, alignment_row_activity_satisfies_contract,
+    AlignmentIndividualReadCapability, AlignmentSceneRequestToken, AlignmentVerticalResidency,
+    ReferenceEngine, TrackEngine, TrackSearchResults, TrackSpecKind,
 };
-use rgv_hts::{
-    AlignedBaseClassification, AlignmentFilter, AlignmentOpenOptions, AlignmentRecord,
-    AuxComparison, AuxPredicate, AuxValue, CigarOpKind, FastaOpenOptions, FilterValue,
-    HttpRangeConfig, ModificationCode, QUALITY_WEIGHT_SCALE, QueryDetail, QueryOptions,
-    ReferenceSlice, RemoteAuthentication, RemoteIoStats, SequenceData, SupplementarySegment,
-    TemplateLengthBounds, UltimaEventUnavailable, UltimaIndelKind, UltimaQualitySource,
-    UltimaTagOrientation, analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse,
-    classify_aligned_base, decode_modified_bases, decode_supplementary_chain, pair_evidence,
-    smrt_kinetics_series, summarize_bisulfite_record, summarize_sbx_record,
-};
-#[cfg(test)]
-use rgv_layout::layout_features;
-use rgv_layout::{
-    AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
-    COPY_NUMBER_HEADER_HEIGHT, DisplayList, JunctionAnnotationLookup, JunctionAnnotationStatus,
-    JunctionArcComponent, MAX_HIDDEN_MODIFICATION_CODES, MINIMUM_BASE_GLYPH_PIXEL_WIDTH,
-    MUTATION_HEADER_HEIGHT, ObjectIdAllocator, ObjectIdRange, QuantitativeRange, RectPrimitive,
-    Rgba, SashimiLayoutOptions, TrackLayoutOptions, alignment_read_name_hash,
-    compose_quantitative_records, copy_number_sample_order, gwas_point_y, junction_count_value,
-    layout_copy_number, layout_features_with_label_widths, layout_gwas, layout_interactions,
-    layout_mutations, layout_quantitative, layout_reference_slice_oriented,
-    layout_reference_translation_in_contig, layout_sashimi, layout_variants,
-    modification_code_color, quantitative_data_range, ultima_quality_color,
-};
-#[cfg(test)]
-use rgv_render::export_png;
+use rgv_hts::RemoteIoStats;
+
+use rgv_layout::{DisplayList, JunctionArcComponent};
 use rgv_render::{
-    AlignmentGpuCameraCaptureError, AlignmentGpuFrame, AlignmentGpuPageAdmissionError,
-    AlignmentGpuPrefetchCursor, AlignmentGpuPrepareError, AlignmentGpuPrepareStats,
-    AlignmentGpuRenderer, AlignmentGpuReplacementError, AlignmentGpuResidencyLease,
-    AlignmentGpuRetirement, AlignmentGpuSceneRequest, AlignmentGpuScissor,
-    AlignmentSummaryFrameOverlays, AlignmentSummaryGpuCameraCaptureError, AlignmentSummaryGpuFrame,
-    AlignmentSummaryGpuLaneOptions, AlignmentSummaryGpuPageAdmissionError,
-    AlignmentSummaryGpuPageKey, AlignmentSummaryGpuPrefetchCursor, AlignmentSummaryGpuPrepareError,
-    AlignmentSummaryGpuPrepareStats, AlignmentSummaryGpuRenderer,
-    AlignmentSummaryGpuReplacementError, AlignmentSummaryGpuResidencyLease,
-    AlignmentSummaryGpuRetirement, AlignmentSummaryGpuSceneRequest,
-    AlignmentSummaryJunctionComponentToken, AlignmentSummaryJunctionInteraction,
-    ContextSceneGpuCamera, ContextSceneGpuCameraCaptureError, ContextSceneGpuCoherenceKey,
-    ContextSceneGpuFrame, ContextSceneGpuLaneKey, ContextSceneGpuLaneRequest,
-    ContextSceneGpuRejection, ContextSceneGpuRejectionReason, ContextSceneGpuRenderer,
-    ContextSceneGpuRetainedLaneRequest, ContextSceneGpuScissor, GpuBudgetPressure, GpuReclaimGoal,
-    GpuReclaimReport, PrepareStats, RectangleRenderer, export_png_scaled,
+    AlignmentGpuFrame, AlignmentGpuPrefetchCursor, AlignmentGpuPrepareStats, AlignmentGpuRenderer,
+    AlignmentGpuResidencyLease, AlignmentSummaryGpuFrame, AlignmentSummaryGpuPageKey,
+    AlignmentSummaryGpuPrefetchCursor, AlignmentSummaryGpuPrepareStats,
+    AlignmentSummaryGpuRenderer, AlignmentSummaryGpuResidencyLease,
+    AlignmentSummaryJunctionComponentToken, ContextSceneGpuFrame, ContextSceneGpuRenderer,
+    GpuBudgetPressure, RectangleRenderer,
 };
-use runtime::*;
-use sha2::{Digest as _, Sha256};
-use sources::*;
-use stress_health::StressHealthPublisher;
-use ui::{
-    AlignmentSubtrack, CytobandAvailability, GenomeContextMetrics, MENU_HEIGHT, NAVIGATION_HEIGHT,
-    SEARCHABLE_COMMANDS, STATUS_HEIGHT, TrackFrame, TrackFrameKey, TrackSubtrack, TrackUiAction,
-    UiCommand, WorkspaceLayoutInput, WorkspaceLayoutSnapshot, WorkspacePanelLayoutInput,
-};
-use ui::{alignment_settings::*, gestures::*, track_settings::*};
+use ui::{TrackFrameKey, UiCommand, WorkspaceLayoutSnapshot};
 use winit::{
-    application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
-    event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, ModifiersState, NamedKey},
-    window::{CursorGrabMode, CursorIcon, Theme, Window, WindowAttributes, WindowId},
-};
-use workspace::{
-    alignment_navigation::*, alignments::*, context_lanes::*, lists::*, navigation::*,
-    navigation_transaction::*, panels::*, tracks::replace_panel_track_selection,
-};
-use workspace_lists::{
-    WorkspaceListImport, WorkspaceListKind, import_workspace_list, region_bed_export,
-    review_tsv_export,
+    dpi::PhysicalPosition,
+    event_loop::{ControlFlow, EventLoop},
+    keyboard::ModifiersState,
+    window::Window,
 };
 
 const SYNTHETIC_CONTIG_LENGTH: u64 = 250_000_000;
@@ -1401,7 +1266,6 @@ struct CachedGenomeOverview {
 #[allow(clippy::struct_excessive_bools)]
 struct Viewer {
     application_instance_id: String,
-    stress_health: Arc<StressHealthPublisher>,
     workspace_revision: u64,
     document_state: app::document_state::DocumentState,
     next_evidence_revision: u64,
@@ -1476,6 +1340,7 @@ struct Viewer {
     assembly_name: String,
     cytoband_path: Option<PathBuf>,
     data_status: String,
+    busy_status: app::status_activity::BusyStatus,
     announced_status: String,
     reference_reverse_complement: bool,
     reference_translation_frames: Vec<ReferenceTranslationFrame>,
@@ -1532,10 +1397,7 @@ struct Viewer {
     open_panel: Option<UiPanel>,
     remote_source_editor: RemoteSourceEditor,
     diagnostics_open: bool,
-    interaction_recording: InteractionRecorder,
-    interaction_trace: InteractionTraceRecorder,
-    manual_diagnostic_trace: ManualDiagnosticTraceRecorder,
-    manual_diagnostic_trace_runtime: ManualDiagnosticTraceRuntime,
+    diagnostics: Diagnostics,
     manual_diagnostic_trace_autostart_pending: bool,
     genome_overview_cache: BTreeMap<PanelId, CachedGenomeOverview>,
     genome_overview_recomputations: u64,

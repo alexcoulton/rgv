@@ -1,5 +1,31 @@
-use super::super::*;
+use crate::inspection::model::{
+    CopyNumberSelection, FeatureSelection, GwasSelection, InteractionSelection, MutationSelection,
+    QuantitativeSelection, RetainedEvidenceSnapshot, SelectedSupplementaryChain, VariantSelection,
+};
 use crate::ui::{ScrollbarOverview, WorkspacePaneLayout};
+use crate::ui::{TrackFrame, TrackFrameKey};
+use crate::workspace::context_lanes::PanelContextScene;
+use crate::workspace::navigation::{
+    IMPORTED_PLACEHOLDER_LOCUS, ImportedLocusRequest, standalone_locus,
+};
+use crate::workspace::navigation_transaction::{NavigationPresentation, NavigationQuerySchedule};
+use crate::{HoverInspectorTarget, JunctionArcHover, ui};
+use anyhow::{Context as _, Result};
+use rgv_alignment_scene::{
+    AlignmentHit, AlignmentPresentationScene, ReferenceRevision, RowAtlasRevision,
+    RowCoordinateSpaceRevision,
+};
+use rgv_core::{
+    ContigId, GenerationClock, GenomicInterval, MAXIMUM_VIEW_PANELS, NamedNavigationHistory,
+    NavigationEntry, PanelGeneration, PanelId, PresentationNodeId, SessionDocument, TrackId,
+    TrackKind, Viewport,
+};
+use rgv_engine::{SourceOwnerId, TrackSnapshot};
+use rgv_hts::{AlignmentRecord, ReferenceSlice};
+use rgv_layout::{DisplayList, JunctionArcComponent};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Default)]
 pub(crate) struct PendingQueries {

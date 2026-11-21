@@ -1,4 +1,30 @@
-use super::super::*;
+use crate::display::auxiliary::gwas_record_index_at_point;
+use crate::inspection::auxiliary::{
+    gwas_inspector_document, gwas_inspector_fields, quantitative_inspector_document,
+    quantitative_inspector_fields,
+};
+use crate::inspection::document::{InspectorProvenance, InspectorValue};
+use crate::inspection::model::{
+    GwasInspectorSnapshot, QuantitativeInspectorSnapshot, QuantitativeOperandSnapshot,
+};
+use crate::launch::LaunchOptions;
+use crate::sources::{
+    DroppedFileKind, DroppedJsonKind, build_tdf_channel_expansion, build_track_specs,
+    classify_dropped_file, classify_dropped_json, inferred_desktop_track_kind,
+    load_assembly_reporting, session_track_specs, tdf_channel_display_name, track_spec_kind,
+};
+use crate::{RemoteSourceEditor, RemoteSourceKind, validate_remote_source_editor};
+use clap::Parser as _;
+use rgv_core::{
+    ContigAliases, ContigId, GenomeConfiguration, GenomicInterval, GenomicSourceFormat,
+    GwasTrackSettings, QuantitativeArithmetic, QuantitativeDisplayMode, QuantitativeTrackSettings,
+    ReferenceDictionary, SessionDocument, SessionLocus, TrackCollection, TrackConfig, TrackFormat,
+    TrackId, TrackKind, TrackSource, Viewport, classify_genomic_source,
+};
+use rgv_engine::TrackSpecKind;
+use rgv_layout::gwas_point_y;
+use std::path::Path;
+use std::sync::Arc;
 
 #[test]
 fn session_track_specs_restore_new_feature_formats_by_extension() {
@@ -762,9 +788,7 @@ fn dropped_json_is_identified_from_one_parse() {
 
 #[test]
 fn unusable_cytobands_are_reported_instead_of_only_logged() {
-    let dictionary = || {
-        ReferenceDictionary::from_contigs([("chr1".to_owned(), 1_000)])
-    };
+    let dictionary = || ReferenceDictionary::from_contigs([("chr1".to_owned(), 1_000)]);
     let directory = tempfile::tempdir().unwrap();
 
     let (assembly, failure) = load_assembly_reporting("test", dictionary(), None);
@@ -773,7 +797,10 @@ fn unusable_cytobands_are_reported_instead_of_only_logged() {
 
     let missing = directory.path().join("missing.txt");
     let (assembly, failure) = load_assembly_reporting("test", dictionary(), Some(&missing));
-    assert!(!assembly.has_cytobands(), "the plain ideogram is the fallback");
+    assert!(
+        !assembly.has_cytobands(),
+        "the plain ideogram is the fallback"
+    );
     let failure = failure.expect("a missing cytoband file is reported");
     assert!(failure.contains("Could not load cytobands"));
     assert!(failure.contains("missing.txt"));
@@ -784,7 +811,11 @@ fn unusable_cytobands_are_reported_instead_of_only_logged() {
     assert!(failure.is_some(), "a malformed cytoband file is reported");
 
     let valid = directory.path().join("valid.txt");
-    std::fs::write(&valid, "chr1\t0\t500\tp1\tgneg\nchr1\t500\t1000\tq1\tgpos50\n").unwrap();
+    std::fs::write(
+        &valid,
+        "chr1\t0\t500\tp1\tgneg\nchr1\t500\t1000\tq1\tgpos50\n",
+    )
+    .unwrap();
     let (assembly, failure) = load_assembly_reporting("test", dictionary(), Some(&valid));
     assert_eq!(failure, None);
     assert!(assembly.has_cytobands());

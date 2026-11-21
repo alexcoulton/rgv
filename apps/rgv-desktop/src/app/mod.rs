@@ -1,8 +1,10 @@
 pub(crate) mod actions;
 pub(crate) mod alignment_context;
+mod display_invalidation;
 pub(crate) mod document_state;
 pub(crate) mod settings_writer;
 pub(crate) mod shell_controller;
 pub(crate) mod shell_state;
+pub(crate) mod status_activity;
 pub(crate) mod tasks;
 pub(crate) mod viewer_runtime;

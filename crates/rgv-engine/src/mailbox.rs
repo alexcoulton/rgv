@@ -322,6 +322,45 @@ fn close_receiver<T>(inner: &MailboxInner<T>) {
 /// Ends a blocking mailbox receive from another thread. See [`CoalescingReceiver::waker`].
 pub(crate) type MailboxWaker = Arc<dyn Fn() + Send + Sync>;
 
+/// Takes over the join of a worker which has already been told to stop, so the caller never
+/// waits for whatever I/O that worker is in the middle of. A finished worker is joined on the
+/// spot; a running one is handed to a short-lived reaper thread, whose handle is returned for
+/// callers which want to observe the exit. `None` means there is nothing left to wait for (or
+/// the reaper could not be started and the worker was detached).
+pub(crate) fn reap_worker(
+    worker: std::thread::JoinHandle<()>,
+    reaper_name: &'static str,
+    worker_description: &'static str,
+) -> Option<std::thread::JoinHandle<()>> {
+    let finished = worker.is_finished();
+    let join = move || {
+        if worker.join().is_err() {
+            tracing::warn!(
+                worker = worker_description,
+                "worker panicked while retiring"
+            );
+        }
+    };
+    if finished {
+        join();
+        return None;
+    }
+    match std::thread::Builder::new()
+        .name(reaper_name.to_owned())
+        .spawn(join)
+    {
+        Ok(reaper) => Some(reaper),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                worker = worker_description,
+                "could not spawn a reaper; worker detached"
+            );
+            None
+        }
+    }
+}
+
 /// Best-effort text of a caught panic payload, for a terminal error event.
 pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     payload

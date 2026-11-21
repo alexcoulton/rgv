@@ -1,4 +1,13 @@
-use super::super::*;
+use crate::inspection::model::BoundedSequenceCopy;
+use crate::inspection::read::{bounded_oriented_sequence_copy, bounded_sequence_copy};
+use crate::ui::TrackFrameKey;
+use crate::workspace::navigation::{mate_locus, mate_viewport};
+use crate::workspace::panels::PendingReadSelection;
+use crate::workspace::tracks::replace_panel_track_selection;
+use crate::{Viewer, ui};
+use anyhow::{Context as _, Result};
+use rgv_core::{MAXIMUM_VIEW_PANELS, PanelId, ReferenceDictionary, TrackId, Viewport};
+use rgv_hts::AlignmentRecord;
 
 impl Viewer {
     fn selected_mate_record(&self) -> Option<(TrackId, AlignmentRecord, &ReferenceDictionary)> {

@@ -1,4 +1,3 @@
-use super::super::*;
 use crate::display::alignment::{
     INDEX_ONLY_READ_NOTICE, ReadPanelKey, ReadPanelSpec, alignment_scene_annotation_frame,
     index_only_read_display, index_only_read_notice, materialized_alignment_row_range,
@@ -9,6 +8,14 @@ use crate::display::auxiliary::{
     pinned_gene_layout_maximum_rows, quantitative_object_id_span, strip_object_ids,
     track_options_with_object_ids,
 };
+use crate::display::auxiliary::{
+    feature_record_index_at_position_and_row, interaction_record_index_at_position,
+    mutation_record_index_at_position, normalize_quantitative_overlay_settings,
+    quantitative_overlay_members, quantitative_overlay_subtracks,
+    quantitative_record_index_at_position, shared_copy_number_range, shared_quantitative_range,
+};
+use crate::display::hit_test::{alignment_lane_at_screen_y, alignment_track_at_content_y};
+use crate::display::reference_bases_label;
 use crate::display::reference_lanes::append_reference_translation_lanes;
 use crate::display::{
     ANNOTATION_PANE_BACKGROUND, PINNED_ALIGNMENT_COVERAGE_HEIGHT,
@@ -22,6 +29,48 @@ use crate::display::{
     reflow_annotation_presentation_with_heights, resolve_read_panel_overview,
     synthetic_read_rows_for_bounds, synthetic_section_display, track_section_geometry,
 };
+use crate::inspection::auxiliary::{
+    copy_number_inspector_document, copy_number_inspector_fields, feature_inspector_document,
+    feature_inspector_fields, interaction_inspector_fields,
+    interaction_inspector_presentation_document, mutation_inspector_document,
+    mutation_inspector_fields,
+};
+use crate::inspection::document::{InspectorActionId, InspectorProvenance, InspectorValue};
+use crate::inspection::model::{
+    CopyNumberInspectorSnapshot, FeatureInspectorSnapshot, InteractionInspectorSnapshot,
+    MutationInspectorSnapshot,
+};
+use crate::ui::gestures::{
+    capture_stable_row_camera, center_read_row_scroll, density_from_horizontal_drag,
+    overview_drag_origin, overview_drag_step, overview_pan_gain, reconcile_vertical_scroll,
+    reproject_stable_row_camera, retained_data_overlaps, vertical_camera_maximum,
+    vertical_overview_step,
+};
+use crate::ui::{AlignmentSubtrack, TrackFrame, TrackFrameKey, TrackSubtrack};
+use crate::workspace::panels::{
+    ReadPanelScrollState, ReadRowCoordinateAuthority, current_read_row_authority,
+    read_row_cache_matches_committed_activity,
+};
+use crate::{MAX_OVERLAY_GUTTER_MEMBERS, MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY, ui};
+use rgv_alignment_scene::{RowAtlasRevision, RowCoordinateSpaceRevision};
+use rgv_core::{
+    ContigId, CopyNumberSortLocus, CopyNumberSortMode, CopyNumberTrackSettings,
+    CopyNumberValueMode, FeatureDisplayMode, GeneticCode, GenomicInterval,
+    InteractionTrackSettings, JunctionDisplayMode, PresentationNodeId, QuantitativeScaleMode,
+    QuantitativeScaleTransform, QuantitativeTrackSettings, ReferenceTranslationFrame,
+    SessionAlignmentTrack, SessionFilters, SessionPaneTrackState, TrackConfig, TrackId, TrackKind,
+    TrackSource, Viewport, WorkspacePresentation,
+};
+use rgv_engine::{TrackSnapshot, TrackSnapshotData};
+use rgv_hts::ReferenceSlice;
+use rgv_layout::{
+    DisplayList, ObjectIdAllocator, QuantitativeRange, RectPrimitive, Rgba, TrackLayoutOptions,
+    layout_features,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use winit::dpi::PhysicalPosition;
+use winit::event::MouseScrollDelta;
 
 #[test]
 fn alignment_row_materialization_tracks_vertical_camera_with_overscan() {

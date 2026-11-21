@@ -1,4 +1,28 @@
-use super::super::*;
+use crate::MAX_RNA_EXPORT_BYTES;
+use crate::inspection::document::{
+    InspectorAction, InspectorActionId, InspectorBadge, InspectorDocument, InspectorField,
+    InspectorNotice, InspectorSection, InspectorTable, InspectorTone, InspectorValue,
+};
+use crate::inspection::model::{
+    ChainDiagramSegment, SelectedSupplementaryChain, SupplementaryChainDiagram,
+};
+use crate::inspection::read::format_cigar;
+use crate::inspection::variant::tsv_cell;
+use rgv_alignment_scene::AlignmentSceneSnapshot;
+use rgv_core::{
+    GenomicInterval, JunctionDisplayMode, SashimiCountMode, SashimiScaleMode, SessionFilters,
+    TrackCollection, TrackId, TrackKind, Viewport,
+};
+use rgv_engine::{TrackSnapshot, TrackSnapshotData};
+use rgv_hts::{
+    AlignmentRecord, AuxValue, CigarOpKind, SupplementarySegment, decode_supplementary_chain,
+};
+use rgv_layout::{
+    DisplayList, JunctionAnnotationLookup, JunctionAnnotationStatus, SashimiLayoutOptions,
+    junction_count_value, layout_sashimi,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 pub(crate) const MAX_JUNCTION_ANNOTATION_RECORDS: usize = 200_000;
 pub(crate) const MAX_JUNCTION_ANNOTATION_LABELS_PER_EVENT: usize = 8;

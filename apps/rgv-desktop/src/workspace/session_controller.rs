@@ -1,4 +1,27 @@
-use super::super::*;
+use crate::Viewer;
+use crate::app::tasks::SessionLoadKind;
+use crate::automation::AutomationAuxiliaryOpenState;
+use crate::display::alignment::persisted_style_tag;
+use crate::launch::LaunchOptions;
+use crate::sources::{
+    DroppedFileKind, DroppedJsonKind, build_tdf_channel_expansion, classify_dropped_file,
+    classify_dropped_json, inferred_desktop_track_kind, primary_alignment_track,
+    reference_open_options, session_track_specs, source_display_name, source_path,
+    spawn_track_engine, spawn_track_engine_without_aliases, track_source,
+};
+use crate::workspace::alignments::filter_state_from_session;
+use crate::workspace::navigation::{ImportedLocusRequest, RequestedLocus, resolve_requested_locus};
+use crate::workspace::panels::PanelWorkspace;
+use anyhow::Result;
+use rgv_core::{
+    ReferenceDictionary, SessionAlignmentTrack, SessionDocument, SessionFilters, SessionLocus,
+    SessionReadPanelState, SessionViewPanel, TrackConfig, TrackFormat, TrackId, TrackKind,
+    TrackSource, WorkspacePresentation,
+};
+use rgv_engine::{ReferenceEngine, TrackSpec, TrackSpecKind};
+use rgv_layout::DisplayList;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// Pure desktop preparation: no live state or worker ownership changes until
 /// every capability, filter and panel construction check has succeeded.

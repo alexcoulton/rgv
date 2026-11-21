@@ -1,12 +1,61 @@
-use super::super::*;
+use crate::display::auxiliary::alignment_sort_position;
+use crate::inspection::model::{
+    CopyNumberSelection, FeatureSelection, GwasSelection, InteractionSelection, MutationSelection,
+    QuantitativeSelection, SelectedSupplementaryChain, VariantSelection, next_evidence_index,
+};
+use crate::launch::LaunchOptions;
+use crate::sources::upsert_primary_alignment_config;
+use crate::ui::{TrackFrame, TrackFrameKey, TrackSubtrack};
 use crate::workspace::alignment_management::{
     alignment_gpu_bundle_error_is_deferred, alignment_read_camera_capture_error_is_deferred,
     alignment_scene_covered_clip, alignment_scene_frame_for_ui_against_retained_interval,
-    alignment_scene_intervals_share_authority, alignment_scene_staging_frame_is_current,
-    alignment_scene_viewport_for_layout_width, alignment_summary_camera_capture_error_is_deferred,
-    retained_alignment_scene_can_present, uncovered_vertical_candidate_retains_committed_pixels,
+    alignment_scene_intervals_share_authority, alignment_scene_progress_frame_defers_to_incumbent,
+    alignment_scene_staging_frame_is_current, alignment_scene_viewport_for_layout_width,
+    alignment_summary_camera_capture_error_is_deferred, retained_alignment_scene_can_present,
+    uncovered_vertical_candidate_retains_committed_pixels,
+};
+use crate::workspace::alignment_navigation::AlignmentNavigationPhase;
+use crate::workspace::alignments::{
+    ALIGNMENT_SASHIMI_CPM_GROUP, ALIGNMENT_SASHIMI_RAW_GROUP, AlignmentHighlightCacheKey,
+    AlignmentPanelProjection, AlignmentReferenceCompatibility, AlignmentSceneResolution,
+    AlignmentSettingsDraft, AlignmentSettingsOutcome, FilterEditor,
+    MAXIMUM_ALLELE_COVERAGE_BASES_PER_PIXEL, MAXIMUM_COVERAGE_BINS, READ_CHECKING_NOTICE_DELAY,
+    active_filters_from_session, alignment_coverage_query_plan, alignment_panel_projections,
+    alignment_query_needs_reference, alignment_range_selection, alignment_reference_compatibility,
+    alignment_scene_build_contract, alignment_scene_contract_equivalent,
+    alignment_scene_coverage_lane_options, alignment_scene_derived_lane_captures,
+    alignment_scene_geometry_lod, alignment_scene_modification_lane_options,
+    alignment_scene_preparation_policy, alignment_scene_reference_revision,
+    alignment_scene_sashimi_group, alignment_scene_sashimi_lane_options,
+    alignment_scene_selected_position, alignment_scene_source_query_options,
+    alignment_view_filter_contract, commit_alignment_settings_draft,
+    compatible_reference_contig_name, copy_compatible_alignment_appearance,
+    expanded_workspace_alignment_limit, filter_state_from_session, move_ordered_item,
+    updated_alignment_selection,
+};
+use crate::workspace::lists::{
+    adjacent_review_locus, apply_compatible_auxiliary_appearance, apply_quantitative_bulk_action,
+    merge_imported_regions, metadata_matching_track_ids, region_overlay_horizontal_span,
+};
+use crate::workspace::navigation::{
+    ImportedLocusRequest, RequestedLocus, annotation_search_hit_locus,
+    annotation_search_hit_primary_label, annotation_search_hit_secondary_identity,
+    imported_locus_request, locus_expression_is_navigable, mate_locus, mate_viewport,
+    parse_contig_aliases, preferred_annotation_search_hit, resolve_initial_locus,
+    resolve_requested_locus, split_locus_expression, standalone_locus,
 };
 use crate::workspace::navigation_controller::{LociNavigationPlan, loci_navigation_plan};
+use crate::workspace::navigation_transaction::{
+    NAVIGATION_NOTICE_DELAY, NAVIGATION_QUERY_IDLE_DELAY, NAVIGATION_QUERY_MAX_CADENCE,
+    NavigationPresentation, NavigationPresentationPhase, NavigationQuerySchedule,
+    NavigationQueryTarget, NavigationTargetFingerprint, navigation_target_ready_for_commit,
+};
+use crate::workspace::panels::{
+    INITIAL_PANEL_ID, PanelScrollDisplayCache, PanelWorkspace, PendingReadSelection,
+    ReadPanelScrollState, StableRowCameraAnchor, ViewPanelController,
+    composite_panel_display_lists, composite_panel_generic_display_lists,
+    maximum_annotation_frame_heights,
+};
 use crate::workspace::queries::{
     AlignmentReferenceLanePlan, AlignmentReferenceLaneRequirement, AlignmentSceneFrameSettlement,
     alignment_scene_budget_event_is_current, alignment_scene_event_token_is_current,
@@ -17,6 +66,50 @@ use crate::workspace::queries::{
     reference_dependency_is_settled, reference_failure_matches_requirement,
     reference_query_completion_matches,
 };
+use crate::{
+    AlignmentDerivedLaneTargetIdentity, AlignmentLaneTargetIdentity, AlignmentPanelTargetIdentity,
+    AlignmentScenePublicationAuthority, AlignmentSceneTargetIdentity, HoverInspectorTarget,
+    QuantitativeBulkAction, alignment_gpu_sequences_match_attempt, auxiliary_query_track_ids,
+    clear_removed_alignment_panel_state, clear_removed_auxiliary_panel_state,
+    clear_removed_quantitative_dependencies, ui,
+};
+use anyhow::Result;
+use clap::Parser as _;
+use rgv_alignment_scene::{
+    AlignmentCamera, AlignmentCoherenceGroupId, AlignmentDerivedLaneKind,
+    AlignmentDerivedLaneOptions, AlignmentFilterPredicate, AlignmentSashimiScalePolicy,
+    AlignmentSceneCamera, AlignmentViewFilterContract, AllocationBundleError, ContractFingerprint,
+    CoverageAlleleInterpretation, CpuClipRect, CpuProjectionError, GeometryLod, LedgerError,
+    ReferenceRevision, RevisionFingerprint, RowCoordinateSpaceRevision,
+};
+use rgv_core::{
+    BisulfiteContext, ContigAliases, ContigId, CoverageScaleTransform, DetailLevel,
+    GenomicInterval, JunctionDisplayMode, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, MAXIMUM_VIEW_PANELS,
+    ModifiedBaseColorMode, PanelId, PresentationNodeId, QuantitativeArithmetic,
+    QuantitativeScaleMode, ReadStackingMode, ReferenceDictionary, RegionOfInterest, ReviewItem,
+    ReviewStatus, SampleMetadataTable, SashimiCountMode, SashimiScaleMode, SessionAlignmentTrack,
+    SessionDocument, SessionFilters, SessionLocus, SessionReadPanelState, SessionViewPanel,
+    SmrtKineticsMode, TrackConfig, TrackId, TrackKind, TrackSource, UltimaDisplayOptions,
+    UltimaQualityMode, Viewport,
+};
+use rgv_engine::{
+    AlignmentCoordinatorFrame, AlignmentIndividualReadCapability, AlignmentReferenceRequirement,
+    AlignmentSceneEngineOperation, AlignmentSceneRequestToken,
+    AlignmentSceneResourcePressureDisposition, AlignmentSceneSourceMetadata,
+    AlignmentVerticalResidency, SourceIntentKind, SourceOwnerId, TrackSearchHit,
+    TrackSearchResults, TrackSnapshot, TrackSnapshotData,
+};
+use rgv_hts::{AlignmentFilter, AlignmentRecord, ModificationCode, ReferenceSlice, SequenceData};
+use rgv_layout::{
+    AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, DisplayList,
+};
+use rgv_render::{
+    AlignmentGpuCameraCaptureError, AlignmentGpuPrepareError,
+    AlignmentSummaryGpuCameraCaptureError, AlignmentSummaryGpuPrepareError, export_png,
+};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[test]
 fn retained_scene_overlap_is_presentable_only_when_semantically_current() {
@@ -4041,4 +4134,242 @@ fn base_sort_position_captures_a_centre_then_keeps_the_fixed_anchor() {
         alignment_sort_position(AlignmentSortMode::MappingQuality, None, viewport),
         None
     );
+}
+
+/// A worker frame for `camera` as the staged scene engine reports it: `current` is whether the
+/// replacement scene has published. The interim frame of a contract change on cached evidence
+/// still names the incumbent's coverage but is not current for the desired contracts.
+fn staged_build_frame(camera: AlignmentSceneCamera, current: bool) -> AlignmentCoordinatorFrame {
+    AlignmentCoordinatorFrame {
+        camera,
+        camera_sequence: 5,
+        snapshot: None,
+        row_activity: None,
+        covered_interval: Some(camera.interval()),
+        requested_rows: 0..10,
+        covered_rows: 0..10,
+        reference_requirement: AlignmentReferenceRequirement::NotRequired,
+        scene_contracts_current: current,
+        reference_products_current: current,
+        individual_reads: AlignmentIndividualReadCapability::Pending,
+        vertical_residency: AlignmentVerticalResidency::ViewportBounded,
+    }
+}
+
+fn staged_build_camera() -> AlignmentSceneCamera {
+    AlignmentSceneCamera::without_visible_rows(
+        Viewport::new(
+            GenomicInterval::new(ContigId::new(0), 1_000, 2_000).unwrap(),
+            800.0,
+        )
+        .unwrap(),
+    )
+}
+
+/// The projection state `dispatch_alignment_queries` leaves behind once the worker has accepted
+/// a contract or camera request.
+fn projection_with_running_request(
+    token: AlignmentSceneRequestToken,
+    camera: AlignmentSceneCamera,
+) -> AlignmentPanelProjection {
+    let mut projection = AlignmentPanelProjection::default();
+    projection.advance_scene_generation();
+    projection
+        .navigation
+        .begin(projection.clock.current().get(), token, "contract change");
+    projection.navigation.bind_camera(camera);
+    projection
+        .navigation
+        .transition(AlignmentNavigationPhase::Running, "source accepted");
+    projection
+}
+
+#[test]
+fn a_staged_build_progress_frame_never_withdraws_the_incumbent_scene() {
+    use AlignmentNavigationPhase as Phase;
+    // The engine answered the exact request before its staged build published: there is no
+    // scene for the new contracts yet, and the transaction still owns the replacement.
+    for phase in [
+        Phase::Running,
+        Phase::WaitingForSourcePressure,
+        Phase::WaitingForReference,
+    ] {
+        assert!(
+            alignment_scene_progress_frame_defers_to_incumbent(true, false, phase),
+            "{phase:?} still owns the replacement"
+        );
+    }
+    // A frame which is itself presentable is admitted, whatever the phase.
+    for phase in [Phase::Running, Phase::CandidateReady, Phase::Committed] {
+        assert!(!alignment_scene_progress_frame_defers_to_incumbent(
+            true, true, phase
+        ));
+    }
+    // An older worker camera is handled by the existing snapshot-lending rule.
+    assert!(!alignment_scene_progress_frame_defers_to_incumbent(
+        false,
+        false,
+        Phase::Running
+    ));
+    // Once the target is terminal, pixels which contradict it are withdrawn as before.
+    for phase in [
+        Phase::Failed,
+        Phase::Unavailable,
+        Phase::BudgetLimited,
+        Phase::IndexOverview,
+        Phase::Superseded,
+        Phase::Committed,
+        Phase::CandidateReady,
+        Phase::WaitingForGpuPressure,
+        Phase::Queued,
+        Phase::Dormant,
+    ] {
+        assert!(
+            !alignment_scene_progress_frame_defers_to_incumbent(true, false, phase),
+            "{phase:?} owns no pending replacement"
+        );
+    }
+}
+
+#[test]
+fn a_contract_change_on_cached_evidence_settles_on_the_later_source_publication() {
+    let token = AlignmentSceneRequestToken::new(61);
+    let camera = staged_build_camera();
+    let mut projection = projection_with_running_request(token, camera);
+
+    // (a) The request's own frame: no scene for the new contracts, and the worker owns a
+    // staged build (`presentation_pending`).
+    let interim = staged_build_frame(camera, false);
+    assert!(
+        projection
+            .navigation
+            .worker_frame_is_admissible(token, interim.camera)
+    );
+    assert_eq!(
+        alignment_scene_frame_settlement(&interim, false),
+        AlignmentSceneFrameSettlement::WaitingForScene
+    );
+    projection.navigation.observe_frame_products(&interim);
+    assert!(
+        !projection
+            .navigation
+            .fail_if_source_owner_is_idle(false, true),
+        "a staged build is owned work, not an idle worker"
+    );
+    assert_eq!(
+        projection.navigation.phase(),
+        AlignmentNavigationPhase::Running
+    );
+    assert!(
+        !projection
+            .navigation
+            .is_current_settled(projection.clock.current().get())
+    );
+    assert!(alignment_scene_progress_frame_defers_to_incumbent(
+        true,
+        interim.scene_contracts_current,
+        projection.navigation.phase(),
+    ));
+
+    // (b) The build publishes under `SourcePublication` with the lane's current token. The
+    // settlement reads the frame, never the cause or the originating operation.
+    let published = staged_build_frame(camera, true);
+    assert!(
+        projection
+            .navigation
+            .worker_frame_is_admissible(token, published.camera)
+    );
+    assert_eq!(
+        alignment_scene_frame_settlement(&published, false),
+        AlignmentSceneFrameSettlement::Settled
+    );
+    projection.navigation.observe_frame_products(&published);
+    projection.navigation.transition(
+        AlignmentNavigationPhase::CandidateReady,
+        "complete semantic scene is ready for atomic GPU publication",
+    );
+    assert!(!alignment_scene_progress_frame_defers_to_incumbent(
+        true,
+        published.scene_contracts_current,
+        projection.navigation.phase(),
+    ));
+    projection.navigation.transition(
+        AlignmentNavigationPhase::Committed,
+        "semantic scene and native GPU derivative committed atomically",
+    );
+    assert!(
+        projection
+            .navigation
+            .is_current_settled(projection.clock.current().get())
+    );
+    assert!(projection.scene_is_current());
+}
+
+#[test]
+fn a_pump_source_failure_resolves_the_camera_request_which_started_the_build() {
+    let token = AlignmentSceneRequestToken::new(62);
+    let camera = staged_build_camera();
+    let mut projection = projection_with_running_request(token, camera);
+    projection.begin_checking(Instant::now());
+    projection.scene_owner = Some(SourceOwnerId::new(9));
+
+    // (c) The staged build fails. The engine reports it owner-scoped as `PumpSource` with the
+    // lane's current token, which is the camera request's token; the operation is not consulted.
+    assert!(alignment_scene_event_token_is_current(
+        projection.navigation.request_token(),
+        Some(token),
+    ));
+    projection.settle_failed("alignment scene could not be built");
+
+    assert_eq!(
+        projection.navigation.phase(),
+        AlignmentNavigationPhase::Failed
+    );
+    assert!(
+        projection
+            .navigation
+            .is_current_settled(projection.clock.current().get()),
+        "the request must not stay behind \"Updating view\""
+    );
+    assert!(projection.checking_started.is_none());
+    assert_eq!(
+        projection.unavailable.as_deref(),
+        Some("alignment scene could not be built")
+    );
+    // A progress frame already queued behind the failure cannot revive the request, and the
+    // terminal target no longer shields the incumbent.
+    assert!(
+        !projection
+            .navigation
+            .worker_frame_is_admissible(token, camera)
+    );
+    assert!(!alignment_scene_progress_frame_defers_to_incumbent(
+        true,
+        false,
+        projection.navigation.phase(),
+    ));
+
+    // Capacity pressure from the same build is foreground work for the same request: it is
+    // current for the lane's source horizon and must be resumed, not dropped as read-ahead.
+    let token = AlignmentSceneRequestToken::new(63);
+    let projection = projection_with_running_request(token, camera);
+    let source_horizon = GenomicInterval::new(ContigId::new(0), 0, 4_000).unwrap();
+    assert!(alignment_scene_pressure_is_current(
+        projection.navigation.request_token(),
+        token,
+        projection.navigation.desired_camera(),
+        source_horizon,
+    ));
+    assert!(alignment_scene_pressure_requires_resume(
+        AlignmentSceneEngineOperation::PumpSource,
+        SourceIntentKind::Foreground,
+    ));
+    assert!(!alignment_scene_pressure_preserves_visible_epoch(
+        AlignmentSceneEngineOperation::PumpSource,
+        SourceIntentKind::Foreground,
+        AlignmentSceneResourcePressureDisposition::Retryable,
+    ));
+    assert!(alignment_scene_pressure_owns_navigation(
+        projection.navigation.phase()
+    ));
 }

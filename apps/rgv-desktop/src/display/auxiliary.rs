@@ -1,4 +1,19 @@
-use super::*;
+use crate::MAX_OVERLAY_GUTTER_MEMBERS;
+use crate::ui::TrackSubtrack;
+
+#[cfg(test)]
+use rgv_core::FeatureDisplayMode;
+use rgv_core::{
+    CopyNumberValueMode, GwasTrackSettings, QuantitativeArithmetic, QuantitativeScaleMode,
+    QuantitativeScaleTransform, QuantitativeTrackSettings, TrackConfig, TrackId, TrackKind,
+    Viewport,
+};
+use rgv_engine::{TrackSnapshot, TrackSnapshotData};
+use rgv_layout::{
+    AlignmentSortMode, DisplayList, ObjectIdAllocator, ObjectIdRange, QuantitativeRange,
+    TrackLayoutOptions, compose_quantitative_records, gwas_point_y, quantitative_data_range,
+};
+use std::borrow::Cow;
 
 /// Contextual tracks take object ids from here upwards; lower ids stay with
 /// the other users of the display-list id space.

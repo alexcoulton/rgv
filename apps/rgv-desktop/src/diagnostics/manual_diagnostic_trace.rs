@@ -18,7 +18,7 @@ const JSON_MEDIA_TYPE: &str = "application/json";
 /// The recorder deliberately gathers no paths, user names, host names, read names, or genomic
 /// source identifiers on its own. Call sites remain responsible for supplying aggregate or
 /// redacted values here.
-pub(crate) type ManualDiagnosticTraceFields = Map<String, Value>;
+pub(crate) use super::ManualDiagnosticTraceFields;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ManualDiagnosticTraceState {

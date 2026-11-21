@@ -9,8 +9,8 @@ use rgv_core::GenomicInterval;
 
 use super::{
     CramSliceSpan, Eligibility, NoodlesReader, RemoteIndex, SelectedCramSlices, eligibility,
-    noodles_record_intersects, normalize_record, record_reference_end, select_cram_containers,
-    visit_cram_container_records,
+    noodles_record_intersects, noodles_record_starts_at_or_after_end, normalize_record,
+    record_reference_end, select_cram_containers, visit_cram_container_records,
 };
 use crate::{
     AlignmentError, AlignmentSourcePosition, PositionedAlignmentBlock, PositionedAlignmentRecord,
@@ -254,6 +254,16 @@ pub(super) fn next_bam_checkpoint(
     let mut builder = BlockBuilder::default();
     let mut current_block = None::<u64>;
     let bgzf_reader = reader;
+    if let StreamWork::Bam { chunks, resume } = &state.work {
+        // The chunks still to be read (the first from where the last checkpoint stopped) are
+        // what the range reader should fetch; a narrowed plan keeps its cached bytes.
+        bgzf_reader
+            .get_mut()
+            .set_bgzf_read_plan(chunks.iter().enumerate().map(|(index, (start, end))| {
+                let start = resume.filter(|_| index == 0).unwrap_or(*start);
+                (u64::from(start), u64::from(*end))
+            }));
+    }
     let mut record = bam::Record::default();
     'chunks: loop {
         let StreamWork::Bam { chunks, resume } = &mut state.work else {
@@ -306,6 +316,16 @@ pub(super) fn next_bam_checkpoint(
                 *resume = Some(after);
             }
             if !noodles_record_intersects(&record, header, interval)? {
+                if noodles_record_starts_at_or_after_end(&record, header, interval)? {
+                    // Coordinate order: no later record can intersect; the remaining chunks
+                    // are never fetched.
+                    let StreamWork::Bam { chunks, resume } = &mut state.work else {
+                        unreachable!("stream work kind is fixed");
+                    };
+                    chunks.clear();
+                    *resume = None;
+                    break 'chunks;
+                }
                 continue;
             }
             current_block = Some(block);

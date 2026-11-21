@@ -1,56 +1,10 @@
 use std::time::{Duration, Instant};
 
+use super::InteractionTraceStage;
 use rgv_core::{AutomationInteractionTrace, AutomationInteractionTraceEvent};
 
 const MAXIMUM_TRACE_EVENTS: usize = 128;
 const MAXIMUM_TRACE_DURATION: Duration = Duration::from_millis(500);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InteractionTraceStage {
-    PointerDown,
-    EguiPointerDown,
-    DensityIntentDetected,
-    PointerCaptureAcquired,
-    DensityChanged,
-    PointerReleased,
-    ScrollDisplayStarted,
-    ScrollDisplayFinished,
-    RendererPrepareStarted,
-    RendererPrepareFinished,
-    EguiTessellationFinished,
-    SurfaceAcquired,
-    EguiBuffersFinished,
-    QueueSubmitted,
-    PresentCalled,
-    FrameFinished,
-}
-
-impl InteractionTraceStage {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::PointerDown => "pointer_down",
-            Self::EguiPointerDown => "egui_pointer_down",
-            Self::DensityIntentDetected => "density_intent_detected",
-            Self::PointerCaptureAcquired => "pointer_capture_acquired",
-            Self::DensityChanged => "density_changed",
-            Self::PointerReleased => "pointer_released",
-            Self::ScrollDisplayStarted => "scroll_display_started",
-            Self::ScrollDisplayFinished => "scroll_display_finished",
-            Self::RendererPrepareStarted => "renderer_prepare_started",
-            Self::RendererPrepareFinished => "renderer_prepare_finished",
-            Self::EguiTessellationFinished => "egui_tessellation_finished",
-            Self::SurfaceAcquired => "surface_acquired",
-            Self::EguiBuffersFinished => "egui_buffers_finished",
-            Self::QueueSubmitted => "queue_submitted",
-            Self::PresentCalled => "present_called",
-            Self::FrameFinished => "frame_finished",
-        }
-    }
-
-    const fn bit(self) -> u16 {
-        1_u16 << self as u16
-    }
-}
 
 #[derive(Clone, Copy)]
 struct InteractionTraceEvent {

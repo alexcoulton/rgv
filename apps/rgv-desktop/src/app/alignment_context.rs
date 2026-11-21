@@ -1,4 +1,18 @@
-use super::super::*;
+use crate::inspection::read::format_cigar;
+use crate::inspection::rna::selected_supplementary_chain;
+use crate::ui::TrackFrameKey;
+use crate::workspace::alignments::filter_state_from_session;
+use crate::workspace::tracks::replace_panel_track_selection;
+use crate::{UiPanel, Viewer, ui};
+use rgv_alignment_scene::{AlignmentComponent, AlignmentHit};
+use rgv_core::{
+    AlignmentPredicateScope, AlignmentViewPredicate, PanelId, ReadBaseDisplayMode,
+    ReadStackingMode, SessionFilters, TrackId,
+};
+use rgv_hts::SequenceData;
+use rgv_layout::{
+    AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AlignmentContextEffect {
@@ -153,7 +167,7 @@ impl Viewer {
         invocation: &'static str,
         reason: &'static str,
     ) -> bool {
-        self.record_manual_diagnostic_event(
+        self.diagnostics.event(
             "alignment_context",
             "menu_open_rejected",
             serde_json::json!({
@@ -175,7 +189,7 @@ impl Viewer {
         reason: Option<&'static str>,
     ) {
         let filter_state = self.alignment_filter_diagnostic_state(target.panel_id, target.track_id);
-        self.record_manual_diagnostic_event(
+        self.diagnostics.event(
             "alignment_context",
             "action_finished",
             serde_json::json!({
@@ -282,7 +296,7 @@ impl Viewer {
             screen_position: point,
         });
         let filter_state = self.alignment_filter_diagnostic_state(panel_id, track_id);
-        self.record_manual_diagnostic_event(
+        self.diagnostics.event(
             "alignment_context",
             "menu_opened",
             serde_json::json!({
@@ -331,7 +345,7 @@ impl Viewer {
         let Some(menu) = self.alignment_context_menu.take() else {
             return false;
         };
-        self.record_manual_diagnostic_event(
+        self.diagnostics.event(
             "alignment_context",
             "menu_closed",
             serde_json::json!({
@@ -410,7 +424,7 @@ impl Viewer {
     ) {
         let filter_state_before =
             self.alignment_filter_diagnostic_state(target.panel_id, target.track_id);
-        self.record_manual_diagnostic_event(
+        self.diagnostics.event(
             "alignment_context",
             "action_requested",
             serde_json::json!({
@@ -1565,6 +1579,11 @@ fn context_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::alignments::{
+        active_filters_from_session, alignment_view_filter_contract,
+    };
+    use rgv_alignment_scene::AlignmentFilterPredicate;
+    use rgv_core::ReferenceDictionary;
 
     #[test]
     fn every_context_action_declares_one_effect_class() {

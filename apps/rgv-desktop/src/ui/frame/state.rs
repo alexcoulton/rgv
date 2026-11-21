@@ -1,6 +1,34 @@
 //! Per-frame drafts shared by frame preparation, the egui pass and the commit step.
 
-use super::*;
+use crate::app::actions::TrackControl;
+use crate::app::alignment_context::{
+    AlignmentContextAction, AlignmentContextMenuState, AlignmentContextMenuView,
+    AlignmentContextTarget,
+};
+use crate::app::status_activity::StatusActivity;
+use crate::ui::frame::WorkspaceScrollbarsDraft;
+use crate::ui::{TrackFrameKey, TrackUiAction, UiCommand};
+use crate::{
+    MetadataTrackRow, RemoteSourceEditor, RemoteSourceRequest, VariantPredicateOperator, ui,
+};
+use rgv_core::{
+    AlignmentReadSampling, ContigId, CopyNumberSortLocus, CopyNumberTrackSettings,
+    CoverageScaleTransform, DetailLevel, GeneticCode, GenomicInterval, GwasTrackSettings,
+    IgvImportReport, InspectorActivation, InteractionTrackSettings, JunctionDisplayMode,
+    ModifiedBaseColorMode, MutationTrackSettings, OverlappingMatePolicy, PanelId,
+    QuantitativeTrackSettings, ReadBaseDisplayMode, ReadStackingMode, ReferenceTranslationFrame,
+    RegionOfInterest, ReviewItem, ReviewStatus, SampleMetadataTable, SashimiCountMode,
+    SashimiScaleMode, SessionFilters, TrackId, TrackSource, UnresolvedSessionSource,
+    VariantFieldScope, VariantMissingValueRule, VariantTrackSettings, Viewport,
+};
+use rgv_engine::{TrackSearchHit, TrackSearchResults};
+use rgv_hts::ModificationCode;
+use rgv_layout::{
+    AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 /// `(panel, contig name, contig length, viewport, genome overview)` for one locus panel.
 pub(super) type PanelContext = (PanelId, String, u64, Viewport, ui::GenomeOverviewData);
@@ -13,6 +41,8 @@ pub(super) struct FrameSnapshot {
     pub(super) detail: DetailLevel,
     pub(super) contig_name: String,
     pub(super) data_status: String,
+    /// Whether `data_status` describes background work; drives the toolbar spinner.
+    pub(super) status_activity: StatusActivity,
     pub(super) announce_status: bool,
     pub(super) active_panel_id: PanelId,
     pub(super) diagnostics: ui::diagnostics::DiagnosticsSnapshot,

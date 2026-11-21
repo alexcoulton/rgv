@@ -173,23 +173,36 @@ Small, local, independently testable. Six parallel workstreams by file ownership
 
 Run after Wave 1 is green. Each item is one reviewable change.
 
-- [ ] SCENE-3 page keys without evidence/atlas revisions (page reuse across extension)
-- [ ] SCENE-4 / SCENE-7 incremental row atlas extension; stable rows under sort/group
+- [x] SCENE-3 page keys without evidence/atlas revisions (page reuse across extension)
+- [~] SCENE-4 / SCENE-7 incremental row atlas extension; stable rows under sort/group
+      — view-as-pairs and leftward extension of ordered layouts still rebuild
 - [ ] ARCH-3 charge-actual-after-build with per-owner soft budgets and LRU; exact ledger only in
       Complete mode; GPU pages outside the ledger
 - [ ] SCENE-9 / REND-8 compact handles, primitives and 16-byte GPU instances with a palette
       uniform (unlocks REND-10 theming and PROD-17)
-- [ ] SCENE-10 fused single-pass summary tiles; generic `SummaryTile<Family>`
-- [ ] ENG-2 decoder stream continuation and chunk-level resume
-- [ ] ENG-7 resumable/cancellable scene builds
-- [ ] ENG-15 coordinator split into modules; pressure classification on error types
-- [ ] REND-16 generic `PagedGpuCache`; shared WGSL; GPU readback goldens (covers REND-7)
-- [ ] REND-9 GPU offscreen export at Nx; vector export from semantic primitives
-- [ ] HTS-2 remote VCF/BCF over `HttpRangeReader`; drop htslib `curl`
-- [ ] HTS-8 index-chunk-driven read-ahead; HTS-12 shared decompression pool
+- [~] SCENE-10 fused single-pass summary tiles; generic `SummaryTile<Family>`
+      — one selection per tile and tile-clipped walks; six tile types remain
+- [~] ENG-2 decoder stream continuation and chunk-level resume
+      — continuation and hysteresis done; chunk-level resume needs an rgv-hts resume API
+- [x] ENG-7 resumable/cancellable scene builds
+      — desktop keeps the incumbent scene on screen during a staged build
+- [x] ENG-15 coordinator split into modules; pressure classification on error types
+- [~] REND-16 generic `PagedGpuCache`; shared WGSL; GPU readback goldens (covers REND-7)
+      — page table/eviction/reclaim shared; plan/stage/publish left separate (8–49% alike).
+        REND-7 confirmed on Metal and fixed with integer cancellation
+- [~] REND-9 GPU offscreen export at Nx; vector export from semantic primitives
+      — GPU PNG export done with tiling; vector SVG/PDF not started
+- [~] HTS-2 remote VCF/BCF over `HttpRangeReader`; drop htslib `curl`
+      — VCF and BCF done; `curl` still used by `LocalAlignmentSource::open` URL fallback
+- [x] HTS-8 index-chunk-driven read-ahead; HTS-12 shared decompression pool
+      — HTS-12 as a process-wide thread allowance (rust-htslib pools cannot be shared);
+        CRAM read-ahead unchanged
 - [ ] HTS-15 / OPS-10 converge on one alignment backend
-- [ ] UI-13 / APP-16 split `ui/tracks.rs`, remove glob preludes, diagnostics behind a facade
-- [ ] OPS-6 derive MCP schemas from core types
+- [x] UI-13 / APP-16 split `ui/tracks.rs`, remove glob preludes, diagnostics behind a facade
+      — boundary violations found are listed for Wave 3; per-frame paint step still ~1,100 lines
+- [~] OPS-6 derive MCP schemas from core types
+      — core `schema` feature and drift test done; `Tool*` mirrors not replaced; batch
+        `commands` still untyped (217 nested fields need verified descriptions)
 
 ## Wave 3 — architecture
 

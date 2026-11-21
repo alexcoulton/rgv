@@ -14,7 +14,7 @@ use std::{
 use rgv_core::{AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationError, AutomationRunReport};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 
-use crate::stress_health::StressHealthPublisher;
+use crate::diagnostics::HealthHandle;
 
 const MAX_CONTROL_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONTROL_SECRET_BYTES: usize = 1_024;
@@ -128,7 +128,7 @@ pub(crate) struct ControlStatusMetadata {
     pub(crate) surface_width_pixels: u32,
     pub(crate) surface_height_pixels: u32,
     pub(crate) scale_factor: f64,
-    pub(crate) stress_health: Arc<StressHealthPublisher>,
+    pub(crate) stress_health: HealthHandle,
     /// Not reported by `/v1/status`: whether batches may name remote sources on loopback,
     /// link-local or private-network addresses (`--control-allow-private-urls`).
     pub(crate) allow_private_network_urls: bool,
@@ -261,6 +261,7 @@ pub(crate) fn read_control_secret(path: &Path) -> Result<String, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
+
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(
                 "the control secret file must not be readable or writable by group or others"
@@ -678,6 +679,7 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::diagnostics::HealthSignal;
     use std::{
         io::{Read as _, Write as _},
         net::{Shutdown, TcpStream},
@@ -695,7 +697,7 @@ mod tests {
             surface_width_pixels: 800,
             surface_height_pixels: 600,
             scale_factor: 1.0,
-            stress_health: Arc::new(StressHealthPublisher::new("test-instance".to_owned())),
+            stress_health: HealthHandle::new("test-instance".to_owned()),
             allow_private_network_urls: false,
         }
     }
@@ -962,8 +964,8 @@ mod tests {
     fn stress_health_is_authenticated_and_does_not_enter_the_ui_queue() {
         let root = tempfile::tempdir().unwrap();
         let status = test_status();
-        status.stress_health.note_ui_heartbeat();
-        status.stress_health.note_native_input();
+        status.stress_health.signal(HealthSignal::UiHeartbeat);
+        status.stress_health.signal(HealthSignal::NativeInput);
         let mut service =
             ControlService::start(0, root.path().to_owned(), TEST_SECRET.to_owned(), status)
                 .unwrap();
@@ -1054,6 +1056,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
+
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         assert_eq!(read_control_secret(&path).unwrap(), TEST_SECRET);

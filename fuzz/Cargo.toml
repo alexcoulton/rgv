@@ -8,6 +8,7 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
+flate2 = "1"
 libfuzzer-sys = "0.4"
 rgv-core = { version = "0.1.0", path = "../crates/rgv-core" }
 rgv-hts = { version = "0.1.0", path = "../crates/rgv-hts" }
@@ -52,6 +53,34 @@ bench = false
 [[bin]]
 name = "normalized_record"
 path = "fuzz_targets/normalized_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crai"
+path = "fuzz_targets/crai.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fai"
+path = "fuzz_targets/fai.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "two_bit"
+path = "fuzz_targets/two_bit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vcf_text"
+path = "fuzz_targets/vcf_text.rs"
 test = false
 doc = false
 bench = false

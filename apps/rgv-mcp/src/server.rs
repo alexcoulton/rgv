@@ -144,6 +144,7 @@ impl RgvMcpServer {
             path: temporary.path().display().to_string(),
             scope,
             format: AutomationSnapshotFormat::Png,
+            scale: rgv_core::default_snapshot_scale(),
         });
         commands.push(AutomationCommand::DescribeWorkspace);
         match self
@@ -4276,5 +4277,255 @@ mod tests {
         client.cancel().await.unwrap();
         server_task.await.unwrap();
         control_worker.join().unwrap();
+    }
+
+    /// The wire identifiers (`enum` values, tag constants or externally-tagged keys) of the
+    /// variants a schema publishes.
+    fn schema_variant_keys(schema: &Value) -> std::collections::BTreeSet<String> {
+        fn entry_keys(entry: &Value, keys: &mut std::collections::BTreeSet<String>) {
+            if let Some(value) = entry.get("const").and_then(Value::as_str) {
+                keys.insert(value.to_owned());
+                return;
+            }
+            if let Some(values) = entry.get("enum").and_then(Value::as_array) {
+                keys.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+                return;
+            }
+            let Some(properties) = entry.get("properties").and_then(Value::as_object) else {
+                return;
+            };
+            let tags = properties
+                .values()
+                .filter_map(|property| {
+                    property.get("const").and_then(Value::as_str).or_else(|| {
+                        property
+                            .get("enum")
+                            .and_then(Value::as_array)
+                            .filter(|values| values.len() == 1)
+                            .and_then(|values| values[0].as_str())
+                    })
+                })
+                .collect::<Vec<_>>();
+            if let [tag] = tags.as_slice() {
+                keys.insert((*tag).to_owned());
+            } else if properties.len() == 1 {
+                keys.extend(properties.keys().cloned());
+            }
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        entry_keys(schema, &mut keys);
+        for combinator in ["oneOf", "anyOf"] {
+            for entry in schema
+                .get(combinator)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                entry_keys(entry, &mut keys);
+            }
+        }
+        // Adapters may spell a variant differently from core (`local` for `Local`); what must
+        // not drift is the set of variants, so compare identifiers without case or separators.
+        keys.into_iter()
+            .map(|key| {
+                key.chars()
+                    .filter(char::is_ascii_alphanumeric)
+                    .map(|character| character.to_ascii_lowercase())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// OPS-6: the hand-written `Tool*` argument enums mirror `rgv-core` wire types. With the core
+    /// `schema` feature both sides publish a schema, so the mirror can be checked mechanically:
+    /// every variant a tool offers must exist in core under the same wire identifier, and every
+    /// core variant must either be offered or be listed here as deliberately withheld. Adding,
+    /// renaming or removing a core variant therefore fails this test until the tool is updated.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn tool_argument_enums_cannot_drift_from_the_core_wire_types() {
+        let mut failures = Vec::<String>::new();
+        macro_rules! mirror {
+            ($tool:ty, $core:ty, [$($withheld:literal),* $(,)?]) => {
+                mirror!($tool, $core, [$($withheld),*], adapter_only: [])
+            };
+            ($tool:ty, $core:ty, [$($withheld:literal),* $(,)?], adapter_only: [$($adapter:literal),* $(,)?]) => {{
+                let tool = schema_variant_keys(
+                    &serde_json::to_value(schemars::schema_for!($tool)).unwrap(),
+                );
+                let core = schema_variant_keys(
+                    &serde_json::to_value(schemars::schema_for!($core)).unwrap(),
+                );
+                let withheld = [$($withheld),*]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<std::collections::BTreeSet<String>>();
+                assert!(!tool.is_empty(), "{} publishes no variants", stringify!($tool));
+                assert!(!core.is_empty(), "{} publishes no variants", stringify!($core));
+                let adapter_only = [$($adapter),*]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<std::collections::BTreeSet<String>>();
+                let unknown = tool
+                    .difference(&core)
+                    .filter(|key| !adapter_only.contains(*key))
+                    .collect::<Vec<_>>();
+                if !unknown.is_empty() {
+                    failures.push(format!(
+                        "{} offers variants that {} does not define: {unknown:?}",
+                        stringify!($tool),
+                        stringify!($core)
+                    ));
+                }
+                let unexposed = core
+                    .difference(&tool)
+                    .filter(|key| !withheld.contains(*key))
+                    .collect::<Vec<_>>();
+                if !unexposed.is_empty() {
+                    failures.push(format!(
+                        "{} defines variants that {} neither offers nor withholds: {unexposed:?}",
+                        stringify!($core),
+                        stringify!($tool)
+                    ));
+                }
+                let stale = withheld
+                    .difference(&core)
+                    .chain(adapter_only.difference(&tool))
+                    .collect::<Vec<_>>();
+                if !stale.is_empty() {
+                    failures.push(format!(
+                        "{} withholds variants that {} no longer defines: {stale:?}",
+                        stringify!($tool),
+                        stringify!($core)
+                    ));
+                }
+            }};
+        }
+        mirror!(
+            ToolViewportOperation,
+            rgv_core::AutomationViewportOperation,
+            []
+        );
+        mirror!(ToolSource, rgv_core::TrackSource, []);
+        mirror!(ToolTrackKind, rgv_core::TrackKind, []);
+        mirror!(ToolTrackChannel, rgv_core::TrackChannel, []);
+        mirror!(ToolPresentationNode, rgv_core::PresentationNodeId, []);
+        mirror!(
+            ToolAlignmentPredicateScope,
+            rgv_core::AlignmentPredicateScope,
+            []
+        );
+        mirror!(
+            ToolAlignmentFlagPredicate,
+            rgv_core::AlignmentFlagPredicate,
+            []
+        );
+        mirror!(
+            ToolAlignmentCigarEventPredicate,
+            rgv_core::AlignmentCigarEventPredicate,
+            []
+        );
+        mirror!(
+            ToolAlignmentAuxComparison,
+            rgv_core::AlignmentAuxComparison,
+            []
+        );
+        // Adapter: core stores a float operand as its IEEE-754 bits (`float_bits`) so the
+        // predicate stays `Eq`/hashable; the tool accepts an ordinary JSON number.
+        mirror!(
+            ToolAlignmentAuxValue,
+            rgv_core::AlignmentAuxFilterValue,
+            ["floatbits"],
+            adapter_only: ["float"]
+        );
+        mirror!(ToolAlignmentPredicate, rgv_core::AlignmentViewPredicate, []);
+        // Adapter: `alignment_color_tag` is a tool-side variant that carries the SAM tag as a
+        // validated string and becomes `alignment_color_mode` with core's `tag` colour mode.
+        // The five withheld core settings are not offered as typed MCP settings; they remain
+        // reachable only through `rgv_execute_batch`.
+        mirror!(
+            ToolSetting,
+            rgv_core::AutomationSetting,
+            [
+                "completereadlimit",
+                "readbrowsingbufferpercent",
+                "readstackingmode",
+                "rebuildstablereadarchitecture",
+                "totalcachebudgetmib",
+            ],
+            adapter_only: ["alignmentcolortag"]
+        );
+        mirror!(
+            ToolCoverageScaleTransform,
+            rgv_core::CoverageScaleTransform,
+            []
+        );
+        mirror!(
+            ToolOverlappingMatePolicy,
+            rgv_core::OverlappingMatePolicy,
+            []
+        );
+        mirror!(ToolReadBaseDisplayMode, rgv_core::ReadBaseDisplayMode, []);
+        mirror!(
+            ToolModifiedBaseColorMode,
+            rgv_core::ModifiedBaseColorMode,
+            []
+        );
+        // `tag` carries a payload and is offered as the `alignment_color_tag` setting instead; the
+        // platform-specific colour modes are not offered as typed MCP values.
+        mirror!(
+            ToolAlignmentColorMode,
+            rgv_core::AlignmentColorMode,
+            ["bisulfite", "sbx", "smrtkinetics", "tag", "ultima"]
+        );
+        mirror!(ToolGroupMode, rgv_core::AlignmentGroupMode, []);
+        mirror!(ToolSortMode, rgv_core::AlignmentSortMode, []);
+        mirror!(ToolDirection, rgv_core::AlignmentOrderDirection, []);
+        mirror!(ToolSelection, rgv_core::AutomationSelection, []);
+        mirror!(
+            ToolSelectionGranularity,
+            rgv_core::AutomationSelectionGranularity,
+            []
+        );
+        mirror!(
+            ToolReviewNavigation,
+            rgv_core::AutomationReviewNavigation,
+            []
+        );
+        mirror!(
+            ToolHistoryNavigation,
+            rgv_core::AutomationHistoryNavigation,
+            []
+        );
+        mirror!(
+            ToolAlignmentSelector,
+            rgv_core::AutomationAlignmentSelector,
+            []
+        );
+        mirror!(ToolAlignmentState, rgv_core::AutomationAlignmentState, []);
+        mirror!(ToolAlignmentReveal, rgv_core::AutomationAlignmentReveal, []);
+        mirror!(
+            ToolAlignmentRelationship,
+            rgv_core::AutomationAlignmentRelationship,
+            []
+        );
+        mirror!(
+            ToolNavigationDestination,
+            rgv_core::AutomationNavigationDestination,
+            []
+        );
+        // `native_window` is the separate `rgv_capture_window` tool.
+        mirror!(
+            ToolSnapshotScope,
+            rgv_core::AutomationSnapshotScope,
+            ["nativewindow"]
+        );
+        mirror!(ToolExportKind, rgv_core::AutomationExportKind, []);
+        mirror!(
+            ToolUnsavedChangesPolicy,
+            rgv_core::AutomationUnsavedChangesPolicy,
+            []
+        );
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

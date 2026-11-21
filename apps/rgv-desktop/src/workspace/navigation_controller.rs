@@ -1,4 +1,16 @@
-use super::super::*;
+use crate::ui::TrackFrameKey;
+use crate::workspace::navigation::{
+    annotation_search_hit_locus, annotation_search_hit_primary_label,
+    locus_expression_is_navigable, preferred_annotation_search_hit, resolve_initial_locus,
+    split_locus_expression, standalone_locus,
+};
+use crate::workspace::tracks::replace_panel_track_selection;
+use crate::{Viewer, ui};
+use anyhow::{Context as _, Result};
+use rgv_core::{
+    ContigAliases, ContigId, GenomicInterval, NavigationEntry, ReferenceDictionary, Viewport,
+};
+use rgv_engine::TrackSearchHit;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LociNavigationPlan {
@@ -395,6 +407,8 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::panels::ViewPanelController;
+    use rgv_core::PanelId;
 
     /// A panel opened at `locus`, as `navigate_to_locus` leaves it.
     fn panel_at(dictionary: Option<&ReferenceDictionary>, locus: &str) -> ViewPanelController {

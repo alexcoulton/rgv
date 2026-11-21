@@ -1,8 +1,10 @@
 use std::{
+    collections::BTreeMap,
     fmt, fs,
     hash::{BuildHasher, Hasher},
     io::{self, Read, Seek, SeekFrom},
     num::NonZeroUsize,
+    ops::Range,
     path::PathBuf,
     sync::{Arc, OnceLock},
     thread,
@@ -189,6 +191,27 @@ struct CachedBlock {
     path: PathBuf,
 }
 
+/// Recently used cache blocks kept in memory, so moving between them (a BGZF reader does it
+/// constantly) costs no file read. A subset of the disk tier, never beyond this many bytes.
+const MEMORY_BLOCK_BYTES: usize = 4 * 1024 * 1024;
+/// Bytes of planned extents one reader keeps in memory.
+const PLANNED_EXTENT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
+/// Two planned ranges closer than this are fetched as one: the bytes in the gap cost less than
+/// another round trip.
+const PLAN_COALESCE_GAP_BYTES: u64 = 64 * 1024;
+/// A planned range longer than one read-ahead window is fetched in requests that double in
+/// size up to this many windows, so a deep region costs few round trips while a query that
+/// stops early has not paid for the whole range.
+const PLANNED_REQUEST_GROWTH_LIMIT: u64 = 4;
+/// Largest BGZF block (`BSIZE` is a 16-bit length minus one).
+const BGZF_MAXIMUM_BLOCK_BYTES: u64 = 64 * 1024;
+
+/// Bytes fetched for a read plan, exactly as requested rather than aligned to cache blocks.
+struct PlannedExtent {
+    data: Vec<u8>,
+    last_used: u64,
+}
+
 pub struct HttpRangeReader {
     client: Client,
     url: Url,
@@ -198,7 +221,17 @@ pub struct HttpRangeReader {
     validator: Validator,
     cache_directory: TempDir,
     blocks: LruCache<u64, CachedBlock>,
-    current_block: Option<(u64, Vec<u8>)>,
+    memory_blocks: LruCache<u64, Arc<[u8]>>,
+    current_block: Option<(u64, Arc<[u8]>)>,
+    /// Coalesced, sorted byte ranges the caller expects to read (see [`Self::set_read_plan`]).
+    plan: Vec<Range<u64>>,
+    /// Size of the next planned request; grows while a long range is read through.
+    plan_request_bytes: u64,
+    /// Planned bytes held in memory, keyed by their first offset; never overlapping.
+    extents: BTreeMap<u64, PlannedExtent>,
+    extent_bytes: usize,
+    extent_clock: u64,
+    current_extent: Option<u64>,
     stats: RemoteIoStats,
     cancellation: Option<RemoteCancellation>,
     cancellation_reported: bool,
@@ -239,6 +272,10 @@ impl HttpRangeReader {
             .checked_div(config.chunk_size.get())
             .unwrap_or_default()
             .max(1);
+        let memory_block_capacity = MEMORY_BLOCK_BYTES
+            .checked_div(config.chunk_size.get())
+            .unwrap_or_default()
+            .clamp(1, block_capacity);
         Ok(Self {
             client,
             url,
@@ -248,7 +285,14 @@ impl HttpRangeReader {
             validator,
             cache_directory: tempfile::tempdir()?,
             blocks: LruCache::new(NonZeroUsize::new(block_capacity).unwrap()),
+            memory_blocks: LruCache::new(NonZeroUsize::new(memory_block_capacity).unwrap()),
             current_block: None,
+            plan: Vec::new(),
+            plan_request_bytes: 0,
+            extents: BTreeMap::new(),
+            extent_bytes: 0,
+            extent_clock: 0,
+            current_extent: None,
             stats: RemoteIoStats {
                 requests: probe_requests,
                 response_bytes: initial_response_bytes,
@@ -338,21 +382,211 @@ impl HttpRangeReader {
         Ok(())
     }
 
+    /// Declares the byte ranges the coming reads are expected to touch, typically the index
+    /// chunks of one region query. A read that misses the cache inside a planned range fetches
+    /// from the read position to the end of that range (in bounded requests) instead of a
+    /// fixed block-aligned window, so a small region transfers about what the index implies
+    /// and a region of many chunks transfers a few coalesced ranges. Ranges closer than
+    /// [`PLAN_COALESCE_GAP_BYTES`] are merged. Reads outside every range behave as before.
+    pub(crate) fn set_read_plan(&mut self, ranges: impl IntoIterator<Item = Range<u64>>) {
+        let mut ranges = ranges
+            .into_iter()
+            .map(|range| range.start..range.end.min(self.length))
+            .filter(|range| range.start < range.end)
+            .collect::<Vec<_>>();
+        ranges.sort_unstable_by_key(|range| (range.start, range.end));
+        let mut plan = Vec::<Range<u64>>::with_capacity(ranges.len());
+        for range in ranges {
+            match plan.last_mut() {
+                Some(last) if range.start <= last.end.saturating_add(PLAN_COALESCE_GAP_BYTES) => {
+                    last.end = last.end.max(range.end);
+                }
+                _ => plan.push(range),
+            }
+        }
+        // A plan that only narrows the previous one (a resumed stream) keeps its request size.
+        let continues = !self.plan.is_empty()
+            && plan.iter().all(|range| {
+                self.plan
+                    .iter()
+                    .any(|previous| previous.start <= range.start && range.end <= previous.end)
+            });
+        if !continues {
+            self.plan_request_bytes = self.planned_request_bytes().0;
+        }
+        self.plan = plan;
+    }
+
+    /// Plans the compressed byte ranges of BGZF index chunks given as `(start, end)` virtual
+    /// offsets. A chunk's last record ends inside the block its end offset names, so that
+    /// whole block (of unknown size, at most 64 KiB) is part of the range.
+    pub(crate) fn set_bgzf_read_plan(&mut self, chunks: impl IntoIterator<Item = (u64, u64)>) {
+        self.set_read_plan(chunks.into_iter().map(|(start, end)| {
+            (start >> 16)..(end >> 16).saturating_add(BGZF_MAXIMUM_BLOCK_BYTES)
+        }));
+    }
+
+    pub(crate) fn clear_read_plan(&mut self) {
+        self.plan.clear();
+    }
+
+    fn extent_memory_budget(&self) -> usize {
+        PLANNED_EXTENT_MEMORY_BYTES.min(self.config.maximum_cache_bytes.get())
+    }
+
+    /// First and largest size of a planned request.
+    fn planned_request_bytes(&self) -> (u64, u64) {
+        let budget = self.extent_memory_budget() as u64;
+        let window = (self.config.chunk_size.get() as u64)
+            .saturating_mul(self.config.maximum_coalesced_chunks.get() as u64);
+        let first = window.min(budget).max(1);
+        let largest = window
+            .saturating_mul(PLANNED_REQUEST_GROWTH_LIMIT)
+            .min(budget / 2)
+            .max(first);
+        (first, largest)
+    }
+
+    /// Start of the cached extent holding `position`, if any.
+    fn extent_containing(&self, position: u64) -> Option<u64> {
+        self.extents
+            .range(..=position)
+            .next_back()
+            .filter(|(start, extent)| position - **start < extent.data.len() as u64)
+            .map(|(start, _)| *start)
+    }
+
+    /// Serves a read from a planned extent, fetching it first when the position lies in the
+    /// read plan. `None` hands the read to the block cache.
+    fn read_planned(&mut self, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+        if self.extents.is_empty() && self.plan.is_empty() {
+            return Ok(None);
+        }
+        let position = self.position;
+        let start = if let Some(start) = self.extent_containing(position) {
+            if self.current_extent != Some(start) {
+                self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
+            }
+            start
+        } else {
+            let Some(range_end) = self
+                .plan
+                .iter()
+                .find(|range| range.contains(&position))
+                .map(|range| range.end)
+            else {
+                return Ok(None);
+            };
+            let block_index = position / self.config.chunk_size.get() as u64;
+            if self.blocks.contains(&block_index) {
+                // Already paid for by an earlier unplanned read.
+                return Ok(None);
+            }
+            self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
+            self.fetch_planned(position, range_end)
+                .map_err(io::Error::other)?;
+            position
+        };
+        self.current_extent = Some(start);
+        self.extent_clock = self.extent_clock.saturating_add(1);
+        let extent = self
+            .extents
+            .get_mut(&start)
+            .expect("the extent was found or just fetched");
+        extent.last_used = self.extent_clock;
+        let offset = usize::try_from(position - start).map_err(io::Error::other)?;
+        let count = buffer.len().min(extent.data.len() - offset);
+        buffer[..count].copy_from_slice(&extent.data[offset..offset + count]);
+        self.position = self.position.saturating_add(count as u64);
+        Ok(Some(count))
+    }
+
+    /// Fetches `[start, range_end)` or its first part, never re-fetching a cached extent and
+    /// never asking for more than the active transfer budget still allows.
+    fn fetch_planned(&mut self, start: u64, range_end: u64) -> Result<(), RemoteError> {
+        let mut end = range_end
+            .min(self.length)
+            .min(start.saturating_add(self.plan_request_bytes.max(1)));
+        if let Some((next, _)) = self.extents.range(start..).next() {
+            end = end.min(*next);
+        }
+        if let Some(active) = self.transfer_budget {
+            let remaining = active.budget.maximum_response_bytes.saturating_sub(
+                self.stats
+                    .response_bytes
+                    .saturating_sub(active.baseline.response_bytes),
+            );
+            if remaining > 0 {
+                end = end.min(start.saturating_add(remaining));
+            }
+        }
+        debug_assert!(end > start, "a planned fetch starts inside its range");
+        let bytes = self.fetch_range_with_retry(start, end.saturating_sub(1))?;
+        self.stats.response_bytes = self.stats.response_bytes.saturating_add(bytes.len() as u64);
+        self.plan_request_bytes = self
+            .plan_request_bytes
+            .saturating_mul(2)
+            .min(self.planned_request_bytes().1);
+        self.extent_bytes = self.extent_bytes.saturating_add(bytes.len());
+        self.extents.insert(
+            start,
+            PlannedExtent {
+                data: bytes,
+                last_used: self.extent_clock,
+            },
+        );
+        let budget = self.extent_memory_budget();
+        while self.extent_bytes > budget {
+            let Some(victim) = self
+                .extents
+                .iter()
+                .filter(|(key, _)| **key != start)
+                .min_by_key(|(_, extent)| extent.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            if let Some(evicted) = self.extents.remove(&victim) {
+                self.extent_bytes = self.extent_bytes.saturating_sub(evicted.data.len());
+                self.stats.evictions = self.stats.evictions.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
     fn load_block(&mut self, block_index: u64, requested_bytes: usize) -> io::Result<()> {
-        if let Some(block) = self.blocks.get(&block_index) {
-            self.current_block = Some((block_index, fs::read(&block.path)?));
+        if self.blocks.get(&block_index).is_some() {
+            let data = self.cached_block_data(block_index)?;
+            self.current_block = Some((block_index, data));
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
             return Ok(());
         }
         self.stats.cache_misses = self.stats.cache_misses.saturating_add(1);
         self.fetch_blocks(block_index, requested_bytes)
             .map_err(io::Error::other)?;
+        if self.blocks.get(&block_index).is_none() {
+            return Err(io::Error::other(
+                "range response did not contain requested block",
+            ));
+        }
+        let data = self.cached_block_data(block_index)?;
+        self.current_block = Some((block_index, data));
+        Ok(())
+    }
+
+    /// Bytes of a block the disk tier holds: from memory when recently used, else read from
+    /// its file once and remembered.
+    fn cached_block_data(&mut self, block_index: u64) -> io::Result<Arc<[u8]>> {
+        if let Some(data) = self.memory_blocks.get(&block_index) {
+            return Ok(Arc::clone(data));
+        }
         let block = self
             .blocks
-            .get(&block_index)
-            .ok_or_else(|| io::Error::other("range response did not contain requested block"))?;
-        self.current_block = Some((block_index, fs::read(&block.path)?));
-        Ok(())
+            .peek(&block_index)
+            .ok_or_else(|| io::Error::other("cache block disappeared"))?;
+        let data: Arc<[u8]> = fs::read(&block.path)?.into();
+        self.memory_blocks.put(block_index, Arc::clone(&data));
+        Ok(data)
     }
 
     fn fetch_blocks(
@@ -395,7 +629,11 @@ impl HttpRangeReader {
                 .path()
                 .join(format!("{block_index:016x}.range"));
             fs::write(&path, data)?;
-            if let Some((_, evicted)) = self.blocks.push(block_index, CachedBlock { path }) {
+            self.memory_blocks.put(block_index, data.into());
+            if let Some((evicted_index, evicted)) =
+                self.blocks.push(block_index, CachedBlock { path })
+            {
+                self.memory_blocks.pop(&evicted_index);
                 let _ = fs::remove_file(evicted.path);
                 self.stats.evictions = self.stats.evictions.saturating_add(1);
             }
@@ -819,6 +1057,10 @@ impl Read for HttpRangeReader {
         if buffer.is_empty() || self.position >= self.length {
             return Ok(0);
         }
+        if let Some(count) = self.read_planned(buffer)? {
+            return Ok(count);
+        }
+        self.current_extent = None;
         let block_size = self.config.chunk_size.get() as u64;
         let block_index = self.position / block_size;
         if self
@@ -1073,6 +1315,8 @@ mod tests {
         url: String,
         stop: Arc<AtomicBool>,
         requests: Arc<AtomicU64>,
+        /// Inclusive byte ranges served, in request order (the opening probe is `(0, 0)`).
+        ranges: Arc<std::sync::Mutex<Vec<(usize, usize)>>>,
         worker: Option<thread::JoinHandle<()>>,
     }
 
@@ -1094,6 +1338,8 @@ mod tests {
             let requests = Arc::new(AtomicU64::new(0));
             let worker_stop = Arc::clone(&stop);
             let worker_requests = Arc::clone(&requests);
+            let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let worker_ranges = Arc::clone(&ranges);
             let worker = thread::spawn(move || {
                 let mut rejected_data_request = false;
                 while !worker_stop.load(Ordering::Relaxed) {
@@ -1120,6 +1366,7 @@ mod tests {
                         .find(|header| header.field.equiv("Range"))
                         .and_then(|header| parse_test_range(header.value.as_str(), data.len()))
                         .unwrap();
+                    worker_ranges.lock().unwrap().push(range);
                     let body = data[range.0..=range.1].to_vec();
                     let response = Response::from_data(body)
                         .with_status_code(StatusCode(206))
@@ -1142,6 +1389,7 @@ mod tests {
                 url: format!("http://{address}/fixture.bin"),
                 stop,
                 requests,
+                ranges,
                 worker: Some(worker),
             })
         }
@@ -1552,6 +1800,197 @@ mod tests {
         );
         assert!(reader.stats().cache_hits > 0);
         assert_eq!(reader.stats().response_bytes, 769);
+    }
+
+    fn fixture_bytes(length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index % 251) as u8 ^ (index / 251) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn read_plan_fetches_the_planned_bytes_and_coalesces_near_ranges() {
+        let data = fixture_bytes(1024 * 1024);
+        let Some(fixture) = RangeFixture::start(data.clone()) else {
+            return;
+        };
+        let mut reader = HttpRangeReader::open(
+            &fixture.url,
+            HttpRangeConfig {
+                chunk_size: NonZeroUsize::new(4_096).unwrap(),
+                maximum_cache_bytes: NonZeroUsize::new(256 * 1024).unwrap(),
+                minimum_coalesced_chunks: NonZeroUsize::new(4).unwrap(),
+                maximum_coalesced_chunks: NonZeroUsize::new(4).unwrap(),
+                ..HttpRangeConfig::default()
+            },
+        )
+        .unwrap();
+        let opened = reader.stats();
+        // Two ranges 100 bytes apart become one request; the distant one is its own.
+        reader.set_read_plan([500_000..500_200, 10_600..11_000, 10_000..10_500]);
+        let read_at = |reader: &mut HttpRangeReader, start: usize, length: usize| {
+            let mut buffer = vec![0; length];
+            reader.seek(SeekFrom::Start(start as u64)).unwrap();
+            reader.read_exact(&mut buffer).unwrap();
+            assert_eq!(buffer, data[start..start + length], "bytes at {start}");
+        };
+        read_at(&mut reader, 10_000, 500);
+        read_at(&mut reader, 10_600, 400);
+        read_at(&mut reader, 500_000, 200);
+        assert_eq!(
+            fixture.ranges.lock().unwrap()[1..],
+            [(10_000, 10_999), (500_000, 500_199)]
+        );
+        // Accounting is exact: 1,200 bytes where the block cache would have fetched two
+        // 16 KiB windows.
+        let planned = reader.stats();
+        assert_eq!(planned.requests - opened.requests, 2);
+        assert_eq!(planned.response_bytes - opened.response_bytes, 1_200);
+        assert_eq!(planned.cache_misses - opened.cache_misses, 2);
+
+        // Revisiting planned bytes is free, also under a later plan that no longer lists them.
+        reader.set_read_plan(std::iter::once(700_000..700_010));
+        read_at(&mut reader, 10_250, 600);
+        read_at(&mut reader, 500_100, 100);
+        assert_eq!(reader.stats().requests, planned.requests);
+        assert_eq!(reader.stats().cache_hits - planned.cache_hits, 2);
+
+        // A read outside every planned range keeps the block cache's aligned read-ahead.
+        read_at(&mut reader, 300_000, 10);
+        assert_eq!(
+            fixture.ranges.lock().unwrap().last().copied(),
+            Some((299_008, 299_008 + 4 * 4_096 - 1))
+        );
+    }
+
+    #[test]
+    fn a_long_planned_range_is_fetched_in_a_few_growing_requests() {
+        let data = fixture_bytes(1024 * 1024);
+        let Some(fixture) = RangeFixture::start(data.clone()) else {
+            return;
+        };
+        let mut reader = HttpRangeReader::open(
+            &fixture.url,
+            HttpRangeConfig {
+                chunk_size: NonZeroUsize::new(4_096).unwrap(),
+                maximum_cache_bytes: NonZeroUsize::new(512 * 1024).unwrap(),
+                minimum_coalesced_chunks: NonZeroUsize::new(4).unwrap(),
+                maximum_coalesced_chunks: NonZeroUsize::new(4).unwrap(),
+                ..HttpRangeConfig::default()
+            },
+        )
+        .unwrap();
+        let opened = reader.stats();
+        reader.set_read_plan(std::iter::once(100_000..300_000));
+        reader.seek(SeekFrom::Start(100_000)).unwrap();
+        let mut buffer = vec![0; 200_000];
+        reader.read_exact(&mut buffer).unwrap();
+        assert_eq!(buffer, data[100_000..300_000]);
+        // One 16 KiB window, then doubling to the 64 KiB limit: five requests, not the
+        // thirteen windows (or forty-nine blocks) of unplanned reading.
+        assert_eq!(
+            fixture.ranges.lock().unwrap()[1..],
+            [
+                (100_000, 116_383),
+                (116_384, 149_151),
+                (149_152, 214_687),
+                (214_688, 280_223),
+                (280_224, 299_999),
+            ]
+        );
+        assert_eq!(
+            reader.stats().response_bytes - opened.response_bytes,
+            200_000
+        );
+
+        // A transfer budget shortens the request instead of overshooting it.
+        reader.set_read_plan(std::iter::once(400_000..500_000));
+        reader.set_transfer_budget(Some(RemoteTransferBudget {
+            maximum_requests: 8,
+            maximum_response_bytes: 1_000,
+        }));
+        reader.seek(SeekFrom::Start(400_000)).unwrap();
+        reader.read_exact(&mut buffer[..1_000]).unwrap();
+        assert_eq!(buffer[..1_000], data[400_000..401_000]);
+        let error = reader.read_exact(&mut buffer[..1]).unwrap_err();
+        assert!(error.to_string().contains("transfer reached"));
+        assert_eq!(
+            fixture.ranges.lock().unwrap().last().copied(),
+            Some((400_000, 400_999))
+        );
+    }
+
+    #[test]
+    fn planned_extents_are_evicted_at_the_memory_bound() {
+        let data = fixture_bytes(64 * 1024);
+        let Some(fixture) = RangeFixture::start(data.clone()) else {
+            return;
+        };
+        let mut reader = HttpRangeReader::open(
+            &fixture.url,
+            HttpRangeConfig {
+                chunk_size: NonZeroUsize::new(256).unwrap(),
+                maximum_cache_bytes: NonZeroUsize::new(2_048).unwrap(),
+                maximum_coalesced_chunks: NonZeroUsize::new(4).unwrap(),
+                ..HttpRangeConfig::default()
+            },
+        )
+        .unwrap();
+        reader.set_read_plan([1_000..2_000, 10_000..11_000, 20_000..21_000]);
+        let mut buffer = vec![0; 1_000];
+        for start in [1_000_usize, 10_000, 20_000] {
+            reader.seek(SeekFrom::Start(start as u64)).unwrap();
+            reader.read_exact(&mut buffer).unwrap();
+            assert_eq!(buffer, data[start..start + 1_000]);
+        }
+        assert_eq!(reader.stats().evictions, 1);
+        assert!(reader.extent_bytes <= 2_048);
+        assert_eq!(
+            reader.extents.keys().copied().collect::<Vec<_>>(),
+            [10_000, 20_000]
+        );
+        // The evicted range is fetched again; the retained ones are not.
+        let requests = reader.stats().requests;
+        reader.seek(SeekFrom::Start(20_000)).unwrap();
+        reader.read_exact(&mut buffer).unwrap();
+        assert_eq!(reader.stats().requests, requests);
+        reader.seek(SeekFrom::Start(1_000)).unwrap();
+        reader.read_exact(&mut buffer).unwrap();
+        assert_eq!(reader.stats().requests, requests + 1);
+    }
+
+    #[test]
+    fn recently_used_blocks_are_served_from_memory_not_reread_from_disk() {
+        let data = fixture_bytes(4_096);
+        let Some(fixture) = RangeFixture::start(data.clone()) else {
+            return;
+        };
+        let mut reader = HttpRangeReader::open(
+            &fixture.url,
+            HttpRangeConfig {
+                chunk_size: NonZeroUsize::new(256).unwrap(),
+                maximum_cache_bytes: NonZeroUsize::new(1_024).unwrap(),
+                maximum_coalesced_chunks: NonZeroUsize::new(4).unwrap(),
+                ..HttpRangeConfig::default()
+            },
+        )
+        .unwrap();
+        let mut buffer = vec![0; 1_024];
+        reader.read_exact(&mut buffer).unwrap();
+        let requests = reader.stats().requests;
+        // With the disk copies gone, only the in-memory tier can serve a block switch.
+        for entry in fs::read_dir(reader.cache_directory.path()).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        for start in [0_usize, 768, 256, 512, 0] {
+            reader.seek(SeekFrom::Start(start as u64)).unwrap();
+            reader.read_exact(&mut buffer[..256]).unwrap();
+            assert_eq!(buffer[..256], data[start..start + 256]);
+        }
+        assert_eq!(reader.stats().requests, requests);
+        assert_eq!(fixture.requests.load(Ordering::Relaxed), requests);
+        // The memory tier never outgrows the configured cache.
+        assert!(reader.memory_blocks.len() <= 4);
     }
 
     #[test]

@@ -24,6 +24,7 @@ use rgv_hts::{
 };
 use thiserror::Error;
 
+use crate::alignment_scene_coordinator::budget_pressure;
 use crate::{
     AlignmentSourceIntentSpec, CanonicalAlignmentSourceBackend, CanonicalDecodeCheckpoint,
     SourceWork,
@@ -594,11 +595,7 @@ impl CanonicalAlignmentSourceBackend for LocalBamCanonicalBackend {
 
     fn allocation_pressure(error: &Self::Error) -> Option<LedgerError> {
         match error {
-            LocalBamCanonicalBackendError::Ledger(
-                pressure @ (LedgerError::BudgetExceeded { .. }
-                | LedgerError::TransientBudgetExceeded { .. }
-                | LedgerError::ReplacementTransitionActive { .. }),
-            ) => Some(*pressure),
+            LocalBamCanonicalBackendError::Ledger(pressure) => budget_pressure(pressure),
             _ => None,
         }
     }

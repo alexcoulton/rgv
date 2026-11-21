@@ -1,4 +1,13 @@
-use super::super::*;
+use crate::VariantPredicateOperator;
+use rgv_core::{
+    CopyNumberSortLocus, CopyNumberSortMode, CopyNumberTrackSettings, CopyNumberValueMode,
+    GwasColorMode, GwasTrackSettings, InteractionDisplayMode, InteractionTrackSettings,
+    MutationColorMode, MutationTrackSettings, QuantitativeArithmetic, QuantitativeDisplayMode,
+    QuantitativeMissingMode, QuantitativeScaleMode, QuantitativeScaleTransform,
+    QuantitativeTrackSettings, QuantitativeWindowFunction, TrackId, VariantColorMode,
+    VariantFieldComparison, VariantFieldPredicate, VariantFieldScope, VariantGenotypeFilter,
+    VariantGenotypeGrouping, VariantMissingValueRule, VariantTrackSettings, VariantTypeGroup,
+};
 
 pub(crate) fn interaction_track_settings_ui(
     ui: &mut egui::Ui,

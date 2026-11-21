@@ -19,6 +19,7 @@ mod interaction;
 mod junction_annotation;
 mod junction_summary;
 mod modification_summary;
+mod page_identity;
 mod pair_summary;
 mod panel_scene;
 mod panel_summary;
@@ -87,6 +88,7 @@ pub use junction_summary::{
 pub use modification_summary::{
     ExactModificationSummaryError, ExactModificationSummaryKey, ExactModificationSummaryTile,
 };
+pub use page_identity::{AlignmentPageContentToken, AlignmentPageIdentity};
 pub use pair_summary::{
     ExactPairSummaryError, ExactPairSummaryKey, ExactPairSummaryTile, PairCandidateEvent,
     summarize_pair_candidates,
@@ -111,8 +113,9 @@ pub use presentation_scene::{
 };
 pub use presentation_store::{
     AlignmentPresentationOwner, AlignmentPresentationOwnerDemand, AlignmentPresentationStore,
-    AlignmentPresentationStoreError, AlignmentReadPageWarm, AlignmentSceneCandidate,
-    PresentationCacheDemotion, PresentationCacheDiscard, PresentationStorePressure,
+    AlignmentPresentationStoreError, AlignmentReadPageReuseStats, AlignmentReadPageWarm,
+    AlignmentSceneCandidate, PresentationCacheDemotion, PresentationCacheDiscard,
+    PresentationStorePressure,
 };
 pub use resource::{
     AlignmentCacheResidencyClass, AlignmentCacheResidencyInventory,
@@ -134,8 +137,9 @@ pub use revision::{
 };
 pub use row_atlas::{
     AlignmentRowActivityBin, AlignmentRowActivityCursor, AlignmentRowActivityProfile,
-    AlignmentRowActivityUpdateStats, AlignmentRowAtlas, AlignmentRowAtlasError,
-    AlignmentRowAtlasPins, AlignmentRowConnector, RowAtlasRecord, RowAtlasRecordHit, RowExtent,
+    AlignmentRowActivityUpdateStats, AlignmentRowAtlas, AlignmentRowAtlasConstructionWork,
+    AlignmentRowAtlasError, AlignmentRowAtlasPins, AlignmentRowConnector, RowAtlasRecord,
+    RowAtlasRecordHit, RowExtent,
 };
 pub use row_oracle::{AlignmentRowGroup, AlignmentRowGroupKey, RowOracleError};
 pub use sampling::ReadSampling;

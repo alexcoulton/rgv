@@ -255,6 +255,7 @@ impl SessionViewPanel {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ReadBaseDisplayMode {
     #[default]
@@ -264,6 +265,7 @@ pub enum ReadBaseDisplayMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ModifiedBaseColorMode {
     #[default]
@@ -277,6 +279,7 @@ pub enum ModifiedBaseColorMode {
 /// The context is written in the direction of the cytosine-bearing strand. `H` is A, C, or T;
 /// `W` is A or T. Both reference strands are considered by the layout layer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BisulfiteContext {
     #[default]
@@ -294,6 +297,7 @@ pub enum BisulfiteContext {
 /// reverse-strand arrays; the renderer selects the appropriate physical tag from the requested
 /// strand and the record's alignment orientation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SmrtKineticsMode {
     #[default]
@@ -306,6 +310,7 @@ pub enum SmrtKineticsMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum UltimaQualityMode {
     #[default]
@@ -314,6 +319,7 @@ pub enum UltimaQualityMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UltimaDisplayOptions {
     #[serde(default)]
     pub quality_mode: UltimaQualityMode,
@@ -323,6 +329,7 @@ pub struct UltimaDisplayOptions {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SbxSimplexTailMode {
     Off,
@@ -332,6 +339,7 @@ pub enum SbxSimplexTailMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SbxDisplayOptions {
     #[serde(default)]
     pub simplex_tail_mode: SbxSimplexTailMode,
@@ -352,6 +360,7 @@ impl Default for SbxDisplayOptions {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OverlappingMatePolicy {
     #[default]
@@ -393,6 +402,7 @@ pub enum SashimiCountMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentColorMode {
     #[default]
@@ -414,6 +424,7 @@ pub enum AlignmentColorMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentGroupMode {
     #[default]
@@ -436,6 +447,7 @@ pub enum AlignmentGroupMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentOrderDirection {
     #[default]
@@ -444,6 +456,7 @@ pub enum AlignmentOrderDirection {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentSortMode {
     #[default]
@@ -469,6 +482,7 @@ pub enum AlignmentSortMode {
 /// Versioned logical AND of alignment predicates. Keeping the expression wrapper in the session
 /// schema lets future versions add OR/NOT nodes without reinterpreting today's flat list.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlignmentPredicateExpression {
     #[serde(default = "default_alignment_predicate_version")]
     pub version: u16,
@@ -490,6 +504,7 @@ const fn default_alignment_predicate_version() -> u16 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum AlignmentPredicateScope {
     Anywhere,
@@ -511,6 +526,7 @@ impl Default for AlignmentPredicateScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentFlagPredicate {
     Duplicate,
@@ -524,6 +540,7 @@ pub enum AlignmentFlagPredicate {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentCigarEventPredicate {
     Insertion,
@@ -535,6 +552,7 @@ pub enum AlignmentCigarEventPredicate {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentAuxComparison {
     Exists,
@@ -547,6 +565,7 @@ pub enum AlignmentAuxComparison {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum AlignmentAuxFilterValue {
     Integer(i64),
@@ -555,6 +574,7 @@ pub enum AlignmentAuxFilterValue {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "predicate", rename_all = "snake_case")]
 pub enum AlignmentViewPredicate {
     MappingQuality {
@@ -607,6 +627,7 @@ impl AlignmentViewPredicate {
 /// Controls whether alignment rows preserve navigation history or are packed
 /// independently for every settled query.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ReadStackingMode {
     /// Keep known alignments on the same rows across zoom, pan, filtering, and
@@ -849,6 +870,7 @@ impl Default for SessionFilters {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageScaleTransform {
     #[default]
@@ -905,6 +927,7 @@ pub struct SessionAlignmentTrack {
 /// The independent presentation channel in which a source track appears.
 /// A single alignment source normally has one node in each channel.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TrackChannel {
     Annotation,
@@ -983,6 +1006,7 @@ pub struct WorkspacePresentation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PresentationNodeId {
     Reference,

@@ -242,6 +242,15 @@ impl TrackSource for LocalVariantSource {
             scan_truncated: results.scan_truncated,
         }))
     }
+
+    fn set_remote_control(
+        &mut self,
+        keep_going: Option<RemoteCancellation>,
+        budget: Option<RemoteTransferBudget>,
+    ) {
+        self.set_remote_cancellation(keep_going);
+        self.set_remote_transfer_budget(budget);
+    }
 }
 
 impl TrackSource for TextGwasSource {

@@ -210,8 +210,14 @@ that is downscaled before it is inlined, preserving the aspect ratio; a narrower
 enlarged. The result's `width`/`height` describe the inlined PNG, `source_width`/`source_height`
 the viewer's original capture, and `downscaled` whether they differ, so image pixels can be mapped
 back to the reported panel geometry by the ratio `source_width / width`. Pass a larger `max_width`
-when full resolution is needed. Automation `snapshot` PNGs remain one pixel per logical point; only
-exports started from the desktop menus use the display's pixel density. The workspace state
+when full resolution is needed. Automation `snapshot` PNGs are one pixel per logical point by default; the batch `snapshot`
+command accepts an optional `scale` (PNG pixels per logical point, 0.25 to 8, default 1.0) for
+sharper or smaller output, for example
+`{"command":"snapshot","path":"view.png","scale":2.0}`. `scale` is ignored for SVG and must be 1
+for the `native_window` scope, which is captured at the window's own pixel density. PNG snapshots
+are rendered through the GPU when the device is available, so they match the screen, and fall back
+to the CPU rasteriser otherwise. Exports started from the desktop menus use the display's pixel
+density. The workspace state
 associated with a capture is reported once, as
 the top-level `panels`, `loci`, `genome`, and revision fields; the embedded command report does not
 repeat the workspace snapshot.

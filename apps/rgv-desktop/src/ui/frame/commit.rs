@@ -3,7 +3,16 @@
 //! `apply_shell_frame` fixes the order in which requests take effect; the helpers in this module
 //! and in the `apply_*` modules are its consecutive steps.
 
-use super::*;
+use crate::app::actions::TrackActionDraft;
+use crate::diagnostics::ManualDiagnosticFramePhase;
+use crate::inspection::model::next_evidence_index;
+use crate::inspection::read::truncate_string_to_bytes;
+use crate::ui::frame::ShellFrame;
+use crate::ui::{AlignmentSubtrack, TrackUiAction, UiCommand};
+use crate::workspace::lists::normalize_sample_association;
+use crate::{LOCUS_EDITOR_ID, RemoteSourceEditor, UiPanel, Viewer, ui};
+use rgv_core::{PresentationNodeId, TrackId};
+use std::time::{Duration, Instant};
 
 /// Chooses the single open dialog from the dialogs that asked to be open this frame, listed in
 /// display precedence.
@@ -85,7 +94,7 @@ impl Viewer {
             metadata_selection_changed,
         );
         self.capture_status_notification();
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellPostProcess,
             shell_post_process_started.elapsed(),
         );
@@ -558,6 +567,7 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::TrackFrameKey;
 
     fn gear(id: u64) -> UiPanel {
         UiPanel::TrackSettings(TrackFrameKey::Auxiliary(TrackId::new(id)))

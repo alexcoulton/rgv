@@ -1,8 +1,12 @@
+// Prefixed with `shaders/common.wgsl`; see `shaders.rs`.
+
 struct Camera {
     screen_size: vec2<f32>,
     clip_origin: vec2<f32>,
     points_per_base: vec2<f32>,
-    page_start_from_camera: vec2<f32>,
+    // Whole-base and fractional parts of (page start - camera start); see `project_genomic_x`.
+    page_start_whole: i32,
+    page_start_fraction: f32,
     row_scroll: f32,
     row_height: f32,
     read_height: f32,
@@ -39,35 +43,13 @@ struct VertexOutput {
     @location(3) @interpolate(flat) shape: u32,
 };
 
-fn two_sum(a: f32, b: f32) -> vec2<f32> {
-    let sum = a + b;
-    let recovered_b = sum - a;
-    return vec2<f32>(sum, (a - (sum - recovered_b)) + (b - recovered_b));
-}
-
-fn quick_two_sum(a: f32, b: f32) -> vec2<f32> {
-    let sum = a + b;
-    return vec2<f32>(sum, b - (sum - a));
-}
-
-fn double_single_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    let leading = two_sum(a.x, b.x);
-    return quick_two_sum(leading.x, leading.y + a.y + b.y);
-}
-
-fn double_single_multiply(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    let product = a.x * b.x;
-    var error = fma(a.x, b.x, -product);
-    error += a.x * b.y;
-    error += a.y * b.x;
-    error += a.y * b.y;
-    return quick_two_sum(product, error);
-}
-
 fn project_x(page_offset: vec2<f32>) -> f32 {
-    let delta = double_single_add(camera.page_start_from_camera, page_offset);
-    let projected = double_single_multiply(delta, camera.points_per_base);
-    return camera.clip_origin.x + projected.x + projected.y;
+    return camera.clip_origin.x + project_genomic_x(
+        page_offset,
+        camera.page_start_whole,
+        camera.page_start_fraction,
+        camera.points_per_base,
+    );
 }
 
 fn interaction_color(color: vec4<f32>, flags: u32) -> vec4<f32> {
@@ -97,15 +79,7 @@ fn project_instance(
     shape: u32,
     color: vec4<f32>,
 ) -> VertexOutput {
-    let corners = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(1.0, 0.0),
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(1.0, 0.0),
-        vec2<f32>(1.0, 1.0),
-    );
-    let corner = corners[vertex_index];
+    let corner = quad_corner(vertex_index);
     var left = project_x(start_offset);
     var right = project_x(end_offset);
     let row = f32(camera.page_row_start + row_offset);
@@ -136,14 +110,8 @@ fn project_instance(
         select(left, right, corner.x > 0.5),
         top + corner.y * height,
     );
-    let normalized = point / camera.screen_size;
     var output: VertexOutput;
-    output.position = vec4<f32>(
-        normalized.x * 2.0 - 1.0,
-        1.0 - normalized.y * 2.0,
-        0.0,
-        1.0,
-    );
+    output.position = points_to_clip(point, camera.screen_size);
     output.color = color;
     output.local_point = corner * vec2<f32>(right - left, height);
     output.size = vec2<f32>(right - left, height);

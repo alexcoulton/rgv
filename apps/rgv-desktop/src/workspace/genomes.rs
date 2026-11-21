@@ -2,10 +2,15 @@
 //! thread. Small genome resources are cached on disk by `rgv-hts`, so a genome which has been
 //! opened once can be opened again offline.
 
-use super::super::*;
-
+use crate::Viewer;
+use crate::launch::default_settings_path;
+use crate::sources::{remote_range_config, source_path, track_spec_kind};
+use anyhow::{Context as _, Result};
+use rgv_core::{GenomeConfiguration, IgvImportReport, SessionDocument, TrackSource};
 use rgv_core::{IGV_HOSTED_GENOME_LIST_URL, IgvGenomeDescription, IgvGenomeListEntry};
 use rgv_hts::{IgvGenomeImport, load_hosted_igv_genome, load_igv_genome, load_igv_genome_list};
+use std::path::{Path, PathBuf};
+use std::thread::JoinHandle;
 
 /// Where genome descriptions and their small companions are cached. `RGV_GENOME_CACHE_DIR`
 /// overrides the default location beside the settings file.
@@ -217,7 +222,7 @@ impl Viewer {
                     .map_err(|error| format!("{error:#}"))
             }) {
             Ok(worker) => {
-                self.data_status = format!("Loading genome {label}…");
+                self.set_busy_status(format!("Loading genome {label}…"));
                 self.genome_tasks.push(GenomeTask {
                     label,
                     is_list: false,

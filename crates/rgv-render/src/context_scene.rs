@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use bytemuck::{Pod, Zeroable};
 use rgv_layout::RectPrimitive;
 
-const CONTEXT_SCENE_SHADER: &str = include_str!("context_scene.wgsl");
 const CAMERA_RING_SIZE: usize = 3;
 
 /// Stable GPU ownership key for one contextual lane in one panel.
@@ -284,10 +283,7 @@ pub struct ContextSceneGpuRenderer {
 impl ContextSceneGpuRenderer {
     #[must_use]
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("RGV contextual scene shader"),
-            source: wgpu::ShaderSource::Wgsl(CONTEXT_SCENE_SHADER.into()),
-        });
+        let shader = crate::shaders::CONTEXT_SCENE.create_module(device);
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("RGV contextual lane camera layout"),
             entries: &[wgpu::BindGroupLayoutEntry {

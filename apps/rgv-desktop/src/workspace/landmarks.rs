@@ -1,8 +1,18 @@
+use crate::automation::AutomationAuxiliaryOpenState;
+use crate::sources::track_source;
+use crate::{Viewer, ui};
+use anyhow::{Context as _, Result};
+use rgv_core::{
+    AutomationLandmarkIntegrityState, AutomationLandmarkSnapshot, AutomationLandmarkTrackState,
+    ContigAliases, FeatureDisplayMode, GenomeAssemblyIdentity, GenomeLandmarkCatalogue,
+    LandmarkAssetRole, LandmarkSearchIndex, ReferenceDictionary, TrackConfig, TrackFormat, TrackId,
+    TrackKind,
+};
+use rgv_engine::{TrackSearchHit, TrackSearchResults, TrackSpecKind};
+use std::path::PathBuf;
 use std::{collections::BTreeMap, io::Read, path::Path};
 
 use flate2::read::MultiGzDecoder;
-
-use super::super::*;
 
 const MAXIMUM_LANDMARK_SEARCH_BYTES: u64 = 64 * 1024 * 1024;
 

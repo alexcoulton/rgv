@@ -257,6 +257,7 @@ const fn default_stress_barrier_timeout_millis() -> u64 {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StressTarget {
     Window,

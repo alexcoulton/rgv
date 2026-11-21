@@ -538,6 +538,7 @@ impl EvidenceRoot {
             root: Arc::clone(self),
             interval,
             records,
+            complete: apply_view_filter,
             _transient: transient,
         })
     }
@@ -589,8 +590,34 @@ impl EvidenceRoot {
             root: Arc::clone(self),
             interval,
             records,
+            complete: false,
             _transient: transient,
         })
+    }
+
+    /// Resolves one row-atlas handle exactly as [`Self::select_handles_with_reservation_kind`]
+    /// would, returning the payload sidecar its record reads from (`Ok(None)` for a core-only
+    /// chunk). `Err` means the handle is outside this derived view or its chunk is not
+    /// retained, so a page build would fail.
+    pub(crate) fn page_record_payload(
+        &self,
+        handle: AlignmentHandle,
+    ) -> Result<Option<&PayloadSidecar>, EvidenceSelectionError> {
+        let missing = EvidenceSelectionError::MissingHandle(handle);
+        if self
+            .allowed_handles
+            .as_ref()
+            .is_some_and(|allowed| allowed.binary_search(&handle).is_err())
+        {
+            return Err(missing);
+        }
+        let record = self.record_ref(handle).ok_or(missing)?;
+        Ok(self
+            .chunks
+            .get(record.chunk as usize)
+            .ok_or(missing)?
+            .payload
+            .as_deref())
     }
 
     fn record_ref(&self, handle: AlignmentHandle) -> Option<EvidenceRecordRef> {
@@ -783,6 +810,9 @@ pub struct EvidenceSelection {
     root: Arc<EvidenceRoot>,
     interval: GenomicInterval,
     records: Arc<[EvidenceRecordRef]>,
+    /// Every view-filtered record overlapping `interval`, as opposed to a chosen handle subset
+    /// or the unfiltered eligible population.
+    complete: bool,
     _transient: TransientResourceReservation,
 }
 
@@ -790,6 +820,12 @@ impl EvidenceSelection {
     #[must_use]
     pub const fn interval(&self) -> GenomicInterval {
         self.interval
+    }
+
+    /// Whether this is the complete view-filtered selection of `interval` from exactly `root`.
+    #[must_use]
+    pub(crate) fn is_over(&self, root: &Arc<EvidenceRoot>, interval: GenomicInterval) -> bool {
+        Arc::ptr_eq(&self.root, root) && self.interval == interval && self.complete
     }
 
     #[must_use]

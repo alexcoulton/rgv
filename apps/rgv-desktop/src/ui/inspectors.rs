@@ -1,4 +1,27 @@
-use super::super::*;
+use crate::Viewer;
+use crate::inspection::auxiliary::{
+    copy_number_inspector_document, endpoint_center_position, feature_inspector_document,
+    gwas_inspector_document, interaction_inspector_presentation_document,
+    mutation_inspector_document, quantitative_inspector_document,
+};
+use crate::inspection::document::{
+    InspectorActionEmphasis, InspectorActionId, InspectorBadge, InspectorDocument,
+    InspectorEndpoint, InspectorField, InspectorProvenance, InspectorTable, InspectorTone,
+    InspectorValue,
+};
+use crate::inspection::model::{
+    FeatureInspectorSnapshot, InspectorSnapshot, VariantAlignmentEvidence, VariantInspectorSnapshot,
+};
+use crate::inspection::read::{
+    alignment_inspector_document, auxiliary_tags_text, junction_inspector_document,
+    modification_inspector_document, pileup_inspector_document,
+};
+use crate::inspection::rna::{
+    paint_supplementary_chain_diagram, supplementary_chain_inspector_document,
+};
+use crate::inspection::variant::variant_inspector_presentation_document;
+use crate::workspace::panels::{TemplateReadEnd, ViewPanelController};
+use rgv_core::{MAXIMUM_VIEW_PANELS, PanelId, TrackId};
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
@@ -1038,10 +1061,11 @@ mod tests {
         inspected_items_relationship, inspector_table_matching_rows, show_inspector_document,
         wrapped_monospace,
     };
-    use crate::{
+    use crate::inspection::document::{
         InspectorDocument, InspectorField, InspectorSection, InspectorTable, InspectorValue,
-        PanelId, TemplateReadEnd,
     };
+    use crate::workspace::panels::TemplateReadEnd;
+    use rgv_core::PanelId;
 
     fn read_item(panel: u64, name: &[u8], template_end: TemplateReadEnd) -> InspectedPanelItem {
         InspectedPanelItem {

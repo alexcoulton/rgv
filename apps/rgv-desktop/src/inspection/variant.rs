@@ -1,4 +1,17 @@
-use super::super::*;
+use crate::inspection::document::{
+    InspectorAction, InspectorActionId, InspectorBadge, InspectorDocument, InspectorField,
+    InspectorLocation, InspectorNotice, InspectorProvenance, InspectorSection, InspectorTable,
+    InspectorTone, InspectorValue,
+};
+use crate::inspection::model::{VariantAlignmentEvidence, VariantInspectorSnapshot};
+use crate::inspection::read::{inspector_fields_text, truncate_string_to_bytes};
+use crate::{
+    MAX_VARIANT_EXPORT_BYTES, MAX_VARIANT_EXPORT_FIELD_BYTES, VARIANT_ALLELE_PREVIEW_BASES,
+    VARIANT_DETAILS_COPY_BYTES,
+};
+use rgv_core::{SampleMetadataTable, VariantGenotypeGrouping};
+use std::fmt::Write as _;
+use std::sync::Arc;
 
 pub(crate) fn variant_inspector_fields(
     inspector: &VariantInspectorSnapshot,

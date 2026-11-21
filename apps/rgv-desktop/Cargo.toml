@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["diagnostics"]
+# Interaction recording, the latency and manual diagnostic traces and the stress-health
+# publisher. Without it the `Diagnostics` facade compiles to no-ops.
+diagnostics = []
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

@@ -1,4 +1,19 @@
-use super::*;
+use crate::display::auxiliary::FIRST_CONTEXT_TRACK_OBJECT_ID;
+use crate::display::{
+    READ_PANE_HEADER_HEIGHT, alignment, ensure_annotation_presentation_frames,
+    pane_layout_snapshot, reflow_annotation_presentation_with_heights, resolve_read_panel_overview,
+    track_section_geometry,
+};
+use crate::ui::gestures::vertical_density_camera_padding;
+use crate::ui::{TrackFrame, TrackFrameKey};
+use crate::workspace::context_lanes::{
+    ContextLaneDraft, ContextLaneKey, buffered_context_interval, context_lane_coherence_groups,
+};
+use crate::workspace::panels::{PanelScrollDisplayCache, ReadPanelDisplayCache};
+use crate::{Viewer, ui};
+use rgv_core::{GenomicInterval, TrackConfig, TrackId, TrackKind, Viewport};
+use rgv_layout::{DisplayList, ObjectIdAllocator};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Layout metrics and accumulators shared by the sections of one genomic
 /// display rebuild. Sections run in a fixed order and append to the

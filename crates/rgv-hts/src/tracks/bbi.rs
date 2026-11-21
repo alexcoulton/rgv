@@ -72,10 +72,70 @@ impl BigWigSource {
         end: u64,
     ) -> Result<QuantitativeQuery, TrackError> {
         match &mut self.reader {
-            BigWigBackend::Local(reader) => query_bigwig(reader, contig, start, end),
-            BigWigBackend::Remote(reader) => query_bigwig(reader, contig, start, end),
+            BigWigBackend::Local(reader) => query_bigwig(reader, contig, start, end, None),
+            BigWigBackend::Remote(reader) => query_bigwig(reader, contig, start, end, None),
         }
     }
+
+    /// As [`Self::query`], with the minimum and maximum of the values behind every record.
+    ///
+    /// The records are those `query` returns for the same arguments, in the same order
+    /// (`mean` is its `value`), and the provenance is the same. When a precomputed zoom level
+    /// is read, `minimum` and `maximum` come from the file's own zoom summaries, so a peak
+    /// narrower than one summary bin stays visible in `maximum` although it barely moves the
+    /// mean. A record of raw values has `minimum == mean == maximum`.
+    pub fn query_with_extremes(
+        &mut self,
+        contig: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<QuantitativeSummaryQuery, TrackError> {
+        let mut extremes = Vec::new();
+        let query = match &mut self.reader {
+            BigWigBackend::Local(reader) => {
+                query_bigwig(reader, contig, start, end, Some(&mut extremes))
+            }
+            BigWigBackend::Remote(reader) => {
+                query_bigwig(reader, contig, start, end, Some(&mut extremes))
+            }
+        }?;
+        debug_assert_eq!(query.records.len(), extremes.len());
+        Ok(QuantitativeSummaryQuery {
+            records: query
+                .records
+                .iter()
+                .zip(extremes)
+                .map(|(record, (minimum, maximum))| QuantitativeSummaryRecord {
+                    start: record.start,
+                    end: record.end,
+                    minimum,
+                    mean: record.value,
+                    maximum,
+                })
+                .collect(),
+            provenance: query.provenance,
+        })
+    }
+}
+
+/// One quantitative record with the range of the values it stands for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuantitativeSummaryRecord {
+    pub start: u64,
+    pub end: u64,
+    /// Smallest value over the covered bases.
+    pub minimum: f32,
+    /// Mean over the covered bases; the `value` of the matching [`QuantitativeRecord`].
+    pub mean: f32,
+    /// Largest value over the covered bases.
+    pub maximum: f32,
+}
+
+/// Result of [`BigWigSource::query_with_extremes`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct QuantitativeSummaryQuery {
+    pub records: Vec<QuantitativeSummaryRecord>,
+    pub provenance: QuantitativeQueryProvenance,
 }
 
 pub struct BigBedSource {
@@ -245,11 +305,13 @@ fn bigwig_zoom_reduction(reductions: &[u32], span: u64) -> Option<u32> {
         .max()
 }
 
+/// `extremes`, when given, receives the `(minimum, maximum)` behind each returned record.
 fn query_bigwig<R: BBIFileRead>(
     reader: &mut BigWigRead<R>,
     contig: &str,
     start: u64,
     end: u64,
+    mut extremes: Option<&mut Vec<(f32, f32)>>,
 ) -> Result<QuantitativeQuery, TrackError> {
     let start = u32::try_from(start).map_err(|_| TrackError::Coordinate)?;
     let end = u32::try_from(end).map_err(|_| TrackError::Coordinate)?;
@@ -261,9 +323,16 @@ fn query_bigwig<R: BBIFileRead>(
         .collect::<Vec<_>>();
     let span = u64::from(end.saturating_sub(start));
     if let Some(reduction) = bigwig_zoom_reduction(&reductions, span) {
-        return query_bigwig_zoom(reader, contig, start, end, reduction);
+        return query_bigwig_zoom(reader, contig, start, end, reduction, extremes);
     }
     let raw = query_bigwig_raw(reader, contig, start, end)?;
+    if let Some(extremes) = extremes.as_deref_mut() {
+        extremes.extend(
+            raw.records
+                .iter()
+                .map(|record| (record.value, record.value)),
+        );
+    }
     if !raw.provenance.records_truncated {
         return Ok(raw);
     }
@@ -272,10 +341,21 @@ fn query_bigwig<R: BBIFileRead>(
     let Some(finest) = reductions.iter().copied().filter(|level| *level > 0).min() else {
         return Ok(raw);
     };
-    let summarized = query_bigwig_zoom(reader, contig, start, end, finest)?;
+    let mut summarized_extremes = Vec::new();
+    let summarized = query_bigwig_zoom(
+        reader,
+        contig,
+        start,
+        end,
+        finest,
+        extremes.is_some().then_some(&mut summarized_extremes),
+    )?;
     Ok(if summarized.provenance.records_truncated {
         raw
     } else {
+        if let Some(extremes) = extremes {
+            *extremes = summarized_extremes;
+        }
         summarized
     })
 }
@@ -309,13 +389,15 @@ fn query_bigwig_raw<R: BBIFileRead>(
 }
 
 /// Reads one precomputed zoom level. Each summary becomes one record carrying the mean of the
-/// covered bases, which is what the file's own reductions are designed to display.
+/// covered bases, which is what the file's own reductions are designed to display; the
+/// summary's minimum and maximum go to `extremes` when it is given.
 fn query_bigwig_zoom<R: BBIFileRead>(
     reader: &mut BigWigRead<R>,
     contig: &str,
     start: u32,
     end: u32,
     reduction: u32,
+    mut extremes: Option<&mut Vec<(f32, f32)>>,
 ) -> Result<QuantitativeQuery, TrackError> {
     let mut query = QuantitativeQuery::default();
     query.provenance.summary_reduction_bases = Some(reduction);
@@ -339,6 +421,13 @@ fn query_bigwig_zoom<R: BBIFileRead>(
             MAX_QUANTITATIVE_RECORDS_PER_QUERY,
         ) {
             break;
+        }
+        if let Some(extremes) = extremes.as_deref_mut() {
+            #[allow(clippy::cast_possible_truncation)]
+            extremes.push((
+                summary.summary.min_val as f32,
+                summary.summary.max_val as f32,
+            ));
         }
     }
     query.provenance.records_retained = query.records.len();

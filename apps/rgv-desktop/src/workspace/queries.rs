@@ -1,5 +1,43 @@
-use super::super::*;
 use super::alignment_management::alignment_scene_frame_for_ui;
+use crate::automation::AutomationAuxiliaryOpenState;
+use crate::diagnostics::HealthSignal;
+use crate::sources::load_assembly_reporting;
+use crate::workspace::alignment_navigation::{
+    AlignmentNavigationPhase, AlignmentNavigationProductState,
+};
+use crate::workspace::alignments::{
+    AlignmentReferenceCompatibility, AlignmentSceneBudgetRetry, AlignmentSceneBudgetRetryPoll,
+    AlignmentScenePressureRetry, AlignmentScenePressureRetryPoll, AlignmentSceneResolution,
+    AlignmentTrackLifecycle, alignment_reference_compatibility,
+    alignment_scene_pressure_after_relief,
+};
+use crate::workspace::context_lanes::buffered_context_interval;
+use crate::workspace::navigation::RequestedLocus;
+use crate::workspace::navigation_transaction::{
+    NavigationPresentationPhase, NavigationQueryTarget, NavigationTargetFingerprint,
+    navigation_target_ready_for_commit,
+};
+use crate::{
+    AlignmentGpuPublicationRetryGate, Viewer, app, auxiliary_query_track_ids,
+    clear_removed_auxiliary_panel_state,
+};
+use rgv_alignment_scene::{AlignmentSceneCamera, ReferenceRevision};
+use rgv_core::{
+    GenomicInterval, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, PanelId, ReferenceDictionary, TrackKind,
+    TrackSource, Viewport,
+};
+use rgv_engine::{
+    AlignmentCoordinatorFrame, AlignmentIndividualReadCapability, AlignmentReferenceAuthority,
+    AlignmentReferenceRequirement, AlignmentSceneEngineEvent, AlignmentSceneEngineOperation,
+    AlignmentSceneFrameCause, AlignmentSceneRequestToken,
+    AlignmentSceneResourcePressureDisposition, AlignmentVerticalResidency, EngineQueueError,
+    MAX_REFERENCE_QUERY_BASES, ReferenceEngineEvent, ReferenceQueryIdentity, SourceIntentKind,
+    SourceOwnerId, TrackEngineEvent,
+};
+use rgv_hts::ReferenceSlice;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// A FASTA completion is authoritative only for the exact open handle and request it was sent
 /// for. Generation acceptance is checked separately by the owning panel.
@@ -378,20 +416,24 @@ impl Viewer {
             generation,
         };
         let source_status = self.data_status.clone();
+        let source_activity = self.status_activity();
         let panel = self.panels.active_mut();
         if previous_phase == NavigationPresentationPhase::Acquiring
             && previous_target_generation != generation
         {
             panel.navigation_query_schedule.record_superseded_target();
         }
-        panel.navigation_presentation.begin_navigation(
-            viewport,
-            generation,
-            self.workspace_layout.revision,
-            self.navigation_contract_revision,
-            &source_status,
-            now,
-        );
+        panel
+            .navigation_presentation
+            .begin_navigation_with_activity(
+                viewport,
+                generation,
+                self.workspace_layout.revision,
+                self.navigation_contract_revision,
+                &source_status,
+                source_activity,
+                now,
+            );
         panel
             .navigation_query_schedule
             .update(target, now, gesture_active, hold_commit_until_end);
@@ -594,16 +636,20 @@ impl Viewer {
     pub(crate) fn begin_all_panel_refresh_transactions(&mut self) {
         let now = Instant::now();
         let source_status = self.data_status.clone();
+        let source_activity = self.status_activity();
         for panel in self.panels.iter_mut() {
             panel.navigation_query_schedule.cancel();
-            panel.navigation_presentation.begin_navigation(
-                panel.viewport,
-                panel.generation_clock.current().get(),
-                self.workspace_layout.revision,
-                self.navigation_contract_revision,
-                &source_status,
-                now,
-            );
+            panel
+                .navigation_presentation
+                .begin_navigation_with_activity(
+                    panel.viewport,
+                    panel.generation_clock.current().get(),
+                    self.workspace_layout.revision,
+                    self.navigation_contract_revision,
+                    &source_status,
+                    source_activity,
+                    now,
+                );
         }
     }
 
@@ -906,8 +952,7 @@ impl Viewer {
                 panel.pending_queries.reference = false;
             }
             Err(EngineQueueError::Full) => {
-                "Reference queue busy; retrying the latest locus…"
-                    .clone_into(&mut self.data_status);
+                self.set_busy_status("Reference queue busy; retrying the latest locus…");
             }
             Err(EngineQueueError::Disconnected) => {
                 self.panels.active_mut().pending_queries.reference = false;
@@ -1016,7 +1061,7 @@ impl Viewer {
                 panel.track_request_interval = Some(interval);
             }
             Err(EngineQueueError::Full) => {
-                "Track queue busy; retrying the latest locus…".clone_into(&mut self.data_status);
+                self.set_busy_status("Track queue busy; retrying the latest locus…");
             }
             Err(EngineQueueError::Disconnected) => {
                 self.panels.active_mut().pending_queries.tracks = false;
@@ -1243,7 +1288,7 @@ impl Viewer {
         self.poll_alignment_events();
         let ledger_progressed = self.alignment_ledger_progress.take_pending();
         if ledger_progressed {
-            self.stress_health.note_worker_progress();
+            self.diagnostics.health(HealthSignal::WorkerProgress);
         }
         let immediate_budget_retry = self.alignment_tracks.iter().any(|track| {
             track
@@ -1295,8 +1340,10 @@ impl Viewer {
         } else {
             desired_generation.saturating_sub(1)
         };
-        self.stress_health
-            .observe_generations(desired_generation, committed_generation);
+        self.diagnostics.health(HealthSignal::Generations {
+            desired: desired_generation,
+            committed: committed_generation,
+        });
     }
 
     fn synchronize_alignment_contextual_product_states(&mut self) {
@@ -1845,10 +1892,10 @@ impl Viewer {
                             self.navigation_stale_result_rejections.saturating_add(1);
                         continue;
                     };
-                    if self.manual_diagnostic_trace_is_recording()
+                    if self.diagnostics.recording()
                         && cause == AlignmentSceneFrameCause::SourceSettlement
                     {
-                        self.record_manual_diagnostic_event(
+                        self.diagnostics.event(
                             "alignment_worker",
                             "source_settlement_without_scene_publication",
                             serde_json::json!({
@@ -1868,10 +1915,10 @@ impl Viewer {
                             }),
                         );
                     }
-                    if self.manual_diagnostic_trace_is_recording()
+                    if self.diagnostics.recording()
                         && let Some(capacity) = update.and_then(|update| update.capacity_plan)
                     {
-                        self.record_manual_diagnostic_event(
+                        self.diagnostics.event(
                             "alignment_cache",
                             "foreground_capacity_plan",
                             serde_json::json!({
@@ -2440,8 +2487,8 @@ impl Viewer {
                     request_id,
                     eviction,
                 } => {
-                    if self.manual_diagnostic_trace_is_recording() {
-                        self.record_manual_diagnostic_event(
+                    if self.diagnostics.recording() {
+                        self.diagnostics.event(
                             "alignment_cache",
                             "reclaim_completed",
                             serde_json::json!({
@@ -2494,8 +2541,8 @@ impl Viewer {
                     request_id,
                     eviction,
                 } => {
-                    if self.manual_diagnostic_trace_is_recording() {
-                        self.record_manual_diagnostic_event(
+                    if self.diagnostics.recording() {
+                        self.diagnostics.event(
                             "alignment_cache",
                             "reclaim_quantum",
                             serde_json::json!({
@@ -2522,8 +2569,8 @@ impl Viewer {
                     relinquished_cache_entries,
                     reason,
                 } => {
-                    if self.manual_diagnostic_trace_is_recording() {
-                        self.record_manual_diagnostic_event(
+                    if self.diagnostics.recording() {
+                        self.diagnostics.event(
                             "alignment_cache",
                             "reclaim_superseded",
                             serde_json::json!({
@@ -2548,8 +2595,8 @@ impl Viewer {
                     owner,
                     elapsed_nanoseconds,
                 } => {
-                    if self.manual_diagnostic_trace_is_recording() {
-                        self.record_manual_diagnostic_event(
+                    if self.diagnostics.recording() {
+                        self.diagnostics.event(
                             "alignment_worker",
                             "slow_phase_completed",
                             serde_json::json!({

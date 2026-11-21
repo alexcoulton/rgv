@@ -1,5 +1,46 @@
-use super::super::*;
+use crate::display::auxiliary::{
+    feature_record_index_at_display_point, genomic_distance_to_interval,
+    gwas_record_index_at_point, interaction_record_index_at_position,
+    measured_feature_label_widths, mutation_record_index_at_position,
+    pinned_gene_layout_maximum_rows, quantitative_record_index_at_position,
+    quantitative_track_y_at_position,
+};
+use crate::display::hit_test::{
+    JUNCTION_ARC_MINIMUM_ACQUISITION_RADIUS, JunctionArcHitTestResult,
+    alignment_lane_in_pane_layout,
+};
 use crate::display::primary_pinned_gene_id;
+use crate::inspection::model::{
+    CopyNumberInspectorSnapshot, CopyNumberSelection, EvidenceSelection, FeatureInspectorSnapshot,
+    FeatureSelection, GwasInspectorSnapshot, GwasSelection, InteractionInspectorSnapshot,
+    InteractionSelection, MutationInspectorSnapshot, MutationSelection,
+    QuantitativeInspectorSnapshot, QuantitativeOperandSnapshot, QuantitativeSelection,
+    VariantAlignmentEvidence, VariantInspectorSnapshot, VariantSelection, next_evidence_index,
+};
+use crate::inspection::rna::selected_supplementary_chain;
+use crate::inspection::variant::variant_allele_evidence_summary;
+use crate::ui::{TrackFrame, TrackFrameKey};
+use crate::workspace::tracks::replace_panel_track_selection;
+use crate::{
+    JunctionArcHover, JunctionArcKey, SashimiHitTestGate, Viewer, alignment_gpu_bundle_is_current,
+    layout_junction_component, native_junction_interaction_token, ui,
+};
+use rgv_alignment_scene::{
+    AlignmentComponent, AlignmentHit, AlignmentTraversalDirection, CpuAlignmentProjector,
+    SummaryPageFamily, SummarySemanticComponent,
+};
+use rgv_core::{
+    AutomationSelectionGranularity, CopyNumberTrackSettings, GenomicInterval, GwasTrackSettings,
+    InteractionTrackSettings, PanelId, QuantitativeTrackSettings, TrackId, TrackKind,
+    VariantTrackSettings,
+};
+use rgv_engine::{AlignmentIndividualReadCapability, TrackSnapshotData};
+use rgv_layout::{
+    COPY_NUMBER_HEADER_HEIGHT, JunctionArcComponent, MUTATION_HEADER_HEIGHT, ObjectIdAllocator,
+    TrackLayoutOptions, alignment_read_name_hash, copy_number_sample_order,
+    layout_features_with_label_widths,
+};
+use std::sync::Arc;
 
 impl Viewer {
     pub(crate) fn visible_track_frame_at_screen_y(

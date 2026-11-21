@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub const MAXIMUM_TDF_CHANNELS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct TrackId(u64);
 
 impl TrackId {
@@ -16,6 +17,7 @@ impl TrackId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum TrackKind {
     Alignment,
     Reference,
@@ -291,6 +293,7 @@ impl InteractionTrackSettings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum TrackSource {
     Local { path: String },
     Remote { url: String },

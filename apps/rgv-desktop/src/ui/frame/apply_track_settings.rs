@@ -1,6 +1,22 @@
 //! Deferred alignment, reference and auxiliary track setting changes.
 
-use super::*;
+use crate::display::alignment::parse_style_tag;
+use crate::display::auxiliary::{alignment_sort_position, normalize_quantitative_overlay_settings};
+use crate::ui::AlignmentSubtrack;
+use crate::ui::alignment_settings::modification_code_label;
+use crate::ui::frame::ShellFrame;
+use crate::workspace::alignments::{
+    ActiveFilters, AlignmentSettingsDraft, FilterEditor, alignment_color_mode_needs_reference,
+};
+use crate::workspace::lists::apply_compatible_auxiliary_appearance;
+use crate::{
+    MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY, QuantitativeBulkAction, Viewer,
+    auxiliary_query_track_ids,
+};
+use rgv_core::TrackId;
+use rgv_hts::{AlignmentFilter, AuxPredicate};
+use rgv_layout::{AlignmentColorMode, AlignmentGroupMode, AlignmentSortMode};
+use std::collections::HashSet;
 
 impl Viewer {
     pub(super) fn apply_primary_alignment_query_settings(

@@ -1,6 +1,18 @@
 //! Deferred changes to regions of interest, the review queue and sample metadata.
 
-use super::*;
+use crate::ui::TrackFrameKey;
+use crate::ui::frame::ShellFrame;
+use crate::workspace::lists::{
+    adjacent_review_locus, metadata_matching_track_ids, next_available_item_id,
+    normalize_regions_and_review_items, session_locus_text,
+};
+use crate::workspace_lists::{WorkspaceListKind, region_bed_export, review_tsv_export};
+use crate::{Viewer, ui};
+use rgv_core::{
+    MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS, PresentationNodeId, RegionOfInterest,
+    ReviewItem, ReviewStatus, SessionLocus,
+};
+use std::collections::BTreeSet;
 
 /// Whether any request this frame reads or edits the region and review lists. They are only
 /// copied into the frame when this is true or one of their windows is open.

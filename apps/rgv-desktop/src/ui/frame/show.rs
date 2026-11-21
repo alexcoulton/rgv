@@ -3,7 +3,9 @@
 //! egui is immediate-mode: the order of the calls below is the order widgets are laid out and
 //! receive ids, so it must not be rearranged.
 
-use super::*;
+use crate::app::alignment_context::show_alignment_context_menu;
+use crate::ui::frame::ShellFrame;
+use crate::{Viewer, ui};
 
 impl Viewer {
     /// Runs every shell widget for this frame.

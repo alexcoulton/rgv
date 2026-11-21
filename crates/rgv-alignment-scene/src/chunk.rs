@@ -51,6 +51,10 @@ pub struct CanonicalRecordChunk {
     record_contract: ContractFingerprint,
     batch: Arc<AlignmentBatch>,
     handles: Arc<[AlignmentHandle]>,
+    /// Record indices ordered by handle, kept only when `handles` is not already ascending
+    /// (packed records may be reordered by genomic position). Either way a handle resolves by
+    /// binary search instead of a scan of the chunk.
+    handle_order: Option<Arc<[u32]>>,
     /// Genomic overlap index over `batch`, built on first use and shared by every clone. Sizing
     /// a chunk for its ledger reservation and then admitting it used to build the index twice.
     overlap: Arc<OnceLock<AlignmentOverlapIndex>>,
@@ -86,12 +90,24 @@ impl CanonicalRecordChunk {
             }
             handles.push(handle);
         }
+        let handle_order = if handles.windows(2).all(|pair| pair[0] < pair[1]) {
+            None
+        } else {
+            let mut order = (0..handles.len())
+                .map(|index| {
+                    u32::try_from(index).map_err(|_| ChunkError::TooManyRecords { record: index })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            order.sort_unstable_by_key(|index| handles[*index as usize]);
+            Some(order.into())
+        };
         Ok(Self {
             source_revision,
             id,
             record_contract,
             batch,
             handles: handles.into(),
+            handle_order,
             overlap: Arc::new(OnceLock::new()),
         })
     }
@@ -133,24 +149,35 @@ impl CanonicalRecordChunk {
     /// genomic position, so lookup stays local rather than assuming physical-order storage.
     #[must_use]
     pub fn record_index(&self, handle: AlignmentHandle) -> Option<usize> {
-        (handle.source_revision() == self.source_revision
-            && SourceChunkId::for_position(handle.source_position()) == self.id)
-            .then(|| {
-                self.handles
-                    .iter()
-                    .position(|candidate| *candidate == handle)
-            })
-            .flatten()
+        if handle.source_revision() != self.source_revision
+            || SourceChunkId::for_position(handle.source_position()) != self.id
+        {
+            return None;
+        }
+        match &self.handle_order {
+            None => self.handles.binary_search(&handle).ok(),
+            Some(order) => order
+                .binary_search_by_key(&handle, |index| self.handles[*index as usize])
+                .ok()
+                .map(|position| order[position] as usize),
+        }
     }
 
     /// Retained packed-record and stable-handle capacity owned by this chunk.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        self.batch.estimated_bytes().saturating_add(
-            self.handles
-                .len()
-                .saturating_mul(size_of::<AlignmentHandle>()),
-        )
+        self.batch
+            .estimated_bytes()
+            .saturating_add(
+                self.handles
+                    .len()
+                    .saturating_mul(size_of::<AlignmentHandle>()),
+            )
+            .saturating_add(
+                self.handle_order
+                    .as_ref()
+                    .map_or(0, |order| order.len().saturating_mul(size_of::<u32>())),
+            )
     }
 }
 
@@ -168,6 +195,8 @@ pub enum ChunkError {
     },
     #[error("record {record} repeats an existing physical source position")]
     DuplicateSourcePosition { record: usize },
+    #[error("record {record} exceeds the per-chunk record index range")]
+    TooManyRecords { record: usize },
 }
 
 #[cfg(test)]
@@ -228,6 +257,67 @@ mod tests {
         .unwrap();
 
         assert_ne!(chunk.handles()[0], chunk.handles()[1]);
+    }
+
+    #[test]
+    fn handles_resolve_by_search_whatever_order_the_batch_stores_them_in() {
+        // Deterministic shuffles of one block's virtual offsets, including the ascending one.
+        for (case, step) in [1_u64, 7, 11, 13].into_iter().enumerate() {
+            let count = 97_u64;
+            let offsets = (0..count)
+                .map(|index| (7 << 16) | ((index * step) % count + 1))
+                .collect::<Vec<_>>();
+            let mut batch = AlignmentBatch::default();
+            for offset in &offsets {
+                batch
+                    .push_with_source_position(
+                        &record(),
+                        AlignmentSourcePosition::bam_virtual_offset(*offset),
+                    )
+                    .unwrap();
+            }
+            let chunk = CanonicalRecordChunk::new(
+                revision(),
+                SourceChunkId::BamBlock {
+                    compressed_offset: 7,
+                },
+                Arc::new(batch),
+                ContractFingerprint::new(5),
+            )
+            .unwrap();
+            assert_eq!(chunk.handle_order.is_none(), step == 1, "case {case}");
+            for (index, handle) in chunk.handles().iter().enumerate() {
+                assert_eq!(chunk.record_index(*handle), Some(index), "case {case}");
+                // The former linear scan is the oracle.
+                assert_eq!(
+                    chunk.record_index(*handle),
+                    chunk
+                        .handles()
+                        .iter()
+                        .position(|candidate| candidate == handle),
+                );
+            }
+            let absent = [
+                AlignmentHandle::new(
+                    revision(),
+                    AlignmentSourcePosition::bam_virtual_offset((7 << 16) | 5_000),
+                ),
+                AlignmentHandle::new(
+                    revision(),
+                    AlignmentSourcePosition::bam_virtual_offset((8 << 16) | 1),
+                ),
+                AlignmentHandle::new(
+                    AlignmentSourceRevision::new(
+                        SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
+                        RevisionFingerprint::new(3, 5),
+                    ),
+                    AlignmentSourcePosition::bam_virtual_offset((7 << 16) | 1),
+                ),
+            ];
+            for handle in absent {
+                assert_eq!(chunk.record_index(handle), None, "case {case}");
+            }
+        }
     }
 
     #[test]

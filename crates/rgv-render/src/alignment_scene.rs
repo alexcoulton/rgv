@@ -17,14 +17,12 @@ use rgv_alignment_scene::{
     AllocationBundleLease, AllocationBundleReservation, AllocationBundleSlot, AllocationClass,
     AllocationId, AllocationLease, AllocationLedger, AllocationRetirementClaimSet,
     AllocationRetirementToken, CpuAlignmentLabelFrame, CpuAlignmentProjector, CpuProjectionError,
-    LedgerError, LedgerProgress, PinnedAllocationLease, ReservationKind, SceneRevision,
-    TransientResourceClass,
+    LedgerError, PinnedAllocationLease, ReservationKind, SceneRevision, TransientResourceClass,
 };
 use thiserror::Error;
 
+use crate::paged_cache::{self, CachedFrameSlot, CachedGpuPage, PageTableError, PagedGpuCache};
 use crate::{AlignmentLedgerPolicyView, GpuBudgetPressure, GpuReclaimGoal, GpuReclaimReport};
-
-const SHADER: &str = include_str!("alignment_scene.wgsl");
 
 /// Two slots are sufficient for a strict present-next/drop-previous frame boundary: the
 /// currently presented frame owns one slot while the next camera frame is captured into the
@@ -168,7 +166,10 @@ struct AlignmentGpuCameraUniform {
     screen_size: [f32; 2],
     clip_origin: [f32; 2],
     points_per_base: [f32; 2],
-    page_start_from_camera: [f32; 2],
+    /// Whole bases from the camera start to the page start, rounded down.
+    page_start_whole: i32,
+    /// The remainder, in `[0, 1)`.
+    page_start_fraction: f32,
     row_scroll: f32,
     row_height: f32,
     read_height: f32,
@@ -380,10 +381,24 @@ struct GpuAlignmentPage {
     last_used_revision: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct AlignmentPageReclaimCandidate {
-    key: AlignmentPageKey,
-    charged_capacity: usize,
+impl CachedGpuPage for GpuAlignmentPage {
+    type Key = AlignmentPageKey;
+
+    fn key(&self) -> AlignmentPageKey {
+        self.key
+    }
+
+    fn last_used_revision(&self) -> u64 {
+        self.last_used_revision
+    }
+
+    fn set_last_used_revision(&mut self, revision: u64) {
+        self.last_used_revision = revision;
+    }
+
+    fn allocation(&self) -> Option<&AllocationLease> {
+        Some(&self.allocation)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -562,6 +577,23 @@ struct GpuAlignmentFrameBuffers {
     frame_allocation: AllocationLease,
     frame_capacity: usize,
     capture_ring: bool,
+}
+
+impl CachedFrameSlot for GpuAlignmentFrameBuffers {
+    fn frame_allocation(&self) -> &AllocationLease {
+        &self.frame_allocation
+    }
+
+    fn capture_ring(&self) -> bool {
+        self.capture_ring
+    }
+
+    fn gpu_allocations(&self) -> [Option<&AllocationLease>; 2] {
+        [
+            self.camera_allocation.as_ref(),
+            self.interaction_allocation.as_ref(),
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -764,12 +796,8 @@ pub struct AlignmentGpuRenderer {
     camera_layout: wgpu::BindGroupLayout,
     camera_stride: usize,
     frame_buffers: Vec<Arc<GpuAlignmentFrameBuffers>>,
-    pages: Vec<GpuAlignmentPage>,
-    /// Online LRU authority. Keeping this index current when a page is admitted, touched, or
-    /// retired removes the former failure-time full page scan and sort from the render thread.
-    reclaim_index: BTreeSet<(u64, AlignmentPageKey)>,
-    page_table_allocation: Option<AllocationLease>,
-    page_table_capacity: usize,
+    /// Sorted device-page table, its ledger charge and the online LRU reclaim authority.
+    cache: PagedGpuCache<GpuAlignmentPage>,
     revision: u64,
     device_generation: u64,
     pending_geometry_uploaded_bytes: usize,
@@ -782,10 +810,7 @@ pub struct AlignmentGpuRenderer {
 impl AlignmentGpuRenderer {
     #[must_use]
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("RGV alignment semantic page shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
+        let shader = crate::shaders::ALIGNMENT_SCENE.create_module(device);
         let camera_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("RGV alignment semantic camera layout"),
@@ -866,10 +891,7 @@ impl AlignmentGpuRenderer {
             camera_layout,
             camera_stride: aligned_uniform_stride(device),
             frame_buffers: Vec::new(),
-            pages: Vec::new(),
-            reclaim_index: BTreeSet::new(),
-            page_table_allocation: None,
-            page_table_capacity: 0,
+            cache: PagedGpuCache::default(),
             revision: 0,
             device_generation: 1,
             pending_geometry_uploaded_bytes: 0,
@@ -991,9 +1013,9 @@ impl AlignmentGpuRenderer {
             });
         }
 
-        let required_page_capacity = self.pages.len().saturating_add(missing_pages.len());
+        let required_page_capacity = self.cache.pages.len().saturating_add(missing_pages.len());
         let (page_table_slot, page_table_requested_capacity, page_table_maximum_bytes) =
-            if required_page_capacity > self.page_table_capacity {
+            if required_page_capacity > self.cache.page_table_capacity {
                 let requested = next_capacity(required_page_capacity)?;
                 let maximum = requested
                     .checked_mul(2)
@@ -1172,7 +1194,7 @@ impl AlignmentGpuRenderer {
         let mut claimable = BTreeSet::<AllocationId>::new();
 
         let mut all_pages_retirable = true;
-        for page in &self.pages {
+        for page in &self.cache.pages {
             if prepared_keys.contains(&page.key)
                 || !exact_retirement_ownership(&page.allocation, &prior_pin_counts)?
             {
@@ -1183,6 +1205,7 @@ impl AlignmentGpuRenderer {
         let can_retire_table = plan.page_table_slot.is_some()
             && all_pages_retirable
             && self
+                .cache
                 .page_table_allocation
                 .as_ref()
                 .map(|allocation| exact_retirement_ownership(allocation, &prior_pin_counts))
@@ -1190,17 +1213,18 @@ impl AlignmentGpuRenderer {
                 .unwrap_or(false);
         let mut retired_page_indices = Vec::new();
         if can_retire_table {
-            for page in &self.pages {
+            for page in &self.cache.pages {
                 claimable.insert(page.allocation.id());
             }
             claimable.insert(
-                self.page_table_allocation
+                self.cache
+                    .page_table_allocation
                     .as_ref()
                     .expect("retirable page table was proven present")
                     .id(),
             );
         } else {
-            for (index, page) in self.pages.iter().enumerate() {
+            for (index, page) in self.cache.pages.iter().enumerate() {
                 if prepared_keys.contains(&page.key) {
                     continue;
                 }
@@ -1254,14 +1278,15 @@ impl AlignmentGpuRenderer {
                 }
             }
         }
-        for (index, page) in self.pages.iter().enumerate() {
+        for (index, page) in self.cache.pages.iter().enumerate() {
             if can_retire_table || retired_page_indices.binary_search(&index).is_ok() {
                 builder.include_lease(&page.allocation)?;
             }
         }
         if can_retire_table {
             builder.include_lease(
-                self.page_table_allocation
+                self.cache
+                    .page_table_allocation
                     .as_ref()
                     .expect("retirable page table was proven present"),
             )?;
@@ -1282,20 +1307,21 @@ impl AlignmentGpuRenderer {
         // strand the caller without its prior frame or leave a partially detached renderer.
         let prior_frame = prior_frame.take();
         let retired_pages = if can_retire_table {
-            std::mem::take(&mut self.pages)
+            std::mem::take(&mut self.cache.pages)
         } else {
             let mut retired = Vec::with_capacity(retired_page_indices.len());
             for index in retired_page_indices.into_iter().rev() {
-                retired.push(self.pages.remove(index));
+                retired.push(self.cache.pages.remove(index));
             }
             retired.sort_unstable_by_key(|page| page.key);
             retired
         };
         let retired_page_table = if can_retire_table {
-            let capacity = self.page_table_capacity;
-            self.page_table_capacity = 0;
+            let capacity = self.cache.page_table_capacity;
+            self.cache.page_table_capacity = 0;
             Some((
-                self.page_table_allocation
+                self.cache
+                    .page_table_allocation
                     .take()
                     .expect("retirable page table was proven present"),
                 capacity,
@@ -1338,20 +1364,20 @@ impl AlignmentGpuRenderer {
             });
         }
         if retirement.retired_page_table.is_some()
-            && (self.page_table_allocation.is_some() || !self.pages.is_empty())
+            && (self.cache.page_table_allocation.is_some() || !self.cache.pages.is_empty())
         {
             return Err(AlignmentGpuReplacementError::RetirementRestoreConflict);
         }
         if let Some((allocation, capacity)) = retirement.retired_page_table.take() {
-            self.pages = std::mem::take(&mut retirement.retired_pages);
-            if self.pages.capacity() != capacity {
+            self.cache.pages = std::mem::take(&mut retirement.retired_pages);
+            if self.cache.pages.capacity() != capacity {
                 return Err(AlignmentGpuReplacementError::RetirementRestoreConflict);
             }
-            self.page_table_allocation = Some(allocation);
-            self.page_table_capacity = capacity;
+            self.cache.page_table_allocation = Some(allocation);
+            self.cache.page_table_capacity = capacity;
         } else {
-            self.pages.append(&mut retirement.retired_pages);
-            self.pages.sort_unstable_by_key(|page| page.key);
+            self.cache.pages.append(&mut retirement.retired_pages);
+            self.cache.pages.sort_unstable_by_key(|page| page.key);
         }
         self.rebuild_reclaim_index();
         for retired in retirement.retired_frame_buffers.drain(..) {
@@ -1498,9 +1524,19 @@ impl AlignmentGpuRenderer {
 
         let page_table = if plan.page_table_slot.is_some() {
             let candidate = Vec::with_capacity(plan.page_table_requested_capacity);
-            if candidate.capacity() < self.pages.len().saturating_add(plan.missing_pages.len()) {
+            if candidate.capacity()
+                < self
+                    .cache
+                    .pages
+                    .len()
+                    .saturating_add(plan.missing_pages.len())
+            {
                 return Err(AlignmentGpuPageAdmissionError::PageTableCapacity {
-                    required: self.pages.len().saturating_add(plan.missing_pages.len()),
+                    required: self
+                        .cache
+                        .pages
+                        .len()
+                        .saturating_add(plan.missing_pages.len()),
                     actual: candidate.capacity(),
                 }
                 .into());
@@ -1673,7 +1709,7 @@ impl AlignmentGpuRenderer {
             .saturating_add(usize::from(plan.frame_slots[0].camera_slot.is_some()))
             .saturating_add(usize::from(plan.frame_slots[0].interaction_slot.is_some()))
             .saturating_add(usize::from(
-                plan.page_table_slot.is_some() || self.page_table_allocation.is_some(),
+                plan.page_table_slot.is_some() || self.cache.page_table_allocation.is_some(),
             ))
             .saturating_add(1);
         let retained_frame_bytes = alignment_gpu_frame_bytes(
@@ -1791,12 +1827,13 @@ impl AlignmentGpuRenderer {
             }
         }
         if staged.page_table.is_none()
-            && let Some(allocation) = &self.page_table_allocation
+            && let Some(allocation) = &self.cache.page_table_allocation
         {
             existing_pins.push(allocation.pin()?);
         }
         let replaced_table_bytes = if staged.page_table.is_some() {
-            self.page_table_allocation
+            self.cache
+                .page_table_allocation
                 .as_ref()
                 .map(|allocation| allocation.snapshot().map(|record| record.charged_capacity))
                 .transpose()?
@@ -2008,19 +2045,19 @@ impl AlignmentGpuRenderer {
         let next_revision = publishable.plan.renderer_revision.saturating_add(1);
         for page in &publishable.plan.mandatory_pages {
             if let Some(index) = self.page_index(page.key()) {
-                self.pages[index].last_used_revision = next_revision;
+                self.cache.pages[index].last_used_revision = next_revision;
             }
         }
         if let Some(mut table) = publishable.page_table.take() {
-            table.extend(std::mem::take(&mut self.pages));
+            table.extend(std::mem::take(&mut self.cache.pages));
             table.append(&mut publishable.pages);
             table.sort_unstable_by_key(|page| page.key);
-            self.pages = table;
-            self.page_table_capacity = self.pages.capacity();
-            self.page_table_allocation = publishable.page_table_allocation.take();
+            self.cache.pages = table;
+            self.cache.page_table_capacity = self.cache.pages.capacity();
+            self.cache.page_table_allocation = publishable.page_table_allocation.take();
         } else {
-            self.pages.append(&mut publishable.pages);
-            self.pages.sort_unstable_by_key(|page| page.key);
+            self.cache.pages.append(&mut publishable.pages);
+            self.cache.pages.sort_unstable_by_key(|page| page.key);
         }
         self.rebuild_reclaim_index();
         self.frame_buffers.append(&mut publishable.frame_buffers);
@@ -2039,7 +2076,7 @@ impl AlignmentGpuRenderer {
             geometry_uploaded_bytes,
             page_cache_hits: publishable.plan.page_cache_hits,
             page_cache_misses: publishable.plan.page_cache_misses,
-            resident_pages: self.pages.len(),
+            resident_pages: self.cache.pages.len(),
             resident_gpu_bytes: publishable.resident_gpu_bytes,
         };
         (publishable.frame, stats, publishable.admission)
@@ -2199,7 +2236,7 @@ impl AlignmentGpuRenderer {
         // proven before either allocation becomes resident.
         self.ensure_page_table_capacity(
             ledger,
-            self.pages.len().saturating_add(missing_pages),
+            self.cache.pages.len().saturating_add(missing_pages),
             reservation_kind,
         )?;
         let scratch_bytes = maximum_instances
@@ -2263,11 +2300,11 @@ impl AlignmentGpuRenderer {
         }
         for page in pages {
             if let Some(index) = self.page_index(page.key()) {
-                self.pages[index].last_used_revision = revision;
+                self.cache.pages[index].last_used_revision = revision;
             }
         }
-        self.pages.extend(admitted);
-        self.pages.sort_unstable_by_key(|page| page.key);
+        self.cache.pages.extend(admitted);
+        self.cache.pages.sort_unstable_by_key(|page| page.key);
         self.rebuild_reclaim_index();
         self.pending_geometry_uploaded_bytes = self
             .pending_geometry_uploaded_bytes
@@ -2506,7 +2543,7 @@ impl AlignmentGpuRenderer {
                 .page_index(request.page)
                 .expect("mandatory page presence was checked before frame mutation");
             self.touch_page_at(page_index, next_revision);
-            let page = &self.pages[page_index];
+            let page = &self.cache.pages[page_index];
             if !page_leases.contains_key(&request.page) {
                 let (lease, acquired) = content_authority
                     .leases
@@ -2528,7 +2565,7 @@ impl AlignmentGpuRenderer {
         if let Some(allocation) = &frame_buffers.interaction_allocation {
             pins.push(allocation.pin()?);
         }
-        if let Some(allocation) = &self.page_table_allocation {
+        if let Some(allocation) = &self.cache.page_table_allocation {
             pins.push(allocation.pin()?);
         }
         if !uniforms.is_empty() {
@@ -2605,7 +2642,7 @@ impl AlignmentGpuRenderer {
             geometry_uploaded_bytes: std::mem::take(&mut self.pending_geometry_uploaded_bytes),
             page_cache_hits,
             page_cache_misses,
-            resident_pages: self.pages.len(),
+            resident_pages: self.cache.pages.len(),
             resident_gpu_bytes,
         };
         Ok((frame, stats))
@@ -3080,7 +3117,11 @@ impl AlignmentGpuRenderer {
     /// device generation advances so frames, leases and plans captured against the old device
     /// are rejected instead of being replayed. Semantic scenes are untouched and are simply
     /// admitted again.
-    pub fn rebuild_for_device(&mut self, device: &wgpu::Device, target_format: wgpu::TextureFormat) {
+    pub fn rebuild_for_device(
+        &mut self,
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+    ) {
         self.discard_device_resources();
         let mut rebuilt = Self::new(device, target_format);
         rebuilt.device_generation = self.device_generation;
@@ -3111,10 +3152,7 @@ impl AlignmentGpuRenderer {
     /// Releases every device-derived page and frame buffer. Semantic scenes, picking, selection,
     /// and evidence remain owned by `rgv-alignment-scene` and are intentionally untouched.
     pub fn discard_device_resources(&mut self) {
-        self.pages = Vec::new();
-        self.reclaim_index.clear();
-        self.page_table_allocation = None;
-        self.page_table_capacity = 0;
+        self.cache.clear();
         self.frame_buffers.clear();
         self.pending_geometry_uploaded_bytes = 0;
         self.device_generation = self.device_generation.saturating_add(1).max(1);
@@ -3122,7 +3160,7 @@ impl AlignmentGpuRenderer {
 
     #[must_use]
     pub fn resident_page_count(&self) -> usize {
-        self.pages.len()
+        self.cache.pages.len()
     }
 
     /// Cooperatively releases renderer-local retained capacity until the exact failed shared-
@@ -3143,51 +3181,15 @@ impl AlignmentGpuRenderer {
         goal: GpuReclaimGoal,
         protected_pages: &[AlignmentPageKey],
     ) -> Result<GpuReclaimReport, LedgerError> {
-        let ledger_before = ledger.progress()?;
-        let pages_before = self.pages.len();
-        let retained_bytes_before = self.resident_retained_bytes()?;
-
-        if goal.is_feasible() && !shared_ledger_satisfies_goal(&ledger_before, goal) {
-            self.reclaim_all_idle_frame_buffers();
-            self.reclaim_sparse_page_table(ledger)?;
-            loop {
-                let snapshot = ledger.progress()?;
-                if shared_ledger_satisfies_goal(&snapshot, goal) {
-                    break;
-                }
-                let occupied = snapshot.charged.saturating_add(snapshot.reserved);
-                let candidates = self
-                    .indexed_unpinned_lru_candidates_until(protected_pages, |released| {
-                        goal.is_satisfied_at(occupied.saturating_sub(released))
-                    })?;
-                if candidates.is_empty() {
-                    break;
-                }
-                let checkpoint = self
-                    .removals_until_sparse_page_table_checkpoint()?
-                    .unwrap_or(candidates.len());
-                let remove = checkpoint.min(candidates.len());
-                if remove == 0 {
-                    break;
-                }
-                self.remove_reclaim_candidates(&candidates[..remove]);
-                self.reclaim_sparse_page_table(ledger)?;
-            }
-        }
-
-        let retained_bytes_after = self.resident_retained_bytes()?;
-        let ledger_after = ledger.progress()?;
-        Ok(GpuReclaimReport {
-            pressure: goal.pressure,
-            baseline_occupied_bytes: goal.baseline_occupied_bytes,
-            pages_before,
-            pages_after: self.pages.len(),
-            retained_bytes_before,
-            retained_bytes_after,
-            ledger_charged_before: ledger_before.charged,
-            ledger_charged_after: ledger_after.charged,
-            headroom_satisfied: shared_ledger_satisfies_goal(&ledger_after, goal),
-        })
+        paged_cache::reclaim_for_goal(
+            &mut self.cache,
+            &mut self.frame_buffers,
+            ledger,
+            goal,
+            protected_pages,
+            self.revision,
+            &self.reclaim_authority_keys_inspected,
+        )
     }
 
     /// Creates a reclaim goal from the post-unwind ledger and applies it to this renderer. Shared
@@ -3224,58 +3226,27 @@ impl AlignmentGpuRenderer {
     }
 
     fn resident_retained_bytes(&self) -> Result<usize, LedgerError> {
-        let mut total = self.resident_gpu_bytes()?;
-        for slot in &self.frame_buffers {
-            total = total.saturating_add(slot.frame_allocation.snapshot()?.charged_capacity);
-        }
-        Ok(total)
+        paged_cache::resident_retained_bytes(&self.cache, &self.frame_buffers)
     }
 
     fn resident_gpu_bytes(&self) -> Result<usize, LedgerError> {
-        let mut total = 0_usize;
-        for page in &self.pages {
-            total = total.saturating_add(page.allocation.snapshot()?.charged_capacity);
-        }
-        if let Some(allocation) = &self.page_table_allocation {
-            total = total.saturating_add(allocation.snapshot()?.charged_capacity);
-        }
-        for slot in &self.frame_buffers {
-            if let Some(allocation) = &slot.camera_allocation {
-                total = total.saturating_add(allocation.snapshot()?.charged_capacity);
-            }
-            if let Some(allocation) = &slot.interaction_allocation {
-                total = total.saturating_add(allocation.snapshot()?.charged_capacity);
-            }
-        }
-        Ok(total)
+        paged_cache::resident_gpu_bytes(&self.cache, &self.frame_buffers)
     }
 
     fn page_index(&self, key: AlignmentPageKey) -> Option<usize> {
-        self.pages
-            .binary_search_by_key(&key, |resident| resident.key)
-            .ok()
+        self.cache.page_index(key)
     }
 
     fn page(&self, key: AlignmentPageKey) -> Option<&GpuAlignmentPage> {
-        self.page_index(key).map(|index| &self.pages[index])
+        self.cache.page(key)
     }
 
     fn rebuild_reclaim_index(&mut self) {
-        self.reclaim_index.clear();
-        self.reclaim_index.extend(
-            self.pages
-                .iter()
-                .map(|page| (page.last_used_revision, page.key)),
-        );
-        debug_assert_eq!(self.reclaim_index.len(), self.pages.len());
+        self.cache.rebuild_reclaim_index();
     }
 
     fn touch_page_at(&mut self, index: usize, revision: u64) {
-        let page = &mut self.pages[index];
-        self.reclaim_index
-            .remove(&(page.last_used_revision, page.key));
-        page.last_used_revision = revision;
-        assert!(self.reclaim_index.insert((revision, page.key)));
+        self.cache.touch_page_at(index, revision);
     }
 
     fn ensure_page_table_capacity(
@@ -3284,38 +3255,12 @@ impl AlignmentGpuRenderer {
         required: usize,
         reservation_kind: ReservationKind,
     ) -> Result<(), AlignmentGpuPageAdmissionError> {
-        if required <= self.page_table_capacity {
-            return Ok(());
-        }
-        let requested_capacity = next_capacity(required)?;
-        let maximum_bytes = requested_capacity
-            .checked_mul(2)
-            .and_then(alignment_page_table_retained_bytes)
-            .ok_or(AlignmentGpuPageAdmissionError::CapacityOverflow)?;
-        let mut reservation =
-            ledger.reserve(AllocationClass::GpuPage, maximum_bytes, reservation_kind)?;
-        let mut candidate = Vec::with_capacity(requested_capacity);
-        let actual_capacity = candidate.capacity();
-        if actual_capacity < required {
-            return Err(AlignmentGpuPageAdmissionError::PageTableCapacity {
-                required,
-                actual: actual_capacity,
-            });
-        }
-        let actual_bytes = alignment_page_table_retained_bytes(actual_capacity)
-            .ok_or(AlignmentGpuPageAdmissionError::CapacityOverflow)?;
-        if actual_bytes > maximum_bytes {
-            return Err(AlignmentGpuPageAdmissionError::PageTableCapacity {
-                required: maximum_bytes,
-                actual: actual_bytes,
-            });
-        }
-        let allocation = reservation.register(actual_bytes, self.revision)?;
-        candidate.extend(std::mem::take(&mut self.pages));
-        self.pages = candidate;
-        self.page_table_capacity = actual_capacity;
-        self.page_table_allocation = Some(allocation);
-        Ok(())
+        Ok(self.cache.ensure_page_table_capacity(
+            ledger,
+            required,
+            reservation_kind,
+            self.revision,
+        )?)
     }
 
     fn acquire_frame_buffers(
@@ -3487,144 +3432,11 @@ impl AlignmentGpuRenderer {
     }
 
     fn reclaim_idle_frame_buffers(&mut self) {
-        self.frame_buffers
-            .retain(|slot| slot.capture_ring || Arc::strong_count(slot) > 1);
+        paged_cache::reclaim_idle_frame_slots(&mut self.frame_buffers);
     }
 
     fn reclaim_all_idle_frame_buffers(&mut self) {
-        self.frame_buffers
-            .retain(|slot| Arc::strong_count(slot) > 1);
-    }
-
-    fn reclaim_sparse_page_table(&mut self, ledger: &AllocationLedger) -> Result<(), LedgerError> {
-        let Some(allocation) = self.page_table_allocation.as_ref() else {
-            return Ok(());
-        };
-        let snapshot = allocation.snapshot()?;
-        if snapshot.pins > 0 {
-            return Ok(());
-        }
-        if self.pages.is_empty() {
-            self.pages = Vec::new();
-            self.page_table_allocation = None;
-            self.page_table_capacity = 0;
-            return Ok(());
-        }
-        let Some(requested_capacity) = self.pages.len().checked_next_power_of_two() else {
-            return Ok(());
-        };
-        if requested_capacity.saturating_mul(4) > self.page_table_capacity {
-            return Ok(());
-        }
-        let maximum_bytes =
-            alignment_page_table_retained_bytes(requested_capacity.saturating_mul(2))
-                .unwrap_or(usize::MAX);
-        let Ok(mut reservation) = ledger.reserve(
-            AllocationClass::GpuPage,
-            maximum_bytes,
-            ReservationKind::Transition,
-        ) else {
-            return Ok(());
-        };
-        let mut candidate = Vec::with_capacity(requested_capacity);
-        if candidate.capacity() < self.pages.len() {
-            return Ok(());
-        }
-        let actual_bytes =
-            alignment_page_table_retained_bytes(candidate.capacity()).unwrap_or(usize::MAX);
-        let Ok(allocation) = reservation.register(actual_bytes, self.revision) else {
-            return Ok(());
-        };
-        candidate.extend(std::mem::take(&mut self.pages));
-        self.pages = candidate;
-        self.page_table_capacity = self.pages.capacity();
-        self.page_table_allocation = Some(allocation);
-        Ok(())
-    }
-
-    fn indexed_unpinned_lru_candidates_until(
-        &self,
-        protected_pages: &[AlignmentPageKey],
-        mut sufficient: impl FnMut(usize) -> bool,
-    ) -> Result<Vec<AlignmentPageReclaimCandidate>, LedgerError> {
-        let mut protected = protected_pages.to_vec();
-        protected.sort_unstable();
-        protected.dedup();
-        let mut candidates = Vec::new();
-        let mut reclaimable_bytes = 0_usize;
-        for (_last_used_revision, key) in &self.reclaim_index {
-            self.reclaim_authority_keys_inspected
-                .fetch_add(1, Ordering::Relaxed);
-            if protected.binary_search(key).is_ok() {
-                continue;
-            }
-            let page = self
-                .page(*key)
-                .expect("online reclaim authority contains only resident pages");
-            let allocation = page.allocation.snapshot()?;
-            if allocation.pins == 0 {
-                candidates.push(AlignmentPageReclaimCandidate {
-                    key: page.key,
-                    charged_capacity: allocation.charged_capacity,
-                });
-                reclaimable_bytes = reclaimable_bytes.saturating_add(
-                    candidates
-                        .last()
-                        .map_or(0, |candidate| candidate.charged_capacity),
-                );
-                if sufficient(reclaimable_bytes) {
-                    break;
-                }
-            }
-        }
-        Ok(candidates)
-    }
-
-    fn removals_until_sparse_page_table_checkpoint(&self) -> Result<Option<usize>, LedgerError> {
-        let Some(allocation) = self.page_table_allocation.as_ref() else {
-            return Ok(None);
-        };
-        if allocation.snapshot()?.pins > 0 || self.pages.is_empty() {
-            return Ok(None);
-        }
-        let quarter_capacity = self.page_table_capacity / 4;
-        if quarter_capacity == 0 {
-            return Ok(Some(self.pages.len()));
-        }
-        let maximum_sparse_len = 1_usize
-            .checked_shl(usize::BITS - quarter_capacity.leading_zeros() - 1)
-            .unwrap_or(0);
-        if self.pages.len() <= maximum_sparse_len {
-            // The immediately preceding shrink attempt was already eligible but could not
-            // reserve its replacement. Retry after one more page releases capacity; combining
-            // more removals would be able to overshoot a goal that the table release satisfies.
-            return Ok(Some(1));
-        }
-        Ok(Some(self.pages.len().saturating_sub(maximum_sparse_len)))
-    }
-
-    fn remove_reclaim_candidates(&mut self, candidates: &[AlignmentPageReclaimCandidate]) {
-        let mut keys = candidates
-            .iter()
-            .map(|candidate| candidate.key)
-            .collect::<Vec<_>>();
-        keys.sort_unstable();
-        let mut next_key = 0;
-        self.pages.retain(|page| {
-            while keys
-                .get(next_key)
-                .is_some_and(|candidate| *candidate < page.key)
-            {
-                next_key = next_key.saturating_add(1);
-            }
-            if keys.get(next_key).is_some_and(|key| *key == page.key) {
-                next_key = next_key.saturating_add(1);
-                false
-            } else {
-                true
-            }
-        });
-        self.rebuild_reclaim_index();
+        paged_cache::reclaim_all_idle_frame_slots(&mut self.frame_buffers);
     }
 
     fn evict_unpinned_pages_for_excluding(
@@ -3635,36 +3447,15 @@ impl AlignmentGpuRenderer {
         protected: &[Arc<AlignmentSemanticPage>],
     ) -> Result<(), LedgerError> {
         self.reclaim_idle_frame_buffers();
-        self.reclaim_sparse_page_table(ledger)?;
         let protected = protected.iter().map(|page| page.key()).collect::<Vec<_>>();
-        loop {
-            let snapshot = ledger.progress()?;
-            if snapshot
-                .charged
-                .saturating_add(snapshot.reserved)
-                .saturating_add(required)
-                <= limit
-            {
-                return Ok(());
-            }
-            let occupied = snapshot.charged.saturating_add(snapshot.reserved);
-            let candidates = self
-                .indexed_unpinned_lru_candidates_until(&protected, |released| {
-                    occupied.saturating_sub(released).saturating_add(required) <= limit
-                })?;
-            if candidates.is_empty() {
-                return Ok(());
-            }
-            let checkpoint = self
-                .removals_until_sparse_page_table_checkpoint()?
-                .unwrap_or(candidates.len());
-            let remove = checkpoint.min(candidates.len());
-            if remove == 0 {
-                return Ok(());
-            }
-            self.remove_reclaim_candidates(&candidates[..remove]);
-            self.reclaim_sparse_page_table(ledger)?;
-        }
+        self.cache.evict_unpinned_pages_for_excluding(
+            ledger,
+            required,
+            limit,
+            &protected,
+            self.revision,
+            &self.reclaim_authority_keys_inspected,
+        )
     }
 }
 
@@ -3974,11 +3765,14 @@ fn camera_uniform(
     page_start: u64,
     page_row_start: u32,
 ) -> AlignmentGpuCameraUniform {
+    let (page_start_whole, page_start_fraction) =
+        crate::shaders::split_camera_origin(page_start, camera.exact_start());
     AlignmentGpuCameraUniform {
         screen_size: [screen_size[0].max(1.0), screen_size[1].max(1.0)],
         clip_origin: [camera.clip().x as f32, camera.clip().y as f32],
         points_per_base: split_f64(1.0 / camera.bases_per_pixel()),
-        page_start_from_camera: split_f64(page_start as f64 - camera.exact_start()),
+        page_start_whole,
+        page_start_fraction,
         row_scroll: camera.row_scroll() as f32,
         row_height: camera.row_height() as f32,
         read_height: camera.read_height() as f32,
@@ -4052,20 +3846,14 @@ pub(crate) fn exact_immutable_buffer_bytes(count: usize, stride: usize) -> Optio
 }
 
 fn next_capacity(count: usize) -> Result<usize, AlignmentGpuPageAdmissionError> {
-    count
-        .max(1)
-        .checked_next_power_of_two()
+    paged_cache::next_power_of_two_capacity(count)
         .ok_or(AlignmentGpuPageAdmissionError::CapacityOverflow)
 }
 
-/// Conservative retained charge for the sorted GPU page table and its online B-tree reclaim
-/// authority. Four pointer words per key cover node links, occupancy slack, and allocator
-/// metadata without depending on the standard library's private B-tree node layout.
+/// Retained charge of a GPU page table of `capacity` entries; see
+/// [`paged_cache::page_table_retained_bytes`].
 fn alignment_page_table_retained_bytes(capacity: usize) -> Option<usize> {
-    let page_table = capacity.checked_mul(size_of::<GpuAlignmentPage>())?;
-    let reclaim_entry = size_of::<(u64, AlignmentPageKey)>()
-        .checked_add(4_usize.checked_mul(size_of::<usize>())?)?;
-    page_table.checked_add(capacity.checked_mul(reclaim_entry)?)
+    paged_cache::page_table_retained_bytes::<GpuAlignmentPage>(capacity)
 }
 
 fn validate_device_buffer_size(
@@ -4083,10 +3871,6 @@ fn validate_device_buffer_size(
         });
     }
     Ok(())
-}
-
-fn shared_ledger_satisfies_goal(snapshot: &LedgerProgress, goal: GpuReclaimGoal) -> bool {
-    goal.is_satisfied_at(snapshot.charged.saturating_add(snapshot.reserved))
 }
 
 fn prepared_scene_pages(
@@ -4270,6 +4054,18 @@ pub enum AlignmentGpuPageAdmissionError {
     Ledger(#[from] LedgerError),
 }
 
+impl From<PageTableError> for AlignmentGpuPageAdmissionError {
+    fn from(error: PageTableError) -> Self {
+        match error {
+            PageTableError::CapacityOverflow => Self::CapacityOverflow,
+            PageTableError::Capacity { required, actual } => {
+                Self::PageTableCapacity { required, actual }
+            }
+            PageTableError::Ledger(error) => Self::from(error),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum AlignmentGpuResidencyError {
     #[error(
@@ -4391,3194 +4187,4 @@ pub enum AlignmentGpuRenderError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        num::{NonZeroU32, NonZeroU64},
-        sync::Arc,
-    };
-
-    use rgv_alignment_scene::{
-        AlignmentHandle, AlignmentOperation, AlignmentPageKey, AlignmentPresentationScene,
-        AlignmentReadLabelMode, AlignmentRowAtlas, AlignmentSemanticPage, AlignmentSourceRevision,
-        AllocationBundleSpec, AllocationClass, AllocationLedger, CanonicalGenomicTile,
-        CanonicalRecordChunk, CanonicalRowBlock, CapabilityRequirement, CompleteCoverage,
-        ContractFingerprint, EvidenceAcquisition, EvidenceChunk, EvidenceRevision,
-        EvidenceRootBuilder, FilteredRecordProvenance, GeometryLod, LayoutContract,
-        PayloadContract, PayloadSidecar, PresentationContract, ReservationKind,
-        RevisionFingerprint, RowAtlasRevision, SceneRevision, SourceChunkId, SourceFingerprint,
-    };
-    use rgv_core::{
-        AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigId, GenomicInterval,
-        ReadStackingMode,
-    };
-    use rgv_hts::{
-        AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
-        AlignmentSourcePosition, CigarOp, CigarOpKind, SequenceData, TemplateLengthBounds,
-    };
-
-    use super::*;
-
-    fn handle() -> AlignmentHandle {
-        AlignmentHandle::new(
-            AlignmentSourceRevision::new(
-                SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
-                RevisionFingerprint::new(3, 4),
-            ),
-            AlignmentSourcePosition::bam_virtual_offset(5),
-        )
-    }
-
-    fn primitive(component: AlignmentComponent) -> AlignmentSemanticPrimitive {
-        let geometry = match component {
-            AlignmentComponent::Deletion { .. }
-            | AlignmentComponent::ReferenceSkip { .. }
-            | AlignmentComponent::PairConnector { .. } => AlignmentGeometryToken::EventLine,
-            AlignmentComponent::Insertion { .. }
-            | AlignmentComponent::SoftClip { .. }
-            | AlignmentComponent::HardClip { .. }
-            | AlignmentComponent::Padding { .. }
-            | AlignmentComponent::UltimaIndel { .. }
-            | AlignmentComponent::SbxInsertion { .. } => AlignmentGeometryToken::PointMarker,
-            AlignmentComponent::DirectionTerminal => {
-                AlignmentGeometryToken::DirectionalTerminalRight
-            }
-            _ => AlignmentGeometryToken::Rectangle,
-        };
-        AlignmentSemanticPrimitive {
-            start_offset: 16_777_217,
-            end_offset: 16_777_219,
-            row_offset: 7,
-            handle: handle(),
-            component,
-            geometry,
-            style: AlignmentStyleToken {
-                flags: 0,
-                mapping_quality: Some(60),
-                operation: Some(AlignmentOperation::SequenceMatch),
-                body: AlignmentBodyColorToken::Category(Some(ContractFingerprint::new(99))),
-            },
-            draw_order: 3,
-        }
-    }
-
-    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
-        .ok()?;
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("RGV alignment scene test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::Off,
-        }))
-        .ok()
-    }
-
-    fn render_test_frame(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        renderer: &AlignmentGpuRenderer,
-        frame: &AlignmentGpuFrame,
-    ) -> Result<(), AlignmentGpuRenderError> {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("RGV alignment scene test target"),
-            size: wgpu::Extent3d {
-                width: 256,
-                height: 128,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("RGV alignment scene test encoder"),
-        });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("RGV alignment scene test pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            renderer.render(&mut pass, frame)?;
-        }
-        queue.submit([encoder.finish()]);
-        Ok(())
-    }
-
-    fn publish_bundled_frame(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        renderer: &mut AlignmentGpuRenderer,
-        requests: &[AlignmentGpuSceneRequest<'_>],
-        ledger: &AllocationLedger,
-        mut prior_frame: Option<AlignmentGpuFrame>,
-        first_slot: u32,
-        publication_revision: u64,
-    ) -> (
-        AlignmentGpuFrame,
-        AlignmentGpuPrepareStats,
-        AlignmentGpuBatchAdmission,
-    ) {
-        let snapshot = ledger.snapshot().unwrap();
-        let plan = renderer
-            .plan_replacement(requests, &snapshot, AllocationBundleSlot::new(first_slot))
-            .unwrap();
-        let retirement = renderer
-            .detach_replacement_retirement(ledger, &plan, &mut prior_frame)
-            .unwrap();
-        assert!(prior_frame.is_none());
-        let spec = AllocationBundleSpec::new(
-            plan.policy_revision(),
-            plan.demands().to_vec(),
-            retirement.retirement_claim_set().clone(),
-        );
-        let bundle = ledger.reserve_replacement_bundle(spec).unwrap();
-        let staged = renderer
-            .stage_replacement(
-                device,
-                queue,
-                requests,
-                plan,
-                &bundle,
-                ledger,
-                publication_revision,
-            )
-            .unwrap();
-        let ready = renderer.preflight_replacement_publication(staged).unwrap();
-        let actuals = ready.actuals().to_vec();
-        let committed = bundle.commit(actuals).unwrap();
-        let mut retirement = Some(retirement);
-        let mut leases = committed.retire_and_settle(&mut retirement).unwrap();
-        assert!(retirement.is_none());
-        let publishable = renderer.bind_replacement_leases(ready, &mut leases);
-        let published = renderer.publish_replacement(publishable);
-        assert!(leases.is_empty());
-        published
-    }
-
-    fn test_scene(ledger: &AllocationLedger) -> Arc<AlignmentPresentationScene> {
-        test_scene_with_page_shape(
-            ledger,
-            NonZeroU64::new(100).unwrap(),
-            1,
-            NonZeroU32::new(16).unwrap(),
-        )
-    }
-
-    fn test_scene_with_tile_bases(
-        ledger: &AllocationLedger,
-        tile_bases: NonZeroU64,
-    ) -> Arc<AlignmentPresentationScene> {
-        test_scene_with_page_shape(ledger, tile_bases, 1, NonZeroU32::new(16).unwrap())
-    }
-
-    fn test_scene_with_tiled_records(
-        ledger: &AllocationLedger,
-        tile_bases: NonZeroU64,
-    ) -> Arc<AlignmentPresentationScene> {
-        let mut starts = Vec::new();
-        let mut start = 5_u64;
-        while start.saturating_add(10) <= 100 {
-            starts.push(start);
-            start = start.saturating_add(tile_bases.get());
-        }
-        test_scene_with_record_starts(ledger, tile_bases, &starts, NonZeroU32::new(16).unwrap())
-    }
-
-    fn test_scene_with_page_shape(
-        ledger: &AllocationLedger,
-        tile_bases: NonZeroU64,
-        overlapping_records: usize,
-        row_block_rows: NonZeroU32,
-    ) -> Arc<AlignmentPresentationScene> {
-        test_scene_with_record_starts(
-            ledger,
-            tile_bases,
-            &vec![10; overlapping_records],
-            row_block_rows,
-        )
-    }
-
-    fn test_scene_with_record_starts(
-        ledger: &AllocationLedger,
-        tile_bases: NonZeroU64,
-        record_starts: &[u64],
-        row_block_rows: NonZeroU32,
-    ) -> Arc<AlignmentPresentationScene> {
-        let source_revision = AlignmentSourceRevision::new(
-            SourceFingerprint::new(RevisionFingerprint::new(11, 12)),
-            RevisionFingerprint::new(13, 14),
-        );
-        let record_contract = ContractFingerprint::new(15);
-        let record = AlignmentRecord {
-            contig: ContigId::new(0),
-            start: 10,
-            end: 20,
-            flags: AlignmentFlags::from_bits(0),
-            mapping_quality: Some(60),
-            mate_contig: None,
-            mate_start: None,
-            template_length: 0,
-            read_name: b"gpu".to_vec(),
-            cigar: vec![CigarOp {
-                kind: CigarOpKind::Match,
-                len: 10,
-            }],
-            sequence: SequenceData::Present {
-                bases: b"ACGTACGTAC".to_vec(),
-                qualities: Some(vec![35; 10]),
-            },
-            auxiliary_fields: Vec::new(),
-        };
-        let mut decoded = AlignmentBatch::default();
-        for (ordinal, start) in record_starts.iter().copied().enumerate() {
-            let mut record = record.clone();
-            record.start = start;
-            record.end = start.saturating_add(10);
-            decoded
-                .push_with_source_position(
-                    &record,
-                    AlignmentSourcePosition::bam_virtual_offset(
-                        (1 << 16) | u64::try_from(ordinal).unwrap(),
-                    ),
-                )
-                .unwrap();
-        }
-        let payload_contract = PayloadContract::new_all_auxiliary(
-            CapabilityRequirement::Required,
-            CapabilityRequirement::Required,
-            None,
-        );
-        let payload =
-            Arc::new(AlignmentPayloadBatch::from_batch(&decoded, true, true, None).unwrap());
-        let core = CanonicalRecordChunk::new(
-            source_revision,
-            SourceChunkId::BamBlock {
-                compressed_offset: 1,
-            },
-            Arc::new(decoded.copy_core().unwrap()),
-            record_contract,
-        )
-        .unwrap();
-        let payload_bytes = payload.estimated_bytes();
-        let mut payload_reservation = ledger
-            .reserve(
-                AllocationClass::PayloadSidecar,
-                payload_bytes,
-                ReservationKind::Normal,
-            )
-            .unwrap();
-        let payload_allocation = payload_reservation.register(payload_bytes, 1).unwrap();
-        let payload = Arc::new(
-            PayloadSidecar::new(&core, payload_contract.clone(), payload, payload_allocation)
-                .unwrap(),
-        );
-        let footprint = EvidenceChunk::footprint(&core);
-        let mut core_reservation = ledger
-            .reserve(
-                AllocationClass::CoreChunk,
-                footprint.core_bytes,
-                ReservationKind::Normal,
-            )
-            .unwrap();
-        let core_allocation = core_reservation.register(footprint.core_bytes, 1).unwrap();
-        let mut overlap_reservation = ledger
-            .reserve(
-                AllocationClass::OverlapIndex,
-                footprint.overlap_index_bytes,
-                ReservationKind::Normal,
-            )
-            .unwrap();
-        let overlap_allocation = overlap_reservation
-            .register(footprint.overlap_index_bytes, 1)
-            .unwrap();
-        let chunk = Arc::new(
-            EvidenceChunk::new_with_payload(core, core_allocation, overlap_allocation, payload)
-                .unwrap(),
-        );
-        let interval = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
-        let coverage = CompleteCoverage::new(
-            source_revision,
-            record_contract,
-            interval,
-            FilteredRecordProvenance {
-                records_seen: u64::try_from(record_starts.len()).unwrap(),
-                eligible_records: u64::try_from(record_starts.len()).unwrap(),
-                ..FilteredRecordProvenance::default()
-            },
-        )
-        .unwrap();
-        let acquisition = EvidenceAcquisition::new(coverage, [chunk]).unwrap();
-        let mut evidence_builder = EvidenceRootBuilder::new(
-            EvidenceRevision::new(RevisionFingerprint::new(16, 17)),
-            source_revision,
-            record_contract,
-            payload_contract,
-            1,
-            1,
-            ledger,
-            ReservationKind::Normal,
-        )
-        .unwrap();
-        evidence_builder.insert_acquisition(&acquisition).unwrap();
-        let evidence = evidence_builder.build(2).unwrap();
-        let layout = LayoutContract {
-            stacking: ReadStackingMode::Compact,
-            grouping: AlignmentGroupMode::None,
-            group_order: AlignmentOrderDirection::Natural,
-            sorting: AlignmentSortMode::Start,
-            sort_order: AlignmentOrderDirection::Natural,
-            sort_anchor: None,
-            view_as_pairs: false,
-            pair_length_bounds: TemplateLengthBounds::default(),
-            promoted_template: None,
-            sampling: rgv_alignment_scene::ReadSampling::Complete,
-        };
-        let atlas = AlignmentRowAtlas::build(
-            RowAtlasRevision::new(RevisionFingerprint::new(18, 19)),
-            &evidence,
-            interval,
-            layout,
-            ledger,
-            ReservationKind::Normal,
-            3,
-        )
-        .unwrap();
-        let presentation = PresentationContract {
-            geometry_lod: GeometryLod::Read,
-            style: rgv_alignment_scene::AlignmentStyleContract {
-                read_labels: AlignmentReadLabelMode::ReadName,
-                ..rgv_alignment_scene::AlignmentStyleContract::default()
-            },
-            reference: None,
-            annotation: None,
-        };
-        let rows = 0..u32::try_from(atlas.row_count()).unwrap();
-        let mut pages = Vec::new();
-        for tile in CanonicalGenomicTile::covering(interval, tile_bases, 100).unwrap() {
-            let row_blocks = rows
-                .end
-                .saturating_add(row_block_rows.get().saturating_sub(1))
-                / row_block_rows.get();
-            for row_block in 0..row_blocks {
-                for family in presentation.required_page_families() {
-                    let key = AlignmentPageKey::new(
-                        source_revision,
-                        evidence.revision(),
-                        atlas.revision(),
-                        layout.fingerprint(),
-                        presentation.page_fingerprint(family),
-                        tile,
-                        CanonicalRowBlock::new(row_block, row_block_rows),
-                        family,
-                        GeometryLod::Read,
-                    );
-                    let page = AlignmentSemanticPage::build(
-                        key,
-                        &evidence,
-                        &atlas,
-                        presentation,
-                        100,
-                        None,
-                        ledger,
-                        ReservationKind::Normal,
-                        4,
-                    )
-                    .unwrap();
-                    pages.push(page);
-                }
-            }
-        }
-        AlignmentPresentationScene::new(
-            SceneRevision::new(RevisionFingerprint::new(20, 21)),
-            evidence,
-            atlas,
-            presentation,
-            interval,
-            rows,
-            pages,
-            ledger,
-            ReservationKind::Normal,
-            5,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn page_local_coordinates_survive_beyond_single_f32_integer_precision() {
-        let instance = pack_primitive(primitive(AlignmentComponent::ReadSpan))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            f64::from(instance.start_offset[0]) + f64::from(instance.start_offset[1]),
-            16_777_217.0
-        );
-        assert_eq!(
-            f64::from(instance.end_offset[0]) + f64::from(instance.end_offset[1]),
-            16_777_219.0
-        );
-    }
-
-    #[test]
-    fn semantic_component_families_map_to_stable_gpu_shapes_without_labels() {
-        assert_eq!(
-            pack_primitive(primitive(AlignmentComponent::Deletion { cigar_index: 1 }))
-                .unwrap()
-                .unwrap()
-                .shape,
-            AlignmentGpuShape::EventLine as u32
-        );
-        assert_eq!(
-            pack_primitive(primitive(AlignmentComponent::Insertion {
-                cigar_index: 1,
-                read_start: 2,
-                length: 3,
-            }))
-            .unwrap()
-            .unwrap()
-            .shape,
-            AlignmentGpuShape::PointMarker as u32
-        );
-        assert_eq!(
-            pack_primitive(primitive(AlignmentComponent::DirectionTerminal))
-                .unwrap()
-                .unwrap()
-                .shape,
-            AlignmentGpuShape::DirectionTerminalRight as u32
-        );
-        assert!(
-            pack_primitive(primitive(AlignmentComponent::Label {
-                kind: rgv_alignment_scene::AlignmentLabelKind::ReadName,
-                id: ContractFingerprint::new(7),
-            }))
-            .unwrap()
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn stable_handle_interaction_is_separate_from_immutable_base_geometry() {
-        let semantic = primitive(AlignmentComponent::ReadSpan);
-        let base = pack_primitive(semantic).unwrap().unwrap();
-        let interaction = AlignmentInteractionState::new(Some(handle()), Some(handle()), []);
-        let token = interaction.token(handle());
-        let flags = interaction_flags(token);
-
-        assert_eq!(base, pack_primitive(semantic).unwrap().unwrap());
-        assert_ne!(flags, 0);
-        assert_ne!(base.color, reference_interaction_color(base.color, token));
-    }
-
-    #[test]
-    fn neutral_hover_selection_and_highlight_have_distinct_read_colours() {
-        let mut semantic = primitive(AlignmentComponent::ReadSpan);
-        semantic.style.body = AlignmentBodyColorToken::Neutral;
-        let neutral = style_color(semantic.style);
-        assert_eq!(neutral, [0.73, 0.73, 0.73, 1.0]);
-        let hovered = reference_interaction_color(
-            neutral,
-            rgv_alignment_scene::AlignmentInteractionToken {
-                hovered: true,
-                ..rgv_alignment_scene::AlignmentInteractionToken::default()
-            },
-        );
-        let selected = reference_interaction_color(
-            neutral,
-            rgv_alignment_scene::AlignmentInteractionToken {
-                selected: true,
-                ..rgv_alignment_scene::AlignmentInteractionToken::default()
-            },
-        );
-        let highlighted = reference_interaction_color(
-            neutral,
-            rgv_alignment_scene::AlignmentInteractionToken {
-                highlighted: true,
-                ..rgv_alignment_scene::AlignmentInteractionToken::default()
-            },
-        );
-        assert_ne!(neutral, hovered);
-        assert_ne!(hovered, selected);
-        assert_ne!(selected, highlighted);
-        assert!(selected[2] > selected[0]);
-        assert!(highlighted[0] > highlighted[2]);
-    }
-
-    #[test]
-    fn camera_uniform_is_host_shareable_and_double_single() {
-        assert_eq!(size_of::<AlignmentGpuCameraUniform>(), 48);
-        let split = split_f64(5_525_127.3);
-        assert!(((f64::from(split[0]) + f64::from(split[1])) - 5_525_127.3).abs() < 1.0e-7);
-    }
-
-    #[test]
-    fn packed_gpu_geometry_matches_the_cpu_reference_projector() {
-        let ledger = AllocationLedger::new(16 << 20, 2 << 20);
-        let scene = test_scene(&ledger);
-        let camera = AlignmentCamera::new(
-            scene.prepared_interval(),
-            0.0,
-            12.0,
-            9.0,
-            rgv_alignment_scene::CpuClipRect {
-                x: 17.0,
-                y: 23.0,
-                width: 503.0,
-                height: 137.0,
-            },
-        )
-        .unwrap();
-        assert_gpu_oracle_matches_cpu_projector(&scene, camera, false);
-    }
-
-    #[test]
-    fn sub_pixel_gpu_geometry_keeps_one_point_and_matches_the_cpu_projector() {
-        let ledger = AllocationLedger::new(16 << 20, 2 << 20);
-        let scene = test_scene(&ledger);
-        // The whole prepared interval squeezed into three points, with rows a quarter of a
-        // point tall: every primitive is far below one point in both axes.
-        let camera = AlignmentCamera::new(
-            scene.prepared_interval(),
-            0.0,
-            0.25,
-            0.2,
-            rgv_alignment_scene::CpuClipRect {
-                x: 17.0,
-                y: 23.0,
-                width: 3.0,
-                height: 137.0,
-            },
-        )
-        .unwrap();
-        assert_gpu_oracle_matches_cpu_projector(&scene, camera, true);
-    }
-
-    #[test]
-    fn immutable_page_buffers_are_exactly_sized() {
-        let stride = size_of::<AlignmentGpuInstance>();
-        assert_eq!(stride % wgpu::COPY_BUFFER_ALIGNMENT as usize, 0);
-        assert_eq!(gpu_buffer_capacity::<AlignmentGpuInstance>(0).unwrap(), 0);
-        for count in [1_usize, 2, 3, 5, 1_000, 1_025, 65_537] {
-            // Exactly the uploaded bytes: no power-of-two slack to waste or to mis-account.
-            assert_eq!(
-                gpu_buffer_capacity::<AlignmentGpuInstance>(count).unwrap(),
-                count * stride
-            );
-        }
-        // Odd strides are rounded up only to wgpu's copy alignment.
-        assert_eq!(exact_immutable_buffer_bytes(3, 5), Some(16));
-        assert_eq!(exact_immutable_buffer_bytes(4, 5), Some(20));
-        assert_eq!(exact_immutable_buffer_bytes(usize::MAX, 2), None);
-        assert!(matches!(
-            gpu_buffer_capacity::<AlignmentGpuInstance>(usize::MAX),
-            Err(AlignmentGpuPageAdmissionError::CapacityOverflow)
-        ));
-    }
-
-    #[test]
-    fn rebuilding_for_a_replacement_device_drops_pages_and_advances_the_generation() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(16 << 20, 2 << 20, 8 << 20);
-        let scene = test_scene(&ledger);
-        let baseline = ledger.snapshot().unwrap().charged;
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Bgra8Unorm);
-        renderer
-            .admit_pages(&device, &queue, scene.pages(), &ledger, 10)
-            .unwrap();
-        assert!(renderer.resident_page_count() > 0);
-        assert!(ledger.snapshot().unwrap().charged > baseline);
-        let generation = renderer.device_generation;
-
-        // Stand-in for a lost device: a second, independent device.
-        let Some((replacement, replacement_queue)) = headless_device() else {
-            return;
-        };
-        renderer.rebuild_for_device(&replacement, wgpu::TextureFormat::Rgba8Unorm);
-        assert_eq!(renderer.resident_page_count(), 0);
-        assert!(renderer.device_generation > generation);
-        assert_eq!(ledger.snapshot().unwrap().charged, baseline);
-
-        // The rebuilt renderer is fully usable on the replacement device.
-        renderer
-            .admit_pages(&replacement, &replacement_queue, scene.pages(), &ledger, 11)
-            .unwrap();
-        assert!(renderer.resident_page_count() > 0);
-    }
-
-    fn assert_gpu_oracle_matches_cpu_projector(
-        scene: &Arc<AlignmentPresentationScene>,
-        camera: AlignmentCamera,
-        expect_minimum_size: bool,
-    ) {
-        let cpu = rgv_alignment_scene::CpuAlignmentProjector::project(scene, 1, camera).unwrap();
-        let mut compared = 0_usize;
-
-        for page in scene.pages() {
-            let packed = PackedAlignmentPage::from_semantic(page).unwrap();
-            for (instance, semantic_index) in packed
-                .instances
-                .iter()
-                .copied()
-                .zip(packed.semantic_indices.iter().copied())
-            {
-                let semantic = page.primitives()[semantic_index as usize];
-                let Some(gpu) = project_alignment_gpu_instance(
-                    instance,
-                    page.interval().start(),
-                    page.row_range().start,
-                    camera,
-                ) else {
-                    continue;
-                };
-                compared += 1;
-                if expect_minimum_size {
-                    // Unless the pane edge cuts it, nothing is thinner than one point.
-                    let clip = camera.clip();
-                    let cut_horizontally = gpu.x <= clip.x + 1.0e-9
-                        || gpu.x + gpu.width >= clip.x + clip.width - 1.0e-9;
-                    let cut_vertically = gpu.y <= clip.y + 1.0e-9
-                        || gpu.y + gpu.height >= clip.y + clip.height - 1.0e-9;
-                    assert!(cut_horizontally || gpu.width >= 1.0 - 1.0e-9, "{gpu:?}");
-                    assert!(cut_vertically || gpu.height >= 1.0 - 1.0e-9, "{gpu:?}");
-                }
-                let row = page.row_range().start + semantic.row_offset;
-                let matching = cpu.primitives.iter().find(|candidate| {
-                    candidate.handle == semantic.handle
-                        && candidate.component == semantic.component
-                        && candidate.row == row
-                        && (candidate.x - gpu.x).abs() < 1.0e-6
-                        && (candidate.y - gpu.y).abs() < 1.0e-6
-                        && (candidate.width - gpu.width).abs() < 1.0e-6
-                        && (candidate.height - gpu.height).abs() < 1.0e-6
-                });
-                assert!(
-                    matching.is_some(),
-                    "GPU instance disagrees with CPU component {:?}",
-                    semantic.component
-                );
-            }
-        }
-        assert!(compared > 0, "the camera must project at least one instance");
-    }
-
-    #[test]
-    fn dedicated_alignment_pipeline_is_valid_on_an_available_headless_adapter() {
-        let Some((device, _queue)) = headless_device() else {
-            return;
-        };
-
-        let renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        assert_eq!(renderer.resident_page_count(), 0);
-    }
-
-    #[test]
-    fn mandatory_batch_failure_never_publishes_a_partial_gpu_page_set() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(16 << 20, 2 << 20, 8 << 20);
-        let scene = test_scene(&ledger);
-        let baseline = ledger.snapshot().unwrap().charged;
-        ledger.set_budget(baseline.saturating_add(1)).unwrap();
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let result = renderer.admit_pages(&device, &queue, scene.pages(), &ledger, 10);
-        assert!(matches!(
-            result,
-            Err(AlignmentGpuPageAdmissionError::Ledger(
-                LedgerError::BudgetExceeded { .. }
-            ))
-        ));
-        assert_eq!(renderer.resident_page_count(), 0);
-
-        ledger.set_budget(16 << 20).unwrap();
-        let admitted = renderer
-            .admit_pages(&device, &queue, scene.pages(), &ledger, 11)
-            .unwrap();
-        assert_eq!(admitted.requested_pages, scene.drawable_page_keys().len());
-        assert_eq!(admitted.admitted_pages, scene.drawable_page_keys().len());
-        assert_eq!(
-            renderer.resident_page_count(),
-            scene.drawable_page_keys().len()
-        );
-        assert_eq!(renderer.reclaim_index.len(), renderer.pages.len());
-        assert_eq!(
-            renderer
-                .page_table_allocation
-                .as_ref()
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .charged_capacity,
-            alignment_page_table_retained_bytes(renderer.page_table_capacity).unwrap()
-        );
-    }
-
-    #[test]
-    fn label_only_pages_remain_cpu_owned_across_replacement_capture_and_reclaim() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(16 << 20, 2 << 20, 8 << 20);
-        let scene = test_scene(&ledger);
-        let label_page = scene
-            .pages()
-            .iter()
-            .find(|page| {
-                !page.primitives().is_empty()
-                    && page.primitives().iter().all(|primitive| {
-                        matches!(primitive.component, AlignmentComponent::Label { .. })
-                    })
-            })
-            .expect("the labelled-read fixture contains one CPU-only label page");
-        let non_drawable_keys = scene
-            .pages()
-            .iter()
-            .filter(|page| !alignment_page_has_gpu_geometry(page))
-            .map(|page| page.key())
-            .collect::<BTreeSet<_>>();
-        assert!(non_drawable_keys.contains(&label_page.key()));
-        assert!(!scene.drawable_page_keys().is_empty());
-
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        assert_eq!(
-            renderer
-                .admit_page(&device, &queue, label_page, &ledger, 9)
-                .unwrap(),
-            AlignmentGpuPageAdmission::NoGpuGeometry
-        );
-        assert_eq!(renderer.resident_page_count(), 0);
-
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let scissor = AlignmentGpuScissor {
-            x: 0,
-            y: 0,
-            width: 256,
-            height: 128,
-        };
-        let first_requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        }];
-        let (first, _, _) = publish_bundled_frame(
-            &device,
-            &queue,
-            &mut renderer,
-            &first_requests,
-            &ledger,
-            None,
-            20,
-            30,
-        );
-        assert_eq!(
-            first.content_authority().page_manifest(),
-            scene.drawable_page_keys().as_ref()
-        );
-        assert!(
-            first
-                .draws
-                .iter()
-                .all(|draw| !non_drawable_keys.contains(&draw.page))
-        );
-        assert!(
-            renderer
-                .pages
-                .iter()
-                .all(|page| !non_drawable_keys.contains(&page.key))
-        );
-        assert!(
-            first
-                .label_frames()
-                .iter()
-                .any(|frame| !frame.labels.is_empty())
-        );
-
-        let authority = first.content_authority().clone();
-        let second_requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 2,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        }];
-        let (second, stats) = renderer
-            .capture_camera_frame(&device, &queue, &authority, &second_requests, &ledger)
-            .unwrap();
-        assert_eq!(stats.geometry_uploaded_bytes, 0);
-        assert!(
-            second
-                .label_frames()
-                .iter()
-                .any(|frame| !frame.labels.is_empty())
-        );
-
-        let resident = renderer.resident_page_count();
-        let snapshot = ledger.snapshot().unwrap();
-        let pressure = GpuBudgetPressure::from_budget_failure(
-            renderer.resident_retained_bytes().unwrap(),
-            snapshot.charged,
-            snapshot.reserved,
-            snapshot.charged.saturating_add(snapshot.reserved),
-        );
-        let pinned = renderer
-            .reclaim_for_budget_pressure(&ledger, pressure, &[])
-            .unwrap();
-        assert_eq!(pinned.reclaimed_pages(), 0);
-        assert_eq!(renderer.resident_page_count(), resident);
-        render_test_frame(&device, &queue, &renderer, &second).unwrap();
-
-        drop(second);
-        drop(first);
-        drop(authority);
-        let released = renderer
-            .reclaim_for_budget_pressure(&ledger, pressure, &[])
-            .unwrap();
-        assert_eq!(released.reclaimed_pages(), resident);
-        assert_eq!(renderer.resident_page_count(), 0);
-    }
-
-    #[test]
-    fn frame_boundary_admission_uploads_once_then_pan_changes_only_camera_state() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(16 << 20, 2 << 20, 8 << 20);
-        let scene = test_scene(&ledger);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let scissor = AlignmentGpuScissor {
-            x: 0,
-            y: 0,
-            width: 256,
-            height: 128,
-        };
-        let request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        };
-        let (first, first_stats, first_admission) = renderer
-            .prepare_with_admission(&device, &queue, &[request], &ledger, 10)
-            .unwrap();
-        assert!(first_admission.admitted_pages > 0);
-        assert!(first_stats.geometry_uploaded_bytes > 0);
-        drop(first);
-
-        let viewport = camera.viewport().pan_pixels(10.0, 100).unwrap();
-        let panned = AlignmentCamera::from_viewport(viewport, 0.0, 12.0, 9.0, clip).unwrap();
-        let request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 2,
-            camera: panned,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        };
-        let (_second, second_stats, second_admission) = renderer
-            .prepare_with_admission(&device, &queue, &[request], &ledger, 11)
-            .unwrap();
-        assert_eq!(second_admission.admitted_pages, 0);
-        assert_eq!(
-            second_admission.already_resident_pages,
-            scene.drawable_page_keys().len()
-        );
-        assert_eq!(second_stats.geometry_uploaded_bytes, 0);
-        assert_eq!(second_stats.page_cache_misses, 0);
-    }
-
-    #[test]
-    fn prepared_margin_prefetch_makes_the_next_tile_a_camera_only_frame() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(16 << 20, 2 << 20, 8 << 20);
-        let scene = test_scene_with_tiled_records(&ledger, NonZeroU64::new(50).unwrap());
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let interaction = AlignmentInteractionState::default();
-        let scissor = AlignmentGpuScissor {
-            x: 0,
-            y: 0,
-            width: 256,
-            height: 128,
-        };
-        let first_camera = AlignmentCamera::new(
-            GenomicInterval::new(ContigId::new(0), 0, 50).unwrap(),
-            0.0,
-            12.0,
-            9.0,
-            clip,
-        )
-        .unwrap();
-        let first_request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera: first_camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        };
-        let (first, _, mandatory) = renderer
-            .prepare_with_admission(
-                &device,
-                &queue,
-                std::slice::from_ref(&first_request),
-                &ledger,
-                10,
-            )
-            .unwrap();
-        assert!(mandatory.admitted_pages > 0);
-        let prefetch = renderer
-            .prefetch_prepared_scene_pages(
-                &device,
-                &queue,
-                std::slice::from_ref(&first_request),
-                &ledger,
-                11,
-            )
-            .unwrap();
-        assert!(prefetch.admitted_pages > 0);
-        assert_eq!(
-            renderer.resident_page_count(),
-            scene.drawable_page_keys().len()
-        );
-        drop(first);
-
-        let second_camera = AlignmentCamera::new(
-            GenomicInterval::new(ContigId::new(0), 50, 100).unwrap(),
-            0.0,
-            12.0,
-            9.0,
-            clip,
-        )
-        .unwrap();
-        let second_request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 2,
-            camera: second_camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        };
-        let (_second, second_stats, second_admission) = renderer
-            .prepare_with_admission(&device, &queue, &[second_request], &ledger, 12)
-            .unwrap();
-        assert_eq!(second_admission.admitted_pages, 0);
-        assert!(second_admission.already_resident_pages > 0);
-        assert_eq!(second_stats.geometry_uploaded_bytes, 0);
-    }
-
-    #[test]
-    fn prepared_vertical_pages_are_uploaded_before_the_row_camera_reaches_them() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(16 << 20, 2 << 20, 8 << 20);
-        let scene = test_scene_with_page_shape(
-            &ledger,
-            NonZeroU64::new(100).unwrap(),
-            4,
-            NonZeroU32::new(1).unwrap(),
-        );
-        assert_eq!(scene.atlas().row_count(), 4);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 5.0,
-        };
-        let interaction = AlignmentInteractionState::default();
-        let scissor = AlignmentGpuScissor {
-            x: 0,
-            y: 0,
-            width: 256,
-            height: 5,
-        };
-        let first_camera =
-            AlignmentCamera::new(scene.prepared_interval(), 0.0, 10.0, 4.0, clip).unwrap();
-        assert_eq!(first_camera.visible_rows(), 0..2);
-        let first_request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera: first_camera,
-            screen_size_points: [256.0, 5.0],
-            scissor,
-            interaction: &interaction,
-        };
-        let (first, _, mandatory) = renderer
-            .prepare_with_admission(
-                &device,
-                &queue,
-                std::slice::from_ref(&first_request),
-                &ledger,
-                10,
-            )
-            .unwrap();
-        assert!(mandatory.admitted_pages > 0);
-        let prefetch = renderer
-            .prefetch_prepared_scene_pages(
-                &device,
-                &queue,
-                std::slice::from_ref(&first_request),
-                &ledger,
-                11,
-            )
-            .unwrap();
-        assert!(prefetch.admitted_pages > 0);
-        assert_eq!(
-            renderer.resident_page_count(),
-            scene.drawable_page_keys().len()
-        );
-        drop(first);
-
-        let second_camera =
-            AlignmentCamera::new(scene.prepared_interval(), 2.0, 10.0, 4.0, clip).unwrap();
-        assert_eq!(second_camera.visible_rows(), 2..4);
-        let second_request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 2,
-            camera: second_camera,
-            screen_size_points: [256.0, 5.0],
-            scissor,
-            interaction: &interaction,
-        };
-        let (_second, second_stats, second_admission) = renderer
-            .prepare_with_admission(&device, &queue, &[second_request], &ledger, 12)
-            .unwrap();
-        assert_eq!(second_admission.admitted_pages, 0);
-        assert!(second_admission.already_resident_pages > 0);
-        assert_eq!(second_stats.geometry_uploaded_bytes, 0);
-    }
-
-    #[test]
-    fn bounded_prepared_scene_prefetch_advances_deterministically_without_duplicate_uploads() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(32 << 20, 4 << 20, 16 << 20);
-        let scene = test_scene_with_tiled_records(&ledger, NonZeroU64::new(20).unwrap());
-        assert!(scene.drawable_page_keys().len() > 2);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let camera = AlignmentCamera::new(
-            scene.prepared_interval(),
-            0.0,
-            12.0,
-            9.0,
-            rgv_alignment_scene::CpuClipRect {
-                x: 0.0,
-                y: 0.0,
-                width: 256.0,
-                height: 128.0,
-            },
-        )
-        .unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        };
-        let requests = [request];
-        let maximum_pages = NonZeroUsize::new(2).unwrap();
-        let first = renderer
-            .prefetch_prepared_scene_pages_bounded(
-                &device,
-                &queue,
-                &requests,
-                &ledger,
-                10,
-                maximum_pages,
-            )
-            .unwrap();
-        let expected_keys = AlignmentGpuRenderer::prepared_page_keys(&requests);
-        assert_eq!(first.prepared_pages, expected_keys.len());
-        assert_eq!(first.missing_pages_before, expected_keys.len());
-        assert_eq!(first.admission.requested_pages, 2);
-        assert_eq!(first.admission.admitted_pages, 2);
-        assert_eq!(first.remaining_missing_pages, expected_keys.len() - 2);
-        assert!(first.missing_pages_remain);
-        assert_eq!(
-            renderer
-                .pages
-                .iter()
-                .map(|page| page.key)
-                .collect::<Vec<_>>(),
-            expected_keys[..2]
-        );
-
-        let mut total_admitted = first.admission.admitted_pages;
-        let mut total_uploaded = first.admission.uploaded_bytes;
-        let mut revision = 11_u64;
-        while renderer.resident_page_count() < expected_keys.len() {
-            let progress = renderer
-                .prefetch_prepared_scene_pages_bounded(
-                    &device,
-                    &queue,
-                    &requests,
-                    &ledger,
-                    revision,
-                    maximum_pages,
-                )
-                .unwrap();
-            assert!(progress.admission.admitted_pages <= maximum_pages.get());
-            assert_eq!(progress.admission.already_resident_pages, 0);
-            total_admitted = total_admitted.saturating_add(progress.admission.admitted_pages);
-            total_uploaded = total_uploaded.saturating_add(progress.admission.uploaded_bytes);
-            revision = revision.saturating_add(1);
-        }
-        assert_eq!(total_admitted, expected_keys.len());
-        assert!(total_uploaded > 0);
-
-        let complete = renderer
-            .prefetch_prepared_scene_pages_bounded(
-                &device,
-                &queue,
-                &requests,
-                &ledger,
-                revision,
-                maximum_pages,
-            )
-            .unwrap();
-        assert!(complete.is_complete());
-        assert_eq!(complete.missing_pages_before, 0);
-        assert_eq!(complete.admission.requested_pages, 0);
-        assert_eq!(complete.admission.admitted_pages, 0);
-        assert_eq!(complete.admission.uploaded_bytes, 0);
-        assert_eq!(renderer.resident_page_count(), expected_keys.len());
-    }
-
-    #[test]
-    fn prepared_scene_prefetch_cursor_resolves_once_then_performs_only_bounded_work() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(32 << 20, 4 << 20, 16 << 20);
-        let scene = test_scene_with_tile_bases(&ledger, NonZeroU64::new(20).unwrap());
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let interaction = AlignmentInteractionState::default();
-        let request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera: AlignmentCamera::new(
-                scene.prepared_interval(),
-                0.0,
-                12.0,
-                9.0,
-                rgv_alignment_scene::CpuClipRect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 256.0,
-                    height: 128.0,
-                },
-            )
-            .unwrap(),
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        };
-        let requests = [request];
-        let keys: Arc<[AlignmentPageKey]> =
-            AlignmentGpuRenderer::prepared_page_keys(&requests).into();
-        let before = renderer.operation_counters();
-        let mut cursor = renderer
-            .begin_prepared_scene_prefetch_cursor(
-                &requests,
-                Arc::clone(&keys),
-                ledger.progress().unwrap().budget,
-            )
-            .unwrap();
-        let after_begin = renderer.operation_counters();
-        assert_eq!(after_begin, before);
-
-        let mut revision = 20_u64;
-        while !cursor.is_complete() {
-            let before_step = renderer.operation_counters();
-            let progress = renderer
-                .advance_prepared_scene_prefetch_cursor(
-                    &device,
-                    &queue,
-                    &mut cursor,
-                    &ledger,
-                    revision,
-                    NonZeroUsize::new(2).unwrap(),
-                )
-                .unwrap();
-            assert!(progress.admission.requested_pages <= 2);
-            let after_step = renderer.operation_counters();
-            assert_eq!(
-                after_step.content_manifest_builds,
-                before_step.content_manifest_builds
-            );
-            assert_eq!(
-                after_step.content_manifest_pages_enumerated,
-                before_step.content_manifest_pages_enumerated
-            );
-            assert!(
-                after_step
-                    .prefetch_authority_keys_inspected
-                    .saturating_sub(before_step.prefetch_authority_keys_inspected)
-                    <= 2
-            );
-            revision = revision.saturating_add(1);
-        }
-        let residency = renderer
-            .finish_prepared_scene_prefetch_cursor(cursor)
-            .unwrap();
-        assert_eq!(residency.page_keys.as_ref(), keys.as_ref());
-        assert_eq!(renderer.resident_page_count(), keys.len());
-        drop(residency);
-
-        let mut limited = renderer
-            .begin_prepared_scene_prefetch_cursor(&requests, Arc::clone(&keys), 0)
-            .unwrap();
-        while !limited.is_complete() {
-            let progress = renderer
-                .advance_prepared_scene_prefetch_cursor(
-                    &device,
-                    &queue,
-                    &mut limited,
-                    &ledger,
-                    revision,
-                    NonZeroUsize::new(2).unwrap(),
-                )
-                .unwrap();
-            assert!(progress.retention_limited);
-        }
-        assert!(matches!(
-            renderer.finish_prepared_scene_prefetch_cursor(limited),
-            Err(AlignmentGpuPrefetchCursorError::ResidencyBudgetLimited {
-                maximum_total_pinned_bytes: 0,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn completed_scene_residency_lease_requires_every_page_and_pins_until_drop() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(32 << 20, 4 << 20, 16 << 20);
-        let scene = test_scene_with_tile_bases(&ledger, NonZeroU64::new(50).unwrap());
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let camera = AlignmentCamera::new(
-            scene.prepared_interval(),
-            0.0,
-            12.0,
-            9.0,
-            rgv_alignment_scene::CpuClipRect {
-                x: 0.0,
-                y: 0.0,
-                width: 256.0,
-                height: 128.0,
-            },
-        )
-        .unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        }];
-
-        assert!(matches!(
-            renderer.pin_prepared_scene_pages(&requests),
-            Err(AlignmentGpuResidencyError::MissingPreparedPages {
-                missing,
-                ..
-            }) if missing == scene.drawable_page_keys().len()
-        ));
-        renderer
-            .prefetch_prepared_scene_pages(&device, &queue, &requests, &ledger, 10)
-            .unwrap();
-        let lease = renderer.pin_prepared_scene_pages(&requests).unwrap();
-        assert_eq!(lease.device_generation(), renderer.device_generation);
-        assert_eq!(lease.page_count(), scene.drawable_page_keys().len());
-        assert!(!lease.is_empty());
-        assert!(lease.page_keys().windows(2).all(|pair| pair[0] < pair[1]));
-
-        let resident = renderer.resident_page_count();
-        let snapshot = ledger.snapshot().unwrap();
-        let retained = renderer.resident_retained_bytes().unwrap();
-        let pressure = GpuBudgetPressure::from_budget_failure(
-            retained,
-            snapshot.charged,
-            snapshot.reserved,
-            snapshot.charged.saturating_add(snapshot.reserved),
-        );
-        let pinned = renderer
-            .reclaim_for_budget_pressure(&ledger, pressure, &[])
-            .unwrap();
-        assert_eq!(pinned.pressure, pressure);
-        assert_eq!(pinned.reclaimed_pages(), 0);
-        assert!(!pinned.headroom_satisfied);
-        assert_eq!(renderer.resident_page_count(), resident);
-        drop(lease);
-        let released = renderer
-            .reclaim_for_budget_pressure(&ledger, pressure, &[])
-            .unwrap();
-        assert_eq!(released.reclaimed_pages(), resident);
-        assert_eq!(renderer.resident_page_count(), 0);
-    }
-
-    #[test]
-    fn preparing_a_replacement_does_not_overwrite_an_in_flight_frame() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(16 << 20, 2 << 20, 8 << 20);
-        let scene = test_scene(&ledger);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        renderer
-            .admit_pages(&device, &queue, scene.pages(), &ledger, 10)
-            .unwrap();
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let scissor = AlignmentGpuScissor {
-            x: 0,
-            y: 0,
-            width: 256,
-            height: 128,
-        };
-        let first_request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        };
-        let (first, _) = renderer
-            .prepare(&device, &queue, &[first_request], &ledger)
-            .unwrap();
-        let panned_viewport = camera.viewport().pan_pixels(10.0, 100).unwrap();
-        let panned = AlignmentCamera::from_viewport(panned_viewport, 0.0, 12.0, 9.0, clip).unwrap();
-        let second_request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 2,
-            camera: panned,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        };
-        let (second, stats) = renderer
-            .prepare(&device, &queue, &[second_request], &ledger)
-            .unwrap();
-        assert_eq!(stats.geometry_uploaded_bytes, 0);
-        let cpu = CpuAlignmentProjector::project_with_interaction(&scene, 2, panned, &interaction)
-            .unwrap();
-        let cpu_labels = cpu
-            .primitives
-            .iter()
-            .filter(|primitive| {
-                primitive.shape == rgv_alignment_scene::CpuPrimitiveShape::TextLabel
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(!cpu_labels.is_empty());
-        assert_eq!(second.label_frames().len(), 1);
-        assert_eq!(
-            second.label_frames()[0].labels.as_ref(),
-            cpu_labels.as_slice()
-        );
-        assert_eq!(stats.text_labels, cpu_labels.len());
-        assert_eq!(
-            stats.label_anchors_examined,
-            second.label_frames()[0].anchors_examined
-        );
-        assert!(stats.label_anchors_examined >= stats.text_labels);
-        assert_ne!(first.revision(), second.revision());
-        render_test_frame(&device, &queue, &renderer, &first).unwrap();
-        render_test_frame(&device, &queue, &renderer, &second).unwrap();
-
-        let snapshot = ledger.snapshot().unwrap();
-        assert!(
-            snapshot.records.iter().any(|record| {
-                record.class == AllocationClass::TransitionFrame && record.pins > 0
-            })
-        );
-        assert!(renderer.frame_buffers.len() >= 2);
-    }
-
-    #[test]
-    fn camera_scroll_and_hover_captures_preserve_read_content_authority_without_a_bundle() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
-        let scene = test_scene_with_page_shape(
-            &ledger,
-            NonZeroU64::new(20).unwrap(),
-            8,
-            NonZeroU32::new(2).unwrap(),
-        );
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 24.0,
-        };
-        let scissor = AlignmentGpuScissor {
-            x: 0,
-            y: 0,
-            width: 256,
-            height: 24,
-        };
-        let first_camera = AlignmentCamera::new(
-            GenomicInterval::new(ContigId::new(0), 0, 40).unwrap(),
-            0.0,
-            12.0,
-            9.0,
-            clip,
-        )
-        .unwrap();
-        let neutral = AlignmentInteractionState::default();
-        let first_requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera: first_camera,
-            screen_size_points: [256.0, 24.0],
-            scissor,
-            interaction: &neutral,
-        }];
-        let (first, _, _) = publish_bundled_frame(
-            &device,
-            &queue,
-            &mut renderer,
-            &first_requests,
-            &ledger,
-            None,
-            700,
-            800,
-        );
-        renderer
-            .prefetch_prepared_scene_pages(&device, &queue, &first_requests, &ledger, 801)
-            .unwrap();
-        let authority = first.content_authority().clone();
-        assert_eq!(
-            authority.page_manifest().len(),
-            scene.drawable_page_keys().len()
-        );
-        drop(first);
-
-        let page_allocations = renderer
-            .pages
-            .iter()
-            .map(|page| (page.key, page.allocation.id()))
-            .collect::<Vec<_>>();
-        let page_table_allocation = renderer
-            .page_table_allocation
-            .as_ref()
-            .map(AllocationLease::id);
-        let hovered = scene
-            .pages()
-            .iter()
-            .flat_map(|page| page.primitives())
-            .next()
-            .expect("the overlapping read fixture produces semantic primitives")
-            .handle;
-        let interactions = [
-            AlignmentInteractionState::default(),
-            AlignmentInteractionState::default(),
-            AlignmentInteractionState::new(Some(hovered), None, []),
-        ];
-        let cameras = [
-            AlignmentCamera::new(
-                GenomicInterval::new(ContigId::new(0), 5, 45).unwrap(),
-                0.0,
-                12.0,
-                9.0,
-                clip,
-            )
-            .unwrap(),
-            AlignmentCamera::new(
-                GenomicInterval::new(ContigId::new(0), 10, 50).unwrap(),
-                2.0,
-                12.0,
-                9.0,
-                clip,
-            )
-            .unwrap(),
-            AlignmentCamera::new(
-                GenomicInterval::new(ContigId::new(0), 15, 55).unwrap(),
-                1.0,
-                12.0,
-                9.0,
-                clip,
-            )
-            .unwrap(),
-        ];
-        let operations_before = ledger.operation_counters().unwrap();
-        let renderer_operations_before = renderer.operation_counters();
-        let mut presented = None;
-        let mut page_pin_acquisitions = Vec::new();
-        for (index, (camera, interaction)) in cameras.into_iter().zip(&interactions).enumerate() {
-            assert_eq!(ledger.progress().unwrap().active_replacement_bundle, None);
-            let requests = [AlignmentGpuSceneRequest {
-                scene: &scene,
-                camera_sequence: 2 + index as u64,
-                camera,
-                screen_size_points: [256.0, 24.0],
-                scissor,
-                interaction,
-            }];
-            let (frame, stats) = renderer
-                .capture_camera_frame(&device, &queue, &authority, &requests, &ledger)
-                .unwrap();
-            assert_eq!(stats.geometry_uploaded_bytes, 0);
-            assert_eq!(stats.page_cache_misses, 0);
-            page_pin_acquisitions.push(stats.page_pin_acquisitions);
-            assert_eq!(frame.content_authority(), &authority);
-            assert_eq!(ledger.progress().unwrap().active_replacement_bundle, None);
-            assert_eq!(
-                renderer
-                    .pages
-                    .iter()
-                    .map(|page| (page.key, page.allocation.id()))
-                    .collect::<Vec<_>>(),
-                page_allocations
-            );
-            assert_eq!(
-                renderer
-                    .page_table_allocation
-                    .as_ref()
-                    .map(AllocationLease::id),
-                page_table_allocation
-            );
-            let previous = presented.replace(frame);
-            drop(previous);
-        }
-        assert!(page_pin_acquisitions[0] > 0);
-        let repeated_requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 99,
-            camera: cameras[2],
-            screen_size_points: [256.0, 24.0],
-            scissor,
-            interaction: &interactions[2],
-        }];
-        let (repeated, repeated_stats) = renderer
-            .capture_camera_frame(&device, &queue, &authority, &repeated_requests, &ledger)
-            .unwrap();
-        assert_eq!(
-            repeated_stats.page_pin_acquisitions, 0,
-            "a contained frame must reuse the prior presentation's page leases"
-        );
-        let previous = presented.replace(repeated);
-        drop(previous);
-        let operations_after = ledger.operation_counters().unwrap();
-        let renderer_operations_after = renderer.operation_counters();
-        assert_eq!(
-            operations_after.full_inventory_snapshots, operations_before.full_inventory_snapshots,
-            "camera, vertical-scroll, and hover capture must not inventory retained allocations"
-        );
-        assert_eq!(
-            operations_after.allocation_records_enumerated,
-            operations_before.allocation_records_enumerated
-        );
-        assert_eq!(
-            renderer_operations_after, renderer_operations_before,
-            "camera, vertical-scroll, and hover capture must not rebuild the full prepared-page manifest"
-        );
-        assert!(renderer.frame_buffers.len() <= 2);
-
-        let changed_scene_set = [
-            AlignmentGpuSceneRequest {
-                scene: &scene,
-                camera_sequence: 7,
-                camera: first_camera,
-                screen_size_points: [256.0, 24.0],
-                scissor,
-                interaction: &neutral,
-            },
-            AlignmentGpuSceneRequest {
-                scene: &scene,
-                camera_sequence: 8,
-                camera: first_camera,
-                screen_size_points: [256.0, 24.0],
-                scissor,
-                interaction: &neutral,
-            },
-        ];
-        assert!(matches!(
-            renderer
-                .capture_camera_frame(&device, &queue, &authority, &changed_scene_set, &ledger,),
-            Err(AlignmentGpuCameraCaptureError::ContentReplacementRequired {
-                reason: AlignmentGpuContentReplacementReason::SceneContent { .. }
-            })
-        ));
-
-        let changed_manifest_scene =
-            test_scene_with_tile_bases(&ledger, NonZeroU64::new(25).unwrap());
-        assert_eq!(changed_manifest_scene.revision(), scene.revision());
-        let changed_requests = [AlignmentGpuSceneRequest {
-            scene: &changed_manifest_scene,
-            camera_sequence: 9,
-            camera: first_camera,
-            screen_size_points: [256.0, 24.0],
-            scissor,
-            interaction: &neutral,
-        }];
-        assert!(matches!(
-            renderer.capture_camera_frame(&device, &queue, &authority, &changed_requests, &ledger,),
-            Err(AlignmentGpuCameraCaptureError::ContentReplacementRequired {
-                reason: AlignmentGpuContentReplacementReason::SceneContent { .. }
-            })
-        ));
-        let (replacement, replacement_stats, _) = publish_bundled_frame(
-            &device,
-            &queue,
-            &mut renderer,
-            &changed_requests,
-            &ledger,
-            None,
-            740,
-            840,
-        );
-        assert!(replacement_stats.geometry_uploaded_bytes > 0);
-
-        let replacement_authority = replacement.content_authority().clone();
-        drop(replacement);
-        renderer.discard_device_resources();
-        assert!(matches!(
-            renderer.capture_camera_frame(
-                &device,
-                &queue,
-                &replacement_authority,
-                &changed_requests,
-                &ledger,
-            ),
-            Err(AlignmentGpuCameraCaptureError::ContentReplacementRequired {
-                reason: AlignmentGpuContentReplacementReason::DeviceGeneration { .. }
-            })
-        ));
-    }
-
-    #[test]
-    fn predicate_highlight_uses_page_local_interaction_buffers() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
-        let scene = test_scene_with_page_shape(
-            &ledger,
-            NonZeroU64::new(20).unwrap(),
-            8,
-            NonZeroU32::new(2).unwrap(),
-        );
-        let highlighted_handles = scene
-            .pages()
-            .iter()
-            .flat_map(|page| page.primitives())
-            .filter(|primitive| !matches!(primitive.component, AlignmentComponent::Label { .. }))
-            .map(|primitive| primitive.handle)
-            .collect::<BTreeSet<_>>();
-        assert!(highlighted_handles.len() > 3);
-        let interaction = AlignmentInteractionState::default()
-            .with_highlighted(highlighted_handles.iter().copied());
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        };
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let (frame, stats, _) = publish_bundled_frame(
-            &device,
-            &queue,
-            &mut renderer,
-            &[request],
-            &ledger,
-            None,
-            760,
-            860,
-        );
-
-        assert!(stats.overlay_instances > 0);
-        assert!(
-            frame
-                .draws
-                .iter()
-                .any(|draw| draw.interaction_buffer_index.is_some())
-        );
-        let visible_rows = camera.visible_rows();
-        let camera_page_envelope = scene.camera_page_envelope(
-            camera.interval().len(),
-            visible_rows.end.saturating_sub(visible_rows.start),
-        );
-        assert!(renderer.frame_buffers.iter().all(|slot| {
-            slot.interaction_buffers.len() >= camera_page_envelope
-                && slot.interaction_capacity >= scene.maximum_non_label_primitives_per_page()
-        }));
-        assert!(renderer.frame_buffers.iter().all(|slot| {
-            slot.interaction_capacity
-                .saturating_mul(size_of::<AlignmentGpuInteractionInstance>())
-                <= device.limits().max_buffer_size as usize
-        }));
-        render_test_frame(&device, &queue, &renderer, &frame).unwrap();
-    }
-
-    #[test]
-    fn compatible_read_capture_uses_the_precharged_ring_while_an_unrelated_bundle_is_active() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 12 << 20, 16 << 20);
-        let scene = test_scene_with_tiled_records(&ledger, NonZeroU64::new(20).unwrap());
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 512.0,
-            height: 256.0,
-        };
-        let first_camera = AlignmentCamera::new(
-            GenomicInterval::new(ContigId::new(0), 0, 20).unwrap(),
-            0.0,
-            12.0,
-            9.0,
-            clip,
-        )
-        .unwrap();
-        let neutral = AlignmentInteractionState::default();
-        let scissor = AlignmentGpuScissor {
-            x: 0,
-            y: 0,
-            width: 512,
-            height: 256,
-        };
-        let first_requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera: first_camera,
-            screen_size_points: [512.0, 256.0],
-            scissor,
-            interaction: &neutral,
-        }];
-        let (first, _, _) = publish_bundled_frame(
-            &device,
-            &queue,
-            &mut renderer,
-            &first_requests,
-            &ledger,
-            None,
-            900,
-            901,
-        );
-        renderer
-            .prefetch_prepared_scene_pages(&device, &queue, &first_requests, &ledger, 902)
-            .unwrap();
-        let authority = first.content_authority().clone();
-        assert_eq!(
-            renderer.frame_buffers.len(),
-            ALIGNMENT_CAMERA_FRAME_SLOT_COUNT
-        );
-        let slot_ids = renderer
-            .frame_buffers
-            .iter()
-            .map(|slot| {
-                (
-                    slot.camera_allocation.as_ref().map(AllocationLease::id),
-                    slot.interaction_allocation
-                        .as_ref()
-                        .map(AllocationLease::id),
-                    slot.frame_allocation.id(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let handles = scene
-            .pages()
-            .iter()
-            .flat_map(|page| page.primitives())
-            .map(|primitive| primitive.handle)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        assert!(handles.len() >= 3);
-        let interaction = AlignmentInteractionState::new(
-            handles.first().copied(),
-            handles.get(1).copied(),
-            handles.iter().copied(),
-        );
-        let wide_camera =
-            AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 2,
-            camera: wide_camera,
-            screen_size_points: [512.0, 256.0],
-            scissor,
-            interaction: &interaction,
-        }];
-
-        let policy_revision = ledger.snapshot().unwrap().policy_revision;
-        let unrelated = ledger
-            .reserve_replacement_bundle(AllocationBundleSpec::new(
-                policy_revision,
-                Vec::new(),
-                ledger.empty_retirement_claim_set(),
-            ))
-            .unwrap();
-        let before = ledger.snapshot().unwrap();
-        let allocation_ids_before = before
-            .records
-            .iter()
-            .map(|record| record.id)
-            .collect::<Vec<_>>();
-        let (second, stats) = renderer
-            .capture_camera_frame(&device, &queue, &authority, &requests, &ledger)
-            .unwrap();
-        assert!(stats.mandatory_pages > first.draw_count());
-        assert!(stats.overlay_instances > 0);
-        assert_eq!(stats.geometry_uploaded_bytes, 0);
-        assert_ne!(
-            first.buffers.frame_allocation.id(),
-            second.buffers.frame_allocation.id()
-        );
-        assert!(matches!(
-            renderer.capture_camera_frame(&device, &queue, &authority, &requests, &ledger),
-            Err(AlignmentGpuCameraCaptureError::FrameSlotBusy { slots: 2 })
-        ));
-        let after = ledger.snapshot().unwrap();
-        assert_eq!(
-            after.active_replacement_bundle,
-            before.active_replacement_bundle
-        );
-        assert_eq!(after.charged, before.charged);
-        assert_eq!(after.reserved, before.reserved);
-        assert_eq!(
-            after
-                .records
-                .iter()
-                .map(|record| record.id)
-                .collect::<Vec<_>>(),
-            allocation_ids_before
-        );
-        assert_eq!(
-            renderer
-                .frame_buffers
-                .iter()
-                .map(|slot| (
-                    slot.camera_allocation.as_ref().map(AllocationLease::id),
-                    slot.interaction_allocation
-                        .as_ref()
-                        .map(AllocationLease::id),
-                    slot.frame_allocation.id(),
-                ))
-                .collect::<Vec<_>>(),
-            slot_ids
-        );
-        drop(unrelated);
-        drop(second);
-        drop(first);
-    }
-
-    #[test]
-    fn large_read_horizon_interaction_slots_scale_with_the_viewport_not_the_horizon() {
-        let Some((device, _queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(128 << 20, 16 << 20, 32 << 20);
-        let scene = test_scene_with_page_shape(
-            &ledger,
-            NonZeroU64::new(20).unwrap(),
-            2_048,
-            NonZeroU32::new(32).unwrap(),
-        );
-        let renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let camera = AlignmentCamera::new(
-            GenomicInterval::new(ContigId::new(0), 0, 20).unwrap(),
-            0.0,
-            12.0,
-            9.0,
-            rgv_alignment_scene::CpuClipRect {
-                x: 0.0,
-                y: 0.0,
-                width: 512.0,
-                height: 256.0,
-            },
-        )
-        .unwrap();
-        let highlighted = scene
-            .pages()
-            .iter()
-            .flat_map(|page| page.primitives())
-            .filter(|primitive| !matches!(primitive.component, AlignmentComponent::Label { .. }))
-            .map(|primitive| primitive.handle)
-            .collect::<BTreeSet<_>>();
-        let interaction =
-            AlignmentInteractionState::default().with_highlighted(highlighted.iter().copied());
-        let requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [512.0, 256.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 512,
-                height: 256,
-            },
-            interaction: &interaction,
-        }];
-        let plan = renderer
-            .plan_replacement(
-                &requests,
-                &ledger.snapshot().unwrap(),
-                AllocationBundleSlot::new(1_000),
-            )
-            .unwrap();
-        let full_non_label_geometry = scene
-            .pages()
-            .iter()
-            .flat_map(|page| page.primitives())
-            .filter(|primitive| !matches!(primitive.component, AlignmentComponent::Label { .. }))
-            .count();
-        assert!(full_non_label_geometry > 2_000);
-        let visible_rows = camera.visible_rows();
-        let camera_envelope = scene.camera_page_envelope(
-            camera.interval().len(),
-            visible_rows.end.saturating_sub(visible_rows.start),
-        );
-        assert_eq!(plan.camera_capacity, camera_envelope.next_power_of_two());
-        assert!(plan.camera_capacity < scene.drawable_page_keys().len());
-        assert!(plan.interaction_capacity > 0);
-        assert_eq!(plan.interaction_buffer_count, camera_envelope);
-        assert_eq!(
-            plan.interaction_capacity,
-            scene
-                .maximum_non_label_primitives_per_page()
-                .next_power_of_two()
-        );
-        assert!(plan.interaction_capacity < full_non_label_geometry);
-        assert_eq!(
-            plan.interaction_buffer_bytes,
-            plan.interaction_capacity
-                .saturating_mul(size_of::<AlignmentGpuInteractionInstance>())
-        );
-        assert!(plan.interaction_buffer_bytes <= device.limits().max_buffer_size as usize);
-        assert!(plan.maximum_interactions > 0);
-        assert!(
-            plan.interaction_total_bytes
-                < full_non_label_geometry.saturating_mul(size_of::<AlignmentGpuInstance>()),
-            "interaction capacity must remain smaller than the former full-horizon geometry copy"
-        );
-        assert_eq!(plan.frame_slots.len(), ALIGNMENT_CAMERA_FRAME_SLOT_COUNT);
-    }
-
-    #[test]
-    fn active_frame_pins_prevent_gpu_page_eviction_until_submission_releases() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(16 << 20, 2 << 20, 8 << 20);
-        let scene = test_scene(&ledger);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        renderer
-            .admit_pages(&device, &queue, scene.pages(), &ledger, 10)
-            .unwrap();
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        };
-        let (frame, _) = renderer
-            .prepare(&device, &queue, &[request], &ledger)
-            .unwrap();
-        let resident = renderer.resident_page_count();
-        let snapshot = ledger.snapshot().unwrap();
-        let retained = renderer.resident_retained_bytes().unwrap();
-        let pressure = GpuBudgetPressure::from_budget_failure(
-            retained,
-            snapshot.charged,
-            snapshot.reserved,
-            snapshot.charged.saturating_add(snapshot.reserved),
-        );
-        let pinned = renderer
-            .reclaim_for_budget_pressure(&ledger, pressure, &[])
-            .unwrap();
-        assert_eq!(pinned.reclaimed_pages(), 0);
-        assert_eq!(renderer.resident_page_count(), resident);
-        assert_eq!(renderer.frame_buffers.len(), 1);
-        render_test_frame(&device, &queue, &renderer, &frame).unwrap();
-        drop(frame);
-        let released = renderer
-            .reclaim_for_budget_pressure(&ledger, pressure, &[])
-            .unwrap();
-        assert_eq!(released.reclaimed_pages(), resident);
-        assert_eq!(renderer.resident_page_count(), 0);
-        assert!(renderer.frame_buffers.is_empty());
-    }
-
-    #[test]
-    fn cooperative_reclaim_drops_idle_resources_and_reports_renderer_local_bytes() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(32 << 20, 4 << 20, 16 << 20);
-        let scene = test_scene(&ledger);
-        let unrelated_bytes = 4_096;
-        let _unrelated = ledger
-            .reserve(
-                AllocationClass::GpuPage,
-                unrelated_bytes,
-                ReservationKind::Normal,
-            )
-            .unwrap()
-            .register(unrelated_bytes, 1)
-            .unwrap();
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        renderer
-            .admit_pages(&device, &queue, scene.pages(), &ledger, 10)
-            .unwrap();
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let request = |camera_sequence| AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        };
-        let (first, _) = renderer
-            .prepare(&device, &queue, &[request(1)], &ledger)
-            .unwrap();
-        let (second, _) = renderer
-            .prepare(&device, &queue, &[request(2)], &ledger)
-            .unwrap();
-        assert_eq!(renderer.frame_buffers.len(), 2);
-        drop(first);
-        drop(second);
-
-        let before = ledger.snapshot().unwrap();
-        let retained_before = renderer.resident_retained_bytes().unwrap();
-        assert!(retained_before > 0);
-        let available = before
-            .budget
-            .saturating_sub(before.charged.saturating_add(before.reserved));
-        let pressure = GpuBudgetPressure::from_budget_failure(
-            available.saturating_add(retained_before),
-            before.charged,
-            before.reserved,
-            before.budget,
-        );
-        let report = renderer
-            .reclaim_for_budget_pressure(&ledger, pressure, &[])
-            .unwrap();
-
-        assert_eq!(report.pressure, pressure);
-        assert_eq!(report.pages_before, scene.drawable_page_keys().len());
-        assert_eq!(report.pages_after, 0);
-        assert_eq!(report.retained_bytes_before, retained_before);
-        assert_eq!(report.retained_bytes_after, 0);
-        assert_eq!(report.ledger_charged_before, before.charged);
-        assert_eq!(report.released_retained_bytes(), retained_before);
-        assert_eq!(report.released_ledger_bytes(), retained_before);
-        assert!(report.headroom_satisfied);
-        assert!(renderer.frame_buffers.is_empty());
-        assert_eq!(renderer.page_table_capacity, 0);
-        assert!(renderer.page_table_allocation.is_none());
-
-        let global_gpu_bytes = ledger
-            .snapshot()
-            .unwrap()
-            .records
-            .iter()
-            .filter(|record| record.class == AllocationClass::GpuPage)
-            .map(|record| record.charged_capacity)
-            .sum::<usize>();
-        assert_eq!(global_gpu_bytes, unrelated_bytes);
-    }
-
-    #[test]
-    fn cooperative_reclaim_skips_protected_and_pinned_pages_in_deterministic_lru_order() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(32 << 20, 4 << 20, 16 << 20);
-        let scene = test_scene_with_tiled_records(&ledger, NonZeroU64::new(20).unwrap());
-        assert!(scene.drawable_page_keys().len() > 2);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        renderer
-            .admit_pages(&device, &queue, scene.pages(), &ledger, 10)
-            .unwrap();
-        for page in &mut renderer.pages {
-            page.last_used_revision = 7;
-        }
-        renderer.rebuild_reclaim_index();
-        let protected = renderer.pages[0].key;
-        let pinned_key = renderer.pages[1].key;
-        let pin = renderer.page(pinned_key).unwrap().allocation.pin().unwrap();
-        let eligible_order = renderer
-            .pages
-            .iter()
-            .filter(|page| page.key != protected && page.key != pinned_key)
-            .map(|page| page.key)
-            .collect::<Vec<_>>();
-        assert!(eligible_order.len() > 1);
-        let eligible_bytes = renderer
-            .pages
-            .iter()
-            .filter(|page| page.key != protected && page.key != pinned_key)
-            .map(|page| page.allocation.snapshot().unwrap().charged_capacity)
-            .sum::<usize>();
-        let before = ledger.snapshot().unwrap();
-        let pressure = GpuBudgetPressure::from_budget_failure(
-            eligible_bytes,
-            before.charged,
-            before.reserved,
-            before.charged.saturating_add(before.reserved),
-        );
-        let report = renderer
-            .reclaim_for_budget_pressure(&ledger, pressure, &[protected])
-            .unwrap();
-        let remaining = renderer
-            .pages
-            .iter()
-            .map(|page| page.key)
-            .collect::<Vec<_>>();
-        let removed = eligible_order
-            .iter()
-            .copied()
-            .filter(|key| !remaining.contains(key))
-            .collect::<Vec<_>>();
-
-        assert!(removed.len() > 1);
-        assert_eq!(removed.as_slice(), &eligible_order[..removed.len()]);
-        assert_eq!(report.reclaimed_pages(), removed.len());
-        assert!(remaining.contains(&protected));
-        assert!(remaining.contains(&pinned_key));
-        assert!(
-            renderer
-                .page(pinned_key)
-                .unwrap()
-                .allocation
-                .snapshot()
-                .unwrap()
-                .pins
-                > 0
-        );
-        drop(pin);
-    }
-
-    #[test]
-    fn infeasible_reclaim_pressure_leaves_the_scene_cache_untouched() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(32 << 20, 4 << 20, 16 << 20);
-        let scene = test_scene_with_tile_bases(&ledger, NonZeroU64::new(25).unwrap());
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        renderer
-            .admit_pages(&device, &queue, scene.pages(), &ledger, 10)
-            .unwrap();
-        let page_keys_before = renderer
-            .pages
-            .iter()
-            .map(|page| page.key)
-            .collect::<Vec<_>>();
-        let table_before = renderer
-            .page_table_allocation
-            .as_ref()
-            .map(AllocationLease::id);
-        let table_capacity_before = renderer.page_table_capacity;
-        let retained_before = renderer.resident_retained_bytes().unwrap();
-        let ledger_before = ledger.snapshot().unwrap();
-        let pressure = GpuBudgetPressure::from_budget_failure(
-            ledger_before.budget.saturating_add(1),
-            ledger_before.charged,
-            ledger_before.reserved,
-            ledger_before.budget,
-        );
-
-        let report = renderer
-            .reclaim_for_budget_pressure(&ledger, pressure, &[])
-            .unwrap();
-
-        assert!(
-            !GpuReclaimGoal::new(
-                pressure,
-                ledger_before.charged.saturating_add(ledger_before.reserved)
-            )
-            .is_feasible()
-        );
-        assert_eq!(report.reclaimed_pages(), 0);
-        assert!(!report.headroom_satisfied);
-        assert_eq!(
-            renderer
-                .pages
-                .iter()
-                .map(|page| page.key)
-                .collect::<Vec<_>>(),
-            page_keys_before
-        );
-        assert_eq!(
-            renderer
-                .page_table_allocation
-                .as_ref()
-                .map(AllocationLease::id),
-            table_before
-        );
-        assert_eq!(renderer.page_table_capacity, table_capacity_before);
-        assert_eq!(renderer.resident_retained_bytes().unwrap(), retained_before);
-        assert_eq!(ledger.snapshot().unwrap().charged, ledger_before.charged);
-    }
-
-    #[test]
-    fn exact_transition_pressure_does_not_reclaim_when_the_original_limit_already_fits() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let transition_reserve = 20;
-        let ledger =
-            AllocationLedger::new_with_transient_budget(32 << 20, transition_reserve, 16 << 20);
-        let scene = test_scene(&ledger);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        renderer
-            .admit_pages(&device, &queue, scene.pages(), &ledger, 10)
-            .unwrap();
-        let before = ledger.snapshot().unwrap();
-        let base_budget = before.charged.saturating_sub(15);
-        ledger.set_budget(base_budget).unwrap();
-        let pressure = GpuBudgetPressure::from_budget_failure(
-            5,
-            before.charged,
-            before.reserved,
-            base_budget.saturating_add(transition_reserve),
-        );
-        let pages_before = renderer.resident_page_count();
-        let retained_before = renderer.resident_retained_bytes().unwrap();
-        let report = renderer
-            .reclaim_for_budget_pressure(&ledger, pressure, &[])
-            .unwrap();
-
-        assert!(report.headroom_satisfied);
-        assert_eq!(report.reclaimed_pages(), 0);
-        assert_eq!(report.released_retained_bytes(), 0);
-        assert_eq!(renderer.resident_page_count(), pages_before);
-        assert_eq!(renderer.resident_retained_bytes().unwrap(), retained_before);
-        assert!(report.ledger_charged_before > base_budget);
-        assert_eq!(report.ledger_charged_after, report.ledger_charged_before);
-    }
-
-    #[test]
-    fn read_gpu_stats_exclude_unrelated_shared_ledger_gpu_allocations() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(32 << 20, 4 << 20, 16 << 20);
-        let scene = test_scene(&ledger);
-        let unrelated_bytes = 4_096;
-        let _unrelated = ledger
-            .reserve(
-                AllocationClass::GpuPage,
-                unrelated_bytes,
-                ReservationKind::Normal,
-            )
-            .unwrap()
-            .register(unrelated_bytes, 1)
-            .unwrap();
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let camera = AlignmentCamera::new(
-            scene.prepared_interval(),
-            0.0,
-            12.0,
-            9.0,
-            rgv_alignment_scene::CpuClipRect {
-                x: 0.0,
-                y: 0.0,
-                width: 256.0,
-                height: 128.0,
-            },
-        )
-        .unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        };
-        let (_frame, stats, _) = renderer
-            .prepare_with_admission(&device, &queue, &[request], &ledger, 10)
-            .unwrap();
-
-        assert_eq!(
-            stats.resident_gpu_bytes,
-            renderer.resident_gpu_bytes().unwrap()
-        );
-        let global_gpu_bytes = ledger
-            .snapshot()
-            .unwrap()
-            .records
-            .iter()
-            .filter(|record| record.class == AllocationClass::GpuPage)
-            .map(|record| record.charged_capacity)
-            .sum::<usize>();
-        assert_eq!(
-            global_gpu_bytes,
-            stats.resident_gpu_bytes.saturating_add(unrelated_bytes)
-        );
-    }
-
-    #[test]
-    fn first_bundled_frame_cannot_spend_transition_reserve_above_the_base_budget() {
-        let Some((device, _queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 16 << 20, 16 << 20);
-        let scene = test_scene(&ledger);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        }];
-        let initial = ledger.snapshot().unwrap();
-        let preliminary = renderer
-            .plan_replacement(&requests, &initial, AllocationBundleSlot::new(7))
-            .unwrap();
-        let candidate_bytes = preliminary
-            .demands()
-            .iter()
-            .try_fold(0_usize, |total, demand| {
-                total.checked_add(demand.maximum_bytes)
-            })
-            .unwrap();
-        assert!(candidate_bytes > 0);
-        let occupied = initial.charged.saturating_add(initial.reserved);
-        ledger
-            .set_limits(
-                occupied.saturating_add(candidate_bytes).saturating_sub(1),
-                candidate_bytes,
-                initial.transient_budget,
-            )
-            .unwrap();
-
-        let snapshot = ledger.snapshot().unwrap();
-        let plan = renderer
-            .plan_replacement(&requests, &snapshot, AllocationBundleSlot::new(7))
-            .unwrap();
-        let mut prior = None;
-        let retirement = renderer
-            .detach_replacement_retirement(&ledger, &plan, &mut prior)
-            .unwrap();
-        assert!(retirement.retirement_claim_set().is_empty());
-        let spec = AllocationBundleSpec::new(
-            plan.policy_revision(),
-            plan.demands().to_vec(),
-            retirement.retirement_claim_set().clone(),
-        );
-        assert!(matches!(
-            ledger.reserve_replacement_bundle(spec),
-            Err(AllocationBundleError::SteadyBudgetExceeded { .. })
-        ));
-        assert!(
-            renderer
-                .restore_replacement_retirement(retirement)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(renderer.resident_page_count(), 0);
-        assert!(renderer.frame_buffers.is_empty());
-    }
-
-    #[test]
-    fn retirement_preflight_error_preserves_the_caller_frame_and_renderer_cache() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 16 << 20, 16 << 20);
-        let foreign_ledger =
-            AllocationLedger::new_with_transient_budget(64 << 20, 16 << 20, 16 << 20);
-        let scene = test_scene(&ledger);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        }];
-        let (frame, _, _) = renderer
-            .prepare_with_admission(&device, &queue, &requests, &ledger, 72)
-            .unwrap();
-        let snapshot = ledger.snapshot().unwrap();
-        let plan = renderer
-            .plan_replacement(&requests, &snapshot, AllocationBundleSlot::new(13))
-            .unwrap();
-        let renderer_revision = renderer.revision;
-        let page_ids = renderer
-            .pages
-            .iter()
-            .map(|page| page.allocation.id())
-            .collect::<Vec<_>>();
-        let table = (
-            renderer
-                .page_table_allocation
-                .as_ref()
-                .map(AllocationLease::id),
-            renderer.page_table_capacity,
-        );
-        let buffer_identity = renderer
-            .frame_buffers
-            .iter()
-            .map(Arc::as_ptr)
-            .collect::<Vec<_>>();
-        let frame_id = frame.buffers.frame_allocation.id();
-        let mut prior = Some(frame);
-
-        assert!(matches!(
-            renderer.detach_replacement_retirement(&foreign_ledger, &plan, &mut prior),
-            Err(AlignmentGpuReplacementError::Bundle(
-                AllocationBundleError::ForeignRetirementReference { .. }
-            ))
-        ));
-        assert_eq!(renderer.revision, renderer_revision);
-        assert_eq!(
-            renderer
-                .pages
-                .iter()
-                .map(|page| page.allocation.id())
-                .collect::<Vec<_>>(),
-            page_ids
-        );
-        assert_eq!(
-            (
-                renderer
-                    .page_table_allocation
-                    .as_ref()
-                    .map(AllocationLease::id),
-                renderer.page_table_capacity,
-            ),
-            table
-        );
-        assert_eq!(
-            renderer
-                .frame_buffers
-                .iter()
-                .map(Arc::as_ptr)
-                .collect::<Vec<_>>(),
-            buffer_identity
-        );
-        let prior = prior
-            .as_ref()
-            .expect("preflight refusal must not consume it");
-        assert_eq!(prior.buffers.frame_allocation.id(), frame_id);
-        render_test_frame(&device, &queue, &renderer, prior).unwrap();
-    }
-
-    #[test]
-    fn over_base_bundled_replacement_refusal_restores_the_exact_prior_frame_and_cache() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 16 << 20, 16 << 20);
-        let old_scene = test_scene(&ledger);
-        let candidate_scene = test_scene_with_tiled_records(&ledger, NonZeroU64::new(25).unwrap());
-        assert!(candidate_scene.drawable_page_keys().len() >= 4);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let interaction = AlignmentInteractionState::default();
-        let scissor = AlignmentGpuScissor {
-            x: 0,
-            y: 0,
-            width: 256,
-            height: 128,
-        };
-        let old_camera = AlignmentCamera::new(
-            GenomicInterval::new(ContigId::new(0), 0, 25).unwrap(),
-            0.0,
-            12.0,
-            9.0,
-            clip,
-        )
-        .unwrap();
-        let old_requests = [AlignmentGpuSceneRequest {
-            scene: &old_scene,
-            camera_sequence: 1,
-            camera: old_camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        }];
-        let (prior, _, _) = renderer
-            .prepare_with_admission(&device, &queue, &old_requests, &ledger, 70)
-            .unwrap();
-        let renderer_revision = renderer.revision;
-        let pages_before = renderer
-            .pages
-            .iter()
-            .map(|page| {
-                (
-                    page.key,
-                    page.allocation.id(),
-                    page.instance_count,
-                    page.last_used_revision,
-                )
-            })
-            .collect::<Vec<_>>();
-        let table_before = (
-            renderer
-                .page_table_allocation
-                .as_ref()
-                .map(AllocationLease::id),
-            renderer.page_table_capacity,
-        );
-        let frame_buffers_before = renderer
-            .frame_buffers
-            .iter()
-            .map(|buffers| {
-                (
-                    Arc::as_ptr(buffers),
-                    buffers.camera_allocation.as_ref().map(AllocationLease::id),
-                    buffers
-                        .interaction_allocation
-                        .as_ref()
-                        .map(AllocationLease::id),
-                    buffers.camera_capacity,
-                    buffers.interaction_buffers.len(),
-                    buffers.interaction_capacity,
-                )
-            })
-            .collect::<Vec<_>>();
-        let prior_frame_allocation = prior.buffers.frame_allocation.id();
-        let prior_buffer = Arc::as_ptr(&prior.buffers);
-
-        let before = ledger.snapshot().unwrap();
-        ledger.set_budget(before.charged).unwrap();
-        let new_camera = AlignmentCamera::new(
-            GenomicInterval::new(ContigId::new(0), 25, 100).unwrap(),
-            0.0,
-            12.0,
-            9.0,
-            clip,
-        )
-        .unwrap();
-        let new_requests = [AlignmentGpuSceneRequest {
-            scene: &candidate_scene,
-            camera_sequence: 2,
-            camera: new_camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        }];
-        let snapshot = ledger.snapshot().unwrap();
-        let plan = renderer
-            .plan_replacement(&new_requests, &snapshot, AllocationBundleSlot::new(31))
-            .unwrap();
-        assert!(plan.missing_pages.len() > pages_before.len());
-        assert!(plan.page_table_slot.is_some());
-        let mut prior = Some(prior);
-        let retirement = renderer
-            .detach_replacement_retirement(&ledger, &plan, &mut prior)
-            .unwrap();
-        assert!(prior.is_none());
-        assert_eq!(retirement.retired_pages.len(), pages_before.len());
-        assert!(retirement.retired_page_table.is_some());
-        assert_eq!(retirement.retired_frame_buffers.len(), 1);
-        assert!(renderer.pages.is_empty());
-        assert!(renderer.page_table_allocation.is_none());
-        assert!(renderer.frame_buffers.is_empty());
-        let spec = AllocationBundleSpec::new(
-            plan.policy_revision(),
-            plan.demands().to_vec(),
-            retirement.retirement_claim_set().clone(),
-        );
-        assert!(matches!(
-            ledger.reserve_replacement_bundle(spec),
-            Err(AllocationBundleError::SteadyBudgetExceeded { .. })
-        ));
-
-        let restored = renderer
-            .restore_replacement_retirement(retirement)
-            .unwrap()
-            .unwrap();
-        assert_eq!(renderer.revision, renderer_revision);
-        assert_eq!(
-            renderer
-                .pages
-                .iter()
-                .map(|page| {
-                    (
-                        page.key,
-                        page.allocation.id(),
-                        page.instance_count,
-                        page.last_used_revision,
-                    )
-                })
-                .collect::<Vec<_>>(),
-            pages_before
-        );
-        assert_eq!(
-            (
-                renderer
-                    .page_table_allocation
-                    .as_ref()
-                    .map(AllocationLease::id),
-                renderer.page_table_capacity,
-            ),
-            table_before
-        );
-        assert_eq!(
-            renderer
-                .frame_buffers
-                .iter()
-                .map(|buffers| {
-                    (
-                        Arc::as_ptr(buffers),
-                        buffers.camera_allocation.as_ref().map(AllocationLease::id),
-                        buffers
-                            .interaction_allocation
-                            .as_ref()
-                            .map(AllocationLease::id),
-                        buffers.camera_capacity,
-                        buffers.interaction_buffers.len(),
-                        buffers.interaction_capacity,
-                    )
-                })
-                .collect::<Vec<_>>(),
-            frame_buffers_before
-        );
-        assert_eq!(
-            restored.buffers.frame_allocation.id(),
-            prior_frame_allocation
-        );
-        assert_eq!(Arc::as_ptr(&restored.buffers), prior_buffer);
-        render_test_frame(&device, &queue, &renderer, &restored).unwrap();
-    }
-
-    #[test]
-    fn bundled_constant_camera_reuses_prepared_geometry_without_uploading_it_again() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 16 << 20, 16 << 20);
-        let scene = test_scene(&ledger);
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let request = |camera_sequence| AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        };
-        let first_requests = [request(1)];
-        let (first, first_stats, first_admission) = publish_bundled_frame(
-            &device,
-            &queue,
-            &mut renderer,
-            &first_requests,
-            &ledger,
-            None,
-            80,
-            90,
-        );
-        assert!(first_admission.admitted_pages > 0);
-        assert!(first_stats.geometry_uploaded_bytes > 0);
-
-        let second_requests = [request(1)];
-        let (second, second_stats, second_admission) = publish_bundled_frame(
-            &device,
-            &queue,
-            &mut renderer,
-            &second_requests,
-            &ledger,
-            Some(first),
-            100,
-            91,
-        );
-        assert_eq!(second_admission.admitted_pages, 0);
-        assert_eq!(
-            second_admission.already_resident_pages,
-            scene.drawable_page_keys().len()
-        );
-        assert_eq!(second_stats.geometry_uploaded_bytes, 0);
-        assert_eq!(second_stats.page_cache_misses, 0);
-        render_test_frame(&device, &queue, &renderer, &second).unwrap();
-    }
-
-    #[test]
-    fn bundled_replacements_preserve_multi_quantum_prepared_prefetch_without_repeat_uploads() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 16 << 20, 16 << 20);
-        let scene = test_scene_with_tiled_records(&ledger, NonZeroU64::new(20).unwrap());
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let interaction = AlignmentInteractionState::default();
-        let scissor = AlignmentGpuScissor {
-            x: 0,
-            y: 0,
-            width: 256,
-            height: 128,
-        };
-        let first_camera = AlignmentCamera::new(
-            GenomicInterval::new(ContigId::new(0), 0, 20).unwrap(),
-            0.0,
-            12.0,
-            9.0,
-            clip,
-        )
-        .unwrap();
-        let first_requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera: first_camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        }];
-        let prepared_keys = AlignmentGpuRenderer::prepared_page_keys(&first_requests);
-        assert!(prepared_keys.len() >= 5);
-        let (first, _, first_admission) = publish_bundled_frame(
-            &device,
-            &queue,
-            &mut renderer,
-            &first_requests,
-            &ledger,
-            None,
-            180,
-            300,
-        );
-        assert!(first_admission.admitted_pages < prepared_keys.len());
-
-        let mut admitted_quanta = 0_usize;
-        let mut previous_resident = renderer.resident_page_count();
-        loop {
-            let progress = renderer
-                .prefetch_prepared_scene_pages_bounded(
-                    &device,
-                    &queue,
-                    &first_requests,
-                    &ledger,
-                    301 + admitted_quanta as u64,
-                    NonZeroUsize::new(1).unwrap(),
-                )
-                .unwrap();
-            assert!(progress.admission.admitted_pages <= 1);
-            let resident = renderer.resident_page_count();
-            assert!(resident >= previous_resident);
-            if progress.admission.admitted_pages > 0 {
-                admitted_quanta = admitted_quanta.saturating_add(1);
-                assert_eq!(resident, previous_resident.saturating_add(1));
-            }
-            previous_resident = resident;
-            if progress.is_complete() {
-                break;
-            }
-        }
-        assert!(admitted_quanta > 2);
-        assert_eq!(renderer.resident_page_count(), prepared_keys.len());
-        let converged_page_ids = renderer
-            .pages
-            .iter()
-            .map(|page| (page.key, page.allocation.id()))
-            .collect::<Vec<_>>();
-
-        let repeated_requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 2,
-            camera: first_camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        }];
-        let (second, second_stats, second_admission) = publish_bundled_frame(
-            &device,
-            &queue,
-            &mut renderer,
-            &repeated_requests,
-            &ledger,
-            Some(first),
-            220,
-            320,
-        );
-        assert_eq!(second_admission.admitted_pages, 0);
-        assert_eq!(second_stats.geometry_uploaded_bytes, 0);
-        assert_eq!(renderer.resident_page_count(), prepared_keys.len());
-        assert_eq!(
-            renderer
-                .pages
-                .iter()
-                .map(|page| (page.key, page.allocation.id()))
-                .collect::<Vec<_>>(),
-            converged_page_ids
-        );
-        let no_repeat = renderer
-            .prefetch_prepared_scene_pages_bounded(
-                &device,
-                &queue,
-                &repeated_requests,
-                &ledger,
-                321,
-                NonZeroUsize::new(1).unwrap(),
-            )
-            .unwrap();
-        assert!(no_repeat.is_complete());
-        assert_eq!(no_repeat.admission.admitted_pages, 0);
-        assert_eq!(no_repeat.admission.uploaded_bytes, 0);
-
-        let compatible_camera = AlignmentCamera::new(
-            GenomicInterval::new(ContigId::new(0), 20, 40).unwrap(),
-            0.0,
-            12.0,
-            9.0,
-            clip,
-        )
-        .unwrap();
-        let compatible_requests = [AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 3,
-            camera: compatible_camera,
-            screen_size_points: [256.0, 128.0],
-            scissor,
-            interaction: &interaction,
-        }];
-        let (third, third_stats, third_admission) = publish_bundled_frame(
-            &device,
-            &queue,
-            &mut renderer,
-            &compatible_requests,
-            &ledger,
-            Some(second),
-            260,
-            322,
-        );
-        assert_eq!(third_admission.admitted_pages, 0);
-        assert_eq!(third_stats.geometry_uploaded_bytes, 0);
-        assert_eq!(renderer.resident_page_count(), prepared_keys.len());
-        assert_eq!(
-            renderer
-                .pages
-                .iter()
-                .map(|page| (page.key, page.allocation.id()))
-                .collect::<Vec<_>>(),
-            converged_page_ids
-        );
-        render_test_frame(&device, &queue, &renderer, &third).unwrap();
-    }
-
-    #[test]
-    fn only_persistent_budget_failures_report_retryable_gpu_pressure() {
-        let budget = LedgerError::BudgetExceeded {
-            requested: 4_096,
-            charged: 8_192,
-            reserved: 0,
-            limit: 12_048,
-        };
-        let expected = GpuBudgetPressure::from_budget_failure(4_096, 8_192, 0, 12_048);
-        let admission =
-            AlignmentGpuFrameBuildError::Admission(AlignmentGpuPageAdmissionError::Ledger(budget));
-        assert_eq!(admission.persistent_budget_pressure(), Some(expected));
-        assert_eq!(expected.required_reclaim_bytes(), 240);
-
-        let nested = AlignmentGpuFrameBuildError::Prepare(AlignmentGpuPrepareError::Admission(
-            AlignmentGpuPageAdmissionError::Ledger(budget),
-        ));
-        assert_eq!(nested.persistent_budget_pressure(), Some(expected));
-        let prepare =
-            AlignmentGpuFrameBuildError::Prepare(AlignmentGpuPrepareError::Ledger(budget));
-        assert_eq!(prepare.persistent_budget_pressure(), Some(expected));
-
-        let transient = AlignmentGpuFrameBuildError::Prepare(AlignmentGpuPrepareError::Ledger(
-            LedgerError::TransientBudgetExceeded {
-                class: TransientResourceClass::GpuUpload,
-                requested: 4_096,
-                transient: 8_192,
-                limit: 10_000,
-            },
-        ));
-        assert_eq!(transient.persistent_budget_pressure(), None);
-        assert_eq!(
-            AlignmentGpuFrameBuildError::Prepare(AlignmentGpuPrepareError::InvalidFrameGeometry)
-                .persistent_budget_pressure(),
-            None
-        );
-    }
-
-    #[test]
-    fn admitted_geometry_is_reused_across_camera_frames_and_device_discard_preserves_scene() {
-        let Some((device, queue)) = headless_device() else {
-            return;
-        };
-        let ledger = AllocationLedger::new_with_transient_budget(16 << 20, 2 << 20, 8 << 20);
-        let scene = test_scene(&ledger);
-        let semantic_handles = scene
-            .pages()
-            .iter()
-            .flat_map(|page| page.primitives().iter().map(|primitive| primitive.handle))
-            .collect::<Vec<_>>();
-        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let mut expected_uploaded = 0_usize;
-        for page in scene.pages() {
-            match renderer
-                .admit_page(&device, &queue, page, &ledger, 10)
-                .unwrap()
-            {
-                AlignmentGpuPageAdmission::Admitted { uploaded_bytes, .. } => {
-                    expected_uploaded = expected_uploaded.saturating_add(uploaded_bytes);
-                }
-                AlignmentGpuPageAdmission::AlreadyResident => {
-                    panic!("fixture page must be admitted exactly once")
-                }
-                AlignmentGpuPageAdmission::NoGpuGeometry => {}
-            }
-        }
-        let clip = rgv_alignment_scene::CpuClipRect {
-            x: 0.0,
-            y: 0.0,
-            width: 256.0,
-            height: 128.0,
-        };
-        let camera = AlignmentCamera::new(scene.prepared_interval(), 0.0, 12.0, 9.0, clip).unwrap();
-        let interaction = AlignmentInteractionState::default();
-        let request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 1,
-            camera,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        };
-        let (first, first_stats) = renderer
-            .prepare(&device, &queue, &[request], &ledger)
-            .unwrap();
-        assert_eq!(first_stats.geometry_uploaded_bytes, expected_uploaded);
-        drop(first);
-
-        let viewport = camera.viewport().pan_pixels(10.0, 100).unwrap();
-        let panned = AlignmentCamera::from_viewport(viewport, 0.0, 12.0, 9.0, clip).unwrap();
-        let request = AlignmentGpuSceneRequest {
-            scene: &scene,
-            camera_sequence: 2,
-            camera: panned,
-            screen_size_points: [256.0, 128.0],
-            scissor: AlignmentGpuScissor {
-                x: 0,
-                y: 0,
-                width: 256,
-                height: 128,
-            },
-            interaction: &interaction,
-        };
-        let (second, second_stats) = renderer
-            .prepare(&device, &queue, &[request], &ledger)
-            .unwrap();
-        assert_eq!(second_stats.geometry_uploaded_bytes, 0);
-        assert_eq!(second_stats.page_cache_misses, 0);
-        assert_eq!(second.scene_revisions.as_ref(), &[scene.revision()]);
-
-        render_test_frame(&device, &queue, &renderer, &second).unwrap();
-        renderer.discard_device_resources();
-        assert_eq!(renderer.resident_page_count(), 0);
-        assert!(matches!(
-            render_test_frame(&device, &queue, &renderer, &second),
-            Err(AlignmentGpuRenderError::DeviceGenerationMismatch { .. })
-        ));
-        assert!(
-            semantic_handles
-                .iter()
-                .all(|handle| scene.contains_handle(*handle))
-        );
-        drop(second);
-        assert_eq!(
-            ledger
-                .snapshot()
-                .unwrap()
-                .records
-                .iter()
-                .filter(|record| record.class == AllocationClass::GpuPage)
-                .count(),
-            0
-        );
-    }
-}
+pub(crate) mod tests;

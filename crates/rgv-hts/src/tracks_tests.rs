@@ -1534,6 +1534,109 @@ fn quantitative_query_cap_and_non_finite_provenance_are_exact() {
 }
 
 #[test]
+fn bigwig_zoom_summaries_expose_the_minimum_and_maximum_a_mean_hides() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("peak.bw");
+    let mut chromosome_sizes = HashMap::new();
+    chromosome_sizes.insert("chr1".to_owned(), 4_000_000);
+    // A flat signal of 2 with one 100-base peak of 5,000 and one 100-base dip to 0.
+    let mut bedgraph = String::new();
+    for index in 0..40_000_u32 {
+        let value = match index {
+            12_345 => 5_000,
+            30_001 => 0,
+            _ => 2,
+        };
+        writeln!(
+            bedgraph,
+            "chr1\t{}\t{}\t{value}",
+            index * 100,
+            (index + 1) * 100
+        )
+        .unwrap();
+    }
+    let writer = bigtools::BigWigWrite::create_file(&path, chromosome_sizes).unwrap();
+    let data = BedParserStreamingIterator::from_bedgraph_file(Cursor::new(bedgraph), false);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    writer.write(data, runtime).unwrap();
+    let mut source = BigWigSource::open(&path).unwrap();
+
+    // Whole contig: a zoom level is read, and the records are exactly those of `query`.
+    let means = source.query("chr1", 0, 4_000_000).unwrap();
+    let wide = source.query_with_extremes("chr1", 0, 4_000_000).unwrap();
+    let reduction = wide
+        .provenance
+        .summary_reduction_bases
+        .expect("a whole-contig query reads a precomputed zoom level");
+    assert!(reduction > 100);
+    assert_eq!(wide.provenance, means.provenance);
+    assert_eq!(
+        wide.records
+            .iter()
+            .map(|record| (record.start, record.end, record.mean))
+            .collect::<Vec<_>>(),
+        means
+            .records
+            .iter()
+            .map(|record| (record.start, record.end, record.value))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        wide.records
+            .iter()
+            .all(|record| record.minimum <= record.mean && record.mean <= record.maximum)
+    );
+    // The peak is diluted in the mean of its bin but intact in the maximum; likewise the dip.
+    // The peak is diluted in the mean of the bin (or two) holding it but intact in the maximum;
+    // likewise the dip in the minimum.
+    let overlapping = |start: u64, end: u64| {
+        wide.records
+            .iter()
+            .filter(|record| record.start < end && start < record.end)
+            .collect::<Vec<_>>()
+    };
+    let peak = overlapping(1_234_500, 1_234_600);
+    assert!(!peak.is_empty());
+    for record in &peak {
+        assert_eq!((record.minimum, record.maximum), (2.0, 5_000.0));
+        assert!(record.mean < 2_500.0, "mean {} hides the peak", record.mean);
+    }
+    let dip = overlapping(3_000_100, 3_000_200);
+    assert!(!dip.is_empty());
+    for record in &dip {
+        assert_eq!((record.minimum, record.maximum), (0.0, 2.0));
+        assert!(record.mean > 0.0 && record.mean < 2.0);
+    }
+    let flat = wide
+        .records
+        .iter()
+        .filter(|record| (record.maximum - record.minimum).abs() < f32::EPSILON)
+        .count();
+    assert_eq!(flat, wide.records.len() - peak.len() - dip.len());
+
+    // Raw values carry no range.
+    let narrow = source
+        .query_with_extremes("chr1", 1_234_400, 1_234_700)
+        .unwrap();
+    assert_eq!(narrow.provenance.summary_reduction_bases, None);
+    assert_eq!(
+        narrow
+            .records
+            .iter()
+            .map(|record| (record.start, record.minimum, record.mean, record.maximum))
+            .collect::<Vec<_>>(),
+        vec![
+            (1_234_400, 2.0, 2.0, 2.0),
+            (1_234_500, 5_000.0, 5_000.0, 5_000.0),
+            (1_234_600, 2.0, 2.0, 2.0),
+        ]
+    );
+}
+
+#[test]
 fn bigwig_wide_queries_use_zoom_summaries_and_narrow_queries_stay_exact() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("dense.bw");

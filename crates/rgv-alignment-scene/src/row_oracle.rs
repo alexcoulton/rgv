@@ -135,10 +135,17 @@ pub(crate) struct RowOracleOutput {
     pub connectors: Vec<OraclePairConnector>,
     /// Eligible reads overlapping the interval before read sampling.
     pub eligible_records: usize,
+    /// Per row: the interval-colouring lane it was packed as, within its group. Rows are then
+    /// permuted by sort priority, so this is the order an extension must keep filling them in.
+    pub row_packing: Vec<u32>,
+    /// Per row: the read which gives the row its sort priority.
+    pub row_best: Vec<AlignmentHandle>,
 }
 
+/// Layout scratch for one read. Read name and CIGAR are borrowed from the packed evidence;
+/// cloning them per candidate dominated layout scratch at deep loci.
 #[derive(Clone, Debug)]
-struct Candidate {
+struct Candidate<'a> {
     handle: AlignmentHandle,
     start: u64,
     end: u64,
@@ -148,8 +155,8 @@ struct Candidate {
     mate_contig: Option<rgv_core::ContigId>,
     mate_start: Option<u64>,
     template_length: i64,
-    read_name: Vec<u8>,
-    cigar: Vec<CigarOp>,
+    read_name: &'a [u8],
+    cigar: &'a [CigarOp],
     group_tag: Option<String>,
     sort_tag: Option<String>,
     has_sa: bool,
@@ -176,7 +183,8 @@ pub(crate) fn build_row_oracle(
 ) -> Result<RowOracleOutput, RowOracleError> {
     validate_capabilities(evidence, contract)?;
     let selection = evidence.select(interval)?;
-    let candidates = build_candidates(&selection, interval, contract)?;
+    let retained = sampled_selection(&selection, contract.sampling)?;
+    let candidates = build_candidates(&selection, interval, contract, retained.as_deref())?;
     let units = build_units(&candidates, contract.view_as_pairs);
     let mut grouped = BTreeMap::<OracleGroupKey, Vec<usize>>::new();
     for (unit_index, unit) in units.iter().enumerate() {
@@ -201,7 +209,7 @@ pub(crate) fn build_row_oracle(
         }
         if let Some(promoted) = contract.promoted_template {
             group.sort_by_key(|unit| {
-                template_id(&candidates[units[*unit].representative].read_name).get() != promoted
+                template_id(candidates[units[*unit].representative].read_name).get() != promoted
             });
         }
     }
@@ -215,19 +223,255 @@ pub(crate) fn build_row_oracle(
     Ok(output)
 }
 
-fn build_candidates(
-    selection: &EvidenceSelection,
+/// Result of extending an ordered (sorted and/or grouped, unpaired) layout rightwards.
+pub(crate) struct OrderedExtension {
+    /// Final row of each new read, in the order the reads were supplied.
+    pub novel_rows: Vec<u32>,
+    /// Final row of each incumbent row, or `None` when every incumbent row kept its index.
+    pub remap: Option<Vec<u32>>,
+    pub extents: Vec<OracleRowExtent>,
+    pub groups: Vec<OracleGroup>,
+    pub row_packing: Vec<u32>,
+    pub row_best: Vec<AlignmentHandle>,
+}
+
+struct ExtensionRow {
+    packing: u32,
+    /// Candidate index of the read which ranks first in this row.
+    best: usize,
+    extent: OracleRowExtent,
+    incumbent: Option<u32>,
+}
+
+fn oracle_group_key(key: &AlignmentRowGroupKey) -> OracleGroupKey {
+    match key {
+        AlignmentRowGroupKey::All => OracleGroupKey::All,
+        AlignmentRowGroupKey::Forward => OracleGroupKey::Forward,
+        AlignmentRowGroupKey::Reverse => OracleGroupKey::Reverse,
+        AlignmentRowGroupKey::Tagged(label) => OracleGroupKey::Tagged(label.to_string()),
+        AlignmentRowGroupKey::Missing => OracleGroupKey::Missing,
+    }
+}
+
+/// Places `novel` reads, all starting at or after the incumbent interval's end and supplied in
+/// `(start, end, handle)` order, into an ordered layout and ranks the rows as
+/// [`build_row_oracle`] would for the union.
+///
+/// This is exact, not an approximation, for an unpaired layout:
+///
+/// * the oracle colours each group's reads in coordinate order, and every new read follows
+///   every incumbent read of its group in that order, so the incumbent colouring is a prefix
+///   of the union's and the same greedy step continues from the retained lanes
+///   (`incumbent_packing`) and lane ends (`incumbent_extents`);
+/// * the oracle then orders a group's rows by their best-ranked read. A row's best read after
+///   the extension is the better of its incumbent best (`incumbent_best`) and the new reads
+///   placed in it, so comparing those few reads reproduces the ranking without consulting any
+///   other incumbent read.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn extend_row_order(
+    evidence: &Arc<EvidenceRoot>,
     interval: GenomicInterval,
     contract: LayoutContract,
-) -> Result<Vec<Candidate>, RowOracleError> {
+    incumbent_groups: &[AlignmentRowGroup],
+    incumbent_extents: &[OracleRowExtent],
+    incumbent_packing: &[u32],
+    incumbent_best: &[AlignmentHandle],
+    novel: &[(AlignmentHandle, u64, u64)],
+    reservation_kind: crate::ReservationKind,
+) -> Result<OrderedExtension, RowOracleError> {
+    validate_capabilities(evidence, contract)?;
+    let handles = novel
+        .iter()
+        .map(|(handle, _, _)| *handle)
+        .chain(incumbent_best.iter().copied())
+        .collect::<Vec<_>>();
+    let selection =
+        evidence.select_handles_with_reservation_kind(interval, handles, reservation_kind)?;
+    let candidates = build_candidates(&selection, interval, contract, None)?;
+    let units = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| RowUnit {
+            representative: index,
+            members: Vec::new(),
+            start: candidate.start,
+            end: candidate.end,
+            paired: false,
+        })
+        .collect::<Vec<_>>();
+    // The oracle's final priority order: sort order, optionally reversed, then the promoted
+    // template stably first.
+    let promoted = |index: usize| {
+        contract
+            .promoted_template
+            .is_some_and(|promoted| template_id(candidates[index].read_name).get() == promoted)
+    };
+    let rank = |left: usize, right: usize| {
+        (!promoted(left)).cmp(&!promoted(right)).then_with(|| {
+            let ordering =
+                compare_units(&units[left], &units[right], &candidates, contract.sorting);
+            if contract.sort_order == AlignmentOrderDirection::Reverse {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        })
+    };
+
+    let mut rows = Vec::<ExtensionRow>::with_capacity(incumbent_extents.len());
+    let mut rows_by_group = BTreeMap::<OracleGroupKey, Vec<usize>>::new();
+    for group in incumbent_groups {
+        let range = group.row_range();
+        if range.is_empty() {
+            // The placeholder group of an atlas with no reads.
+            continue;
+        }
+        let members = rows_by_group
+            .entry(oracle_group_key(group.key()))
+            .or_default();
+        for row in range {
+            let index = row as usize;
+            members.push(rows.len());
+            rows.push(ExtensionRow {
+                packing: *incumbent_packing
+                    .get(index)
+                    .ok_or(RowOracleError::IndexOverflow)?,
+                best: novel.len().saturating_add(index),
+                extent: *incumbent_extents
+                    .get(index)
+                    .ok_or(RowOracleError::IndexOverflow)?,
+                incumbent: Some(row),
+            });
+        }
+    }
+    if rows.len() != incumbent_extents.len() || incumbent_best.len() != incumbent_extents.len() {
+        return Err(RowOracleError::IndexOverflow);
+    }
+
+    let mut novel_by_group = BTreeMap::<OracleGroupKey, Vec<usize>>::new();
+    for (index, candidate) in candidates.iter().enumerate().take(novel.len()) {
+        novel_by_group
+            .entry(group_key(candidate, contract.grouping))
+            .or_default()
+            .push(index);
+    }
+    let mut row_of_novel = vec![usize::MAX; novel.len()];
+    for (key, members) in novel_by_group {
+        let group_rows = rows_by_group.entry(key).or_default();
+        let mut active = group_rows
+            .iter()
+            .map(|row| Reverse((rows[*row].extent.maximum_end, rows[*row].packing, *row)))
+            .collect::<BinaryHeap<_>>();
+        let mut available = BinaryHeap::<Reverse<(u32, usize)>>::new();
+        let mut next_packing =
+            u32::try_from(group_rows.len()).map_err(|_| RowOracleError::IndexOverflow)?;
+        for index in members {
+            let unit = &units[index];
+            while active
+                .peek()
+                .is_some_and(|Reverse((end, _, _))| *end <= unit.start)
+            {
+                let Reverse((_, packing, row)) = active.pop().expect("observed reusable row");
+                available.push(Reverse((packing, row)));
+            }
+            let row = if let Some(Reverse((_, row))) = available.pop() {
+                if rank(index, rows[row].best) == Ordering::Less {
+                    rows[row].best = index;
+                }
+                row
+            } else {
+                let row = rows.len();
+                rows.push(ExtensionRow {
+                    packing: next_packing,
+                    best: index,
+                    extent: empty_extent(),
+                    incumbent: None,
+                });
+                next_packing = next_packing
+                    .checked_add(1)
+                    .ok_or(RowOracleError::IndexOverflow)?;
+                group_rows.push(row);
+                row
+            };
+            let extent = &mut rows[row].extent;
+            extent.minimum_start = extent.minimum_start.min(unit.start);
+            extent.maximum_end = extent.maximum_end.max(unit.end);
+            extent.record_count = extent
+                .record_count
+                .checked_add(1)
+                .ok_or(RowOracleError::IndexOverflow)?;
+            active.push(Reverse((unit.end, rows[row].packing, row)));
+            row_of_novel[index] = row;
+        }
+    }
+
+    let ordered_groups = match contract.group_order {
+        AlignmentOrderDirection::Natural => rows_by_group.into_iter().collect::<Vec<_>>(),
+        AlignmentOrderDirection::Reverse => rows_by_group.into_iter().rev().collect::<Vec<_>>(),
+    };
+    let mut final_row = vec![0_u32; rows.len()];
+    let mut remap = vec![0_u32; incumbent_extents.len()];
+    let mut extents = Vec::with_capacity(rows.len());
+    let mut row_packing = Vec::with_capacity(rows.len());
+    let mut row_best = Vec::with_capacity(rows.len());
+    let mut groups = Vec::with_capacity(ordered_groups.len());
+    for (key, mut members) in ordered_groups {
+        if members.is_empty() {
+            continue;
+        }
+        members.sort_by(|left, right| rank(rows[*left].best, rows[*right].best));
+        let row_start = u32::try_from(extents.len()).map_err(|_| RowOracleError::IndexOverflow)?;
+        for member in members {
+            let row = u32::try_from(extents.len()).map_err(|_| RowOracleError::IndexOverflow)?;
+            final_row[member] = row;
+            if let Some(incumbent) = rows[member].incumbent {
+                remap[incumbent as usize] = row;
+            }
+            extents.push(rows[member].extent);
+            row_packing.push(rows[member].packing);
+            row_best.push(candidates[rows[member].best].handle);
+        }
+        let row_end = u32::try_from(extents.len()).map_err(|_| RowOracleError::IndexOverflow)?;
+        groups.push(OracleGroup {
+            key,
+            row_start,
+            row_end,
+        });
+    }
+    if groups.is_empty() {
+        groups.push(OracleGroup {
+            key: OracleGroupKey::All,
+            row_start: 0,
+            row_end: 0,
+        });
+    }
+    let unmoved = remap
+        .iter()
+        .enumerate()
+        .all(|(incumbent, row)| *row as usize == incumbent);
+    Ok(OrderedExtension {
+        novel_rows: row_of_novel.into_iter().map(|row| final_row[row]).collect(),
+        remap: (!unmoved).then_some(remap),
+        extents,
+        groups,
+        row_packing,
+        row_best,
+    })
+}
+
+fn build_candidates<'a>(
+    selection: &'a EvidenceSelection,
+    interval: GenomicInterval,
+    contract: LayoutContract,
+    retained: Option<&[bool]>,
+) -> Result<Vec<Candidate<'a>>, RowOracleError> {
     let group_tag = mode_tag(contract.grouping);
     let sort_tag = sort_tag(contract.sorting);
-    let retained = sampled_selection(selection, contract.sampling)?;
     selection
         .records()
         .iter()
         .enumerate()
-        .filter(|(index, _)| retained.as_ref().is_none_or(|retained| retained[*index]))
+        .filter(|(index, _)| retained.is_none_or(|retained| retained[*index]))
         .map(|(index, reference)| {
             let record = selection
                 .record_view(index)
@@ -279,8 +523,8 @@ fn build_candidates(
                 mate_contig: record.mate_contig(),
                 mate_start: record.mate_start(),
                 template_length: record.template_length(),
-                read_name: record.read_name().to_vec(),
-                cigar: record.cigar().to_vec(),
+                read_name: record.read_name(),
+                cigar: record.cigar(),
                 group_tag,
                 sort_tag,
                 has_sa,
@@ -398,9 +642,9 @@ fn tag_label(
     })
 }
 
-fn build_units(candidates: &[Candidate], view_as_pairs: bool) -> Vec<RowUnit> {
+fn build_units(candidates: &[Candidate<'_>], view_as_pairs: bool) -> Vec<RowUnit> {
     let mut units = Vec::<RowUnit>::new();
-    let mut first_by_name = HashMap::<Vec<u8>, usize>::new();
+    let mut first_by_name = HashMap::<&[u8], usize>::new();
     for (index, candidate) in candidates.iter().enumerate() {
         let eligible_pair = view_as_pairs
             && candidate.flags.is_paired()
@@ -408,11 +652,11 @@ fn build_units(candidates: &[Candidate], view_as_pairs: bool) -> Vec<RowUnit> {
             && !candidate.flags.is_supplementary()
             && !candidate.read_name.is_empty();
         let unit_index = if eligible_pair {
-            if let Some(unit) = first_by_name.get(&candidate.read_name).copied() {
+            if let Some(unit) = first_by_name.get(candidate.read_name).copied() {
                 unit
             } else {
                 let unit = units.len();
-                first_by_name.insert(candidate.read_name.clone(), unit);
+                first_by_name.insert(candidate.read_name, unit);
                 units.push(RowUnit {
                     representative: index,
                     members: Vec::new(),
@@ -462,7 +706,7 @@ fn build_units(candidates: &[Candidate], view_as_pairs: bool) -> Vec<RowUnit> {
     units
 }
 
-fn group_key(candidate: &Candidate, mode: AlignmentGroupMode) -> OracleGroupKey {
+fn group_key(candidate: &Candidate<'_>, mode: AlignmentGroupMode) -> OracleGroupKey {
     match mode {
         AlignmentGroupMode::None => OracleGroupKey::All,
         AlignmentGroupMode::Strand => {
@@ -490,12 +734,12 @@ fn group_key(candidate: &Candidate, mode: AlignmentGroupMode) -> OracleGroupKey 
         } else {
             "Primary/secondary"
         }),
-        AlignmentGroupMode::LeftClip => tagged(if left_clip(&candidate.cigar) > 0 {
+        AlignmentGroupMode::LeftClip => tagged(if left_clip(candidate.cigar) > 0 {
             "Left clipped"
         } else {
             "Not left clipped"
         }),
-        AlignmentGroupMode::RightClip => tagged(if right_clip(&candidate.cigar) > 0 {
+        AlignmentGroupMode::RightClip => tagged(if right_clip(candidate.cigar) > 0 {
             "Right clipped"
         } else {
             "Not right clipped"
@@ -534,7 +778,7 @@ fn tagged(label: &str) -> OracleGroupKey {
 fn compare_units(
     left: &RowUnit,
     right: &RowUnit,
-    candidates: &[Candidate],
+    candidates: &[Candidate<'_>],
     mode: AlignmentSortMode,
 ) -> Ordering {
     let left_record = &candidates[left.representative];
@@ -564,7 +808,7 @@ fn compare_units(
             )),
         AlignmentSortMode::ReadName => left_record
             .read_name
-            .cmp(&right_record.read_name)
+            .cmp(right_record.read_name)
             .then_with(|| left.start.cmp(&right.start)),
         AlignmentSortMode::ReadGroup | AlignmentSortMode::Haplotype | AlignmentSortMode::Tag(_) => {
             (
@@ -579,13 +823,13 @@ fn compare_units(
                 ))
         }
         AlignmentSortMode::AlignedLength => {
-            (Reverse(aligned_length(&left_record.cigar)), left.start)
-                .cmp(&(Reverse(aligned_length(&right_record.cigar)), right.start))
+            (Reverse(aligned_length(left_record.cigar)), left.start)
+                .cmp(&(Reverse(aligned_length(right_record.cigar)), right.start))
         }
-        AlignmentSortMode::LeftClip => (Reverse(left_clip(&left_record.cigar)), left.start)
-            .cmp(&(Reverse(left_clip(&right_record.cigar)), right.start)),
-        AlignmentSortMode::RightClip => (Reverse(right_clip(&left_record.cigar)), left.start)
-            .cmp(&(Reverse(right_clip(&right_record.cigar)), right.start)),
+        AlignmentSortMode::LeftClip => (Reverse(left_clip(left_record.cigar)), left.start)
+            .cmp(&(Reverse(left_clip(right_record.cigar)), right.start)),
+        AlignmentSortMode::RightClip => (Reverse(right_clip(left_record.cigar)), left.start)
+            .cmp(&(Reverse(right_clip(right_record.cigar)), right.start)),
         AlignmentSortMode::TemplateLength => (
             Reverse(left_record.template_length.unsigned_abs()),
             left.start,
@@ -623,12 +867,14 @@ fn compare_units(
 }
 
 fn pack_groups(
-    candidates: &[Candidate],
+    candidates: &[Candidate<'_>],
     units: &[RowUnit],
     groups: Vec<(OracleGroupKey, Vec<usize>)>,
 ) -> Result<RowOracleOutput, RowOracleError> {
     let mut rows_by_unit = vec![0_u32; units.len()];
     let mut extents = Vec::<OracleRowExtent>::new();
+    let mut row_packing = Vec::<u32>::new();
+    let mut row_best = Vec::<AlignmentHandle>::new();
     let mut retained_groups = Vec::with_capacity(groups.len());
     for (key, priority_order) in groups {
         let row_start = u32::try_from(extents.len()).map_err(|_| RowOracleError::IndexOverflow)?;
@@ -679,6 +925,10 @@ fn pack_groups(
         for (next, previous) in ordered_rows.into_iter().enumerate() {
             remap[previous] = u32::try_from(next).map_err(|_| RowOracleError::IndexOverflow)?;
             reordered_extents.push(local_extents[previous]);
+            row_packing.push(u32::try_from(previous).map_err(|_| RowOracleError::IndexOverflow)?);
+            row_best.push(
+                candidates[units[priority_order[priority_by_row[previous]]].representative].handle,
+            );
         }
         for unit in &priority_order {
             rows_by_unit[*unit] = row_start.saturating_add(remap[rows_by_unit[*unit] as usize]);
@@ -712,11 +962,13 @@ fn pack_groups(
         groups: retained_groups,
         connectors,
         eligible_records: 0,
+        row_packing,
+        row_best,
     })
 }
 
 fn build_connectors(
-    candidates: &[Candidate],
+    candidates: &[Candidate<'_>],
     units: &[RowUnit],
     rows_by_unit: &[u32],
 ) -> Vec<OraclePairConnector> {
@@ -735,7 +987,7 @@ fn build_connectors(
                     continue;
                 }
                 connectors.push(OraclePairConnector {
-                    template: template_id(&left.read_name).get(),
+                    template: template_id(left.read_name).get(),
                     left: left.handle,
                     right: Some(right.handle),
                     row: rows_by_unit[unit_index],
@@ -764,7 +1016,7 @@ fn build_connectors(
         };
         if start < end {
             connectors.push(OraclePairConnector {
-                template: template_id(&record.read_name).get(),
+                template: template_id(record.read_name).get(),
                 left: record.handle,
                 right: None,
                 row: rows_by_unit[unit_index],

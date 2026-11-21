@@ -1,4 +1,12 @@
-use super::super::*;
+use crate::app::status_activity::StatusActivity;
+use rgv_alignment_scene::AlignmentSceneCamera;
+use rgv_core::{PanelId, TrackId};
+use rgv_engine::{
+    AlignmentCoordinatorFrame, AlignmentIndividualReadCapability, AlignmentReferenceRequirement,
+    AlignmentSceneRequestToken,
+};
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 const ALIGNMENT_NAVIGATION_JOURNAL_CAPACITY: usize = 64;
 
@@ -118,6 +126,26 @@ impl AlignmentNavigationPhase {
                 | Self::Failed
                 | Self::BudgetLimited
         )
+    }
+
+    /// Whether the phase's status line describes work in progress that warrants the status
+    /// spinner. Only evidence loading does; the waiting phases are shown without one.
+    pub(crate) const fn activity(self) -> StatusActivity {
+        match self {
+            Self::Running => StatusActivity::Busy,
+            Self::Dormant
+            | Self::Queued
+            | Self::WaitingForSourcePressure
+            | Self::WaitingForReference
+            | Self::CandidateReady
+            | Self::WaitingForGpuPressure
+            | Self::BudgetLimited
+            | Self::Committed
+            | Self::IndexOverview
+            | Self::Unavailable
+            | Self::Failed
+            | Self::Superseded => StatusActivity::Idle,
+        }
     }
 
     pub(crate) const fn status(self) -> &'static str {
@@ -625,6 +653,40 @@ const fn alignment_navigation_transition_is_legal(
 mod tests {
     use super::*;
     use rgv_core::{ContigId, GenomicInterval, Viewport};
+
+    /// The spinner used to be keyed on status text starting with "Loading". The typed activity
+    /// must select exactly the phases that text selected, so rewording a status cannot change it.
+    #[test]
+    fn phase_activity_selects_exactly_the_loading_phases() {
+        let phases = [
+            AlignmentNavigationPhase::Dormant,
+            AlignmentNavigationPhase::Queued,
+            AlignmentNavigationPhase::Running,
+            AlignmentNavigationPhase::WaitingForSourcePressure,
+            AlignmentNavigationPhase::WaitingForReference,
+            AlignmentNavigationPhase::CandidateReady,
+            AlignmentNavigationPhase::WaitingForGpuPressure,
+            AlignmentNavigationPhase::BudgetLimited,
+            AlignmentNavigationPhase::Committed,
+            AlignmentNavigationPhase::IndexOverview,
+            AlignmentNavigationPhase::Unavailable,
+            AlignmentNavigationPhase::Failed,
+            AlignmentNavigationPhase::Superseded,
+        ];
+        for phase in phases {
+            let legacy_text_rule =
+                phase.status().starts_with("Loading") || phase.status().contains("queue busy");
+            assert_eq!(
+                phase.activity() == StatusActivity::Busy,
+                legacy_text_rule,
+                "{phase:?}"
+            );
+        }
+        assert_eq!(
+            AlignmentNavigationPhase::Running.activity(),
+            StatusActivity::Busy
+        );
+    }
 
     fn camera_on(contig: u32, start: u64) -> AlignmentSceneCamera {
         AlignmentSceneCamera::without_visible_rows(

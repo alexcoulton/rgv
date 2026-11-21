@@ -51,6 +51,9 @@ pub use automation::{
     MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS, check_automation_remote_url,
     check_session_sources_within,
 };
+pub use automation::{
+    MAXIMUM_AUTOMATION_SNAPSHOT_SCALE, MINIMUM_AUTOMATION_SNAPSHOT_SCALE, default_snapshot_scale,
+};
 pub use coordinates::{
     Contig, ContigAliasError, ContigAliases, ContigId, DuplicateContigError, GenomicInterval,
     IntervalError, ReferenceDictionary, resolve_contig_alias,

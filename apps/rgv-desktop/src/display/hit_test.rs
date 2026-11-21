@@ -1,4 +1,9 @@
-use super::*;
+use crate::ui::TrackFrameKey;
+
+#[cfg(test)]
+use crate::ui::{AlignmentSubtrack, TrackFrame};
+use crate::{JunctionArcHover, SashimiHitTestGate, ui};
+use rgv_core::TrackId;
 
 pub(crate) const JUNCTION_ARC_MINIMUM_ACQUISITION_RADIUS: f32 = 4.0;
 

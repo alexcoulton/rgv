@@ -1,4 +1,25 @@
-use super::super::*;
+use crate::inspection::model::InspectorSnapshot;
+use crate::inspection::read::{
+    alignment_edit_fields, bounded_aligned_sequence_copy, format_aux_value, format_cigar,
+    inspector_cigar_value, read_event_details,
+};
+use crate::inspection::rna::junction_annotation_context;
+use crate::ui::alignment_settings::{
+    bisulfite_context_label, modification_code_label, sbx_simplex_tail_mode_label,
+    smrt_kinetics_mode_label, ultima_event_unavailable_label, ultima_indel_kind_label,
+    ultima_quality_mode_label, ultima_quality_source_label,
+};
+use crate::{HoverInspectorTarget, Viewer};
+use rgv_alignment_scene::AlignmentComponent;
+use rgv_core::{AutomationSelectionKind, GenomicInterval, OverlappingMatePolicy, SashimiCountMode};
+use rgv_hts::{
+    AlignmentRecord, AuxValue, CigarOpKind, QUALITY_WEIGHT_SCALE, SequenceData,
+    UltimaTagOrientation, analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse,
+    decode_modified_bases, pair_evidence, smrt_kinetics_series, summarize_bisulfite_record,
+    summarize_sbx_record,
+};
+use rgv_layout::{AlignmentColorMode, JunctionAnnotationStatus, JunctionArcComponent};
+use std::fmt::Write as _;
 
 pub(crate) fn focused_junction_component_value(
     component: JunctionArcComponent,
@@ -85,6 +106,7 @@ fn alignment_component_event(
 /// Wording shown in the read inspector, in place of Rust enum variant names.
 pub(crate) const fn pair_classification_label(value: rgv_hts::PairClassification) -> &'static str {
     use rgv_hts::PairClassification as Pair;
+
     match value {
         Pair::Unpaired => "Unpaired read",
         Pair::ReadUnmapped => "Read unmapped",
@@ -1091,6 +1113,8 @@ impl Viewer {
 #[cfg(test)]
 mod scene_inspection_tests {
     use super::*;
+    use rgv_core::ContigId;
+    use rgv_hts::AlignedBaseClassification;
 
     #[test]
     fn pair_fields_use_reader_facing_wording_not_enum_names() {

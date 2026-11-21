@@ -1,4 +1,57 @@
-use super::super::*;
+use crate::app::tasks::NativeWindowCaptureTask;
+use crate::automation::{AutomationAuxiliaryOpenState, AutomationRunner};
+use crate::control_service::{ControlService, ControlStatusMetadata};
+use crate::diagnostics::LatencyEvent;
+use crate::diagnostics::{Diagnostics, HealthHandle, InteractionTraceStage};
+use crate::diagnostics::{ManualDiagnosticFramePhase, object_fields};
+use crate::display::alignment::persisted_style_tag;
+use crate::launch::{LaunchOptions, default_settings_path};
+use crate::sources::{
+    build_track_specs, load_assembly, opened_project_status, primary_alignment_track,
+    reference_open_options, source_display_name, source_path, spawn_track_engine_without_aliases,
+    track_source,
+};
+use crate::ui::{
+    CytobandAvailability, GenomeContextMetrics, MENU_HEIGHT, NAVIGATION_HEIGHT, STATUS_HEIGHT,
+    WorkspaceLayoutInput, WorkspaceLayoutSnapshot, WorkspacePanelLayoutInput,
+};
+use crate::workspace::alignments::{
+    AlignmentSceneBudgetSnapshot, EmptyAlignmentState, initial_filters,
+    spawn_alignment_track_controller,
+};
+use crate::workspace::navigation::{launch_contig_aliases, standalone_locus};
+use crate::workspace::navigation_transaction::NavigationPresentationPhase;
+use crate::workspace::panels::{INITIAL_PANEL_ID, PanelWorkspace, ViewPanelController};
+use crate::{
+    AlignmentGpuPrefetchState, AlignmentGpuSpeculationGate, AlignmentScenePublicationAuthority,
+    INITIAL_INTERVAL_END, INITIAL_INTERVAL_START, RemoteSourceEditor, SYNTHETIC_ALIGNMENT_TRACK_ID,
+    SYNTHETIC_CONTIG_LENGTH, SashimiInteractionDiagnostics, UiPanel, VariantPredicateOperator,
+    Viewer, alignment_gpu_bundle_is_current, app, apply_accessibility_preferences, ui,
+};
+use anyhow::{Context as _, Result};
+use egui_wgpu::{RendererOptions, ScreenDescriptor};
+use rgv_alignment_scene::{AlignmentPanelSceneStore, AllocationLedger};
+use rgv_core::{
+    AutomationEnvironmentTelemetry, AutomationErrorCode, ContigId, GeneticCode, GenomicInterval,
+    ReferenceDictionary, SessionAlignmentTrack, SessionDocument, SessionFilters,
+    SessionPaneTrackState, TrackId, TrackSource, VariantFieldScope, VariantMissingValueRule,
+    Viewport, WorkspacePresentation,
+};
+use rgv_engine::{ReferenceEngine, TrackSearchResults};
+use rgv_layout::DisplayList;
+use rgv_render::{
+    AlignmentGpuPrepareStats, AlignmentGpuRenderer, AlignmentSummaryGpuPrepareStats,
+    AlignmentSummaryGpuRenderer, ContextSceneGpuFrame, ContextSceneGpuRenderer, PrepareStats,
+    RectangleRenderer,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::keyboard::ModifiersState;
+use winit::window::Window;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrameTargetPlan {
@@ -702,7 +755,7 @@ impl Viewer {
                 automation_environment,
             )
         });
-        let stress_health = Arc::new(StressHealthPublisher::new(application_instance_id.clone()));
+        let stress_health = HealthHandle::new(application_instance_id.clone());
         // Everything a control client makes RGV open is held to these rules (APP-8).
         let control_source_policy = options.control_port.and_then(|_| {
             options
@@ -732,7 +785,7 @@ impl Viewer {
                     surface_width_pixels: surface_config.width,
                     surface_height_pixels: surface_config.height,
                     scale_factor: window.scale_factor(),
-                    stress_health: Arc::clone(&stress_health),
+                    stress_health: stress_health.clone(),
                     allow_private_network_urls: options.control_allow_private_urls,
                 },
             )
@@ -766,7 +819,6 @@ impl Viewer {
         let start_diagnostic_trace = options.start_diagnostic_trace;
         let mut viewer = Self {
             application_instance_id,
-            stress_health,
             workspace_revision: 1,
             document_state: app::document_state::DocumentState::default(),
             shell: app::shell_state::ShellState::default(),
@@ -852,6 +904,7 @@ impl Viewer {
             assembly_name: options.genome_name,
             cytoband_path: options.cytobands,
             data_status,
+            busy_status: app::status_activity::BusyStatus::default(),
             announced_status: String::new(),
             reference_reverse_complement: options
                 .loaded_session
@@ -928,10 +981,8 @@ impl Viewer {
             open_panel: initial_open_panel,
             remote_source_editor: RemoteSourceEditor::default(),
             diagnostics_open: false,
-            interaction_recording: InteractionRecorder::default(),
-            interaction_trace: InteractionTraceRecorder::default(),
-            manual_diagnostic_trace: ManualDiagnosticTraceRecorder::new(),
-            manual_diagnostic_trace_runtime: ManualDiagnosticTraceRuntime::new(
+            diagnostics: Diagnostics::new(
+                stress_health,
                 diagnostic_trace_directory,
                 adapter_info.name.clone(),
                 format!("{:?}", adapter_info.backend),
@@ -1286,15 +1337,15 @@ impl Viewer {
         let paint_jobs = self
             .egui_context
             .tessellate(full_output.shapes, full_output.pixels_per_point);
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::Tessellation,
             tessellation_started.elapsed(),
         );
-        if self.interaction_trace.is_active() {
-            self.interaction_trace.record_phase(
+        if self.diagnostics.latency_active() {
+            self.diagnostics.latency(LatencyEvent::Phase(
                 InteractionTraceStage::EguiTessellationFinished,
                 tessellation_started.elapsed(),
-            );
+            ));
         }
         let screen_descriptor = ScreenDescriptor {
             size_in_pixels: [self.surface_config.width, self.surface_config.height],
@@ -1341,7 +1392,7 @@ impl Viewer {
                 Some(frame)
             }
             wgpu::CurrentSurfaceTexture::Timeout => {
-                self.record_manual_diagnostic_frame_phase(
+                self.diagnostics.frame_phase(
                     ManualDiagnosticFramePhase::SurfaceAcquisition,
                     surface_started.elapsed(),
                 );
@@ -1351,7 +1402,7 @@ impl Viewer {
             }
             wgpu::CurrentSurfaceTexture::Occluded => {
                 if self.automation.is_none() {
-                    self.record_manual_diagnostic_frame_phase(
+                    self.diagnostics.frame_phase(
                         ManualDiagnosticFramePhase::SurfaceAcquisition,
                         surface_started.elapsed(),
                     );
@@ -1365,7 +1416,7 @@ impl Viewer {
                 None
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.record_manual_diagnostic_frame_phase(
+                self.diagnostics.frame_phase(
                     ManualDiagnosticFramePhase::SurfaceAcquisition,
                     surface_started.elapsed(),
                 );
@@ -1375,7 +1426,7 @@ impl Viewer {
                 return;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
-                self.record_manual_diagnostic_frame_phase(
+                self.diagnostics.frame_phase(
                     ManualDiagnosticFramePhase::SurfaceAcquisition,
                     surface_started.elapsed(),
                 );
@@ -1407,13 +1458,13 @@ impl Viewer {
             .or(automation_surface_texture.as_ref())
             .expect("presented or automation frame target exists")
             .create_view(&wgpu::TextureViewDescriptor::default());
-        if self.interaction_trace.is_active() && automation_surface_texture.is_none() {
-            self.interaction_trace.record_phase(
+        if self.diagnostics.latency_active() && automation_surface_texture.is_none() {
+            self.diagnostics.latency(LatencyEvent::Phase(
                 InteractionTraceStage::SurfaceAcquired,
                 surface_started.elapsed(),
-            );
+            ));
         }
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::SurfaceAcquisition,
             surface_started.elapsed(),
         );
@@ -1430,15 +1481,15 @@ impl Viewer {
             &paint_jobs,
             &screen_descriptor,
         );
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::EguiBuffers,
             egui_buffers_started.elapsed(),
         );
-        if self.interaction_trace.is_active() {
-            self.interaction_trace.record_phase(
+        if self.diagnostics.latency_active() {
+            self.diagnostics.latency(LatencyEvent::Phase(
                 InteractionTraceStage::EguiBuffersFinished,
                 egui_buffers_started.elapsed(),
-            );
+            ));
         }
         let scale_factor = self.window.scale_factor() as f32;
         let targets = frame_target_plan(capture_texture.is_some());
@@ -1538,13 +1589,13 @@ impl Viewer {
                 self.window.request_redraw();
             }
         }
-        if self.interaction_trace.is_active() {
-            self.interaction_trace.record_phase(
+        if self.diagnostics.latency_active() {
+            self.diagnostics.latency(LatencyEvent::Phase(
                 InteractionTraceStage::QueueSubmitted,
                 queue_started.elapsed(),
-            );
+            ));
         }
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::QueueSubmission,
             queue_started.elapsed(),
         );
@@ -1552,13 +1603,13 @@ impl Viewer {
         if let Some(surface_frame) = surface_frame {
             surface_frame.present();
         }
-        if self.interaction_trace.is_active() && automation_surface_texture.is_none() {
-            self.interaction_trace.record_phase(
+        if self.diagnostics.latency_active() && automation_surface_texture.is_none() {
+            self.diagnostics.latency(LatencyEvent::Phase(
                 InteractionTraceStage::PresentCalled,
                 present_started.elapsed(),
-            );
+            ));
         }
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::Present,
             present_started.elapsed(),
         );
@@ -1568,8 +1619,8 @@ impl Viewer {
             self.complete_native_window_capture(task, pixels);
         }
         let frame_ms = frame_started.elapsed().as_secs_f64() * 1_000.0;
-        self.interaction_trace
-            .frame_finished(frame_started.elapsed());
+        self.diagnostics
+            .latency(LatencyEvent::FrameFinished(frame_started.elapsed()));
         self.smoothed_frame_ms = self.smoothed_frame_ms * 0.9 + frame_ms * 0.1;
         let navigation_frame = self
             .automation

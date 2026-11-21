@@ -11,11 +11,11 @@ use rgv_hts::{AlignmentRecord, ModificationCode, PackedRecordError, decode_modif
 use thiserror::Error;
 
 use crate::{
-    AlignmentHandle, AlignmentPageFamily, AlignmentPageKey, AlignmentRowAtlas,
-    AlignmentRowAtlasPins, AlignmentSemanticPage, AllocationClass, AllocationLease,
-    AllocationLedger, CanonicalGenomicTile, CanonicalRowBlock, CapabilityRequirement, EvidencePins,
-    EvidenceRoot, EvidenceSelectionError, LedgerError, PinnedAllocationLease, PresentationContract,
-    ReservationKind, SceneRevision,
+    AlignmentHandle, AlignmentPageFamily, AlignmentPageIdentity, AlignmentPageKey,
+    AlignmentRowAtlas, AlignmentRowAtlasPins, AlignmentSemanticPage, AllocationClass,
+    AllocationLease, AllocationLedger, CanonicalGenomicTile, CanonicalRowBlock,
+    CapabilityRequirement, EvidencePins, EvidenceRoot, EvidenceSelectionError, LedgerError,
+    PinnedAllocationLease, PresentationContract, ReservationKind, SceneRevision,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -63,7 +63,41 @@ impl AlignmentPresentationScene {
         presentation: PresentationContract,
         prepared_interval: GenomicInterval,
         prepared_rows: Range<u32>,
+        pages: Vec<Arc<AlignmentSemanticPage>>,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, AlignmentPresentationSceneError> {
+        Self::new_with_page_identities(
+            revision,
+            evidence,
+            atlas,
+            presentation,
+            prepared_interval,
+            prepared_rows,
+            pages,
+            None,
+            ledger,
+            reservation_kind,
+            publication_revision,
+        )
+    }
+
+    /// Assembles a scene whose pages may have been built from earlier compatible roots.
+    ///
+    /// `identities[i]` is the content identity the page store derived for `pages[i]` from
+    /// *these* roots. A page whose key carries other revisions is admitted only when its own
+    /// identity equals that derivation, i.e. when a build from these roots would reproduce it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_page_identities(
+        revision: SceneRevision,
+        evidence: Arc<EvidenceRoot>,
+        atlas: Arc<AlignmentRowAtlas>,
+        presentation: PresentationContract,
+        prepared_interval: GenomicInterval,
+        prepared_rows: Range<u32>,
         mut pages: Vec<Arc<AlignmentSemanticPage>>,
+        identities: Option<&[AlignmentPageIdentity]>,
         ledger: &AllocationLedger,
         reservation_kind: ReservationKind,
         publication_revision: u64,
@@ -75,6 +109,7 @@ impl AlignmentPresentationScene {
             prepared_interval,
             &prepared_rows,
             &pages,
+            identities,
         )?;
         pages.sort_unstable_by_key(|page| page.key());
         let first_key = pages
@@ -685,7 +720,11 @@ fn validate_scene_dependencies(
     prepared_interval: GenomicInterval,
     prepared_rows: &Range<u32>,
     pages: &[Arc<AlignmentSemanticPage>],
+    identities: Option<&[AlignmentPageIdentity]>,
 ) -> Result<(), AlignmentPresentationSceneError> {
+    if identities.is_some_and(|identities| identities.len() != pages.len()) {
+        return Err(AlignmentPresentationSceneError::AuthorityMismatch);
+    }
     if !atlas.shares_stable_record_authority(evidence) {
         return Err(AlignmentPresentationSceneError::AuthorityMismatch);
     }
@@ -709,14 +748,24 @@ fn validate_scene_dependencies(
     let mut keys = HashSet::<AlignmentPageKey>::with_capacity(pages.len());
     let required_families = presentation.required_page_families();
     let first = pages[0].key();
-    for page in pages {
+    for (index, page) in pages.iter().enumerate() {
         let key = page.key();
         if !keys.insert(key) {
             return Err(AlignmentPresentationSceneError::DuplicatePage(key));
         }
+        // A page is this scene's own when its key names these exact roots. Otherwise it must be
+        // a proven reuse: the store derived the page's content identity from these roots and it
+        // equals the identity the page was built with.
+        let built_from_these_roots = key.evidence_revision() == evidence.revision()
+            && key.row_atlas_revision() == atlas.revision();
+        let identity = page.identity();
+        let proven_reuse = identities
+            .and_then(|identities| identities.get(index))
+            .is_some_and(|expected| *expected == identity)
+            && identity.record_contract() == evidence.record_contract()
+            && identity.view_filter() == atlas.view_filter();
         if key.source_revision() != evidence.source_revision()
-            || key.evidence_revision() != evidence.revision()
-            || key.row_atlas_revision() != atlas.revision()
+            || !(built_from_these_roots || proven_reuse)
             || key.layout() != atlas.layout_contract().fingerprint()
             || key.presentation() != presentation.page_fingerprint(key.family())
             || key.lod() != presentation.geometry_lod

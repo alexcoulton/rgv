@@ -1,4 +1,28 @@
-use super::*;
+use super::enabled::Diagnostics;
+use super::manual_diagnostic_trace::{
+    ManualDiagnosticInteractionId, ManualDiagnosticTraceFields, ManualDiagnosticTraceState,
+};
+use super::{ManualDiagnosticFramePhase, object_fields};
+use crate::display::alignment::materialized_alignment_row_range;
+use crate::workspace::alignments::alignment_effective_view_predicates;
+use crate::workspace::panels::{
+    ReadRowCoordinateAuthority, current_read_row_authority, read_panel_materialization_coverage,
+};
+use crate::{Viewer, alignment_gpu_bundle_is_current, ui};
+use rgv_alignment_scene::{
+    AlignmentComponent, AlignmentSceneSnapshot, AlignmentViewFilterContract, ContractFingerprint,
+    ReferenceRevision, RevisionFingerprint,
+};
+use rgv_core::{
+    AlignmentAuxFilterValue, AlignmentPredicateScope, AlignmentViewPredicate, PanelId, TrackId,
+    TrackSource,
+};
+use rgv_engine::AlignmentSceneRequestToken;
+use rgv_render::{AlignmentGpuPrefetchCursor, AlignmentSummaryGpuPrefetchCursor};
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
 const MANUAL_TRACE_STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const MANUAL_TRACE_WHEEL_IDLE_INTERVAL: Duration = Duration::from_millis(250);
@@ -268,57 +292,6 @@ fn diagnostic_alignment_component(component: AlignmentComponent) -> &'static str
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ManualDiagnosticFramePhase {
-    PollBackground,
-    ApplyCapturedMotion,
-    FirstDisplayRebuild,
-    Shell,
-    ShellPreparation,
-    ShellDiagnostics,
-    ShellInspectors,
-    ShellPairSummary,
-    ShellScrollbars,
-    ShellTextCopy,
-    ShellOverviewProjection,
-    ShellUiRun,
-    ShellPostProcess,
-    SecondDisplayRebuild,
-    Tessellation,
-    SurfaceAcquisition,
-    EguiBuffers,
-    QueueSubmission,
-    Present,
-    Prefetch,
-}
-
-impl ManualDiagnosticFramePhase {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::PollBackground => "poll_background",
-            Self::ApplyCapturedMotion => "apply_captured_motion",
-            Self::FirstDisplayRebuild => "first_display_rebuild",
-            Self::Shell => "shell",
-            Self::ShellPreparation => "shell_preparation",
-            Self::ShellDiagnostics => "shell_diagnostics",
-            Self::ShellInspectors => "shell_inspectors",
-            Self::ShellPairSummary => "shell_pair_summary",
-            Self::ShellScrollbars => "shell_scrollbars",
-            Self::ShellTextCopy => "shell_text_copy",
-            Self::ShellOverviewProjection => "shell_overview_projection",
-            Self::ShellUiRun => "shell_ui_run",
-            Self::ShellPostProcess => "shell_post_process",
-            Self::SecondDisplayRebuild => "second_display_rebuild",
-            Self::Tessellation => "tessellation",
-            Self::SurfaceAcquisition => "surface_acquisition",
-            Self::EguiBuffers => "egui_buffers",
-            Self::QueueSubmission => "queue_submission",
-            Self::Present => "present",
-            Self::Prefetch => "prefetch",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ManualDiagnosticDisplayInvalidation {
     sequence: u64,
@@ -559,20 +532,21 @@ impl ManualDiagnosticTraceRuntime {
     }
 }
 
-impl Viewer {
-    /// Marks the generic display derivative stale and, while a manual trace is recording,
-    /// preserves the exact producer and frame phase. Recording repeated marks while already dirty
+impl Diagnostics {
+    /// Called when the generic display derivative is marked stale. While a manual trace is
+    /// recording, preserves the exact producer and frame phase. Recording repeated marks while already dirty
     /// is intentional: those marks reveal the feedback loop that can re-dirty a just-rebuilt
     /// display every frame.
-    #[track_caller]
-    pub(crate) fn mark_display_dirty(&mut self, reason: &'static str) {
-        let was_already_dirty = self.display_dirty;
-        self.display_dirty = true;
-        if !self.manual_diagnostic_trace_is_recording() {
+    pub(crate) fn display_marked_dirty(
+        &mut self,
+        reason: &'static str,
+        caller: &std::panic::Location<'_>,
+        was_already_dirty: bool,
+    ) {
+        if !self.recording() {
             return;
         }
-        let caller = std::panic::Location::caller();
-        let runtime = &mut self.manual_diagnostic_trace_runtime;
+        let runtime = &mut self.manual_runtime;
         runtime.display_dirty_mark_sequence = runtime.display_dirty_mark_sequence.saturating_add(1);
         let invalidation = ManualDiagnosticDisplayInvalidation {
             sequence: runtime.display_dirty_mark_sequence,
@@ -586,47 +560,46 @@ impl Viewer {
         };
         runtime.last_display_invalidation = Some(invalidation.clone());
         let interaction_id = self
-            .manual_diagnostic_trace_runtime
+            .manual_runtime
             .pointer_interaction
-            .or(self.manual_diagnostic_trace_runtime.wheel_interaction)
+            .or(self.manual_runtime.wheel_interaction)
             .map(ManualDiagnosticInteractionId::get);
-        self.manual_diagnostic_trace.record(
+        self.manual.record(
             "display_invalidation",
             "marked_dirty",
             object_fields(serde_json::json!({
                 "causal_interaction_id": interaction_id,
-                "display_dirty_after": self.display_dirty,
+                "display_dirty_after": true,
                 "invalidation": invalidation.json(),
             })),
         );
     }
 
-    /// Clears display invalidation only after the complete CPU/GPU display derivative has been
-    /// rebuilt. The clear sequence is paired with mark sequences in per-frame diagnostics.
-    #[track_caller]
-    pub(crate) fn clear_display_dirty(&mut self, reason: &'static str) {
-        let was_dirty = self.display_dirty;
-        self.display_dirty = false;
-        if !self.manual_diagnostic_trace_is_recording() {
+    /// Called when display invalidation is cleared after the complete CPU/GPU display derivative
+    /// has been rebuilt. The clear sequence is paired with mark sequences in per-frame diagnostics.
+    pub(crate) fn display_cleared_dirty(
+        &mut self,
+        reason: &'static str,
+        caller: &std::panic::Location<'_>,
+        was_dirty: bool,
+    ) {
+        if !self.recording() {
             return;
         }
-        let caller = std::panic::Location::caller();
-        let runtime = &mut self.manual_diagnostic_trace_runtime;
+        let runtime = &mut self.manual_runtime;
         runtime.display_dirty_clear_sequence =
             runtime.display_dirty_clear_sequence.saturating_add(1);
         let frame_id = self
-            .manual_diagnostic_trace_runtime
+            .manual_runtime
             .current_frame
             .as_ref()
             .map(|frame| frame.frame_id);
-        let after_phase = self
-            .manual_diagnostic_trace_runtime
-            .last_completed_frame_phase;
-        self.manual_diagnostic_trace.record(
+        let after_phase = self.manual_runtime.last_completed_frame_phase;
+        self.manual.record(
             "display_invalidation",
             "cleared_dirty",
             object_fields(serde_json::json!({
-                "sequence": self.manual_diagnostic_trace_runtime.display_dirty_clear_sequence,
+                "sequence": self.manual_runtime.display_dirty_clear_sequence,
                 "reason": reason,
                 "caller_file": diagnostic_caller_file(caller.file()),
                 "caller_line": caller.line(),
@@ -634,11 +607,41 @@ impl Viewer {
                 "frame_id": frame_id,
                 "after_phase": after_phase,
                 "was_dirty": was_dirty,
-                "display_dirty_after": self.display_dirty,
+                "display_dirty_after": false,
             })),
         );
     }
 
+    /// Records one event in the manual diagnostic trace; a no-op unless it is recording.
+    pub(crate) fn event(&mut self, category: &str, name: &str, fields: serde_json::Value) {
+        if !self.recording() {
+            return;
+        }
+        self.manual.record(category, name, object_fields(fields));
+    }
+
+    /// Attributes `duration` to `phase` of the frame currently being traced, if any.
+    pub(crate) fn frame_phase(&mut self, phase: ManualDiagnosticFramePhase, duration: Duration) {
+        let marks = self.manual_runtime.display_dirty_mark_sequence;
+        let clears = self.manual_runtime.display_dirty_clear_sequence;
+        if let Some(frame) = self.manual_runtime.current_frame.as_mut() {
+            frame.add(phase, duration);
+            frame.note_display_invalidation_progress(phase, marks, clears);
+        }
+        self.manual_runtime.last_completed_frame_phase = Some(phase.label());
+    }
+
+    /// Whether the manual diagnostic trace is recording. Call sites use this to skip building
+    /// event payloads.
+    pub(crate) fn recording(&self) -> bool {
+        matches!(
+            self.manual.status().state,
+            ManualDiagnosticTraceState::Recording
+        )
+    }
+}
+
+impl Viewer {
     pub(crate) fn maybe_start_pending_manual_diagnostic_trace(&mut self) {
         if !self.manual_diagnostic_trace_autostart_pending {
             return;
@@ -659,7 +662,8 @@ impl Viewer {
     }
 
     pub(crate) fn start_manual_diagnostic_trace(&mut self, trigger: &str, show_diagnostics: bool) {
-        self.manual_diagnostic_trace_runtime
+        self.diagnostics
+            .manual_runtime
             .reset_for_recording(&self.data_status);
         let panel = self.panels.active();
         let source_kinds = self
@@ -682,8 +686,8 @@ impl Viewer {
             "application_instance_id": self.application_instance_id,
             "operating_system": std::env::consts::OS,
             "architecture": std::env::consts::ARCH,
-            "gpu_adapter": self.manual_diagnostic_trace_runtime.gpu_adapter,
-            "gpu_backend": self.manual_diagnostic_trace_runtime.gpu_backend,
+            "gpu_adapter": self.diagnostics.manual_runtime.gpu_adapter,
+            "gpu_backend": self.diagnostics.manual_runtime.gpu_backend,
             "surface_width_pixels": self.surface_config.width,
             "surface_height_pixels": self.surface_config.height,
             "scale_factor": self.window.scale_factor(),
@@ -715,10 +719,10 @@ impl Viewer {
             ],
             "privacy": "No sequence, read names, auxiliary-tag values, credentials, or remote URLs are intentionally recorded. Filter kinds, numeric thresholds, redacted auxiliary value types, user-visible diagnostic/status text, and genomic loci are included.",
         }));
-        let session = self.manual_diagnostic_trace.start_with_metadata(metadata);
+        let session = self.diagnostics.manual.start_with_metadata(metadata);
         tracing::info!(
             session_id = session.as_str(),
-            output_directory = %self.manual_diagnostic_trace_runtime.output_directory.display(),
+            output_directory = %self.diagnostics.manual_runtime.output_directory.display(),
             "manual diagnostic trace started"
         );
         if show_diagnostics {
@@ -728,7 +732,7 @@ impl Viewer {
     }
 
     pub(crate) fn stop_and_save_manual_diagnostic_trace(&mut self) {
-        if !self.manual_diagnostic_trace.stop() {
+        if !self.diagnostics.manual.stop() {
             return;
         }
         self.save_manual_diagnostic_trace("manual stop");
@@ -737,13 +741,14 @@ impl Viewer {
 
     pub(crate) fn save_recording_manual_diagnostic_trace_before_exit(&mut self) {
         if matches!(
-            self.manual_diagnostic_trace.status().state,
+            self.diagnostics.manual.status().state,
             ManualDiagnosticTraceState::Recording
         ) {
             let fields = object_fields(serde_json::json!({ "reason": "application exit" }));
-            self.manual_diagnostic_trace
+            self.diagnostics
+                .manual
                 .record("lifecycle", "application_exit", fields);
-            let _ = self.manual_diagnostic_trace.stop();
+            let _ = self.diagnostics.manual.stop();
             self.save_manual_diagnostic_trace("application exit");
         } else {
             self.save_frozen_manual_diagnostic_trace_if_needed();
@@ -751,7 +756,7 @@ impl Viewer {
     }
 
     pub(crate) fn manual_diagnostic_trace_snapshot(&self) -> ui::ManualInteractionTraceSnapshot {
-        let status = self.manual_diagnostic_trace.status();
+        let status = self.diagnostics.manual.status();
         let retained_duration = match (status.first_elapsed_us, status.last_elapsed_us) {
             (Some(first), Some(last)) => Duration::from_micros(last.saturating_sub(first)),
             _ => Duration::ZERO,
@@ -768,17 +773,18 @@ impl Viewer {
                 .saturating_add(status.overwritten_events),
             retained_duration,
             saved_path: self
-                .manual_diagnostic_trace_runtime
+                .diagnostics
+                .manual_runtime
                 .last_saved_path
                 .as_ref()
                 .map(|path| path.display().to_string()),
-            failure: self.manual_diagnostic_trace_runtime.failure.clone(),
+            failure: self.diagnostics.manual_runtime.failure.clone(),
         }
     }
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn record_manual_window_event(&mut self, event: &WindowEvent, consumed: bool) {
-        if !self.manual_diagnostic_trace_is_recording() {
+        if !self.diagnostics.recording() {
             return;
         }
         self.finish_idle_manual_wheel_interaction();
@@ -809,47 +815,43 @@ impl Viewer {
                 );
                 fields.insert("state".to_owned(), serde_json::json!(format!("{state:?}")));
                 if *button == MouseButton::Left && *state == ElementState::Pressed {
-                    if let Some(previous) = self
-                        .manual_diagnostic_trace_runtime
-                        .pointer_interaction
-                        .take()
+                    if let Some(previous) =
+                        self.diagnostics.manual_runtime.pointer_interaction.take()
                     {
-                        self.manual_diagnostic_trace.end_interaction(
+                        self.diagnostics.manual.end_interaction(
                             previous,
                             "input",
                             "pointer_superseded",
                             ManualDiagnosticTraceFields::new(),
                         );
                     }
-                    self.manual_diagnostic_trace_runtime.pointer_interaction = self
-                        .manual_diagnostic_trace
+                    self.diagnostics.manual_runtime.pointer_interaction = self
+                        .diagnostics
+                        .manual
                         .begin_interaction("input", "pointer_press", fields);
                 } else if *button == MouseButton::Left && *state == ElementState::Released {
-                    if let Some(id) = self
-                        .manual_diagnostic_trace_runtime
-                        .pointer_interaction
-                        .take()
-                    {
-                        self.manual_diagnostic_trace.end_interaction(
+                    if let Some(id) = self.diagnostics.manual_runtime.pointer_interaction.take() {
+                        self.diagnostics.manual.end_interaction(
                             id,
                             "input",
                             "pointer_release",
                             fields,
                         );
                     } else {
-                        self.manual_diagnostic_trace.record(
+                        self.diagnostics.manual.record(
                             "input",
                             "pointer_release_without_press",
                             fields,
                         );
                     }
                 } else {
-                    self.manual_diagnostic_trace
+                    self.diagnostics
+                        .manual
                         .record("input", "mouse_button", fields);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some(id) = self.manual_diagnostic_trace_runtime.pointer_interaction {
+                if let Some(id) = self.diagnostics.manual_runtime.pointer_interaction {
                     let fields = object_fields(serde_json::json!({
                         "x_physical": position.x,
                         "y_physical": position.y,
@@ -857,22 +859,15 @@ impl Viewer {
                         "canvas_dragging": self.dragging,
                         "vertical_scrollbar_dragging": self.vertical_overview_drag.is_some(),
                     }));
-                    self.manual_diagnostic_trace.record_interaction(
-                        id,
-                        "input",
-                        "pointer_move",
-                        fields,
-                    );
+                    self.diagnostics
+                        .manual
+                        .record_interaction(id, "input", "pointer_move", fields);
                 }
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
-                if self
-                    .manual_diagnostic_trace_runtime
-                    .wheel_interaction
-                    .is_none()
-                {
-                    self.manual_diagnostic_trace_runtime.wheel_interaction =
-                        self.manual_diagnostic_trace.begin_interaction(
+                if self.diagnostics.manual_runtime.wheel_interaction.is_none() {
+                    self.diagnostics.manual_runtime.wheel_interaction =
+                        self.diagnostics.manual.begin_interaction(
                             "input",
                             "wheel_begin",
                             object_fields(serde_json::json!({
@@ -882,7 +877,7 @@ impl Viewer {
                             })),
                         );
                 }
-                self.manual_diagnostic_trace_runtime.wheel_last_event = Some(Instant::now());
+                self.diagnostics.manual_runtime.wheel_last_event = Some(Instant::now());
                 let (delta_kind, delta_x, delta_y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => ("line", f64::from(*x), f64::from(*y)),
                     MouseScrollDelta::PixelDelta(position) => ("pixel", position.x, position.y),
@@ -896,25 +891,22 @@ impl Viewer {
                     "shift": self.modifiers.shift_key(),
                     "cursor_in_genomic_canvas": self.cursor_in_genomic_canvas(),
                 }));
-                if let Some(id) = self.manual_diagnostic_trace_runtime.wheel_interaction {
-                    self.manual_diagnostic_trace.record_interaction(
-                        id,
-                        "input",
-                        "wheel_delta",
-                        fields,
-                    );
+                if let Some(id) = self.diagnostics.manual_runtime.wheel_interaction {
+                    self.diagnostics
+                        .manual
+                        .record_interaction(id, "input", "wheel_delta", fields);
                     if matches!(
                         phase,
                         winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
                     ) {
-                        self.manual_diagnostic_trace.end_interaction(
+                        self.diagnostics.manual.end_interaction(
                             id,
                             "input",
                             "wheel_end",
                             ManualDiagnosticTraceFields::new(),
                         );
-                        self.manual_diagnostic_trace_runtime.wheel_interaction = None;
-                        self.manual_diagnostic_trace_runtime.wheel_last_event = None;
+                        self.diagnostics.manual_runtime.wheel_interaction = None;
+                        self.diagnostics.manual_runtime.wheel_last_event = None;
                     }
                 }
             }
@@ -928,12 +920,12 @@ impl Viewer {
                     "shift": self.modifiers.shift_key(),
                     "alt": self.modifiers.alt_key(),
                 }));
-                if let Some(id) = self.manual_diagnostic_trace.begin_interaction(
-                    "input",
-                    "keyboard_press",
-                    fields,
-                ) {
-                    self.manual_diagnostic_trace.end_interaction(
+                if let Some(id) =
+                    self.diagnostics
+                        .manual
+                        .begin_interaction("input", "keyboard_press", fields)
+                {
+                    self.diagnostics.manual.end_interaction(
                         id,
                         "input",
                         "keyboard_dispatch",
@@ -942,7 +934,7 @@ impl Viewer {
                 }
             }
             WindowEvent::Resized(size) => {
-                self.manual_diagnostic_trace.record(
+                self.diagnostics.manual.record(
                     "window",
                     "resized",
                     object_fields(serde_json::json!({
@@ -952,21 +944,21 @@ impl Viewer {
                 );
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.manual_diagnostic_trace.record(
+                self.diagnostics.manual.record(
                     "window",
                     "scale_factor_changed",
                     object_fields(serde_json::json!({ "scale_factor": scale_factor })),
                 );
             }
             WindowEvent::Focused(focused) => {
-                self.manual_diagnostic_trace.record(
+                self.diagnostics.manual.record(
                     "window",
                     "focus_changed",
                     object_fields(serde_json::json!({ "focused": focused })),
                 );
             }
             WindowEvent::RedrawRequested => {
-                self.manual_diagnostic_trace.record(
+                self.diagnostics.manual.record(
                     "frame",
                     "redraw_requested",
                     ManualDiagnosticTraceFields::new(),
@@ -977,13 +969,13 @@ impl Viewer {
     }
 
     pub(crate) fn record_manual_device_event(&mut self, event: &DeviceEvent) {
-        if !self.manual_diagnostic_trace_is_recording() {
+        if !self.diagnostics.recording() {
             return;
         }
         if let DeviceEvent::MouseMotion { delta } = event
-            && let Some(id) = self.manual_diagnostic_trace_runtime.pointer_interaction
+            && let Some(id) = self.diagnostics.manual_runtime.pointer_interaction
         {
-            self.manual_diagnostic_trace.record_interaction(
+            self.diagnostics.manual.record_interaction(
                 id,
                 "input",
                 "raw_mouse_motion",
@@ -997,29 +989,31 @@ impl Viewer {
     }
 
     pub(crate) fn begin_manual_diagnostic_frame(&mut self) {
-        if !self.manual_diagnostic_trace_is_recording() {
-            self.manual_diagnostic_trace_runtime.current_frame = None;
+        if !self.diagnostics.recording() {
+            self.diagnostics.manual_runtime.current_frame = None;
             return;
         }
         self.finish_idle_manual_wheel_interaction();
-        self.manual_diagnostic_trace_runtime.frame_clock = self
-            .manual_diagnostic_trace_runtime
+        self.diagnostics.manual_runtime.frame_clock = self
+            .diagnostics
+            .manual_runtime
             .frame_clock
             .saturating_add(1);
-        let frame_id = self.manual_diagnostic_trace_runtime.frame_clock;
-        self.manual_diagnostic_trace_runtime
-            .last_completed_frame_phase = Some("frame_begin");
-        self.manual_diagnostic_trace_runtime.current_frame = Some(ManualDiagnosticFrameTimings {
+        let frame_id = self.diagnostics.manual_runtime.frame_clock;
+        self.diagnostics.manual_runtime.last_completed_frame_phase = Some("frame_begin");
+        self.diagnostics.manual_runtime.current_frame = Some(ManualDiagnosticFrameTimings {
             frame_id,
             display_dirty_marks_at_begin: self
-                .manual_diagnostic_trace_runtime
+                .diagnostics
+                .manual_runtime
                 .display_dirty_mark_sequence,
             display_dirty_clears_at_begin: self
-                .manual_diagnostic_trace_runtime
+                .diagnostics
+                .manual_runtime
                 .display_dirty_clear_sequence,
             ..ManualDiagnosticFrameTimings::default()
         });
-        self.manual_diagnostic_trace.record(
+        self.diagnostics.manual.record(
             "frame",
             "begin",
             object_fields(serde_json::json!({
@@ -1030,41 +1024,19 @@ impl Viewer {
         );
     }
 
-    pub(crate) fn record_manual_diagnostic_frame_phase(
-        &mut self,
-        phase: ManualDiagnosticFramePhase,
-        duration: Duration,
-    ) {
-        let marks = self
-            .manual_diagnostic_trace_runtime
-            .display_dirty_mark_sequence;
-        let clears = self
-            .manual_diagnostic_trace_runtime
-            .display_dirty_clear_sequence;
-        if let Some(frame) = self.manual_diagnostic_trace_runtime.current_frame.as_mut() {
-            frame.add(phase, duration);
-            frame.note_display_invalidation_progress(phase, marks, clears);
-        }
-        self.manual_diagnostic_trace_runtime
-            .last_completed_frame_phase = Some(phase.label());
-    }
-
     pub(crate) fn finish_manual_diagnostic_frame(&mut self, total: Duration) {
-        let Some(frame) = self.manual_diagnostic_trace_runtime.current_frame.take() else {
+        let Some(frame) = self.diagnostics.manual_runtime.current_frame.take() else {
             self.save_frozen_manual_diagnostic_trace_if_needed();
             return;
         };
         let interaction_id = self
-            .manual_diagnostic_trace_runtime
+            .diagnostics
+            .manual_runtime
             .pointer_interaction
-            .or(self.manual_diagnostic_trace_runtime.wheel_interaction)
+            .or(self.diagnostics.manual_runtime.wheel_interaction)
             .map(ManualDiagnosticInteractionId::get);
-        let marks_at_end = self
-            .manual_diagnostic_trace_runtime
-            .display_dirty_mark_sequence;
-        let clears_at_end = self
-            .manual_diagnostic_trace_runtime
-            .display_dirty_clear_sequence;
+        let marks_at_end = self.diagnostics.manual_runtime.display_dirty_mark_sequence;
+        let clears_at_end = self.diagnostics.manual_runtime.display_dirty_clear_sequence;
         let marks_after_first = frame
             .display_dirty_marks_after_first_rebuild
             .unwrap_or(frame.display_dirty_marks_at_begin);
@@ -1084,14 +1056,15 @@ impl Viewer {
             .display_dirty_clears_after_second_rebuild
             .unwrap_or(clears_after_shell);
         let last_display_invalidation = self
-            .manual_diagnostic_trace_runtime
+            .diagnostics
+            .manual_runtime
             .last_display_invalidation
             .as_ref()
             .map_or(
                 serde_json::Value::Null,
                 ManualDiagnosticDisplayInvalidation::json,
             );
-        self.manual_diagnostic_trace.record(
+        self.diagnostics.manual.record(
             "frame",
             "present_cycle_finished",
             object_fields(serde_json::json!({
@@ -1138,7 +1111,8 @@ impl Viewer {
         );
         self.record_manual_diagnostic_state_if_needed(frame.frame_id);
         if let Some(failure) = self
-            .manual_diagnostic_trace_runtime
+            .diagnostics
+            .manual_runtime
             .pending_critical_failure
             .take()
         {
@@ -1151,21 +1125,21 @@ impl Viewer {
         }
         self.record_manual_data_status_change();
         self.save_frozen_manual_diagnostic_trace_if_needed();
-        self.manual_diagnostic_trace_runtime
-            .last_completed_frame_phase = Some("frame_finished");
+        self.diagnostics.manual_runtime.last_completed_frame_phase = Some("frame_finished");
     }
 
     pub(crate) fn record_manual_navigation_intent(&mut self, kind: &str) {
-        if !self.manual_diagnostic_trace_is_recording() {
+        if !self.diagnostics.recording() {
             return;
         }
         let panel = self.panels.active();
         let causal_interaction_id = self
-            .manual_diagnostic_trace_runtime
+            .diagnostics
+            .manual_runtime
             .pointer_interaction
-            .or(self.manual_diagnostic_trace_runtime.wheel_interaction)
+            .or(self.diagnostics.manual_runtime.wheel_interaction)
             .map(ManualDiagnosticInteractionId::get);
-        self.manual_diagnostic_trace.record(
+        self.diagnostics.manual.record(
             "navigation",
             kind,
             object_fields(serde_json::json!({
@@ -1184,19 +1158,6 @@ impl Viewer {
         );
     }
 
-    pub(crate) fn record_manual_diagnostic_event(
-        &mut self,
-        category: &str,
-        name: &str,
-        fields: serde_json::Value,
-    ) {
-        if !self.manual_diagnostic_trace_is_recording() {
-            return;
-        }
-        self.manual_diagnostic_trace
-            .record(category, name, object_fields(fields));
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_manual_vertical_scroll_intent(
         &mut self,
@@ -1207,15 +1168,16 @@ impl Viewer {
         applied: f32,
         source: &str,
     ) {
-        if !self.manual_diagnostic_trace_is_recording() {
+        if !self.diagnostics.recording() {
             return;
         }
         let causal_interaction_id = self
-            .manual_diagnostic_trace_runtime
+            .diagnostics
+            .manual_runtime
             .pointer_interaction
-            .or(self.manual_diagnostic_trace_runtime.wheel_interaction)
+            .or(self.diagnostics.manual_runtime.wheel_interaction)
             .map(ManualDiagnosticInteractionId::get);
-        self.manual_diagnostic_trace.record(
+        self.diagnostics.manual.record(
             "vertical_navigation",
             "scroll_intent",
             object_fields(serde_json::json!({
@@ -1239,7 +1201,7 @@ impl Viewer {
         message: &str,
         mut fields: ManualDiagnosticTraceFields,
     ) {
-        if !self.manual_diagnostic_trace_is_recording() {
+        if !self.diagnostics.recording() {
             return;
         }
         fields.insert("message".to_owned(), serde_json::json!(message));
@@ -1248,10 +1210,11 @@ impl Viewer {
             self.manual_diagnostic_state_snapshot(),
         );
         if self
-            .manual_diagnostic_trace
+            .diagnostics
+            .manual
             .freeze_on_critical_failure(category, name, fields)
         {
-            self.manual_diagnostic_trace_runtime.failure = Some(message.to_owned());
+            self.diagnostics.manual_runtime.failure = Some(message.to_owned());
             self.save_frozen_manual_diagnostic_trace_if_needed();
             self.diagnostics_open = true;
             self.window.request_redraw();
@@ -1265,58 +1228,52 @@ impl Viewer {
         message: &str,
         fields: ManualDiagnosticTraceFields,
     ) {
-        self.stress_health
+        self.diagnostics
+            .health
+            .0
             .set_terminal_failure(Some("critical_invariant"));
-        if !self.manual_diagnostic_trace_is_recording() {
+        if !self.diagnostics.recording() {
             return;
         }
-        self.manual_diagnostic_trace
+        self.diagnostics
+            .manual
             .record(category, format!("{name}_detected"), fields);
-        self.manual_diagnostic_trace_runtime
-            .pending_critical_failure = Some(PendingManualDiagnosticFailure {
-            category: category.to_owned(),
-            name: name.to_owned(),
-            message: message.to_owned(),
-        });
-    }
-
-    pub(crate) fn manual_diagnostic_trace_is_recording(&self) -> bool {
-        matches!(
-            self.manual_diagnostic_trace.status().state,
-            ManualDiagnosticTraceState::Recording
-        )
+        self.diagnostics.manual_runtime.pending_critical_failure =
+            Some(PendingManualDiagnosticFailure {
+                category: category.to_owned(),
+                name: name.to_owned(),
+                message: message.to_owned(),
+            });
     }
 
     fn finish_idle_manual_wheel_interaction(&mut self) {
         let expired = self
-            .manual_diagnostic_trace_runtime
+            .diagnostics
+            .manual_runtime
             .wheel_last_event
             .is_some_and(|last| last.elapsed() >= MANUAL_TRACE_WHEEL_IDLE_INTERVAL);
         if !expired {
             return;
         }
-        if let Some(id) = self
-            .manual_diagnostic_trace_runtime
-            .wheel_interaction
-            .take()
-        {
-            self.manual_diagnostic_trace.end_interaction(
+        if let Some(id) = self.diagnostics.manual_runtime.wheel_interaction.take() {
+            self.diagnostics.manual.end_interaction(
                 id,
                 "input",
                 "wheel_idle_end",
                 ManualDiagnosticTraceFields::new(),
             );
         }
-        self.manual_diagnostic_trace_runtime.wheel_last_event = None;
+        self.diagnostics.manual_runtime.wheel_last_event = None;
     }
 
     fn record_manual_diagnostic_state_if_needed(&mut self, frame_id: u64) {
-        if !self.manual_diagnostic_trace_is_recording() {
+        if !self.diagnostics.recording() {
             return;
         }
         let now = Instant::now();
         let interval_elapsed = self
-            .manual_diagnostic_trace_runtime
+            .diagnostics
+            .manual_runtime
             .last_state_sample
             .is_none_or(|last| {
                 now.saturating_duration_since(last) >= MANUAL_TRACE_STATE_SAMPLE_INTERVAL
@@ -1325,10 +1282,10 @@ impl Viewer {
             return;
         }
         let state = self.manual_diagnostic_state_snapshot();
-        let changed = self.manual_diagnostic_trace_runtime.last_state.as_ref() != Some(&state);
-        self.manual_diagnostic_trace_runtime.last_state = Some(state.clone());
-        self.manual_diagnostic_trace_runtime.last_state_sample = Some(now);
-        self.manual_diagnostic_trace.record(
+        let changed = self.diagnostics.manual_runtime.last_state.as_ref() != Some(&state);
+        self.diagnostics.manual_runtime.last_state = Some(state.clone());
+        self.diagnostics.manual_runtime.last_state_sample = Some(now);
+        self.diagnostics.manual.record(
             "state",
             if changed { "changed" } else { "periodic" },
             object_fields(serde_json::json!({
@@ -1347,7 +1304,7 @@ impl Viewer {
         panel_id: PanelId,
         track_id: TrackId,
     ) -> serde_json::Value {
-        if !self.manual_diagnostic_trace_is_recording() {
+        if !self.diagnostics.recording() {
             return serde_json::Value::Null;
         }
         let Some(track) = self
@@ -2021,7 +1978,8 @@ impl Viewer {
             })
         });
         let last_display_invalidation = self
-            .manual_diagnostic_trace_runtime
+            .diagnostics
+            .manual_runtime
             .last_display_invalidation
             .as_ref()
             .map_or(
@@ -2073,8 +2031,8 @@ impl Viewer {
                 "surface_height": self.surface_config.height,
                 "scale_factor": self.window.scale_factor(),
                 "display_dirty": self.display_dirty,
-                "display_dirty_mark_sequence": self.manual_diagnostic_trace_runtime.display_dirty_mark_sequence,
-                "display_dirty_clear_sequence": self.manual_diagnostic_trace_runtime.display_dirty_clear_sequence,
+                "display_dirty_mark_sequence": self.diagnostics.manual_runtime.display_dirty_mark_sequence,
+                "display_dirty_clear_sequence": self.diagnostics.manual_runtime.display_dirty_clear_sequence,
                 "last_display_invalidation": last_display_invalidation,
             },
             "input": {
@@ -2182,21 +2140,18 @@ impl Viewer {
 
     fn record_manual_data_status_change(&mut self) {
         if manual_trace_status_is_critical(&self.data_status) {
-            self.stress_health
+            self.diagnostics
+                .health
+                .0
                 .set_terminal_failure(Some("critical_invariant"));
         }
-        if !self.manual_diagnostic_trace_is_recording()
-            || self
-                .manual_diagnostic_trace_runtime
-                .last_observed_data_status
-                == self.data_status
+        if !self.diagnostics.recording()
+            || self.diagnostics.manual_runtime.last_observed_data_status == self.data_status
         {
             return;
         }
         let previous = std::mem::replace(
-            &mut self
-                .manual_diagnostic_trace_runtime
-                .last_observed_data_status,
+            &mut self.diagnostics.manual_runtime.last_observed_data_status,
             self.data_status.clone(),
         );
         let fields = object_fields(serde_json::json!({
@@ -2212,38 +2167,33 @@ impl Viewer {
                 fields,
             );
         } else {
-            self.manual_diagnostic_trace
+            self.diagnostics
+                .manual
                 .record("status", "data_status_changed", fields);
         }
     }
 
     fn save_frozen_manual_diagnostic_trace_if_needed(&mut self) {
         if matches!(
-            self.manual_diagnostic_trace.status().state,
+            self.diagnostics.manual.status().state,
             ManualDiagnosticTraceState::Frozen
-        ) && self
-            .manual_diagnostic_trace_runtime
-            .last_saved_path
-            .is_none()
+        ) && self.diagnostics.manual_runtime.last_saved_path.is_none()
         {
             self.save_manual_diagnostic_trace("critical failure");
         }
     }
 
     fn save_manual_diagnostic_trace(&mut self, reason: &str) {
-        let payload = match self.manual_diagnostic_trace.export_payload() {
+        let payload = match self.diagnostics.manual.export_payload() {
             Ok(payload) => payload,
             Err(error) => {
                 let message = format!("could not serialize manual trace: {error}");
-                self.manual_diagnostic_trace_runtime.failure = Some(message.clone());
+                self.diagnostics.manual_runtime.failure = Some(message.clone());
                 tracing::error!(%error, "could not serialize manual diagnostic trace");
                 return;
             }
         };
-        let directory = self
-            .manual_diagnostic_trace_runtime
-            .output_directory
-            .clone();
+        let directory = self.diagnostics.manual_runtime.output_directory.clone();
         let path = directory.join(&payload.suggested_filename);
         let result = (|| -> std::io::Result<()> {
             std::fs::create_dir_all(&directory)?;
@@ -2255,7 +2205,7 @@ impl Viewer {
         })();
         match result {
             Ok(()) => {
-                self.manual_diagnostic_trace_runtime.last_saved_path = Some(path.clone());
+                self.diagnostics.manual_runtime.last_saved_path = Some(path.clone());
                 tracing::info!(
                     %reason,
                     path = %path.display(),
@@ -2266,15 +2216,11 @@ impl Viewer {
             }
             Err(error) => {
                 let message = format!("could not save trace to {}: {error}", path.display());
-                self.manual_diagnostic_trace_runtime.failure = Some(message.clone());
+                self.diagnostics.manual_runtime.failure = Some(message.clone());
                 tracing::error!(%error, path = %path.display(), "could not save manual diagnostic trace");
             }
         }
     }
-}
-
-pub(crate) fn object_fields(value: serde_json::Value) -> ManualDiagnosticTraceFields {
-    value.as_object().cloned().unwrap_or_default()
 }
 
 fn duration_micros(duration: Duration) -> u64 {
@@ -2300,6 +2246,7 @@ fn manual_trace_status_is_critical(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rgv_core::AlignmentAuxComparison;
 
     #[test]
     fn only_terminal_alignment_statuses_trigger_automatic_freeze() {

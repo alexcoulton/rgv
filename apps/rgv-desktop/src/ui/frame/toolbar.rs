@@ -1,6 +1,12 @@
 //! Status bar, navigation toolbar, annotation search popup and the Properties side panel.
 
-use super::*;
+use crate::app::status_activity::StatusActivity;
+use crate::ui::frame::ShellFrame;
+use crate::ui::{NAVIGATION_HEIGHT, STATUS_HEIGHT};
+use crate::workspace::navigation::{
+    annotation_search_hit_primary_label, annotation_search_hit_secondary_identity,
+};
+use crate::{LOCUS_EDITOR_ID, Viewer, ui};
 
 impl Viewer {
     pub(super) fn show_status_bar(ui: &mut egui::Ui, st: &mut ShellFrame) {
@@ -110,8 +116,7 @@ impl Viewer {
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             if !st.commands.reduced_motion
-                                && (st.snapshot.data_status.starts_with("Loading")
-                                    || st.snapshot.data_status.contains("queue busy"))
+                                && st.snapshot.status_activity == StatusActivity::Busy
                             {
                                 ui.spinner();
                             }

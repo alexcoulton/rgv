@@ -1,4 +1,26 @@
-use super::super::*;
+use crate::inspection::document::{
+    InspectorAction, InspectorActionId, InspectorBadge, InspectorDocument, InspectorEndpoint,
+    InspectorField, InspectorLocation, InspectorNotice, InspectorProvenance, InspectorSection,
+    InspectorTone, InspectorValue,
+};
+use crate::inspection::model::{
+    CopyNumberInspectorSnapshot, FeatureInspectorSnapshot, GwasInspectorSnapshot,
+    InteractionInspectorSnapshot, MutationInspectorSnapshot, QuantitativeInspectorSnapshot,
+};
+use crate::inspection::read::{
+    MAX_FEATURE_INSPECTOR_ATTRIBUTES, MAX_FEATURE_INSPECTOR_BLOCKS,
+    MAX_FEATURE_INSPECTOR_VALUE_BYTES, inspector_fields_text,
+};
+use crate::ui::track_settings::{
+    effective_copy_number_semantics_for_settings, quantitative_arithmetic_value,
+};
+use rgv_core::{
+    CopyNumberSortMode, CopyNumberValueMode, GwasColorMode, InteractionDisplayMode,
+    QuantitativeArithmetic, QuantitativeScaleMode, QuantitativeScaleTransform,
+    QuantitativeWindowFunction,
+};
+use rgv_layout::copy_number_sample_order;
+use std::fmt::Write as _;
 
 fn feature_attribute<'a>(record: &'a rgv_hts::FeatureRecord, keys: &[&str]) -> Option<&'a str> {
     record

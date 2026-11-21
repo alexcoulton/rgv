@@ -1,3 +1,5 @@
+use crate::Viewer;
+use rgv_core::{AutomationRectSnapshot, AutomationWorkspaceSnapshot, PresentationNodeId};
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write as _},
@@ -10,6 +12,7 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use winit::keyboard::ModifiersState;
 
 use rgv_core::{
     INTERACTION_RECORDING_SCHEMA_NAME, INTERACTION_RECORDING_SCHEMA_VERSION, InteractionLifecycle,
@@ -22,8 +25,6 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
     keyboard::{KeyCode, PhysicalKey},
 };
-
-use super::*;
 
 const RECORDING_QUEUE_CAPACITY: usize = 16_384;
 const RECORDING_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -829,33 +830,34 @@ impl Viewer {
             record_text,
             initial_workspace: Some(self.automation_workspace_snapshot()),
         };
-        let status = self.interaction_recording.start(path, header)?;
-        self.stress_health.publish_recording(&status);
+        let status = self.diagnostics.recording.start(path, header)?;
+        self.diagnostics.health.0.publish_recording(&status);
         Ok(status)
     }
 
     pub(crate) fn stop_interaction_recording(
         &mut self,
     ) -> Result<InteractionRecordingStatus, String> {
-        let status = self.interaction_recording.stop()?;
-        self.stress_health.publish_recording(&status);
+        let status = self.diagnostics.recording.stop()?;
+        self.diagnostics.health.0.publish_recording(&status);
         Ok(status)
     }
 
     pub(crate) fn abort_interaction_recording_before_exit(&mut self) {
-        if self.interaction_recording.is_recording() {
+        if self.diagnostics.recording.is_recording() {
             match self
-                .interaction_recording
+                .diagnostics
+                .recording
                 .abort("RGV exited while interaction recording was active")
             {
-                Ok(status) => self.stress_health.publish_recording(&status),
+                Ok(status) => self.diagnostics.health.0.publish_recording(&status),
                 Err(error) => tracing::warn!(%error, "interaction recording could not be aborted"),
             }
         }
     }
 
     pub(crate) fn interaction_recording_status(&self) -> InteractionRecordingStatus {
-        self.interaction_recording.status()
+        self.diagnostics.recording.status()
     }
 
     pub(crate) fn prepare_native_input_observation(
@@ -863,7 +865,7 @@ impl Viewer {
         event: &WindowEvent,
         egui_consumed: bool,
     ) -> Option<PendingNativeInputObservation> {
-        if !self.interaction_recording.is_recording() {
+        if !self.diagnostics.recording.is_recording() {
             return None;
         }
         let scale = self.window.scale_factor();
@@ -881,11 +883,11 @@ impl Viewer {
             .map_or(StressPoint::default(), |(point, rect)| {
                 normalized_point(point, rect)
             });
-        let elapsed_micros = self.interaction_recording.elapsed_micros()?;
+        let elapsed_micros = self.diagnostics.recording.elapsed_micros()?;
         let modifiers = stress_modifiers(self.modifiers);
-        let held_pointer_button = self.interaction_recording.held_pointer_button();
-        let interaction_active = self.interaction_recording.interaction_active();
-        let record_text = self.interaction_recording.record_text();
+        let held_pointer_button = self.diagnostics.recording.held_pointer_button();
+        let interaction_active = self.diagnostics.recording.interaction_active();
+        let record_text = self.diagnostics.recording.record_text();
         let event = recording_event(
             event,
             elapsed_micros,
@@ -914,19 +916,21 @@ impl Viewer {
                     StressNativeEvent::SecondaryDown { .. } => Some(HeldPointerButton::Secondary),
                     _ => None,
                 };
-                self.interaction_recording
+                self.diagnostics
+                    .recording
                     .begin_interaction(held_pointer_button)
             }
             InteractionLifecycle::Advanced => self
-                .interaction_recording
+                .diagnostics
+                .recording
                 .current_interaction_id()
-                .or_else(|| self.interaction_recording.begin_interaction(None)),
+                .or_else(|| self.diagnostics.recording.begin_interaction(None)),
             InteractionLifecycle::Released | InteractionLifecycle::Cancelled => {
-                self.interaction_recording.current_interaction_id()
+                self.diagnostics.recording.current_interaction_id()
             }
             InteractionLifecycle::None => None,
         };
-        let sequence = self.interaction_recording.next_sequence()?;
+        let sequence = self.diagnostics.recording.next_sequence()?;
         let (before_interval, before_read_scroll) = self.recording_semantic_state(target.as_ref());
         Some(PendingNativeInputObservation {
             sequence,
@@ -974,7 +978,7 @@ impl Viewer {
         let observation = NativeInputObservation {
             sequence: pending.sequence,
             elapsed_micros: pending.elapsed_micros,
-            step_id: self.interaction_recording.active_step_id(),
+            step_id: self.diagnostics.recording.active_step_id(),
             event: pending.event,
             physical_position: pending.physical_position,
             logical_position: pending.logical_position,
@@ -993,12 +997,12 @@ impl Viewer {
             observation.lifecycle,
             InteractionLifecycle::Released | InteractionLifecycle::Cancelled
         );
-        self.interaction_recording.append_input(observation);
+        self.diagnostics.recording.append_input(observation);
         if release {
-            self.interaction_recording.release_interaction();
+            self.diagnostics.recording.release_interaction();
         }
-        let status = self.interaction_recording.status();
-        self.stress_health.publish_recording(&status);
+        let status = self.diagnostics.recording.status();
+        self.diagnostics.health.0.publish_recording(&status);
     }
 
     fn recording_target_at(&self, point: egui::Pos2) -> (Option<StressTarget>, Option<egui::Rect>) {
@@ -1475,6 +1479,7 @@ fn unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use rgv_core::PanelId;
     use std::io::{BufRead as _, BufReader};
 
     use super::*;

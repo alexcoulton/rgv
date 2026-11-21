@@ -25,7 +25,7 @@ use rgv_hts::{
 use crate::{
     EngineQueueError,
     mailbox::{
-        CoalescingReceiver, CoalescingSender, bounded_coalescing_to_ui, panic_message,
+        CoalescingReceiver, CoalescingSender, bounded_coalescing_to_ui, panic_message, reap_worker,
         run_thread_root,
     },
     track_source::{SearchRequest, TdfChannel, TrackQuerySettings, TrackSource},
@@ -572,13 +572,14 @@ impl TrackEngine {
 }
 
 impl Drop for TrackEngine {
+    /// Signals the actor exactly as `retire` does and returns without joining it: an engine
+    /// dropped on a path which forgot to retire must not block that thread on in-flight I/O.
+    /// A reaper thread waits for the actor instead.
     fn drop(&mut self) {
         self.input.take();
         self.output.close();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            tracing::warn!("track actor panicked while shutting down");
+        if let Some(worker) = self.worker.take() {
+            drop(reap_worker(worker, "rgv-track-reaper", "track actor"));
         }
     }
 }
@@ -1336,9 +1337,11 @@ fn open_track_with(
                 .map(|source| OpenTrack::new(id, name, source))
                 .map_err(|error| error.to_string())
         }
-        TrackSpecKind::VcfOrBcf => LocalVariantSource::open(&specification.path)
-            .map(|source| OpenTrack::new(id, name, source))
-            .map_err(|error| error.to_string()),
+        TrackSpecKind::VcfOrBcf => {
+            LocalVariantSource::open_with_remote_config(&specification.path, remote.clone())
+                .map(|source| OpenTrack::new(id, name, source))
+                .map_err(|error| error.to_string())
+        }
         TrackSpecKind::Gwas => TextGwasSource::open(&specification.path)
             .map(|source| OpenTrack::new(id, name, source))
             .map_err(|error| error.to_string()),
@@ -2502,6 +2505,12 @@ mod tests {
 
     impl AuthorizedRangeServer {
         fn start(data: Vec<u8>) -> Self {
+            Self::start_objects(vec![("archive.tdf", data)])
+        }
+
+        /// Serves several named objects; `url` names the first.
+        fn start_objects(objects: Vec<(&'static str, Vec<u8>)>) -> Self {
+            let first = objects[0].0;
             let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
             let address = server.server_addr().to_ip().unwrap();
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2529,6 +2538,17 @@ mod tests {
                             .unwrap();
                         continue;
                     }
+                    let name = request.url().rsplit('/').next().unwrap_or_default();
+                    let Some(data) = objects
+                        .iter()
+                        .find(|(object, _)| *object == name)
+                        .map(|(_, data)| data)
+                    else {
+                        request
+                            .respond(tiny_http::Response::empty(tiny_http::StatusCode(404)))
+                            .unwrap();
+                        continue;
+                    };
                     if let Some(clock) = worker_advance.lock().unwrap().take() {
                         clock.advance();
                     }
@@ -2563,7 +2583,7 @@ mod tests {
                 }
             });
             Self {
-                url: format!("http://{address}/archive.tdf"),
+                url: format!("http://{address}/{first}"),
                 stop,
                 advance_on_request,
                 worker: Some(worker),
@@ -2675,6 +2695,102 @@ mod tests {
         );
         assert_eq!(lane_values(&receiver), [2.0, 4.0]);
         assert_eq!(stats().cancellations, 1);
+    }
+
+    #[test]
+    fn remote_variant_tracks_use_the_engine_remote_config_cancellation_and_budget() {
+        let fixture = |name: &str| {
+            std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../benchmark-data/manual-suite/data/variants")
+                    .join(name),
+            )
+            .unwrap()
+        };
+        let server = AuthorizedRangeServer::start_objects(vec![
+            ("cohort.vcf.gz", fixture("cohort.vcf.gz")),
+            ("cohort.vcf.gz.tbi", fixture("cohort.vcf.gz.tbi")),
+        ]);
+        let specification = TrackSpec {
+            id: TrackId::new(41),
+            name: "engine variants".to_owned(),
+            path: PathBuf::from(&server.url),
+            kind: TrackSpecKind::VcfOrBcf,
+        };
+        // The server refuses every request without the bearer token, so opening with the
+        // anonymous default fails and opening at all proves the engine's configuration (and
+        // its authentication header) reached the variant reader.
+        assert!(
+            open_track_with(
+                &specification,
+                &mut TdfSourceCache::new(),
+                &HttpRangeConfig::default()
+            )
+            .is_err()
+        );
+        let remote = HttpRangeConfig {
+            authentication: rgv_hts::RemoteAuthentication::Bearer("track-secret".to_owned()),
+            // One 64-byte block is cached at a time, so every query below must fetch.
+            chunk_size: std::num::NonZeroUsize::new(64).unwrap(),
+            maximum_cache_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+            maximum_retries: 0,
+            ..HttpRangeConfig::default()
+        };
+        let open = || open_track_with(&specification, &mut TdfSourceCache::new(), &remote).unwrap();
+        let mut track = open();
+
+        let clock = GenerationClock::default();
+        let interval = GenomicInterval::new(ContigId::new(0), 15_000, 16_100).unwrap();
+        let request =
+            |clock: &GenerationClock| PanelGeneration::new(PanelId::new(1), clock.current());
+        let (output, receiver) = bounded_coalescing(8);
+        let context = test_query_context(output, &clock, request(&clock), interval);
+        let lane_records =
+            |receiver: &CoalescingReceiver<TrackEngineEvent>| match receiver.try_receive().unwrap()
+            {
+                Some(TrackEngineEvent::LaneCompleted { track, .. }) => {
+                    let TrackSnapshotData::Variants(query) = track.data else {
+                        panic!("variant source returned the wrong snapshot type");
+                    };
+                    query.records.len()
+                }
+                other => panic!("expected a lane, got {other:?}"),
+            };
+
+        // The budget reaches the remote reader: an exhausted allowance fails the read...
+        track.source.set_remote_control(
+            None,
+            Some(RemoteTransferBudget {
+                maximum_requests: 0,
+                maximum_response_bytes: 0,
+            }),
+        );
+        let (_, over_budget) =
+            query_track(&mut track, "chrVariants", 15_000, 16_100, &[], &[], &[]).unwrap_err();
+        assert!(over_budget.contains("budget"), "{over_budget}");
+        // ...and every engine query starts with a fresh one.
+        assert_eq!(
+            query_one(&mut track, "chrVariants", &context),
+            Some(TrackId::new(41))
+        );
+        assert!(lane_records(&receiver) > 0);
+
+        // A reader which has not fetched its data yet. The view moves on while the first range
+        // of its query is in flight: the transfer is abandoned and no lane is published.
+        let mut track = open();
+        *server.advance_on_request.lock().unwrap() = Some(clock.clone());
+        assert_eq!(query_one(&mut track, "chrVariants", &context), None);
+        assert!(server.advance_on_request.lock().unwrap().is_none());
+        assert_eq!(receiver.try_receive().unwrap(), None);
+
+        // The stale check does not outlive its request.
+        let (output, receiver) = bounded_coalescing(8);
+        let context = test_query_context(output, &clock, request(&clock), interval);
+        assert_eq!(
+            query_one(&mut track, "chrVariants", &context),
+            Some(TrackId::new(41))
+        );
+        assert!(lane_records(&receiver) > 0);
     }
 
     #[test]

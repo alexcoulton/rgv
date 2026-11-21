@@ -1,5 +1,29 @@
-use super::super::*;
-use crate::automation::auxiliary_position_snapshot_is_current;
+use crate::MAX_AUTOMATION_EXPORT_BYTES;
+use crate::automation::{
+    AutomationNavigationState, AutomationRunner, AutomationWait, atomic_write_text,
+    automation_alignments_export, automation_pileup_export, automation_quantitative_export,
+    automation_read_evidence_field_is_public, automation_variants_export,
+    automation_viewport_after_operation, auxiliary_position_snapshot_is_current,
+    cropped_display_list, display_list_svg_export, observed_retained_selection,
+    semantic_export_display_list,
+};
+use crate::control_service::ControlRequest;
+use crate::inspection::rna::{AutomationAlignmentExportAuthority, AutomationAlignmentExportTrack};
+use crate::workspace::alignment_navigation::AlignmentNavigationPhase;
+use crate::workspace::alignments::AlignmentPanelProjection;
+use crate::workspace::panels::ViewPanelController;
+use rgv_core::{
+    AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationCommand, AutomationCommandStatus,
+    AutomationErrorCode, AutomationEvidenceField, AutomationRunReport,
+    AutomationSelectionGranularity, AutomationSelectionKind, AutomationSelectionSnapshot,
+    AutomationViewportOperation, ContigId, GenomicInterval, PanelId, TrackId, Viewport,
+};
+use rgv_engine::{AlignmentSceneRequestToken, TrackSnapshot, TrackSnapshotData};
+use rgv_layout::{DisplayList, RectPrimitive, Rgba};
+use rgv_render::PrepareStats;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[test]
 fn unified_scene_budget_uses_automation_schema_version_six() {
@@ -152,17 +176,16 @@ fn a_timed_out_control_batch_is_cancelled_instead_of_running_on() {
     assert!(!runner.cancel_if_requested(), "cancellation happens once");
 
     // The file worker finishes afterwards: its completion is ignored.
-    assert!(!runner.finish_command(
-        index,
-        Ok(("late".to_owned(), serde_json::Value::Null))
-    ));
+    assert!(!runner.finish_command(index, Ok(("late".to_owned(), serde_json::Value::Null))));
     assert_eq!(runner.results.len(), 3);
 }
 
 #[test]
 fn a_cancelled_idle_control_batch_skips_every_remaining_command() {
-    let (mut runner, cancelled, _receiver) =
-        control_runner(vec![AutomationCommand::NewWorkspace, AutomationCommand::Exit]);
+    let (mut runner, cancelled, _receiver) = control_runner(vec![
+        AutomationCommand::NewWorkspace,
+        AutomationCommand::Exit,
+    ]);
     cancelled.store(true, std::sync::atomic::Ordering::Release);
     assert!(runner.cancel_if_requested());
     assert_eq!(runner.results.len(), 2);

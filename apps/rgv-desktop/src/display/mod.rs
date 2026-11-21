@@ -1,3 +1,36 @@
+use crate::diagnostics::{InteractionTraceStage, LatencyEvent};
+use crate::ui::gestures::{
+    capture_stable_row_camera, center_read_row_scroll, reconcile_vertical_scroll,
+    reproject_stable_row_camera, vertical_density_camera_padding,
+};
+use crate::ui::{AlignmentSubtrack, TrackFrame, TrackFrameKey, TrackSubtrack};
+use crate::workspace::context_lanes::ContextLaneLease;
+use crate::workspace::lists::region_overlay_horizontal_span;
+use crate::workspace::panels::{
+    ReadPanelMaterializationCoverage, ReadPanelScrollState, ReadRowCoordinateAuthority,
+    ReadRowCoordinateSpace, composite_panel_display_lists, composite_panel_generic_display_lists,
+    current_read_row_authority, maximum_annotation_frame_heights,
+    read_panel_materialization_coverage,
+};
+use crate::{
+    HoverInspectorTarget, JunctionArcHover, MAX_RENDERED_REGIONS_OF_INTEREST,
+    SYNTHETIC_ALIGNMENT_TRACK_ID, Viewer, alignment_gpu_bundle_is_current, app, ui,
+};
+use rgv_alignment_scene::{AlignmentComponent, AlignmentRowActivityProfile};
+use rgv_core::{
+    JunctionDisplayMode, PresentationNodeId, SessionFilters, TrackConfig, TrackId, TrackKind,
+    TrackSource, WorkspacePresentation,
+};
+use rgv_layout::{DisplayList, RectPrimitive, Rgba};
+use rgv_render::{
+    ContextSceneGpuCamera, ContextSceneGpuCameraCaptureError, ContextSceneGpuCoherenceKey,
+    ContextSceneGpuLaneKey, ContextSceneGpuLaneRequest, ContextSceneGpuRetainedLaneRequest,
+    ContextSceneGpuScissor, RectangleRenderer,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
+use winit::window::CursorIcon;
+
 pub(crate) mod alignment;
 mod alignment_lanes;
 pub(crate) mod auxiliary;
@@ -6,7 +39,6 @@ mod genomic_pass;
 pub(crate) mod hit_test;
 pub(crate) mod reference_lanes;
 
-use super::*;
 use genomic_pass::GenomicDisplayPass;
 
 pub(super) const COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT: f32 = 20.0;
@@ -638,10 +670,11 @@ impl Viewer {
     }
 
     fn rebuild_active_panel_from_scroll_cache(&mut self) -> bool {
-        let trace_started = self.interaction_trace.is_active().then(Instant::now);
+        let trace_started = self.diagnostics.latency_active().then(Instant::now);
         if trace_started.is_some() {
-            self.interaction_trace
-                .record(InteractionTraceStage::ScrollDisplayStarted);
+            self.diagnostics.latency(LatencyEvent::Stage(
+                InteractionTraceStage::ScrollDisplayStarted,
+            ));
         }
         let Some((annotation_content_bottom, annotation_clip_top, annotation_clip_bottom)) = self
             .panels
@@ -980,12 +1013,12 @@ impl Viewer {
         let capacity_grew = display.rectangles.capacity() > rectangle_capacity
             || display.texts.capacity() > text_capacity;
         if let Some(started) = trace_started {
-            self.interaction_trace.record_scroll_display(
-                started.elapsed(),
-                display.rectangles.len(),
-                display.texts.len(),
+            self.diagnostics.latency(LatencyEvent::ScrollDisplay {
+                duration: started.elapsed(),
+                rectangles: display.rectangles.len(),
+                texts: display.texts.len(),
                 capacity_grew,
-            );
+            });
         }
         let panel = self.panels.active_mut();
         panel.generic_display_list = generic_display;
@@ -1010,10 +1043,10 @@ impl Viewer {
             None
         };
         if let Some(reason) = refusal {
-            if self.manual_diagnostic_trace_is_recording() {
+            if self.diagnostics.recording() {
                 let panel_id = self.panels.active().id.get();
                 let authorities = self.manual_active_scroll_cache_diagnostic_state();
-                self.record_manual_diagnostic_event(
+                self.diagnostics.event(
                     "vertical_navigation",
                     "fast_scroll_refresh_refused",
                     serde_json::json!({
@@ -1026,10 +1059,10 @@ impl Viewer {
             return false;
         }
         if !self.rebuild_active_panel_from_scroll_cache() {
-            if self.manual_diagnostic_trace_is_recording() {
+            if self.diagnostics.recording() {
                 let panel_id = self.panels.active().id.get();
                 let authorities = self.manual_active_scroll_cache_diagnostic_state();
-                self.record_manual_diagnostic_event(
+                self.diagnostics.event(
                     "vertical_navigation",
                     "fast_scroll_refresh_refused",
                     serde_json::json!({
@@ -1514,10 +1547,11 @@ impl Viewer {
         // display. Give the GPU tier precisely the currently unused headroom
         // before admitting or reusing a slab.
         self.refresh_alignment_scene_budget();
-        let trace_started = self.interaction_trace.is_active().then(Instant::now);
+        let trace_started = self.diagnostics.latency_active().then(Instant::now);
         if trace_started.is_some() {
-            self.interaction_trace
-                .record(InteractionTraceStage::RendererPrepareStarted);
+            self.diagnostics.latency(LatencyEvent::Stage(
+                InteractionTraceStage::RendererPrepareStarted,
+            ));
         }
         let logical_height = self.surface_config.height as f32 / self.window.scale_factor() as f32;
         let logical_width = self.surface_config.width as f32 / self.window.scale_factor() as f32;
@@ -1555,14 +1589,14 @@ impl Viewer {
         self.refresh_alignment_scene_budget();
         if let Some(started) = trace_started {
             let stats = self.rectangle_renderer.last_prepare_stats();
-            self.interaction_trace.record_renderer_prepare(
-                started.elapsed(),
-                stats.total_instances,
-                stats.uploaded_bytes,
-                stats.buffer_reallocated,
-                stats.cpu_capacity_grew,
-                stats.slab_cache_hit,
-            );
+            self.diagnostics.latency(LatencyEvent::RendererPrepare {
+                duration: started.elapsed(),
+                primitive_count: stats.total_instances,
+                uploaded_bytes: stats.uploaded_bytes,
+                buffer_reallocated: stats.buffer_reallocated,
+                cpu_capacity_grew: stats.cpu_capacity_grew,
+                slab_cache_hit: stats.slab_cache_hit,
+            });
         }
         self.display_upload_pending_metrics = true;
     }

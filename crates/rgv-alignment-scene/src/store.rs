@@ -58,6 +58,11 @@ pub struct EvidenceStore {
     current: Option<PublishedEvidence>,
     next_revision: u64,
     eviction_order_dirty: bool,
+    /// The complete selection of the tile whose summaries are being prepared, shared by every
+    /// family that tile still has to build. Present only inside `prepare_exact_summaries`.
+    tile_selection: Option<crate::EvidenceSelection>,
+    sharing_tile_selection: bool,
+    shared_tile_selections: u64,
 }
 
 /// Lazily maintained `key -> positions` index over one cache vector.
@@ -97,6 +102,13 @@ impl<K: Copy + Eq + std::hash::Hash> CachePositionIndex<K> {
             self.valid = true;
         }
         self.positions.get(&key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Positions stored under `key` if the index is current, for callers which cannot rebuild
+    /// it. `None` means the caller must scan.
+    fn current_positions(&self, key: K) -> Option<&[usize]> {
+        self.valid
+            .then(|| self.positions.get(&key).map_or(&[][..], Vec::as_slice))
     }
 
     /// Records an entry appended at `position`.
@@ -246,6 +258,9 @@ impl EvidenceStore {
             current: None,
             next_revision: 1,
             eviction_order_dirty: false,
+            tile_selection: None,
+            sharing_tile_selection: false,
+            shared_tile_selections: 0,
         }
     }
 
@@ -486,12 +501,21 @@ impl EvidenceStore {
         handles: &[crate::AlignmentHandle],
         required_payload: &PayloadContract,
     ) -> Option<&Arc<EvidenceChunk>> {
-        self.chunks
-            .iter()
-            .filter(|cached| cached.chunk.chunk().id() == id)
-            .filter(|cached| cached.chunk.chunk().handles() == handles)
-            .find(|cached| chunk_satisfies_payload(&cached.chunk, required_payload))
-            .map(|cached| &cached.chunk)
+        let matches = |cached: &&CachedEvidenceChunk| {
+            cached.chunk.chunk().id() == id
+                && cached.chunk.chunk().handles() == handles
+                && chunk_satisfies_payload(&cached.chunk, required_payload)
+        };
+        // The decode loop asks this once per physical source unit. The owner-unit directory
+        // answers it directly; only a directory left stale by a reclaim falls back to a scan.
+        if let Some(positions) = self.chunk_index.current_positions(id) {
+            return positions
+                .iter()
+                .filter_map(|position| self.chunks.get(*position))
+                .find(matches)
+                .map(|cached| &cached.chunk);
+        }
+        self.chunks.iter().find(matches).map(|cached| &cached.chunk)
     }
 
     #[must_use]
@@ -721,6 +745,8 @@ impl EvidenceStore {
                 _pins: row_atlas._pins,
             }),
         });
+        // The atlas published before this one is no longer protected as current.
+        self.drop_superseded_row_atlases(&atlas_root);
         Ok((evidence_root, summary_root, atlas_root))
     }
 
@@ -762,7 +788,10 @@ impl EvidenceStore {
                 .touch(cached.summary.allocation().id(), revision)?;
             return Ok(Arc::clone(&cached.summary));
         }
-        let summary = ExactDepthSummaryTile::build(
+        self.share_tile_selection(evidence, tile, contig_length, reservation_kind)
+            .map_err(crate::ExactDepthSummaryError::from)?;
+        let summary = ExactDepthSummaryTile::build_with_selection(
+            self.tile_selection.as_ref(),
             evidence,
             tile,
             contig_length,
@@ -814,7 +843,11 @@ impl EvidenceStore {
                 .touch(cached.summary.allocation().id(), revision)?;
             return Ok(Arc::clone(&cached.summary));
         }
-        let summary = ExactAlleleSummaryTile::build(
+        self.share_tile_selection(evidence, tile, contig_length, reservation_kind)
+            .map_err(crate::ExactAlleleSummaryError::from)?;
+        let summary = ExactAlleleSummaryTile::build_with_selection(
+            self.tile_selection.as_ref(),
+            crate::allele_summary::CigarWalk::EnterAtTile,
             evidence,
             tile,
             contig_length,
@@ -873,7 +906,11 @@ impl EvidenceStore {
                 .touch(cached.summary.allocation().id(), revision)?;
             return Ok(Arc::clone(&cached.summary));
         }
-        let summary = ExactJunctionSummaryTile::build(
+        self.share_tile_selection(evidence, tile, contig_length, reservation_kind)
+            .map_err(crate::ExactJunctionSummaryError::from)?;
+        let summary = ExactJunctionSummaryTile::build_with_selection(
+            self.tile_selection.as_ref(),
+            crate::allele_summary::CigarWalk::EnterAtTile,
             evidence,
             tile,
             contig_length,
@@ -926,7 +963,10 @@ impl EvidenceStore {
                 .touch(cached.summary.allocation().id(), revision)?;
             return Ok(Arc::clone(&cached.summary));
         }
-        let summary = ExactPairSummaryTile::build(
+        self.share_tile_selection(evidence, tile, contig_length, reservation_kind)
+            .map_err(crate::ExactPairSummaryError::from)?;
+        let summary = ExactPairSummaryTile::build_with_selection(
+            self.tile_selection.as_ref(),
             evidence,
             tile,
             contig_length,
@@ -984,7 +1024,10 @@ impl EvidenceStore {
                 .touch(cached.summary.allocation().id(), revision)?;
             return Ok(Arc::clone(&cached.summary));
         }
-        let summary = ExactModificationSummaryTile::build(
+        self.share_tile_selection(evidence, tile, contig_length, reservation_kind)
+            .map_err(crate::ExactModificationSummaryError::from)?;
+        let summary = ExactModificationSummaryTile::build_with_selection(
+            self.tile_selection.as_ref(),
             evidence,
             tile,
             contig_length,
@@ -1069,8 +1112,76 @@ impl EvidenceStore {
     /// Prepares every exact summary family required by one factorised summary contract. The
     /// canonical horizon is expanded to whole measurement-selected tiles; the evidence root must
     /// certify that full horizon before any summary candidate can publish.
+    ///
+    /// Each tile is selected from the evidence at most once, however many of its summary
+    /// families miss the cache: the families read one shared selection instead of each
+    /// enumerating, sorting and deduplicating the tile's records for itself.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_exact_summaries(
+        &mut self,
+        evidence: &Arc<EvidenceRoot>,
+        target: GenomicInterval,
+        tile_bases: NonZeroU64,
+        contig_length: u64,
+        contract: SummaryContract,
+        normalization_mapped_records: Option<u64>,
+        reservation_kind: ReservationKind,
+    ) -> Result<ExactSummaryCandidate, EvidenceStoreError> {
+        self.sharing_tile_selection = true;
+        let candidate = self.prepare_exact_summaries_sharing_selections(
+            evidence,
+            target,
+            tile_bases,
+            contig_length,
+            contract,
+            normalization_mapped_records,
+            reservation_kind,
+        );
+        self.sharing_tile_selection = false;
+        self.tile_selection = None;
+        candidate
+    }
+
+    /// Selects `interval` once for the tile being prepared, unless a family already did.
+    /// Outside `prepare_exact_summaries` this does nothing and each tile selects for itself.
+    fn share_tile_selection(
+        &mut self,
+        evidence: &Arc<EvidenceRoot>,
+        tile: CanonicalGenomicTile,
+        contig_length: u64,
+        reservation_kind: ReservationKind,
+    ) -> Result<(), crate::EvidenceSelectionError> {
+        if !self.sharing_tile_selection {
+            return Ok(());
+        }
+        let Ok(interval) = tile.interval(contig_length) else {
+            // The builder reports the tile error itself.
+            return Ok(());
+        };
+        if self
+            .tile_selection
+            .as_ref()
+            .is_some_and(|selection| selection.is_over(evidence, interval))
+        {
+            return Ok(());
+        }
+        // Release the previous tile's selection before charging this one's.
+        self.tile_selection = None;
+        self.tile_selection =
+            Some(evidence.select_with_reservation_kind(interval, reservation_kind)?);
+        self.shared_tile_selections = self.shared_tile_selections.saturating_add(1);
+        Ok(())
+    }
+
+    /// Evidence selections made by `prepare_exact_summaries` over this store's lifetime: one
+    /// per tile with at least one summary family to build, none for a tile served from cache.
+    #[must_use]
+    pub const fn exact_summary_selection_count(&self) -> u64 {
+        self.shared_tile_selections
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_exact_summaries_sharing_selections(
         &mut self,
         evidence: &Arc<EvidenceRoot>,
         target: GenomicInterval,
@@ -1188,6 +1299,7 @@ impl EvidenceStore {
                 )?);
             }
         }
+        self.tile_selection = None;
         let revision_number = self.take_revision()?;
         let revision = SummaryRevision::new(RevisionFingerprint::new(0, revision_number));
         let root = ExactSummaryRoot::build(
@@ -1300,11 +1412,34 @@ impl EvidenceStore {
             admitted_revision: revision_number,
             atlas: Arc::clone(&atlas),
         });
+        self.drop_superseded_row_atlases(&atlas);
         Ok(RowAtlasCandidate {
             target,
             root: atlas,
             _pins: pins,
         })
+    }
+
+    /// Relinquishes cache ownership of every row atlas `successor` supersedes: one with the
+    /// same layout and record authority whose interval `successor` contains. Any target such
+    /// an atlas could serve, `successor` serves too, so keeping it only holds its layers and
+    /// metadata charged. The published atlas is kept (it is pinned and preferred for contained
+    /// targets until its successor is published); scenes still presenting a dropped atlas keep
+    /// their own reference and pins.
+    fn drop_superseded_row_atlases(&mut self, successor: &Arc<AlignmentRowAtlas>) {
+        let published = self.current_row_atlas().cloned();
+        self.row_atlases.retain(|cached| {
+            let atlas = &cached.atlas;
+            Arc::ptr_eq(atlas, successor)
+                || published
+                    .as_ref()
+                    .is_some_and(|published| Arc::ptr_eq(published, atlas))
+                || !(atlas.layout_contract() == successor.layout_contract()
+                    && atlas.source_revision() == successor.source_revision()
+                    && atlas.record_contract() == successor.record_contract()
+                    && atlas.view_filter() == successor.view_filter()
+                    && successor.interval().contains_interval(atlas.interval()))
+        });
     }
 
     #[must_use]
@@ -1639,11 +1774,19 @@ impl EvidenceStore {
         // Entries backing the published authority are set aside, not dropped: releasing the
         // cache's reference to them frees nothing while the published root pins them, and it
         // strips the lookup entries the next extension of the visible locus needs.
-        let protected = if self.ledger.progress()?.charged > target_charged {
+        let under_pressure = self.ledger.progress()?.charged > target_charged;
+        let protected = if under_pressure {
             self.published_allocations()
         } else {
             HashSet::new()
         };
+        // A certificate over a stretch with no reads owns no chunk, so no allocation can mark
+        // it as published. It still certifies part of the visible locus.
+        let published_target = self
+            .current
+            .as_ref()
+            .filter(|_| under_pressure)
+            .map(|current| current.target);
         let mut held = ProtectedCacheEntries::default();
         let mut candidates_inspected = 0_usize;
         let mut evicted_acquisitions = 0;
@@ -1716,7 +1859,13 @@ impl EvidenceStore {
                         .acquisition
                         .chunks()
                         .iter()
-                        .any(|chunk| protected.contains(&chunk.core_allocation().id())));
+                        .any(|chunk| protected.contains(&chunk.core_allocation().id()))
+                        || (cached.acquisition.chunks().is_empty()
+                            && published_target.is_some_and(|target| cached
+                                .acquisition
+                                .coverage()
+                                .interval()
+                                .overlaps(target))));
                 }
             }
             removed = removed.saturating_add(1);
@@ -2946,7 +3095,87 @@ mod tests {
         let reused = contained_atlas(&mut store);
         assert!(Arc::ptr_eq(&reused, &wide_atlas));
         assert_eq!(reused.revision(), wide_atlas.revision());
-        assert_eq!(store.row_atlas_count(), 2);
+        // Publishing the wider atlas ends the narrow one's protection as the current
+        // authority; the cache then drops it as superseded instead of holding it charged.
+        assert_eq!(store.row_atlas_count(), 1);
+        assert!(Arc::ptr_eq(store.current_row_atlas().unwrap(), &wide_atlas));
+    }
+
+    #[test]
+    fn chunk_fragment_lookup_agrees_with_a_scan_with_and_without_a_current_directory() {
+        let ledger = AllocationLedger::new(1 << 20, 0);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        let chunks = (0..40_u64)
+            .map(|block| {
+                let acquisition =
+                    one_record_acquisition(&ledger, block * 100, block * 100 + 100, block + 1);
+                store
+                    .admit_chunk(Arc::clone(&acquisition.chunks()[0]))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let check = |store: &EvidenceStore, expected_resident: &dyn Fn(usize) -> bool| {
+            for (index, chunk) in chunks.iter().enumerate() {
+                let found = store.cached_chunk_fragment(
+                    chunk.chunk().id(),
+                    chunk.chunk().handles(),
+                    &no_payload(),
+                );
+                assert_eq!(found.is_some(), expected_resident(index), "chunk {index}");
+                if let Some(found) = found {
+                    assert!(Arc::ptr_eq(found, chunk), "chunk {index}");
+                }
+                // Same owner unit, different record population: never a match.
+                assert!(
+                    store
+                        .cached_chunk_fragment(chunk.chunk().id(), &[], &no_payload())
+                        .is_none()
+                );
+            }
+        };
+        assert!(
+            store
+                .chunk_index
+                .current_positions(chunks[0].chunk().id())
+                .is_some()
+        );
+        check(&store, &|_| true);
+
+        // Reclaim reorders and removes entries, leaving the directory stale until the next
+        // admission rebuilds it. Lookups must stay exact in both states.
+        store.evict_inactive_batch(0, 15).unwrap();
+        let resident = chunks
+            .iter()
+            .map(|chunk| {
+                store
+                    .chunks
+                    .iter()
+                    .any(|cached| Arc::ptr_eq(&cached.chunk, chunk))
+            })
+            .collect::<Vec<_>>();
+        assert!(resident.iter().any(|resident| !resident));
+        assert!(
+            store
+                .chunk_index
+                .current_positions(chunks[0].chunk().id())
+                .is_none()
+        );
+        check(&store, &|index| resident[index]);
+        let readmitted = one_record_acquisition(&ledger, 9_000, 9_100, 99);
+        store
+            .admit_chunk(Arc::clone(&readmitted.chunks()[0]))
+            .unwrap();
+        assert!(
+            store
+                .chunk_index
+                .current_positions(chunks[0].chunk().id())
+                .is_some()
+        );
+        check(&store, &|index| resident[index]);
     }
 
     #[test]

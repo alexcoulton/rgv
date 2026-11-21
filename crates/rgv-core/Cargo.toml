@@ -6,8 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Derives `schemars::JsonSchema` on the automation and session types that `rgv-mcp` publishes
+# as tool argument schemas, so those schemas cannot drift from the wire types.
+schema = ["dep:schemars"]
+
 [dependencies]
 quick-xml.workspace = true
+schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

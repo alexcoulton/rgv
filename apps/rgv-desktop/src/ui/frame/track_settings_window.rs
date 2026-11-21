@@ -1,6 +1,28 @@
 //! The "Track settings" window for reference, alignment and auxiliary tracks.
 
-use super::*;
+use crate::app::alignment_context::{
+    AlignmentQuickPredicate, alignment_predicate_label, quick_alignment_predicate,
+};
+use crate::display::auxiliary::alignment_sort_position;
+use crate::ui::alignment_settings::{
+    alignment_style_controls, modification_code_label, modified_base_color_mode_label,
+    read_base_display_mode_label, rgba_to_color32,
+};
+use crate::ui::frame::ShellFrame;
+use crate::ui::track_settings::{
+    copy_number_track_settings_ui, gwas_track_settings_ui, interaction_track_settings_ui,
+    mutation_track_settings_ui, quantitative_track_settings_ui, variant_track_settings_ui,
+};
+use crate::ui::{TrackFrameKey, TrackUiAction};
+use crate::workspace::lists::sample_association_ui;
+use crate::{MIN_VERTICAL_DENSITY, Viewer, ui};
+use rgv_core::{
+    AlignmentReadSampling, CoverageScaleTransform, FeatureDisplayMode, GeneticCode,
+    InspectorActivation, JunctionDisplayMode, LandmarkAssetRole, ModifiedBaseColorMode,
+    OverlappingMatePolicy, ReadBaseDisplayMode, ReadStackingMode, ReferenceTranslationFrame,
+    SashimiCountMode, SashimiScaleMode, TrackId,
+};
+use rgv_layout::{AlignmentSortMode, MAX_HIDDEN_MODIFICATION_CODES, modification_code_color};
 
 impl Viewer {
     pub(super) fn show_track_settings_window(&self, ui: &mut egui::Ui, st: &mut ShellFrame) {

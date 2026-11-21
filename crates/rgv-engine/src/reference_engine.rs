@@ -16,7 +16,10 @@ use rgv_hts::{
 
 use crate::{
     EngineQueueError,
-    mailbox::{CoalescingReceiver, CoalescingSender, bounded_coalescing_to_ui, run_thread_root},
+    mailbox::{
+        CoalescingReceiver, CoalescingSender, bounded_coalescing_to_ui, reap_worker,
+        run_thread_root,
+    },
 };
 
 /// Maximum number of bases fetched by one underlying FASTA operation.
@@ -214,14 +217,19 @@ impl ReferenceEngine {
 }
 
 impl Drop for ReferenceEngine {
+    /// Signals the actor exactly as `retire` does and returns without joining it: an engine
+    /// dropped on a path which forgot to retire must not block that thread on in-flight I/O.
+    /// A reaper thread waits for the actor instead.
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         self.input.take();
         self.output.close();
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            tracing::warn!("reference actor panicked while shutting down");
+        if let Some(worker) = self.worker.take() {
+            drop(reap_worker(
+                worker,
+                "rgv-reference-reaper",
+                "reference actor",
+            ));
         }
     }
 }

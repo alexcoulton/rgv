@@ -1,10 +1,12 @@
-use std::time::Duration;
+use crate::workspace::context_lanes::ContextLaneKey;
+use crate::{Viewer, ui};
+use rgv_engine::AlignmentSceneRequestToken;
+use std::time::{Duration, Instant};
 
 use egui::Context;
 
-use super::super::*;
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) enum ManualInteractionTraceState {
     #[default]
     Idle,
@@ -554,7 +556,7 @@ impl Viewer {
                 0,
                 0,
             ),
-            interaction: Some(self.interaction_trace.snapshot().map_or(
+            interaction: Some(self.diagnostics.latency_snapshot().map_or(
                 sashimi_interaction.clone(),
                 |trace| {
                     let maximum = trace

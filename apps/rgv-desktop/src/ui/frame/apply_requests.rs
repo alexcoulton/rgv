@@ -1,6 +1,18 @@
 //! Deferred navigation, export, settings, file and cache requests.
 
-use super::*;
+use crate::app::tasks::SessionLoadKind;
+use crate::inspection::rna::{
+    junction_bed_export, rna_export_file_name, sashimi_export_display, sashimi_svg_export,
+};
+use crate::inspection::variant::{
+    variant_evidence_export_tsv, variant_export_file_name, variant_genotype_export_tsv,
+};
+use crate::sources::source_path;
+use crate::ui::frame::ShellFrame;
+use crate::{Viewer, apply_accessibility_preferences};
+use rgv_core::{AutomationSnapshotFormat, AutomationSnapshotScope, MAXIMUM_VIEW_PANELS};
+use rgv_render::ContextSceneGpuFrame;
+use std::path::Path;
 
 impl Viewer {
     pub(super) fn apply_locus_search_and_panel_changes(&mut self, st: &mut ShellFrame) {
@@ -96,10 +108,17 @@ impl Viewer {
             {
                 let scale =
                     crate::automation::export::interactive_export_scale(self.window.scale_factor());
+                let gpu = self.export_gpu();
                 self.start_export_job(path, move |path| {
                     let (display, width, height) = sashimi_export_display(&bundle);
-                    export_png_scaled(&display, width, height, scale, path)
-                        .map_err(|error| std::io::Error::other(error.to_string()))
+                    crate::automation::export::write_png_export(
+                        gpu.as_ref(),
+                        &display,
+                        width,
+                        height,
+                        scale,
+                        &path,
+                    )
                 });
             }
         }
@@ -412,6 +431,7 @@ impl Viewer {
             // REND-9: match the display's pixel density instead of one pixel per point.
             let scale =
                 crate::automation::export::interactive_export_scale(self.window.scale_factor());
+            let gpu = self.export_gpu();
             match self.capture_semantic_export(AutomationSnapshotScope::VisibleWorkspace) {
                 Ok(capture) => self.start_export_job(path, move |path| {
                     capture.write(
@@ -419,6 +439,7 @@ impl Viewer {
                         AutomationSnapshotFormat::Png,
                         "RGV manual export",
                         scale,
+                        gpu,
                     )
                 }),
                 Err(error) => self.report_error(error.to_string()),

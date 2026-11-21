@@ -1113,7 +1113,11 @@ mod tests {
             AlignmentInteractionToken::default(),
         );
         assert!(outside.is_none());
-        let empty = project(primitive(7, 7, AlignmentGeometryToken::Rectangle), 0, detailed);
+        let empty = project(
+            primitive(7, 7, AlignmentGeometryToken::Rectangle),
+            0,
+            detailed,
+        );
         assert!(empty.is_none());
     }
 }

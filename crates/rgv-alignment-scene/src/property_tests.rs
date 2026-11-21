@@ -21,25 +21,27 @@ use std::{
 };
 
 use rgv_core::{
-    AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigId, GenomicInterval,
-    ModifiedBaseColorMode, OverlappingMatePolicy, ReadBaseDisplayMode, ReadStackingMode,
+    AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigId,
+    GenomicInterval, ModifiedBaseColorMode, OverlappingMatePolicy, ReadBaseDisplayMode,
+    ReadStackingMode,
 };
 use rgv_hts::{
     AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
-    AlignmentSourcePosition, AuxField, AuxValue, CigarOp, CigarOpKind, SequenceData,
-    TemplateLengthBounds,
+    AlignmentSourcePosition, AuxField, AuxValue, CigarOp, CigarOpKind, ReferenceSlice,
+    SequenceData, TemplateLengthBounds,
 };
 
 use crate::{
-    AlignmentHandle, AlignmentPageFamily, AlignmentPageKey, AlignmentReadLabelMode,
-    AlignmentRowAtlas, AlignmentSemanticPage, AlignmentSourceRevision, AlignmentStyleContract,
-    AlleleSummaryContract, AlleleSummaryDetail, AllocationClass, AllocationLedger,
-    CanonicalGenomicTile, CanonicalRecordChunk, CanonicalRowBlock, CapabilityRequirement,
-    CompleteCoverage, ContractFingerprint, DepthSummaryContract, EvidenceAcquisition,
-    EvidenceChunk, EvidenceRoot, EvidenceStore, ExactAlleleSummaryTile, ExactDepthSummaryTile,
-    ExactSummaryRoot, FilteredRecordProvenance, GeometryLod, LayoutContract, PayloadContract,
-    PayloadSidecar, PresentationContract, ReadSampling, ReservationKind, RevisionFingerprint,
-    RowAtlasRevision, SourceChunkId, SourceFingerprint, SummaryContract,
+    AlignmentHandle, AlignmentPageFamily, AlignmentPageKey, AlignmentPresentationStore,
+    AlignmentReadLabelMode, AlignmentRowAtlas, AlignmentSemanticPage, AlignmentSourceRevision,
+    AlignmentStyleContract, AlleleSummaryContract, AlleleSummaryDetail, AllocationClass,
+    AllocationLedger, CanonicalGenomicTile, CanonicalRecordChunk, CanonicalRowBlock,
+    CapabilityRequirement, CompleteCoverage, ContractFingerprint, DepthSummaryContract,
+    EvidenceAcquisition, EvidenceChunk, EvidenceRoot, EvidenceStore, ExactAlleleSummaryTile,
+    ExactDepthSummaryTile, ExactSummaryRoot, FilteredRecordProvenance, GeometryLod, LayoutContract,
+    PayloadContract, PayloadSidecar, PresentationContract, ReadSampling, ReferenceRevision,
+    ReservationKind, RevisionFingerprint, RowAtlasRevision, SourceChunkId, SourceFingerprint,
+    SummaryContract,
 };
 
 const RECORD_CONTRACT: ContractFingerprint = ContractFingerprint::new(23);
@@ -775,6 +777,30 @@ fn drive(
         &Arc<AlignmentRowAtlas>,
     ),
 ) {
+    drive_steps(world, layout, policy, &mut check);
+    let snapshot = world.ledger.snapshot().unwrap();
+    assert_eq!(snapshot.reserved, 0, "seed {}", world.seed);
+    assert_eq!(snapshot.transient, 0, "seed {}", world.seed);
+}
+
+/// What a driver hands each step: context, target, whether the target ever grew leftwards, and
+/// the published evidence, summaries and row atlas.
+type StepCheck<'a> = dyn FnMut(
+        &str,
+        GenomicInterval,
+        bool,
+        &Arc<EvidenceRoot>,
+        &Arc<ExactSummaryRoot>,
+        &Arc<AlignmentRowAtlas>,
+    ) + 'a;
+
+/// [`drive`] without the closing ledger check, for callers which still hold pages or scenes.
+fn drive_steps(
+    world: &World,
+    layout: LayoutContract,
+    policy: OverlappingMatePolicy,
+    check: &mut StepCheck<'_>,
+) {
     let mut store = world.store();
     let mut extended_left = false;
     for (step, (piece, target, left)) in world.steps.iter().copied().enumerate() {
@@ -818,10 +844,6 @@ fn drive(
         // Pressure between steps must never cost the published locus its cache entries.
         store.evict_inactive_until(0).unwrap();
     }
-    drop(store);
-    let snapshot = world.ledger.snapshot().unwrap();
-    assert_eq!(snapshot.reserved, 0, "seed {}", world.seed);
-    assert_eq!(snapshot.transient, 0, "seed {}", world.seed);
 }
 
 #[test]
@@ -1285,4 +1307,1204 @@ fn downsampled_extension_never_shows_half_a_pair() {
     }
     // The property is vacuous unless sampling both kept and declined whole pairs.
     assert!(declined > 0 && declined < pairs_seen);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Read-page reuse across extension (SCENE-3)
+// ---------------------------------------------------------------------------------------------
+
+fn reference_bases(world: &World) -> Vec<u8> {
+    let mut rng = XorShift::new(world.seed ^ 0x5eed_ba5e);
+    (0..world.contig_length)
+        .map(|_| b"ACGT"[rng.below(4) as usize])
+        .collect()
+}
+
+fn reference_slice(bases: &[u8], covered: GenomicInterval) -> ReferenceSlice {
+    ReferenceSlice {
+        interval: covered,
+        bases: bases[covered.start() as usize..covered.end() as usize].to_vec(),
+    }
+}
+
+/// A random presentation: level of detail, colour mode (including every pair mode, whose body
+/// token is derived per record), labels, modified bases, and whether a reference is named.
+fn random_presentation(rng: &mut XorShift) -> PresentationContract {
+    let lod = [
+        GeometryLod::Overview,
+        GeometryLod::Span,
+        GeometryLod::Read,
+        GeometryLod::Base,
+    ][rng.below(4) as usize];
+    let color_mode = [
+        AlignmentColorMode::Strand,
+        AlignmentColorMode::MappingQuality,
+        AlignmentColorMode::Haplotype,
+        AlignmentColorMode::TemplateLength,
+        AlignmentColorMode::PairOrientation,
+        AlignmentColorMode::UnexpectedPair,
+        AlignmentColorMode::FirstOfPairStrand,
+        AlignmentColorMode::Bisulfite(rgv_core::BisulfiteContext::Cg),
+        AlignmentColorMode::Bisulfite(rgv_core::BisulfiteContext::Chh),
+    ][rng.below(9) as usize];
+    let reads_reference =
+        lod == GeometryLod::Base || matches!(color_mode, AlignmentColorMode::Bisulfite(_));
+    PresentationContract {
+        geometry_lod: lod,
+        style: AlignmentStyleContract {
+            color_mode,
+            base_display: if rng.chance(1, 2) {
+                ReadBaseDisplayMode::All
+            } else {
+                ReadBaseDisplayMode::Mismatches
+            },
+            read_labels: if rng.chance(1, 2) {
+                AlignmentReadLabelMode::ReadName
+            } else {
+                AlignmentReadLabelMode::Hidden
+            },
+            show_modified_bases: rng.chance(1, 2),
+            ..AlignmentStyleContract::default()
+        },
+        reference: (reads_reference && rng.chance(4, 5))
+            .then(|| ReferenceRevision::new(RevisionFingerprint::new(70, 71))),
+        annotation: None,
+    }
+}
+
+/// Everything that can make two builds of one page differ, derived from the generated world
+/// rather than from the content token: the clamped row range, which generated record sits in
+/// which row, the connectors crossing the page, and the reference bases the family reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PageManifest {
+    rows: std::ops::Range<u32>,
+    records: Vec<(usize, u32)>,
+    connectors: Vec<(u64, u32, u64, u64)>,
+    reference: Option<Vec<(u64, u8)>>,
+}
+
+fn page_manifest(
+    world: &World,
+    atlas: &AlignmentRowAtlas,
+    presentation: PresentationContract,
+    page: &AlignmentSemanticPage,
+    reference: Option<&ReferenceSlice>,
+) -> PageManifest {
+    let key = page.key();
+    let tile = page.interval();
+    let rows = key.row_block().range(atlas.row_count()).unwrap();
+    let mut records = world
+        .overlapping(tile)
+        .filter_map(|index| {
+            let row = atlas.record(handle(index))?.record.row();
+            rows.contains(&row).then_some((index, row))
+        })
+        .collect::<Vec<_>>();
+    records.sort_unstable();
+    let connectors = if key.family() == AlignmentPageFamily::ReadGeometry {
+        atlas
+            .connectors_for_rows(rows.clone(), tile)
+            .into_iter()
+            .map(|connector| {
+                (
+                    connector.template(),
+                    connector.row(),
+                    connector.start(),
+                    connector.end(),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let bisulfite = key.family() == AlignmentPageFamily::SpecialistOverlay
+        && matches!(key.lod(), GeometryLod::Read | GeometryLod::Base)
+        && matches!(
+            presentation.style.color_mode,
+            AlignmentColorMode::Bisulfite(_)
+        );
+    let base_cells =
+        key.family() == AlignmentPageFamily::ReadGeometry && key.lod() == GeometryLod::Base;
+    let reference = (bisulfite || base_cells).then(|| {
+        let margin = if bisulfite { 8 } else { 0 };
+        (tile.start().saturating_sub(margin)..tile.end() + margin)
+            .filter_map(|position| Some((position, reference?.base_at(position)?)))
+            .collect()
+    });
+    PageManifest {
+        rows,
+        records,
+        connectors,
+        reference,
+    }
+}
+
+fn assert_pages_structurally_equal(
+    resolved: &AlignmentSemanticPage,
+    fresh: &AlignmentSemanticPage,
+    context: &str,
+) {
+    let key = resolved.key();
+    assert_eq!(resolved.identity(), fresh.identity(), "{context}: {key:?}");
+    assert_eq!(resolved.interval(), fresh.interval(), "{context}: {key:?}");
+    assert_eq!(
+        resolved.row_range(),
+        fresh.row_range(),
+        "{context}: {key:?}"
+    );
+    assert_eq!(
+        resolved.primitives(),
+        fresh.primitives(),
+        "{context}: primitives of {key:?}"
+    );
+    assert_eq!(
+        resolved.labels(),
+        fresh.labels(),
+        "{context}: labels of {key:?}"
+    );
+    assert_eq!(
+        resolved.label_anchors().collect::<Vec<_>>(),
+        fresh.label_anchors().collect::<Vec<_>>(),
+        "{context}: label anchors of {key:?}"
+    );
+    assert_eq!(
+        resolved.drawable_primitive_count(),
+        fresh.drawable_primitive_count(),
+        "{context}: {key:?}"
+    );
+    // Picking walks the page's private row directory; probe it at every primitive.
+    for primitive in resolved.primitives() {
+        let row = resolved.row_range().start + primitive.row_offset;
+        let position = resolved.interval().start() + primitive.start_offset;
+        assert_eq!(
+            resolved.pick(row, position),
+            fresh.pick(row, position),
+            "{context}: pick in {key:?}"
+        );
+    }
+}
+
+type Spatial = (CanonicalGenomicTile, CanonicalRowBlock, AlignmentPageFamily);
+
+#[derive(Default)]
+struct ReuseTally {
+    pages: u64,
+    reused_across_revisions: u64,
+    changed_and_rebuilt: u64,
+    unchanged_and_shared: u64,
+    cached_before_prepare: u64,
+}
+
+/// Drives one world through one presentation store and checks, for every page of every
+/// prepared scene, that it equals a page built from scratch for the same roots, and that a
+/// page whose inputs changed since the previous step was not carried over.
+#[allow(clippy::too_many_lines)]
+fn check_page_reuse(
+    world: &World,
+    rng: &mut XorShift,
+    layout: LayoutContract,
+    window_tiles: Option<u64>,
+    tally: &mut ReuseTally,
+) -> crate::AlignmentReadPageReuseStats {
+    let bases = reference_bases(world);
+    let presentation = random_presentation(rng);
+    let row_block_rows = NonZeroU32::new(u32::try_from(rng.between(3, 24)).unwrap()).unwrap();
+    let mut pages = AlignmentPresentationStore::new(world.ledger.clone());
+    let mut previous = HashMap::<Spatial, (PageManifest, Arc<AlignmentSemanticPage>)>::new();
+    drive_steps(
+        world,
+        layout,
+        OverlappingMatePolicy::CountBoth,
+        &mut |context, target, _, evidence, summaries, atlas| {
+            // A panning camera prepares a sliding window; otherwise the whole target.
+            let prepared = window_tiles.map_or(target, |tiles| {
+                let width = tiles * world.tile_bases.get();
+                interval(
+                    target.end().saturating_sub(width).max(target.start()),
+                    target.end(),
+                )
+            });
+            // Cameras are not tile aligned. Trimming the prepared interval leaves its edge
+            // tiles overhanging the reference slice, which then fills in as the camera moves.
+            let prepared = {
+                let mut trim = || {
+                    if rng.chance(1, 2) {
+                        rng.below(prepared.len().min(world.tile_bases.get()) / 2)
+                    } else {
+                        0
+                    }
+                };
+                let (left, right) = (trim(), trim());
+                interval(prepared.start() + left, prepared.end() - right)
+            };
+            // The slice covers every summary tile of the target plus the allele lane's margin.
+            let slice = presentation.reference.map(|_| {
+                reference_slice(
+                    &bases,
+                    interval(
+                        target.start().saturating_sub(4),
+                        (target.end() + 4).min(world.contig_length),
+                    ),
+                )
+            });
+            // Vertical warm-up may run against a narrower slice than the foreground gets. Pages
+            // it leaves behind saw fewer reference bases and must not answer the request below.
+            if let Some(full) = &slice
+                && atlas.row_count() > 0
+                && rng.chance(1, 2)
+            {
+                let trim = rng.between(1, prepared.len().min(world.tile_bases.get()) / 2 + 1);
+                let narrow = interval(
+                    (full.interval.start() + trim).min(full.interval.end() - 1),
+                    full.interval
+                        .end()
+                        .saturating_sub(trim)
+                        .max(full.interval.start() + trim + 1)
+                        .min(full.interval.end()),
+                );
+                let blocks = (atlas.row_count() as u64).div_ceil(u64::from(row_block_rows.get()));
+                pages
+                    .warm_read_row_block(
+                        evidence,
+                        atlas,
+                        presentation,
+                        prepared,
+                        CanonicalRowBlock::new(
+                            u32::try_from(rng.below(blocks)).unwrap(),
+                            row_block_rows,
+                        ),
+                        world.contig_length,
+                        world.tile_bases,
+                        Some(&reference_slice(&bases, narrow)),
+                        ReservationKind::Normal,
+                    )
+                    .unwrap_or_else(|error| panic!("{context}: warm: {error}"));
+            }
+            let reference = slice.as_ref();
+            let rows = 0..u32::try_from(atlas.row_count()).unwrap();
+            let block_count = u32::try_from(
+                u64::from(rows.end)
+                    .div_ceil(u64::from(row_block_rows.get()))
+                    .max(1),
+            )
+            .unwrap();
+            let blocks = (0..block_count)
+                .map(|coordinate| CanonicalRowBlock::new(coordinate, row_block_rows))
+                .collect::<Vec<_>>();
+            let fully_cached = |pages: &AlignmentPresentationStore| {
+                blocks.iter().all(|block| {
+                    pages
+                        .read_row_block_is_fully_cached(
+                            evidence,
+                            atlas,
+                            presentation,
+                            prepared,
+                            *block,
+                            world.contig_length,
+                            world.tile_bases,
+                        )
+                        .unwrap()
+                })
+            };
+            // Asked before these roots were ever prepared: true only if earlier pages still
+            // describe them, in which case preparing must build nothing.
+            let cached_before = presentation.reference.is_none() && fully_cached(&pages);
+            let builds_before = pages.read_page_reuse_stats().builds;
+            let candidate = pages
+                .prepare(
+                    evidence,
+                    summaries,
+                    atlas,
+                    presentation,
+                    prepared,
+                    rows,
+                    world.contig_length,
+                    world.tile_bases,
+                    row_block_rows,
+                    reference,
+                    ReservationKind::Normal,
+                )
+                .unwrap_or_else(|error| panic!("{context}: prepare: {error}"));
+            for page in candidate.snapshot().reads().pages() {
+                let key = page.key();
+                let fresh = AlignmentSemanticPage::build(
+                    AlignmentPageKey::new(
+                        evidence.source_revision(),
+                        evidence.revision(),
+                        atlas.revision(),
+                        atlas.layout_contract().fingerprint(),
+                        presentation.page_fingerprint(key.family()),
+                        key.genomic_tile(),
+                        key.row_block(),
+                        key.family(),
+                        presentation.geometry_lod,
+                    ),
+                    evidence,
+                    atlas,
+                    presentation,
+                    world.contig_length,
+                    reference,
+                    &world.ledger,
+                    ReservationKind::Normal,
+                    7,
+                )
+                .unwrap_or_else(|error| panic!("{context}: fresh {key:?}: {error}"));
+                assert_pages_structurally_equal(page, &fresh, context);
+                tally.pages += 1;
+                let reused = key.evidence_revision() != evidence.revision()
+                    || key.row_atlas_revision() != atlas.revision();
+                tally.reused_across_revisions += u64::from(reused);
+
+                let manifest = page_manifest(world, atlas, presentation, page, reference);
+                let spatial = (key.genomic_tile(), key.row_block(), key.family());
+                if let Some((before, incumbent)) = previous.get(&spatial) {
+                    if *before != manifest {
+                        assert!(
+                            !Arc::ptr_eq(incumbent, page) && incumbent.key() != key,
+                            "{context}: {key:?} changed ({before:?} -> {manifest:?}) but was reused"
+                        );
+                        tally.changed_and_rebuilt += 1;
+                    } else if Arc::ptr_eq(incumbent, page) {
+                        tally.unchanged_and_shared += 1;
+                    }
+                }
+                previous.insert(spatial, (manifest, Arc::clone(page)));
+            }
+            if cached_before {
+                assert_eq!(
+                    pages.read_page_reuse_stats().builds,
+                    builds_before,
+                    "{context}: a fully cached scene built pages"
+                );
+                tally.cached_before_prepare += 1;
+            }
+            assert!(
+                fully_cached(&pages),
+                "{context}: prepared pages not resident"
+            );
+            // Asking again for the same roots builds nothing.
+            let builds = pages.read_page_reuse_stats().builds;
+            let again = pages
+                .prepare(
+                    evidence,
+                    summaries,
+                    atlas,
+                    presentation,
+                    prepared,
+                    0..u32::try_from(atlas.row_count()).unwrap(),
+                    world.contig_length,
+                    world.tile_bases,
+                    row_block_rows,
+                    reference,
+                    ReservationKind::Normal,
+                )
+                .unwrap();
+            assert_eq!(pages.read_page_reuse_stats().builds, builds, "{context}");
+            for (first, second) in candidate
+                .snapshot()
+                .reads()
+                .pages()
+                .iter()
+                .zip(again.snapshot().reads().pages())
+            {
+                assert!(Arc::ptr_eq(first, second), "{context}");
+            }
+            drop(again);
+            if rng.chance(1, 4) {
+                // Unstaged pages are legal eviction victims; the directory must follow.
+                drop(candidate);
+                pages.remove_owner(crate::AlignmentPresentationOwner::default());
+                pages
+                    .evict_inactive_batch(0, rng.between(1, 12) as usize)
+                    .unwrap();
+            } else {
+                pages.stage(candidate);
+            }
+        },
+    );
+    pages.read_page_reuse_stats()
+}
+
+fn pairs_layout() -> LayoutContract {
+    LayoutContract {
+        view_as_pairs: true,
+        ..layout(ReadStackingMode::Compact, ReadSampling::Complete)
+    }
+}
+
+#[test]
+fn pages_reused_across_extension_equal_fresh_builds_and_changed_pages_rebuild() {
+    let mut tally = ReuseTally::default();
+    for seed in 0..CASES {
+        let world = World::new(seed);
+        let mut rng = XorShift::new(seed ^ 0x9a6e);
+        for layout in [
+            layout(ReadStackingMode::Compact, ReadSampling::Complete),
+            layout(ReadStackingMode::Stable, ReadSampling::Complete),
+            pairs_layout(),
+        ] {
+            for _ in 0..2 {
+                check_page_reuse(&world, &mut rng, layout, None, &mut tally);
+            }
+        }
+        let snapshot = world.ledger.snapshot().unwrap();
+        assert_eq!(snapshot.reserved, 0, "seed {seed}");
+        assert_eq!(snapshot.transient, 0, "seed {seed}");
+    }
+    eprintln!(
+        "page reuse: {} pages checked, {} reused across revisions, {} changed and rebuilt, {} unchanged and shared",
+        tally.pages,
+        tally.reused_across_revisions,
+        tally.changed_and_rebuilt,
+        tally.unchanged_and_shared
+    );
+    // The properties above are vacuous unless both outcomes actually occur.
+    assert!(tally.reused_across_revisions > 0, "no page was ever reused");
+    assert!(
+        tally.changed_and_rebuilt > 0,
+        "no changed page was observed"
+    );
+    assert!(
+        tally.unchanged_and_shared > 0,
+        "no unchanged page was shared"
+    );
+    assert!(tally.pages > tally.reused_across_revisions);
+    assert!(
+        tally.cached_before_prepare > 0,
+        "no extension was ever answered wholly from cache"
+    );
+}
+
+/// Reads tiled along a long contig, admitted one tile at a time left to right: the workload of
+/// a camera panning into uncached territory.
+fn pan_world(seed: u64) -> World {
+    let mut world = World::new(seed);
+    let tile = world.tile_bases.get();
+    let tiles = world.contig_length / tile;
+    world.steps = (0..tiles)
+        .map(|index| {
+            let end = if index + 1 == tiles {
+                world.contig_length
+            } else {
+                (index + 1) * tile
+            };
+            (interval(index * tile, end), interval(0, end), false)
+        })
+        .collect();
+    world
+}
+
+#[test]
+fn panning_by_extension_reuses_most_pages() {
+    let (mut requests, mut reuses, mut builds) = (0_u64, 0_u64, 0_u64);
+    for seed in 0..CASES / 2 {
+        let world = pan_world(seed);
+        let mut rng = XorShift::new(seed ^ 0x9a17);
+        for stacking in [ReadStackingMode::Compact, ReadStackingMode::Stable] {
+            let mut tally = ReuseTally::default();
+            let stats = check_page_reuse(
+                &world,
+                &mut rng,
+                layout(stacking, ReadSampling::Complete),
+                Some(6),
+                &mut tally,
+            );
+            // `check_page_reuse` asks for every scene twice; the repeat is all same-revision.
+            requests += stats.cross_revision_reuses + stats.builds;
+            reuses += stats.cross_revision_reuses;
+            builds += stats.builds;
+        }
+    }
+    eprintln!(
+        "pan workload: {reuses} of {requests} first-time page requests reused, {builds} built"
+    );
+    assert!(reuses > 0, "panning never reused a page");
+    // Before content identity every one of these requests built a page. Now a pan step
+    // rebuilds only the pages its new reads (or a grown last row block) actually touch.
+    assert!(
+        reuses * 2 > requests,
+        "panning reused only {reuses} of {requests} first-time page requests ({builds} builds)"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Incremental row atlas (SCENE-4 / SCENE-7)
+// ---------------------------------------------------------------------------------------------
+
+/// A random sorted and/or grouped, unpaired layout: every sort key and a spread of group keys,
+/// either direction of each, with and without a position anchor and a promoted template.
+fn random_ordered_layout(rng: &mut XorShift, world: &World) -> LayoutContract {
+    let sorting = [
+        AlignmentSortMode::Start,
+        AlignmentSortMode::Strand,
+        AlignmentSortMode::FirstOfPairStrand,
+        AlignmentSortMode::MappingQuality,
+        AlignmentSortMode::ReadName,
+        AlignmentSortMode::Haplotype,
+        AlignmentSortMode::AlignedLength,
+        AlignmentSortMode::LeftClip,
+        AlignmentSortMode::RightClip,
+        AlignmentSortMode::TemplateLength,
+        AlignmentSortMode::PairOrientation,
+        AlignmentSortMode::MateContig,
+        AlignmentSortMode::PairStatus,
+        AlignmentSortMode::ReadOrder,
+        AlignmentSortMode::Base,
+        AlignmentSortMode::Tag(*b"XS"),
+    ][rng.below(16) as usize];
+    let grouping = [
+        AlignmentGroupMode::None,
+        AlignmentGroupMode::None,
+        AlignmentGroupMode::None,
+        AlignmentGroupMode::Strand,
+        AlignmentGroupMode::Haplotype,
+        AlignmentGroupMode::ReadOrder,
+        AlignmentGroupMode::FirstOfPairStrand,
+        AlignmentGroupMode::LeftClip,
+        AlignmentGroupMode::PairOrientation,
+        AlignmentGroupMode::Base,
+        AlignmentGroupMode::Insertion,
+        AlignmentGroupMode::Tag(*b"XS"),
+    ][rng.below(12) as usize];
+    let direction = |rng: &mut XorShift| {
+        if rng.chance(1, 2) {
+            AlignmentOrderDirection::Natural
+        } else {
+            AlignmentOrderDirection::Reverse
+        }
+    };
+    let needs_anchor = sorting == AlignmentSortMode::Base
+        || matches!(
+            grouping,
+            AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
+        );
+    LayoutContract {
+        stacking: if rng.chance(1, 2) {
+            ReadStackingMode::Compact
+        } else {
+            ReadStackingMode::Stable
+        },
+        grouping,
+        group_order: direction(rng),
+        sorting,
+        sort_order: direction(rng),
+        sort_anchor: (needs_anchor || rng.chance(1, 5)).then(|| rng.below(world.contig_length)),
+        view_as_pairs: false,
+        pair_length_bounds: TemplateLengthBounds::default(),
+        promoted_template: rng.chance(1, 4).then(|| {
+            let record = &world.records[rng.below(world.records.len() as u64) as usize];
+            rgv_hts::template_id(&record.read_name).get()
+        }),
+        sampling: ReadSampling::Complete,
+    }
+}
+
+/// Camera-activity answers of an atlas at `probe`, both from a fresh cursor and from a cursor
+/// walked there from `via`.
+fn activity_answers(
+    atlas: &AlignmentRowAtlas,
+    via: GenomicInterval,
+    probe: GenomicInterval,
+) -> [(
+    usize,
+    usize,
+    usize,
+    usize,
+    Vec<crate::AlignmentRowActivityBin>,
+); 2] {
+    let bins = std::num::NonZeroUsize::new(7).unwrap();
+    let describe = |profile: crate::AlignmentRowActivityProfile| {
+        (
+            profile.active_row_end(),
+            profile.occupied_rows(),
+            profile.visible_record_count(),
+            profile.visible_connector_count(),
+            profile.bins().to_vec(),
+        )
+    };
+    let fresh = describe(atlas.activity_profile(probe, bins).unwrap());
+    let mut cursor = atlas.activity_cursor(via).unwrap();
+    assert!(cursor.update(probe));
+    [fresh, describe(cursor.profile(bins))]
+}
+
+#[derive(Default)]
+struct AtlasTally {
+    ordered_extensions_in_place: u64,
+    ordered_extensions_reshuffled: u64,
+    rebuilt: u64,
+    compactions: u64,
+}
+
+/// Drives one layout and checks every published atlas against a clean build, the stability of
+/// rows inside one row-coordinate space, and the work each extension reports.
+#[allow(clippy::too_many_lines)]
+fn check_atlas_extension(
+    world: &World,
+    rng: &mut XorShift,
+    layout: LayoutContract,
+    tally: &mut AtlasTally,
+) {
+    let default_order = layout.grouping == AlignmentGroupMode::None
+        && layout.sorting == AlignmentSortMode::Start
+        && layout.sort_order == AlignmentOrderDirection::Natural
+        && layout.group_order == AlignmentOrderDirection::Natural
+        && layout.sort_anchor.is_none()
+        && layout.promoted_template.is_none()
+        && !layout.view_as_pairs;
+    let mut step = 0_usize;
+    let mut previous = None::<(
+        crate::RowCoordinateSpaceRevision,
+        BTreeMap<AlignmentHandle, (u32, u64, u64)>,
+    )>;
+    drive(
+        world,
+        layout,
+        OverlappingMatePolicy::CountBoth,
+        |context, target, extended_left, evidence, _, atlas| {
+            let context = &format!("{context} {layout:?}");
+            let piece = world.steps[step].0;
+            step += 1;
+            let rows = atlas_rows(atlas, target, context);
+            let work = atlas.construction_work();
+
+            // Rows never move inside one row-coordinate space, and a root which reports no
+            // reassignment stays in its incumbent's space.
+            if let Some((space, incumbent_rows)) = &previous {
+                if *space == atlas.row_coordinate_space() {
+                    assert!(!work.rows_reassigned, "{context}");
+                    for (handle, assignment) in incumbent_rows {
+                        assert_eq!(rows.get(handle), Some(assignment), "{context}: {handle:?}");
+                    }
+                    if !default_order {
+                        tally.ordered_extensions_in_place += 1;
+                    }
+                } else {
+                    assert!(work.rows_reassigned, "{context}");
+                    // A reshuffle rewrites the incumbent layers into one; a rebuild from
+                    // evidence compacts nothing.
+                    if work.layers_compacted > 0 {
+                        assert!(!default_order, "{context}");
+                        tally.ordered_extensions_reshuffled += 1;
+                    } else {
+                        tally.rebuilt += 1;
+                    }
+                }
+                // An extension that reassigned nothing visited only the strip it admitted, one
+                // priority read per row when ordered, and whatever compaction merged.
+                if !work.rows_reassigned {
+                    let strip = world.overlapping(piece).count() as u64;
+                    let allowance = strip * 4 + atlas.row_count() as u64;
+                    if work.layers_compacted == 0 {
+                        assert!(
+                            work.records_visited <= allowance,
+                            "{context}: visited {} for a strip of {strip}",
+                            work.records_visited
+                        );
+                    }
+                    tally.compactions += u64::from(work.layers_compacted);
+                }
+            }
+            previous = Some((atlas.row_coordinate_space(), rows.clone()));
+
+            // Equal to a clean build, except where stable stacking froze rows on a leftward
+            // extension of the default order (the one documented divergence).
+            let clean = world.clean_evidence(target);
+            let clean_atlas = AlignmentRowAtlas::build(
+                RowAtlasRevision::new(RevisionFingerprint::new(90, 92)),
+                &clean,
+                target,
+                layout,
+                &world.ledger,
+                ReservationKind::Normal,
+                9,
+            )
+            .unwrap();
+            assert_eq!(atlas.record_count(), evidence.record_count(), "{context}");
+            let frozen =
+                default_order && layout.stacking == ReadStackingMode::Stable && extended_left;
+            if frozen {
+                return;
+            }
+            assert_eq!(
+                rows,
+                atlas_rows(&clean_atlas, target, context),
+                "{context}: rows"
+            );
+            assert_eq!(atlas.row_count(), clean_atlas.row_count(), "{context}");
+            assert_eq!(atlas.groups(), clean_atlas.groups(), "{context}: groups");
+            for row in 0..u32::try_from(atlas.row_count()).unwrap() {
+                assert_eq!(
+                    atlas.row_extent(row),
+                    clean_atlas.row_extent(row),
+                    "{context}: row {row}"
+                );
+            }
+            assert_eq!(
+                atlas.assignment_fingerprint(),
+                clean_atlas.assignment_fingerprint(),
+                "{context}: fingerprint"
+            );
+            for _ in 0..3 {
+                let mut random_interval = || {
+                    let start = rng.between(target.start(), target.end() - 1);
+                    interval(start, rng.between(start + 1, target.end()))
+                };
+                let (via, probe) = (random_interval(), random_interval());
+                let extended = activity_answers(atlas, via, probe);
+                let expected = activity_answers(&clean_atlas, via, probe);
+                assert_eq!(extended[0], expected[0], "{context}: activity at {probe:?}");
+                assert_eq!(
+                    extended[1], extended[0],
+                    "{context}: walked cursor at {probe:?}"
+                );
+                assert_eq!(
+                    expected[1], expected[0],
+                    "{context}: clean cursor at {probe:?}"
+                );
+                // And against the generated reads themselves.
+                let visible = world
+                    .overlapping(probe)
+                    .map(|index| rows[&handle(index)].0)
+                    .collect::<Vec<_>>();
+                let mut occupied = visible.clone();
+                occupied.sort_unstable();
+                occupied.dedup();
+                assert_eq!(
+                    extended[0].2,
+                    visible.len(),
+                    "{context}: visible at {probe:?}"
+                );
+                assert_eq!(
+                    extended[0].1,
+                    occupied.len(),
+                    "{context}: occupied at {probe:?}"
+                );
+                assert_eq!(
+                    extended[0].0,
+                    occupied.last().map_or(0, |row| *row as usize + 1),
+                    "{context}: active row end at {probe:?}"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn extended_atlas_equals_a_clean_build_in_every_order_and_keeps_rows_within_a_space() {
+    let mut tally = AtlasTally::default();
+    for seed in 0..CASES {
+        let world = World::new(seed);
+        let mut rng = XorShift::new(seed ^ 0x000a_71a5);
+        for stacking in [ReadStackingMode::Compact, ReadStackingMode::Stable] {
+            check_atlas_extension(
+                &world,
+                &mut rng,
+                layout(stacking, ReadSampling::Complete),
+                &mut tally,
+            );
+        }
+        for _ in 0..6 {
+            let layout = random_ordered_layout(&mut rng, &world);
+            check_atlas_extension(&world, &mut rng, layout, &mut tally);
+        }
+        // Rightward pans exercise chained in-place extension and compaction.
+        let pan = pan_world(seed);
+        for _ in 0..2 {
+            let layout = random_ordered_layout(&mut rng, &pan);
+            check_atlas_extension(&pan, &mut rng, layout, &mut tally);
+        }
+        check_atlas_extension(
+            &pan,
+            &mut rng,
+            layout(ReadStackingMode::Compact, ReadSampling::Complete),
+            &mut tally,
+        );
+    }
+    eprintln!(
+        "ordered extensions: {} in place, {} reshuffled; rebuilds {}; compactions {}",
+        tally.ordered_extensions_in_place,
+        tally.ordered_extensions_reshuffled,
+        tally.rebuilt,
+        tally.compactions
+    );
+    assert!(tally.ordered_extensions_in_place > 0);
+    assert!(tally.ordered_extensions_reshuffled > 0);
+    assert!(tally.compactions > 0);
+}
+
+/// Complexity regression, counted in record slots visited rather than wall time. A camera pans
+/// rightwards over thousands of short reads, one tile per extension.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn row_atlas_extension_work_is_proportional_to_the_reads_it_admits() {
+    let tile = 100_u64;
+    let read_count = 3_000_usize;
+    let contig_length = read_count as u64 * 10 + 100;
+    let records = (0..read_count)
+        .map(|index| AlignmentRecord {
+            contig: ContigId::new(0),
+            start: index as u64 * 10,
+            end: index as u64 * 10 + 30,
+            flags: AlignmentFlags::from_bits(if index % 3 == 0 { 0x10 } else { 0 }),
+            mapping_quality: Some((index % 61) as u8),
+            mate_contig: None,
+            mate_start: None,
+            template_length: 0,
+            read_name: format!("read-{index:05}").into_bytes(),
+            cigar: vec![CigarOp {
+                kind: CigarOpKind::Match,
+                len: 30,
+            }],
+            sequence: SequenceData::Present {
+                bases: vec![b'A'; 30],
+                qualities: Some(vec![30; 30]),
+            },
+            auxiliary_fields: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let ledger = AllocationLedger::new(1 << 30, 0);
+    let chunks = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| chunk(&ledger, record, index))
+        .collect();
+    let tiles = contig_length / tile;
+    let world = World {
+        seed: 0,
+        ledger,
+        contig_length,
+        tile_bases: NonZeroU64::new(tile).unwrap(),
+        records,
+        chunks,
+        steps: (0..tiles)
+            .map(|index| {
+                let end = (index + 1) * tile;
+                (interval(index * tile, end), interval(0, end), false)
+            })
+            .collect(),
+    };
+
+    for (label, layout, ordered) in [
+        (
+            "default",
+            layout(ReadStackingMode::Compact, ReadSampling::Complete),
+            false,
+        ),
+        (
+            // Names rise with position, so every new row ranks after every incumbent row.
+            "sorted by read name",
+            LayoutContract {
+                grouping: AlignmentGroupMode::None,
+                sorting: AlignmentSortMode::ReadName,
+                ..layout(ReadStackingMode::Compact, ReadSampling::Complete)
+            },
+            true,
+        ),
+    ] {
+        let mut store = world.store();
+        let (mut visited, mut strips, mut full_rebuilds) = (0_u64, 0_u64, 0_u64);
+        let mut last = None;
+        for (step, (piece, target, _)) in world.steps.iter().copied().enumerate() {
+            store.admit(world.acquisition(piece)).unwrap();
+            let evidence = store
+                .prepare(target, payload_contract(), ReservationKind::Normal)
+                .unwrap();
+            let rows = store
+                .prepare_row_atlas(evidence.root(), target, layout, ReservationKind::Normal)
+                .unwrap();
+            let atlas = Arc::clone(rows.root());
+            let work = atlas.construction_work();
+            let strip = world.overlapping(piece).count() as u64;
+            if step > 0 {
+                assert!(
+                    !work.rows_reassigned,
+                    "{label}: step {step} reassigned rows"
+                );
+                visited += work.records_visited;
+                strips += strip;
+                full_rebuilds += atlas.record_count() as u64;
+                if work.layers_compacted == 0 {
+                    let allowance = strip * 3 + if ordered { atlas.row_count() as u64 } else { 0 };
+                    assert!(
+                        work.records_visited <= allowance,
+                        "{label}: step {step} visited {} for a strip of {strip}",
+                        work.records_visited
+                    );
+                }
+            }
+            // Layers stay logarithmic, and superseded atlases leave the cache.
+            assert!(
+                atlas.layer_count() <= 4 + 12,
+                "{label}: {} layers",
+                atlas.layer_count()
+            );
+            assert_eq!(store.row_atlas_count(), 1, "{label}: step {step}");
+            last = Some((evidence, atlas));
+        }
+        let (evidence, atlas) = last.unwrap();
+        assert_eq!(atlas.record_count(), read_count);
+        let log = u64::from(usize::BITS - read_count.leading_zeros());
+        let rows = if ordered {
+            atlas.row_count() as u64 * tiles
+        } else {
+            0
+        };
+        let bound = strips * 3 + read_count as u64 * (log + 2) + rows;
+        eprintln!(
+            "{label}: visited {visited} slots over {tiles} extensions (bound {bound}); \
+             rebuilding every extension visits at least {full_rebuilds}"
+        );
+        assert!(visited <= bound, "{label}: visited {visited} > {bound}");
+        // The former implementation visited every incumbent record at least once per extension.
+        assert!(
+            visited * 5 < full_rebuilds,
+            "{label}: {visited} vs {full_rebuilds}"
+        );
+
+        let clean = AlignmentRowAtlas::build(
+            RowAtlasRevision::new(RevisionFingerprint::new(90, 93)),
+            evidence.root(),
+            atlas.interval(),
+            layout,
+            &world.ledger,
+            ReservationKind::Normal,
+            9,
+        )
+        .unwrap();
+        assert_eq!(
+            atlas.assignment_fingerprint(),
+            clean.assignment_fingerprint(),
+            "{label}"
+        );
+        assert_eq!(
+            atlas_rows(&atlas, atlas.interval(), label),
+            atlas_rows(&clean, atlas.interval(), label),
+            "{label}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// One selection per summary tile, entered at the tile (SCENE-10)
+// ---------------------------------------------------------------------------------------------
+
+/// Every family of every tile the store prepared from one shared selection equals the tile its
+/// builder produces alone from its own selection, and the allele and junction tiles equal the
+/// former builders that walked each read's whole CIGAR.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn summary_families_from_one_selection_equal_independent_whole_cigar_builds() {
+    let mut compared = 0_u64;
+    for seed in 0..CASES {
+        let world = World::new(seed);
+        for policy in [
+            OverlappingMatePolicy::CountBoth,
+            OverlappingMatePolicy::CountOnce,
+        ] {
+            let contract = summary_contract(policy);
+            drive(
+                &world,
+                layout(ReadStackingMode::Compact, ReadSampling::Complete),
+                policy,
+                |context, _, _, evidence, summaries, _| {
+                    let ledger = &world.ledger;
+                    let kind = ReservationKind::Normal;
+                    let length = world.contig_length;
+                    for tile in summaries.depth_tiles() {
+                        let alone = crate::ExactDepthSummaryTile::build(
+                            evidence,
+                            tile.tile(),
+                            length,
+                            contract.depth(),
+                            ledger,
+                            kind,
+                            3,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            (
+                                tile.depth(),
+                                tile.eligible_records(),
+                                tile.collapsed_mate_bases()
+                            ),
+                            (
+                                alone.depth(),
+                                alone.eligible_records(),
+                                alone.collapsed_mate_bases()
+                            ),
+                            "{context}: depth {:?}",
+                            tile.tile()
+                        );
+                        compared += 1;
+                    }
+                    for tile in summaries.allele_tiles() {
+                        let describe = |tile: &ExactAlleleSummaryTile| {
+                            (
+                                tile.sites().to_vec(),
+                                tile.eligible_records(),
+                                tile.collapsed_mate_bases(),
+                            )
+                        };
+                        let build = |whole: bool| {
+                            let builder = if whole {
+                                ExactAlleleSummaryTile::build_walking_whole_cigars
+                            } else {
+                                ExactAlleleSummaryTile::build
+                            };
+                            builder(
+                                evidence,
+                                tile.tile(),
+                                length,
+                                contract.alleles(),
+                                ledger,
+                                kind,
+                                3,
+                            )
+                            .unwrap()
+                        };
+                        let expected = describe(&build(true));
+                        assert_eq!(
+                            describe(tile),
+                            expected,
+                            "{context}: alleles {:?}",
+                            tile.tile()
+                        );
+                        assert_eq!(
+                            describe(&build(false)),
+                            expected,
+                            "{context}: {:?}",
+                            tile.tile()
+                        );
+                        compared += 1;
+                    }
+                    for tile in summaries.junction_tiles() {
+                        let describe = |tile: &crate::ExactJunctionSummaryTile| {
+                            (tile.summary().clone(), tile.entering_junctions().to_vec())
+                        };
+                        let build = |whole: bool| {
+                            let builder = if whole {
+                                crate::ExactJunctionSummaryTile::build_walking_whole_cigars
+                            } else {
+                                crate::ExactJunctionSummaryTile::build
+                            };
+                            builder(
+                                evidence,
+                                tile.tile(),
+                                length,
+                                contract.junctions(),
+                                None,
+                                ledger,
+                                kind,
+                                3,
+                            )
+                            .unwrap()
+                        };
+                        let expected = describe(&build(true));
+                        assert_eq!(
+                            describe(tile),
+                            expected,
+                            "{context}: junctions {:?}",
+                            tile.tile()
+                        );
+                        assert_eq!(
+                            describe(&build(false)),
+                            expected,
+                            "{context}: {:?}",
+                            tile.tile()
+                        );
+                        compared += 1;
+                    }
+                    for tile in summaries.pair_tiles() {
+                        let alone = crate::ExactPairSummaryTile::build(
+                            evidence,
+                            tile.tile(),
+                            length,
+                            contract.pairs(),
+                            ledger,
+                            kind,
+                            3,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            (tile.candidates(), tile.summary(), tile.maximum_record_end()),
+                            (
+                                alone.candidates(),
+                                alone.summary(),
+                                alone.maximum_record_end()
+                            ),
+                            "{context}: pairs {:?}",
+                            tile.tile()
+                        );
+                        compared += 1;
+                    }
+                    for tile in summaries.modification_tiles() {
+                        let alone = crate::ExactModificationSummaryTile::build(
+                            evidence,
+                            tile.tile(),
+                            length,
+                            contract.modifications().unwrap(),
+                            ledger,
+                            kind,
+                            3,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            tile.summary(),
+                            alone.summary(),
+                            "{context}: modifications {:?}",
+                            tile.tile()
+                        );
+                        compared += 1;
+                    }
+                },
+            );
+        }
+    }
+    assert!(compared > 1_000, "only {compared} tiles compared");
+}
+
+/// The store selects a tile's records once for all of its summary families, and not at all for
+/// a tile whose families are every one cached.
+#[test]
+fn exact_summaries_select_each_tile_once_for_all_families() {
+    for seed in 0..CASES {
+        let world = World::new(seed);
+        let target = interval(0, world.contig_length);
+        let tiles = world.contig_length.div_ceil(world.tile_bases.get());
+        let mut store = world.store();
+        store.admit(world.acquisition(target)).unwrap();
+        let evidence = store
+            .prepare(target, payload_contract(), ReservationKind::Normal)
+            .unwrap();
+        let prepare = |store: &mut EvidenceStore| {
+            store
+                .prepare_exact_summaries(
+                    evidence.root(),
+                    target,
+                    world.tile_bases,
+                    world.contig_length,
+                    summary_contract(OverlappingMatePolicy::CountOnce),
+                    None,
+                    ReservationKind::Normal,
+                )
+                .unwrap()
+        };
+        let first = prepare(&mut store);
+        // Depth, alleles, junctions, pairs and modifications all read records: five families.
+        assert!(!first.root().modification_tiles().is_empty(), "seed {seed}");
+        assert!(!first.root().allele_tiles().is_empty(), "seed {seed}");
+        assert_eq!(store.exact_summary_selection_count(), tiles, "seed {seed}");
+        let again = prepare(&mut store);
+        assert_eq!(
+            store.exact_summary_selection_count(),
+            tiles,
+            "seed {seed}: cached"
+        );
+        assert_eq!(
+            again.root().depth_tiles().len(),
+            first.root().depth_tiles().len()
+        );
+        assert_eq!(world.ledger.snapshot().unwrap().transient, 0, "seed {seed}");
+    }
 }

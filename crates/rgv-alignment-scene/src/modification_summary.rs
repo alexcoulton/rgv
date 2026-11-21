@@ -65,6 +65,32 @@ impl ExactModificationSummaryTile {
         reservation_kind: ReservationKind,
         publication_revision: u64,
     ) -> Result<Arc<Self>, ExactModificationSummaryError> {
+        Self::build_with_selection(
+            None,
+            evidence,
+            tile,
+            contig_length,
+            contract,
+            ledger,
+            reservation_kind,
+            publication_revision,
+        )
+    }
+
+    /// [`Self::build`] over a selection of the tile already made for another summary family.
+    /// One tile's families all read the same complete selection, so the store selects once per
+    /// tile. A selection of another root or interval is ignored and the tile selects its own.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_with_selection(
+        shared: Option<&crate::EvidenceSelection>,
+        evidence: &Arc<EvidenceRoot>,
+        tile: CanonicalGenomicTile,
+        contig_length: u64,
+        contract: ModificationSummaryContract,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, ExactModificationSummaryError> {
         if evidence.payload().sequence() != CapabilityRequirement::Required {
             return Err(ExactModificationSummaryError::MissingSequenceCapability);
         }
@@ -82,10 +108,18 @@ impl ExactModificationSummaryTile {
         let interval = tile.interval(contig_length)?;
         let bins = usize::try_from(interval.len())
             .map_err(|_| ExactModificationSummaryError::TileTooWide(interval.len()))?;
-        let selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
+        let owned_selection;
+        let selection = if let Some(shared) =
+            shared.filter(|shared| shared.is_over(evidence, interval))
+        {
+            shared
+        } else {
+            owned_selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
+            &owned_selection
+        };
         // Every series owns one dense bin per tile base, so reserve for the series the selected
         // records can actually open rather than always for the declared maximum.
-        let maximum_series = maximum_series(&selection)?;
+        let maximum_series = maximum_series(selection)?;
         let maximum_bytes = maximum_retained_bytes(maximum_series, bins);
         let mut reservation = ledger.reserve(
             AllocationClass::ExactSummary,

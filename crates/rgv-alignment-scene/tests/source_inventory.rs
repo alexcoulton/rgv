@@ -34,7 +34,12 @@ fn function_source<'a>(source: &'a str, function: &str) -> &'a str {
         .find(&signature)
         .unwrap_or_else(|| panic!("function {function} is absent"));
     let remainder = &source[start + signature.len()..];
-    let end = ["\n    fn ", "\n    pub fn ", "\n    pub(crate) fn "]
+    let end = [
+        "\n    fn ",
+        "\n    pub fn ",
+        "\n    pub(crate) fn ",
+        "\n    pub(super) fn ",
+    ]
         .into_iter()
         .filter_map(|prefix| remainder.find(prefix))
         .min()

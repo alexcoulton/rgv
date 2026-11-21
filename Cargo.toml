@@ -70,6 +70,7 @@ rmcp = { version = "3.1.4", default-features = false, features = ["base64", "mac
 rfd = "0.17.2"
 rsomics-bamio = { version = "0.8.4", default-features = false }
 rust-htslib = { version = "1.0.1", default-features = false, features = ["curl", "libdeflate"] }
+schemars = "1.2.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"

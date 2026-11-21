@@ -1,6 +1,7 @@
 //! Central workspace canvas: genome context, track chrome, genomic text and scrollbars.
 
-use super::*;
+use crate::ui::frame::{ShellFrame, read_panel_scrollbar_rect, remap_genomic_texts_for_layout};
+use crate::{Viewer, ui};
 
 impl Viewer {
     #[allow(clippy::too_many_lines)]

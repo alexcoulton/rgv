@@ -70,8 +70,42 @@ impl ExactPairSummaryTile {
         reservation_kind: ReservationKind,
         publication_revision: u64,
     ) -> Result<Arc<Self>, ExactPairSummaryError> {
+        Self::build_with_selection(
+            None,
+            evidence,
+            tile,
+            contig_length,
+            contract,
+            ledger,
+            reservation_kind,
+            publication_revision,
+        )
+    }
+
+    /// [`Self::build`] over a selection of the tile already made for another summary family.
+    /// One tile's families all read the same complete selection, so the store selects once per
+    /// tile. A selection of another root or interval is ignored and the tile selects its own.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_with_selection(
+        shared: Option<&crate::EvidenceSelection>,
+        evidence: &Arc<EvidenceRoot>,
+        tile: CanonicalGenomicTile,
+        contig_length: u64,
+        contract: PairSummaryContract,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, ExactPairSummaryError> {
         let interval = tile.interval(contig_length)?;
-        let selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
+        let owned_selection;
+        let selection = if let Some(shared) =
+            shared.filter(|shared| shared.is_over(evidence, interval))
+        {
+            shared
+        } else {
+            owned_selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
+            &owned_selection
+        };
         let maximum_capacity = selection
             .len()
             .checked_next_power_of_two()

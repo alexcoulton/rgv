@@ -10,7 +10,8 @@ use super::shell_state::{
     ScrollModifiers, UnsavedChoice, escape_action, interpret_scroll, pinch_zoom_factor,
 };
 use super::tasks::SessionLoadKind;
-use crate::{TrackSearchResults, UiPanel, Viewer};
+use crate::{UiPanel, Viewer};
+use rgv_engine::TrackSearchResults;
 
 /// Whether the annotation-search popup is shown under the locus field.
 pub(crate) fn search_popup_visible(

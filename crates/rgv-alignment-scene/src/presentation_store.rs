@@ -9,15 +9,17 @@ use rgv_core::GenomicInterval;
 use rgv_hts::ReferenceSlice;
 use thiserror::Error;
 
+use crate::page_identity::{page_reads_reference, reference_slice_stamp};
 use crate::summary_page::required_summary_page_keys;
 use crate::{
-    AlignmentCacheResidencyClass, AlignmentCacheResidencyInventory, AlignmentPageKey,
-    AlignmentPresentationScene, AlignmentPresentationSceneError, AlignmentRowAtlas,
-    AlignmentSceneSnapshot, AlignmentSceneSnapshotError, AlignmentSemanticPage, AllocationId,
-    AllocationLedger, AllocationRecordSnapshot, CanonicalGenomicTile, CanonicalRowBlock,
-    ExactSummaryRoot, JunctionAnnotationIndex, LedgerError, PresentationContract,
-    ReferenceRevision, ReservationKind, RevisionFingerprint, SceneRevision, SemanticPageError,
-    SummaryPageFamily, SummaryPageKey, SummarySemanticPage, SummarySemanticPageError,
+    AlignmentCacheResidencyClass, AlignmentCacheResidencyInventory, AlignmentPageIdentity,
+    AlignmentPageKey, AlignmentPresentationScene, AlignmentPresentationSceneError,
+    AlignmentRowAtlas, AlignmentSceneSnapshot, AlignmentSceneSnapshotError, AlignmentSemanticPage,
+    AllocationId, AllocationLedger, AllocationRecordSnapshot, CanonicalGenomicTile,
+    CanonicalRowBlock, ExactSummaryRoot, JunctionAnnotationIndex, LedgerError,
+    PresentationContract, ReferenceRevision, ReservationKind, RevisionFingerprint, SceneRevision,
+    SemanticPageError, SummaryPageFamily, SummaryPageKey, SummarySemanticPage,
+    SummarySemanticPageError,
 };
 
 /// Stable publication slot within one source-owned presentation repository. Multiple panels can
@@ -83,7 +85,30 @@ pub struct AlignmentPresentationStore {
     prepared_by_owner: HashMap<AlignmentPresentationOwner, Arc<AlignmentSceneSnapshot>>,
     demanded_read_residency: HashMap<AlignmentPageKey, AlignmentCacheResidencyClass>,
     demanded_summary_residency: HashMap<SummaryPageKey, AlignmentCacheResidencyClass>,
+    /// Content directory over `read_pages`: identity with its reference digest cleared, to
+    /// every resident page with those records and rows as `(reference digest, page key)`.
+    read_identities: HashMap<AlignmentPageIdentity, Vec<(RevisionFingerprint, AlignmentPageKey)>>,
+    /// Requests already resolved for one pair of immutable roots: the key a request would
+    /// build under, to the whole-reference-slice stamp it was resolved with and the key of the
+    /// resident page that satisfies it. This is a memo of a completed identity proof; an entry
+    /// whose page has left the cache is ignored.
+    resolved_read_keys: HashMap<AlignmentPageKey, (RevisionFingerprint, AlignmentPageKey)>,
+    read_page_reuse: AlignmentReadPageReuseStats,
     next_revision: u64,
+}
+
+/// Cumulative read-page resolution counters for one presentation store.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentReadPageReuseStats {
+    /// Read pages requested by `prepare*` and `warm_read_row_block`.
+    pub requests: u64,
+    /// Requests answered by a page built under the same evidence and row-atlas revisions.
+    pub same_revision_hits: u64,
+    /// Requests answered by a page built under earlier revisions, after proving that these
+    /// roots hand the builder identical inputs.
+    pub cross_revision_reuses: u64,
+    /// Requests which had to build a page.
+    pub builds: u64,
 }
 
 impl AlignmentPresentationStore {
@@ -97,6 +122,9 @@ impl AlignmentPresentationStore {
             prepared_by_owner: HashMap::new(),
             demanded_read_residency: HashMap::new(),
             demanded_summary_residency: HashMap::new(),
+            read_identities: HashMap::new(),
+            resolved_read_keys: HashMap::new(),
+            read_page_reuse: AlignmentReadPageReuseStats::default(),
             next_revision: 1,
         }
     }
@@ -171,12 +199,13 @@ impl AlignmentPresentationStore {
             CanonicalGenomicTile::covering(prepared_interval, geometry_tile_bases, contig_length)?;
         let row_blocks = covering_row_blocks(prepared_rows.clone(), row_block_rows);
         let read_families = presentation.required_page_families();
-        let mut read_pages = Vec::with_capacity(
-            genomic_tiles
-                .len()
-                .saturating_mul(row_blocks.len())
-                .saturating_mul(read_families.len()),
-        );
+        let page_capacity = genomic_tiles
+            .len()
+            .saturating_mul(row_blocks.len())
+            .saturating_mul(read_families.len());
+        let mut read_pages = Vec::with_capacity(page_capacity);
+        let mut read_identities = Vec::with_capacity(page_capacity);
+        let reference_stamp = reference_slice_stamp(reference);
         for row_block in row_blocks {
             for genomic_tile in genomic_tiles.iter().copied() {
                 for family in read_families.iter().copied() {
@@ -191,21 +220,26 @@ impl AlignmentPresentationStore {
                         family,
                         presentation.geometry_lod,
                     );
-                    read_pages.push(self.read_page(
+                    let page = self.read_page(
                         key,
                         evidence,
                         atlas,
                         presentation,
                         contig_length,
                         reference,
+                        reference_stamp,
                         AlignmentCacheResidencyClass::ForegroundVisible,
                         reservation_kind,
                         revision_number,
-                    )?);
+                    )?;
+                    // The page was either built from these roots or resolved by reproducing
+                    // its identity from them; the scene re-checks that binding per page.
+                    read_identities.push(page.identity());
+                    read_pages.push(page);
                 }
             }
         }
-        let reads = AlignmentPresentationScene::new(
+        let reads = AlignmentPresentationScene::new_with_page_identities(
             revision,
             Arc::clone(evidence),
             Arc::clone(atlas),
@@ -213,6 +247,7 @@ impl AlignmentPresentationStore {
             prepared_interval,
             prepared_rows,
             read_pages,
+            Some(&read_identities),
             &self.ledger,
             reservation_kind,
             revision_number,
@@ -284,6 +319,7 @@ impl AlignmentPresentationStore {
         let read_families = presentation.required_page_families();
         let page_occurrences = genomic_tiles.len().saturating_mul(read_families.len());
         let mut cache_misses = 0_usize;
+        let reference_stamp = reference_slice_stamp(reference);
         for genomic_tile in genomic_tiles {
             for family in read_families.iter().copied() {
                 let key = AlignmentPageKey::new(
@@ -297,8 +333,7 @@ impl AlignmentPresentationStore {
                     family,
                     presentation.geometry_lod,
                 );
-                cache_misses =
-                    cache_misses.saturating_add(usize::from(!self.read_pages.contains_key(&key)));
+                let builds_before = self.read_page_reuse.builds;
                 self.read_page(
                     key,
                     evidence,
@@ -306,10 +341,13 @@ impl AlignmentPresentationStore {
                     presentation,
                     contig_length,
                     reference,
+                    reference_stamp,
                     AlignmentCacheResidencyClass::DisposableSpeculation,
                     reservation_kind,
                     revision_number,
                 )?;
+                cache_misses = cache_misses
+                    .saturating_add(usize::from(self.read_page_reuse.builds != builds_before));
             }
         }
         Ok(AlignmentReadPageWarm {
@@ -350,12 +388,36 @@ impl AlignmentPresentationStore {
                     family,
                     presentation.geometry_lod,
                 );
-                if !self.read_pages.contains_key(&key) {
+                if self.resolved_read_page(key).is_some() {
+                    continue;
+                }
+                // Not resolved for these exact roots yet: a page built from earlier roots
+                // still counts when these roots reproduce its records and rows.
+                let resident = AlignmentSemanticPage::probe_identity(
+                    key,
+                    evidence,
+                    atlas,
+                    presentation,
+                    contig_length,
+                )
+                .is_ok_and(|identity| {
+                    self.read_identities
+                        .get(&identity)
+                        .is_some_and(|pages| !pages.is_empty())
+                });
+                if !resident {
                     return Ok(false);
                 }
             }
         }
         Ok(true)
+    }
+
+    /// Cumulative read-page resolution counters: how many requests were answered from the
+    /// cache, how many of those crossed an evidence or row-atlas revision, and how many built.
+    #[must_use]
+    pub const fn read_page_reuse_stats(&self) -> AlignmentReadPageReuseStats {
+        self.read_page_reuse
     }
 
     pub fn stage(&mut self, candidate: AlignmentSceneCandidate) -> Arc<AlignmentSceneSnapshot> {
@@ -457,6 +519,7 @@ impl AlignmentPresentationStore {
         self.summary_pages
             .retain(|_, cached| cached.page.indexed_interval().overlaps(target));
         self.rebuild_eviction_index();
+        self.rebuild_read_identities();
         PresentationCacheDiscard {
             read_pages: read_pages_before.saturating_sub(self.read_pages.len()),
             summary_pages: summary_pages_before.saturating_sub(self.summary_pages.len()),
@@ -713,7 +776,7 @@ impl AlignmentPresentationStore {
             self.eviction_index.remove(&indexed);
             match candidate {
                 CachedPageLocation::Read(key) => {
-                    self.read_pages.remove(&key);
+                    self.forget_read_page(key);
                     evicted_read_pages = evicted_read_pages.saturating_add(1);
                 }
                 CachedPageLocation::Summary(key) => {
@@ -745,6 +808,105 @@ impl AlignmentPresentationStore {
         })
     }
 
+    /// The resident page a request for `key` was last resolved to, if it is still cached.
+    fn resolved_read_page(
+        &self,
+        key: AlignmentPageKey,
+    ) -> Option<(RevisionFingerprint, AlignmentPageKey)> {
+        self.resolved_read_keys
+            .get(&key)
+            .copied()
+            .filter(|(_, canonical)| self.read_pages.contains_key(canonical))
+    }
+
+    fn touch_read_page(
+        &mut self,
+        canonical: AlignmentPageKey,
+        requested_residency: AlignmentCacheResidencyClass,
+        revision: u64,
+    ) -> Result<Option<Arc<AlignmentSemanticPage>>, AlignmentPresentationStoreError> {
+        let Some(cached) = self.read_pages.get_mut(&canonical) else {
+            return Ok(None);
+        };
+        let previous = (
+            cached.residency,
+            cached.last_used_revision,
+            cached.page.allocation().id(),
+            CachedPageLocation::Read(canonical),
+        );
+        cached.last_used_revision = revision;
+        cached.residency = cached.residency.max(requested_residency);
+        self.ledger.touch(cached.page.allocation().id(), revision)?;
+        self.eviction_index.remove(&previous);
+        self.eviction_index.insert((
+            cached.residency,
+            revision,
+            cached.page.allocation().id(),
+            CachedPageLocation::Read(canonical),
+        ));
+        Ok(Some(Arc::clone(&cached.page)))
+    }
+
+    /// Drops one read page from the lookup maps and the content directory. The eviction index
+    /// entry is the caller's to remove.
+    fn forget_read_page(&mut self, key: AlignmentPageKey) -> Option<CachedReadPage> {
+        let cached = self.read_pages.remove(&key)?;
+        let identity = cached.page.identity().without_reference();
+        if let Some(pages) = self.read_identities.get_mut(&identity) {
+            pages.retain(|(_, resident)| *resident != key);
+            if pages.is_empty() {
+                self.read_identities.remove(&identity);
+            }
+        }
+        Some(cached)
+    }
+
+    fn rebuild_read_identities(&mut self) {
+        self.read_identities.clear();
+        for (key, cached) in &self.read_pages {
+            let identity = cached.page.identity();
+            self.read_identities
+                .entry(identity.without_reference())
+                .or_default()
+                .push((identity.content().reference(), *key));
+        }
+        let read_pages = &self.read_pages;
+        self.resolved_read_keys
+            .retain(|_, (_, canonical)| read_pages.contains_key(canonical));
+    }
+
+    fn remember_resolution(
+        &mut self,
+        key: AlignmentPageKey,
+        reference_stamp: RevisionFingerprint,
+        canonical: AlignmentPageKey,
+    ) {
+        self.resolved_read_keys
+            .insert(key, (reference_stamp, canonical));
+        // Every publication mints new request keys, so entries for superseded roots are never
+        // asked for again. Bound the memo by the cache it describes; losing an entry only costs
+        // one identity derivation.
+        let limit = self
+            .read_pages
+            .len()
+            .saturating_mul(8)
+            .saturating_add(1_024);
+        if self.resolved_read_keys.len() > limit {
+            let read_pages = &self.read_pages;
+            self.resolved_read_keys
+                .retain(|_, (_, canonical)| read_pages.contains_key(canonical));
+            if self.resolved_read_keys.len() > limit / 2 {
+                self.resolved_read_keys.clear();
+                self.resolved_read_keys
+                    .insert(key, (reference_stamp, canonical));
+            }
+        }
+    }
+
+    /// Resolves one read page for these roots: a page already resolved for them, else a
+    /// resident page from earlier roots whose content identity these roots reproduce, else a
+    /// fresh build.
+    #[allow(clippy::too_many_arguments)]
     fn read_page(
         &mut self,
         key: AlignmentPageKey,
@@ -753,30 +915,23 @@ impl AlignmentPresentationStore {
         presentation: PresentationContract,
         contig_length: u64,
         reference: Option<&ReferenceSlice>,
+        reference_stamp: RevisionFingerprint,
         requested_residency: AlignmentCacheResidencyClass,
         reservation_kind: ReservationKind,
         revision: u64,
     ) -> Result<Arc<AlignmentSemanticPage>, AlignmentPresentationStoreError> {
-        if let Some(cached) = self.read_pages.get_mut(&key) {
-            let previous = (
-                cached.residency,
-                cached.last_used_revision,
-                cached.page.allocation().id(),
-                CachedPageLocation::Read(key),
-            );
-            cached.last_used_revision = revision;
-            cached.residency = cached.residency.max(requested_residency);
-            self.ledger.touch(cached.page.allocation().id(), revision)?;
-            self.eviction_index.remove(&previous);
-            self.eviction_index.insert((
-                cached.residency,
-                revision,
-                cached.page.allocation().id(),
-                CachedPageLocation::Read(key),
-            ));
-            return Ok(Arc::clone(&cached.page));
+        self.read_page_reuse.requests = self.read_page_reuse.requests.saturating_add(1);
+        // Same immutable roots (the key names both revisions) and, for a page that reads the
+        // reference, the same slice: the inputs are those of the earlier resolution.
+        let reads_reference = page_reads_reference(key.family(), key.lod(), presentation.style);
+        if let Some((stamp, canonical)) = self.resolved_read_page(key)
+            && (!reads_reference || stamp == reference_stamp)
+            && let Some(page) = self.touch_read_page(canonical, requested_residency, revision)?
+        {
+            self.count_read_page_hit(key, canonical);
+            return Ok(page);
         }
-        let page = AlignmentSemanticPage::build(
+        let inputs = AlignmentSemanticPage::collect_inputs(
             key,
             evidence,
             atlas,
@@ -785,8 +940,50 @@ impl AlignmentPresentationStore {
             reference,
             &self.ledger,
             reservation_kind,
+        )?;
+        let identity = inputs.identity();
+        let resident = self
+            .read_identities
+            .get(&identity.without_reference())
+            .and_then(|pages| {
+                pages
+                    .iter()
+                    .find(|(reference, _)| *reference == identity.content().reference())
+            })
+            .map(|(_, canonical)| *canonical);
+        if let Some(canonical) = resident
+            && let Some(page) = self.touch_read_page(canonical, requested_residency, revision)?
+        {
+            debug_assert_eq!(page.identity(), identity);
+            drop(inputs);
+            self.remember_resolution(key, reference_stamp, canonical);
+            self.count_read_page_hit(key, canonical);
+            return Ok(page);
+        }
+        let inputs = inputs.keyed_by_reference();
+        let request = key;
+        let key = inputs.key();
+        let page = AlignmentSemanticPage::build_from_inputs(
+            inputs,
+            evidence,
+            atlas,
+            presentation,
+            reference,
+            &self.ledger,
+            reservation_kind,
             revision,
         )?;
+        self.read_page_reuse.builds = self.read_page_reuse.builds.saturating_add(1);
+        // A resident page under this exact key would have matched the identity above; replace
+        // defensively rather than leave two directory entries for one key.
+        if let Some(replaced) = self.forget_read_page(key) {
+            self.eviction_index.remove(&(
+                replaced.residency,
+                replaced.last_used_revision,
+                replaced.page.allocation().id(),
+                CachedPageLocation::Read(key),
+            ));
+        }
         self.read_pages.insert(
             key,
             CachedReadPage {
@@ -795,13 +992,29 @@ impl AlignmentPresentationStore {
                 page: Arc::clone(&page),
             },
         );
+        self.read_identities
+            .entry(identity.without_reference())
+            .or_default()
+            .push((identity.content().reference(), key));
         self.eviction_index.insert((
             requested_residency,
             revision,
             page.allocation().id(),
             CachedPageLocation::Read(key),
         ));
+        self.remember_resolution(request, reference_stamp, key);
         Ok(page)
+    }
+
+    fn count_read_page_hit(&mut self, key: AlignmentPageKey, canonical: AlignmentPageKey) {
+        let counter = if key.evidence_revision() == canonical.evidence_revision()
+            && key.row_atlas_revision() == canonical.row_atlas_revision()
+        {
+            &mut self.read_page_reuse.same_revision_hits
+        } else {
+            &mut self.read_page_reuse.cross_revision_reuses
+        };
+        *counter = counter.saturating_add(1);
     }
 
     fn summary_page(

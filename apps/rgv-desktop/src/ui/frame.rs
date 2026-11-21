@@ -10,7 +10,18 @@
 //! `toolbar`, `canvas` and `track_settings_window`) runs the egui pass against
 //! it, and `commit` (with the `apply_*` modules) applies the result.
 
-use super::super::*;
+use crate::diagnostics::ManualDiagnosticFramePhase;
+use crate::ui::{AlignmentSubtrack, TrackUiAction};
+use crate::workspace::panels::{
+    ReadPanelDisplayCache, ReadPanelScrollState, ReadRowCoordinateAuthority,
+    current_read_row_authority,
+};
+use crate::{
+    CachedGenomeOverview, GenomeOverviewCacheKey, GenomeOverviewTrackCacheKey, Viewer, ui,
+};
+use rgv_core::{PanelId, PresentationNodeId, SessionFilters, TrackId};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 mod apply_lists;
 mod apply_requests;
@@ -286,7 +297,7 @@ impl Viewer {
                 data: genome_overview.clone(),
             },
         );
-        self.record_manual_diagnostic_event(
+        self.diagnostics.event(
             "ui",
             "genome_overview_recomputed",
             serde_json::json!({
@@ -314,7 +325,7 @@ impl Viewer {
             align.bulk_alignment_pane,
         );
         let nav = self.prepare_navigation_draft();
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellPreparation,
             shell_preparation_started.elapsed(),
         );
@@ -340,7 +351,7 @@ impl Viewer {
             alignment_context_menu_view,
             alignment_context_action: None,
         };
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellPreparation,
             shell_preparation_started.elapsed(),
         );
@@ -348,7 +359,7 @@ impl Viewer {
         let full_output = self
             .egui_context
             .run_ui(raw_input, |ui| self.show_shell_ui(ui, &mut frame));
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellUiRun,
             shell_ui_started.elapsed(),
         );
@@ -360,6 +371,7 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rgv_layout::Rgba;
 
     fn text_layout(
         workspace_right: f32,

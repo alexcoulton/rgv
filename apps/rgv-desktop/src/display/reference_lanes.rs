@@ -1,4 +1,27 @@
-use super::*;
+use crate::display::auxiliary::{
+    measured_feature_label_widths, pinned_gene_layout_maximum_rows, strip_object_ids,
+    track_options_with_object_ids,
+};
+use crate::display::{
+    GenomicDisplayPass, pinned_gene_track_height, primary_pinned_gene_id, reference_bases_label,
+};
+use crate::ui::gestures::retained_data_overlaps;
+use crate::ui::{TrackFrame, TrackFrameKey, TrackSubtrack};
+use crate::workspace::context_lanes::{
+    ContextLaneDraft, ContextLaneKey, buffered_context_interval, prepared_context_viewport,
+};
+use crate::{Viewer, ui};
+use rgv_core::{
+    GeneticCode, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, ReferenceTranslationFrame, TrackKind,
+    TrackSource, Viewport,
+};
+use rgv_engine::{MAX_REFERENCE_QUERY_BASES, TrackSnapshot, TrackSnapshotData};
+use rgv_hts::ReferenceSlice;
+use rgv_layout::{
+    DisplayList, MINIMUM_BASE_GLYPH_PIXEL_WIDTH, TrackLayoutOptions,
+    layout_features_with_label_widths, layout_reference_slice_oriented,
+    layout_reference_translation_in_contig,
+};
 
 /// Appends one 20-point lane per translation frame. Reverse frames are
 /// phased from the contig end, so the contig length is required.

@@ -4,7 +4,29 @@
 //! marks, the pending-command take, overview caching and egui temp data) keep the order
 //! `render_shell_frame` calls them in.
 
-use super::*;
+use crate::app::actions::TrackControl;
+use crate::app::alignment_context::{AlignmentContextMenuState, AlignmentContextMenuView};
+use crate::app::status_activity::StatusActivity;
+use crate::diagnostics::ManualDiagnosticFramePhase;
+use crate::display::alignment::persisted_style_tag;
+use crate::display::auxiliary::snapshot_record_count;
+use crate::inspection::rna::selected_supplementary_chain;
+use crate::ui::alignment_settings::parse_modification_code;
+use crate::ui::frame::{
+    AlignmentSettingsFrame, CommandDraft, FrameSnapshot, InspectorDraft, LayoutFrame,
+    NavigationDraft, PanelContext, TrackControlsDraft, WorkspaceListsDraft,
+    WorkspaceScrollbarsDraft, pane_vertical_bounds, read_panel_scrollbar_draft,
+};
+use crate::ui::{TrackFrameKey, UiCommand};
+use crate::{UiPanel, Viewer, ui};
+use rgv_core::{
+    CopyNumberSortLocus, PanelId, PresentationNodeId, SessionFilters, TrackId, TrackKind,
+};
+use rgv_engine::{TrackSearchResults, TrackSnapshotData};
+use rgv_hts::SequenceData;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 impl Viewer {
     /// Active-panel status, diagnostics and inspector snapshots.
@@ -22,22 +44,36 @@ impl Viewer {
             .then(|| {
                 let diagnostic = projection.navigation.diagnostic();
                 diagnostic.invariant_failure.as_deref().map_or_else(
-                    || diagnostic.phase.status().to_owned(),
-                    |failure| format!("Alignment navigation stopped: {failure}"),
+                    || {
+                        (
+                            diagnostic.phase.status().to_owned(),
+                            diagnostic.phase.activity(),
+                        )
+                    },
+                    |failure| {
+                        (
+                            format!("Alignment navigation stopped: {failure}"),
+                            StatusActivity::Idle,
+                        )
+                    },
                 )
             })
         });
-        let data_status = if navigation.is_unsettled() {
+        let (data_status, status_activity) = if navigation.is_unsettled() {
             if navigation.notice_visible {
-                alignment_navigation_status
-                    .unwrap_or_else(|| "Updating contextual tracks…".to_owned())
+                alignment_navigation_status.unwrap_or_else(|| {
+                    (
+                        "Updating contextual tracks…".to_owned(),
+                        StatusActivity::Idle,
+                    )
+                })
             } else if navigation.source_status.is_empty() {
-                self.data_status.clone()
+                (self.data_status.clone(), self.status_activity())
             } else {
-                navigation.source_status.clone()
+                (navigation.source_status.clone(), navigation.source_activity)
             }
         } else {
-            self.data_status.clone()
+            (self.data_status.clone(), self.status_activity())
         };
         let announce_status = self.announced_status != data_status;
         let active_panel_id = self.panels.active().id;
@@ -50,7 +86,7 @@ impl Viewer {
             ui::diagnostics::DiagnosticsSnapshot::default()
         };
         let manual_trace = self.manual_diagnostic_trace_snapshot();
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellDiagnostics,
             diagnostics_started.elapsed(),
         );
@@ -58,7 +94,7 @@ impl Viewer {
         // Built once per frame and shared with the Properties panel, which used to build every
         // one of these a second time.
         let inspectors = ui::inspectors::InspectorFrame::capture(self);
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellInspectors,
             inspectors_started.elapsed(),
         );
@@ -77,6 +113,7 @@ impl Viewer {
             detail,
             contig_name,
             data_status,
+            status_activity,
             announce_status,
             active_panel_id,
             diagnostics,
@@ -162,7 +199,7 @@ impl Viewer {
         let settings_alignment_id = editing_alignment_id.unwrap_or(primary_alignment_id);
         let pair_summary_started = Instant::now();
         let settings_pair_summary = self.alignment_pair_summary_for_track(settings_alignment_id);
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellPairSummary,
             pair_summary_started.elapsed(),
         );
@@ -890,7 +927,7 @@ impl Viewer {
                 }
             })
             .collect::<Vec<_>>();
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellScrollbars,
             scrollbars_started.elapsed(),
         );
@@ -900,10 +937,8 @@ impl Viewer {
         );
         // Display text is now borrowed by the canvas pass instead of copied here. The phase is
         // still reported so recorded traces keep their shape.
-        self.record_manual_diagnostic_frame_phase(
-            ManualDiagnosticFramePhase::ShellTextCopy,
-            Duration::ZERO,
-        );
+        self.diagnostics
+            .frame_phase(ManualDiagnosticFramePhase::ShellTextCopy, Duration::ZERO);
         let selected_track = self.panels.active().selected_track;
         let overview_interaction = ui::OverviewInteraction::default();
         let overview_panel_id = active_panel_id;
@@ -1033,7 +1068,7 @@ impl Viewer {
                 )
             })
             .collect::<Vec<_>>();
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellOverviewProjection,
             overview_projection_started.elapsed(),
         );

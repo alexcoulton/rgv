@@ -1,4 +1,6 @@
-use super::super::*;
+use crate::Viewer;
+use crate::diagnostics::ManualDiagnosticFramePhase;
+use std::time::Instant;
 
 const fn alignment_scene_prefetch_pending(reads: bool, summaries: bool) -> bool {
     reads || summaries
@@ -24,13 +26,13 @@ impl Viewer {
         self.begin_manual_diagnostic_frame();
         let phase_started = Instant::now();
         self.poll_background_work();
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::PollBackground,
             phase_started.elapsed(),
         );
         let phase_started = Instant::now();
         self.apply_captured_motion();
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ApplyCapturedMotion,
             phase_started.elapsed(),
         );
@@ -40,24 +42,22 @@ impl Viewer {
         if !first_egui_frame {
             self.rebuild_display_list();
         }
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::FirstDisplayRebuild,
             phase_started.elapsed(),
         );
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let phase_started = Instant::now();
         let (full_output, repaint_delay) = self.render_shell_frame(raw_input);
-        self.record_manual_diagnostic_frame_phase(
-            ManualDiagnosticFramePhase::Shell,
-            phase_started.elapsed(),
-        );
+        self.diagnostics
+            .frame_phase(ManualDiagnosticFramePhase::Shell, phase_started.elapsed());
         // Shell layout is resolved by egui. If it changed the committed
         // workspace geometry, rebuild before submitting this same frame so
         // native GPU primitives, egui chrome, scissoring, and hit geometry
         // never describe different layout revisions on screen.
         let phase_started = Instant::now();
         self.rebuild_display_list();
-        self.record_manual_diagnostic_frame_phase(
+        self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::SecondDisplayRebuild,
             phase_started.elapsed(),
         );
@@ -83,7 +83,7 @@ impl Viewer {
         if prefetch {
             let phase_started = Instant::now();
             self.advance_current_alignment_gpu_prefetch();
-            self.record_manual_diagnostic_frame_phase(
+            self.diagnostics.frame_phase(
                 ManualDiagnosticFramePhase::Prefetch,
                 phase_started.elapsed(),
             );

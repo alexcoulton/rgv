@@ -1,4 +1,16 @@
-use super::super::*;
+use crate::display::alignment::parse_style_tag;
+use crate::{CachedModificationCodes, Viewer};
+use rgv_alignment_scene::AlignmentSceneSnapshot;
+use rgv_core::{
+    BisulfiteContext, ModifiedBaseColorMode, ReadBaseDisplayMode, SbxDisplayOptions,
+    SbxSimplexTailMode, SmrtKineticsMode, TrackId, UltimaDisplayOptions, UltimaQualityMode,
+};
+use rgv_hts::{ModificationCode, UltimaEventUnavailable, UltimaIndelKind, UltimaQualitySource};
+use rgv_layout::{
+    AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
+    MAX_HIDDEN_MODIFICATION_CODES, ultima_quality_color,
+};
+use std::sync::Arc;
 
 pub(crate) const fn read_base_display_mode_label(mode: ReadBaseDisplayMode) -> &'static str {
     match mode {

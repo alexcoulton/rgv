@@ -1,4 +1,14 @@
-use super::super::*;
+use crate::ui::{TrackFrame, TrackFrameKey};
+use rgv_core::{
+    GenomicInterval, PanelId, QuantitativeScaleMode, TrackConfig, TrackId, TrackKind, Viewport,
+};
+use rgv_layout::DisplayList;
+use rgv_render::{
+    ContextSceneGpuFrame, ContextSceneGpuLaneKey, ContextSceneGpuRejection,
+    ContextSceneGpuRejectionReason,
+};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 
 /// Stable identity of one non-alignment genomic lane. Overlay members retain their own key even
 /// when several members share one presentation frame, so readiness and replacement never become
@@ -837,6 +847,11 @@ pub(crate) fn context_lane_coherence_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rgv_layout::{RectPrimitive, Rgba};
+    use rgv_render::{
+        ContextSceneGpuCamera, ContextSceneGpuLaneRequest, ContextSceneGpuRenderer,
+        ContextSceneGpuRetainedLaneRequest, ContextSceneGpuScissor,
+    };
 
     fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::default();

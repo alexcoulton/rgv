@@ -1,4 +1,19 @@
-use super::*;
+use crate::display::{
+    GenomicDisplayPass, READ_PANE_HEADER_HEIGHT, alignment, alignment_row_activity_overview,
+    alignment_scene_read_extent, collapsed_alignment_subtrack,
+};
+use crate::ui::{AlignmentSubtrack, TrackFrame, TrackFrameKey, TrackSubtrack};
+use crate::workspace::alignments::{
+    AlignmentPanelProjection, AlignmentTrackController, AlignmentTrackLifecycle,
+    alignment_active_filter_count,
+};
+use crate::workspace::panels::{ReadPanelDisplayCache, ReadRowCoordinateAuthority};
+use crate::{MAX_ALIGNMENT_ROW_HEIGHT, PresentedAlignmentLane, Viewer, ui};
+use rgv_alignment_scene::AlignmentRowActivityProfile;
+use rgv_core::{AlignmentViewPredicate, DetailLevel, TrackKind};
+use rgv_engine::AlignmentIndividualReadCapability;
+use rgv_layout::DisplayList;
+use std::sync::Arc;
 
 impl Viewer {
     /// Annotation-pane group header and summary frame of the primary

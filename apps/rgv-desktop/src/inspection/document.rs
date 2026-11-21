@@ -1,4 +1,8 @@
-use super::super::*;
+use crate::inspection::model::SelectedSupplementaryChain;
+use crate::inspection::read::inspector_fields_text;
+use rgv_core::TrackId;
+use std::fmt::Write as _;
+use std::sync::Arc;
 
 /// Format-neutral presentation data for the Properties panel.
 ///

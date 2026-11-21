@@ -1,4 +1,18 @@
-use super::super::*;
+use crate::MAX_AUTOMATION_FRAME_SAMPLES;
+use crate::control_service::ControlRequest;
+use anyhow::{Context as _, Result};
+use rgv_core::{
+    AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationCommand, AutomationCommandResult,
+    AutomationCommandStatus, AutomationEnvironmentTelemetry, AutomationErrorCode,
+    AutomationFrameTelemetry, AutomationGpuTelemetry, AutomationNavigationTelemetry,
+    AutomationRunReport, AutomationRunTelemetry, GenomicInterval, PanelId, TrackId,
+};
+use rgv_render::PrepareStats;
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Instant;
 
 pub(crate) struct AutomationRunner {
     pub(crate) commands: VecDeque<(usize, AutomationCommand)>,

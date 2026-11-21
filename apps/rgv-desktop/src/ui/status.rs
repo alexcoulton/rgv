@@ -12,36 +12,37 @@ pub fn status_bar_with_badge(
     badge: Option<&str>,
 ) -> (egui::Response, bool) {
     let mut badge_clicked = false;
-    let response = ui.horizontal_centered(|ui| {
-        if let Some(badge) = badge {
-            badge_clicked = ui
-                .add(egui::Button::new(
-                    RichText::new(badge).color(Color32::from_rgb(170, 30, 30)),
-                ))
-                .on_hover_text("Show errors and warnings")
-                .clicked();
+    let response = ui
+        .horizontal_centered(|ui| {
+            if let Some(badge) = badge {
+                badge_clicked = ui
+                    .add(egui::Button::new(
+                        RichText::new(badge).color(Color32::from_rgb(170, 30, 30)),
+                    ))
+                    .on_hover_text("Show errors and warnings")
+                    .clicked();
+                ui.separator();
+            }
+            ui.label(RichText::new(format!("{track_count} tracks")).color(Color32::from_gray(70)));
             ui.separator();
-        }
-        ui.label(RichText::new(format!("{track_count} tracks")).color(Color32::from_gray(70)));
-        ui.separator();
-        ui.monospace(locus);
-        ui.separator();
-        let response =
-            ui.add(egui::Label::new(status).sense(egui::Sense::focusable_noninteractive()));
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Label,
-                true,
-                format!("Application status: {status}"),
-            )
-        });
-        if let Some(selection) = selection {
+            ui.monospace(locus);
             ui.separator();
-            ui.label(selection);
-        }
-        response
-    })
-    .inner;
+            let response =
+                ui.add(egui::Label::new(status).sense(egui::Sense::focusable_noninteractive()));
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Label,
+                    true,
+                    format!("Application status: {status}"),
+                )
+            });
+            if let Some(selection) = selection {
+                ui.separator();
+                ui.label(selection);
+            }
+            response
+        })
+        .inner;
     (response, badge_clicked)
 }
 
@@ -66,8 +67,7 @@ mod tests {
         });
         let update = output.platform_output.accesskit_update.unwrap();
         assert!(update.nodes.iter().any(|(_, node)| {
-            node.role() == egui::accesskit::Role::Button
-                && node.label() == Some("2 errors (1 new)")
+            node.role() == egui::accesskit::Role::Button && node.label() == Some("2 errors (1 new)")
         }));
     }
 

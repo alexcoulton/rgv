@@ -1,4 +1,49 @@
-use super::super::*;
+use crate::display::auxiliary::alignment_sort_position;
+use crate::sources::{alignment_open_options, primary_alignment_track};
+use crate::ui::alignment_settings::parse_modification_code;
+use crate::workspace::alignment_navigation::{
+    AlignmentNavigationPhase, AlignmentNavigationTransaction,
+};
+use crate::{MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY, SYNTHETIC_ALIGNMENT_TRACK_ID, Viewer, ui};
+use anyhow::Result;
+use rgv_alignment_scene::{
+    AlignmentCoherenceGroupId, AlignmentCoverageLaneOptions, AlignmentDerivedLaneCapture,
+    AlignmentDerivedLaneOptions, AlignmentFilterPredicate, AlignmentFilterScope, AlignmentHandle,
+    AlignmentInteractionState, AlignmentModificationLaneOptions, AlignmentPanelSceneError,
+    AlignmentReadLabelMode, AlignmentSashimiLaneOptions, AlignmentSashimiScalePolicy,
+    AlignmentSceneCamera, AlignmentStyleContract, AlignmentViewFilterContract, AlleleSummaryDetail,
+    AllocationLedger, CapabilityRequirement, ContractFingerprint, CoverageAlleleInterpretation,
+    CpuAlleleProjectionOptions, CpuClipRect, CpuDepthProjectionOptions,
+    CpuJunctionProjectionOptions, CpuModificationProjectionOptions, GeometryLod, LayoutContract,
+    LedgerError, LedgerProgress, LedgerProgressEpoch, LedgerSnapshot,
+    MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract, ReadSampling,
+    ReferenceRevision, SummaryContract,
+};
+use rgv_core::{
+    AlignmentAuxComparison, AlignmentAuxFilterValue, AlignmentPredicateScope,
+    AlignmentReadSampling, AlignmentViewPredicate, ContigAliases, ContigId, DetailLevel,
+    GenerationClock, GenomicInterval, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, PanelId,
+    ReferenceDictionary, SashimiCountMode, SashimiScaleMode, SessionAlignmentTrack,
+    SessionDocument, SessionFilters, TrackId, TrackSource, Viewport, ViewportGeneration,
+};
+use rgv_engine::{
+    AlignmentCoordinatorFrame, AlignmentSceneBuildContract, AlignmentSceneCoordinatorTelemetry,
+    AlignmentSceneEngine, AlignmentScenePreparationPolicy, AlignmentSceneRequestToken,
+    AlignmentSceneSourceMetadata, LocalAlignmentSceneEngineConfig, LocalBamCanonicalBackend,
+    SourceOwnerId,
+};
+use rgv_hts::{
+    AlignmentFilter, AuxComparison, AuxPredicate, FilterValue, ModificationCode, QueryDetail,
+    QueryOptions, TemplateLengthBounds,
+};
+use rgv_layout::{
+    AlignmentColorMode, AlignmentGroupMode, AlignmentSortMode, MAX_HIDDEN_MODIFICATION_CODES,
+};
+use std::collections::HashMap;
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Canonical presentation partition used by the first desktop qualification slice. This is a
 /// cache/page granularity, never an evidence or display cap. Measurements may replace it without
@@ -590,6 +635,7 @@ pub(crate) enum AlignmentSceneBudgetRetryPoll {
 #[cfg(test)]
 mod alignment_scene_pressure_retry_tests {
     use super::*;
+    use rgv_alignment_scene::AllocationBundleSpec;
 
     fn request() -> (AlignmentSceneRequestToken, GenomicInterval) {
         (
@@ -812,6 +858,7 @@ mod alignment_scene_pressure_retry_tests {
 #[cfg(test)]
 mod alignment_scene_budget_retry_tests {
     use super::*;
+    use rgv_alignment_scene::AllocationBundleSpec;
 
     fn active_bundle(
         ledger: &AllocationLedger,

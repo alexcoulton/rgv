@@ -1,4 +1,6 @@
-use super::super::*;
+use crate::app::status_activity::StatusActivity;
+use rgv_core::{GenomicInterval, Viewport};
+use std::time::{Duration, Instant};
 
 pub(crate) const NAVIGATION_QUERY_IDLE_DELAY: Duration = Duration::from_millis(50);
 pub(crate) const NAVIGATION_QUERY_MAX_CADENCE: Duration = Duration::from_millis(150);
@@ -26,6 +28,8 @@ pub(crate) struct NavigationPresentation {
     pub(crate) notice_visible: bool,
     pub(crate) invalidation_reason: Option<String>,
     pub(crate) source_status: String,
+    /// Whether `source_status` described background work when the transaction began.
+    pub(crate) source_activity: StatusActivity,
     /// Monotonic semantic presentation epoch. This is consumed by interaction provenance and is
     /// unrelated to any retained texture.
     pub(crate) committed_content_revision: u64,
@@ -43,18 +47,44 @@ impl NavigationPresentation {
             notice_visible: false,
             invalidation_reason: Some("initial scene publication is pending".to_owned()),
             source_status: String::new(),
+            source_activity: StatusActivity::Idle,
             committed_content_revision: 0,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn begin_navigation(
+        &mut self,
+        target_viewport: Viewport,
+        target_generation: u64,
+        layout_revision: u64,
+        contract_revision: u64,
+        source_status: &str,
+        now: Instant,
+    ) {
+        self.begin_navigation_with_activity(
+            target_viewport,
+            target_generation,
+            layout_revision,
+            contract_revision,
+            source_status,
+            StatusActivity::Idle,
+            now,
+        );
+    }
+
+    /// As [`Self::begin_navigation`], also recording whether the status line that the
+    /// transaction preserves described background work.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_navigation_with_activity(
         &mut self,
         target_viewport: Viewport,
         target_generation: u64,
         _layout_revision: u64,
         _contract_revision: u64,
         source_status: &str,
+        source_activity: StatusActivity,
         now: Instant,
     ) {
         let is_new_transaction = matches!(
@@ -67,6 +97,7 @@ impl NavigationPresentation {
             self.started_at = now;
             self.notice_visible = false;
             self.source_status = source_status.to_owned();
+            self.source_activity = source_activity;
         }
         self.target_generation = target_generation;
         self.target_interval = target_viewport.interval();

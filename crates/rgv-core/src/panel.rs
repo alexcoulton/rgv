@@ -7,6 +7,7 @@ use crate::{TrackId, ViewportGeneration};
 /// A panel ID is independent of its current position in the workspace. Moving,
 /// resizing, or activating a panel must never change this value.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PanelId(u64);
 
 impl PanelId {

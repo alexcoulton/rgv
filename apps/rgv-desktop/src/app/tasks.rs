@@ -1,6 +1,24 @@
-use super::super::*;
 use super::document_state::DocumentTicket;
 use super::shell_state::{NewerWriterSave, NotificationSeverity};
+use crate::launch::{autosave_directory, autosave_snapshot_path, prune_autosaves};
+use crate::sources::opened_project_status;
+use crate::workspace::lists::{
+    imported_list_status, merge_imported_regions, merge_imported_review_items,
+};
+use crate::workspace::navigation::{ImportedLocusRequest, imported_locus_request};
+use crate::workspace_lists::{WorkspaceListImport, WorkspaceListKind, import_workspace_list};
+use crate::{UiPanel, Viewer};
+use anyhow::Result;
+use rgv_core::{
+    AutomationErrorCode, IgvImportReport, MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS,
+    SessionDocument,
+};
+use sha2::{Digest as _, Sha256};
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime};
 
 /// All writers share this key, including `SaveThenOpen` and recovery autosaves.
 fn normalized_session_destination(path: &Path) -> std::io::Result<PathBuf> {
@@ -882,6 +900,7 @@ impl Viewer {
 #[cfg(test)]
 mod control_source_tests {
     use super::*;
+    use rgv_core::{SessionLocus, TrackSource};
 
     #[test]
     fn only_projects_opened_by_a_control_client_are_held_to_the_control_root() {

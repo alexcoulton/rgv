@@ -72,6 +72,64 @@ impl ExactJunctionSummaryTile {
         reservation_kind: ReservationKind,
         publication_revision: u64,
     ) -> Result<Arc<Self>, ExactJunctionSummaryError> {
+        Self::build_with_selection(
+            None,
+            crate::allele_summary::CigarWalk::EnterAtTile,
+            evidence,
+            tile,
+            contig_length,
+            contract,
+            normalization_mapped_records,
+            ledger,
+            reservation_kind,
+            publication_revision,
+        )
+    }
+
+    /// The former builder, which collected every junction of every overlapping read before
+    /// discarding those the tile does not retain. Kept as the oracle for the gated walk.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_walking_whole_cigars(
+        evidence: &Arc<EvidenceRoot>,
+        tile: CanonicalGenomicTile,
+        contig_length: u64,
+        contract: JunctionSummaryContract,
+        normalization_mapped_records: Option<u64>,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, ExactJunctionSummaryError> {
+        Self::build_with_selection(
+            None,
+            crate::allele_summary::CigarWalk::Whole,
+            evidence,
+            tile,
+            contig_length,
+            contract,
+            normalization_mapped_records,
+            ledger,
+            reservation_kind,
+            publication_revision,
+        )
+    }
+
+    /// [`Self::build`] over a selection of the tile already made for another summary family.
+    /// One tile's families all read the same complete selection, so the store selects once per
+    /// tile. A selection of another root or interval is ignored and the tile selects its own.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) fn build_with_selection(
+        shared: Option<&crate::EvidenceSelection>,
+        walk: crate::allele_summary::CigarWalk,
+        evidence: &Arc<EvidenceRoot>,
+        tile: CanonicalGenomicTile,
+        contig_length: u64,
+        contract: JunctionSummaryContract,
+        normalization_mapped_records: Option<u64>,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, ExactJunctionSummaryError> {
         if !evidence.payload().all_auxiliary_tags()
             && evidence
                 .payload()
@@ -82,7 +140,15 @@ impl ExactJunctionSummaryTile {
             return Err(ExactJunctionSummaryError::MissingXsCapability);
         }
         let interval = tile.interval(contig_length)?;
-        let selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
+        let owned_selection;
+        let selection = if let Some(shared) =
+            shared.filter(|shared| shared.is_over(evidence, interval))
+        {
+            shared
+        } else {
+            owned_selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
+            &owned_selection
+        };
         // Only skips this tile can retain are counted: those it owns (start inside the tile)
         // and those entering across its left edge.
         let (maximum_owned, maximum_entering) =
@@ -129,6 +195,14 @@ impl ExactJunctionSummaryTile {
             let record = selection
                 .record_view(index)
                 .ok_or(EvidenceSelectionError::InvalidChunkIndex)?;
+            // Flank lengths need the read's whole CIGAR, but only for a read with a skip this
+            // tile retains. The count stops at the tile's end, so an unspliced read (or one
+            // spliced only elsewhere) costs a walk to the tile and no collection at all.
+            if walk == crate::allele_summary::CigarWalk::EnterAtTile
+                && retained_skip_counts(record, interval) == (0, 0)
+            {
+                continue;
+            }
             let mut reference_position = record.start();
             let mut collector = RecordJunctionCollector::exact();
             for operation in record.cigar() {

@@ -1,4 +1,27 @@
-use super::*;
+use crate::display::auxiliary::{
+    measured_feature_label_widths, quantitative_display_records, quantitative_object_id_span,
+    quantitative_overlay_members, quantitative_overlay_subtracks, shared_copy_number_range,
+    shared_quantitative_range, snapshot_data_record_count, strip_object_ids,
+    track_options_with_object_ids,
+};
+use crate::display::{GenomicDisplayPass, primary_pinned_gene_id};
+use crate::ui::gestures::retained_data_overlaps;
+use crate::ui::{TrackFrame, TrackFrameKey, TrackSubtrack};
+use crate::workspace::context_lanes::{
+    ContextLaneDraft, ContextLaneKey, prepared_context_viewport,
+};
+use crate::{Viewer, ui};
+use rgv_core::{
+    CopyNumberTrackSettings, MutationTrackSettings, QuantitativeScaleMode, TrackConfig, TrackId,
+    TrackKind, Viewport,
+};
+use rgv_engine::TrackSnapshotData;
+use rgv_layout::{
+    DisplayList, ObjectIdAllocator, TrackLayoutOptions, layout_copy_number,
+    layout_features_with_label_widths, layout_gwas, layout_interactions, layout_mutations,
+    layout_quantitative, layout_variants,
+};
+use std::collections::BTreeSet;
 
 /// Inputs for laying out one visible member of an auxiliary lane.
 struct AuxiliaryMemberLane<'a> {

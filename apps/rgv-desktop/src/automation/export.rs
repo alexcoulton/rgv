@@ -1,8 +1,34 @@
-use super::super::*;
+use crate::inspection::model::InspectorSnapshot;
+use crate::inspection::read::{format_cigar, truncate_string_to_bytes};
+use crate::inspection::rna::{AutomationAlignmentExportTrack, xml_escape};
+use crate::inspection::variant::{
+    bounded_variant_allele, bounded_variant_export_field, format_genotype, format_variant_type,
+    tsv_cell, variant_genotype_group_label,
+};
+use crate::ui::alignment_settings::modification_code_label;
+use crate::workspace::alignments::AlignmentTrackController;
+use crate::workspace::panels::PanelWorkspace;
+use crate::{
+    MAX_AUTOMATION_EXPORT_BYTES, MAX_AUTOMATION_FULL_PANEL_HEIGHT, SEQUENCE_COPY_BASES, Viewer, ui,
+};
+use anyhow::Result;
+use rgv_alignment_scene::AlleleSummaryDetail;
+use rgv_core::{
+    AutomationSnapshotFormat, AutomationSnapshotScope, GenomicInterval, PanelId, TrackCollection,
+    TrackId, WorkspacePresentation,
+};
+use rgv_engine::{TrackSnapshot, TrackSnapshotData};
+use rgv_hts::AlignmentRecord;
 use rgv_layout::{
     Direction, RectShape, breakend_bracket_dimensions, junction_arc_stroke_width,
     read_arrow_head_width,
 };
+use rgv_layout::{DisplayList, RectPrimitive};
+use rgv_render::{PngExportBackend, export_png_scaled_prefer_gpu};
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 pub(crate) struct SemanticExportCapture {
     generic: DisplayList,
@@ -16,8 +42,6 @@ pub(crate) struct SemanticExportCapture {
     _resources: rgv_alignment_scene::TransientResourceReservation,
 }
 
-/// Automation snapshots are one PNG pixel per logical point, as they always were.
-pub(crate) const AUTOMATION_SNAPSHOT_SCALE: f32 = 1.0;
 /// Largest pixel density an interactive export uses.
 const MAXIMUM_INTERACTIVE_EXPORT_SCALE: f32 = 8.0;
 
@@ -38,13 +62,55 @@ pub(crate) fn interactive_export_scale(window_scale_factor: f64) -> f32 {
     }
 }
 
+/// The GPU device and queue an export job may render through. Both are cheap reference-counted
+/// handles, so an export worker thread owns its own pair.
+pub(crate) type ExportGpu = (wgpu::Device, wgpu::Queue);
+
+/// Writes `display` as a PNG, through the GPU when `gpu` is supplied so the pixels match the
+/// screen, and through the CPU rasteriser otherwise or when the GPU export fails.
+pub(crate) fn write_png_export(
+    gpu: Option<&ExportGpu>,
+    display: &DisplayList,
+    width: u32,
+    height: u32,
+    scale: f32,
+    path: &Path,
+) -> std::io::Result<()> {
+    let backend = export_png_scaled_prefer_gpu(
+        gpu.map(|(device, queue)| (device, queue)),
+        display,
+        width,
+        height,
+        scale,
+        path,
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if let PngExportBackend::Cpu {
+        gpu_failure: Some(reason),
+    } = backend
+    {
+        tracing::warn!(%reason, "PNG export fell back to the CPU rasteriser");
+    }
+    Ok(())
+}
+
+impl Viewer {
+    /// The device and queue for a PNG export, or `None` while the GPU device is lost, in which
+    /// case the export uses the CPU rasteriser.
+    pub(crate) fn export_gpu(&self) -> Option<ExportGpu> {
+        (!self.gpu_device_health.is_lost()).then(|| (self.device.clone(), self.queue.clone()))
+    }
+}
+
 impl SemanticExportCapture {
+    /// `gpu` is used for PNG output only; see [`write_png_export`].
     pub(crate) fn write(
         self,
         path: PathBuf,
         format: AutomationSnapshotFormat,
         metadata: &str,
         scale: f32,
+        gpu: Option<ExportGpu>,
     ) -> std::io::Result<()> {
         let geometry = rgv_render::project_semantic_alignment_export(
             &self.panels,
@@ -57,10 +123,14 @@ impl SemanticExportCapture {
             .extend_from_slice(&geometry.display.rectangles);
         let display = cropped_display_list(&display, self.bounds);
         match format {
-            AutomationSnapshotFormat::Png => {
-                export_png_scaled(&display, self.width, self.height, scale, path)
-                    .map_err(|error| std::io::Error::other(error.to_string()))
-            }
+            AutomationSnapshotFormat::Png => write_png_export(
+                gpu.as_ref(),
+                &display,
+                self.width,
+                self.height,
+                scale,
+                &path,
+            ),
             AutomationSnapshotFormat::Svg => std::fs::write(
                 path,
                 display_list_svg_export(&display, self.width, self.height, metadata),
@@ -1265,6 +1335,7 @@ pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> std::result::Res
 #[cfg(test)]
 mod scale_tests {
     use super::*;
+    use rgv_layout::Rgba;
 
     #[test]
     fn interactive_exports_use_the_display_density_and_automation_reports_pixels() {
@@ -1275,7 +1346,11 @@ mod scale_tests {
         assert_eq!(scale(0.5), 1.0_f32.to_bits());
         assert_eq!(scale(f64::NAN), 1.0_f32.to_bits());
         assert_eq!(scale(64.0), 8.0_f32.to_bits());
-        assert_eq!(AUTOMATION_SNAPSHOT_SCALE.to_bits(), 1.0_f32.to_bits());
+        // Automation snapshots stay one PNG pixel per logical point unless the command asks.
+        assert_eq!(
+            rgv_core::default_snapshot_scale().to_bits(),
+            1.0_f32.to_bits()
+        );
 
         assert_eq!(scaled_snapshot_pixels(1_280, 720, 1.0), (1_280, 720));
         assert_eq!(scaled_snapshot_pixels(1_280, 720, 2.0), (2_560, 1_440));
@@ -1299,7 +1374,7 @@ mod scale_tests {
         let directory = tempfile::tempdir().unwrap();
         for scale in [1.0_f32, 2.0] {
             let path = directory.path().join(format!("view-{scale}.png"));
-            export_png_scaled(&display, 120, 60, scale, &path).unwrap();
+            write_png_export(None, &display, 120, 60, scale, &path).unwrap();
             assert_eq!(
                 image::image_dimensions(&path).unwrap(),
                 scaled_snapshot_pixels(120, 60, scale)

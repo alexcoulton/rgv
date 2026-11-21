@@ -4,9 +4,18 @@ mod alignment_scene;
 mod alignment_summary;
 mod context_scene;
 mod device_health;
+mod gpu_export;
+mod paged_cache;
 pub mod palette;
+#[cfg(test)]
+mod readback_tests;
 mod semantic_export;
+mod shaders;
 pub use device_health::{GpuDeviceHealth, GpuDeviceLoss};
+pub use gpu_export::{
+    GpuExportError, GpuExportLayout, GpuExportTarget, GpuExportTile, PngExportBackend,
+    export_png_scaled_prefer_gpu, render_display_list_gpu, render_gpu_export,
+};
 pub use semantic_export::{SemanticAlignmentExport, project_semantic_alignment_export};
 
 /// Constant-size policy view accepted by replacement planners. Desktop code supplies
@@ -289,6 +298,8 @@ use rgv_layout::{
     junction_arc_distance_to_point, junction_arc_stroke_width, read_arrow_head_width,
 };
 
+/// The rectangle pipeline's own WGSL, without the shared chunks `shaders::RECTANGLE` prepends.
+#[cfg(test)]
 const RECTANGLE_SHADER: &str = include_str!("rectangle.wgsl");
 const MAX_UPLOAD_BYTES_PER_FRAME: usize = 16 * 1024 * 1024;
 
@@ -410,10 +421,7 @@ pub struct RectangleRendererOperationCounters {
 
 impl RectangleRenderer {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("RGV rectangle shader"),
-            source: wgpu::ShaderSource::Wgsl(RECTANGLE_SHADER.into()),
-        });
+        let shader = shaders::RECTANGLE.create_module(device);
         // Created unmapped: both screen uniforms are written by every `prepare` before anything
         // is drawn, and a buffer mapped at creation aborts the process when the device is
         // already lost (wgpu treats a failed `get_mapped_range` as fatal), which would turn a

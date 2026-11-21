@@ -26,7 +26,10 @@ use crate::{
     AllocationLease, AllocationLedger, CanonicalGenomicTile, CanonicalTileError,
     CapabilityRequirement, ContractFingerprint, EvidenceRevision, EvidenceRoot,
     EvidenceSelectionError, GeometryLod, LedgerError, PresentationContract, ReservationKind,
-    RowAtlasRecordHit, RowAtlasRevision, TransientResourceClass, fingerprint::StableHasher,
+    RevisionFingerprint, RowAtlasRecordHit, RowAtlasRevision, TransientResourceClass,
+    TransientResourceReservation,
+    fingerprint::StableHasher,
+    page_identity::{AlignmentPageIdentity, page_identity},
 };
 
 /// Measurement-selected canonical vertical page identity. The block height is explicit in every
@@ -70,8 +73,15 @@ impl CanonicalRowBlock {
     }
 }
 
-/// Content identity for one immutable alignment geometry page. No exact camera coordinate,
-/// pixel position, hover, selection, or vertical scroll state participates in this key.
+/// Name of one immutable alignment geometry page. No exact camera coordinate, pixel position,
+/// hover, selection, or vertical scroll state participates in this key.
+///
+/// The evidence and row-atlas revisions are those the page was *first built from*. A page the
+/// store carries across an extension keeps its key, so scenes published from later roots can
+/// hold pages whose keys name earlier revisions; that is what lets key-addressed derivatives
+/// such as GPU pages survive an edge acquisition. The revision-free content identity the store
+/// proves reuse with is [`crate::AlignmentPageIdentity`], from
+/// [`AlignmentSemanticPage::identity`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AlignmentPageKey {
     source_revision: AlignmentSourceRevision,
@@ -83,6 +93,11 @@ pub struct AlignmentPageKey {
     row_block: CanonicalRowBlock,
     family: AlignmentPageFamily,
     lod: GeometryLod,
+    /// Digest of the reference bases a store-resolved page was built against; zero for a key
+    /// made by [`Self::new`] and for every page family which reads no reference. One pair of
+    /// roots can be presented against two reference slices, and this keeps those two pages
+    /// from sharing a key.
+    reference: RevisionFingerprint,
 }
 
 impl AlignmentPageKey {
@@ -109,7 +124,20 @@ impl AlignmentPageKey {
             row_block,
             family,
             lod,
+            reference: RevisionFingerprint::new(0, 0),
         }
+    }
+
+    /// Digest of the reference bases the page was built against, or zero. See
+    /// [`crate::AlignmentPageContentToken::reference`].
+    #[must_use]
+    pub const fn reference_digest(self) -> RevisionFingerprint {
+        self.reference
+    }
+
+    pub(crate) const fn with_reference_digest(mut self, reference: RevisionFingerprint) -> Self {
+        self.reference = reference;
+        self
     }
 
     #[must_use]
@@ -426,6 +454,9 @@ pub struct SemanticPageHit {
 #[derive(Debug)]
 pub struct AlignmentSemanticPage {
     key: AlignmentPageKey,
+    /// Revision-free digest of every input this page was built from. A later evidence or
+    /// row-atlas publication may reuse this page exactly when it reproduces this identity.
+    identity: AlignmentPageIdentity,
     interval: GenomicInterval,
     row_start: u32,
     row_end: u32,
@@ -459,8 +490,41 @@ struct PendingLabel {
     text: String,
 }
 
+/// Everything a page build reads from the row atlas, gathered once so that the content
+/// identity and the build provably describe the same inputs.
+#[derive(Debug)]
+pub(crate) struct AlignmentPageInputs {
+    key: AlignmentPageKey,
+    identity: AlignmentPageIdentity,
+    interval: GenomicInterval,
+    rows: std::ops::Range<u32>,
+    atlas_records: Vec<RowAtlasRecordHit>,
+    pair_connectors: Vec<AlignmentRowConnector>,
+    _scratch: TransientResourceReservation,
+}
+
+impl AlignmentPageInputs {
+    pub(crate) const fn key(&self) -> AlignmentPageKey {
+        self.key
+    }
+
+    pub(crate) const fn identity(&self) -> AlignmentPageIdentity {
+        self.identity
+    }
+
+    /// Names the page to be built by the reference bases it reads, so that the same roots
+    /// presented against a different reference slice cannot produce a second page under one
+    /// key. Only the page store does this; a directly built page keeps the caller's key.
+    pub(crate) fn keyed_by_reference(mut self) -> Self {
+        self.key = self
+            .key
+            .with_reference_digest(self.identity.content().reference());
+        self
+    }
+}
+
 impl AlignmentSemanticPage {
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         key: AlignmentPageKey,
         evidence: &Arc<EvidenceRoot>,
@@ -472,6 +536,42 @@ impl AlignmentSemanticPage {
         reservation_kind: ReservationKind,
         publication_revision: u64,
     ) -> Result<Arc<Self>, SemanticPageError> {
+        let inputs = Self::collect_inputs(
+            key,
+            evidence,
+            atlas,
+            presentation,
+            contig_length,
+            reference,
+            ledger,
+            reservation_kind,
+        )?;
+        Self::build_from_inputs(
+            inputs,
+            evidence,
+            atlas,
+            presentation,
+            reference,
+            ledger,
+            reservation_kind,
+            publication_revision,
+        )
+    }
+
+    /// Validates `key` against the roots and gathers the row-atlas inputs and content identity
+    /// of the page it names, without selecting evidence or walking any CIGAR. Succeeding here
+    /// means every handle the atlas assigns to the page resolves in `evidence`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn collect_inputs(
+        key: AlignmentPageKey,
+        evidence: &EvidenceRoot,
+        atlas: &AlignmentRowAtlas,
+        presentation: PresentationContract,
+        contig_length: u64,
+        reference: Option<&ReferenceSlice>,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+    ) -> Result<AlignmentPageInputs, SemanticPageError> {
         validate_dependencies(key, evidence, atlas, presentation, reference)?;
         let interval = key.genomic_tile.interval(contig_length)?;
         if !evidence.coverage().covers(interval) {
@@ -479,33 +579,118 @@ impl AlignmentSemanticPage {
         }
         let rows = key.row_block.range(atlas.row_count())?;
         let atlas_records = atlas.records_for_rows(rows.clone(), interval);
-        let selection = evidence.select_handles_with_reservation_kind(
-            interval,
-            atlas_records.iter().map(|hit| hit.record.handle()),
-            reservation_kind,
-        )?;
-        let atlas_record_count = atlas_records.len();
         let connector_count = if key.family == AlignmentPageFamily::ReadGeometry {
             atlas.connector_count_for_rows(rows.clone(), interval)
         } else {
             0
         };
-        let base_scratch_bytes =
-            semantic_page_base_scratch_bytes(selection.len(), atlas_record_count, connector_count);
+        let scratch = ledger.reserve_transient(
+            TransientResourceClass::SemanticPageBuilder,
+            semantic_page_base_scratch_bytes(0, atlas_records.len(), connector_count),
+            reservation_kind,
+        )?;
+        let pair_connectors = if key.family == AlignmentPageFamily::ReadGeometry {
+            atlas.connectors_for_rows(rows.clone(), interval)
+        } else {
+            Vec::new()
+        };
+        let identity = page_identity(
+            key,
+            evidence,
+            atlas,
+            presentation.style,
+            contig_length,
+            interval,
+            rows.clone(),
+            &atlas_records,
+            &pair_connectors,
+            reference,
+        )
+        .map_err(|missing| SemanticPageError::MissingEvidenceHandle(missing.0))?;
+        Ok(AlignmentPageInputs {
+            key,
+            identity,
+            interval,
+            rows,
+            atlas_records,
+            pair_connectors,
+            _scratch: scratch,
+        })
+    }
+
+    /// Reference-agnostic identity of the page `key` names, for residency questions asked
+    /// without a reference slice. It matches a resident page built from the same records and
+    /// rows whatever reference bases that page was built with.
+    pub(crate) fn probe_identity(
+        key: AlignmentPageKey,
+        evidence: &EvidenceRoot,
+        atlas: &AlignmentRowAtlas,
+        presentation: PresentationContract,
+        contig_length: u64,
+    ) -> Result<AlignmentPageIdentity, SemanticPageError> {
+        validate_root_dependencies(key, evidence, atlas, presentation)?;
+        let interval = key.genomic_tile.interval(contig_length)?;
+        if !evidence.coverage().covers(interval) {
+            return Err(SemanticPageError::UncertifiedTile(interval));
+        }
+        let rows = key.row_block.range(atlas.row_count())?;
+        let atlas_records = atlas.records_for_rows(rows.clone(), interval);
+        let pair_connectors = if key.family == AlignmentPageFamily::ReadGeometry {
+            atlas.connectors_for_rows(rows.clone(), interval)
+        } else {
+            Vec::new()
+        };
+        page_identity(
+            key,
+            evidence,
+            atlas,
+            presentation.style,
+            contig_length,
+            interval,
+            rows,
+            &atlas_records,
+            &pair_connectors,
+            None,
+        )
+        .map(AlignmentPageIdentity::without_reference)
+        .map_err(|missing| SemanticPageError::MissingEvidenceHandle(missing.0))
+    }
+
+    /// Builds the page from inputs gathered by [`Self::collect_inputs`] for the same roots.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) fn build_from_inputs(
+        inputs: AlignmentPageInputs,
+        evidence: &Arc<EvidenceRoot>,
+        atlas: &Arc<AlignmentRowAtlas>,
+        presentation: PresentationContract,
+        reference: Option<&ReferenceSlice>,
+        ledger: &AllocationLedger,
+        reservation_kind: ReservationKind,
+        publication_revision: u64,
+    ) -> Result<Arc<Self>, SemanticPageError> {
+        let AlignmentPageInputs {
+            key,
+            identity,
+            interval,
+            rows,
+            atlas_records,
+            pair_connectors,
+            _scratch: _inputs_scratch,
+        } = inputs;
+        let selection = evidence.select_handles_with_reservation_kind(
+            interval,
+            atlas_records.iter().map(|hit| hit.record.handle()),
+            reservation_kind,
+        )?;
         let _base_scratch = ledger.reserve_transient(
             TransientResourceClass::SemanticPageBuilder,
-            base_scratch_bytes,
+            semantic_page_base_scratch_bytes(selection.len(), 0, 0),
             reservation_kind,
         )?;
         let mut by_handle = HashMap::with_capacity(selection.len());
         for (index, record) in selection.records().iter().enumerate() {
             by_handle.insert(record.handle, index);
         }
-        let pair_connectors = if key.family == AlignmentPageFamily::ReadGeometry {
-            atlas.connectors_for_rows(rows.clone(), interval)
-        } else {
-            Vec::new()
-        };
 
         let dynamic_scratch_bytes = semantic_page_dynamic_scratch_bytes(
             &selection,
@@ -540,7 +725,11 @@ impl AlignmentSemanticPage {
                     selection_index,
                     record,
                     presentation.style.color_mode,
-                    atlas.interval(),
+                    // Only the pair classification and orientation are read, and neither
+                    // depends on this interval (it decides mate visibility alone). Passing the
+                    // tile keeps the atlas's prepared extent out of the page's inputs, so an
+                    // extension cannot change a page it did not touch.
+                    interval,
                     atlas.layout_contract().pair_length_bounds,
                 )?
             } else {
@@ -783,6 +972,7 @@ impl AlignmentSemanticPage {
         let allocation = reservation.register(retained_bytes, publication_revision)?;
         Ok(Arc::new(Self {
             key,
+            identity,
             interval,
             row_start: rows.start,
             row_end: rows.end,
@@ -794,9 +984,18 @@ impl AlignmentSemanticPage {
         }))
     }
 
+    /// The key this page was first built under. Its evidence and row-atlas revisions are the
+    /// page's birth revisions: a scene published from later roots keeps this key for every page
+    /// it reuses, which is what lets key-addressed derivatives (GPU pages) survive an extension.
     #[must_use]
     pub const fn key(&self) -> AlignmentPageKey {
         self.key
+    }
+
+    /// Revision-free content identity. Equal identities mean structurally equal pages.
+    #[must_use]
+    pub const fn identity(&self) -> AlignmentPageIdentity {
+        self.identity
     }
 
     #[must_use]
@@ -2530,6 +2729,26 @@ fn validate_dependencies(
     presentation: PresentationContract,
     reference: Option<&ReferenceSlice>,
 ) -> Result<(), SemanticPageError> {
+    validate_root_dependencies(key, evidence, atlas, presentation)?;
+    let page_uses_reference = (key.family == AlignmentPageFamily::ReadGeometry
+        && key.lod == GeometryLod::Base)
+        || (key.family == AlignmentPageFamily::SpecialistOverlay
+            && matches!(
+                presentation.style.color_mode,
+                AlignmentColorMode::Bisulfite(_) | AlignmentColorMode::Ultima(_)
+            ));
+    if page_uses_reference && presentation.reference.is_some() && reference.is_none() {
+        return Err(SemanticPageError::ReferenceUnavailable);
+    }
+    Ok(())
+}
+
+fn validate_root_dependencies(
+    key: AlignmentPageKey,
+    evidence: &EvidenceRoot,
+    atlas: &AlignmentRowAtlas,
+    presentation: PresentationContract,
+) -> Result<(), SemanticPageError> {
     if key.source_revision != evidence.source_revision()
         || key.source_revision != atlas.source_revision()
     {
@@ -2551,16 +2770,6 @@ fn validate_dependencies(
         || key.lod != presentation.geometry_lod
     {
         return Err(SemanticPageError::PresentationContractMismatch);
-    }
-    let page_uses_reference = (key.family == AlignmentPageFamily::ReadGeometry
-        && key.lod == GeometryLod::Base)
-        || (key.family == AlignmentPageFamily::SpecialistOverlay
-            && matches!(
-                presentation.style.color_mode,
-                AlignmentColorMode::Bisulfite(_) | AlignmentColorMode::Ultima(_)
-            ));
-    if page_uses_reference && presentation.reference.is_some() && reference.is_none() {
-        return Err(SemanticPageError::ReferenceUnavailable);
     }
     validate_style_capabilities(evidence, presentation, key.family)?;
     Ok(())

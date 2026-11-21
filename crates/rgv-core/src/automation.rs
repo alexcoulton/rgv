@@ -132,6 +132,7 @@ impl AutomationBatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum AutomationCommand {
     DescribeWorkspace,
@@ -279,6 +280,14 @@ pub enum AutomationCommand {
         scope: AutomationSnapshotScope,
         #[serde(default)]
         format: AutomationSnapshotFormat,
+        /// PNG pixels per logical point, from 0.25 to 8. The default 1.0 gives one pixel per
+        /// point. Ignored for SVG; must be 1.0 for the `native_window` scope, which is always
+        /// captured at the window's own pixel density.
+        #[serde(
+            default = "default_snapshot_scale",
+            skip_serializing_if = "is_default_snapshot_scale"
+        )]
+        scale: f32,
     },
     Export {
         path: String,
@@ -513,9 +522,13 @@ impl AutomationCommand {
             },
             Self::NavigateReviewItem { action } => action.validate(),
             Self::WaitUntilSettled { timeout_millis } => validate_settle_timeout(*timeout_millis),
-            Self::Snapshot { path, .. } | Self::Export { path, .. } | Self::Save { path } => {
-                validate_string(path, "output path")
+            Self::Snapshot {
+                path, scope, scale, ..
+            } => {
+                validate_string(path, "output path")?;
+                validate_snapshot_scale(*scale, *scope)
             }
+            Self::Export { path, .. } | Self::Save { path } => validate_string(path, "output path"),
         }
     }
 
@@ -589,6 +602,7 @@ impl AutomationCommand {
 /// Zoom factors are expressed in user-facing magnification: values greater
 /// than one zoom in and values below one zoom out.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum AutomationViewportOperation {
     PanBases {
@@ -638,6 +652,7 @@ impl AutomationViewportOperation {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationUnsavedChangesPolicy {
     #[default]
@@ -649,6 +664,7 @@ pub enum AutomationUnsavedChangesPolicy {
 /// Typed configuration accepted by automation schema v4. Each variant owns
 /// its valid scope, preventing key/scope mismatches at the protocol boundary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "setting", rename_all = "snake_case")]
 pub enum AutomationSetting {
     WindowSize {
@@ -1001,6 +1017,7 @@ impl AutomationSetting {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "selector", rename_all = "snake_case")]
 pub enum AutomationAlignmentSelector {
     ExactReadName {
@@ -1043,6 +1060,7 @@ impl AutomationAlignmentSelector {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationAlignmentState {
     Primary,
@@ -1051,6 +1069,7 @@ pub enum AutomationAlignmentState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationAlignmentReveal {
     #[default]
@@ -1060,6 +1079,7 @@ pub enum AutomationAlignmentReveal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationAlignmentRelationship {
     Mate,
@@ -1067,6 +1087,7 @@ pub enum AutomationAlignmentRelationship {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationNavigationDestination {
     #[default]
@@ -1075,6 +1096,7 @@ pub enum AutomationNavigationDestination {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum AutomationReviewNavigation {
     Item { review_item_id: u64 },
@@ -1091,6 +1113,7 @@ impl AutomationReviewNavigation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum AutomationHistoryNavigation {
     Back,
@@ -1839,6 +1862,7 @@ pub struct AutomationSelectionSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationSelectionGranularity {
     #[default]
@@ -2135,6 +2159,7 @@ fn normalize_automation_path(path: &Path) -> PathBuf {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum AutomationOptionScope {
     Workspace,
@@ -2154,6 +2179,7 @@ impl AutomationOptionScope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "selection", rename_all = "snake_case")]
 pub enum AutomationSelection {
     Track {
@@ -2194,6 +2220,7 @@ fn default_alignment_density() -> f32 {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationSnapshotScope {
     #[default]
@@ -2204,6 +2231,7 @@ pub enum AutomationSnapshotScope {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationSnapshotFormat {
     #[default]
@@ -2212,6 +2240,7 @@ pub enum AutomationSnapshotFormat {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationExportKind {
     /// Backward-compatible alias for the committed filtered alignment view.
@@ -2444,6 +2473,38 @@ impl AutomationRunReport {
     }
 }
 
+/// Smallest and largest PNG pixel density an automation snapshot may request.
+pub const MINIMUM_AUTOMATION_SNAPSHOT_SCALE: f32 = 0.25;
+pub const MAXIMUM_AUTOMATION_SNAPSHOT_SCALE: f32 = 8.0;
+
+/// Pixel density of an automation snapshot when the command does not name one.
+#[must_use]
+pub const fn default_snapshot_scale() -> f32 {
+    1.0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshot_scale(scale: &f32) -> bool {
+    scale.to_bits() == default_snapshot_scale().to_bits()
+}
+
+fn validate_snapshot_scale(scale: f32, scope: AutomationSnapshotScope) -> Result<(), String> {
+    if !scale.is_finite()
+        || !(MINIMUM_AUTOMATION_SNAPSHOT_SCALE..=MAXIMUM_AUTOMATION_SNAPSHOT_SCALE).contains(&scale)
+    {
+        return Err(format!(
+            "snapshot scale must be between {MINIMUM_AUTOMATION_SNAPSHOT_SCALE} and {MAXIMUM_AUTOMATION_SNAPSHOT_SCALE}"
+        ));
+    }
+    if scope == AutomationSnapshotScope::NativeWindow && !is_default_snapshot_scale(&scale) {
+        return Err(
+            "native_window snapshots are captured at the window's pixel density; scale must be 1"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn default_settle_timeout_millis() -> u64 {
     30_000
 }
@@ -2583,6 +2644,7 @@ mod tests {
                     path: "output/view.png".to_owned(),
                     scope: AutomationSnapshotScope::VisibleWorkspace,
                     format: AutomationSnapshotFormat::Png,
+                    scale: default_snapshot_scale(),
                 },
                 AutomationCommand::Save {
                     path: "output/project.json".to_owned(),
@@ -2622,6 +2684,7 @@ mod tests {
                 path: "captures/window.png".to_owned(),
                 scope: AutomationSnapshotScope::NativeWindow,
                 format: AutomationSnapshotFormat::Png,
+                scale: default_snapshot_scale(),
             }],
         };
         let json = batch.to_json().unwrap();
@@ -3225,6 +3288,7 @@ mod tests {
                     path: "../results/view.svg".to_owned(),
                     scope: AutomationSnapshotScope::VisibleWorkspace,
                     format: AutomationSnapshotFormat::Svg,
+                    scale: default_snapshot_scale(),
                 },
                 AutomationCommand::Save {
                     path: "results/project.json".to_owned(),
@@ -3272,6 +3336,7 @@ mod tests {
                 path: "results/view.svg".to_owned(),
                 scope: AutomationSnapshotScope::VisibleWorkspace,
                 format: AutomationSnapshotFormat::Svg,
+                scale: default_snapshot_scale(),
             }],
         };
         accepted.resolve_paths_within(&root).unwrap();
@@ -3571,5 +3636,48 @@ mod tests {
         document.remote_reference_index_url = Some("http://10.0.0.1/ref.fa.fai".to_owned());
         assert!(check(&document).is_err());
         assert!(check_session_sources_within(&document, &root, true).is_ok());
+    }
+
+    #[test]
+    fn snapshot_scale_is_additive_defaulted_and_bounded() {
+        // A command written before the field existed still parses, at one pixel per point.
+        let legacy: AutomationCommand =
+            serde_json::from_str(r#"{"command":"snapshot","path":"view.png"}"#).unwrap();
+        let AutomationCommand::Snapshot { scale, .. } = &legacy else {
+            panic!("expected a snapshot command");
+        };
+        assert_eq!(scale.to_bits(), 1.0_f32.to_bits());
+        assert!(legacy.validate().is_ok());
+        // The default is not serialized, so the wire form of existing batches is unchanged.
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({
+                "command": "snapshot", "path": "view.png",
+                "scope": "visible_workspace", "format": "png"
+            })
+        );
+
+        let scaled: AutomationCommand =
+            serde_json::from_str(r#"{"command":"snapshot","path":"view.png","scale":2.0}"#)
+                .unwrap();
+        assert!(scaled.validate().is_ok());
+        assert_eq!(serde_json::to_value(&scaled).unwrap()["scale"], 2.0);
+
+        for scale in [0.0, -1.0, 0.1, 8.5, f32::NAN, f32::INFINITY] {
+            let command = AutomationCommand::Snapshot {
+                path: "view.png".to_owned(),
+                scope: AutomationSnapshotScope::VisibleWorkspace,
+                format: AutomationSnapshotFormat::Png,
+                scale,
+            };
+            assert!(command.validate().is_err(), "{scale}");
+        }
+        let native = AutomationCommand::Snapshot {
+            path: "window.png".to_owned(),
+            scope: AutomationSnapshotScope::NativeWindow,
+            format: AutomationSnapshotFormat::Png,
+            scale: 2.0,
+        };
+        assert!(native.validate().is_err());
     }
 }

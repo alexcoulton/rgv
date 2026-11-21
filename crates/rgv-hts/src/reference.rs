@@ -55,7 +55,7 @@ enum FastaReader {
 }
 
 #[derive(Clone, Debug)]
-struct FastaIndexEntry {
+pub(crate) struct FastaIndexEntry {
     name: String,
     length: u64,
     offset: u64,
@@ -349,7 +349,7 @@ fn combine_remote_stats(left: RemoteIoStats, right: RemoteIoStats) -> RemoteIoSt
     }
 }
 
-fn parse_fasta_index(bytes: &[u8]) -> Result<Vec<FastaIndexEntry>, AlignmentError> {
+pub(crate) fn parse_fasta_index(bytes: &[u8]) -> Result<Vec<FastaIndexEntry>, AlignmentError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| AlignmentError::InvalidFastaIndex("index is not UTF-8".to_owned()))?;
     let mut entries = Vec::new();

@@ -1,4 +1,13 @@
-use super::*;
+use crate::display::{
+    COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT, READ_PANE_HEADER_HEIGHT,
+    alignment_annotation_lane_heights, collapsed_alignment_subtrack,
+};
+use crate::ui;
+use crate::ui::{AlignmentSubtrack, TrackFrame, TrackFrameKey, TrackSubtrack};
+use rgv_core::{DetailLevel, SessionAlignmentTrack, TrackId, TrackKind, Viewport};
+use rgv_layout::{
+    AlignmentColorMode, AlignmentGroupMode, AlignmentSortMode, DisplayList, RectPrimitive, Rgba,
+};
 
 pub(crate) const INDEX_ONLY_READ_NOTICE: &str = "zoom in to see read data";
 

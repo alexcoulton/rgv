@@ -1,4 +1,18 @@
-use super::super::*;
+use crate::inspection::document::{
+    InspectorAction, InspectorActionId, InspectorBadge, InspectorDocument, InspectorField,
+    InspectorProvenance, InspectorSection, InspectorTone, InspectorValue,
+};
+use crate::inspection::model::{BoundedSequenceCopy, InspectorSnapshot};
+use crate::{
+    AUXILIARY_TAGS_COPY_BYTES, AUXILIARY_VALUE_DISPLAY_BYTES, EVENT_SEQUENCE_COPY_BASES,
+    EVENT_SEQUENCE_PREVIEW_BASES, SEQUENCE_COPY_BASES,
+};
+use rgv_hts::{
+    AlignedBaseClassification, AlignmentRecord, AuxValue, CigarOpKind, ReferenceSlice,
+    SequenceData, classify_aligned_base,
+};
+use std::borrow::Cow;
+use std::fmt::Write as _;
 
 pub(crate) struct ReadEventDetails {
     pub(crate) fields: Vec<(String, String)>,

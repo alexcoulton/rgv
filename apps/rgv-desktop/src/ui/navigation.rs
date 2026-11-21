@@ -393,7 +393,9 @@ pub fn paint_genome_context(
         // A click on the ideogram centres the view there, like a click on the overview below.
         ideogram_clicked_position = ideogram_click_position(
             ideogram_response.clicked(),
-            ideogram_response.interact_pointer_pos().map(|pointer| pointer.x),
+            ideogram_response
+                .interact_pointer_pos()
+                .map(|pointer| pointer.x),
             |x| contig_axis.position_at_x(x),
         );
         let hovered_segment = ideogram_response
@@ -822,10 +824,12 @@ mod tests {
             ideogram_click_position(true, Some(12.5), position_at_x),
             Some(12_500)
         );
-        assert_eq!(ideogram_click_position(false, Some(12.5), position_at_x), None);
+        assert_eq!(
+            ideogram_click_position(false, Some(12.5), position_at_x),
+            None
+        );
         assert_eq!(ideogram_click_position(true, None, position_at_x), None);
     }
-
 
     #[test]
     fn two_panel_contig_length_is_measured_inside_metadata_and_clear_of_the_ruler() {

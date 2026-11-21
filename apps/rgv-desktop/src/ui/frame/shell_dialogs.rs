@@ -1,7 +1,7 @@
 //! The unsaved-changes prompt and the notification log window.
 
-use super::*;
 use crate::app::shell_state::{Notification, NotificationSeverity, UnsavedChoice};
+use std::fmt::Write as _;
 
 /// Shell prompt and notification state for one frame.
 #[derive(Default)]
@@ -70,7 +70,9 @@ pub(super) fn show_shell_dialogs(ui: &mut egui::Ui, draft: &mut ShellUiDraft) {
                                     draft.dismiss_notification = Some(entry.sequence);
                                 }
                                 let colour = match entry.severity {
-                                    NotificationSeverity::Error => egui::Color32::from_rgb(170, 30, 30),
+                                    NotificationSeverity::Error => {
+                                        egui::Color32::from_rgb(170, 30, 30)
+                                    }
                                     NotificationSeverity::Warning => {
                                         egui::Color32::from_rgb(140, 95, 0)
                                     }
@@ -155,6 +157,9 @@ mod tests {
                 "missing {label} button"
             );
         }
-        assert_eq!(draft.unsaved_choice, None, "nothing is chosen without input");
+        assert_eq!(
+            draft.unsaved_choice, None,
+            "nothing is chosen without input"
+        );
     }
 }

@@ -1,4 +1,15 @@
-use super::*;
+use crate::Viewer;
+use crate::diagnostics::HealthSignal;
+use crate::launch::LaunchOptions;
+use anyhow::Context as _;
+use std::sync::Arc;
+use std::time::Instant;
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::{DeviceEvent, ElementState, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::window::{CursorIcon, Theme, WindowAttributes, WindowId};
 
 fn native_canvas_press_starts_drag(
     unobstructed_canvas: bool,
@@ -60,7 +71,7 @@ impl ApplicationHandler for Application {
             return;
         }
 
-        viewer.stress_health.note_ui_heartbeat();
+        viewer.diagnostics.health(HealthSignal::UiHeartbeat);
         observe_stress_input_health(viewer, &event);
 
         let egui_response = viewer.egui_state.on_window_event(&viewer.window, &event);
@@ -328,7 +339,7 @@ impl ApplicationHandler for Application {
             WindowEvent::DroppedFile(path) => viewer.handle_dropped_file(&path),
             WindowEvent::RedrawRequested => {
                 viewer.render();
-                viewer.stress_health.note_frame_presented();
+                viewer.diagnostics.health(HealthSignal::FramePresented);
             }
             _ => {}
         }
@@ -349,10 +360,10 @@ impl ApplicationHandler for Application {
         let Some(viewer) = self.viewer.as_mut() else {
             return;
         };
-        viewer.stress_health.note_ui_heartbeat();
+        viewer.diagnostics.health(HealthSignal::UiHeartbeat);
         viewer.record_manual_device_event(&event);
         if let DeviceEvent::MouseMotion { delta } = event {
-            viewer.stress_health.note_native_input();
+            viewer.diagnostics.health(HealthSignal::NativeInput);
             viewer.capture_mouse_motion(delta);
         }
     }
@@ -362,7 +373,7 @@ impl ApplicationHandler for Application {
         self.worker_wake_pending
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(viewer) = &mut self.viewer {
-            viewer.stress_health.note_ui_heartbeat();
+            viewer.diagnostics.health(HealthSignal::UiHeartbeat);
             viewer.poll_background_work();
             let now = Instant::now();
             viewer.maybe_start_autosave(now);
@@ -463,28 +474,40 @@ fn observe_stress_input_health(viewer: &Viewer, event: &WindowEvent) {
             | WindowEvent::ScaleFactorChanged { .. }
     );
     if is_native_input {
-        viewer.stress_health.note_native_input();
+        viewer.diagnostics.health(HealthSignal::NativeInput);
     }
     match event {
         WindowEvent::MouseInput {
             state: ElementState::Pressed,
             ..
         } => {
-            viewer.stress_health.begin_pointer_interaction();
+            viewer
+                .diagnostics
+                .health(HealthSignal::PointerInteractionBegan);
         }
         WindowEvent::MouseInput {
             state: ElementState::Released,
             ..
-        } => viewer.stress_health.finish_interaction(),
+        } => viewer.diagnostics.health(HealthSignal::InteractionFinished),
         WindowEvent::MouseWheel { phase, .. } => match phase {
             winit::event::TouchPhase::Started | winit::event::TouchPhase::Moved => {
-                viewer.stress_health.begin_scroll_interaction();
+                viewer
+                    .diagnostics
+                    .health(HealthSignal::ScrollInteractionBegan);
             }
-            winit::event::TouchPhase::Ended => viewer.stress_health.finish_interaction(),
-            winit::event::TouchPhase::Cancelled => viewer.stress_health.cancel_interaction(),
+            winit::event::TouchPhase::Ended => {
+                viewer.diagnostics.health(HealthSignal::InteractionFinished)
+            }
+            winit::event::TouchPhase::Cancelled => viewer
+                .diagnostics
+                .health(HealthSignal::InteractionCancelled),
         },
-        WindowEvent::Focused(false) => viewer.stress_health.cancel_interaction(),
-        WindowEvent::Focused(true) => viewer.stress_health.clear_cancelled_interaction(),
+        WindowEvent::Focused(false) => viewer
+            .diagnostics
+            .health(HealthSignal::InteractionCancelled),
+        WindowEvent::Focused(true) => viewer
+            .diagnostics
+            .health(HealthSignal::CancelledInteractionCleared),
         _ => {}
     }
 }

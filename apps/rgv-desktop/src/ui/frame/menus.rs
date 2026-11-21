@@ -1,6 +1,8 @@
 //! Application menu bar.
 
-use super::*;
+use crate::ui::frame::{ShellFrame, alignment_subtrack_menu};
+use crate::ui::{MENU_HEIGHT, TrackFrameKey};
+use crate::{Viewer, ui};
 
 impl Viewer {
     pub(super) fn show_application_menu(&self, ui: &mut egui::Ui, st: &mut ShellFrame) {
