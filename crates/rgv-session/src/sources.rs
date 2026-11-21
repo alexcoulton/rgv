@@ -137,3 +137,35 @@ pub fn build_tdf_channel_expansion(
         children,
     })
 }
+
+/// The assembly of a newly opened dictionary, with cytobands from `cytoband_path` when that
+/// file reads and parses; otherwise the plain ideogram and the reason to report.
+pub fn load_assembly_reporting(
+    name: &str,
+    dictionary: rgv_core::ReferenceDictionary,
+    cytoband_path: Option<&Path>,
+) -> (rgv_core::GenomeAssembly, Option<String>) {
+    use anyhow::Context as _;
+    let mut assembly = rgv_core::GenomeAssembly::from_dictionary(name, dictionary);
+    let Some(path) = cytoband_path else {
+        return (assembly, None);
+    };
+    match std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read cytobands from {}", path.display()))
+        .and_then(|text| {
+            rgv_core::parse_ucsc_cytobands(&text, &assembly.dictionary).map_err(Into::into)
+        }) {
+        Ok(cytobands) => {
+            assembly.cytobands = cytobands;
+            (assembly, None)
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "using ideogram fallback");
+            let failure = format!(
+                "Could not load cytobands from {}: {error:#}; showing the plain ideogram",
+                path.display()
+            );
+            (assembly, Some(failure))
+        }
+    }
+}

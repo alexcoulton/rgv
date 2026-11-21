@@ -29,8 +29,7 @@ pub(crate) use scene_authority::{
     retained_alignment_scene_can_present, uncovered_vertical_candidate_retains_committed_pixels,
 };
 pub(crate) use scene_clip::{
-    alignment_clip_gpu_scissor, alignment_scene_covered_clip, alignment_scene_frame_for_ui,
-    alignment_scene_gpu_scissor,
+    alignment_clip_gpu_scissor, alignment_scene_covered_clip, alignment_scene_gpu_scissor,
 };
 #[cfg(test)]
 pub(crate) use scene_clip::{

@@ -82,7 +82,7 @@ const COMMAND_SEARCH_ID: &str = "rgv-command-search";
 // row height.
 const MIN_VERTICAL_DENSITY: f32 = 0.35;
 const MAX_VERTICAL_DENSITY: f32 = 9.0;
-const MAX_ALIGNMENT_ROW_HEIGHT: f32 = 64.0;
+use rgv_session::alignment::lanes::MAX_ALIGNMENT_ROW_HEIGHT;
 const EVENT_SEQUENCE_PREVIEW_BASES: usize = 120;
 const EVENT_SEQUENCE_COPY_BASES: usize = 1_000_000;
 const SEQUENCE_COPY_BASES: usize = 1_000_000;
@@ -95,7 +95,7 @@ const MAX_VARIANT_EXPORT_FIELD_BYTES: usize = 64 * 1024;
 const MAX_RNA_EXPORT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SASHIMI_EXPORT_TRACKS: usize = 16;
 const MAX_OVERLAY_GUTTER_MEMBERS: usize = 64;
-const SYNTHETIC_ALIGNMENT_TRACK_ID: TrackId = TrackId::new(0);
+use rgv_session::alignment::lanes::SYNTHETIC_ALIGNMENT_TRACK_ID;
 const MAX_RENDERED_REGIONS_OF_INTEREST: usize = 10_000;
 const MAX_METADATA_FILTER_VALUES: usize = 4_096;
 const MAX_METADATA_VISIBLE_COLUMNS: usize = 12;
@@ -1312,8 +1312,6 @@ struct Viewer {
     alignment_capacity_reclaim_clock: u64,
     alignment_gpu_speculation_gate: AlignmentGpuSpeculationGate,
     alignment_panel_scene_stores: HashMap<PanelId, AlignmentPanelSceneStore>,
-    alignment_scene_owner_clock: u64,
-    alignment_scene_request_clock: u64,
     alignment_scene_publication_authority: AlignmentScenePublicationAuthority,
     egui_context: egui::Context,
     egui_state: egui_winit::State,

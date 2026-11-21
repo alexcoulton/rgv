@@ -7,14 +7,13 @@ use crate::{AlignmentGpuPrefetchState, ui};
 use rgv_alignment_scene::{
     AlignmentPanelSceneFrame, AlignmentPanelSceneStore, AlignmentSceneCamera,
     AlignmentSceneSnapshot, AlignmentSemanticRetirementStats, AllocationRetirementClaimSet,
-    AllocationRetirementToken, ReferenceRevision, RowAtlasRevision,
+    AllocationRetirementToken, RowAtlasRevision,
 };
 use rgv_core::{GenomicInterval, PanelId, TrackId, Viewport};
 use rgv_engine::{
     AlignmentIndividualReadCapability, AlignmentSceneRequestToken, AlignmentVerticalResidency,
-    SourceOwnerId,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,12 +24,8 @@ pub(super) const ALIGNMENT_GPU_PREFETCH_TARGET_QUANTUM: Duration = Duration::fro
 
 pub(super) const ALIGNMENT_GPU_PREFETCH_MAXIMUM_PAGES_PER_QUANTUM: usize = 64;
 
-pub(super) fn retire_reference_install_receipt_for_contract_epoch(
-    receipts: &mut BTreeMap<SourceOwnerId, (ReferenceRevision, GenomicInterval)>,
-    owner: SourceOwnerId,
-) -> bool {
-    receipts.remove(&owner).is_some()
-}
+#[cfg(test)]
+pub(super) use rgv_session::alignment::dispatch::retire_reference_install_receipt_for_contract_epoch;
 
 impl AlignmentGpuPrefetchState {
     pub(super) fn maximum_pages(&self) -> NonZeroUsize {

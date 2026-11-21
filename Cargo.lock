@@ -4254,6 +4254,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rgv-snapshot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "image",
+ "rgv-alignment-scene",
+ "rgv-core",
+ "rgv-engine",
+ "rgv-layout",
+ "rgv-render",
+ "rgv-session",
+ "tempfile",
+]
+
+[[package]]
 name = "rgv-validation-runner"
 version = "0.1.0"
 dependencies = [

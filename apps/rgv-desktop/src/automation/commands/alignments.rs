@@ -1,11 +1,9 @@
 use crate::automation::commands::auxiliary_position_snapshot_is_current;
 use crate::automation::commands::evidence::automation_scene_supplementary_chain;
-use crate::automation::parse_automation_sam_tag;
-use crate::display::auxiliary::{alignment_sort_position, quantitative_record_index_at_position};
+use crate::display::auxiliary::quantitative_record_index_at_position;
 use crate::inspection::model::{FeatureSelection, QuantitativeSelection, VariantSelection};
 use crate::inspection::rna::selected_supplementary_chain;
 use crate::ui::TrackFrameKey;
-use crate::workspace::alignments::filter_state_from_session;
 use crate::workspace::panels::PendingReadSelection;
 use crate::workspace::tracks::replace_panel_track_selection;
 use crate::{AutomationAlignmentHandleTarget, Viewer, ui};
@@ -19,8 +17,7 @@ use rgv_automation::{
 use rgv_core::{PanelId, TrackId};
 use rgv_engine::{AlignmentIndividualReadCapability, TrackSnapshotData};
 use rgv_hts::{
-    AlignmentRecord, AuxPredicate, SequenceData, TemplateLengthBounds, decode_modified_bases,
-    pair_evidence,
+    AlignmentRecord, SequenceData, TemplateLengthBounds, decode_modified_bases, pair_evidence,
 };
 use rgv_layout::{AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode};
 use std::collections::{HashMap, HashSet};
@@ -523,6 +520,7 @@ impl Viewer {
         }))
     }
 
+    /// `group`: a thin translation to one alignment settings action.
     pub(crate) fn apply_automation_group(
         &mut self,
         track_ids: &[TrackId],
@@ -531,41 +529,13 @@ impl Viewer {
         tag: Option<&str>,
         anchor_position: Option<u64>,
     ) -> Result<()> {
-        self.ensure_automation_alignment_tracks(track_ids)?;
-        let mode = tag.map_or(Ok(mode), |tag| {
-            parse_automation_sam_tag(tag).map(AlignmentGroupMode::Tag)
-        })?;
-        let captured_anchor = matches!(
+        self.apply_command_translation(&rgv_automation::AutomationCommand::Group {
+            track_ids: track_ids.to_vec(),
             mode,
-            AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
-        )
-        .then(|| {
-            anchor_position.unwrap_or_else(|| {
-                self.session
-                    .panels
-                    .active()
-                    .viewport
-                    .interval()
-                    .start()
-                    .saturating_add(self.session.panels.active().viewport.interval().len() / 2)
-            })
-        });
-        for track in self
-            .session
-            .alignment_tracks
-            .iter_mut()
-            .filter(|track| track_ids.contains(&track.config.id))
-        {
-            track.config.filters.alignment_group_mode = mode;
-            track.config.filters.alignment_group_order = direction;
-            if captured_anchor.is_some() {
-                track.config.filters.alignment_sort_anchor = captured_anchor;
-            }
-        }
-        if track_ids.contains(&self.primary_alignment_track_id()) {
-            self.activate_first_alignment_track()?;
-        }
-        self.invalidate_automation_alignment_layouts(Some(track_ids), false);
+            direction,
+            tag: tag.map(str::to_owned),
+            anchor_position,
+        })?;
         self.rebuild_all_panel_displays();
         self.mark_display_dirty("explicit display invalidation");
         Ok(())
@@ -635,6 +605,7 @@ impl Viewer {
             .collect()
     }
 
+    /// `sort`: a thin translation to one alignment settings action.
     pub(crate) fn apply_automation_sort(
         &mut self,
         track_ids: &[TrackId],
@@ -643,75 +614,28 @@ impl Viewer {
         tag: Option<&str>,
         anchor_position: Option<u64>,
     ) -> Result<()> {
-        self.ensure_automation_alignment_tracks(track_ids)?;
-        let mode = tag.map_or(Ok(mode), |tag| {
-            parse_automation_sam_tag(tag).map(AlignmentSortMode::Tag)
+        self.apply_command_translation(&rgv_automation::AutomationCommand::Sort {
+            track_ids: track_ids.to_vec(),
+            mode,
+            direction,
+            tag: tag.map(str::to_owned),
+            anchor_position,
         })?;
-        let captured_anchor = if mode == AlignmentSortMode::Base {
-            anchor_position.or_else(|| {
-                alignment_sort_position(mode, None, self.session.panels.active().viewport)
-            })
-        } else {
-            None
-        };
-        for track in self
-            .session
-            .alignment_tracks
-            .iter_mut()
-            .filter(|track| track_ids.contains(&track.config.id))
-        {
-            track.config.filters.alignment_sort_mode = mode;
-            track.config.filters.alignment_sort_order = direction;
-            if captured_anchor.is_some() {
-                track.config.filters.alignment_sort_anchor = captured_anchor;
-            } else if !matches!(
-                track.config.filters.alignment_group_mode,
-                AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
-            ) {
-                track.config.filters.alignment_sort_anchor = None;
-            }
-        }
-        if track_ids.contains(&self.primary_alignment_track_id()) {
-            self.activate_first_alignment_track()?;
-        }
-        self.invalidate_automation_alignment_layouts(Some(track_ids), false);
         self.rebuild_all_panel_displays();
         self.mark_display_dirty("explicit display invalidation");
         Ok(())
     }
 
+    /// `filter`: a thin translation to one alignment settings action.
     pub(crate) fn apply_automation_filter(
         &mut self,
         track_ids: &[TrackId],
         expression: &str,
     ) -> Result<()> {
-        self.ensure_automation_alignment_tracks(track_ids)?;
-        let predicates = expression
-            .split(';')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .map(|part| part.parse::<AuxPredicate>().map(|_| part.to_owned()))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for track in self
-            .session
-            .alignment_tracks
-            .iter_mut()
-            .filter(|track| track_ids.contains(&track.config.id))
-        {
-            track
-                .config
-                .filters
-                .auxiliary_predicates
-                .clone_from(&predicates);
-            let (editor, active) = filter_state_from_session(&track.config.filters)?;
-            track.filter_editor = editor;
-            track.active_filters = active;
-        }
-        if track_ids.contains(&self.primary_alignment_track_id()) {
-            self.activate_first_alignment_track()?;
-        }
-        self.invalidate_automation_alignment_layouts(Some(track_ids), true);
-        self.request_all_panel_queries();
+        self.apply_command_translation(&rgv_automation::AutomationCommand::Filter {
+            track_ids: track_ids.to_vec(),
+            expression: expression.to_owned(),
+        })?;
         self.rebuild_all_panel_displays();
         self.mark_display_dirty("explicit display invalidation");
         Ok(())
@@ -775,9 +699,10 @@ impl Viewer {
                 Ok(serde_json::json!({"panel_id": panel_id.get(), "workspace_revision": revision}))
             }
             AutomationSelection::Track { track_id } => {
-                let key = self.automation_track_key(track_id)?;
-                self.session.panels.active_mut().clear_selection();
-                self.select_track_key(key, ui::TrackPane::Annotation);
+                // A thin translation: clear the focused panel's selection, select the row.
+                self.apply_command_translation(&rgv_automation::AutomationCommand::Select {
+                    selection: selection.clone(),
+                })?;
                 self.bump_workspace_revision();
                 self.retain_active_selection(None);
                 Ok(serde_json::json!({

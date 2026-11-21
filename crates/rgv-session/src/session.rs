@@ -112,6 +112,8 @@ pub struct Session<P: Panel = PanelState> {
     pub alignment_scene_budget: AlignmentSceneBudgetSnapshot,
     /// Most alignments any track of the workspace may hold.
     pub workspace_alignment_limit: usize,
+    /// Source-owner and request-token identities handed to alignment scene engines.
+    pub alignment_scene_identities: crate::alignment::dispatch::AlignmentSceneIdentityClock,
 }
 
 /// What the host's canvas contributes to a panel action: how wide each panel would be, and
@@ -227,6 +229,8 @@ impl<P: Panel> Session<P> {
             alignment_scene_ledger,
             alignment_scene_budget,
             workspace_alignment_limit,
+            alignment_scene_identities:
+                crate::alignment::dispatch::AlignmentSceneIdentityClock::default(),
         }
     }
 

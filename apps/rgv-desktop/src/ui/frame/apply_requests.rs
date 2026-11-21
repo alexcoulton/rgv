@@ -1,5 +1,6 @@
 //! Deferred navigation, export, settings, file and cache requests.
 
+use crate::action::{Action, Preferences, TrackLoad, TrackLoadKind};
 use crate::app::tasks::SessionLoadKind;
 use crate::inspection::rna::{
     junction_bed_export, rna_export_file_name, sashimi_export_display, sashimi_svg_export,
@@ -7,9 +8,8 @@ use crate::inspection::rna::{
 use crate::inspection::variant::{
     variant_evidence_export_tsv, variant_export_file_name, variant_genotype_export_tsv,
 };
-use crate::sources::source_path;
 use crate::ui::frame::ShellFrame;
-use crate::{Viewer, apply_accessibility_preferences};
+use crate::Viewer;
 use rgv_automation::{AutomationSnapshotFormat, AutomationSnapshotScope};
 use rgv_core::MAXIMUM_VIEW_PANELS;
 use rgv_render::ContextSceneGpuFrame;
@@ -254,72 +254,40 @@ impl Viewer {
     }
 
     pub(super) fn apply_settings_changes(&mut self, st: &mut ShellFrame) {
-        let autosave_schedule_changed = self.session.settings.autosave_enabled
-            != st.commands.autosave_enabled
-            || self.session.settings.autosave_interval_seconds
-                != st.commands.autosave_interval_seconds;
-        let accessibility_changed = self.session.settings.interface_scale_percent
-            != st.commands.interface_scale_percent
-            || self.session.settings.high_contrast != st.commands.high_contrast
-            || self.session.settings.theme != st.commands.interface_theme
-            || self.session.settings.reduced_motion != st.commands.reduced_motion;
-        let read_browsing_buffer_changed = self.session.settings.read_browsing_buffer_percent
-            != st.commands.read_browsing_buffer_percent;
-        let cache_budget_changed =
-            self.session.settings.cache_budget_mib != st.commands.cache_budget_mib;
-        let coverage_cache_changed =
-            self.session.settings.coverage_cache_enabled != st.commands.coverage_cache_enabled;
-        let track_pipeline_changed =
-            self.session.settings.track_pipeline != st.commands.track_pipeline;
-        let settings_changed = cache_budget_changed
-            || coverage_cache_changed
-            || track_pipeline_changed
-            || read_browsing_buffer_changed
-            || self.session.settings.diagnostics_opt_in != st.commands.diagnostics_opt_in
-            || autosave_schedule_changed
-            || self.session.settings.autosave_retention != st.commands.autosave_retention
-            || accessibility_changed;
-        self.session.settings.cache_budget_mib = st.commands.cache_budget_mib;
-        self.session.settings.read_browsing_buffer_percent =
-            st.commands.read_browsing_buffer_percent;
-        self.session.settings.diagnostics_opt_in = st.commands.diagnostics_opt_in;
-        self.session.settings.autosave_enabled = st.commands.autosave_enabled;
-        self.session.settings.autosave_interval_seconds = st.commands.autosave_interval_seconds;
-        self.session.settings.autosave_retention = st.commands.autosave_retention;
-        self.session.settings.interface_scale_percent = st.commands.interface_scale_percent;
-        self.session.settings.high_contrast = st.commands.high_contrast;
-        self.session.settings.theme = st.commands.interface_theme;
-        self.session.settings.reduced_motion = st.commands.reduced_motion;
-        self.session.settings.coverage_cache_enabled = st.commands.coverage_cache_enabled;
-        if coverage_cache_changed {
-            self.apply_coverage_cache_setting();
-        }
-        self.session.settings.track_pipeline = st.commands.track_pipeline;
-        if track_pipeline_changed {
-            self.apply_track_pipeline_setting();
-        }
-        if accessibility_changed {
-            apply_accessibility_preferences(&self.egui_context, &self.session.settings);
-            self.apply_theme_to_renderers();
-            self.mark_display_dirty("explicit display invalidation");
-        }
-        if autosave_schedule_changed {
-            self.schedule_next_autosave();
-        }
-        if cache_budget_changed {
-            self.apply_live_cache_budget(st.commands.cache_budget_mib);
-        }
-        if read_browsing_buffer_changed || cache_budget_changed {
-            self.request_all_panel_queries();
+        // A thin translation: the window's preference controls are one preferences action.
+        let requested = Preferences {
+            cache_budget_mib: st.commands.cache_budget_mib,
+            read_browsing_buffer_percent: st.commands.read_browsing_buffer_percent,
+            diagnostics_opt_in: st.commands.diagnostics_opt_in,
+            autosave_enabled: st.commands.autosave_enabled,
+            autosave_interval_seconds: st.commands.autosave_interval_seconds,
+            autosave_retention: st.commands.autosave_retention,
+            interface_scale_percent: st.commands.interface_scale_percent,
+            high_contrast: st.commands.high_contrast,
+            theme: st.commands.interface_theme,
+            reduced_motion: st.commands.reduced_motion,
+            coverage_cache_enabled: st.commands.coverage_cache_enabled,
+            track_pipeline: st.commands.track_pipeline,
+        };
+        if requested != Preferences::of(&self.session.settings)
+            && let Err(error) = self.apply_action(Action::SetPreferences(requested))
+        {
+            self.report_error(error.to_string());
         }
         if st.commands.clear_recent_requested {
             self.session.settings.clear_recent();
-        }
-        if settings_changed || st.commands.clear_recent_requested {
             self.persist_settings();
         }
-        if let Some(source) = st.commands.recent_alignment_requested.take() {
-            self.open_alignment_source(&source_path(&source));
+        if let Some(source) = st.commands.recent_alignment_requested.take()
+            && let Err(error) = self.load_tracks(vec![TrackLoad {
+                source,
+                kind: TrackLoadKind::Alignment {
+                    remote_index_url: None,
+                },
+                name: None,
+            }])
+        {
+            self.report_error(error.to_string());
         }
         if let Some(path) = st.commands.recent_session_requested.take() {
             self.handle_dropped_file(Path::new(&path));
@@ -327,6 +295,13 @@ impl Viewer {
         if let Some(locus) = st.commands.recent_locus_requested.take()
             && let Err(error) = self.navigate_to_locus(self.session.panels.active().id, &locus)
         {
+            self.report_error(error.to_string());
+        }
+    }
+
+    /// Opens a chosen file through the action path, so the open is undoable.
+    fn load_requested_track(&mut self, path: &std::path::Path, kind: TrackLoadKind) {
+        if let Err(error) = self.load_track_path(path, kind) {
             self.report_error(error.to_string());
         }
     }
@@ -339,14 +314,24 @@ impl Viewer {
                 .add_filter("Alignment", &["bam", "cram"])
                 .pick_file()
         {
-            self.open_alignment_source(&path);
+            self.load_requested_track(
+                &path,
+                TrackLoadKind::Alignment {
+                    remote_index_url: None,
+                },
+            );
         }
         if st.commands.open_reference_requested
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter("Reference FASTA or 2bit", &["fa", "fasta", "fna", "2bit"])
                 .pick_file()
         {
-            self.open_reference_source(&path);
+            self.load_requested_track(
+                &path,
+                TrackLoadKind::Reference {
+                    remote_index_url: None,
+                },
+            );
         }
         if st.commands.open_genome_config_requested
             && let Some(path) = rfd::FileDialog::new()
@@ -425,9 +410,8 @@ impl Viewer {
                     ],
                 )
                 .pick_file()
-            && let Err(error) = self.add_track_source(&path)
         {
-            self.report_error(error.to_string());
+            self.load_requested_track(&path, TrackLoadKind::Annotation);
         }
         if let Some(path) = st.commands.recovery_requested.take() {
             self.request_session_load(path, SessionLoadKind::Recovery);

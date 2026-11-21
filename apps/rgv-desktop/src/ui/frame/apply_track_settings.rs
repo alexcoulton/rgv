@@ -1,303 +1,206 @@
 //! Deferred alignment, reference and auxiliary track setting changes.
 
+use crate::action::{Action, ReferencePresentation};
 use crate::display::alignment::parse_style_tag;
 use crate::display::auxiliary::{alignment_sort_position, normalize_quantitative_overlay_settings};
 use crate::ui::AlignmentSubtrack;
 use crate::ui::alignment_settings::modification_code_label;
-use crate::ui::frame::ShellFrame;
-use crate::workspace::alignments::{
-    ActiveFilters, AlignmentSettingsDraft, FilterEditor, alignment_color_mode_needs_reference,
-};
+use crate::ui::frame::{AlignmentSettingsFrame, ShellFrame};
+use crate::workspace::alignments::FilterEditor;
 use crate::workspace::lists::apply_compatible_auxiliary_appearance;
-use crate::{
-    MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY, QuantitativeBulkAction, Viewer,
-    auxiliary_query_track_ids,
-};
-use rgv_core::TrackId;
-use rgv_hts::{AlignmentFilter, AuxPredicate};
+use crate::{MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY, QuantitativeBulkAction, Viewer};
+use rgv_core::{TrackConfig, TrackId, Viewport};
+use rgv_hts::AuxPredicate;
 use rgv_layout::{AlignmentColorMode, AlignmentGroupMode, AlignmentSortMode};
-use std::collections::HashSet;
+use rgv_session::action::AlignmentSettings;
+use rgv_session::action::alignment_settings::merge_alignment_settings_draft;
+use std::collections::BTreeMap;
+
+/// The settings the alignment controls of `align` ask for, as the settings action carries
+/// them. The filter clauses are left as they were: only "Apply filter" commits those.
+fn drafted_alignment_settings(
+    align: &mut AlignmentSettingsFrame,
+    viewport: Viewport,
+) -> AlignmentSettings {
+    if let Some(tag) = parse_style_tag(&align.style_tag_editor) {
+        if matches!(align.color_mode, AlignmentColorMode::Tag(_)) {
+            align.color_mode = AlignmentColorMode::Tag(tag);
+        }
+        if matches!(align.group_mode, AlignmentGroupMode::Tag(_)) {
+            align.group_mode = AlignmentGroupMode::Tag(tag);
+        }
+        if matches!(align.sort_mode, AlignmentSortMode::Tag(_)) {
+            align.sort_mode = AlignmentSortMode::Tag(tag);
+        }
+    }
+    let position_grouping = |mode| {
+        matches!(
+            mode,
+            AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
+        )
+    };
+    let previous = &align.settings_filters;
+    // A base sort or position grouping keeps the anchor it started with; a new one anchors at
+    // the centre of the focused view.
+    let alignment_sort_anchor = (align.sort_mode == AlignmentSortMode::Base
+        || position_grouping(align.group_mode))
+    .then(|| {
+        (previous.alignment_sort_mode == AlignmentSortMode::Base
+            || position_grouping(previous.alignment_group_mode))
+        .then_some(previous.alignment_sort_anchor)
+        .flatten()
+        .or_else(|| alignment_sort_position(AlignmentSortMode::Base, None, viewport))
+    })
+    .flatten();
+    let mut filters = align.settings_filters.clone();
+    filters.alignment_color_mode = align.color_mode;
+    filters.alignment_group_mode = align.group_mode;
+    filters.alignment_group_order = align.group_order;
+    filters.alignment_sort_mode = align.sort_mode;
+    filters.alignment_sort_order = align.sort_order;
+    filters.alignment_sort_anchor = alignment_sort_anchor;
+    filters.read_stacking_mode = align.read_stacking_mode;
+    filters.read_sampling = align.read_sampling.normalized();
+    filters.view_as_pairs = align.view_as_pairs;
+    filters.minimum_template_length = align
+        .override_pair_bounds
+        .then_some(align.minimum_template_length);
+    filters.maximum_template_length = align.override_pair_bounds.then_some(
+        align
+            .maximum_template_length
+            .max(align.minimum_template_length),
+    );
+    filters.overlapping_mate_policy = align.overlapping_mate_policy;
+    filters.minimum_base_quality = align.minimum_base_quality;
+    filters.minimum_allele_fraction = align.minimum_allele_fraction;
+    filters.quality_weighted_alleles = align.quality_weighted_alleles;
+    filters.show_reference = align.show_reference;
+    filters.show_coverage = align.show_coverage;
+    filters.show_junctions = align.show_junctions;
+    filters.minimum_junction_depth = align.minimum_junction_depth.max(1);
+    filters.minimum_junction_flank = align.minimum_junction_flank;
+    filters.junction_display_mode = align.junction_display_mode;
+    filters.sashimi_scale_mode = align.sashimi_scale_mode;
+    filters.sashimi_fixed_scale_maximum = align.sashimi_fixed_scale_maximum.max(1);
+    filters.sashimi_count_mode = align.sashimi_count_mode;
+    filters.show_junction_labels = align.show_junction_labels;
+    filters.coverage_scale_maximum = align
+        .use_fixed_coverage_scale
+        .then_some(align.coverage_scale_maximum.max(1));
+    filters.coverage_scale_transform = align.coverage_scale_transform;
+    filters.show_coverage_center_line = align.show_coverage_center_line;
+    filters.alignment_density = align
+        .alignment_density
+        .clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);
+    filters.inspector_activation = align.inspector_activation;
+    filters.read_base_display_mode = align.read_base_display_mode;
+    filters.shade_read_bases_by_quality = align.shade_read_bases_by_quality;
+    filters.minimum_indel_size = align.minimum_indel_size;
+    filters.minimum_event_label_size = align.minimum_event_label_size;
+    filters.show_modified_bases = align.show_modified_bases;
+    filters.show_modification_frequency = align.show_modification_frequency;
+    filters.minimum_modification_probability = align.minimum_modification_probability;
+    filters.modified_base_color_mode = align.modified_base_color_mode;
+    filters.hidden_modification_codes = align
+        .hidden_modification_codes
+        .iter()
+        .copied()
+        .map(modification_code_label)
+        .collect();
+    AlignmentSettings {
+        filters,
+        maximum_alignments: align.complete_read_limit as usize,
+    }
+}
+
+/// The filter clauses the editor commits: the mapping-quality floor and the tag predicates.
+fn committed_filter_clauses(
+    align: &AlignmentSettingsFrame,
+) -> Result<(Option<u8>, Vec<String>), String> {
+    let expressions = align
+        .filter_expression
+        .split(';')
+        .map(str::trim)
+        .filter(|expression| !expression.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    for expression in &expressions {
+        expression
+            .parse::<AuxPredicate>()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok((
+        (align.minimum_mapq > 0).then_some(align.minimum_mapq),
+        expressions,
+    ))
+}
+
+/// A gutter lane toggle as the settings it leaves. `None` for the reads lane, which is a
+/// track-arrangement edit.
+pub(crate) fn toggled_alignment_lane(
+    current: &AlignmentSettings,
+    subtrack: AlignmentSubtrack,
+) -> Option<AlignmentSettings> {
+    let mut next = current.clone();
+    let filters = &mut next.filters;
+    match subtrack {
+        AlignmentSubtrack::Reference => filters.show_reference = !filters.show_reference,
+        AlignmentSubtrack::Coverage => filters.show_coverage = !filters.show_coverage,
+        AlignmentSubtrack::Sashimi => filters.show_junctions = !filters.show_junctions,
+        AlignmentSubtrack::Modifications => {
+            filters.show_modification_frequency = !filters.show_modification_frequency;
+        }
+        AlignmentSubtrack::Reads => return None,
+    }
+    Some(next)
+}
 
 impl Viewer {
-    pub(super) fn apply_primary_alignment_query_settings(
-        &mut self,
-        st: &mut ShellFrame,
-        editing_primary_settings: bool,
-    ) {
-        if editing_primary_settings && st.align.typed_alignment_predicates_changed {
-            self.primary_alignment_filters_mut().alignment_view_filter =
-                st.align.settings_filters.alignment_view_filter.clone();
-            self.primary_alignment_filters_mut()
-                .alignment_highlight_filter =
-                st.align.settings_filters.alignment_highlight_filter.clone();
-            if st.align.alignment_highlight_predicates_changed {
-                self.refresh_alignment_highlight_interactions(&[st.align.settings_alignment_id]);
-            }
-            self.query_options_changed();
-        }
-        if editing_primary_settings {
-            self.primary_filter_editor_mut().minimum_mapq = st.align.minimum_mapq;
-            self.primary_filter_editor_mut().include_secondary = st.align.include_secondary;
-            self.primary_filter_editor_mut().include_supplementary = st.align.include_supplementary;
-            self.primary_filter_editor_mut()
-                .expression
-                .clone_from(&st.align.filter_expression);
-        }
-        if editing_primary_settings
-            && st.align.minimum_base_quality
-                != self.primary_alignment_filters().minimum_base_quality
-        {
-            self.primary_alignment_filters_mut().minimum_base_quality =
-                st.align.minimum_base_quality;
-            self.query_options_changed();
-        }
-        if editing_primary_settings
-            && st.align.minimum_junction_flank
-                != self.primary_alignment_filters().minimum_junction_flank
-        {
-            self.primary_alignment_filters_mut().minimum_junction_flank =
-                st.align.minimum_junction_flank;
-            self.query_options_changed();
-        }
-        if editing_primary_settings
-            && st.align.overlapping_mate_policy
-                != self.primary_alignment_filters().overlapping_mate_policy
-        {
-            self.primary_alignment_filters_mut().overlapping_mate_policy =
-                st.align.overlapping_mate_policy;
-            self.query_options_changed();
-        }
-        if editing_primary_settings
-            && st.align.show_modification_frequency
-                != self.primary_alignment_filters().show_modification_frequency
-        {
-            self.primary_alignment_filters_mut()
-                .show_modification_frequency = st.align.show_modification_frequency;
-            self.session
-                .panels
-                .active_mut()
-                .selected_modification_position = None;
-            self.query_options_changed();
-        }
-    }
-
     pub(super) fn apply_reference_presentation(&mut self, st: &mut ShellFrame) {
-        st.align.reference_translation_frames.sort();
-        st.align.reference_translation_frames.dedup();
-        if st.align.reference_reverse_complement != self.reference_reverse_complement
-            || st.align.reference_translation_frames != self.reference_translation_frames
-            || st.align.reference_genetic_code != self.reference_genetic_code
+        let requested = ReferencePresentation {
+            reverse_complement: st.align.reference_reverse_complement,
+            translation_frames: std::mem::take(&mut st.align.reference_translation_frames),
+            genetic_code: st.align.reference_genetic_code,
+        }
+        .normalized();
+        if requested != self.reference_presentation()
+            && let Err(error) = self.apply_action(Action::SetReferencePresentation(requested))
         {
-            self.reference_reverse_complement = st.align.reference_reverse_complement;
-            self.reference_translation_frames =
-                std::mem::take(&mut st.align.reference_translation_frames);
-            self.reference_genetic_code = st.align.reference_genetic_code;
-            self.invalidate_navigation_contract("reference presentation changed");
-            self.rebuild_all_panel_displays();
-            self.mark_display_dirty("explicit display invalidation");
+            self.report_error(error.to_string());
         }
     }
 
-    #[allow(clippy::too_many_lines)]
-    pub(super) fn apply_primary_alignment_presentation(
-        &mut self,
-        st: &mut ShellFrame,
-        editing_primary_settings: bool,
-        requested_coverage_scale: Option<u32>,
-    ) {
-        if editing_primary_settings
-            && st.align.inspector_activation
-                != self.primary_alignment_filters().inspector_activation
-        {
-            self.primary_alignment_filters_mut().inspector_activation =
-                st.align.inspector_activation;
-            self.session.panels.active_mut().hover_inspector_target = None;
-        }
-        if editing_primary_settings
-            && ((st.align.minimum_allele_fraction
-                - self.primary_alignment_filters().minimum_allele_fraction)
-                .abs()
-                > f32::EPSILON
-                || st.align.quality_weighted_alleles
-                    != self.primary_alignment_filters().quality_weighted_alleles
-                || st.align.show_reference != self.primary_alignment_filters().show_reference
-                || st.align.show_coverage != self.primary_alignment_filters().show_coverage
-                || st.align.show_junctions != self.primary_alignment_filters().show_junctions
-                || st.align.minimum_junction_depth
-                    != self.primary_alignment_filters().minimum_junction_depth
-                || st.align.junction_display_mode
-                    != self.primary_alignment_filters().junction_display_mode
-                || st.align.sashimi_scale_mode
-                    != self.primary_alignment_filters().sashimi_scale_mode
-                || st.align.sashimi_fixed_scale_maximum
-                    != self.primary_alignment_filters().sashimi_fixed_scale_maximum
-                || st.align.sashimi_count_mode
-                    != self.primary_alignment_filters().sashimi_count_mode
-                || st.align.show_junction_labels
-                    != self.primary_alignment_filters().show_junction_labels
-                || requested_coverage_scale
-                    != self.primary_alignment_filters().coverage_scale_maximum
-                || st.align.coverage_scale_transform
-                    != self.primary_alignment_filters().coverage_scale_transform
-                || st.align.show_coverage_center_line
-                    != self.primary_alignment_filters().show_coverage_center_line
-                || (st.align.alignment_density
-                    - self.primary_alignment_filters().alignment_density)
-                    .abs()
-                    > f32::EPSILON
-                || st.align.read_base_display_mode
-                    != self.primary_alignment_filters().read_base_display_mode
-                || st.align.shade_read_bases_by_quality
-                    != self.primary_alignment_filters().shade_read_bases_by_quality
-                || st.align.minimum_indel_size
-                    != self.primary_alignment_filters().minimum_indel_size
-                || st.align.minimum_event_label_size
-                    != self.primary_alignment_filters().minimum_event_label_size
-                || st.align.show_modified_bases
-                    != self.primary_alignment_filters().show_modified_bases
-                || st.align.minimum_modification_probability
-                    != self
-                        .primary_alignment_filters()
-                        .minimum_modification_probability
-                || st.align.modified_base_color_mode
-                    != self.primary_alignment_filters().modified_base_color_mode
-                || st.align.hidden_modification_codes != self.primary_hidden_modification_codes())
-        {
-            self.primary_alignment_filters_mut().minimum_allele_fraction =
-                st.align.minimum_allele_fraction;
-            self.primary_alignment_filters_mut()
-                .quality_weighted_alleles = st.align.quality_weighted_alleles;
-            self.primary_alignment_filters_mut().show_reference = st.align.show_reference;
-            if !st.align.show_coverage {
-                self.session.panels.active_mut().selected_pileup_position = None;
-            }
-            self.primary_alignment_filters_mut().show_coverage = st.align.show_coverage;
-            if !st.align.show_junctions {
-                self.session.panels.active_mut().selected_junction = None;
-                self.session.panels.active_mut().selected_junction_component = None;
-            }
-            self.primary_alignment_filters_mut().show_junctions = st.align.show_junctions;
-            self.primary_alignment_filters_mut().minimum_junction_depth =
-                st.align.minimum_junction_depth.max(1);
-            self.primary_alignment_filters_mut().junction_display_mode =
-                st.align.junction_display_mode;
-            self.primary_alignment_filters_mut().sashimi_scale_mode = st.align.sashimi_scale_mode;
-            self.primary_alignment_filters_mut()
-                .sashimi_fixed_scale_maximum = st.align.sashimi_fixed_scale_maximum.max(1);
-            self.primary_alignment_filters_mut().sashimi_count_mode = st.align.sashimi_count_mode;
-            self.primary_alignment_filters_mut().show_junction_labels =
-                st.align.show_junction_labels;
-            self.primary_alignment_filters_mut().coverage_scale_maximum = requested_coverage_scale;
-            self.primary_alignment_filters_mut()
-                .coverage_scale_transform = st.align.coverage_scale_transform;
-            self.primary_alignment_filters_mut()
-                .show_coverage_center_line = st.align.show_coverage_center_line;
-            self.set_alignment_density_for_track(
-                st.align.primary_alignment_id,
-                st.align.alignment_density,
-            );
-            self.primary_alignment_filters_mut().read_base_display_mode =
-                st.align.read_base_display_mode;
-            self.primary_alignment_filters_mut()
-                .shade_read_bases_by_quality = st.align.shade_read_bases_by_quality;
-            self.primary_alignment_filters_mut().minimum_indel_size = st.align.minimum_indel_size;
-            self.primary_alignment_filters_mut()
-                .minimum_event_label_size = st.align.minimum_event_label_size;
-            self.primary_alignment_filters_mut().show_modified_bases = st.align.show_modified_bases;
-            self.primary_alignment_filters_mut()
-                .minimum_modification_probability = st.align.minimum_modification_probability;
-            self.primary_alignment_filters_mut()
-                .modified_base_color_mode = st.align.modified_base_color_mode;
-            self.primary_alignment_filters_mut()
-                .hidden_modification_codes = st
-                .align
-                .hidden_modification_codes
-                .iter()
-                .copied()
-                .map(modification_code_label)
-                .collect();
-            self.invalidate_navigation_contract("alignment presentation changed");
-            self.rebuild_genomic_display(self.session.panels.active().id);
-            self.mark_display_dirty("explicit display invalidation");
-        }
-    }
-
-    #[allow(clippy::too_many_lines)]
+    /// Commits the annotation and signal track controls (names, sample key, the settings of
+    /// each kind) as one track settings action, and a track-list move as another.
     pub(super) fn apply_auxiliary_track_settings(&mut self, st: &mut ShellFrame) {
-        let previous_auxiliary_query_membership =
-            auxiliary_query_track_ids(self.session.tracks.tracks())
-                .into_iter()
-                .collect::<HashSet<_>>();
-        let mut track_configuration_changed = false;
-        if let Some(id) = st.align.editing_auxiliary_id
-            && let Some(track) = self
-                .session
-                .tracks
-                .tracks_mut()
-                .iter_mut()
-                .find(|track| track.id == id)
-            && track.sample_key != st.align.edited_track_sample_key
-        {
-            track
-                .sample_key
-                .clone_from(&st.align.edited_track_sample_key);
-            track_configuration_changed = true;
+        let mut edited = BTreeMap::<TrackId, TrackConfig>::new();
+        let tracks = self.session.tracks.tracks();
+        let mut edit = |id: TrackId, apply: &mut dyn FnMut(&mut TrackConfig)| {
+            if let Some(config) = edited.get_mut(&id) {
+                apply(config);
+            } else if let Some(track) = tracks.iter().find(|track| track.id == id) {
+                let mut config = track.clone();
+                apply(&mut config);
+                edited.insert(id, config);
+            }
+        };
+        if let Some(id) = st.align.editing_auxiliary_id {
+            let sample_key = st.align.edited_track_sample_key.clone();
+            edit(id, &mut |track| track.sample_key.clone_from(&sample_key));
         }
         for control in std::mem::take(&mut st.tracks.track_controls) {
-            if let Some(track) = self
-                .session
-                .tracks
-                .tracks_mut()
-                .iter_mut()
-                .find(|track| track.id == control.id)
-                && track.name != control.name
-            {
-                track.name = control.name;
-                track_configuration_changed = true;
-            }
+            let name = control.name;
+            edit(control.id, &mut |track| track.name.clone_from(&name));
         }
         for (id, settings) in std::mem::take(&mut st.tracks.feature_settings_controls) {
-            if let Some(track) = self
-                .session
-                .tracks
-                .tracks_mut()
-                .iter_mut()
-                .find(|track| track.id == id)
-                && track.feature != settings
-            {
-                track.feature = settings;
-                track_configuration_changed = true;
-            }
+            edit(id, &mut |track| track.feature = settings.clone());
         }
-        let mut variant_query_requested = false;
         for (id, settings) in std::mem::take(&mut st.tracks.variant_settings_controls) {
-            if let Some(track) = self
-                .session
-                .tracks
-                .tracks_mut()
-                .iter_mut()
-                .find(|track| track.id == id)
-                && track.variant != settings
-            {
-                track.variant = settings;
-                variant_query_requested = true;
-                track_configuration_changed = true;
-            }
+            edit(id, &mut |track| track.variant = settings.clone());
         }
         for (id, settings) in std::mem::take(&mut st.tracks.gwas_settings_controls) {
-            if !settings.is_valid() {
-                continue;
-            }
-            if let Some(track) = self
-                .session
-                .tracks
-                .tracks_mut()
-                .iter_mut()
-                .find(|track| track.id == id)
-                && track.gwas != settings
-            {
-                track.gwas = settings;
-                track_configuration_changed = true;
+            if settings.is_valid() {
+                edit(id, &mut |track| track.gwas = settings.clone());
             }
         }
         normalize_quantitative_overlay_settings(
@@ -305,332 +208,144 @@ impl Viewer {
             st.align.editing_auxiliary_id,
         );
         for (id, settings) in std::mem::take(&mut st.tracks.quantitative_settings_controls) {
-            if !settings.is_valid() {
-                continue;
-            }
-            if let Some(track) = self
-                .session
-                .tracks
-                .tracks_mut()
-                .iter_mut()
-                .find(|track| track.id == id)
-                && track.quantitative != settings
-            {
-                track.quantitative = settings;
-                track_configuration_changed = true;
+            if settings.is_valid() {
+                edit(id, &mut |track| track.quantitative = settings.clone());
             }
         }
-        let mut copy_number_query_requested = false;
         for (id, settings) in std::mem::take(&mut st.tracks.copy_number_settings_controls) {
-            if !settings.is_valid() {
-                continue;
-            }
-            if let Some(track) = self
-                .session
-                .tracks
-                .tracks_mut()
-                .iter_mut()
-                .find(|track| track.id == id)
-                && track.copy_number != settings
-            {
-                copy_number_query_requested |= track.copy_number.sort_mode != settings.sort_mode
-                    || track.copy_number.sort_locus != settings.sort_locus;
-                track.copy_number = settings;
-                track_configuration_changed = true;
+            if settings.is_valid() {
+                edit(id, &mut |track| track.copy_number = settings.clone());
             }
         }
         for (id, settings) in std::mem::take(&mut st.tracks.mutation_settings_controls) {
-            if !settings.is_valid() {
-                continue;
-            }
-            if let Some(track) = self
-                .session
-                .tracks
-                .tracks_mut()
-                .iter_mut()
-                .find(|track| track.id == id)
-                && track.mutation != settings
-            {
-                track.mutation = settings;
-                track_configuration_changed = true;
+            if settings.is_valid() {
+                edit(id, &mut |track| track.mutation = settings.clone());
             }
         }
-        let mut interaction_query_requested = false;
         for (id, settings) in std::mem::take(&mut st.tracks.interaction_settings_controls) {
-            if !settings.is_valid() {
-                continue;
-            }
-            if let Some(track) = self
-                .session
-                .tracks
-                .tracks_mut()
-                .iter_mut()
-                .find(|track| track.id == id)
-                && track.interaction != settings
-            {
-                interaction_query_requested |=
-                    track.interaction.minimum_score != settings.minimum_score;
-                track.interaction = settings;
-                track_configuration_changed = true;
+            if settings.is_valid() {
+                edit(id, &mut |track| track.interaction = settings.clone());
             }
         }
-        if let Some((id, new_index)) = st.tracks.track_move {
-            track_configuration_changed |= self.session.tracks.move_track(id, new_index);
-        }
-        let auxiliary_query_membership_changed = previous_auxiliary_query_membership
-            != auxiliary_query_track_ids(self.session.tracks.tracks())
-                .into_iter()
-                .collect::<HashSet<_>>();
-        if track_configuration_changed {
-            self.invalidate_navigation_contract("auxiliary track presentation changed");
-            self.reconcile_track_presentation();
-            self.rebuild_genomic_display(self.session.panels.active().id);
-            self.mark_display_dirty("explicit display invalidation");
-        }
-        if auxiliary_query_membership_changed {
-            self.invalidate_and_request_all_auxiliary_track_queries();
-        } else if variant_query_requested
-            || interaction_query_requested
-            || copy_number_query_requested
+        let tracks = self.session.tracks.tracks();
+        let changed = edited
+            .into_values()
+            .filter(|config| {
+                tracks
+                    .iter()
+                    .find(|track| track.id == config.id)
+                    .is_some_and(|track| track != config)
+            })
+            .collect::<Vec<_>>();
+        if !changed.is_empty()
+            && let Err(error) = self.apply_action(Action::SetTrackConfigs { tracks: changed })
         {
-            self.request_all_auxiliary_track_queries();
+            self.report_error(error.to_string());
+        }
+        if let Some((track_id, index)) = st.tracks.track_move
+            && let Err(error) = self.apply_action(Action::MoveTrack { track_id, index })
+        {
+            self.report_error(error.to_string());
         }
     }
 
-    /// Colour/group/sort/stacking/pairing changes for the primary track. Returns the resolved
-    /// base-sort anchor, which secondary tracks reuse.
-    #[allow(clippy::too_many_lines)]
-    pub(super) fn apply_primary_alignment_style(
-        &mut self,
-        st: &mut ShellFrame,
-        editing_primary_settings: bool,
-    ) -> Option<u64> {
-        if let Some(tag) = parse_style_tag(&st.align.style_tag_editor) {
-            if matches!(st.align.color_mode, AlignmentColorMode::Tag(_)) {
-                st.align.color_mode = AlignmentColorMode::Tag(tag);
-            }
-            if matches!(st.align.group_mode, AlignmentGroupMode::Tag(_)) {
-                st.align.group_mode = AlignmentGroupMode::Tag(tag);
-            }
-            if matches!(st.align.sort_mode, AlignmentSortMode::Tag(_)) {
-                st.align.sort_mode = AlignmentSortMode::Tag(tag);
-            }
-        }
-        let position_grouping = matches!(
-            st.align.group_mode,
-            AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
-        );
-        let previous_position_grouping = matches!(
-            st.align.settings_filters.alignment_group_mode,
-            AlignmentGroupMode::Base | AlignmentGroupMode::Insertion
-        );
-        let alignment_sort_anchor = (st.align.sort_mode == AlignmentSortMode::Base
-            || position_grouping)
-            .then(|| {
-                (st.align.settings_filters.alignment_sort_mode == AlignmentSortMode::Base
-                    || previous_position_grouping)
-                    .then_some(st.align.settings_filters.alignment_sort_anchor)
-                    .flatten()
-                    .or_else(|| {
-                        alignment_sort_position(
-                            AlignmentSortMode::Base,
-                            None,
-                            self.session.panels.active().viewport,
-                        )
-                    })
-            })
-            .flatten();
-        if editing_primary_settings
-            && (st.align.color_mode != self.primary_alignment_filters().alignment_color_mode
-                || st.align.group_mode != self.primary_alignment_filters().alignment_group_mode
-                || st.align.group_order != self.primary_alignment_filters().alignment_group_order
-                || st.align.sort_mode != self.primary_alignment_filters().alignment_sort_mode
-                || st.align.sort_order != self.primary_alignment_filters().alignment_sort_order
-                || alignment_sort_anchor != self.primary_alignment_filters().alignment_sort_anchor
-                || st.align.read_stacking_mode
-                    != self.primary_alignment_filters().read_stacking_mode
-                || st.align.read_sampling != self.primary_alignment_filters().read_sampling
-                || st.align.view_as_pairs != self.primary_alignment_filters().view_as_pairs
-                || (st
-                    .align
-                    .override_pair_bounds
-                    .then_some(st.align.minimum_template_length)
-                    != self.primary_alignment_filters().minimum_template_length)
-                || (st
-                    .align
-                    .override_pair_bounds
-                    .then_some(st.align.maximum_template_length)
-                    != self.primary_alignment_filters().maximum_template_length))
+    /// Commits the "Track settings" draft of the alignment track it shows (the primary track
+    /// when the window is closed) as one alignment settings action. Only fields the window
+    /// edited this frame are taken from the draft, so an untouched window never writes.
+    pub(super) fn commit_alignment_settings(&mut self, st: &mut ShellFrame) {
+        let track_id = st.align.settings_alignment_id;
+        let viewport = self.session.panels.active().viewport;
+        let drafted = drafted_alignment_settings(&mut st.align, viewport);
+        self.commit_filter_editor_draft(track_id, &st.align);
+        let Some(current) = self.session.alignment_settings(track_id) else {
+            return;
+        };
+        let mut next = if drafted == current {
+            current.clone()
+        } else {
+            // What the controls showed before the user touched them: values the controls
+            // cannot express (an unparsed modification code, a one-sided pair bound) are not
+            // edits and must not be written back, or undo would be undone by the next frame.
+            let mut baseline_frame = self.prepare_alignment_settings();
+            let baseline = if baseline_frame.settings_alignment_id == track_id {
+                drafted_alignment_settings(&mut baseline_frame, viewport)
+            } else {
+                current.clone()
+            };
+            merge_alignment_settings_draft(&current, &baseline, &drafted)
+        };
+        if !(st.align.typed_alignment_predicates_changed
+            || st.align.alignment_highlight_predicates_changed)
         {
-            let reference_query_changed =
-                alignment_color_mode_needs_reference(
-                    self.primary_alignment_filters().alignment_color_mode,
-                ) != alignment_color_mode_needs_reference(st.align.color_mode);
-            self.primary_alignment_filters_mut().alignment_color_mode = st.align.color_mode;
-            self.primary_alignment_filters_mut().alignment_group_mode = st.align.group_mode;
-            self.primary_alignment_filters_mut().alignment_group_order = st.align.group_order;
-            self.primary_alignment_filters_mut().alignment_sort_mode = st.align.sort_mode;
-            self.primary_alignment_filters_mut().alignment_sort_order = st.align.sort_order;
-            self.primary_alignment_filters_mut().alignment_sort_anchor = alignment_sort_anchor;
-            self.primary_alignment_filters_mut().read_stacking_mode = st.align.read_stacking_mode;
-            self.primary_alignment_filters_mut().read_sampling =
-                st.align.read_sampling.normalized();
-            self.primary_alignment_filters_mut().view_as_pairs = st.align.view_as_pairs;
-            if st.align.override_pair_bounds {
-                st.align.maximum_template_length = st
-                    .align
-                    .maximum_template_length
-                    .max(st.align.minimum_template_length);
-                self.primary_alignment_filters_mut().minimum_template_length =
-                    Some(st.align.minimum_template_length);
-                self.primary_alignment_filters_mut().maximum_template_length =
-                    Some(st.align.maximum_template_length);
-            } else {
-                self.primary_alignment_filters_mut().minimum_template_length = None;
-                self.primary_alignment_filters_mut().maximum_template_length = None;
-            }
-            if reference_query_changed {
-                self.query_options_changed();
-            } else {
-                self.query_options_changed();
+            next.filters
+                .alignment_view_filter
+                .clone_from(&current.filters.alignment_view_filter);
+            next.filters
+                .alignment_highlight_filter
+                .clone_from(&current.filters.alignment_highlight_filter);
+        }
+        if st.align.apply_filter {
+            match committed_filter_clauses(&st.align) {
+                Ok((minimum_mapping_quality, auxiliary_predicates)) => {
+                    next.filters.minimum_mapping_quality = minimum_mapping_quality;
+                    next.filters.include_secondary = st.align.include_secondary;
+                    next.filters.include_supplementary = st.align.include_supplementary;
+                    next.filters.auxiliary_predicates = auxiliary_predicates;
+                    if let Some(editor) = self.alignment_filter_editor_mut(track_id) {
+                        editor.error = None;
+                    }
+                }
+                Err(error) => {
+                    if let Some(editor) = self.alignment_filter_editor_mut(track_id) {
+                        editor.error = Some(error);
+                    }
+                }
             }
         }
-        if editing_primary_settings {
+        if next != current
+            && let Err(error) = self.set_alignment_settings(vec![(track_id, next)])
+        {
+            self.report_error(error.to_string());
+        }
+        if track_id == st.align.primary_alignment_id {
             self.style_tag_editor.clone_from(&st.align.style_tag_editor);
         }
-        alignment_sort_anchor
     }
 
-    pub(super) fn apply_primary_alignment_filters(
-        &mut self,
-        st: &mut ShellFrame,
-        editing_primary_settings: bool,
-    ) {
-        if editing_primary_settings && st.align.apply_filter {
-            let editor = self.primary_filter_editor().clone();
-            let expressions = editor
-                .expression
-                .split(';')
-                .map(str::trim)
-                .filter(|expression| !expression.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>();
-            let parsed = expressions
-                .iter()
-                .map(|expression| expression.parse::<AuxPredicate>())
-                .collect::<Result<Vec<_>, _>>();
-            match parsed {
-                Ok(auxiliary) => {
-                    let active = ActiveFilters {
-                        alignment: AlignmentFilter {
-                            minimum_mapping_quality: (editor.minimum_mapq > 0)
-                                .then_some(editor.minimum_mapq),
-                            auxiliary,
-                            ..AlignmentFilter::default()
-                        },
-                        include_secondary: editor.include_secondary,
-                        include_supplementary: editor.include_supplementary,
-                    };
-                    let filters = self.primary_alignment_filters_mut();
-                    filters.minimum_mapping_quality = active.alignment.minimum_mapping_quality;
-                    filters.include_secondary = active.include_secondary;
-                    filters.include_supplementary = active.include_supplementary;
-                    filters.auxiliary_predicates = expressions;
-                    *self.primary_active_filters_mut() = active;
-                    self.primary_filter_editor_mut().error = None;
-                    self.query_options_changed();
-                }
-                Err(error) => self.primary_filter_editor_mut().error = Some(error.to_string()),
-            }
+    /// The filter editor of an alignment track (the primary settings while none is open).
+    fn alignment_filter_editor_mut(&mut self, track_id: TrackId) -> Option<&mut FilterEditor> {
+        if track_id == self.primary_alignment_track_id() {
+            return Some(self.primary_filter_editor_mut());
         }
-        if editing_primary_settings
-            && st.align.complete_read_limit
-                != u32::try_from(self.primary_alignment_limit()).unwrap_or(u32::MAX)
-        {
-            self.set_primary_alignment_limit(st.align.complete_read_limit as usize);
-            self.query_options_changed();
+        self.session
+            .alignment_tracks
+            .iter_mut()
+            .find(|track| track.config.id == track_id)
+            .map(|track| &mut track.filter_editor)
+    }
+
+    /// The filter editor holds what the user typed until "Apply filter" commits it.
+    fn commit_filter_editor_draft(&mut self, track_id: TrackId, align: &AlignmentSettingsFrame) {
+        if let Some(editor) = self.alignment_filter_editor_mut(track_id) {
+            editor.minimum_mapq = align.minimum_mapq;
+            editor.include_secondary = align.include_secondary;
+            editor.include_supplementary = align.include_supplementary;
+            editor.expression.clone_from(&align.filter_expression);
         }
     }
 
-    pub(super) fn commit_secondary_alignment_settings(
-        &mut self,
-        st: &mut ShellFrame,
-        editing_primary_settings: bool,
-        requested_coverage_scale: Option<u32>,
-        alignment_sort_anchor: Option<u64>,
-    ) {
-        if !editing_primary_settings && st.align.editing_alignment_id.is_some() {
-            let mut filters = std::mem::take(&mut st.align.settings_filters);
-            filters.alignment_color_mode = st.align.color_mode;
-            filters.alignment_group_mode = st.align.group_mode;
-            filters.alignment_group_order = st.align.group_order;
-            filters.alignment_sort_mode = st.align.sort_mode;
-            filters.alignment_sort_order = st.align.sort_order;
-            filters.alignment_sort_anchor = alignment_sort_anchor;
-            filters.read_stacking_mode = st.align.read_stacking_mode;
-            filters.read_sampling = st.align.read_sampling.normalized();
-            filters.view_as_pairs = st.align.view_as_pairs;
-            filters.minimum_template_length = st
-                .align
-                .override_pair_bounds
-                .then_some(st.align.minimum_template_length);
-            filters.maximum_template_length = st.align.override_pair_bounds.then_some(
-                st.align
-                    .maximum_template_length
-                    .max(st.align.minimum_template_length),
-            );
-            filters.overlapping_mate_policy = st.align.overlapping_mate_policy;
-            filters.minimum_base_quality = st.align.minimum_base_quality;
-            filters.minimum_allele_fraction = st.align.minimum_allele_fraction;
-            filters.quality_weighted_alleles = st.align.quality_weighted_alleles;
-            filters.show_reference = st.align.show_reference;
-            filters.show_coverage = st.align.show_coverage;
-            filters.show_junctions = st.align.show_junctions;
-            filters.minimum_junction_depth = st.align.minimum_junction_depth.max(1);
-            filters.minimum_junction_flank = st.align.minimum_junction_flank;
-            filters.junction_display_mode = st.align.junction_display_mode;
-            filters.sashimi_scale_mode = st.align.sashimi_scale_mode;
-            filters.sashimi_fixed_scale_maximum = st.align.sashimi_fixed_scale_maximum.max(1);
-            filters.sashimi_count_mode = st.align.sashimi_count_mode;
-            filters.show_junction_labels = st.align.show_junction_labels;
-            filters.coverage_scale_maximum = requested_coverage_scale;
-            filters.coverage_scale_transform = st.align.coverage_scale_transform;
-            filters.show_coverage_center_line = st.align.show_coverage_center_line;
-            filters.alignment_density = st
-                .align
-                .alignment_density
-                .clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);
-            filters.inspector_activation = st.align.inspector_activation;
-            filters.read_base_display_mode = st.align.read_base_display_mode;
-            filters.shade_read_bases_by_quality = st.align.shade_read_bases_by_quality;
-            filters.minimum_indel_size = st.align.minimum_indel_size;
-            filters.minimum_event_label_size = st.align.minimum_event_label_size;
-            filters.show_modified_bases = st.align.show_modified_bases;
-            filters.show_modification_frequency = st.align.show_modification_frequency;
-            filters.minimum_modification_probability = st.align.minimum_modification_probability;
-            filters.modified_base_color_mode = st.align.modified_base_color_mode;
-            filters.hidden_modification_codes = st
-                .align
-                .hidden_modification_codes
-                .iter()
-                .copied()
-                .map(modification_code_label)
-                .collect();
-            self.apply_secondary_alignment_settings(
-                st.align.settings_alignment_id,
-                AlignmentSettingsDraft {
-                    filters,
-                    filter_editor: FilterEditor {
-                        minimum_mapq: st.align.minimum_mapq,
-                        include_secondary: st.align.include_secondary,
-                        include_supplementary: st.align.include_supplementary,
-                        expression: std::mem::take(&mut st.align.filter_expression),
-                        error: st.align.filter_error.take(),
-                    },
-                    maximum_alignments: st.align.complete_read_limit as usize,
-                    apply_filter: st.align.apply_filter,
-                },
-            );
+    /// The gutter's lane toggles: reference, coverage, junctions and modifications are
+    /// alignment settings; the reads lane is a track-arrangement edit.
+    fn toggle_alignment_lane(&mut self, track_id: TrackId, subtrack: AlignmentSubtrack) {
+        let Some(current) = self.session.alignment_settings(track_id) else {
+            return;
+        };
+        let Some(next) = toggled_alignment_lane(&current, subtrack) else {
+            self.toggle_alignment_subtrack(track_id, subtrack);
+            return;
+        };
+        if let Err(error) = self.set_alignment_settings(vec![(track_id, next)]) {
+            self.report_error(error.to_string());
         }
     }
 
@@ -653,7 +368,7 @@ impl Viewer {
             self.report_error(error.to_string());
         }
         for (track_id, subtrack) in alignment_subtracks_to_toggle {
-            self.toggle_alignment_subtrack(track_id, subtrack);
+            self.toggle_alignment_lane(track_id, subtrack);
         }
         self.metadata_bulk_height = st.lists.metadata_bulk_height;
         self.metadata_remove_armed = st.lists.metadata_remove_armed && !metadata_selection_changed;
@@ -678,14 +393,11 @@ impl Viewer {
         {
             self.report_error(error.to_string());
         }
-        if st.lists.metadata_bulk_auxiliary_appearance_requested
-            && apply_compatible_auxiliary_appearance(
-                self.session.tracks.tracks_mut(),
-                &metadata_selected,
-            )
-        {
-            self.rebuild_all_panel_displays();
-            self.mark_display_dirty("explicit display invalidation");
+        if st.lists.metadata_bulk_auxiliary_appearance_requested {
+            let mut tracks = self.session.tracks.tracks().to_vec();
+            if apply_compatible_auxiliary_appearance(&mut tracks, &metadata_selected) {
+                self.set_changed_track_configs(tracks);
+            }
         }
         if st.lists.metadata_bulk_quantitative_autoscale_requested {
             self.apply_metadata_quantitative_action(
@@ -719,5 +431,122 @@ impl Viewer {
         if let Some((target, action)) = st.alignment_context_action.take() {
             self.apply_alignment_context_action(target, action);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rgv_automation::{AutomationCommand, AutomationSetting};
+    use rgv_core::{ContigId, DesktopSettings, GenomeAssembly, GenomicInterval, PanelId};
+    use rgv_session::action::Action;
+    use rgv_session::action::alignment_settings::{
+        EMPTY_ALIGNMENT_TRACK_ID, MAXIMUM_ALIGNMENT_DENSITY, MINIMUM_ALIGNMENT_DENSITY,
+    };
+    use rgv_session::action::translate::automation_alignment_settings_actions;
+    use rgv_session::panels::PanelState;
+
+    fn session() -> rgv_session::Session {
+        let dictionary =
+            rgv_core::ReferenceDictionary::from_contigs([("chr1".to_owned(), 1_000_000)]);
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 10_000).unwrap();
+        rgv_session::Session::new(
+            PanelState::new(
+                PanelId::new(1),
+                Viewport::new(interval, 600.0).unwrap(),
+                None,
+                "chr1".to_owned(),
+                1_000_000,
+            ),
+            GenomeAssembly::from_dictionary("test", dictionary),
+            DesktopSettings::default(),
+            std::path::PathBuf::from("settings.json"),
+        )
+    }
+
+    fn apply(session: &mut rgv_session::Session, actions: Vec<Action>) {
+        for action in actions {
+            let Action::SetAlignmentSettings {
+                updates,
+                workspace_limit,
+            } = action
+            else {
+                panic!("an alignment settings action");
+            };
+            session
+                .apply_alignment_settings(&updates, workspace_limit)
+                .unwrap();
+        }
+    }
+
+    fn document(session: &rgv_session::Session) -> String {
+        serde_json::to_string(
+            &session
+                .alignment_settings(EMPTY_ALIGNMENT_TRACK_ID)
+                .unwrap()
+                .filters,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_session_validates_density_against_the_navigator_range() {
+        assert!((MINIMUM_ALIGNMENT_DENSITY - MIN_VERTICAL_DENSITY).abs() < f32::EPSILON);
+        assert!((MAXIMUM_ALIGNMENT_DENSITY - MAX_VERTICAL_DENSITY).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn gutter_lane_toggles_and_their_settings_leave_the_same_document() {
+        let cases = [
+            (
+                AlignmentSubtrack::Coverage,
+                AutomationSetting::ShowCoverage { value: false },
+            ),
+            (
+                AlignmentSubtrack::Reference,
+                AutomationSetting::ShowReference { value: false },
+            ),
+            (
+                AlignmentSubtrack::Sashimi,
+                AutomationSetting::ShowJunctions { value: false },
+            ),
+        ];
+        for (subtrack, setting) in cases {
+            let mut by_automation = session();
+            let mut by_gutter = session();
+            let before = document(&by_automation);
+            let command = AutomationCommand::Configure { setting };
+            let actions = automation_alignment_settings_actions(&by_automation, &command)
+                .unwrap()
+                .unwrap();
+            apply(&mut by_automation, actions);
+            let current = by_gutter
+                .alignment_settings(EMPTY_ALIGNMENT_TRACK_ID)
+                .unwrap();
+            let toggled = toggled_alignment_lane(&current, subtrack).unwrap();
+            apply(
+                &mut by_gutter,
+                vec![Action::SetAlignmentSettings {
+                    updates: vec![(EMPTY_ALIGNMENT_TRACK_ID, toggled)],
+                    workspace_limit: None,
+                }],
+            );
+            assert_eq!(
+                document(&by_automation),
+                document(&by_gutter),
+                "{subtrack:?}"
+            );
+            assert_ne!(document(&by_automation), before, "{subtrack:?}");
+        }
+        assert!(
+            toggled_alignment_lane(
+                &session()
+                    .alignment_settings(EMPTY_ALIGNMENT_TRACK_ID)
+                    .unwrap(),
+                AlignmentSubtrack::Reads
+            )
+            .is_none(),
+            "the reads lane is an arrangement edit"
+        );
     }
 }

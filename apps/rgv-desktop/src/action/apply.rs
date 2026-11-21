@@ -87,6 +87,9 @@ impl Viewer {
     /// Applies an action and returns the undo entry it earned, without recording it.
     fn perform_action_now(&mut self, action: Action) -> Result<(ActionOutcome, Option<UndoEntry>)> {
         let mut coalesce = Session::track_intents_coalesce_key(&action);
+        // An action whose redo is not the action itself (a load is redone by reopening the
+        // tracks it added from their configuration).
+        let mut redo_as = None;
         let (outcome, inverse) = if Session::reduces(&action) {
             let (outcome, inverse, gesture) = self.perform_session_action(&action)?;
             coalesce = gesture;
@@ -133,12 +136,83 @@ impl Viewer {
                         },
                     )
                 }
+                Action::LoadTracks { loads } => {
+                    let (outcome, inverse, redo) = self.perform_track_loads(loads)?;
+                    redo_as = redo;
+                    (outcome, inverse)
+                }
                 Action::RemoveTracks { track_ids } => self.perform_track_removal(track_ids)?,
                 Action::RestoreTracks(restore) => self.perform_track_restore(restore)?,
+                Action::SetAlignmentSettings {
+                    updates,
+                    workspace_limit,
+                } => {
+                    let (outcome, inverse, gesture) =
+                        self.perform_alignment_settings(updates, *workspace_limit)?;
+                    coalesce = gesture;
+                    (outcome, inverse)
+                }
+                Action::SetTrackConfigs { tracks } => {
+                    let (outcome, inverse, gesture) = self.perform_track_configs(tracks)?;
+                    coalesce = gesture;
+                    (outcome, inverse)
+                }
+                Action::SetAlignmentTrackLabels { labels } => {
+                    let (outcome, inverse, gesture) =
+                        self.perform_alignment_track_labels(labels)?;
+                    coalesce = gesture;
+                    (outcome, inverse)
+                }
+                Action::MoveTrack { track_id, index } => {
+                    let (outcome, inverse, _) = self.perform_track_move(*track_id, *index);
+                    (outcome, inverse)
+                }
+                Action::SelectTrack {
+                    panel_id,
+                    target,
+                    extent,
+                } => {
+                    let changed = self.select_track_node_now(*panel_id, *target, *extent)?;
+                    (
+                        ActionOutcome {
+                            changed,
+                            panel_id: Some(*panel_id),
+                            ..ActionOutcome::default()
+                        },
+                        Vec::new(),
+                    )
+                }
+                Action::SetPreferences(preferences) => {
+                    (self.perform_preferences(*preferences), Vec::new())
+                }
+                Action::ClearSelection { panel_id } => {
+                    let panel =
+                        self.session.panels.get_mut(*panel_id).ok_or_else(|| {
+                            anyhow::anyhow!("panel {} was not found", panel_id.get())
+                        })?;
+                    panel.clear_selection();
+                    self.rebuild_genomic_display(*panel_id);
+                    self.mark_display_dirty("explicit display invalidation");
+                    (
+                        ActionOutcome {
+                            changed: true,
+                            panel_id: Some(*panel_id),
+                            ..ActionOutcome::default()
+                        },
+                        Vec::new(),
+                    )
+                }
+                Action::SetReferencePresentation(presentation) => {
+                    let (outcome, inverse, _) = self.perform_reference_presentation(presentation);
+                    (outcome, inverse)
+                }
                 _ => unreachable!("the session reduces every other action"),
             }
         };
-        let entry = Session::undo_entry(action, inverse, coalesce);
+        let mut entry = Session::undo_entry(action, inverse, coalesce);
+        if let (Some(entry), Some(redo)) = (entry.as_mut(), redo_as) {
+            entry.redo = vec![redo];
+        }
         Ok((outcome, entry))
     }
 

@@ -6,50 +6,27 @@ use crate::ui::gestures::{capture_stable_row_camera, vertical_density_camera_pad
 use crate::workspace::alignment_management::scene_authority::{
     CapturedAlignmentPanelSceneEpoch, read_panel_display_derivative_authority,
 };
-use crate::workspace::alignment_management::{
-    alignment_scene_viewport_for_layout_width,
-    uncovered_vertical_candidate_retains_committed_pixels,
-};
-use crate::workspace::alignment_navigation::AlignmentNavigationPhase;
-use crate::workspace::alignments::{
-    AlignmentTrackLifecycle, alignment_scene_derived_lane_captures, alignment_scene_read_clip,
-    alignment_scene_sashimi_group, alignment_scene_selected_position,
-};
+use crate::workspace::alignment_management::uncovered_vertical_candidate_retains_committed_pixels;
+use crate::workspace::alignments::AlignmentTrackLifecycle;
 use crate::workspace::panels::{
     ReadPanelScrollState, ReadRowCoordinateAuthority, read_row_cache_matches_committed_activity,
 };
 use crate::{
-    AlignmentCommittedLaneAuthority, AlignmentGpuFrameBundle, MAX_ALIGNMENT_ROW_HEIGHT, Viewer,
+    AlignmentCommittedLaneAuthority, AlignmentGpuFrameBundle, Viewer,
     alignment_gpu_bundle_is_current, ui,
 };
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use rgv_alignment_scene::{
-    AlignmentCamera, AlignmentPanelLaneCapture, AlignmentRowActivityProfile, AlignmentSceneCamera,
-    AlleleSummaryDetail,
+    AlignmentCamera, AlignmentPanelLaneCapture, AlignmentRowActivityProfile, AlleleSummaryDetail,
 };
-use rgv_core::{ContigId, DetailLevel, PanelId, TrackId};
+use rgv_core::{ContigId, PanelId, TrackId};
+use rgv_session::alignment::admission::AlignmentLaneAdmission;
+use rgv_session::lane_layout::PanelLaneLayout;
 use std::sync::Arc;
 
 impl Viewer {
     pub(crate) fn request_alignment_query(&mut self, panel_id: PanelId) {
-        for track_index in 0..self.session.alignment_tracks.len() {
-            self.queue_alignment_navigation_for_track(
-                track_index,
-                panel_id,
-                false,
-                "alignment refresh requested",
-            );
-        }
-        self.session
-            .panels
-            .panel_mut(panel_id)
-            .pending_queries
-            .alignment = self.session.alignment_tracks.iter().any(|track| {
-            track
-                .projection(panel_id)
-                .is_some_and(|projection| projection.navigation.is_queued())
-        });
-        self.dispatch_alignment_query(panel_id);
+        rgv_session::alignment::dispatch::request_alignment_query(self, panel_id);
     }
 
     pub(crate) fn request_alignment_scene_camera_update(
@@ -57,136 +34,45 @@ impl Viewer {
         panel_id: PanelId,
         track_id: TrackId,
     ) {
-        let Some(track_index) = self
-            .session
-            .alignment_tracks
-            .iter()
-            .position(|track| track.config.id == track_id)
-        else {
-            return;
-        };
-        if !matches!(
-            self.session.alignment_tracks[track_index].lifecycle,
-            AlignmentTrackLifecycle::Ready
-        ) {
-            return;
-        }
-        self.queue_alignment_navigation_for_track(
-            track_index,
-            panel_id,
-            false,
-            "alignment row camera changed",
+        rgv_session::alignment::dispatch::request_alignment_scene_camera_update(
+            self, panel_id, track_id,
         );
-        self.session
-            .panels
-            .panel_mut(panel_id)
-            .pending_queries
-            .alignment = true;
-        self.dispatch_alignment_query(panel_id);
     }
 
-    /// Resolves the complete live presentation demand for one track from the final pane layout.
-    /// A read camera exists only for actual read pixels; a derived-only track receives a genomic
-    /// preparation camera with no fabricated rows or clip.
+    /// The device-free lane layout of `panel_id` as last committed: its canvas column and both
+    /// panes. `None` when the panel has left the layout.
+    pub(crate) fn panel_lane_layout(&self, panel_id: PanelId) -> Option<PanelLaneLayout> {
+        let panel = self.session.panels.get(panel_id)?;
+        let canvas = self.panel_column_rect(panel_id)?;
+        Some(panel.pane_layout.to_panel_lanes(
+            panel_id,
+            canvas,
+            self.workspace_layout.track_gutter.width(),
+        ))
+    }
+
+    /// Resolves the complete live presentation demand for one track from the final lane layout;
+    /// see [`rgv_session::Session::alignment_scene_lane_capture_for_panel_track`].
     pub(super) fn alignment_scene_lane_capture_for_panel_track(
         &self,
+        layout: Option<&PanelLaneLayout>,
         panel_id: PanelId,
         track_id: TrackId,
         contig: ContigId,
         contig_length: u64,
         reference_backed_alleles: bool,
     ) -> Result<Option<AlignmentPanelLaneCapture>> {
-        let Some(panel) = self.session.panels.get(panel_id) else {
+        let Some(layout) = layout else {
             return Ok(None);
         };
-        if panel.viewport.detail_level() == DetailLevel::Overview {
-            return Ok(None);
-        }
-        let Some(panel_rect) = self.panel_column_rect(panel_id) else {
-            return Ok(None);
-        };
-        if panel_rect.width() <= 0.0 {
-            return Ok(None);
-        }
-        let Some(track) = self
-            .session
-            .alignment_tracks
-            .iter()
-            .find(|track| track.config.id == track_id)
-        else {
-            return Ok(None);
-        };
-        let filters = self.alignment_filters_for_track(track_id);
-        let sashimi_group = alignment_scene_sashimi_group(&filters);
-        let selected_pileup_position = alignment_scene_selected_position(
-            panel.selected_alignment_track,
+        self.session.alignment_scene_lane_capture_for_panel_track(
+            layout,
+            panel_id,
             track_id,
-            panel.selected_pileup_position,
-        );
-        let selected_modification_position = alignment_scene_selected_position(
-            panel.selected_alignment_track,
-            track_id,
-            panel.selected_modification_position,
-        );
-        let derived_lanes = alignment_scene_derived_lane_captures(
-            &panel.pane_layout.annotation,
-            track_id,
-            f64::from(panel_rect.left()),
-            f64::from(panel_rect.width()),
-            &filters,
+            contig,
+            contig_length,
             reference_backed_alleles,
-            sashimi_group,
-            selected_pileup_position,
-            selected_modification_position,
-        )?;
-        let viewport = panel
-            .viewport
-            .remapped_contig(contig, contig_length)
-            .context("could not remap the alignment scene camera")?;
-        let viewport =
-            alignment_scene_viewport_for_layout_width(viewport, f64::from(panel_rect.width()))
-                .context(
-                    "could not reconcile the alignment scene camera with the live panel width",
-                )?;
-        let read_camera = alignment_scene_read_clip(
-            &panel.pane_layout.reads,
-            track_id,
-            f64::from(panel_rect.left()),
-            f64::from(panel_rect.width()),
         )
-        .map(|clip| {
-            let density = self.alignment_density_for_panel_track(panel_id, track_id);
-            let row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
-            let read_height = (5.0 * density).clamp(1.5, (row_height - 1.0).max(1.5));
-            let row_scroll = panel
-                .read_panel_scroll_state(track_id)
-                .effective_scroll_points()
-                / row_height;
-            AlignmentCamera::from_viewport(
-                viewport,
-                f64::from(row_scroll),
-                f64::from(row_height),
-                f64::from(read_height),
-                clip,
-            )
-        })
-        .transpose()
-        .context("could not construct the alignment read camera")?;
-        if read_camera.is_none() && derived_lanes.is_empty() {
-            return Ok(None);
-        }
-        let preparation_camera = read_camera.map_or_else(
-            || AlignmentSceneCamera::without_visible_rows(viewport),
-            AlignmentSceneCamera::from,
-        );
-        AlignmentPanelLaneCapture::new(
-            track.config.id,
-            preparation_camera,
-            read_camera,
-            derived_lanes,
-        )
-        .map(Some)
-        .map_err(Into::into)
     }
 
     /// Reconciles scene cameras after a desktop layout pass. Pane resizing, density changes,
@@ -205,6 +91,7 @@ impl Viewer {
                 continue;
             };
             let contig_name = panel.contig_name.clone();
+            let lane_layout = self.panel_lane_layout(panel_id);
             let changed = self
                 .session
                 .alignment_tracks
@@ -225,6 +112,7 @@ impl Viewer {
                         });
                     let camera = self
                         .alignment_scene_lane_capture_for_panel_track(
+                            lane_layout.as_ref(),
                             panel_id,
                             track.config.id,
                             contig,
@@ -340,117 +228,26 @@ impl Viewer {
         &mut self,
         bundle: &AlignmentGpuFrameBundle,
     ) {
-        for authority in &bundle.lane_authorities {
-            if !authority.semantic_target_complete {
-                continue;
-            }
-            let Some(track) = self
-                .session
-                .alignment_tracks
-                .iter_mut()
-                .find(|track| track.config.id == authority.track_id)
-            else {
-                continue;
-            };
-            let projection = track.projection_mut(authority.panel_id);
-            if projection.navigation.request_token() != Some(authority.desired_request_token)
-                || projection.navigation.desired_camera() != Some(authority.source_camera)
-                || !matches!(
-                    projection.navigation.phase(),
-                    AlignmentNavigationPhase::CandidateReady
-                        | AlignmentNavigationPhase::WaitingForGpuPressure
-                )
-            {
-                continue;
-            }
-            projection.navigation.transition(
-                AlignmentNavigationPhase::Committed,
-                "semantic scene and native GPU derivative committed atomically",
-            );
-            projection.finish_checking();
-        }
-        self.synchronize_alignment_pending_mirrors();
-        self.resume_alignment_optional_work_for_settled_panels();
-    }
-
-    pub(crate) fn synchronize_alignment_pending_mirrors(&mut self) {
-        let panel_ids = self
-            .session
-            .panels
-            .iter()
-            .map(|panel| panel.id)
-            .collect::<Vec<_>>();
-        for panel_id in panel_ids {
-            let pending = self.session.alignment_tracks.iter().any(|track| {
-                matches!(track.lifecycle, AlignmentTrackLifecycle::Ready)
-                    && track.projection(panel_id).is_some_and(|projection| {
-                        !projection
-                            .navigation
-                            .is_current_settled(projection.clock.current().get())
-                    })
-            });
-            if let Some(panel) = self.session.panels.get_mut(panel_id) {
-                panel.pending_queries.alignment = pending;
-            }
-        }
+        self.session
+            .commit_alignment_lane_admissions(&alignment_lane_admissions(&bundle.lane_authorities));
     }
 
     pub(super) fn wait_alignment_navigation_transactions_for_gpu(
         &mut self,
         candidates: &[AlignmentCommittedLaneAuthority],
     ) {
-        for candidate in candidates {
-            if !candidate.semantic_target_complete {
-                continue;
-            }
-            let Some(track) = self
-                .session
-                .alignment_tracks
-                .iter_mut()
-                .find(|track| track.config.id == candidate.track_id)
-            else {
-                continue;
-            };
-            let projection = track.projection_mut(candidate.panel_id);
-            if projection.navigation.request_token() == Some(candidate.desired_request_token)
-                && projection.navigation.desired_camera() == Some(candidate.source_camera)
-                && projection.navigation.phase() == AlignmentNavigationPhase::CandidateReady
-            {
-                projection.navigation.transition(
-                    AlignmentNavigationPhase::WaitingForGpuPressure,
-                    "atomic GPU publication is waiting for an exact ledger blocker",
-                );
-            }
-        }
+        self.session
+            .wait_alignment_lane_admissions_for_gpu(&alignment_lane_admissions(candidates));
     }
 
     pub(super) fn resume_alignment_navigation_transactions_after_gpu_progress(
         &mut self,
         candidates: &[AlignmentCommittedLaneAuthority],
     ) {
-        for candidate in candidates {
-            if !candidate.semantic_target_complete {
-                continue;
-            }
-            let Some(track) = self
-                .session
-                .alignment_tracks
-                .iter_mut()
-                .find(|track| track.config.id == candidate.track_id)
-            else {
-                continue;
-            };
-            let projection = track.projection_mut(candidate.panel_id);
-            if projection.navigation.request_token() == Some(candidate.desired_request_token)
-                && projection.navigation.desired_camera() == Some(candidate.source_camera)
-                && projection.navigation.phase() == AlignmentNavigationPhase::WaitingForGpuPressure
-            {
-                projection.navigation.transition(
-                    AlignmentNavigationPhase::CandidateReady,
-                    "GPU blocker cleared; rebuilding the same atomic candidate",
-                );
-            }
-        }
+        self.session
+            .resume_alignment_lane_admissions_after_gpu_progress(&alignment_lane_admissions(
+                candidates,
+            ));
     }
 
     pub(super) fn fail_alignment_navigation_gpu_candidates(
@@ -458,50 +255,13 @@ impl Viewer {
         candidates: &[AlignmentCommittedLaneAuthority],
         message: &str,
     ) {
-        for candidate in candidates {
-            if !candidate.semantic_target_complete {
-                continue;
-            }
-            let Some(track) = self
-                .session
-                .alignment_tracks
-                .iter_mut()
-                .find(|track| track.config.id == candidate.track_id)
-            else {
-                continue;
-            };
-            let projection = track.projection_mut(candidate.panel_id);
-            if projection.navigation.request_token() == Some(candidate.desired_request_token)
-                && projection.navigation.desired_camera() == Some(candidate.source_camera)
-                && matches!(
-                    projection.navigation.phase(),
-                    AlignmentNavigationPhase::CandidateReady
-                        | AlignmentNavigationPhase::WaitingForGpuPressure
-                )
-            {
-                projection.settle_failed(message.to_owned());
-            }
-        }
-        self.synchronize_alignment_pending_mirrors();
-        self.resume_alignment_optional_work_for_settled_panels();
+        self.session
+            .fail_alignment_lane_admissions(&alignment_lane_admissions(candidates), message);
     }
 
     pub(super) fn settle_alignment_navigation_gpu_budget_limited(&mut self, message: &str) {
-        for track in &mut self.session.alignment_tracks {
-            for projection in track.projections.values_mut() {
-                if projection.navigation.phase() == AlignmentNavigationPhase::WaitingForGpuPressure
-                {
-                    projection.navigation.transition(
-                        AlignmentNavigationPhase::BudgetLimited,
-                        Arc::<str>::from(message),
-                    );
-                    projection.finish_checking();
-                    projection.unavailable = None;
-                }
-            }
-        }
-        self.synchronize_alignment_pending_mirrors();
-        self.resume_alignment_optional_work_for_settled_panels();
+        self.session
+            .settle_alignment_lane_admissions_budget_limited(message);
     }
 
     /// Ensures the scroll/display derivative catches up after the semantic/native epoch commits.
@@ -801,4 +561,20 @@ impl Viewer {
             self.window.request_redraw();
         }
     }
+}
+
+/// The session's view of committed-lane authorities: which request and camera each answers.
+fn alignment_lane_admissions(
+    authorities: &[AlignmentCommittedLaneAuthority],
+) -> Vec<AlignmentLaneAdmission> {
+    authorities
+        .iter()
+        .map(|authority| AlignmentLaneAdmission {
+            panel_id: authority.panel_id,
+            track_id: authority.track_id,
+            desired_request_token: authority.desired_request_token,
+            source_camera: authority.source_camera,
+            semantic_target_complete: authority.semantic_target_complete,
+        })
+        .collect()
 }

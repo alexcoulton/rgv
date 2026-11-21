@@ -1,0 +1,6 @@
+##fileformat=VCFv4.2
+##contig=<ID=chr1,length=248956422>
+##INFO=<ID=AF,Number=A,Type=Float,Description="Allele frequency">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+chr1	908001	SNAPSHOT_SNV	A	T	50	PASS	AF=0.5
+chr1	915001	SECOND_SNV	C	G	40	PASS	AF=0.25

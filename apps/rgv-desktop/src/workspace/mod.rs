@@ -10,6 +10,7 @@ pub(super) mod navigation;
 pub(super) mod navigation_controller;
 pub(super) mod navigation_transaction;
 pub(super) mod panels;
+mod presentation_host;
 pub(super) mod queries;
 pub(super) mod session_controller;
 pub(super) mod track_tiles;

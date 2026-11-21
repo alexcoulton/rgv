@@ -10,18 +10,31 @@
 //! redraw). That split is what lets the reducer and this vocabulary move into a session crate
 //! without the desktop shell.
 
+pub mod alignment_settings;
+#[cfg(test)]
+mod alignment_settings_tests;
 pub mod history;
+pub mod preferences;
 pub mod reduce;
 #[cfg(test)]
 mod tests;
+pub mod track_load;
+pub mod track_settings;
+#[cfg(test)]
+mod track_settings_tests;
 pub mod translate;
 
+pub use alignment_settings::AlignmentSettings;
+pub use preferences::Preferences;
 use rgv_automation::{AutomationHistoryNavigation, AutomationViewportOperation};
 use rgv_core::{
-    GenomicInterval, NavigationEntry, PanelId, RegionOfInterest, ReviewItem, SessionAlignmentTrack,
-    TrackChangeSet, TrackConfig, TrackId, TrackIntent, Viewport, WorkspacePresentation,
+    GenomicInterval, NavigationEntry, PanelId, PresentationNodeId, RegionOfInterest, ReviewItem,
+    SessionAlignmentTrack, TrackChangeSet, TrackConfig, TrackId, TrackIntent, Viewport,
+    WorkspacePresentation,
 };
 use std::collections::BTreeSet;
+pub use track_load::{TrackLoad, TrackLoadKind};
+pub use track_settings::{AlignmentTrackLabel, ReferencePresentation};
 
 /// How a viewport change is committed to history and to the data pipeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +139,9 @@ pub enum Action {
     RestorePanel(PanelRestore),
 
     // ----- Track management ------------------------------------------------------------------
+    /// Open sources as tracks (or, for a FASTA, as the reference), in order. The inverse
+    /// removes the tracks it added; redo reopens them from their configuration.
+    LoadTracks { loads: Vec<TrackLoad> },
     /// Reorder, show, hide, collapse, resize or group tracks.
     ApplyTrackIntents { intents: Vec<TrackIntent> },
     /// Put the whole track arrangement back (the inverse of `ApplyTrackIntents`).
@@ -144,6 +160,65 @@ pub enum Action {
         regions: Vec<RegionOfInterest>,
         review_items: Vec<ReviewItem>,
     },
+
+    // ----- Track display settings ------------------------------------------------------------
+    /// Give alignment tracks new display and query settings, each complete as the session
+    /// document saves it. The inverse is the settings they replaced. `workspace_limit` sets the
+    /// workspace-wide complete-read limit exactly (an undo putting it back); `None` widens it as
+    /// far as a requested track limit needs.
+    SetAlignmentSettings {
+        updates: Vec<(TrackId, AlignmentSettings)>,
+        workspace_limit: Option<usize>,
+    },
+    /// Give annotation and signal tracks new configurations (name, sample key and the display
+    /// settings of their kind), each complete. The inverse is the configurations they replaced.
+    SetTrackConfigs { tracks: Vec<TrackConfig> },
+    /// Rename alignment tracks and set their sample association.
+    SetAlignmentTrackLabels { labels: Vec<AlignmentTrackLabel> },
+    /// Move an annotation or signal track to a position in the track list.
+    MoveTrack { track_id: TrackId, index: usize },
+    /// Change how the reference sequence lane is drawn (strand, translation frames, code).
+    SetReferencePresentation(ReferencePresentation),
+
+    // ----- Selection -------------------------------------------------------------------------
+    // Selection is not an undo step: it is not saved with the document, every click replaces
+    // it, and recording it would bury each edit under selection noise (as navigation would).
+    /// Select a track row (or the reference row, or a group) in one panel's track list.
+    SelectTrack {
+        panel_id: PanelId,
+        target: PresentationNodeId,
+        extent: SelectionExtent,
+    },
+    /// Clear one panel's selection: track rows, reads, positions and records.
+    ClearSelection { panel_id: PanelId },
+
+    // ----- Preferences -----------------------------------------------------------------------
+    /// Replace the user's preferences (see [`preferences`] for why this is not an undo step).
+    SetPreferences(Preferences),
+}
+
+/// How a track-row click combines with the rows already selected in its pane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionExtent {
+    /// The row alone (a plain click).
+    Replace,
+    /// Add or remove the row (Cmd/Ctrl-click).
+    Toggle,
+    /// Every row from the anchor to this one (Shift-click).
+    Range,
+}
+
+impl SelectionExtent {
+    /// The extent the modifier keys held during a click ask for; Shift wins over Cmd/Ctrl.
+    pub const fn from_modifiers(shift: bool, toggle: bool) -> Self {
+        if shift {
+            Self::Range
+        } else if toggle {
+            Self::Toggle
+        } else {
+            Self::Replace
+        }
+    }
 }
 
 impl Action {
@@ -160,14 +235,23 @@ impl Action {
             | Self::NavigateToEntry { panel_id, .. }
             | Self::ClosePanel { panel_id }
             | Self::MovePanel { panel_id, .. }
-            | Self::ActivatePanel { panel_id } => Some(*panel_id),
+            | Self::ActivatePanel { panel_id }
+            | Self::SelectTrack { panel_id, .. }
+            | Self::ClearSelection { panel_id } => Some(*panel_id),
             Self::RestorePanel(restore) => Some(restore.panel_id),
             Self::AddPanel { .. }
             | Self::ApplyTrackIntents { .. }
             | Self::RestorePresentation { .. }
             | Self::RemoveTracks { .. }
             | Self::RestoreTracks(_)
-            | Self::SetWorkspaceLists { .. } => None,
+            | Self::SetWorkspaceLists { .. }
+            | Self::LoadTracks { .. }
+            | Self::SetAlignmentSettings { .. }
+            | Self::SetTrackConfigs { .. }
+            | Self::SetAlignmentTrackLabels { .. }
+            | Self::MoveTrack { .. }
+            | Self::SetReferencePresentation(_)
+            | Self::SetPreferences(_) => None,
         }
     }
 
@@ -188,9 +272,17 @@ impl Action {
             Self::ActivatePanel { .. } => "focus panel",
             Self::RestorePanel(_) => "reopen panel",
             Self::ApplyTrackIntents { .. } | Self::RestorePresentation { .. } => "track layout",
+            Self::LoadTracks { .. } => "load track",
             Self::RemoveTracks { .. } => "remove track",
             Self::RestoreTracks(_) => "restore track",
             Self::SetWorkspaceLists { .. } => "region or review edit",
+            Self::SetAlignmentSettings { .. } => "alignment settings",
+            Self::SetTrackConfigs { .. } => "track settings",
+            Self::SetAlignmentTrackLabels { .. } => "track name",
+            Self::MoveTrack { .. } => "track order",
+            Self::SetReferencePresentation(_) => "reference display",
+            Self::SelectTrack { .. } | Self::ClearSelection { .. } => "selection",
+            Self::SetPreferences(_) => "preferences",
         }
     }
 }
@@ -208,6 +300,8 @@ pub struct ActionOutcome {
     pub track_changes: Option<TrackChangeSet>,
     /// How many tracks a removal took out.
     pub removed_tracks: usize,
+    /// The tracks a load added, in load order.
+    pub loaded_tracks: Vec<TrackId>,
 }
 
 /// Work the host owes after the reducer changed the panel workspace. Effects carry no data the

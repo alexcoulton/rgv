@@ -211,3 +211,103 @@ impl WorkspacePaneLayout {
             .map(|item| &item.frame)
     }
 }
+
+// ----- Device-free lane layout ------------------------------------------------------------
+//
+// Settlement and scene-request dispatch read the session's plain lane layout, never the
+// widget toolkit's rectangles. These conversions are exact copies of the resolved geometry.
+
+fn layout_rect(rect: Rect) -> rgv_session::lane_layout::LayoutRect {
+    rgv_session::lane_layout::LayoutRect::from_min_max(
+        rect.min.x, rect.min.y, rect.max.x, rect.max.y,
+    )
+}
+
+impl AlignmentSubtrack {
+    pub const fn sublane_kind(self) -> rgv_session::lane_layout::SublaneKind {
+        use rgv_session::lane_layout::SublaneKind;
+        match self {
+            Self::Reference => SublaneKind::Reference,
+            Self::Coverage => SublaneKind::Coverage,
+            Self::Sashimi => SublaneKind::Sashimi,
+            Self::Modifications => SublaneKind::Modifications,
+            Self::Reads => SublaneKind::Reads,
+        }
+    }
+}
+
+impl TrackFrameKey {
+    pub const fn lane_owner(self) -> rgv_session::lane_layout::LaneOwner {
+        use rgv_session::lane_layout::LaneOwner;
+        match self {
+            Self::Reference => LaneOwner::Reference,
+            Self::Group { channel, id } => LaneOwner::Group { channel, id },
+            Self::Alignment(track_id) => LaneOwner::Alignment(track_id),
+            Self::Auxiliary(track_id) => LaneOwner::Auxiliary(track_id),
+        }
+    }
+}
+
+impl PaneItemLayout {
+    pub fn to_lane(&self) -> rgv_session::lane_layout::LaneLayout {
+        rgv_session::lane_layout::LaneLayout {
+            owner: self.frame.key.lane_owner(),
+            channel: self.frame.channel,
+            name: self.frame.name.clone(),
+            track_kind: self.frame.kind,
+            frame_top: self.frame.top,
+            frame_bottom: self.frame.bottom,
+            row_rect: layout_rect(self.row_rect),
+            header_rect: layout_rect(self.header_rect),
+            content_rect: self.content_rect.map(layout_rect),
+            clip_rect: layout_rect(self.clip_rect),
+            effective_content_visible: self.effective_content_visible,
+            sublanes: self
+                .frame
+                .subtracks
+                .iter()
+                .map(|subtrack| rgv_session::lane_layout::Sublane {
+                    kind: subtrack
+                        .alignment_subtrack
+                        .map(AlignmentSubtrack::sublane_kind),
+                    label: subtrack.label.clone(),
+                    top: subtrack.top,
+                    bottom: subtrack.bottom,
+                    collapsed: subtrack.collapsed,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl PaneLayoutSnapshot {
+    /// The device-free copy of this pane.
+    pub fn to_lanes(&self) -> rgv_session::lane_layout::PaneLanes {
+        rgv_session::lane_layout::PaneLanes {
+            channel: self.channel,
+            pane_rect: layout_rect(self.pane_rect),
+            content_bottom: self.content_bottom,
+            scroll_points: self.scroll_points,
+            stack_scroll_points: self.stack_scroll_points,
+            lanes: self.items.iter().map(PaneItemLayout::to_lane).collect(),
+        }
+    }
+}
+
+impl WorkspacePaneLayout {
+    /// The device-free lane layout of one panel whose canvas column is `canvas`.
+    pub fn to_panel_lanes(
+        &self,
+        panel_id: rgv_core::PanelId,
+        canvas: Rect,
+        gutter_width: f32,
+    ) -> rgv_session::lane_layout::PanelLaneLayout {
+        rgv_session::lane_layout::PanelLaneLayout {
+            panel_id,
+            canvas: layout_rect(canvas),
+            gutter_width,
+            annotation: self.annotation.to_lanes(),
+            reads: self.reads.to_lanes(),
+        }
+    }
+}

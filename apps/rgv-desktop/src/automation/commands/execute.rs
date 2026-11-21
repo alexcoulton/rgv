@@ -12,7 +12,6 @@ use rgv_automation::{
 };
 use rgv_core::{SessionDocument, SessionLocus, TrackKind, TrackSource};
 use rgv_layout::{AlignmentGroupMode, AlignmentSortMode};
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -179,9 +178,13 @@ impl Viewer {
             }
             AutomationCommand::ClearSelection => {
                 let previous = self.automation_selection_snapshot();
-                self.session.panels.active_mut().clear_selection();
+                // A thin translation: one selection action on the focused panel.
+                if let Err(error) =
+                    self.apply_command_translation(&AutomationCommand::ClearSelection)
+                {
+                    return automation_failure(AutomationErrorCode::InvalidState, error);
+                }
                 self.bump_workspace_revision();
-                self.rebuild_genomic_display(self.session.panels.active().id);
                 AutomationExecution::Complete {
                     message: "Cleared the active panel selection".to_owned(),
                     data: serde_json::json!({
@@ -374,22 +377,30 @@ impl Viewer {
                     );
                 }
                 let effective_kind = inferred_automation_track_kind(&source, kind);
-                let before = self
-                    .session
-                    .alignment_tracks
-                    .iter()
-                    .map(|track| track.config.id)
-                    .chain(self.session.tracks.tracks().iter().map(|track| track.id))
-                    .collect::<BTreeSet<_>>();
+                if matches!(source, TrackSource::Remote { .. })
+                    && !matches!(effective_kind, TrackKind::Alignment)
+                {
+                    return automation_failure(
+                        AutomationErrorCode::UnsupportedCommand,
+                        if effective_kind == TrackKind::Reference {
+                            "Remote standalone FASTA is not yet supported"
+                        } else {
+                            "Remote auxiliary tracks are not yet supported"
+                        },
+                    );
+                }
+                // A thin translation: the load is one undoable action, opened through the same
+                // source-open path as the window's Open menu.
+                let load =
+                    crate::action::translate::load_track_action(source, effective_kind, name);
+                let outcome = match self.apply_action(load) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return automation_failure(AutomationErrorCode::InvalidCommand, error);
+                    }
+                };
                 match effective_kind {
                     TrackKind::Reference => {
-                        if matches!(source, TrackSource::Remote { .. }) {
-                            return automation_failure(
-                                AutomationErrorCode::UnsupportedCommand,
-                                "Remote standalone FASTA is not yet supported",
-                            );
-                        }
-                        self.open_reference_source(&path);
                         if self.session.reference_engine.is_none() {
                             return automation_failure(
                                 AutomationErrorCode::InvalidState,
@@ -402,28 +413,12 @@ impl Viewer {
                         })
                     }
                     TrackKind::Alignment => {
-                        self.open_alignment_source(&path);
-                        let track_id = self
-                            .session
-                            .alignment_tracks
-                            .iter()
-                            .find(|track| !before.contains(&track.config.id))
-                            .map(|track| track.config.id);
-                        let Some(track_id) = track_id else {
+                        let Some(track_id) = outcome.loaded_tracks.first().copied() else {
                             return automation_failure(
                                 AutomationErrorCode::InvalidState,
                                 &self.session.data_status,
                             );
                         };
-                        if let Some(name) = name
-                            && let Some(track) = self
-                                .session
-                                .alignment_tracks
-                                .iter_mut()
-                                .find(|track| track.config.id == track_id)
-                        {
-                            track.config.name = name;
-                        }
                         self.bump_workspace_revision();
                         AutomationExecution::Wait(AutomationWait::AlignmentTrack {
                             command_index,
@@ -432,38 +427,12 @@ impl Viewer {
                         })
                     }
                     _ => {
-                        if matches!(source, TrackSource::Remote { .. }) {
-                            return automation_failure(
-                                AutomationErrorCode::UnsupportedCommand,
-                                "Remote auxiliary tracks are not yet supported",
-                            );
-                        }
-                        if let Err(error) = self.add_track_source(&path) {
-                            return automation_failure(AutomationErrorCode::InvalidCommand, error);
-                        }
-                        let track_id = self
-                            .session
-                            .tracks
-                            .tracks()
-                            .iter()
-                            .find(|track| !before.contains(&track.id))
-                            .map(|track| track.id);
-                        let Some(track_id) = track_id else {
+                        let Some(track_id) = outcome.loaded_tracks.first().copied() else {
                             return automation_failure(
                                 AutomationErrorCode::Internal,
                                 "the newly queued auxiliary track has no stable identity",
                             );
                         };
-                        if let Some(name) = name
-                            && let Some(track) = self
-                                .session
-                                .tracks
-                                .tracks_mut()
-                                .iter_mut()
-                                .find(|track| track.id == track_id)
-                        {
-                            track.name = name;
-                        }
                         self.automation_auxiliary_open_state
                             .insert(track_id, AutomationAuxiliaryOpenState::Pending);
                         self.bump_workspace_revision();

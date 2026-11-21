@@ -1,18 +1,16 @@
+use crate::action::SelectionExtent;
 use crate::inspection::rna::{
     SashimiExportBundle, SashimiExportTrack, junction_annotation_context,
 };
 use crate::ui::TrackFrameKey;
 use crate::workspace::alignments::{
-    AlignmentSettingsDraft, AlignmentTrackController, AlignmentTrackLifecycle,
-    commit_alignment_settings_draft, copy_compatible_alignment_appearance,
-    expanded_workspace_alignment_limit,
+    AlignmentTrackController, copy_compatible_alignment_appearance,
 };
 use crate::workspace::lists::apply_quantitative_bulk_action;
 use crate::workspace::panels::ViewPanelController;
 use crate::{
-    MAX_SASHIMI_EXPORT_TRACKS, QuantitativeBulkAction, SYNTHETIC_ALIGNMENT_TRACK_ID, UiPanel,
-    Viewer, auxiliary_query_track_ids, clear_removed_auxiliary_panel_state,
-    clear_removed_quantitative_dependencies, ui,
+    MAX_SASHIMI_EXPORT_TRACKS, QuantitativeBulkAction, UiPanel, Viewer, auxiliary_query_track_ids,
+    clear_removed_auxiliary_panel_state, clear_removed_quantitative_dependencies, ui,
 };
 use anyhow::Result;
 use rgv_core::{
@@ -388,10 +386,7 @@ impl Viewer {
     }
 
     pub(crate) fn primary_alignment_track_id(&self) -> TrackId {
-        self.session
-            .alignment_tracks
-            .first()
-            .map_or(SYNTHETIC_ALIGNMENT_TRACK_ID, |track| track.config.id)
+        self.session.primary_alignment_track_id()
     }
 
     pub(crate) fn alignment_dictionary_for_track(
@@ -551,16 +546,7 @@ impl Viewer {
     }
 
     pub(crate) fn alignment_filters_for_track(&self, id: TrackId) -> SessionFilters {
-        if id == self.primary_alignment_track_id() {
-            return self.live_session_filters();
-        }
-        self.session
-            .alignment_tracks
-            .iter()
-            .find(|track| track.config.id == id)
-            .map_or_else(SessionFilters::default, |track| {
-                track.config.filters.clone()
-            })
+        self.session.alignment_filters_for_track(id)
     }
 
     fn sashimi_summary_for_track(
@@ -633,9 +619,13 @@ impl Viewer {
         }
     }
 
+    /// A click on a track row of the focused panel: one selection action, combined with the
+    /// rows already selected as the held modifier keys ask.
     pub(crate) fn select_track_key(&mut self, key: TrackFrameKey, pane: ui::TrackPane) {
-        let shift_range = self.modifiers.shift_key();
-        let toggle = self.modifiers.control_key() || self.modifiers.super_key();
+        let extent = SelectionExtent::from_modifiers(
+            self.modifiers.shift_key(),
+            self.modifiers.control_key() || self.modifiers.super_key(),
+        );
         let target = match key {
             TrackFrameKey::Reference if pane == ui::TrackPane::Annotation => {
                 PresentationNodeId::Reference
@@ -658,14 +648,38 @@ impl Viewer {
             | TrackFrameKey::Auxiliary(_)
             | TrackFrameKey::Group { .. } => return,
         };
+        let panel_id = self.session.panels.active().id;
+        if let Err(error) = self.apply_action(crate::action::Action::SelectTrack {
+            panel_id,
+            target,
+            extent,
+        }) {
+            self.report_error(error.to_string());
+        }
+    }
+
+    /// The implementation behind `Action::SelectTrack`; only the action path calls it. Returns
+    /// whether the row could be selected.
+    pub(crate) fn select_track_node_now(
+        &mut self,
+        panel_id: PanelId,
+        target: PresentationNodeId,
+        extent: SelectionExtent,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            self.session.panels.get(panel_id).is_some(),
+            "panel {} was not found",
+            panel_id.get()
+        );
+        let pane = target.channel();
         let mut order = self.session.track_presentation.pane_interactive_nodes(pane);
         if pane == ui::TrackPane::Annotation && self.session.reference_engine.is_some() {
             order.insert(0, PresentationNodeId::Reference);
         }
         if !order.contains(&target) {
-            return;
+            return Ok(false);
         }
-        let panel = self.session.panels.active();
+        let panel = self.session.panels.panel(panel_id);
         let selected = panel
             .selected_presentation_nodes
             .iter()
@@ -675,63 +689,51 @@ impl Viewer {
         let anchor = panel
             .presentation_selection_anchor
             .filter(|node| node.channel() == pane);
-        let (next, next_anchor) =
-            updated_track_pane_selection(&order, &selected, anchor, target, shift_range, toggle);
+        let (next, next_anchor) = updated_track_pane_selection(
+            &order,
+            &selected,
+            anchor,
+            target,
+            extent == SelectionExtent::Range,
+            extent == SelectionExtent::Toggle,
+        );
         let alignment_ids = self
             .session
             .alignment_tracks
             .iter()
             .map(|track| track.config.id)
             .collect::<BTreeSet<_>>();
-        let panel = self.session.panels.active_mut();
+        let panel = self.session.panels.panel_mut(panel_id);
         panel.selected_presentation_nodes = next;
         panel.presentation_selection_anchor = next_anchor;
         synchronize_panel_track_selection(panel, &alignment_ids);
         self.mark_display_dirty("explicit display invalidation");
+        Ok(true)
     }
 
+    /// Copies the appearance of one alignment track to the selected ones, as one undoable
+    /// alignment settings action.
     pub(crate) fn apply_bulk_alignment_appearance(
         &mut self,
         source_id: TrackId,
         selected_ids: &[TrackId],
     ) -> Result<()> {
-        let Some(source) = self
+        let Some(source) = self.session.alignment_settings(source_id) else {
+            return Ok(());
+        };
+        let updates = self
             .session
             .alignment_tracks
             .iter()
-            .find(|track| track.config.id == source_id)
-            .map(|track| track.config.filters.clone())
-        else {
-            return Ok(());
-        };
-        let primary_id = self.primary_alignment_track_id();
-        let mut query_requested = false;
-        for track in self
-            .session
-            .alignment_tracks
-            .iter_mut()
-            .filter(|track| selected_ids.contains(&track.config.id))
-        {
-            let collect_modifications_changed = track.config.filters.show_modification_frequency
-                != source.show_modification_frequency;
-            copy_compatible_alignment_appearance(&mut track.config.filters, &source);
-            if collect_modifications_changed
-                && !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_))
-            {
-                for projection in track.projections.values_mut() {
-                    projection.advance_scene_generation();
-                }
-                query_requested = true;
-            }
-        }
-        if selected_ids.contains(&primary_id) {
-            self.activate_first_alignment_track()?;
-        }
-        if query_requested {
-            self.request_all_alignment_queries();
-        }
-        self.rebuild_genomic_display(self.session.panels.active().id);
-        self.mark_display_dirty("explicit display invalidation");
+            .map(|track| track.config.id)
+            .filter(|id| selected_ids.contains(id))
+            .filter_map(|id| {
+                let mut settings = self.session.alignment_settings(id)?;
+                copy_compatible_alignment_appearance(&mut settings.filters, &source.filters);
+                Some((id, settings))
+            })
+            .collect::<Vec<_>>();
+        self.set_alignment_settings(updates)?;
         Ok(())
     }
 
@@ -812,35 +814,8 @@ impl Viewer {
         {
             self.report_error(error.to_string());
         }
-        let mut changed = false;
-        for track in self
-            .session
-            .alignment_tracks
-            .iter_mut()
-            .filter(|track| selected.contains(&track.config.id))
-        {
-            if rename_to_sample
-                && let Some(sample_key) = &track.config.sample_key
-                && track.config.name != *sample_key
-            {
-                track.config.name.clone_from(sample_key);
-                changed = true;
-            }
-        }
-        for track in self
-            .session
-            .tracks
-            .tracks_mut()
-            .iter_mut()
-            .filter(|track| selected.contains(&track.id))
-        {
-            if rename_to_sample
-                && let Some(sample_key) = &track.sample_key
-                && track.name != *sample_key
-            {
-                track.name.clone_from(sample_key);
-                changed = true;
-            }
+        if rename_to_sample {
+            self.rename_tracks_to_samples(selected);
         }
         debug_assert_eq!(
             previous_auxiliary_query_membership,
@@ -849,9 +824,63 @@ impl Viewer {
                 .collect::<HashSet<_>>(),
             "presentation changes must not alter auxiliary query membership"
         );
-        if changed {
-            self.rebuild_all_panel_displays();
-            self.mark_display_dirty("explicit display invalidation");
+    }
+
+    /// "Rename to sample": alignment tracks are renamed by one label action, the others by one
+    /// settings action.
+    fn rename_tracks_to_samples(&mut self, selected: &BTreeSet<TrackId>) {
+        let labels = self
+            .session
+            .alignment_tracks
+            .iter()
+            .filter(|track| selected.contains(&track.config.id))
+            .filter_map(|track| {
+                let sample_key = track.config.sample_key.as_ref()?;
+                (track.config.name != *sample_key).then(|| {
+                    rgv_session::action::AlignmentTrackLabel {
+                        track_id: track.config.id,
+                        name: sample_key.clone(),
+                        sample_key: Some(sample_key.clone()),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        if !labels.is_empty()
+            && let Err(error) =
+                self.apply_action(crate::action::Action::SetAlignmentTrackLabels { labels })
+        {
+            self.report_error(error.to_string());
+        }
+        let mut tracks = self.session.tracks.tracks().to_vec();
+        for track in tracks
+            .iter_mut()
+            .filter(|track| selected.contains(&track.id))
+        {
+            if let Some(sample_key) = &track.sample_key {
+                track.name.clone_from(sample_key);
+            }
+        }
+        self.set_changed_track_configs(tracks);
+    }
+
+    /// Commits the annotation and signal track configurations in `edited` that differ from the
+    /// current ones, as one undoable track settings action.
+    pub(crate) fn set_changed_track_configs(&mut self, edited: Vec<TrackConfig>) {
+        let tracks = self.session.tracks.tracks();
+        let changed = edited
+            .into_iter()
+            .filter(|config| {
+                tracks
+                    .iter()
+                    .find(|track| track.id == config.id)
+                    .is_some_and(|track| track != config)
+            })
+            .collect::<Vec<_>>();
+        if !changed.is_empty()
+            && let Err(error) =
+                self.apply_action(crate::action::Action::SetTrackConfigs { tracks: changed })
+        {
+            self.report_error(error.to_string());
         }
     }
 
@@ -863,29 +892,21 @@ impl Viewer {
             .session
             .alignment_tracks
             .iter()
-            .find(|track| selected.contains(&track.config.id))
-            .map(|track| track.config.clone())
+            .map(|track| track.config.id)
+            .find(|id| selected.contains(id))
+            .and_then(|id| Some((id, self.session.alignment_settings(id)?)))
         else {
             return Ok(());
         };
-        for track in self
+        let updates = self
             .session
             .alignment_tracks
-            .iter_mut()
-            .filter(|track| selected.contains(&track.config.id) && track.config.id != source.id)
-        {
-            track.config.filters.clone_from(&source.filters);
-            track.config.maximum_alignments = source.maximum_alignments;
-            for projection in track.projections.values_mut() {
-                projection.advance_scene_generation();
-            }
-        }
-        if selected.contains(&self.primary_alignment_track_id()) {
-            self.activate_first_alignment_track()?;
-        }
-        self.request_all_panel_queries();
-        self.rebuild_all_panel_displays();
-        self.mark_display_dirty("explicit display invalidation");
+            .iter()
+            .map(|track| track.config.id)
+            .filter(|id| selected.contains(id) && *id != source.0)
+            .map(|id| (id, source.1.clone()))
+            .collect::<Vec<_>>();
+        self.set_alignment_settings(updates)?;
         Ok(())
     }
 
@@ -894,11 +915,9 @@ impl Viewer {
         selected: &BTreeSet<TrackId>,
         action: QuantitativeBulkAction,
     ) {
-        let changed =
-            apply_quantitative_bulk_action(self.session.tracks.tracks_mut(), selected, action);
-        if changed {
-            self.rebuild_all_panel_displays();
-            self.mark_display_dirty("explicit display invalidation");
+        let mut tracks = self.session.tracks.tracks().to_vec();
+        if apply_quantitative_bulk_action(&mut tracks, selected, action) {
+            self.set_changed_track_configs(tracks);
         }
     }
 
@@ -1034,47 +1053,6 @@ impl Viewer {
             if let Some(projection) = track.projection(panel_id) {
                 projection.advance_scene_generation();
             }
-        }
-    }
-
-    pub(crate) fn apply_secondary_alignment_settings(
-        &mut self,
-        id: TrackId,
-        mut update: AlignmentSettingsDraft,
-    ) {
-        let (workspace_limit, requested_limit) = expanded_workspace_alignment_limit(
-            self.session.workspace_alignment_limit,
-            update.maximum_alignments,
-        );
-        self.session.workspace_alignment_limit = workspace_limit;
-        update.maximum_alignments = requested_limit;
-        let Some(track) = self
-            .session
-            .alignment_tracks
-            .iter_mut()
-            .find(|track| track.config.id == id)
-        else {
-            return;
-        };
-        let outcome = commit_alignment_settings_draft(
-            &mut track.config,
-            &mut track.filter_editor,
-            &mut track.active_filters,
-            update,
-            workspace_limit,
-        );
-        if outcome.query_changed && !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_)) {
-            for projection in track.projections.values_mut() {
-                projection.advance_scene_generation();
-            }
-            self.session.panels.active_mut().pending_queries.alignment = true;
-        }
-        if outcome.configuration_changed {
-            self.rebuild_genomic_display(self.session.panels.active().id);
-            self.mark_display_dirty("explicit display invalidation");
-        }
-        if outcome.query_changed {
-            self.request_all_alignment_queries();
         }
     }
 }

@@ -1,4 +1,5 @@
 use crate::Viewer;
+use crate::action::{TrackLoad, TrackLoadKind};
 use crate::app::tasks::SessionLoadKind;
 use crate::automation::AutomationAuxiliaryOpenState;
 use crate::display::alignment::persisted_style_tag;
@@ -10,12 +11,12 @@ use crate::sources::{
     track_source,
 };
 use crate::workspace::alignments::filter_state_from_session;
-use crate::workspace::navigation::{ImportedLocusRequest, RequestedLocus, resolve_requested_locus};
+use crate::workspace::navigation::ImportedLocusRequest;
 use crate::workspace::panels::PanelWorkspace;
 use anyhow::Result;
 use rgv_core::{
-    ReferenceDictionary, SessionAlignmentTrack, SessionDocument, SessionFilters, TrackConfig,
-    TrackFormat, TrackId, TrackKind, TrackSource, WorkspacePresentation,
+    SessionAlignmentTrack, SessionDocument, SessionFilters, TrackConfig, TrackFormat, TrackId,
+    TrackKind, TrackSource, WorkspacePresentation,
 };
 use rgv_engine::TrackSpecKind;
 use rgv_layout::DisplayList;
@@ -47,6 +48,28 @@ fn prepare_session_geometry(
     ))
 }
 
+/// A dropped file that is a source, as the load that opens it: an alignment track, the
+/// reference, or an annotation or signal track. `None` for sessions and genome descriptions.
+pub(crate) fn dropped_track_load(path: &Path, kind: DroppedFileKind) -> Option<TrackLoad> {
+    let kind = match kind {
+        DroppedFileKind::Alignment => TrackLoadKind::Alignment {
+            remote_index_url: None,
+        },
+        DroppedFileKind::Reference => TrackLoadKind::Reference {
+            remote_index_url: None,
+        },
+        DroppedFileKind::Track => TrackLoadKind::Annotation,
+        DroppedFileKind::GenomeConfiguration
+        | DroppedFileKind::Json
+        | DroppedFileKind::IgvSession => return None,
+    };
+    Some(TrackLoad {
+        source: track_source(path),
+        kind,
+        name: None,
+    })
+}
+
 impl Viewer {
     /// Replaces an imported IGV session's placeholder locus (see
     /// [`ImportedLocusRequest`]); `None` for every other project.
@@ -61,24 +84,6 @@ impl Viewer {
         self.session.imported_locus = request;
         self.session.imported_feature_search = None;
         Ok(())
-    }
-
-    /// Finishes resolving a panel's requested locus against `dictionary`,
-    /// queuing a feature search when it was an imported gene name.
-    pub(crate) fn resolve_panel_requested_locus(
-        &self,
-        dictionary: &ReferenceDictionary,
-        requested: Option<&str>,
-    ) -> Result<RequestedLocus> {
-        resolve_requested_locus(
-            dictionary,
-            &self.session.contig_aliases,
-            requested,
-            self.session
-                .imported_locus
-                .as_ref()
-                .and_then(ImportedLocusRequest::feature_name),
-        )
     }
 
     /// Called once panels have been placed on a newly opened dictionary:
@@ -138,9 +143,16 @@ impl Viewer {
     }
 
     pub(crate) fn handle_dropped_file(&mut self, path: &Path) {
-        match classify_dropped_file(path) {
-            DroppedFileKind::Alignment => self.open_alignment_source(path),
-            DroppedFileKind::Reference => self.open_reference_source(path),
+        let kind = classify_dropped_file(path);
+        match kind {
+            // Sources open through the action path, so a drop is undoable like a menu open.
+            DroppedFileKind::Alignment | DroppedFileKind::Reference | DroppedFileKind::Track => {
+                if let Some(load) = dropped_track_load(path, kind)
+                    && let Err(error) = self.load_tracks(vec![load])
+                {
+                    self.report_error(error.to_string());
+                }
+            }
             DroppedFileKind::GenomeConfiguration => {
                 if let Err(error) = self.open_genome_configuration(path) {
                     self.report_error(error.to_string());
@@ -167,11 +179,6 @@ impl Viewer {
             }
             DroppedFileKind::IgvSession => {
                 self.request_session_load(path.to_path_buf(), SessionLoadKind::IgvImport);
-            }
-            DroppedFileKind::Track => {
-                if let Err(error) = self.add_track_source(path) {
-                    self.report_error(error.to_string());
-                }
             }
         }
     }
@@ -433,16 +440,7 @@ impl Viewer {
     }
 
     pub(crate) fn live_session_filters(&self) -> SessionFilters {
-        let mut filters = self.primary_alignment_filters().clone();
-        filters.minimum_mapping_quality = self
-            .primary_active_filters()
-            .alignment
-            .minimum_mapping_quality;
-        filters.include_secondary = self.primary_active_filters().include_secondary;
-        filters.include_supplementary = self.primary_active_filters().include_supplementary;
-        // The editor may contain an unapplied or invalid draft. The canonical
-        // configuration already contains the last successfully applied clauses.
-        filters
+        self.session.live_session_filters()
     }
 
     pub(crate) fn session_document(&self) -> SessionDocument {

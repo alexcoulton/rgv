@@ -95,3 +95,26 @@ fn track_arrangement_settings_and_gutter_requests_leave_the_same_document() {
         assert_ne!(presentation_document(&by_automation), before, "{setting:?}");
     }
 }
+
+#[test]
+fn load_track_commands_and_window_opens_are_the_same_load() {
+    use crate::sources::{classify_dropped_file, inferred_automation_track_kind};
+    use crate::workspace::session_controller::dropped_track_load;
+    use rgv_session::action::translate::load_track_action;
+    use std::path::Path;
+
+    for path in ["/data/tumour.bam", "/data/peaks.bed.gz", "/data/genome.fa"] {
+        let source = TrackSource::Local {
+            path: path.to_owned(),
+        };
+        // `load_track` without a kind, as the protocol resolves it.
+        let kind = inferred_automation_track_kind(&source, None);
+        let by_automation = load_track_action(source, kind, None);
+        // The same file dropped on the window or picked in its Open dialog.
+        let path = Path::new(path);
+        let by_window = Action::LoadTracks {
+            loads: vec![dropped_track_load(path, classify_dropped_file(path)).unwrap()],
+        };
+        assert_eq!(by_automation, by_window, "{}", path.display());
+    }
+}

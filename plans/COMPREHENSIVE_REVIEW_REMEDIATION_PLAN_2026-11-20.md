@@ -215,7 +215,8 @@ Run after Wave 1 is green. Each item is one reviewable change.
 
 ## Wave 3 — architecture
 
-Status at 2026-11-22: the coverage pyramid is wired into the desktop and on by default. The
+Status at 2026-11-23: wave 3 is substantially complete; remaining items are listed per entry.
+The coverage pyramid is wired into the desktop and on by default. The
 track tile pipeline is wired only as an experimental, default-off setting covering plain
 annotation tracks. Nothing in this wave has been checked in the running application.
 
@@ -225,12 +226,14 @@ annotation tracks. Nothing in this wave has been checked in the running applicat
         and absent from non-GPU exports
 - [~] ARCH-2 / ARCH-7 headless `rgv-session` crate (workspace state, `Action` reducer, engines,
       scene publication); desktop, CLI snapshot, MCP and automation drive it
-      — `rgv-session` owns document, panels, tracks and track load, track-event routing,
-        reference engine and query dispatch, alignment track controllers and settlement
-        decisions, settings, notifications and undo (50 fields; `Viewer` 143 → 136).
-        Remaining: `dispatch_alignment_query`, `poll_alignment_events` and
-        `poll_reference_events` interleave GPU work with settlement and stay in the desktop;
-        `PanelPresentation`, the remaining `Action` domains and `rgv-snapshot` are not started
+      — `rgv-session` owns session state, engines, track load, reference and alignment
+        dispatch, event polling and settlement behind a `PresentationHost` the desktop
+        implements; `rgv-snapshot` renders PNG/SVG with no window or GPU (PROD-15, part).
+        `Action` covers navigation, panels, arrangement, lists, alignment and track display
+        settings, track load (undoable), selection and preferences. Remaining: desktop
+        renderers do not yet read `PanelPresentation`; list imports and session
+        open/save/new are not on the `Action` path; the alignment context menu still writes
+        state directly; snapshots lack quantitative tracks and pyramid coverage
 - [~] ARCH-4 explicit `(PanelId, TrackId)` throughout
       — all 37 activate-swaps removed; ~55 functions take a panel; `inspection/selection.rs`
         and wheel/junction hover still use the focused panel

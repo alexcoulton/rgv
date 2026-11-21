@@ -1094,6 +1094,39 @@ and writes a bounded structured report with stable status and error-code values.
 closes the application only after the report has been atomically replaced and flushed. Closing the
 window early also attempts to preserve a report that identifies the interrupted command.
 
+### Headless snapshots
+
+`rgv-snapshot` renders a view to PNG or SVG with no window and no GPU device, so it runs on a
+server or in CI. It opens the sources in the same session code the desktop uses, waits until every
+panel has settled (the alignment scene for the exact view committed, reference bases installed,
+every annotation track answered), and draws what settled:
+
+```sh
+cargo run --release -p rgv-snapshot -- \
+  --track benchmark-data/mixed.bam \
+  --track features.bed --track variants.vcf \
+  --locus chr1:900001-920000 \
+  --width 1200 --height 800 --out view.png
+
+cargo run --release -p rgv-snapshot -- --session project.json --out view.svg
+```
+
+- `--session` opens an RGV session file (its reference, tracks and locus; relative paths resolve
+  against the file's directory). `--reference`, `--track` (repeatable; BAM/CRAM or any annotation
+  format RGV opens) and `--locus` add to or override it.
+- `--width`/`--height` set the canvas in logical points; `--scale` sets PNG pixels per point.
+- `--format png|svg` is inferred from the `--out` extension when omitted.
+- `--timeout` (seconds, default 60) bounds the wait. A view that has not settled by then is not
+  written: the command fails and names what each panel was still waiting for.
+
+The image has a locus ruler, track names in a left gutter, each alignment track's coverage and
+reads (drawn by the same CPU projection as figure export), and feature and variant lanes with
+their names. Limits of this first version: quantitative, interaction, copy-number and other
+annotation kinds show only their names; the coverage pyramid is not used, so at overview zoom (where the
+desktop draws the pyramid) the alignment lanes are empty; split views use one panel; PNG is always rasterised
+on the CPU. A view whose reads exceed the alignment cache budget settles as unavailable and is
+drawn without reads, as on the desktop.
+
 ### Opt-in local control
 
 RGV has no command listener by default. To control an already-running desktop window, explicitly

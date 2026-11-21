@@ -4,12 +4,12 @@
 
 pub(crate) use rgv_session::alignment::track::*;
 
-use crate::{MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY, SYNTHETIC_ALIGNMENT_TRACK_ID, Viewer, ui};
+#[cfg(test)]
+use crate::ui;
+use crate::{MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY, SYNTHETIC_ALIGNMENT_TRACK_ID, Viewer};
+#[cfg(test)]
 use anyhow::Result;
-use rgv_alignment_scene::{
-    AlignmentCoherenceGroupId, AlignmentDerivedLaneCapture, AlignmentDerivedLaneOptions,
-    AlignmentPanelSceneError, CpuClipRect, ReferenceRevision,
-};
+use rgv_alignment_scene::ReferenceRevision;
 #[cfg(test)]
 use rgv_core::{DetailLevel, MAXIMUM_BASE_MARK_BASES_PER_PIXEL};
 use rgv_core::{PanelId, ReferenceDictionary, SessionFilters, TrackId, TrackSource};
@@ -18,9 +18,9 @@ use rgv_hts::ModificationCode;
 use rgv_layout::AlignmentColorMode;
 use rgv_layout::MAX_HIDDEN_MODIFICATION_CODES;
 
-/// Resolves scene-owned derived lanes from the already-final pane layout. The lane's stable
-/// `AlignmentSubtrack` identity—not its user-facing label—selects semantics, and the returned clip
-/// is intersected with the final scrolled item clip used by gutter hit testing.
+/// Resolves scene-owned derived lanes from the already-final pane layout; see
+/// [`rgv_session::alignment::lanes::alignment_scene_derived_lane_captures`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn alignment_scene_derived_lane_captures(
     layout: &ui::PaneLayoutSnapshot,
@@ -29,98 +29,24 @@ pub(crate) fn alignment_scene_derived_lane_captures(
     horizontal_width: f64,
     filters: &SessionFilters,
     reference_backed_alleles: bool,
-    sashimi_group: Option<AlignmentCoherenceGroupId>,
+    sashimi_group: Option<rgv_alignment_scene::AlignmentCoherenceGroupId>,
     selected_pileup_position: Option<u64>,
     selected_modification_position: Option<u64>,
-) -> Result<Vec<AlignmentDerivedLaneCapture>, AlignmentPanelSceneError> {
-    let Some(item) = layout.items.iter().find(|item| {
-        item.frame.key == ui::TrackFrameKey::Alignment(track_id)
-            && item.frame.channel == ui::TrackPane::Annotation
-    }) else {
-        return Ok(Vec::new());
-    };
-    if !item.effective_content_visible || item.clip_rect.height() <= 0.0 {
-        return Ok(Vec::new());
-    }
-    let mut captures = Vec::new();
-    for subtrack in &item.frame.subtracks {
-        if subtrack.collapsed {
-            continue;
-        }
-        let Some(kind) = subtrack.alignment_subtrack else {
-            continue;
-        };
-        let top = (subtrack.top - layout.scroll_points).max(item.clip_rect.top());
-        let bottom = (subtrack.bottom - layout.scroll_points).min(item.clip_rect.bottom());
-        if bottom <= top {
-            continue;
-        }
-        let options = match kind {
-            ui::AlignmentSubtrack::Coverage if filters.show_coverage => {
-                AlignmentDerivedLaneOptions::Coverage(alignment_scene_coverage_lane_options(
-                    filters,
-                    reference_backed_alleles,
-                    selected_pileup_position,
-                ))
-            }
-            ui::AlignmentSubtrack::Sashimi if filters.show_junctions => {
-                let Some(options) = alignment_scene_sashimi_lane_options(filters, sashimi_group)
-                else {
-                    // A Shared lane cannot truthfully enter an epoch without its explicit group.
-                    continue;
-                };
-                AlignmentDerivedLaneOptions::Sashimi(options)
-            }
-            ui::AlignmentSubtrack::Modifications if filters.show_modification_frequency => {
-                AlignmentDerivedLaneOptions::Modifications(
-                    alignment_scene_modification_lane_options(
-                        filters,
-                        selected_modification_position,
-                    ),
-                )
-            }
-            ui::AlignmentSubtrack::Reference
-            | ui::AlignmentSubtrack::Reads
-            | ui::AlignmentSubtrack::Coverage
-            | ui::AlignmentSubtrack::Sashimi
-            | ui::AlignmentSubtrack::Modifications => continue,
-        };
-        captures.push(AlignmentDerivedLaneCapture::new(
-            CpuClipRect {
-                x: horizontal_x,
-                y: f64::from(top),
-                width: horizontal_width,
-                height: f64::from(bottom - top),
-            },
-            options,
-        )?);
-    }
-    Ok(captures)
-}
-
-/// Actual read-pixel clip from the canonical Reads pane. A hidden lane returns `None`; callers
-/// must not manufacture a read render camera merely to keep summary acquisition alive.
-pub(crate) fn alignment_scene_read_clip(
-    layout: &ui::PaneLayoutSnapshot,
-    track_id: TrackId,
-    horizontal_x: f64,
-    horizontal_width: f64,
-) -> Option<CpuClipRect> {
-    let item = layout.items.iter().find(|item| {
-        item.frame.key == ui::TrackFrameKey::Alignment(track_id)
-            && item.frame.channel == ui::TrackPane::Reads
-    })?;
-    let reads_visible = item.effective_content_visible
-        && item.frame.subtracks.iter().any(|subtrack| {
-            subtrack.alignment_subtrack == Some(ui::AlignmentSubtrack::Reads) && !subtrack.collapsed
-        });
-    let content = reads_visible.then_some(item.content_rect).flatten()?;
-    (content.height() > 0.0).then_some(CpuClipRect {
-        x: horizontal_x,
-        y: f64::from(content.top()),
-        width: horizontal_width,
-        height: f64::from(content.height()),
-    })
+) -> Result<
+    Vec<rgv_alignment_scene::AlignmentDerivedLaneCapture>,
+    rgv_alignment_scene::AlignmentPanelSceneError,
+> {
+    rgv_session::alignment::lanes::alignment_scene_derived_lane_captures(
+        &layout.to_lanes(),
+        track_id,
+        horizontal_x,
+        horizontal_width,
+        filters,
+        reference_backed_alleles,
+        sashimi_group,
+        selected_pileup_position,
+        selected_modification_position,
+    )
 }
 
 impl Viewer {
@@ -132,25 +58,8 @@ impl Viewer {
             .compatible_alignment_reference_revision(alignment)
     }
 
-    pub(crate) fn alignment_reference_incompatibility(
-        &self,
-        alignment: &ReferenceDictionary,
-    ) -> Option<String> {
-        let reference = self.session.reference_dictionary.as_ref()?;
-        match alignment_reference_compatibility(alignment, reference, &self.session.contig_aliases)
-        {
-            AlignmentReferenceCompatibility::Compatible => None,
-            AlignmentReferenceCompatibility::Incompatible(reason) => Some(reason),
-        }
-    }
-
     pub(crate) fn primary_alignment_filters(&self) -> &SessionFilters {
-        self.session
-            .alignment_tracks
-            .first()
-            .map_or(&self.session.empty_alignment.filters, |track| {
-                &track.config.filters
-            })
+        self.session.primary_alignment_filters()
     }
 
     pub(crate) fn primary_alignment_filters_mut(&mut self) -> &mut SessionFilters {
@@ -201,11 +110,7 @@ impl Viewer {
         track_id: TrackId,
     ) -> f32 {
         self.session
-            .panels
-            .get(panel_id)
-            .and_then(|panel| panel.read_panel_scrolls.get(&track_id))
-            .and_then(|state| state.density)
-            .unwrap_or_else(|| self.alignment_filters_for_track(track_id).alignment_density)
+            .alignment_density_for_panel_track(panel_id, track_id)
     }
 
     pub(crate) fn set_read_panel_density(
@@ -244,15 +149,6 @@ impl Viewer {
             .first_mut()
             .map_or(&mut self.session.empty_alignment.filter_editor, |track| {
                 &mut track.filter_editor
-            })
-    }
-
-    pub(crate) fn primary_active_filters(&self) -> &ActiveFilters {
-        self.session
-            .alignment_tracks
-            .first()
-            .map_or(&self.session.empty_alignment.active_filters, |track| {
-                &track.active_filters
             })
     }
 

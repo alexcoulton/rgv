@@ -2,6 +2,7 @@
 members = [
     "apps/rgv-desktop",
     "apps/rgv-mcp",
+    "apps/rgv-snapshot",
     "benchmarks/alignment-io",
     "benchmarks/interaction",
     "benchmarks/comparison",
@@ -26,6 +27,7 @@ members = [
 default-members = [
     "apps/rgv-desktop",
     "apps/rgv-mcp",
+    "apps/rgv-snapshot",
     "benchmarks/interaction",
     "benchmarks/comparison",
     "benchmarks/remote-range",

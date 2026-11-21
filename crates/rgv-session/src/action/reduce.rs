@@ -70,6 +70,15 @@ pub const fn is_panel_action(action: &Action) -> bool {
             | Action::RemoveTracks { .. }
             | Action::RestoreTracks(_)
             | Action::SetWorkspaceLists { .. }
+            | Action::LoadTracks { .. }
+            | Action::SetAlignmentSettings { .. }
+            | Action::SetTrackConfigs { .. }
+            | Action::SetAlignmentTrackLabels { .. }
+            | Action::MoveTrack { .. }
+            | Action::SetReferencePresentation(_)
+            | Action::SelectTrack { .. }
+            | Action::ClearSelection { .. }
+            | Action::SetPreferences(_)
     )
 }
 
@@ -546,7 +555,16 @@ pub fn reduce_panel_action<P: Panel>(
         | Action::RestorePresentation { .. }
         | Action::RemoveTracks { .. }
         | Action::RestoreTracks(_)
-        | Action::SetWorkspaceLists { .. } => {
+        | Action::SetWorkspaceLists { .. }
+        | Action::LoadTracks { .. }
+        | Action::SetAlignmentSettings { .. }
+        | Action::SetTrackConfigs { .. }
+        | Action::SetAlignmentTrackLabels { .. }
+        | Action::MoveTrack { .. }
+        | Action::SetReferencePresentation(_)
+        | Action::SelectTrack { .. }
+        | Action::ClearSelection { .. }
+        | Action::SetPreferences(_) => {
             anyhow::bail!("{} is not a panel action", action.label())
         }
     }

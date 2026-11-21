@@ -10,7 +10,6 @@ use rgv_alignment_scene::{
     AlignmentRowActivityProfile, AlignmentSceneSnapshot, evaluate_alignment_filter,
 };
 use rgv_core::{PanelId, TrackId};
-use rgv_engine::{AlignmentSceneRequestToken, SourceOwnerId};
 use rgv_hts::AlignmentRecord;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -348,21 +347,5 @@ impl Viewer {
     ) -> Option<AlignmentRecord> {
         let snapshot = self.alignment_scene_snapshot_for_panel_track(panel_id, hit.track)?;
         snapshot.inspect_retained(hit.handle).ok().flatten()
-    }
-
-    pub(super) fn take_alignment_scene_owner(&mut self) -> SourceOwnerId {
-        self.alignment_scene_owner_clock = self
-            .alignment_scene_owner_clock
-            .checked_add(1)
-            .expect("alignment scene owner identity space was exhausted");
-        SourceOwnerId::new(self.alignment_scene_owner_clock)
-    }
-
-    pub(crate) fn take_alignment_scene_request_token(&mut self) -> AlignmentSceneRequestToken {
-        self.alignment_scene_request_clock = self
-            .alignment_scene_request_clock
-            .checked_add(1)
-            .expect("alignment scene request identity space was exhausted");
-        AlignmentSceneRequestToken::new(self.alignment_scene_request_clock)
     }
 }

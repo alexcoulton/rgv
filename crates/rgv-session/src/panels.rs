@@ -173,6 +173,26 @@ pub trait Panel: Sized {
     fn state_mut(&mut self) -> &mut PanelState;
     /// Wraps a freshly created state in the host's panel type.
     fn from_state(state: PanelState) -> Self;
+
+    /// The alignment track the panel's pileup and modification selections belong to. A host
+    /// without alignment selection (a headless session) keeps the default.
+    fn selected_alignment_track(&self) -> Option<TrackId> {
+        None
+    }
+
+    /// The selected pileup column, captured into the owning track's coverage lane.
+    fn selected_pileup_position(&self) -> Option<u64> {
+        None
+    }
+
+    /// The selected modification column, captured into the owning track's modification lane.
+    fn selected_modification_position(&self) -> Option<u64> {
+        None
+    }
+
+    /// Drops a pending read reveal whose scene authority has just ended: the one aimed at
+    /// `only_track`, or any pending reveal when `None`.
+    fn clear_pending_alignment_reveal(&mut self, _only_track: Option<TrackId>) {}
 }
 
 impl Panel for PanelState {
@@ -497,6 +517,36 @@ impl<P: Panel> PanelWorkspace<P> {
             .position(|panel| panel.state().id == id)
             .unwrap_or(self.active);
         &mut self.panels[index]
+    }
+
+    /// The device-free state of every panel, in order.
+    pub fn states(&self) -> impl ExactSizeIterator<Item = &PanelState> {
+        self.panels.iter().map(Panel::state)
+    }
+
+    /// Mutable counterpart of [`Self::states`].
+    pub fn states_mut(&mut self) -> impl ExactSizeIterator<Item = &mut PanelState> {
+        self.panels.iter_mut().map(Panel::state_mut)
+    }
+
+    /// The device-free state of panel `id`, if it is in the workspace.
+    pub fn state(&self, id: PanelId) -> Option<&PanelState> {
+        self.get(id).map(Panel::state)
+    }
+
+    /// Mutable counterpart of [`Self::state`].
+    pub fn state_mut(&mut self, id: PanelId) -> Option<&mut PanelState> {
+        self.get_mut(id).map(Panel::state_mut)
+    }
+
+    /// The device-free state of the panel [`Self::panel`] resolves `id` to.
+    pub fn panel_state(&self, id: PanelId) -> &PanelState {
+        self.panel(id).state()
+    }
+
+    /// Mutable counterpart of [`Self::panel_state`].
+    pub fn panel_state_mut(&mut self, id: PanelId) -> &mut PanelState {
+        self.panel_mut(id).state_mut()
     }
 
     /// Whether `id` is the focused panel: the one keyboard and locus-box input address.

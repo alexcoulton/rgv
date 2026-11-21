@@ -3,14 +3,18 @@
 //! `apply_shell_frame` fixes the order in which requests take effect; the helpers in this module
 //! and in the `apply_*` modules are its consecutive steps.
 
+use crate::action::{TrackLoad, TrackLoadKind};
 use crate::app::actions::TrackActionDraft;
 use crate::diagnostics::ManualDiagnosticFramePhase;
 use crate::inspection::model::next_evidence_index;
 use crate::inspection::read::truncate_string_to_bytes;
+use crate::sources::track_source;
 use crate::ui::frame::ShellFrame;
 use crate::ui::{AlignmentSubtrack, TrackUiAction, UiCommand};
 use crate::workspace::lists::normalize_sample_association;
-use crate::{LOCUS_EDITOR_ID, RemoteSourceEditor, UiPanel, Viewer, ui};
+use crate::{
+    LOCUS_EDITOR_ID, RemoteSourceEditor, RemoteSourceKind, RemoteSourceRequest, UiPanel, Viewer, ui,
+};
 use rgv_core::{PresentationNodeId, TrackId};
 use std::time::{Duration, Instant};
 
@@ -36,6 +40,45 @@ pub(crate) fn resolve_open_panel(
             .find(|panel| Some(*panel) != previous)
             .unwrap_or(first),
     )
+}
+
+/// The remote-source dialog's request as the sources it opens: an alignment with its optional
+/// reference, a reference, or an indexed annotation or signal track.
+fn remote_source_loads(request: RemoteSourceRequest) -> Vec<TrackLoad> {
+    let source = |url: &str| track_source(std::path::Path::new(url));
+    match request.kind {
+        RemoteSourceKind::Alignment => request
+            .reference_url
+            .as_deref()
+            .map(|url| TrackLoad {
+                source: source(url),
+                kind: TrackLoadKind::Reference {
+                    remote_index_url: request.reference_index_url.clone(),
+                },
+                name: None,
+            })
+            .into_iter()
+            .chain([TrackLoad {
+                source: source(&request.source_url),
+                kind: TrackLoadKind::Alignment {
+                    remote_index_url: request.index_url.clone(),
+                },
+                name: None,
+            }])
+            .collect(),
+        RemoteSourceKind::Reference => vec![TrackLoad {
+            source: source(&request.source_url),
+            kind: TrackLoadKind::Reference {
+                remote_index_url: request.index_url,
+            },
+            name: None,
+        }],
+        RemoteSourceKind::IndexedTrack => vec![TrackLoad {
+            source: source(&request.source_url),
+            kind: TrackLoadKind::Annotation,
+            name: None,
+        }],
+    }
 }
 
 impl Viewer {
@@ -64,29 +107,9 @@ impl Viewer {
         self.apply_file_requests(st);
         self.apply_cache_clear(st);
         self.commit_editors_and_selection(st);
-        let editing_primary_settings =
-            st.align.settings_alignment_id == st.align.primary_alignment_id;
-        self.apply_primary_alignment_query_settings(st, editing_primary_settings);
         self.apply_reference_presentation(st);
-        let requested_coverage_scale = st
-            .align
-            .use_fixed_coverage_scale
-            .then_some(st.align.coverage_scale_maximum.max(1));
-        self.apply_primary_alignment_presentation(
-            st,
-            editing_primary_settings,
-            requested_coverage_scale,
-        );
         self.apply_auxiliary_track_settings(st);
-        let alignment_sort_anchor =
-            self.apply_primary_alignment_style(st, editing_primary_settings);
-        self.apply_primary_alignment_filters(st, editing_primary_settings);
-        self.commit_secondary_alignment_settings(
-            st,
-            editing_primary_settings,
-            requested_coverage_scale,
-            alignment_sort_anchor,
-        );
+        self.commit_alignment_settings(st);
         self.apply_bulk_and_deferred_track_actions(
             st,
             alignment_subtracks_to_toggle,
@@ -449,38 +472,41 @@ impl Viewer {
         st.commands.export_png_requested |= track_effects.export_requested;
         let alignment_track_to_remove = track_effects.alignment_to_remove;
         let alignment_subtracks_to_toggle = track_effects.alignment_subtracks_to_toggle;
-        let mut alignment_configuration_changed =
-            track_effects.annotation_geometry_changed || track_effects.read_geometry_changed;
-        for control in std::mem::take(&mut st.tracks.alignment_track_controls) {
-            if let Some(track) = self
-                .session
-                .alignment_tracks
-                .iter_mut()
-                .find(|track| track.config.id == control.id)
-            {
-                alignment_configuration_changed |= track.config.name != control.name;
-                track.config.name = control.name;
-            }
-        }
-        normalize_sample_association(&mut st.align.edited_track_sample_key);
-        if let Some(id) = st.align.editing_alignment_id
-            && let Some(track) = self
-                .session
-                .alignment_tracks
-                .iter_mut()
-                .find(|track| track.config.id == id)
-            && track.config.sample_key != st.align.edited_track_sample_key
-        {
-            track
-                .config
-                .sample_key
-                .clone_from(&st.align.edited_track_sample_key);
-            alignment_configuration_changed = true;
-        }
-        if alignment_configuration_changed {
+        if track_effects.annotation_geometry_changed || track_effects.read_geometry_changed {
             self.invalidate_navigation_contract("alignment track layout changed");
             self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
+        }
+        // Names and the sample association are one label action.
+        normalize_sample_association(&mut st.align.edited_track_sample_key);
+        let mut labels = std::mem::take(&mut st.tracks.alignment_track_controls)
+            .into_iter()
+            .filter_map(|control| {
+                let mut label = self.session.alignment_track_label(control.id)?;
+                label.name = control.name;
+                Some(label)
+            })
+            .collect::<Vec<_>>();
+        if let Some(id) = st.align.editing_alignment_id {
+            if !labels.iter().any(|label| label.track_id == id)
+                && let Some(label) = self.session.alignment_track_label(id)
+            {
+                labels.push(label);
+            }
+            if let Some(label) = labels.iter_mut().find(|label| label.track_id == id) {
+                label
+                    .sample_key
+                    .clone_from(&st.align.edited_track_sample_key);
+            }
+        }
+        labels.retain(|label| {
+            self.session.alignment_track_label(label.track_id).as_ref() != Some(label)
+        });
+        if !labels.is_empty()
+            && let Err(error) =
+                self.apply_action(crate::action::Action::SetAlignmentTrackLabels { labels })
+        {
+            self.report_error(error.to_string());
         }
         if self.session.alignment_tracks.is_empty()
             && st.align.alignment_visible != self.primary_alignment_visible()
@@ -511,7 +537,7 @@ impl Viewer {
     pub(super) fn commit_open_panel(&mut self, st: &mut ShellFrame) {
         self.remote_source_editor = std::mem::take(&mut st.commands.remote_source_editor);
         if let Some(request) = st.commands.remote_source_request.take() {
-            match self.open_remote_source(request) {
+            match self.load_tracks(remote_source_loads(request)).map(|_| ()) {
                 Ok(()) => self.remote_source_editor = RemoteSourceEditor::default(),
                 Err(error) => {
                     self.remote_source_editor.error = Some(error.to_string());
@@ -576,8 +602,12 @@ impl Viewer {
         }
         if st.inspect.clear_selection {
             self.clear_promoted_read();
-            self.session.panels.active_mut().clear_selection();
-            self.mark_display_dirty("explicit display invalidation");
+            let panel_id = self.session.panels.active().id;
+            if let Err(error) =
+                self.apply_action(crate::action::Action::ClearSelection { panel_id })
+            {
+                self.report_error(error.to_string());
+            }
         }
     }
 }

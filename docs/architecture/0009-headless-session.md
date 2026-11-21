@@ -1,8 +1,9 @@
 # ADR 0009: Headless session crate
 
-Status: accepted in part, 21 November 2026. Stage 2 of the plan below is done except alignment
-query dispatch and settlement, which stay in the desktop for the reasons given under "What the
-desktop still owns".
+Status: accepted in part, 21 November 2026. Stages 1, 2, 3 (except desktop consumption of
+`PanelPresentation`) and 5 of the plan below are done; stage 4 is in progress separately.
+Alignment query dispatch and settlement now run in the session against a narrow presenter
+interface, and `rgv-snapshot` renders a settled session with no window and no GPU.
 
 ## Context
 
@@ -26,8 +27,10 @@ a `PanelState` with display caches and GPU-facing state. A headless host uses `P
 
 ```text
 rgv-core, rgv-automation, rgv-engine, rgv-hts, rgv-layout, rgv-alignment-scene
-└── rgv-session      session state, Action reducer, undo, reference/track/alignment engines
-    └── rgv-desktop  window, GPU, egui, alignment dispatch, settlement and scene publication
+└── rgv-session       session state, Action reducer, undo, engines, alignment dispatch and
+    │                 settlement, lane layout, PresentationHost, PanelPresentation, HeadlessHost
+    ├── rgv-desktop   window, GPU, egui; implements PresentationHost; GPU scene publication
+    └── rgv-snapshot  headless CLI: HeadlessHost + CPU projectors (rgv-render) -> PNG/SVG
 ```
 
 ### What the session holds now
@@ -77,49 +80,82 @@ rgv-core, rgv-automation, rgv-engine, rgv-hts, rgv-layout, rgv-alignment-scene
   A coverage worker is started when its scene engine reports the source open, from that
   engine's dictionary and stamp, so a request the sidecar cache serves opens no file.
 
+- **Stage 3 (this change):**
+  - *Device-free lane layout* (`lane_layout`): `PanelLaneLayout` is one panel's committed
+    layout in logical points — canvas column, gutter width, and per pane (`PaneLanes`: pane
+    rectangle, scroll, content bottom) the lanes (`LaneLayout`: owner, channel, name, kind,
+    row/header/content/clip rectangles, visibility, `Sublane`s with a semantic `SublaneKind`).
+    The desktop converts its egui `WorkspacePaneLayout` exactly
+    (`WorkspacePaneLayout::to_panel_lanes`, `Viewer::panel_lane_layout`). Lane demand
+    (`alignment::lanes`: derived-lane captures, read clip,
+    `Session::alignment_scene_lane_capture_for_panel_track`) reads only this type. The panel's
+    alignment selections reach it through default methods on the `Panel` trait.
+  - *Presenter interface* (`presentation_host::PresentationHost`): the host owns the session
+    (`session()`/`session_mut()`, the `ActionHost` pattern) and provides exactly the effects
+    settlement needs — `panel_lane_layout`, `prepare_alignment_scene_frame`,
+    `clear_alignment_scene_lane`, `yield_speculation_for_source_pressure`,
+    `observe_capacity_reclaim`, display rebuild / interaction sync / dirty / redraw, the shell
+    work settlement triggers (`request_all_panel_queries`, coverage-engine start, imported
+    locus, landmarks, active-panel context, settings persistence, remote IO stats),
+    `promoted_read_template`, error/warning reports, and diagnostics (`diagnostics_recording`,
+    `diagnostic_event`, `alignment_filter_diagnostic_state`, all defaulting to off). Admission
+    results come back as session calls over device-free `AlignmentLaneAdmission`s
+    (`alignment::admission`: commit, wait-for-GPU, resume, fail, budget-limited, pending
+    mirrors, optional-work pause/resume). `RecordingHost` records calls for tests.
+  - *Moved functions:* `dispatch_alignment_query`, `request_alignment_query`,
+    `request_alignment_scene_camera_update` and `Session::queue_alignment_navigation_for_track`
+    (`alignment::dispatch`), `poll_alignment_events` (`alignment::events`, with the frame
+    normaliser `alignment_scene_frame_for_ui`) and `poll_reference_events`
+    (`reference_events`) are generic over `PresentationHost`; the desktop methods delegate
+    with `self` as host. Every host call sits where the desktop made the effect, so event
+    ordering is unchanged. Two deliberate reorderings with no observable effect: a reference
+    receive error is reported after the receive loop ends instead of just before it breaks, and
+    in `QueryCompleted` the display is marked dirty after the status line is set (the two touch
+    independent state). Scene owner and request-token clocks moved to the session
+    (`AlignmentSceneIdentityClock`). Nothing was left behind.
+  - *`PanelPresentation`* (`presentation`): per panel the camera, contig, lane layout, per
+    alignment track the navigation phase and settled flag, the current scene as an
+    `Arc<AlignmentSceneSnapshot>` (reads, row atlas and summaries), contract currency,
+    completeness, refusal, overview and unavailable state and the presented coverage-pyramid
+    mode; per annotation track its retained snapshot and interval; the reference slice
+    `Arc`; pending flags; the status line. Built by `Session::panel_presentation`.
+  - *Headless presenter* (`headless::HeadlessHost`): fixed lane layout on a canvas, CPU
+    `AlignmentPanelSceneStore`s, admission of every complete lane, track-query dispatch, a
+    `poll` that mirrors the desktop's frame loop, and `settle(timeout)` that fails naming what
+    each panel still waits for. `apps/rgv-snapshot` builds on it (stage 5).
+
 ### What the desktop still owns
 
-GPU publication, the track tile pipeline, display lists and pane layout, landmarks, export
-and session save/load tasks, automation and control service plumbing, and every window, GPU
-and egui object. Actions the session cannot reduce yet (`ApplyTrackIntents`,
-`RestorePresentation`, `RemoveTracks`, `RestoreTracks`) are carried out by the desktop inside
-`ActionHost::perform_action`, so they are still recorded in the one undo history.
+GPU publication (`prepare_alignment_scene_frame` and its residency, prefetch, speculation and
+capacity-reclaim machinery, now reached through `PresentationHost`), the track tile pipeline,
+display lists and the egui pane layout that `PanelLaneLayout` is converted from, landmarks,
+export and session save/load tasks, automation and control service plumbing, track query
+dispatch (`dispatch_track_query`, because it consults the tile pipeline's routing), and every
+window, GPU and egui object. Actions the session cannot reduce yet are carried out by the
+desktop inside `ActionHost::perform_action`, so they are still recorded in the one undo history.
 
-Three functions read the session's alignment state but stay in the desktop, because each
-interleaves window or GPU work with the session-level work too tightly to split safely without
-checking the running application:
-
-- `dispatch_alignment_query` (`workspace/alignment_management/dispatch.rs`) takes each lane's
-  read and derived-lane clips from the egui-typed pane layout
-  (`alignment_scene_lane_capture_for_panel_track`), clears lanes of the panel scene stores that
-  GPU publication shares, writes diagnostics through the desktop facade, allocates owners and
-  request tokens from desktop counters, and ends by preparing the GPU frame.
-- `poll_alignment_events` (`workspace/queries.rs`, about 1,000 lines) settles frames,
-  refusals, pressure and budget events, and in the same arms yields GPU speculation for source
-  pressure, observes cross-owner GPU capacity reclaim, writes diagnostics, rebuilds displays
-  and prepares the GPU frame.
-- `poll_reference_events` installs FASTA slices and settles reference dependencies, updates
-  landmark resolution and the imported locus, then rebuilds displays and prepares the GPU
-  frame.
-
-Moving them needs a device-free lane layout (stage 3) and a narrow host interface for GPU
-admission results, speculation and diagnostics.
+The desktop renderers do not consume `PanelPresentation` yet: GPU publication still reads the
+session's projections directly. Switching them is the remaining part of stage 3; the headless
+renderer is its first consumer.
 
 ## Plan
 
 1. Crate skeleton, pure state and the action model with re-exports; boundary test. Done.
 2. Move engines, lifecycle and non-UI background work into the session in slices, each ending
-   green. Done: document/panels/tracks/reference state, track queries, track-engine event
-   receipt and routing into panels, the reference lifecycle and query dispatch, annotation
-   track load, alignment controllers and their lifecycle, the coverage and navigation state
-   settlement reads, and the settlement decisions. Remaining: `dispatch_alignment_query`,
-   `poll_alignment_events` and `poll_reference_events` (see above).
-3. A device-free `PanelPresentation` published by the session; alignment GPU publication stays
-   in the desktop and consumes it.
+   green. Done, including alignment dispatch and settlement (stage 3 work above).
+3. A device-free lane layout, a narrow presenter interface, and a `PanelPresentation`
+   published by the session. Done except that the desktop's GPU publication does not consume
+   `PanelPresentation` yet.
 4. The remaining `Action` domains (track load, alignment display settings, session
    open/save/new, preferences, selection, list imports) with automation-versus-UI
    document-equivalence tests, and undo for track load and display settings.
 5. A headless `rgv-snapshot` binary and an end-to-end headless test that renders an image.
+   Done: `apps/rgv-snapshot` (see `docs/USER_GUIDE.md`, "Headless snapshots") and
+   `apps/rgv-snapshot/tests/headless_snapshot.rs`, which settles a session over
+   `benchmark-data/mixed.bam` and small BED/VCF fixtures with no window or device, asserts on
+   the presentation (committed complete scene, depth at two positions, feature and variant
+   names, read rectangles in the reads pane) and runs the binary to write a PNG and an SVG.
+   Rendering lives in the binary crate so `rgv-session` stays free of `wgpu`.
 
 ## Consequences
 

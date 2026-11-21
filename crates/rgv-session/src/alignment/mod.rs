@@ -3,7 +3,11 @@
 //! Nothing here names a window or a GPU device; GPU publication of the scenes stays with the
 //! host.
 
+pub mod admission;
 pub mod coverage;
+pub mod dispatch;
+pub mod events;
+pub mod lanes;
 pub mod navigation;
 pub mod settlement;
 pub mod track;

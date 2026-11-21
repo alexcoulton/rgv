@@ -1,3 +1,4 @@
+use crate::action::translate::{AlignmentOption, TrackLabelEdit};
 use crate::automation::commands::evidence::{automation_locus, bounded_automation_text};
 use crate::automation::{
     automation_bool, automation_f32, automation_inspector_export, automation_name,
@@ -5,16 +6,14 @@ use crate::automation::{
     automation_u64,
 };
 use crate::inspection::model::{InspectorSnapshot, RetainedEvidenceSnapshot};
-use crate::workspace::alignments::expanded_workspace_alignment_limit;
-use crate::{MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY, Viewer, ui};
+use crate::{Viewer, ui};
 use anyhow::Result;
 use rgv_automation::{
     AutomationEvidenceField, AutomationOptionScope, AutomationSelectionGranularity,
     AutomationSelectionKind, AutomationSetting, AutomationViewportOperation,
 };
 use rgv_core::{
-    AlignmentViewPredicate, CoverageScaleTransform, PanelId, PresentationNodeId, ReadStackingMode,
-    TrackId, TrackIntent,
+    CoverageScaleTransform, PanelId, PresentationNodeId, ReadStackingMode, TrackId, TrackIntent,
 };
 use std::time::Instant;
 
@@ -31,6 +30,69 @@ pub(crate) fn automation_alignment_target(
         Some(track_id) if is_alignment_track(track_id) => Ok(track_id),
         Some(track_id) => anyhow::bail!("alignment track {} was not found", track_id.get()),
     }
+}
+
+/// Reads the JSON value of a `set_option` workspace key other than `show_reads`.
+pub(crate) fn workspace_alignment_option(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<AlignmentOption> {
+    Ok(match key {
+        "show_reference" => AlignmentOption::ShowReference(automation_bool(value, key)?),
+        "show_coverage" => AlignmentOption::ShowCoverage(automation_bool(value, key)?),
+        "show_junctions" => AlignmentOption::ShowJunctions(automation_bool(value, key)?),
+        "show_junction_labels" => AlignmentOption::ShowJunctionLabels(automation_bool(value, key)?),
+        "show_coverage_center_line" => {
+            AlignmentOption::ShowCoverageCenterLine(automation_bool(value, key)?)
+        }
+        "view_as_pairs" => AlignmentOption::ViewAsPairs(automation_bool(value, key)?),
+        "quality_weighted_alleles" => {
+            AlignmentOption::QualityWeightedAlleles(automation_bool(value, key)?)
+        }
+        "shade_read_bases_by_quality" => {
+            AlignmentOption::ShadeReadBasesByQuality(automation_bool(value, key)?)
+        }
+        "show_modified_bases" => AlignmentOption::ShowModifiedBases(automation_bool(value, key)?),
+        "show_modification_frequency" => {
+            AlignmentOption::ShowModificationFrequency(automation_bool(value, key)?)
+        }
+        "minimum_mapping_quality" => AlignmentOption::MinimumMappingQuality(
+            automation_optional_u64(value, key)?
+                .map(|value| automation_u8(value, key))
+                .transpose()?,
+        ),
+        "include_secondary" => AlignmentOption::IncludeSecondary(automation_bool(value, key)?),
+        "include_supplementary" => {
+            AlignmentOption::IncludeSupplementary(automation_bool(value, key)?)
+        }
+        "minimum_base_quality" => {
+            AlignmentOption::MinimumBaseQuality(automation_u8(automation_u64(value, key)?, key)?)
+        }
+        "minimum_allele_fraction" => {
+            AlignmentOption::MinimumAlleleFraction(automation_f32(value, key)?)
+        }
+        "vertical_density" => AlignmentOption::VerticalDensity(automation_f32(value, key)?),
+        "coverage_scale_maximum" => AlignmentOption::CoverageScaleMaximum(
+            automation_optional_u64(value, key)?
+                .map(|value| automation_u32(value, key))
+                .transpose()?,
+        ),
+        "coverage_scale_transform" => {
+            AlignmentOption::CoverageScaleTransform(match automation_name(value, key)?.as_str() {
+                "linear" => CoverageScaleTransform::Linear,
+                "square_root" => CoverageScaleTransform::SquareRoot,
+                _ => anyhow::bail!("{key} must be linear or square_root"),
+            })
+        }
+        "minimum_indel_size" => {
+            AlignmentOption::MinimumIndelSize(automation_u32(automation_u64(value, key)?, key)?)
+        }
+        "minimum_event_label_size" => AlignmentOption::MinimumEventLabelSize(automation_u32(
+            automation_u64(value, key)?,
+            key,
+        )?),
+        _ => anyhow::bail!("unknown workspace option {key}"),
+    })
 }
 
 impl Viewer {
@@ -131,6 +193,9 @@ impl Viewer {
     ) -> Result<crate::action::ActionOutcome> {
         let focused = self.session.panels.active().id;
         let actions = crate::action::translate::automation_command_actions(command, focused)
+            .or_else(|| {
+                crate::action::translate::automation_session_actions(&self.session, command)
+            })
             .ok_or_else(|| anyhow::anyhow!("the command is not an action translation"))??;
         let mut outcome = crate::action::ActionOutcome::default();
         for action in actions {
@@ -224,145 +289,26 @@ impl Viewer {
     ) -> Result<()> {
         let alignment_track = self.automation_alignment_target(alignment_track)?;
         match *scope {
+            AutomationOptionScope::Workspace if key == "show_reads" => {
+                let visible = automation_bool(value, key)?;
+                self.apply_track_intents(&[TrackIntent::SetNodeVisibility {
+                    target: PresentationNodeId::Track {
+                        channel: ui::TrackPane::Reads,
+                        track_id: alignment_track,
+                    },
+                    visible,
+                }])?;
+                self.rebuild_all_panel_displays();
+            }
             AutomationOptionScope::Workspace => {
-                let mut query_changed = false;
-                match key {
-                    "show_reference" => {
-                        self.primary_alignment_filters_mut().show_reference =
-                            automation_bool(value, key)?;
-                    }
-                    "show_coverage" => {
-                        self.primary_alignment_filters_mut().show_coverage =
-                            automation_bool(value, key)?;
-                    }
-                    "show_reads" => {
-                        let visible = automation_bool(value, key)?;
-                        self.apply_track_intents(&[TrackIntent::SetNodeVisibility {
-                            target: PresentationNodeId::Track {
-                                channel: ui::TrackPane::Reads,
-                                track_id: alignment_track,
-                            },
-                            visible,
-                        }])?;
-                    }
-                    "show_junctions" => {
-                        self.primary_alignment_filters_mut().show_junctions =
-                            automation_bool(value, key)?;
-                    }
-                    "show_junction_labels" => {
-                        self.primary_alignment_filters_mut().show_junction_labels =
-                            automation_bool(value, key)?;
-                    }
-                    "show_coverage_center_line" => {
-                        self.primary_alignment_filters_mut()
-                            .show_coverage_center_line = automation_bool(value, key)?;
-                    }
-                    "view_as_pairs" => {
-                        self.primary_alignment_filters_mut().view_as_pairs =
-                            automation_bool(value, key)?;
-                    }
-                    "quality_weighted_alleles" => {
-                        self.primary_alignment_filters_mut()
-                            .quality_weighted_alleles = automation_bool(value, key)?;
-                    }
-                    "shade_read_bases_by_quality" => {
-                        self.primary_alignment_filters_mut()
-                            .shade_read_bases_by_quality = automation_bool(value, key)?;
-                    }
-                    "show_modified_bases" => {
-                        self.primary_alignment_filters_mut().show_modified_bases =
-                            automation_bool(value, key)?;
-                    }
-                    "show_modification_frequency" => {
-                        let requested = automation_bool(value, key)?;
-                        query_changed = requested
-                            != self.primary_alignment_filters().show_modification_frequency;
-                        self.primary_alignment_filters_mut()
-                            .show_modification_frequency = requested;
-                    }
-                    "minimum_mapping_quality" => {
-                        let requested = automation_optional_u64(value, key)?
-                            .map(|value| automation_u8(value, key))
-                            .transpose()?;
-                        query_changed = requested
-                            != self
-                                .primary_active_filters()
-                                .alignment
-                                .minimum_mapping_quality;
-                        self.primary_active_filters_mut()
-                            .alignment
-                            .minimum_mapping_quality = requested;
-                        self.primary_filter_editor_mut().minimum_mapq =
-                            requested.unwrap_or_default();
-                    }
-                    "include_secondary" => {
-                        let requested = automation_bool(value, key)?;
-                        query_changed =
-                            requested != self.primary_active_filters().include_secondary;
-                        self.primary_alignment_filters_mut().include_secondary = requested;
-                        self.primary_active_filters_mut().include_secondary = requested;
-                        self.primary_filter_editor_mut().include_secondary = requested;
-                    }
-                    "include_supplementary" => {
-                        let requested = automation_bool(value, key)?;
-                        query_changed =
-                            requested != self.primary_active_filters().include_supplementary;
-                        self.primary_alignment_filters_mut().include_supplementary = requested;
-                        self.primary_active_filters_mut().include_supplementary = requested;
-                        self.primary_filter_editor_mut().include_supplementary = requested;
-                    }
-                    "minimum_base_quality" => {
-                        self.primary_alignment_filters_mut().minimum_base_quality =
-                            automation_u8(automation_u64(value, key)?, key)?;
-                    }
-                    "minimum_allele_fraction" => {
-                        let fraction = automation_f32(value, key)?;
-                        anyhow::ensure!(
-                            (0.0..=1.0).contains(&fraction),
-                            "{key} must be between 0 and 1"
-                        );
-                        self.primary_alignment_filters_mut().minimum_allele_fraction = fraction;
-                    }
-                    "vertical_density" => {
-                        let density = automation_f32(value, key)?;
-                        anyhow::ensure!(
-                            (MIN_VERTICAL_DENSITY..=MAX_VERTICAL_DENSITY).contains(&density),
-                            "{key} must be between {MIN_VERTICAL_DENSITY} and {MAX_VERTICAL_DENSITY}"
-                        );
-                        self.set_alignment_density_for_track(alignment_track, density);
-                    }
-                    "coverage_scale_maximum" => {
-                        let maximum = automation_optional_u64(value, key)?
-                            .map(|value| automation_u32(value, key))
-                            .transpose()?;
-                        anyhow::ensure!(maximum != Some(0), "{key} must be positive or null");
-                        self.primary_alignment_filters_mut().coverage_scale_maximum = maximum;
-                    }
-                    "coverage_scale_transform" => {
-                        let requested = automation_name(value, key)?;
-                        self.primary_alignment_filters_mut()
-                            .coverage_scale_transform = match requested.as_str() {
-                            "linear" => CoverageScaleTransform::Linear,
-                            "square_root" => CoverageScaleTransform::SquareRoot,
-                            _ => anyhow::bail!("{key} must be linear or square_root"),
-                        };
-                    }
-                    "minimum_indel_size" => {
-                        let minimum = automation_u32(automation_u64(value, key)?, key)?;
-                        anyhow::ensure!(minimum > 0, "{key} must be positive");
-                        self.primary_alignment_filters_mut().minimum_indel_size = minimum;
-                    }
-                    "minimum_event_label_size" => {
-                        let minimum = automation_u32(automation_u64(value, key)?, key)?;
-                        anyhow::ensure!(minimum > 0, "{key} must be positive");
-                        self.primary_alignment_filters_mut()
-                            .minimum_event_label_size = minimum;
-                    }
-                    _ => anyhow::bail!("unknown workspace option {key}"),
-                }
-                self.invalidate_automation_alignment_layouts(None, query_changed);
-                if query_changed {
-                    self.request_all_panel_queries();
+                // A thin translation: every other workspace key is an alignment settings edit.
+                let actions = crate::action::translate::alignment_option_actions(
+                    &self.session,
+                    workspace_alignment_option(key, value)?,
+                    Some(alignment_track),
+                )?;
+                for action in actions {
+                    self.apply_action(action)?;
                 }
                 self.rebuild_all_panel_displays();
             }
@@ -409,40 +355,26 @@ impl Viewer {
                     self.mark_display_dirty("explicit display invalidation");
                     return Ok(());
                 }
-                let primary_id = self.primary_alignment_track_id();
-                if let Some(track) = self
+                // A thin translation: a rename or sample association is a label edit.
+                let alignment = self
                     .session
                     .alignment_tracks
-                    .iter_mut()
-                    .find(|track| track.config.id == track_id)
+                    .iter()
+                    .any(|track| track.config.id == track_id);
+                let edit = match key {
+                    "name" => TrackLabelEdit::Name(automation_name(value, key)?),
+                    "sample_key" => {
+                        TrackLabelEdit::SampleKey(automation_optional_name(value, key)?)
+                    }
+                    _ if alignment => anyhow::bail!("unknown alignment-track option {key}"),
+                    _ => anyhow::bail!("unknown auxiliary-track option {key}"),
+                };
+                for action in
+                    crate::action::translate::track_label_actions(&self.session, track_id, edit)?
                 {
-                    match key {
-                        "name" => track.config.name = automation_name(value, key)?,
-                        "sample_key" => {
-                            track.config.sample_key = automation_optional_name(value, key)?;
-                        }
-                        _ => anyhow::bail!("unknown alignment-track option {key}"),
-                    }
-                    if track_id == primary_id {
-                        self.activate_first_alignment_track()?;
-                    }
-                    self.rebuild_all_panel_displays();
-                } else if let Some(track) = self
-                    .session
-                    .tracks
-                    .tracks_mut()
-                    .iter_mut()
-                    .find(|track| track.id == track_id)
-                {
-                    match key {
-                        "name" => track.name = automation_name(value, key)?,
-                        "sample_key" => {
-                            track.sample_key = automation_optional_name(value, key)?;
-                        }
-                        _ => anyhow::bail!("unknown auxiliary-track option {key}"),
-                    }
-                    self.rebuild_all_panel_displays();
+                    self.apply_action(action)?;
                 }
+                self.rebuild_all_panel_displays();
             }
             AutomationOptionScope::Panel { panel_id } => {
                 // The panel-level `vertical_scroll_points` field mirrors the primary track only.
@@ -532,31 +464,15 @@ impl Viewer {
                 self.egui_context.request_repaint();
                 self.window.request_redraw();
             }
-            AutomationSetting::ReadBrowsingBufferPercent { value } => {
-                deferred_shell_change =
-                    self.session.settings.read_browsing_buffer_percent != *value;
-                self.session.settings.read_browsing_buffer_percent = *value;
-                if deferred_shell_change {
-                    self.persist_settings();
-                    self.request_all_panel_queries();
-                }
-            }
-            AutomationSetting::TotalCacheBudgetMib { value } => {
-                deferred_shell_change = self.session.settings.cache_budget_mib != *value;
-                self.session.settings.cache_budget_mib = *value;
-                if deferred_shell_change {
-                    self.apply_live_cache_budget(*value);
-                    self.persist_settings();
-                    self.request_all_panel_queries();
-                }
-            }
-            AutomationSetting::TrackPipeline { value } => {
-                deferred_shell_change = self.session.settings.track_pipeline != *value;
-                if deferred_shell_change {
-                    self.session.settings.track_pipeline = *value;
-                    self.persist_settings();
-                    self.apply_track_pipeline_setting();
-                }
+            AutomationSetting::ReadBrowsingBufferPercent { .. }
+            | AutomationSetting::TotalCacheBudgetMib { .. }
+            | AutomationSetting::TrackPipeline { .. } => {
+                // A thin translation: a preference setting is one preferences action, applied
+                // exactly as the Settings window applies it.
+                let action =
+                    crate::action::translate::preference_setting_action(&self.session, setting)
+                        .expect("every preference setting translates to preferences");
+                deferred_shell_change = self.apply_action(action)?.changed;
             }
             AutomationSetting::PropertiesPanelExpanded { value } => {
                 let id = egui::Id::new("properties-panel-expanded");
@@ -602,171 +518,34 @@ impl Viewer {
                 self.egui_context.request_repaint();
                 self.window.request_redraw();
             }
-            AutomationSetting::ShowReference { value } => self.apply_automation_option(
-                &AutomationOptionScope::Workspace,
-                "show_reference",
-                &serde_json::json!(value),
-            )?,
-            AutomationSetting::ShowCoverage { value } => self.apply_automation_option(
-                &AutomationOptionScope::Workspace,
-                "show_coverage",
-                &serde_json::json!(value),
-            )?,
             AutomationSetting::ShowReads { value, track_id } => self.apply_automation_option_for(
                 &AutomationOptionScope::Workspace,
                 "show_reads",
                 &serde_json::json!(value),
                 *track_id,
             )?,
-            AutomationSetting::ShowJunctions { value } => self.apply_automation_option(
-                &AutomationOptionScope::Workspace,
-                "show_junctions",
-                &serde_json::json!(value),
-            )?,
-            AutomationSetting::ViewAsPairs { value } => self.apply_automation_option(
-                &AutomationOptionScope::Workspace,
-                "view_as_pairs",
-                &serde_json::json!(value),
-            )?,
-            AutomationSetting::AlignmentDensity { value, track_id } => self
-                .apply_automation_option_for(
-                    &AutomationOptionScope::Workspace,
-                    "vertical_density",
-                    &serde_json::json!(value),
-                    *track_id,
-                )?,
-            AutomationSetting::IncludeSecondary { value } => self.apply_automation_option(
-                &AutomationOptionScope::Workspace,
-                "include_secondary",
-                &serde_json::json!(value),
-            )?,
-            AutomationSetting::IncludeSupplementary { value } => self.apply_automation_option(
-                &AutomationOptionScope::Workspace,
-                "include_supplementary",
-                &serde_json::json!(value),
-            )?,
-            AutomationSetting::CoverageScaleTransform { value } => self.apply_automation_option(
-                &AutomationOptionScope::Workspace,
-                "coverage_scale_transform",
-                &serde_json::json!(value),
-            )?,
-            AutomationSetting::ReadBaseDisplayMode { value } => {
-                self.primary_alignment_filters_mut().read_base_display_mode = *value;
-                self.invalidate_automation_alignment_layouts(None, false);
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::ShadeReadBasesByQuality { value } => self.apply_automation_option(
-                &AutomationOptionScope::Workspace,
-                "shade_read_bases_by_quality",
-                &serde_json::json!(value),
-            )?,
-            AutomationSetting::ShowModifiedBases { value } => self.apply_automation_option(
-                &AutomationOptionScope::Workspace,
-                "show_modified_bases",
-                &serde_json::json!(value),
-            )?,
-            AutomationSetting::OverlappingMatePolicy { value } => {
-                let changed = self.primary_alignment_filters().overlapping_mate_policy != *value;
-                self.primary_alignment_filters_mut().overlapping_mate_policy = *value;
-                self.invalidate_automation_alignment_layouts(None, changed);
-                if changed {
-                    self.request_all_panel_queries();
-                }
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::ModifiedBaseColorMode { value } => {
-                self.primary_alignment_filters_mut()
-                    .modified_base_color_mode = *value;
-                self.invalidate_automation_alignment_layouts(None, false);
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::AlignmentColorMode { track_ids, value } => {
-                self.ensure_automation_alignment_tracks(track_ids)?;
-                for track in self
-                    .session
-                    .alignment_tracks
-                    .iter_mut()
-                    .filter(|track| track_ids.contains(&track.config.id))
-                {
-                    track.config.filters.alignment_color_mode = *value;
-                }
-                self.invalidate_automation_alignment_layouts(Some(track_ids), false);
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::AlignmentViewFilter { track_ids, value } => {
-                self.ensure_automation_alignment_tracks(track_ids)?;
-                anyhow::ensure!(
-                    self.session.reference_source.is_some()
-                        || !value
-                            .all
-                            .iter()
-                            .any(AlignmentViewPredicate::requires_reference),
-                    "reference-backed alignment filters require a matching reference FASTA"
-                );
-                for track in self
-                    .session
-                    .alignment_tracks
-                    .iter_mut()
-                    .filter(|track| track_ids.contains(&track.config.id))
-                {
-                    track.config.filters.alignment_view_filter = value.clone();
-                }
-                self.invalidate_automation_alignment_layouts(Some(track_ids), true);
-                self.request_all_panel_queries();
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::AlignmentHighlightFilter { track_ids, value } => {
-                self.ensure_automation_alignment_tracks(track_ids)?;
-                anyhow::ensure!(
-                    self.session.reference_source.is_some()
-                        || !value
-                            .all
-                            .iter()
-                            .any(AlignmentViewPredicate::requires_reference),
-                    "reference-backed alignment highlights require a matching reference FASTA"
-                );
-                for track in self
-                    .session
-                    .alignment_tracks
-                    .iter_mut()
-                    .filter(|track| track_ids.contains(&track.config.id))
-                {
-                    track.config.filters.alignment_highlight_filter = value.clone();
-                }
-                self.refresh_alignment_highlight_interactions(track_ids);
-                self.invalidate_automation_alignment_layouts(Some(track_ids), false);
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::ReadStackingMode { track_ids, value } => {
-                self.ensure_automation_alignment_tracks(track_ids)?;
-                for track in self
-                    .session
-                    .alignment_tracks
-                    .iter_mut()
-                    .filter(|track| track_ids.contains(&track.config.id))
-                {
-                    track.config.filters.read_stacking_mode = *value;
-                }
-                self.invalidate_automation_alignment_layouts(Some(track_ids), false);
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::CompleteReadLimit { track_ids, value } => {
-                self.ensure_automation_alignment_tracks(track_ids)?;
-                let (workspace_limit, requested_limit) = expanded_workspace_alignment_limit(
-                    self.session.workspace_alignment_limit,
-                    *value,
-                );
-                self.session.workspace_alignment_limit = workspace_limit;
-                for track in self
-                    .session
-                    .alignment_tracks
-                    .iter_mut()
-                    .filter(|track| track_ids.contains(&track.config.id))
-                {
-                    track.config.maximum_alignments = requested_limit;
-                }
-                self.invalidate_automation_alignment_layouts(Some(track_ids), true);
-                self.request_all_panel_queries();
+            AutomationSetting::ShowReference { .. }
+            | AutomationSetting::ShowCoverage { .. }
+            | AutomationSetting::ShowJunctions { .. }
+            | AutomationSetting::ViewAsPairs { .. }
+            | AutomationSetting::AlignmentDensity { .. }
+            | AutomationSetting::IncludeSecondary { .. }
+            | AutomationSetting::IncludeSupplementary { .. }
+            | AutomationSetting::CoverageScaleTransform { .. }
+            | AutomationSetting::ReadBaseDisplayMode { .. }
+            | AutomationSetting::ShadeReadBasesByQuality { .. }
+            | AutomationSetting::ShowModifiedBases { .. }
+            | AutomationSetting::OverlappingMatePolicy { .. }
+            | AutomationSetting::ModifiedBaseColorMode { .. }
+            | AutomationSetting::AlignmentColorMode { .. }
+            | AutomationSetting::AlignmentViewFilter { .. }
+            | AutomationSetting::AlignmentHighlightFilter { .. }
+            | AutomationSetting::ReadStackingMode { .. }
+            | AutomationSetting::CompleteReadLimit { .. } => {
+                // A thin translation: the alignment settings are one settings action.
+                self.apply_command_translation(&rgv_automation::AutomationCommand::Configure {
+                    setting: setting.clone(),
+                })?;
                 self.rebuild_all_panel_displays();
             }
             AutomationSetting::RebuildStableReadArchitecture {

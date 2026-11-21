@@ -1,0 +1,29 @@
+[package]
+name = "rgv-snapshot"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Renders an RGV view to PNG or SVG with no window and no GPU"
+
+[[bin]]
+name = "rgv-snapshot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rgv-alignment-scene = { version = "0.1.0", path = "../../crates/rgv-alignment-scene" }
+rgv-core = { version = "0.1.0", path = "../../crates/rgv-core" }
+rgv-engine = { version = "0.1.0", path = "../../crates/rgv-engine" }
+rgv-layout = { version = "0.1.0", path = "../../crates/rgv-layout" }
+rgv-render = { version = "0.1.0", path = "../../crates/rgv-render" }
+rgv-session = { version = "0.1.0", path = "../../crates/rgv-session" }
+
+[dev-dependencies]
+image.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

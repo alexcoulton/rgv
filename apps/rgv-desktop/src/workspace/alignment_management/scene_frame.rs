@@ -851,6 +851,7 @@ impl Viewer {
             // presenting until the replacement publishes atomically.
             let mut panel_deferred_sources = Vec::new();
             let mut capture_error = None;
+            let lane_layout = self.panel_lane_layout(panel_id);
             for track in &self.session.alignment_tracks {
                 let Some(projection) = track.projection(panel_id) else {
                     continue;
@@ -875,6 +876,7 @@ impl Viewer {
                             && contract.presentation.reference.is_some()
                     });
                 match self.alignment_scene_lane_capture_for_panel_track(
+                    lane_layout.as_ref(),
                     panel_id,
                     track.config.id,
                     contig,

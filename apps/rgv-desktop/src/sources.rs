@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result};
 use rgv_core::{
     GenomeAssembly, GenomicSourceFormat, ReferenceDictionary, SessionAlignmentTrack,
     SessionDocument, TrackCollection, TrackConfig, TrackFormat, TrackId, TrackKind, TrackSource,
-    UnresolvedSessionSource, classify_genomic_source, parse_ucsc_cytobands,
+    UnresolvedSessionSource, classify_genomic_source,
 };
 use rgv_engine::{TrackSpec, TrackSpecKind};
 use std::path::Path;
@@ -268,36 +268,10 @@ pub(super) fn load_assembly(
     load_assembly_reporting(name, dictionary, cytoband_path).0
 }
 
-/// As [`load_assembly`], also returning why the cytoband file could not be used. The assembly
-/// then falls back to the plain ideogram, which must be explained to the user rather than only
-/// written to the log.
-pub(super) fn load_assembly_reporting(
-    name: &str,
-    dictionary: ReferenceDictionary,
-    cytoband_path: Option<&Path>,
-) -> (GenomeAssembly, Option<String>) {
-    let mut assembly = GenomeAssembly::from_dictionary(name, dictionary);
-    let Some(path) = cytoband_path else {
-        return (assembly, None);
-    };
-    match std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read cytobands from {}", path.display()))
-        .and_then(|text| parse_ucsc_cytobands(&text, &assembly.dictionary).map_err(Into::into))
-    {
-        Ok(cytobands) => {
-            assembly.cytobands = cytobands;
-            (assembly, None)
-        }
-        Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "using ideogram fallback");
-            let failure = format!(
-                "Could not load cytobands from {}: {error:#}; showing the plain ideogram",
-                path.display()
-            );
-            (assembly, Some(failure))
-        }
-    }
-}
+// As `load_assembly`, also returning why the cytoband file could not be used. The assembly
+// then falls back to the plain ideogram, which must be explained to the user rather than only
+// written to the log.
+pub(super) use rgv_session::sources::load_assembly_reporting;
 
 pub(super) fn track_spec_kind(
     kind: TrackKind,

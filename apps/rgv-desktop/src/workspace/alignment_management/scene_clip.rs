@@ -1,8 +1,5 @@
 use rgv_alignment_scene::{AlignmentCamera, CpuClipRect};
 use rgv_core::{GenomicInterval, Viewport};
-use rgv_engine::{
-    AlignmentCoordinatorFrame, AlignmentIndividualReadCapability, AlignmentVerticalResidency,
-};
 use rgv_render::AlignmentGpuScissor;
 
 /// Narrows a lane rectangle to the exact horizontal portion owned by a retained snapshot. The
@@ -71,51 +68,8 @@ pub(crate) fn alignment_clip_gpu_scissor(
     })
 }
 
-/// A retained snapshot from a discontinuous locus is not a row-count or render authority for the
-/// new camera. Source workers may truthfully attach that old immutable snapshot while acquiring
-/// the replacement; the desktop keeps the progress frame but strips the irrelevant scene.
-pub(crate) fn alignment_scene_frame_for_ui(
-    frame: AlignmentCoordinatorFrame,
-) -> AlignmentCoordinatorFrame {
-    let retained_interval = frame
-        .snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.reads().atlas().interval());
-    alignment_scene_frame_for_ui_against_retained_interval(frame, retained_interval)
-}
-
-/// Normalizes a worker progress frame against the interval carried by its retained snapshot. This
-/// decomposition keeps the discontinuous-locus rule directly testable without constructing the
-/// heavyweight immutable scene graph.
-pub(crate) fn alignment_scene_frame_for_ui_against_retained_interval(
-    mut frame: AlignmentCoordinatorFrame,
-    retained_interval: Option<GenomicInterval>,
-) -> AlignmentCoordinatorFrame {
-    let camera_refusal_is_terminal = frame.individual_reads_refused_for_camera();
-    let relevant = retained_interval.is_none_or(|interval| {
-        alignment_scene_intervals_share_authority(interval, frame.camera.interval())
-    });
-    if !relevant {
-        frame.snapshot = None;
-        frame.row_activity = None;
-        frame.covered_interval = None;
-        frame.covered_rows = 0..0;
-        frame.requested_rows = frame.camera.visible_rows();
-        // The requirement describes the new desired camera, not the discarded old snapshot. It
-        // must survive so the desktop can request and install the exact FASTA horizon.
-        frame.scene_contracts_current = false;
-        frame.reference_products_current = false;
-        if !camera_refusal_is_terminal {
-            frame.individual_reads = AlignmentIndividualReadCapability::Pending;
-        }
-        frame.vertical_residency = AlignmentVerticalResidency::ViewportBounded;
-    }
-    frame
-}
-
-pub(crate) fn alignment_scene_intervals_share_authority(
-    atlas: GenomicInterval,
-    camera: GenomicInterval,
-) -> bool {
-    atlas.contig() == camera.contig() && atlas.overlaps(camera)
-}
+#[cfg(test)]
+pub(crate) use rgv_session::alignment::events::{
+    alignment_scene_frame_for_ui_against_retained_interval,
+    alignment_scene_intervals_share_authority,
+};

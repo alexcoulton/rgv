@@ -512,6 +512,26 @@ impl Panel for ViewPanelController {
         &mut self.state
     }
 
+    fn selected_alignment_track(&self) -> Option<TrackId> {
+        self.selected_alignment_track
+    }
+
+    fn selected_pileup_position(&self) -> Option<u64> {
+        self.selected_pileup_position
+    }
+
+    fn selected_modification_position(&self) -> Option<u64> {
+        self.selected_modification_position
+    }
+
+    fn clear_pending_alignment_reveal(&mut self, only_track: Option<TrackId>) {
+        if self.pending_alignment_reveal.is_some_and(|(pending_track, _)| {
+            only_track.is_none_or(|track_id| pending_track == track_id)
+        }) {
+            self.pending_alignment_reveal = None;
+        }
+    }
+
     fn from_state(state: PanelState) -> Self {
         Self {
             state,
