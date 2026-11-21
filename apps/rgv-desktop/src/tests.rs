@@ -6,6 +6,8 @@ mod display;
 mod inspection;
 #[path = "tests/scene_fixture.rs"]
 mod scene_fixture;
+#[path = "tests/semantic_retirement.rs"]
+mod semantic_retirement;
 #[path = "tests/sources.rs"]
 mod sources;
 #[path = "tests/workspace.rs"]

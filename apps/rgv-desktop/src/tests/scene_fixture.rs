@@ -252,6 +252,12 @@ fn exact_authority(ledger: &AllocationLedger) -> (Arc<EvidenceRoot>, Arc<ExactSu
 
 pub(super) fn alignment_scene_snapshot() -> Arc<AlignmentSceneSnapshot> {
     let ledger = AllocationLedger::new_with_transient_budget(8 << 20, 8 << 20, 8 << 20);
+    alignment_scene_snapshot_on(&ledger)
+}
+
+/// The same scene, with every CPU allocation charged to `ledger`.
+pub(crate) fn alignment_scene_snapshot_on(ledger: &AllocationLedger) -> Arc<AlignmentSceneSnapshot> {
+    let ledger = ledger.clone();
     let (evidence, summaries) = exact_authority(&ledger);
     let interval = summaries.prepared_interval();
     let reference_revision = ReferenceRevision::new(RevisionFingerprint::new(30, 31));

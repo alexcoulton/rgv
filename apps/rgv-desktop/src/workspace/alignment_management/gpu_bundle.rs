@@ -16,8 +16,9 @@ use crate::{
 use rgv_alignment_scene::{
     AlignmentDerivedLaneOptions, AlignmentInteractionState, AlignmentPanelSceneFrame,
     AlignmentPanelSceneStore, AllocationBundleActual, AllocationBundleError, AllocationBundleSlot,
-    AllocationBundleSpec, AllocationRetirementToken, CpuSummaryCamera,
-    build_alignment_semantic_retirement_claim_set,
+    AllocationBundleSpec, AllocationLedger, AllocationRetirementClaimSet,
+    AllocationRetirementToken, AlignmentSceneSnapshot, AlignmentSemanticRetirementStats,
+    CpuSummaryCamera, build_alignment_semantic_retirement_claim_set,
 };
 use rgv_core::PanelId;
 use rgv_engine::AlignmentIndividualReadCapability;
@@ -310,14 +311,17 @@ impl Viewer {
     pub(super) fn detach_alignment_semantic_epoch_retirement(
         &mut self,
     ) -> std::result::Result<Option<AlignmentSemanticEpochRetirement>, AllocationBundleError> {
+        let gpu_ledger_is_private = self.alignment_gpu_ledger_is_private();
         let Some(epoch) = self.alignment_presented_epoch.as_mut() else {
             debug_assert!(self.alignment_panel_scene_stores.is_empty());
             return Ok(None);
         };
         let panel_frames = std::mem::take(&mut epoch.panel_frames);
         let panel_scene_stores = std::mem::take(&mut self.alignment_panel_scene_stores);
-        let planned = build_alignment_semantic_retirement_claim_set(
+        let planned = plan_alignment_semantic_retirement(
             &self.alignment_gpu_ledger,
+            &self.session.alignment_scene_ledger,
+            gpu_ledger_is_private,
             panel_frames
                 .values()
                 .flat_map(|frame| frame.lanes.iter())
@@ -864,5 +868,32 @@ impl Viewer {
             )));
         }
         Ok(())
+    }
+}
+
+/// Plans the semantic (CPU scene) component of an alignment epoch's retirement.
+///
+/// The snapshots are CPU scene allocations charged to the scene ledger. Under the Complete policy
+/// that ledger is also the GPU ledger, so the old epoch's semantic bytes are credited to the
+/// atomic replacement bundle exactly as before. Under the Bounded policy the GPU ledger is
+/// private: its budget never counted these bytes, and its claim builder rejects their leases as
+/// foreign ("retirement reference ... belongs to another ledger"). The ownership proof is then
+/// planned against the scene ledger that owns them (for the statistics), and the bundle receives
+/// an empty claim on the GPU ledger; the scene ledger releases the bytes when the retired
+/// snapshots are dropped.
+pub(crate) fn plan_alignment_semantic_retirement<'a>(
+    gpu_ledger: &AllocationLedger,
+    scene_ledger: &AllocationLedger,
+    gpu_ledger_is_private: bool,
+    snapshots: impl IntoIterator<Item = &'a Arc<AlignmentSceneSnapshot>>,
+) -> std::result::Result<
+    (AllocationRetirementClaimSet, AlignmentSemanticRetirementStats),
+    AllocationBundleError,
+> {
+    if gpu_ledger_is_private {
+        let (_, stats) = build_alignment_semantic_retirement_claim_set(scene_ledger, snapshots)?;
+        Ok((gpu_ledger.empty_retirement_claim_set(), stats))
+    } else {
+        build_alignment_semantic_retirement_claim_set(gpu_ledger, snapshots)
     }
 }

@@ -17,6 +17,8 @@ mod speculation;
 
 pub(crate) use gpu_budget::alignment_gpu_ledger_for;
 #[cfg(test)]
+pub(crate) use gpu_bundle::plan_alignment_semantic_retirement;
+#[cfg(test)]
 pub(crate) use gpu_publication::{
     alignment_gpu_bundle_error_is_deferred, alignment_read_camera_capture_error_is_deferred,
     alignment_summary_camera_capture_error_is_deferred,
